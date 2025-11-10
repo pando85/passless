@@ -1,0 +1,144 @@
+name: Rust
+
+on:
+  push:
+    branches: [master]
+    tags:
+      - v[0-9]*
+  pull_request:
+    branches: [master]
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Install stable toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - run: rustup override set ${{steps.toolchain.outputs.name}}
+      - run: rustup component add rustfmt
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      - name: Update apt
+        run: sudo apt update
+
+      - name: Install alsa
+        run: sudo apt-get install -y libasound2-dev
+
+      - name: Install stable toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - run: rustup override set ${{steps.toolchain.outputs.name}}
+      - run: rustup component add clippy
+
+      - uses: clechasseur/rs-clippy-check@v5
+        with:
+          args: --all-features -- --deny warnings
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          # use ubuntu 22.04 to keep older glibc version dependency
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+    name: ${{ matrix.job.target }} (${{ matrix.job.os }})
+    runs-on: ${{ matrix.job.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          case ${{ matrix.job.target }} in
+            x86_64-unknown-linux-gnu) sudo apt install -y libasound2-dev;;
+          esac
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.job.target }}
+          override: true
+
+      - name: Build
+        shell: bash
+        run: cargo build --verbose
+
+      - name: Run tests
+        shell: bash
+        run: cargo test --verbose
+
+      - name: Extract crate information
+        shell: bash
+        run: |
+          echo "PROJECT_NAME=passless" >> $GITHUB_ENV
+          echo "PROJECT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | head -n1)" >> $GITHUB_ENV
+
+      - name: Make release
+        id: package
+        shell: bash
+        run: |
+          export CARGO_TARGET=${{ matrix.job.target }}
+          export PKG_BASE_NAME=${PROJECT_NAME}-${PROJECT_VERSION}-${CARGO_TARGET}
+          make release
+          echo "PKG_BASE_NAME=${PKG_BASE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Generate SHA256 hash
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            shasum -a 256 ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz > ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
+          else
+            sha256sum ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz > ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
+          fi
+          cat ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
+
+      - name: Publish crates
+        if: startsWith(github.ref, 'refs/tags/') && matrix.job.target == 'x86_64-unknown-linux-gnu'
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        shell: bash
+        run: |
+          echo "${CRATES_IO_TOKEN}" | cargo login
+          make publish
+
+      - name: Get Changelog Entry
+        if: startsWith(github.ref, 'refs/tags/')
+        id: changelog_reader
+        uses: mindsers/changelog-reader-action@v2.2.3
+        with:
+          version: v${{ env.PROJECT_VERSION }}
+          path: ./CHANGELOG.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          body: ${{ steps.changelog_reader.outputs.changes }}
+          prerelease: ${{ steps.changelog_reader.outputs.status == 'prereleased' }}
+          draft: ${{ steps.changelog_reader.outputs.status == 'unreleased' }}
+          files: |
+            ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz
+            ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
+            vendor.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

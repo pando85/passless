@@ -1,0 +1,10 @@
+# Passless FIDO2 Authenticator Configuration
+# Copy this file to ~/.config/passless/config.toml or specify with --config
+
+# Directory to store credentials
+# Default: /tmp/fido2_credentials
+storage_dir = "/tmp/fido2_credentials"
+
+# Enable verbose logging
+# Default: false
+verbose = false

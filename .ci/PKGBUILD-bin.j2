@@ -1,0 +1,20 @@
+# Maintainer: Pando85 <pando855@gmail.com>
+_pkgname=passless-rs
+pkgname="${_pkgname}-bin"
+pkgver={{ env.PROJECT_VERSION }}
+pkgrel=1
+pkgdesc="passless application"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pando85/passless"
+license=('GPL')
+depends=('gcc-libs'
+         'alsa-lib')
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
+
+source=("https://github.com/pando85/passless/releases/download/v${pkgver}/passless-${pkgver}-${CARCH}-unknown-linux-gnu.tar.gz")
+sha256sums=('{{ checksum }}')
+
+package() {
+	install -Dm755 passless "${pkgdir}/usr/bin/passless"
+}

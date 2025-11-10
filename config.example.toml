@@ -1,0 +1,24 @@
+# Passless Configuration File
+# Copy this file to ~/.config/passless/config.toml and customize as needed
+
+# Enable verbose logging
+verbose = false
+
+# ============================================
+# Local Backend Configuration
+# ============================================
+# Use local file system for storage (default)
+
+[backend]
+type = "local"
+path = "/tmp/fido2_credentials"
+
+# ============================================
+# Pass Backend Configuration
+# ============================================
+# Use pass (password-store) for encrypted storage with git sync
+
+# [backend]
+# type = "pass"
+# path = "~/.password-store/fido2"
+# gpg_key = "your.email@example.com"  # Optional: uses default GPG key if not specified

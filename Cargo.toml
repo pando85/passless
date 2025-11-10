@@ -1,0 +1,44 @@
+[package]
+name = "passless"
+description = "FIDO2 security token emulator."
+authors = ["Pando85 <pando855@gmail.com>"]
+version = "0.0.0"
+edition = "2024"
+license-file = "./LICENSE"
+homepage = "https://github.com/pando85/passless"
+categories = ["command-line-utilities"]
+keywords = ["passkeys", "fido2", "auth", "password-manager", "pass"]
+repository = "https://github.com/pando85/passless"
+readme = "./README.md"
+
+[[bin]]
+name = "passless"
+path = "src/main.rs"
+
+[dependencies]
+thiserror = "2.0"
+clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
+#keylib = { path = "../rust-keylib/keylib" }
+keylib = { version = "0.2", features = ["bundled"] }
+log = "0.4"
+env_logger = "0.11"
+sha2 = "0.10"
+serde_cbor = "0.11.2"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0"
+prs-lib = { version = "0.5" }
+serde_json = "1.0"
+libc = "0.2"
+nix = { version = "0.27", features = ["resource"] }
+notify-rust = "4.11"
+
+[dev-dependencies]
+base64 = "0.22"
+ciborium = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
