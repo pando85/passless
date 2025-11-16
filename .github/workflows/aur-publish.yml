@@ -16,9 +16,9 @@ jobs:
     strategy:
       matrix:
         package:
-          - name: passless-rs
+          - name: passless
             pkgbuild: PKGBUILD
-          - name: passless-rs-bin
+          - name: passless-bin
             pkgbuild: PKGBUILD-bin
 
     steps:

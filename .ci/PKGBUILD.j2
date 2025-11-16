@@ -1,23 +1,25 @@
 # Maintainer: Pando85 <pando855@gmail.com>
 
-_pkgname=passless-rs
+_pkgname=passless
 pkgname="${_pkgname}"
 pkgver={{ env.PROJECT_VERSION }}
 pkgrel=1
-pkgdesc="Simple countdown terminal alarm"
-arch=('i686' 'x86_64' 'armv6h' 'armv7h' 'aarch64')
+pkgdesc="FIDO2 security token emulator "
+arch=('x86_64' 'aarch64')
 url="https://github.com/pando85/passless"
 license=('GPL')
-depends=('gcc-libs'
-         'alsa-lib')
+install=passless.install
+depends=('gcc-libs')
 makedepends=('cargo'
              'pkgconf'
              'git')
 provides=("${_pkgname}")
 conflicts=("${_pkgname}")
-source=("git+$url.git#tag=v${pkgver}?signed")
+source=("git+$url.git#tag=v${pkgver}?signed"
+        "passless.install")
 validpgpkeys=('CD1DB60B2C8465FD50028EF6D381D73787B45B3E')
-sha512sums=('SKIP')
+sha512sums=('SKIP'
+            'SKIP')
 
 prepare() {
     cd "$srcdir/passless"
@@ -40,4 +42,7 @@ check() {
 package() {
     cd "$srcdir/passless"
     install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/passless"
+    install -Dm0644 contrib/systemd/passless.service "$pkgdir/usr/lib/systemd/user/passless.service"
+    install -Dm0644 contrib/udev/90-passless.rules "$pkgdir/usr/lib/udev/rules.d/90-passless.rules"
+    install -Dm0644 contrib/sysusers.d/passless.conf "$pkgdir/usr/lib/sysusers.d/passless.conf"
 }

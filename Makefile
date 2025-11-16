@@ -95,3 +95,68 @@ release:	## generate vendor.tar.gz and $(PKG_BASE_NAME).tar.gz
 .PHONY: publish
 publish:	## publish crate
 	cargo publish
+
+# Installation targets
+.PHONY: install-binary
+install-binary:	## install passless binary to ~/.cargo/bin
+	cargo install --path .
+
+.PHONY: install
+install: install-binary install-sysusers install-udev install-systemd	## install everything (binary, sysusers, udev, systemd)
+	@bash -c '. .ci/passless.install && post_install'
+
+.PHONY: install-systemd
+install-systemd:	## install systemd user service
+	@mkdir -p ~/.config/systemd/user
+	@cp contrib/systemd/passless.service ~/.config/systemd/user/
+	@systemctl --user daemon-reload
+	@echo "Systemd service installed."
+
+.PHONY: uninstall-systemd
+uninstall-systemd:	## uninstall systemd user service
+	@systemctl --user stop passless.service 2>/dev/null || true
+	@systemctl --user disable passless.service 2>/dev/null || true
+	@rm -f ~/.config/systemd/user/passless.service
+	@systemctl --user daemon-reload
+	@echo "Systemd service uninstalled."
+
+.PHONY: install-udev
+install-udev:	## install udev rules (requires sudo)
+	@echo "Installing udev rules (requires sudo)..."
+	@sudo cp contrib/udev/90-passless.rules /etc/udev/rules.d/
+	@sudo udevadm control --reload-rules
+	@sudo udevadm trigger
+	@echo "Udev rules installed."
+
+.PHONY: uninstall-udev
+uninstall-udev:	## uninstall udev rules (requires sudo)
+	@echo "Removing udev rules (requires sudo)..."
+	@sudo rm -f /etc/udev/rules.d/90-passless.rules
+	@sudo udevadm control --reload-rules
+	@sudo udevadm trigger
+	@echo "Udev rules removed."
+
+.PHONY: install-sysusers
+install-sysusers:	## install sysusers configuration (requires sudo)
+	@echo "Installing sysusers configuration (requires sudo)..."
+	@sudo cp contrib/sysusers.d/passless.conf /usr/lib/sysusers.d/
+	@sudo systemd-sysusers
+	@echo "Sysusers configuration installed. The 'fido' group has been created."
+
+.PHONY: uninstall-sysusers
+uninstall-sysusers:	## uninstall sysusers configuration (requires sudo)
+	@echo "Removing sysusers configuration (requires sudo)..."
+	@sudo rm -f /usr/lib/sysusers.d/passless.conf
+	@echo "Sysusers configuration removed."
+	@echo "Note: The 'fido' group still exists and must be removed manually if desired."
+
+.PHONY: uninstall-binary
+uninstall-binary:	## uninstall passless binary (requires cargo)
+	cargo uninstall passless
+
+.PHONY: uninstall
+uninstall: uninstall-systemd uninstall-udev uninstall-sysusers uninstall-binary	## uninstall everything (systemd, udev, sysusers, binary)
+	@bash -c '. .ci/passless.install && post_remove'
+	@echo "    Note: The 'fido' group still exists. To remove it:"
+	@echo "      sudo groupdel fido"
+	@echo ""

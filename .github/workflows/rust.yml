@@ -36,8 +36,8 @@ jobs:
       - name: Update apt
         run: sudo apt update
 
-      - name: Install alsa
-        run: sudo apt-get install -y libasound2-dev
+      - name: Install udev
+        run: sudo apt-get install -y libudev-dev
 
       - name: Install stable toolchain
         id: toolchain
@@ -62,12 +62,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          case ${{ matrix.job.target }} in
-            x86_64-unknown-linux-gnu) sudo apt install -y libasound2-dev;;
-          esac
+      - name: Update apt
+        run: sudo apt update
+
+      - name: Install udev
+        run: sudo apt-get install -y libudev-dev
 
       - uses: Swatinem/rust-cache@v2
 

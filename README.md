@@ -16,7 +16,6 @@ TODO
 - [Installation](#installation)
   - [Cargo](#cargo)
   - [Arch Linux](#arch-linux)
-  - [Binaries](#binaries)
 
 ## Features
 
@@ -26,37 +25,31 @@ TODO
 
 ### Cargo
 
+Install from source with full system integration:
+
 ```bash
-cargo install passless-cli
+# Clone the repository
+git clone https://github.com/pando85/passless.git
+cd passless
+
+# Install everything (binary, systemd service, udev rules, sysusers config)
+make install
+
+# Follow the post-install instructions to:
+# 1. Add yourself to the fido group
+# 2. Load the uhid kernel module
+# 3. Log out and back in
+# 4. Enable the systemd service
 ```
 
 ### Arch Linux
 
 ```bash
-yay -S passless-rs
+yay -S passless
 ```
 
 or the binary from AUR:
 
 ```bash
-yay -S passless-rs-bin
-```
-
-### Binaries
-
-Binaries are made available each release for the Linux and MacOS operating systems.
-
-You can download a prebuilt binary from our
-[Releases](https://github.com/pando85/passless/releases).
-
-```bash
-curl -s https://api.github.com/repos/pando85/passless/releases/latest \
-  | grep browser_download_url \
-  | grep -v sha256 \
-  | grep $(uname -m) \
-  | grep linux \
-  | cut -d '"' -f 4 \
-  | xargs curl -L \
-  | tar xvz
-sudo mv passless /usr/local/bin
+yay -S passless-bin
 ```

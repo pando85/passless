@@ -1,0 +1,26 @@
+[Unit]
+Description=Passless FIDO2 Software Authenticator
+Documentation=https://github.com/pando85/passless
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=passless
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+# The application already handles its own memory locking and core dump prevention
+# but we can add additional systemd protections
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=passless
+
+[Install]
+WantedBy=default.target

@@ -241,3 +241,22 @@ Release process:
 2. Run `make update-changelog` to generate changelog
 3. Tag with `v*` pattern
 4. CI builds, runs tests, publishes to crates.io, creates GitHub release
+
+## Documentation Guidelines
+
+### README Files
+
+Keep README files concise and focused on basic examples only:
+- **DO**: Provide simple, working examples
+- **DO**: Show the most common use cases
+- **DO**: Keep explanations brief and to the point
+- **DON'T**: Create lengthy, comprehensive documentation
+- **DON'T**: Duplicate information already in other docs
+- **DON'T**: Recreate README files that have been intentionally deleted
+
+Examples of good README content:
+- Quick installation command
+- Basic usage example
+- Link to more detailed documentation if needed
+
+For detailed documentation, use dedicated files like INSTALL.md, CONTRIBUTING.md, etc.

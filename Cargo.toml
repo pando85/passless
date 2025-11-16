@@ -10,6 +10,13 @@ categories = ["command-line-utilities"]
 keywords = ["passkeys", "fido2", "auth", "password-manager", "pass"]
 repository = "https://github.com/pando85/passless"
 readme = "./README.md"
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "contrib/**/*",
+]
 
 [[bin]]
 name = "passless"
