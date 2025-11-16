@@ -199,7 +199,9 @@ impl PassStorageAdapter {
 
         match sync.finalize(message) {
             Ok(()) => {
-                debug!("Successfully finalized store sync (committed and pushed if remote configured)");
+                debug!(
+                    "Successfully finalized store sync (committed and pushed if remote configured)"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -587,7 +589,11 @@ impl PassStorageAdapter {
         let mut hasher = Sha256::new();
         hasher.update(cred.rp.id.as_bytes());
         let rp_hash: [u8; 32] = hasher.finalize().into();
-        self.indexes.rp_hash.entry(rp_hash).or_default().push(path.clone());
+        self.indexes
+            .rp_hash
+            .entry(rp_hash)
+            .or_default()
+            .push(path.clone());
 
         // Commit and push changes to git remote if configured
         let relative_path = path
