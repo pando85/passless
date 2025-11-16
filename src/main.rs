@@ -185,8 +185,8 @@ fn main() -> Result<()> {
         return match command {
             Commands::Config { action } => match action {
                 ConfigAction::Print => {
-                    // Generate default configuration
-                    let default_config = AppConfig::default();
+                    // Generate default configuration with all defaults filled in
+                    let default_config = AppConfig::with_defaults_filled();
                     let toml_string = toml::to_string_pretty(&default_config)
                         .map_err(|e| error::Error::Config(format!("Failed to serialize config: {}", e)))?;
                     println!("{}", toml_string);
@@ -258,15 +258,31 @@ fn main() -> Result<()> {
     info!("Creating authenticator service...");
     match &config.backend {
         config::BackendConfig::Local(local_config) => {
-            let storage = LocalStorageAdapter::new(local_config.path.clone().into())?;
+            let path = local_config.path.clone().unwrap_or_else(|| {
+                dirs::data_dir()
+                    .expect("Could not determine data directory")
+                    .join("passless")
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let storage = LocalStorageAdapter::new(path.into())?;
             let service = AuthenticatorService::new(storage)?;
             run_with_service(service, uhid)
         }
         config::BackendConfig::Pass(pass_config) => {
-            let gpg_backend = storage::GpgBackend::from_str(&pass_config.gpg_backend)?;
+            let store_path = pass_config.store_path.clone().unwrap_or_else(|| {
+                dirs::home_dir()
+                    .expect("Could not determine home directory")
+                    .join(".password-store")
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let path = pass_config.path.clone().unwrap_or_else(|| "fido2".to_string());
+            let gpg_backend_str = pass_config.gpg_backend.clone().unwrap_or_else(|| "gnupg-bin".to_string());
+            let gpg_backend = storage::GpgBackend::from_str(&gpg_backend_str)?;
             let storage = PassStorageAdapter::new(
-                pass_config.store_path.clone().into(),
-                pass_config.path.clone().into(),
+                store_path.into(),
+                path.into(),
                 gpg_backend,
             )?;
             let service = AuthenticatorService::new(storage)?;
