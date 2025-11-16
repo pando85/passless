@@ -587,10 +587,14 @@ impl PassStorageAdapter {
         let mut hasher = Sha256::new();
         hasher.update(cred.rp.id.as_bytes());
         let rp_hash: [u8; 32] = hasher.finalize().into();
-        self.indexes.rp_hash.entry(rp_hash).or_default().push(path);
+        self.indexes.rp_hash.entry(rp_hash).or_default().push(path.clone());
 
         // Commit and push changes to git remote if configured
-        let commit_message = format!("Add credential for {}", cred.rp.id);
+        let relative_path = path
+            .strip_prefix(&self.store_path)
+            .unwrap_or(&path)
+            .display();
+        let commit_message = format!("Add generated password for {}.", relative_path);
         self.sync_finalize(&commit_message)?;
 
         Ok(())
@@ -653,7 +657,11 @@ impl PassStorageAdapter {
         debug!("Successfully deleted credential");
 
         // Commit and push changes to git remote if configured
-        let commit_message = format!("Remove credential for {}", cred.rp.id);
+        let relative_path = path
+            .strip_prefix(&self.store_path)
+            .unwrap_or(&path)
+            .display();
+        let commit_message = format!("Remove {} from store.", relative_path);
         self.sync_finalize(&commit_message)?;
 
         Ok(())
