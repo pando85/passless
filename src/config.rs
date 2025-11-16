@@ -43,43 +43,36 @@ pub struct SecurityConfig {
     #[arg(
         long = "use-mlock",
         env = "PASSLESS_USE_MLOCK",
-        default_value_t = true,
         help = "Lock credential memory to prevent swapping to disk (requires CAP_IPC_LOCK or root)"
     )]
-    #[serde(default = "default_true")]
-    pub use_mlock: bool,
+    #[serde(default)]
+    pub use_mlock: Option<bool>,
 
     /// Disable core dumps to prevent credential leakage
     #[arg(
         long = "disable-core-dumps",
         env = "PASSLESS_DISABLE_CORE_DUMPS",
-        default_value_t = true,
         help = "Disable core dumps to prevent credential leakage in crash dumps"
     )]
-    #[serde(default = "default_true")]
-    pub disable_core_dumps: bool,
+    #[serde(default)]
+    pub disable_core_dumps: Option<bool>,
 
     /// Set no new privileges flag to prevent privilege escalation
     #[arg(
         long = "no-new-privs",
         env = "PASSLESS_NO_NEW_PRIVS",
-        default_value_t = true,
         help = "Set PR_SET_NO_NEW_PRIVS to prevent gaining new privileges"
     )]
-    #[serde(default = "default_true")]
-    pub no_new_privs: bool,
-}
-
-fn default_true() -> bool {
-    true
+    #[serde(default)]
+    pub no_new_privs: Option<bool>,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            use_mlock: true,
-            disable_core_dumps: true,
-            no_new_privs: true,
+            use_mlock: None,
+            disable_core_dumps: None,
+            no_new_privs: None,
         }
     }
 }
@@ -88,17 +81,17 @@ impl Default for SecurityConfig {
 impl SecurityConfig {
     /// Apply all enabled security hardening measures
     pub fn apply_hardening(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.disable_core_dumps {
-            self.disable_core_dumps()?;
+        if self.disable_core_dumps.unwrap_or(true) {
+            self.disable_core_dumps_impl()?;
         }
-        if self.use_mlock {
+        if self.use_mlock.unwrap_or(true) {
             self.lock_all_memory()?;
         }
         Ok(())
     }
 
     /// Disable core dumps to prevent credential leakage
-    fn disable_core_dumps(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn disable_core_dumps_impl(&self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Disabling core dumps to prevent credential leakage");
         // setrlimit(RLIMIT_CORE, 0)
         setrlimit(Resource::RLIMIT_CORE, 0, 0)?;
@@ -198,16 +191,14 @@ pub fn build_authenticator_config<S: CredentialStorage + 'static>(
 #[group(id = "local")]
 pub struct LocalBackendConfig {
     /// Path to storage directory
-    #[arg(long = "local-path", env = "PASSLESS_LOCAL_PATH", id = "local.path", default_value_t = default_local_path(), value_name = "PATH")]
-    #[serde(default = "default_local_path_safe")]
-    pub path: String,
+    #[arg(long = "local-path", env = "PASSLESS_LOCAL_PATH", id = "local.path", value_name = "PATH")]
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 impl Default for LocalBackendConfig {
     fn default() -> Self {
-        Self {
-            path: default_local_path_safe(),
-        }
+        Self { path: None }
     }
 }
 
@@ -222,50 +213,42 @@ fn default_local_path() -> String {
         .into_owned()
 }
 
-fn default_local_path_safe() -> String {
-    dirs::data_dir()
-        .map(|p| p.join("passless").to_string_lossy().into_owned())
-        .unwrap_or_else(|| "$XDG_DATA_HOME/passless or $HOME/.local/share/passless".to_string())
-}
-
 /// Pass (password-store) backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
 #[group(id = "pass")]
 pub struct PassBackendConfig {
     /// Path to password store directory
-    #[arg(long = "pass-store-path", env = "PASSLESS_PASS_STORE_PATH", id = "pass.store_path", default_value_t = default_pass_store_path(), value_name = "PATH")]
-    #[serde(default = "default_pass_store_path_safe")]
-    pub store_path: String,
+    #[arg(long = "pass-store-path", env = "PASSLESS_PASS_STORE_PATH", id = "pass.store_path", value_name = "PATH")]
+    #[serde(default)]
+    pub store_path: Option<String>,
 
     /// Relative dir to password store directory for FIDO2 entries
     #[arg(
         long = "pass-path",
         env = "PASSLESS_PASS_PATH",
         id = "pass.path",
-        default_value = "fido2",
         value_name = "PATH"
     )]
-    #[serde(default = "default_pass_path")]
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
 
     /// GPG backend: "gpgme" or "gnupg-bin"
     #[arg(
         long = "pass-gpg-backend",
         env = "PASSLESS_PASS_GPG_BACKEND",
         id = "pass.gpg_backend",
-        default_value = "gnupg-bin",
         value_name = "BACKEND"
     )]
-    #[serde(default = "default_gpg_backend")]
-    pub gpg_backend: String,
+    #[serde(default)]
+    pub gpg_backend: Option<String>,
 }
 
 impl Default for PassBackendConfig {
     fn default() -> Self {
         Self {
-            store_path: default_pass_store_path_safe(),
-            path: default_pass_path(),
-            gpg_backend: default_gpg_backend(),
+            store_path: None,
+            path: None,
+            gpg_backend: None,
         }
     }
 }
@@ -281,20 +264,6 @@ fn default_pass_store_path() -> String {
         .join(".password-store")
         .to_string_lossy()
         .into_owned()
-}
-
-fn default_pass_store_path_safe() -> String {
-    dirs::home_dir()
-        .map(|p| p.join(".password-store").to_string_lossy().into_owned())
-        .unwrap_or_else(|| "$HOME/.password-store".to_string())
-}
-
-fn default_pass_path() -> String {
-    "fido2".to_string()
-}
-
-fn default_gpg_backend() -> String {
-    "gnupg-bin".to_string()
 }
 
 /// Storage backend configuration (type-safe enum)
@@ -348,26 +317,52 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Create a display config with all defaults filled in for documentation purposes
+    pub fn with_defaults_filled() -> Self {
+        Self {
+            backend: BackendConfig::Local(LocalBackendConfig {
+                path: dirs::data_dir()
+                    .map(|p| p.join("passless").to_string_lossy().into_owned())
+                    .or(Some("$XDG_DATA_HOME/passless or $HOME/.local/share/passless".to_string())),
+            }),
+            verbose: false,
+            security: SecurityConfig {
+                use_mlock: Some(true),
+                disable_core_dumps: Some(true),
+                no_new_privs: Some(true),
+            },
+        }
+    }
+
     /// Merge CLI overrides into the configuration
     /// CLI arguments take precedence over config file settings
     pub fn merge_cli_overrides<T>(&self, cli: T) -> Self
     where
         T: CliArgs,
     {
+        // Helper to merge Option values: CLI takes precedence, then config, then None
+        let merge_opt = |cli_val: Option<_>, config_val: Option<_>| cli_val.or(config_val);
+
         // Determine backend config to use
         let backend = match cli.backend_type().as_deref() {
-            Some("local") => BackendConfig::Local(cli.local_config().clone()),
-            Some("pass") => BackendConfig::Pass(cli.pass_config().clone()),
+            Some("local") => BackendConfig::Local(LocalBackendConfig {
+                path: cli.local_config().path.clone(),
+            }),
+            Some("pass") => BackendConfig::Pass(PassBackendConfig {
+                store_path: cli.pass_config().store_path.clone(),
+                path: cli.pass_config().path.clone(),
+                gpg_backend: cli.pass_config().gpg_backend.clone(),
+            }),
             _ => {
                 // If no backend type override, merge CLI fields into the current backend
                 match &self.backend {
-                    BackendConfig::Local(_) => BackendConfig::Local(LocalBackendConfig {
-                        path: cli.local_config().path.clone(),
+                    BackendConfig::Local(config) => BackendConfig::Local(LocalBackendConfig {
+                        path: merge_opt(cli.local_config().path.clone(), config.path.clone()),
                     }),
-                    BackendConfig::Pass(_) => BackendConfig::Pass(PassBackendConfig {
-                        store_path: cli.pass_config().store_path.clone(),
-                        path: cli.pass_config().path.clone(),
-                        gpg_backend: cli.pass_config().gpg_backend.clone(),
+                    BackendConfig::Pass(config) => BackendConfig::Pass(PassBackendConfig {
+                        store_path: merge_opt(cli.pass_config().store_path.clone(), config.store_path.clone()),
+                        path: merge_opt(cli.pass_config().path.clone(), config.path.clone()),
+                        gpg_backend: merge_opt(cli.pass_config().gpg_backend.clone(), config.gpg_backend.clone()),
                     }),
                 }
             }
@@ -377,10 +372,9 @@ impl AppConfig {
             backend,
             verbose: cli.verbose() || self.verbose,
             security: SecurityConfig {
-                use_mlock: cli.security_config().use_mlock || self.security.use_mlock,
-                disable_core_dumps: cli.security_config().disable_core_dumps
-                    || self.security.disable_core_dumps,
-                no_new_privs: cli.security_config().no_new_privs || self.security.no_new_privs,
+                use_mlock: merge_opt(cli.security_config().use_mlock, self.security.use_mlock),
+                disable_core_dumps: merge_opt(cli.security_config().disable_core_dumps, self.security.disable_core_dumps),
+                no_new_privs: merge_opt(cli.security_config().no_new_privs, self.security.no_new_privs),
             },
         }
     }
