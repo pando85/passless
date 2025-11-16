@@ -13,12 +13,11 @@ use core::fmt;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
-use prs_lib::{Ciphertext, Plaintext};
+use prs_lib::{Ciphertext, Plaintext, Store};
 
 /// Time-to-live for cached credentials (30 seconds)
 /// Short enough to minimize exposure, long enough for a single auth flow
@@ -122,7 +121,7 @@ impl PassStorageAdapter {
         };
 
         // Pull latest changes from git remote if configured
-        adapter.git_pull()?;
+        adapter.sync_prepare()?;
 
         adapter.indexes = adapter.load_credential_paths()?;
 
@@ -162,138 +161,54 @@ impl PassStorageAdapter {
         self.store_path.join(&self.path)
     }
 
-    /// Check if the password store has a git remote configured
-    fn has_git_remote(&self) -> bool {
-        debug!("Checking if password store has git remote configured");
+    /// Prepare the store for changes (pulls from git remote if configured)
+    fn sync_prepare(&self) -> Result<()> {
+        debug!("Preparing password store sync");
 
-        let output = Command::new("git")
-            .args(["remote"])
-            .current_dir(&self.store_path)
-            .output();
+        let store = Store::open(&self.store_path).map_err(|e| {
+            debug!("Failed to open store for sync: {:?}", e);
+            Error::Storage(format!("Failed to open store for sync: {:?}", e))
+        })?;
 
-        match output {
-            Ok(output) if output.status.success() => {
-                let remotes = String::from_utf8_lossy(&output.stdout);
-                let has_remote = !remotes.trim().is_empty();
-                debug!("Git remote check: {}", if has_remote { "found" } else { "not found" });
-                has_remote
-            }
-            Ok(output) => {
-                debug!("Git remote check failed with status: {}", output.status);
-                false
+        let sync = store.sync();
+
+        match sync.prepare() {
+            Ok(()) => {
+                debug!("Successfully prepared store sync (pulled if remote configured)");
+                Ok(())
             }
             Err(e) => {
-                debug!("Git remote check failed: {}", e);
-                false
+                debug!("Failed to prepare store sync: {:?}", e);
+                // Don't fail the operation if sync fails, just log a warning
+                warn!("Failed to prepare store sync: {:?}", e);
+                Ok(())
             }
         }
     }
 
-    /// Pull changes from git remote
-    fn git_pull(&self) -> Result<()> {
-        if !self.has_git_remote() {
-            debug!("No git remote configured, skipping pull");
-            return Ok(());
-        }
+    /// Finalize changes to the store (commits and pushes to git remote if configured)
+    fn sync_finalize(&self, message: &str) -> Result<()> {
+        debug!("Finalizing password store sync: {}", message);
 
-        debug!("Pulling changes from git remote");
+        let store = Store::open(&self.store_path).map_err(|e| {
+            debug!("Failed to open store for sync: {:?}", e);
+            Error::Storage(format!("Failed to open store for sync: {:?}", e))
+        })?;
 
-        let output = Command::new("git")
-            .args(["pull", "--rebase", "--autostash"])
-            .current_dir(&self.store_path)
-            .output()
-            .map_err(|e| {
-                debug!("Failed to execute git pull: {}", e);
-                Error::Storage(format!("Failed to execute git pull: {}", e))
-            })?;
+        let sync = store.sync();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!("Git pull failed: {}", stderr);
-            // Don't fail the operation if pull fails, just log a warning
-            log::warn!("Failed to pull from git remote: {}", stderr);
-        } else {
-            debug!("Successfully pulled changes from git remote");
-        }
-
-        Ok(())
-    }
-
-    /// Commit changes to git with a message
-    fn git_commit(&self, message: &str) -> Result<()> {
-        debug!("Committing changes to git: {}", message);
-
-        // Add all changes in the password store
-        let add_output = Command::new("git")
-            .args(["add", "."])
-            .current_dir(&self.store_path)
-            .output()
-            .map_err(|e| {
-                debug!("Failed to execute git add: {}", e);
-                Error::Storage(format!("Failed to execute git add: {}", e))
-            })?;
-
-        if !add_output.status.success() {
-            let stderr = String::from_utf8_lossy(&add_output.stderr);
-            debug!("Git add failed: {}", stderr);
-            log::warn!("Failed to add changes to git: {}", stderr);
-            return Ok(());
-        }
-
-        // Commit the changes
-        let commit_output = Command::new("git")
-            .args(["commit", "-m", message])
-            .current_dir(&self.store_path)
-            .output()
-            .map_err(|e| {
-                debug!("Failed to execute git commit: {}", e);
-                Error::Storage(format!("Failed to execute git commit: {}", e))
-            })?;
-
-        if !commit_output.status.success() {
-            let stderr = String::from_utf8_lossy(&commit_output.stderr);
-            // Ignore "nothing to commit" errors
-            if !stderr.contains("nothing to commit") {
-                debug!("Git commit failed: {}", stderr);
-                log::warn!("Failed to commit changes to git: {}", stderr);
-            } else {
-                debug!("No changes to commit");
+        match sync.finalize(message) {
+            Ok(()) => {
+                debug!("Successfully finalized store sync (committed and pushed if remote configured)");
+                Ok(())
             }
-        } else {
-            debug!("Successfully committed changes to git");
+            Err(e) => {
+                debug!("Failed to finalize store sync: {:?}", e);
+                // Don't fail the operation if sync fails, just log a warning
+                warn!("Failed to finalize store sync: {:?}", e);
+                Ok(())
+            }
         }
-
-        Ok(())
-    }
-
-    /// Push changes to git remote
-    fn git_push(&self) -> Result<()> {
-        if !self.has_git_remote() {
-            debug!("No git remote configured, skipping push");
-            return Ok(());
-        }
-
-        debug!("Pushing changes to git remote");
-
-        let output = Command::new("git")
-            .args(["push"])
-            .current_dir(&self.store_path)
-            .output()
-            .map_err(|e| {
-                debug!("Failed to execute git push: {}", e);
-                Error::Storage(format!("Failed to execute git push: {}", e))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!("Git push failed: {}", stderr);
-            // Don't fail the operation if push fails, just log a warning
-            log::warn!("Failed to push to git remote: {}", stderr);
-        } else {
-            debug!("Successfully pushed changes to git remote");
-        }
-
-        Ok(())
     }
 
     /// Get the full path for a credential file
@@ -676,8 +591,7 @@ impl PassStorageAdapter {
 
         // Commit and push changes to git remote if configured
         let commit_message = format!("Add credential for {}", cred.rp.id);
-        self.git_commit(&commit_message)?;
-        self.git_push()?;
+        self.sync_finalize(&commit_message)?;
 
         Ok(())
     }
@@ -740,8 +654,7 @@ impl PassStorageAdapter {
 
         // Commit and push changes to git remote if configured
         let commit_message = format!("Remove credential for {}", cred.rp.id);
-        self.git_commit(&commit_message)?;
-        self.git_push()?;
+        self.sync_finalize(&commit_message)?;
 
         Ok(())
     }
