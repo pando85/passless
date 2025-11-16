@@ -35,7 +35,7 @@ pub const MAX_RESIDENT_CREDENTIALS: u32 = 100;
 pub const FIRMWARE_VERSION: u32 = 0x0001;
 
 /// Security hardening configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
 #[group(id = "security")]
 pub struct SecurityConfig {
     /// Use mlock to prevent credentials from being swapped to disk
@@ -46,7 +46,7 @@ pub struct SecurityConfig {
         default_value_t = true,
         help = "Lock credential memory to prevent swapping to disk (requires CAP_IPC_LOCK or root)"
     )]
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub use_mlock: bool,
 
     /// Disable core dumps to prevent credential leakage
@@ -56,7 +56,7 @@ pub struct SecurityConfig {
         default_value_t = true,
         help = "Disable core dumps to prevent credential leakage in crash dumps"
     )]
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub disable_core_dumps: bool,
 
     /// Set no new privileges flag to prevent privilege escalation
@@ -66,8 +66,22 @@ pub struct SecurityConfig {
         default_value_t = true,
         help = "Set PR_SET_NO_NEW_PRIVS to prevent gaining new privileges"
     )]
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub no_new_privs: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            use_mlock: true,
+            disable_core_dumps: true,
+            no_new_privs: true,
+        }
+    }
 }
 
 /// Security hardening functions
@@ -180,13 +194,21 @@ pub fn build_authenticator_config<S: CredentialStorage + 'static>(
 }
 
 /// Local storage backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
 #[group(id = "local")]
 pub struct LocalBackendConfig {
     /// Path to storage directory
     #[arg(long = "local-path", env = "PASSLESS_LOCAL_PATH", id = "local.path", default_value_t = default_local_path(), value_name = "PATH")]
-    #[serde(default)]
+    #[serde(default = "default_local_path_safe")]
     pub path: String,
+}
+
+impl Default for LocalBackendConfig {
+    fn default() -> Self {
+        Self {
+            path: default_local_path_safe(),
+        }
+    }
 }
 
 fn default_local_path() -> String {
@@ -200,12 +222,19 @@ fn default_local_path() -> String {
         .into_owned()
 }
 
+fn default_local_path_safe() -> String {
+    dirs::data_dir()
+        .map(|p| p.join("passless").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "$XDG_DATA_HOME/passless or $HOME/.local/share/passless".to_string())
+}
+
 /// Pass (password-store) backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
 #[group(id = "pass")]
 pub struct PassBackendConfig {
     /// Path to password store directory
     #[arg(long = "pass-store-path", env = "PASSLESS_PASS_STORE_PATH", id = "pass.store_path", default_value_t = default_pass_store_path(), value_name = "PATH")]
+    #[serde(default = "default_pass_store_path_safe")]
     pub store_path: String,
 
     /// Relative dir to password store directory for FIDO2 entries
@@ -216,6 +245,7 @@ pub struct PassBackendConfig {
         default_value = "fido2",
         value_name = "PATH"
     )]
+    #[serde(default = "default_pass_path")]
     pub path: String,
 
     /// GPG backend: "gpgme" or "gnupg-bin"
@@ -226,7 +256,18 @@ pub struct PassBackendConfig {
         default_value = "gnupg-bin",
         value_name = "BACKEND"
     )]
+    #[serde(default = "default_gpg_backend")]
     pub gpg_backend: String,
+}
+
+impl Default for PassBackendConfig {
+    fn default() -> Self {
+        Self {
+            store_path: default_pass_store_path_safe(),
+            path: default_pass_path(),
+            gpg_backend: default_gpg_backend(),
+        }
+    }
 }
 
 fn default_pass_store_path() -> String {
@@ -240,6 +281,20 @@ fn default_pass_store_path() -> String {
         .join(".password-store")
         .to_string_lossy()
         .into_owned()
+}
+
+fn default_pass_store_path_safe() -> String {
+    dirs::home_dir()
+        .map(|p| p.join(".password-store").to_string_lossy().into_owned())
+        .unwrap_or_else(|| "$HOME/.password-store".to_string())
+}
+
+fn default_pass_path() -> String {
+    "fido2".to_string()
+}
+
+fn default_gpg_backend() -> String {
+    "gnupg-bin".to_string()
 }
 
 /// Storage backend configuration (type-safe enum)
