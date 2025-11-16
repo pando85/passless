@@ -11,7 +11,7 @@ use keylib::uhid::Uhid;
 use std::path::PathBuf;
 
 use authenticator::AuthenticatorService;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use config::AppConfig;
 use env_logger::{Builder, Env};
 use error::Result;
@@ -89,6 +89,34 @@ fn run_with_service<S: CredentialStorage + 'static>(
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// When no subcommand is provided, run the authenticator with these options
+    #[command(flatten)]
+    run_args: RunArgs,
+}
+
+/// Subcommands for passless
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Configuration management commands
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+/// Configuration actions
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Print the default configuration in TOML format
+    Print,
+}
+
+/// Arguments for running the authenticator (default behavior)
+#[derive(Args, Debug)]
+struct RunArgs {
     /// Path to configuration file (TOML format)
     #[arg(short, long, env = "PASSLESS_CONFIG")]
     config: Option<PathBuf>,
@@ -118,7 +146,7 @@ struct Cli {
     verbose: bool,
 }
 
-impl config::CliArgs for Cli {
+impl config::CliArgs for RunArgs {
     fn backend_type(&self) -> Option<String> {
         self.backend_type.clone()
     }
@@ -152,8 +180,27 @@ fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
+    // Handle subcommands
+    if let Some(command) = cli.command {
+        return match command {
+            Commands::Config { action } => match action {
+                ConfigAction::Print => {
+                    // Generate default configuration
+                    let default_config = AppConfig::default();
+                    let toml_string = toml::to_string_pretty(&default_config)
+                        .map_err(|e| error::Error::Config(format!("Failed to serialize config: {}", e)))?;
+                    println!("{}", toml_string);
+                    Ok(())
+                }
+            },
+        };
+    }
+
+    // If no subcommand, run the authenticator (default behavior)
+    let run_args = cli.run_args;
+
     // Initialize logging with appropriate level
-    let log_level = if cli.verbose {
+    let log_level = if run_args.verbose {
         log::LevelFilter::Debug
     } else {
         log::LevelFilter::Info
@@ -168,7 +215,7 @@ fn main() -> Result<()> {
         .init();
 
     // Load configuration
-    let config_file = if let Some(config_path) = &cli.config {
+    let config_file = if let Some(config_path) = &run_args.config {
         info!("Loading configuration from: {}", config_path.display());
         AppConfig::from_toml(config_path).map_err(|e| {
             error!("Failed to load config file: {}", e);
@@ -194,7 +241,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let config = config_file.merge_cli_overrides(cli);
+    let config = config_file.merge_cli_overrides(run_args);
 
     info!("Applying security hardening...");
     if let Err(e) = config.security.apply_hardening() {

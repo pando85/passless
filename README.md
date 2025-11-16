@@ -13,6 +13,7 @@
 TODO
 
 - [Features](#features)
+- [Configuration](#configuration)
 - [Installation](#installation)
   - [Cargo](#cargo)
   - [Arch Linux](#arch-linux)
@@ -21,6 +22,18 @@ TODO
 ## Features
 
 TODO
+
+## Configuration
+
+Passless can be configured using a TOML configuration file. By default, the configuration file is located at `~/.config/passless/config.toml`.
+
+To generate a default configuration file:
+
+```bash
+passless config print > ~/.config/passless/config.toml
+```
+
+You can then edit this file to customize the storage backend, security settings, and other options. Command-line arguments will override settings from the configuration file.
 
 ## Installation
 
