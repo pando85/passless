@@ -35,7 +35,7 @@ pub const MAX_RESIDENT_CREDENTIALS: u32 = 100;
 pub const FIRMWARE_VERSION: u32 = 0x0001;
 
 /// Security hardening configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
 #[group(id = "security")]
 pub struct SecurityConfig {
     /// Use mlock to prevent credentials from being swapped to disk
@@ -65,16 +65,6 @@ pub struct SecurityConfig {
     )]
     #[serde(default)]
     pub no_new_privs: Option<bool>,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            use_mlock: None,
-            disable_core_dumps: None,
-            no_new_privs: None,
-        }
-    }
 }
 
 /// Security hardening functions
@@ -187,19 +177,13 @@ pub fn build_authenticator_config<S: CredentialStorage + 'static>(
 }
 
 /// Local storage backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
 #[group(id = "local")]
 pub struct LocalBackendConfig {
     /// Path to storage directory
     #[arg(long = "local-path", env = "PASSLESS_LOCAL_PATH", id = "local.path", value_name = "PATH")]
     #[serde(default)]
     pub path: Option<String>,
-}
-
-impl Default for LocalBackendConfig {
-    fn default() -> Self {
-        Self { path: None }
-    }
 }
 
 fn default_local_path() -> String {
@@ -214,7 +198,7 @@ fn default_local_path() -> String {
 }
 
 /// Pass (password-store) backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
 #[group(id = "pass")]
 pub struct PassBackendConfig {
     /// Path to password store directory
@@ -241,16 +225,6 @@ pub struct PassBackendConfig {
     )]
     #[serde(default)]
     pub gpg_backend: Option<String>,
-}
-
-impl Default for PassBackendConfig {
-    fn default() -> Self {
-        Self {
-            store_path: None,
-            path: None,
-            gpg_backend: None,
-        }
-    }
 }
 
 fn default_pass_store_path() -> String {
