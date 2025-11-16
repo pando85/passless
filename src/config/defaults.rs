@@ -39,10 +39,3 @@ pub fn pass_store_path() -> String {
         .to_string_lossy()
         .into_owned()
 }
-
-/// Compute default password-store path, with fallback for display purposes
-pub fn pass_store_path_display() -> String {
-    dirs::home_dir()
-        .map(|p| p.join(".password-store").to_string_lossy().into_owned())
-        .unwrap_or_else(|| "$HOME/.password-store".to_string())
-}

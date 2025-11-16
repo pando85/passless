@@ -187,8 +187,9 @@ fn main() -> Result<()> {
                 ConfigAction::Print => {
                     // Generate default configuration with all defaults filled in
                     let default_config = AppConfig::with_defaults_filled();
-                    let toml_string = toml::to_string_pretty(&default_config)
-                        .map_err(|e| error::Error::Config(format!("Failed to serialize config: {}", e)))?;
+                    let toml_string = toml::to_string_pretty(&default_config).map_err(|e| {
+                        error::Error::Config(format!("Failed to serialize config: {}", e))
+                    })?;
                     println!("{}", toml_string);
                     Ok(())
                 }
@@ -280,11 +281,7 @@ fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| config::defaults::PASS_GPG_BACKEND.to_string());
             let gpg_backend = storage::GpgBackend::from_str(&gpg_backend_str)?;
-            let storage = PassStorageAdapter::new(
-                store_path.into(),
-                path.into(),
-                gpg_backend,
-            )?;
+            let storage = PassStorageAdapter::new(store_path.into(), path.into(), gpg_backend)?;
             let service = AuthenticatorService::new(storage)?;
             run_with_service(service, uhid)
         }

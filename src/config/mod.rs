@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Args;
 use libc::{MCL_CURRENT, MCL_FUTURE, PR_SET_DUMPABLE, mlockall, prctl};
-use log::{debug, error};
+use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +73,10 @@ pub struct SecurityConfig {
 impl SecurityConfig {
     /// Apply all enabled security hardening measures
     pub fn apply_hardening(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.disable_core_dumps.unwrap_or(defaults::SECURITY_DISABLE_CORE_DUMPS) {
+        if self
+            .disable_core_dumps
+            .unwrap_or(defaults::SECURITY_DISABLE_CORE_DUMPS)
+        {
             self.disable_core_dumps_impl()?;
         }
         if self.use_mlock.unwrap_or(defaults::SECURITY_USE_MLOCK) {
@@ -183,7 +186,12 @@ pub fn build_authenticator_config<S: CredentialStorage + 'static>(
 #[group(id = "local")]
 pub struct LocalBackendConfig {
     /// Path to storage directory
-    #[arg(long = "local-path", env = "PASSLESS_LOCAL_PATH", id = "local.path", value_name = "PATH")]
+    #[arg(
+        long = "local-path",
+        env = "PASSLESS_LOCAL_PATH",
+        id = "local.path",
+        value_name = "PATH"
+    )]
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -193,7 +201,12 @@ pub struct LocalBackendConfig {
 #[group(id = "pass")]
 pub struct PassBackendConfig {
     /// Path to password store directory
-    #[arg(long = "pass-store-path", env = "PASSLESS_PASS_STORE_PATH", id = "pass.store_path", value_name = "PATH")]
+    #[arg(
+        long = "pass-store-path",
+        env = "PASSLESS_PASS_STORE_PATH",
+        id = "pass.store_path",
+        value_name = "PATH"
+    )]
     #[serde(default)]
     pub store_path: Option<String>,
 
@@ -291,7 +304,9 @@ impl AppConfig {
         T: CliArgs,
     {
         // Helper to merge Option values: CLI takes precedence, then config, then None
-        let merge_opt = |cli_val: Option<_>, config_val: Option<_>| cli_val.or(config_val);
+        fn merge_opt<U>(cli_val: Option<U>, config_val: Option<U>) -> Option<U> {
+            cli_val.or(config_val)
+        }
 
         // Determine backend config to use
         let backend = match cli.backend_type().as_deref() {
@@ -310,9 +325,15 @@ impl AppConfig {
                         path: merge_opt(cli.local_config().path.clone(), config.path.clone()),
                     }),
                     BackendConfig::Pass(config) => BackendConfig::Pass(PassBackendConfig {
-                        store_path: merge_opt(cli.pass_config().store_path.clone(), config.store_path.clone()),
+                        store_path: merge_opt(
+                            cli.pass_config().store_path.clone(),
+                            config.store_path.clone(),
+                        ),
                         path: merge_opt(cli.pass_config().path.clone(), config.path.clone()),
-                        gpg_backend: merge_opt(cli.pass_config().gpg_backend.clone(), config.gpg_backend.clone()),
+                        gpg_backend: merge_opt(
+                            cli.pass_config().gpg_backend.clone(),
+                            config.gpg_backend.clone(),
+                        ),
                     }),
                 }
             }
@@ -323,8 +344,14 @@ impl AppConfig {
             verbose: cli.verbose() || self.verbose,
             security: SecurityConfig {
                 use_mlock: merge_opt(cli.security_config().use_mlock, self.security.use_mlock),
-                disable_core_dumps: merge_opt(cli.security_config().disable_core_dumps, self.security.disable_core_dumps),
-                no_new_privs: merge_opt(cli.security_config().no_new_privs, self.security.no_new_privs),
+                disable_core_dumps: merge_opt(
+                    cli.security_config().disable_core_dumps,
+                    self.security.disable_core_dumps,
+                ),
+                no_new_privs: merge_opt(
+                    cli.security_config().no_new_privs,
+                    self.security.no_new_privs,
+                ),
             },
         }
     }

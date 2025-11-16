@@ -165,7 +165,7 @@ impl PassStorageAdapter {
     fn sync_prepare(&self) -> Result<()> {
         debug!("Preparing password store sync");
 
-        let store = Store::open(&self.store_path).map_err(|e| {
+        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
             debug!("Failed to open store for sync: {:?}", e);
             Error::Storage(format!("Failed to open store for sync: {:?}", e))
         })?;
@@ -190,7 +190,7 @@ impl PassStorageAdapter {
     fn sync_finalize(&self, message: &str) -> Result<()> {
         debug!("Finalizing password store sync: {}", message);
 
-        let store = Store::open(&self.store_path).map_err(|e| {
+        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
             debug!("Failed to open store for sync: {:?}", e);
             Error::Storage(format!("Failed to open store for sync: {:?}", e))
         })?;
