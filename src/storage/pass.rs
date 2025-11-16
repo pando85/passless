@@ -13,6 +13,7 @@ use core::fmt;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use log::{debug, info};
@@ -120,6 +121,9 @@ impl PassStorageAdapter {
             iteration_entries: Default::default(),
         };
 
+        // Pull latest changes from git remote if configured
+        adapter.git_pull()?;
+
         adapter.indexes = adapter.load_credential_paths()?;
 
         Ok(adapter)
@@ -156,6 +160,140 @@ impl PassStorageAdapter {
     /// Get the FIDO path within the password store
     fn get_fido2_path(&self) -> PathBuf {
         self.store_path.join(&self.path)
+    }
+
+    /// Check if the password store has a git remote configured
+    fn has_git_remote(&self) -> bool {
+        debug!("Checking if password store has git remote configured");
+
+        let output = Command::new("git")
+            .args(["remote"])
+            .current_dir(&self.store_path)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let remotes = String::from_utf8_lossy(&output.stdout);
+                let has_remote = !remotes.trim().is_empty();
+                debug!("Git remote check: {}", if has_remote { "found" } else { "not found" });
+                has_remote
+            }
+            Ok(output) => {
+                debug!("Git remote check failed with status: {}", output.status);
+                false
+            }
+            Err(e) => {
+                debug!("Git remote check failed: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Pull changes from git remote
+    fn git_pull(&self) -> Result<()> {
+        if !self.has_git_remote() {
+            debug!("No git remote configured, skipping pull");
+            return Ok(());
+        }
+
+        debug!("Pulling changes from git remote");
+
+        let output = Command::new("git")
+            .args(["pull", "--rebase", "--autostash"])
+            .current_dir(&self.store_path)
+            .output()
+            .map_err(|e| {
+                debug!("Failed to execute git pull: {}", e);
+                Error::Storage(format!("Failed to execute git pull: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!("Git pull failed: {}", stderr);
+            // Don't fail the operation if pull fails, just log a warning
+            log::warn!("Failed to pull from git remote: {}", stderr);
+        } else {
+            debug!("Successfully pulled changes from git remote");
+        }
+
+        Ok(())
+    }
+
+    /// Commit changes to git with a message
+    fn git_commit(&self, message: &str) -> Result<()> {
+        debug!("Committing changes to git: {}", message);
+
+        // Add all changes in the password store
+        let add_output = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&self.store_path)
+            .output()
+            .map_err(|e| {
+                debug!("Failed to execute git add: {}", e);
+                Error::Storage(format!("Failed to execute git add: {}", e))
+            })?;
+
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr);
+            debug!("Git add failed: {}", stderr);
+            log::warn!("Failed to add changes to git: {}", stderr);
+            return Ok(());
+        }
+
+        // Commit the changes
+        let commit_output = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(&self.store_path)
+            .output()
+            .map_err(|e| {
+                debug!("Failed to execute git commit: {}", e);
+                Error::Storage(format!("Failed to execute git commit: {}", e))
+            })?;
+
+        if !commit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_output.stderr);
+            // Ignore "nothing to commit" errors
+            if !stderr.contains("nothing to commit") {
+                debug!("Git commit failed: {}", stderr);
+                log::warn!("Failed to commit changes to git: {}", stderr);
+            } else {
+                debug!("No changes to commit");
+            }
+        } else {
+            debug!("Successfully committed changes to git");
+        }
+
+        Ok(())
+    }
+
+    /// Push changes to git remote
+    fn git_push(&self) -> Result<()> {
+        if !self.has_git_remote() {
+            debug!("No git remote configured, skipping push");
+            return Ok(());
+        }
+
+        debug!("Pushing changes to git remote");
+
+        let output = Command::new("git")
+            .args(["push"])
+            .current_dir(&self.store_path)
+            .output()
+            .map_err(|e| {
+                debug!("Failed to execute git push: {}", e);
+                Error::Storage(format!("Failed to execute git push: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!("Git push failed: {}", stderr);
+            // Don't fail the operation if push fails, just log a warning
+            log::warn!("Failed to push to git remote: {}", stderr);
+        } else {
+            debug!("Successfully pushed changes to git remote");
+        }
+
+        Ok(())
     }
 
     /// Get the full path for a credential file
@@ -536,6 +674,11 @@ impl PassStorageAdapter {
         let rp_hash: [u8; 32] = hasher.finalize().into();
         self.indexes.rp_hash.entry(rp_hash).or_default().push(path);
 
+        // Commit and push changes to git remote if configured
+        let commit_message = format!("Add credential for {}", cred.rp.id);
+        self.git_commit(&commit_message)?;
+        self.git_push()?;
+
         Ok(())
     }
 
@@ -594,6 +737,11 @@ impl PassStorageAdapter {
         }
 
         debug!("Successfully deleted credential");
+
+        // Commit and push changes to git remote if configured
+        let commit_message = format!("Remove credential for {}", cred.rp.id);
+        self.git_commit(&commit_message)?;
+        self.git_push()?;
 
         Ok(())
     }

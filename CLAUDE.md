@@ -125,6 +125,10 @@ cargo run -- --backend-type local --local-path /tmp/passless
 **Storage Implementations**:
 - `LocalStorageAdapter` (`src/storage/local.rs`): JSON files in local directory with in-memory caching
 - `PassStorageAdapter` (`src/storage/pass.rs`): Encrypted storage using password-store/GPG
+  - Automatic git sync: If the password-store has a git remote configured, changes are automatically synced
+  - Git pull on initialization: Ensures latest credentials are loaded
+  - Git commit + push on write/delete: Automatically commits with descriptive messages and pushes to remote
+  - Non-blocking: Git failures are logged as warnings and don't prevent credential operations
 
 **CTAP Command Handlers** (`src/commands/`):
 - `credential_mgmt.rs`: Implements credential management subcommands (enumerate, delete)
