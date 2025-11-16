@@ -19,6 +19,56 @@ use log::{debug, error};
 use nix::sys::resource::{Resource, setrlimit};
 use serde::{Deserialize, Serialize};
 
+/// Default configuration values
+pub mod defaults {
+    /// Default value for use_mlock security setting
+    pub const SECURITY_USE_MLOCK: bool = true;
+
+    /// Default value for disable_core_dumps security setting
+    pub const SECURITY_DISABLE_CORE_DUMPS: bool = true;
+
+    /// Default value for no_new_privs security setting
+    pub const SECURITY_NO_NEW_PRIVS: bool = true;
+
+    /// Default relative path within password-store for FIDO2 credentials
+    pub const PASS_PATH: &str = "fido2";
+
+    /// Default GPG backend
+    pub const PASS_GPG_BACKEND: &str = "gnupg-bin";
+
+    /// Compute default local storage path
+    pub fn local_path() -> String {
+        dirs::data_dir()
+            .expect("Could not determine data directory: $XDG_DATA_HOME or $HOME/.local/share")
+            .join("passless")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Compute default local storage path, with fallback for display purposes
+    pub fn local_path_display() -> String {
+        dirs::data_dir()
+            .map(|p| p.join("passless").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "$XDG_DATA_HOME/passless or $HOME/.local/share/passless".to_string())
+    }
+
+    /// Compute default password-store path
+    pub fn pass_store_path() -> String {
+        dirs::home_dir()
+            .expect("Could not determine home directory: $HOME")
+            .join(".password-store")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Compute default password-store path, with fallback for display purposes
+    pub fn pass_store_path_display() -> String {
+        dirs::home_dir()
+            .map(|p| p.join(".password-store").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "$HOME/.password-store".to_string())
+    }
+}
+
 /// AAGUID for the passless authenticator
 /// "fido.passless.rs" encoded as hex
 pub const AAGUID: [u8; 16] = [
@@ -71,10 +121,10 @@ pub struct SecurityConfig {
 impl SecurityConfig {
     /// Apply all enabled security hardening measures
     pub fn apply_hardening(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.disable_core_dumps.unwrap_or(true) {
+        if self.disable_core_dumps.unwrap_or(defaults::SECURITY_DISABLE_CORE_DUMPS) {
             self.disable_core_dumps_impl()?;
         }
-        if self.use_mlock.unwrap_or(true) {
+        if self.use_mlock.unwrap_or(defaults::SECURITY_USE_MLOCK) {
             self.lock_all_memory()?;
         }
         Ok(())
@@ -186,17 +236,6 @@ pub struct LocalBackendConfig {
     pub path: Option<String>,
 }
 
-fn default_local_path() -> String {
-    dirs::data_dir()
-        .unwrap_or_else(|| {
-            error!("Could not determine data directory: $XDG_DATA_HOME or $HOME/.local/share . Please, define local-path explicitly.");
-            panic!()
-        })
-        .join("passless")
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// Pass (password-store) backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
 #[group(id = "pass")]
@@ -225,19 +264,6 @@ pub struct PassBackendConfig {
     )]
     #[serde(default)]
     pub gpg_backend: Option<String>,
-}
-
-fn default_pass_store_path() -> String {
-    dirs::home_dir()
-        .unwrap_or_else(|| {
-            error!(
-                "Could not determine home directory: $HOME. Please, define pass-path explicitly."
-            );
-            panic!()
-        })
-        .join(".password-store")
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Storage backend configuration (type-safe enum)
@@ -295,15 +321,13 @@ impl AppConfig {
     pub fn with_defaults_filled() -> Self {
         Self {
             backend: BackendConfig::Local(LocalBackendConfig {
-                path: dirs::data_dir()
-                    .map(|p| p.join("passless").to_string_lossy().into_owned())
-                    .or(Some("$XDG_DATA_HOME/passless or $HOME/.local/share/passless".to_string())),
+                path: Some(defaults::local_path_display()),
             }),
             verbose: false,
             security: SecurityConfig {
-                use_mlock: Some(true),
-                disable_core_dumps: Some(true),
-                no_new_privs: Some(true),
+                use_mlock: Some(defaults::SECURITY_USE_MLOCK),
+                disable_core_dumps: Some(defaults::SECURITY_DISABLE_CORE_DUMPS),
+                no_new_privs: Some(defaults::SECURITY_NO_NEW_PRIVS),
             },
         }
     }
