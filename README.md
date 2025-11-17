@@ -10,7 +10,9 @@
 ![Build status](https://img.shields.io/github/actions/workflow/status/pando85/passless/rust.yml?branch=main)
 ![passless license](https://img.shields.io/github/license/pando85/passless)
 
-TODO
+Software FIDO2 authenticator that emulates a hardware security key. Built with
+[rust-keylib](https://github.com/linux-china/rust-keylib) and runs as a virtual UHID device on
+Linux.
 
 - [Features](#features)
 - [Configuration](#configuration)
@@ -20,19 +22,29 @@ TODO
 
 ## Features
 
-TODO
+- FIDO2/WebAuthn authentication without hardware tokens
+- Passkey support (resident credentials)
+- User verification via desktop notifications
+- Storage backends:
+  - Local filesystem (JSON)
+  - [password-store](https://www.passwordstore.org/) (encrypted, git-synced)
+- Security hardening (memory locking, core dump prevention)
+- Credential management via CTAP commands
 
 ## Configuration
 
-Passless can be configured using a TOML configuration file. By default, the configuration file is located at `~/.config/passless/config.toml`.
+Passless can be configured using a TOML configuration file. By default, the configuration file is
+located at `~/.config/passless/config.toml`.
 
 To generate a default configuration file:
 
 ```bash
+mkdir -p ~/.config/passless
 passless config print > ~/.config/passless/config.toml
 ```
 
-You can then edit this file to customize the storage backend, security settings, and other options. Command-line arguments will override settings from the configuration file.
+You can then edit this file to customize the storage backend, security settings, and other options.
+Command-line arguments will override settings from the configuration file.
 
 ## Installation
 
