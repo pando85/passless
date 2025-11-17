@@ -56,7 +56,8 @@ jobs:
       matrix:
         job:
           # use ubuntu 22.04 to keep older glibc version dependency
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - {target: x86_64-unknown-linux-gnu, os: ubuntu-22.04}
+          - {target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm}
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
     steps:
