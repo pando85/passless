@@ -1757,7 +1757,7 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "passless-rs"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "base64",
  "ciborium",
