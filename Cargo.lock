@@ -1383,9 +1383,9 @@ dependencies = [
 
 [[package]]
 name = "keylib"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a07aa348b52fe1eaf2914ce80d693907f4059d7f5c67e59f504d9d2bb30d451b"
+checksum = "e0d2d16fb41637f7fc74751085ba5a938aaccc9ed95e0c5a2671fd3074cc9788"
 dependencies = [
  "aes",
  "cbc",
@@ -1401,9 +1401,9 @@ dependencies = [
 
 [[package]]
 name = "keylib-sys"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc3b52d770944a6fc63874ebc63463461453dd73f6a620dc7aec1f4203056efc"
+checksum = "46c7c9719d818549bf5ce02bea84f6a3af26690908740d3754817be64de91ecc"
 dependencies = [
  "bindgen",
  "flate2",
