@@ -36,6 +36,29 @@ pub const MAX_RESIDENT_CREDENTIALS: u32 = 100;
 /// Firmware version
 pub const FIRMWARE_VERSION: u32 = 0x0001;
 
+/// User verification configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
+#[group(id = "user_verification")]
+pub struct UserVerificationConfig {
+    /// Enable user verification notification for registration
+    #[arg(
+        long = "user-verification-registration",
+        env = "PASSLESS_USER_VERIFICATION_REGISTRATION",
+        help = "Show user verification notification during registration"
+    )]
+    #[serde(default)]
+    pub registration: Option<bool>,
+
+    /// Enable user verification notification for authentication
+    #[arg(
+        long = "user-verification-authentication",
+        env = "PASSLESS_USER_VERIFICATION_AUTHENTICATION",
+        help = "Show user verification notification during authentication"
+    )]
+    #[serde(default)]
+    pub authentication: Option<bool>,
+}
+
 /// Security hardening configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
 #[group(id = "security")]
@@ -261,6 +284,10 @@ pub struct AppConfig {
     /// Security hardening configuration
     #[serde(default)]
     pub security: SecurityConfig,
+
+    /// User verification configuration
+    #[serde(default)]
+    pub user_verification: UserVerificationConfig,
 }
 
 fn default_backend_type() -> String {
@@ -275,6 +302,7 @@ impl Default for AppConfig {
             local: LocalBackendConfig::default(),
             pass: PassBackendConfig::default(),
             security: SecurityConfig::default(),
+            user_verification: UserVerificationConfig::default(),
         }
     }
 }
@@ -296,6 +324,7 @@ pub trait CliArgs {
     fn pass_config(&self) -> &PassBackendConfig;
     fn verbose(&self) -> bool;
     fn security_config(&self) -> &SecurityConfig;
+    fn user_verification_config(&self) -> &UserVerificationConfig;
 }
 
 impl AppConfig {
@@ -324,6 +353,10 @@ impl AppConfig {
             security: SecurityConfig {
                 use_mlock: Some(defaults::SECURITY_USE_MLOCK),
                 disable_core_dumps: Some(defaults::SECURITY_DISABLE_CORE_DUMPS),
+            },
+            user_verification: UserVerificationConfig {
+                registration: Some(defaults::USER_VERIFICATION_REGISTRATION),
+                authentication: Some(defaults::USER_VERIFICATION_AUTHENTICATION),
             },
         }
     }
@@ -372,6 +405,16 @@ impl AppConfig {
                 disable_core_dumps: merge_opt(
                     cli.security_config().disable_core_dumps,
                     self.security.disable_core_dumps,
+                ),
+            },
+            user_verification: UserVerificationConfig {
+                registration: merge_opt(
+                    cli.user_verification_config().registration,
+                    self.user_verification.registration,
+                ),
+                authentication: merge_opt(
+                    cli.user_verification_config().authentication,
+                    self.user_verification.authentication,
                 ),
             },
         }

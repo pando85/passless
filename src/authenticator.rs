@@ -1,4 +1,4 @@
-use crate::config::build_authenticator_config;
+use crate::config::{UserVerificationConfig, build_authenticator_config};
 use crate::notification::show_verification_notification;
 use crate::storage::CredentialStorage;
 
@@ -27,17 +27,19 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     /// # Arguments
     ///
     /// * `storage` - The storage backend implementation
+    /// * `user_verification_config` - User verification configuration
     ///
     /// # Returns
     ///
     /// A new AuthenticatorService instance
-    pub fn new(storage: S) -> Result<Self> {
+    pub fn new(storage: S, user_verification_config: UserVerificationConfig) -> Result<Self> {
         let storage = Arc::new(Mutex::new(storage));
         let storage_for_callbacks = storage.clone();
         let storage_for_config = storage.clone();
 
         // Build callbacks
-        let callbacks = Self::build_callbacks(storage_for_callbacks)?;
+        let callbacks =
+            Self::build_callbacks(storage_for_callbacks, user_verification_config.clone())?;
 
         // Build authenticator with custom commands that use storage
         let auth_config = build_authenticator_config(storage_for_config);
@@ -87,7 +89,10 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     }
 
     /// Build callbacks for the authenticator
-    fn build_callbacks(storage: Arc<Mutex<S>>) -> Result<keylib::Callbacks> {
+    fn build_callbacks(
+        storage: Arc<Mutex<S>>,
+        user_verification_config: UserVerificationConfig,
+    ) -> Result<keylib::Callbacks> {
         let storage_for_up = storage.clone();
 
         let up_callback = Arc::new(
@@ -104,8 +109,37 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
                 let is_registration = info.to_lowercase().contains("registration")
                     && !info.to_lowercase().contains("credential excluded");
 
-                if storage_for_up.lock().unwrap().disable_user_verification() && !is_registration {
+                // Check if user verification should be bypassed for this operation
+                let should_verify = if is_registration {
+                    user_verification_config
+                        .registration
+                        .unwrap_or(crate::config::defaults::USER_VERIFICATION_REGISTRATION)
+                } else {
+                    user_verification_config
+                        .authentication
+                        .unwrap_or(crate::config::defaults::USER_VERIFICATION_AUTHENTICATION)
+                };
+
+                // If backend handles verification (e.g., GPG) and not registration, skip notification
+                if storage_for_up.lock().unwrap().disable_user_verification()
+                    && !is_registration
+                    && !should_verify
+                {
                     debug!("User verification handled by backend (e.g., GPG): {}", info);
+                    return Ok(UpResult::Accepted);
+                }
+
+                // If user verification is disabled for this operation type, auto-accept
+                if !should_verify {
+                    debug!(
+                        "User verification disabled for {}: {}",
+                        if is_registration {
+                            "registration"
+                        } else {
+                            "authentication"
+                        },
+                        info
+                    );
                     return Ok(UpResult::Accepted);
                 }
 
@@ -240,8 +274,9 @@ mod tests {
     fn test_service_creation() {
         let temp_dir = std::env::temp_dir().join("test_passless");
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
+        let uv_config = crate::config::UserVerificationConfig::default();
 
-        let service = AuthenticatorService::new(storage);
+        let service = AuthenticatorService::new(storage, uv_config);
         assert!(service.is_ok());
 
         // Cleanup
