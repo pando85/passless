@@ -1383,9 +1383,9 @@ dependencies = [
 
 [[package]]
 name = "keylib"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0d2d16fb41637f7fc74751085ba5a938aaccc9ed95e0c5a2671fd3074cc9788"
+checksum = "919f203d24d0e7f20699c5d9665efe407905e96152f7b6056a065bf160546da7"
 dependencies = [
  "aes",
  "cbc",
@@ -1401,9 +1401,9 @@ dependencies = [
 
 [[package]]
 name = "keylib-sys"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46c7c9719d818549bf5ce02bea84f6a3af26690908740d3754817be64de91ecc"
+checksum = "3d41ed0d64b1d900ae48ba095d394f7ea640b065456448cde01f333548f7f00b"
 dependencies = [
  "bindgen",
  "flate2",
@@ -1757,7 +1757,7 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "passless-rs"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "ciborium",
