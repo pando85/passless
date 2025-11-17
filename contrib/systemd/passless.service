@@ -12,9 +12,6 @@ RestartSec=5s
 # Security hardening
 # The application already handles its own memory locking and core dump prevention
 # but we can add additional systemd protections
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=true
 NoNewPrivileges=true
 
 # Logging
