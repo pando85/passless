@@ -14,6 +14,18 @@ Software FIDO2 authenticator that emulates a hardware security key. Built with
 [rust-keylib](https://github.com/linux-china/rust-keylib) and runs as a virtual UHID device on
 Linux.
 
+## ⚠️ Security Disclaimer
+
+**Software authenticators lack the physical isolation of dedicated hardware security keys.** While
+Passless uses GPG encryption, memory protection, and prevents core dumps to minimize exposure,
+credentials stored in software are inherently more vulnerable to system-level compromise than
+hardware-isolated keys.
+
+For most use cases, Passless provides a reasonable security model. However, for highly sensitive
+accounts or threat models requiring protection against local attackers with elevated privileges,
+dedicated hardware security keys remain the recommended option.
+
+- [⚠️ Security Disclaimer](#️-security-disclaimer)
 - [Features](#features)
 - [Configuration](#configuration)
 - [Installation](#installation)
