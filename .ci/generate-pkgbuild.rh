@@ -21,3 +21,8 @@
   template:
     src: "{{ rash.dir }}/{{ target }}.j2"
     dest: "{{ target }}"
+
+- name: Copy raw files
+  copy:
+    src: "{{ rash.dir }}/passless.install"
+    dest: "passless.install"
