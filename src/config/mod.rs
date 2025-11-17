@@ -45,7 +45,7 @@ pub struct SecurityConfig {
     #[arg(
         long = "use-mlock",
         env = "PASSLESS_USE_MLOCK",
-        help = "Lock credential memory to prevent swapping to disk (requires CAP_IPC_LOCK or root)"
+        help = "Lock credential memory to prevent swapping to disk (requires CAP_IPC_LOCK)"
     )]
     #[serde(default)]
     pub use_mlock: Option<bool>,
@@ -97,7 +97,8 @@ impl SecurityConfig {
         if r != 0 {
             // EINVAL, EPERM, ENOMEM possible. Treat as warning: mlockall often requires capabilities or raising RLIMIT_MEMLOCK.
             return Err(format!(
-                "mlockall failed (errno {}). Consider increasing RLIMIT_MEMLOCK or run with appropriate privileges.",
+                "mlockall failed (errno {}). Consider increasing RLIMIT_MEMLOCK.\n\
+                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'",
                 std::io::Error::last_os_error()
             ).into());
         }
