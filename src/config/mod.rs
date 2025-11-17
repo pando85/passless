@@ -58,15 +58,6 @@ pub struct SecurityConfig {
     )]
     #[serde(default)]
     pub disable_core_dumps: Option<bool>,
-
-    /// Set no new privileges flag to prevent privilege escalation
-    #[arg(
-        long = "no-new-privs",
-        env = "PASSLESS_NO_NEW_PRIVS",
-        help = "Set PR_SET_NO_NEW_PRIVS to prevent gaining new privileges"
-    )]
-    #[serde(default)]
-    pub no_new_privs: Option<bool>,
 }
 
 /// Security hardening functions
@@ -248,19 +239,53 @@ impl Default for BackendConfig {
 }
 
 /// Application-level configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Storage backend configuration
-    #[serde(default)]
-    pub backend: BackendConfig,
+    /// Backend type: "local" or "pass"
+    #[serde(default = "default_backend_type")]
+    pub backend_type: String,
 
     /// Enable verbose logging
     #[serde(default)]
     pub verbose: bool,
 
+    /// Local backend configuration
+    #[serde(default)]
+    pub local: LocalBackendConfig,
+
+    /// Pass backend configuration
+    #[serde(default)]
+    pub pass: PassBackendConfig,
+
     /// Security hardening configuration
     #[serde(default)]
     pub security: SecurityConfig,
+}
+
+fn default_backend_type() -> String {
+    defaults::BACKEND_TYPE.to_string()
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            backend_type: defaults::BACKEND_TYPE.to_string(),
+            verbose: defaults::VERBOSE,
+            local: LocalBackendConfig::default(),
+            pass: PassBackendConfig::default(),
+            security: SecurityConfig::default(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Get the active backend configuration as an enum
+    pub fn backend(&self) -> BackendConfig {
+        match self.backend_type.as_str() {
+            "pass" => BackendConfig::Pass(self.pass.clone()),
+            _ => BackendConfig::Local(self.local.clone()),
+        }
+    }
 }
 
 /// Trait for CLI arguments that provide backend configuration
@@ -285,14 +310,19 @@ impl AppConfig {
     /// Create a display config with all defaults filled in for documentation purposes
     pub fn with_defaults_filled() -> Self {
         Self {
-            backend: BackendConfig::Local(LocalBackendConfig {
+            backend_type: defaults::BACKEND_TYPE.to_string(),
+            verbose: defaults::VERBOSE,
+            local: LocalBackendConfig {
                 path: Some(defaults::local_path_display()),
-            }),
-            verbose: false,
+            },
+            pass: PassBackendConfig {
+                store_path: Some(defaults::pass_store_path()),
+                path: Some(defaults::PASS_PATH.to_string()),
+                gpg_backend: Some(defaults::PASS_GPG_BACKEND.to_string()),
+            },
             security: SecurityConfig {
                 use_mlock: Some(defaults::SECURITY_USE_MLOCK),
                 disable_core_dumps: Some(defaults::SECURITY_DISABLE_CORE_DUMPS),
-                no_new_privs: Some(defaults::SECURITY_NO_NEW_PRIVS),
             },
         }
     }
@@ -308,49 +338,39 @@ impl AppConfig {
             cli_val.or(config_val)
         }
 
-        // Determine backend config to use
-        let backend = match cli.backend_type().as_deref() {
-            Some("local") => BackendConfig::Local(LocalBackendConfig {
-                path: cli.local_config().path.clone(),
-            }),
-            Some("pass") => BackendConfig::Pass(PassBackendConfig {
-                store_path: cli.pass_config().store_path.clone(),
-                path: cli.pass_config().path.clone(),
-                gpg_backend: cli.pass_config().gpg_backend.clone(),
-            }),
-            _ => {
-                // If no backend type override, merge CLI fields into the current backend
-                match &self.backend {
-                    BackendConfig::Local(config) => BackendConfig::Local(LocalBackendConfig {
-                        path: merge_opt(cli.local_config().path.clone(), config.path.clone()),
-                    }),
-                    BackendConfig::Pass(config) => BackendConfig::Pass(PassBackendConfig {
-                        store_path: merge_opt(
-                            cli.pass_config().store_path.clone(),
-                            config.store_path.clone(),
-                        ),
-                        path: merge_opt(cli.pass_config().path.clone(), config.path.clone()),
-                        gpg_backend: merge_opt(
-                            cli.pass_config().gpg_backend.clone(),
-                            config.gpg_backend.clone(),
-                        ),
-                    }),
-                }
-            }
+        // Determine backend type (CLI > config > default)
+        let backend_type = cli
+            .backend_type()
+            .unwrap_or_else(|| self.backend_type.clone());
+
+        // Merge local backend config
+        let local = LocalBackendConfig {
+            path: merge_opt(cli.local_config().path.clone(), self.local.path.clone()),
+        };
+
+        // Merge pass backend config
+        let pass = PassBackendConfig {
+            store_path: merge_opt(
+                cli.pass_config().store_path.clone(),
+                self.pass.store_path.clone(),
+            ),
+            path: merge_opt(cli.pass_config().path.clone(), self.pass.path.clone()),
+            gpg_backend: merge_opt(
+                cli.pass_config().gpg_backend.clone(),
+                self.pass.gpg_backend.clone(),
+            ),
         };
 
         AppConfig {
-            backend,
+            backend_type,
             verbose: cli.verbose() || self.verbose,
+            local,
+            pass,
             security: SecurityConfig {
                 use_mlock: merge_opt(cli.security_config().use_mlock, self.security.use_mlock),
                 disable_core_dumps: merge_opt(
                     cli.security_config().disable_core_dumps,
                     self.security.disable_core_dumps,
-                ),
-                no_new_privs: merge_opt(
-                    cli.security_config().no_new_privs,
-                    self.security.no_new_privs,
                 ),
             },
         }

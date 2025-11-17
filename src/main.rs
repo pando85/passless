@@ -257,7 +257,7 @@ fn main() -> Result<()> {
     })?;
 
     info!("Creating authenticator service...");
-    match &config.backend {
+    match config.backend() {
         config::BackendConfig::Local(local_config) => {
             let path = local_config
                 .path

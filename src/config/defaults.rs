@@ -1,13 +1,16 @@
 //! Default configuration values
 
+/// Default backend type
+pub const BACKEND_TYPE: &str = "local";
+
+/// Default verbose setting
+pub const VERBOSE: bool = false;
+
 /// Default value for use_mlock security setting
 pub const SECURITY_USE_MLOCK: bool = true;
 
 /// Default value for disable_core_dumps security setting
 pub const SECURITY_DISABLE_CORE_DUMPS: bool = true;
-
-/// Default value for no_new_privs security setting
-pub const SECURITY_NO_NEW_PRIVS: bool = true;
 
 /// Default relative path within password-store for FIDO2 credentials
 pub const PASS_PATH: &str = "fido2";

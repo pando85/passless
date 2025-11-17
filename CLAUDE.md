@@ -264,3 +264,57 @@ Examples of good README content:
 - Link to more detailed documentation if needed
 
 For detailed documentation, use dedicated files like INSTALL.md, CONTRIBUTING.md, etc.
+
+## Commit Message Guidelines
+
+This project uses **Conventional Commits** enforced by commitlint.
+
+### Format
+
+```
+<type>: <subject>
+
+<body>
+
+<footer>
+```
+
+### Rules
+
+- **Type**: Required, must be one of:
+  - `feat`: New feature
+  - `fix`: Bug fix
+  - `refactor`: Code refactoring (no functional changes)
+  - `docs`: Documentation changes
+  - `style`: Code style changes (formatting, etc.)
+  - `test`: Adding or updating tests
+  - `chore`: Maintenance tasks
+  - `build`: Build system changes
+  - `revert`: Reverting a previous commit
+  - `release`: Release-related commits
+
+- **Subject**:
+  - Use sentence-case or lower-case (NOT Title Case)
+  - Don't end with a period
+  - Keep it concise and descriptive
+
+- **Body** (optional):
+  - Must have a blank line before it
+  - Explain what and why, not how
+  - Use present tense
+
+- **Footer** (optional):
+  - Must have a blank line before it
+  - Use for breaking changes (`BREAKING CHANGE:`) or issue references
+
+### Examples
+
+```
+feat: add TOML config file support
+
+refactor: flatten config structure for better TOML serialization
+
+fix: resolve clippy warnings in storage module
+
+docs: update installation guide with systemd service
+```
