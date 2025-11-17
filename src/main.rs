@@ -137,6 +137,10 @@ struct RunArgs {
     #[command(flatten)]
     security: config::SecurityConfig,
 
+    /// User verification configuration
+    #[command(flatten)]
+    user_verification: config::UserVerificationConfig,
+
     /// Enable verbose logging
     #[arg(
         short,
@@ -165,6 +169,10 @@ impl config::CliArgs for RunArgs {
 
     fn security_config(&self) -> &config::SecurityConfig {
         &self.security
+    }
+
+    fn user_verification_config(&self) -> &config::UserVerificationConfig {
+        &self.user_verification
     }
 }
 
@@ -264,7 +272,7 @@ fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(config::defaults::local_path);
             let storage = LocalStorageAdapter::new(path.into())?;
-            let service = AuthenticatorService::new(storage)?;
+            let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
             run_with_service(service, uhid)
         }
         config::BackendConfig::Pass(pass_config) => {
@@ -282,7 +290,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| config::defaults::PASS_GPG_BACKEND.to_string());
             let gpg_backend = storage::GpgBackend::from_str(&gpg_backend_str)?;
             let storage = PassStorageAdapter::new(store_path.into(), path.into(), gpg_backend)?;
-            let service = AuthenticatorService::new(storage)?;
+            let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
             run_with_service(service, uhid)
         }
     }
