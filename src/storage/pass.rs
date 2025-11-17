@@ -178,8 +178,6 @@ impl PassStorageAdapter {
                 Ok(())
             }
             Err(e) => {
-                debug!("Failed to prepare store sync: {:?}", e);
-                // Don't fail the operation if sync fails, just log a warning
                 warn!("Failed to prepare store sync: {:?}", e);
                 Ok(())
             }
