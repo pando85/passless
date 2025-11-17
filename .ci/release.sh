@@ -5,7 +5,7 @@ set -e
 vim ./Cargo.toml
 
 # update lock file
-cargo update -p passless-cli
+cargo update -p passless-rs
 
 make update-changelog
 
