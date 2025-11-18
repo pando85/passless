@@ -36,8 +36,9 @@ jobs:
       - name: Update apt
         run: sudo apt update
 
-      - name: Install udev
-        run: sudo apt-get install -y libudev-dev
+      - name: Install udev and tss2 for TPM support
+        run: sudo apt-get install -y libudev-dev libtss2-dev
+
 
       - name: Install stable toolchain
         id: toolchain
@@ -66,8 +67,8 @@ jobs:
       - name: Update apt
         run: sudo apt update
 
-      - name: Install udev
-        run: sudo apt-get install -y libudev-dev
+      - name: Install udev and tss2 for TPM support
+        run: sudo apt-get install -y libudev-dev libtss2-dev
 
       - uses: Swatinem/rust-cache@v2
 
