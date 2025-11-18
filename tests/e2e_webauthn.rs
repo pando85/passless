@@ -8,21 +8,30 @@
 //!
 //! # Running the tests
 //!
-//! These tests require the passless authenticator to be running in a separate terminal.
+//! These tests automatically start and stop the authenticator with the appropriate
+//! backend configuration. No manual setup is required.
 //!
-//! ## Setup:
+//! ## Running all E2E tests:
 //! ```bash
-//! # Terminal 1: Start authenticator with E2E test mode (auto-accepts UV)
-//! PASSLESS_E2E_AUTO_ACCEPT_UV=1 cargo run
-//!
-//! # Terminal 2: Run tests
-//! cargo test --test e2e_webauthn --test-threads=1 -- --ignored
+//! cargo test --test e2e_webauthn -- --test-threads=1 --ignored
+//! # or
+//! make test-e2e
 //! ```
 //!
-//! Note: The PASSLESS_E2E_AUTO_ACCEPT_UV environment variable is only available
-//! in debug builds and will be ignored in release builds for security.
+//! ## Running tests for a specific backend:
+//! ```bash
+//! cargo test --test e2e_webauthn local -- --test-threads=1 --ignored
+//! cargo test --test e2e_webauthn pass -- --test-threads=1 --ignored
+//! cargo test --test e2e_webauthn tpm -- --test-threads=1 --ignored
+//! ```
+//!
+//! Note: Tests must run with --test-threads=1 to avoid conflicts between
+//! multiple authenticator instances.
 //!
 
+mod harness;
+
+use harness::{AuthenticatorHarness, BackendSetup};
 use keylib::client::{
     Client, ClientDataHash, GetAssertionRequest, MakeCredentialRequest, TransportList, User,
 };
@@ -33,6 +42,41 @@ use std::io::Write;
 
 const RP_ID: &str = "example.com";
 const ORIGIN: &str = "https://example.com";
+
+/// Run a test with the specified backend
+fn with_backend<F>(
+    backend_name: &str,
+    backend_factory: fn() -> Result<AuthenticatorHarness, Box<dyn std::error::Error>>,
+    test_fn: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    println!("\n┌{'─' as char:─<60}┐");
+    println!("│ Backend: {:<51} │", backend_name);
+    println!("└{'─' as char:─<60}┘");
+
+    let mut harness = match backend_factory() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("⚠️  Failed to create backend: {}", e);
+            eprintln!("   Skipping {} backend tests", backend_name);
+            return Ok(()); // Skip instead of fail
+        }
+    };
+
+    if let Err(e) = harness.start() {
+        eprintln!("⚠️  Failed to start authenticator: {}", e);
+        eprintln!("   Skipping {} backend tests", backend_name);
+        return Ok(()); // Skip instead of fail
+    }
+
+    let result = test_fn();
+
+    harness.stop();
+
+    result
+}
 
 /// Helper to generate client data hash for registration
 fn generate_client_data_hash_for_registration(challenge: &[u8]) -> ClientDataHash {
@@ -118,9 +162,8 @@ fn connect_to_authenticator() -> Result<keylib::client::Transport> {
     Ok(transport)
 }
 
-#[test]
-#[ignore] // Run with: cargo test --test e2e_webauthn -- --ignored --test-threads=1
-fn test_complete_registration_and_authentication_flow() -> Result<()> {
+/// Core test logic for registration and authentication flow
+fn run_registration_and_authentication_test() -> Result<()> {
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║   E2E Test: Registration + Authentication     ║");
     println!("╚════════════════════════════════════════════════╝\n");
@@ -230,7 +273,30 @@ fn test_complete_registration_and_authentication_flow() -> Result<()> {
 
 #[test]
 #[ignore]
-fn test_registration_multiple_users() -> Result<()> {
+fn test_local_registration_and_authentication() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_registration_and_authentication_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_registration_and_authentication() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_registration_and_authentication_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_registration_and_authentication() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_registration_and_authentication_test()
+    })
+}
+
+/// Core test logic for multiple user registration
+fn run_registration_multiple_users_test() -> Result<()> {
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║   E2E Test: Multiple User Registration        ║");
     println!("╚════════════════════════════════════════════════╝\n");
@@ -285,7 +351,30 @@ fn test_registration_multiple_users() -> Result<()> {
 
 #[test]
 #[ignore]
-fn test_authentication_with_multiple_credentials() -> Result<()> {
+fn test_local_registration_multiple_users() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_registration_multiple_users_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_registration_multiple_users() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_registration_multiple_users_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_registration_multiple_users() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_registration_multiple_users_test()
+    })
+}
+
+/// Core test logic for authentication with multiple credentials
+fn run_authentication_with_multiple_credentials_test() -> Result<()> {
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║   E2E Test: Auth with Multiple Credentials    ║");
     println!("╚════════════════════════════════════════════════╝\n");
@@ -356,7 +445,30 @@ fn test_authentication_with_multiple_credentials() -> Result<()> {
 
 #[test]
 #[ignore]
-fn test_authentication_without_credential_fails() -> Result<()> {
+fn test_local_authentication_with_multiple_credentials() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_authentication_with_multiple_credentials_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_authentication_with_multiple_credentials() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_authentication_with_multiple_credentials_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_authentication_with_multiple_credentials() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_authentication_with_multiple_credentials_test()
+    })
+}
+
+/// Core test logic for authentication without credential (should fail)
+fn run_authentication_without_credential_fails_test() -> Result<()> {
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║   E2E Test: Auth Without Credential (Fail)    ║");
     println!("╚════════════════════════════════════════════════╝\n");
@@ -396,7 +508,30 @@ fn test_authentication_without_credential_fails() -> Result<()> {
 
 #[test]
 #[ignore]
-fn test_registration_with_different_rps() -> Result<()> {
+fn test_local_authentication_without_credential_fails() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_authentication_without_credential_fails_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_authentication_without_credential_fails() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_authentication_without_credential_fails_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_authentication_without_credential_fails() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_authentication_without_credential_fails_test()
+    })
+}
+
+/// Core test logic for registration with different RPs
+fn run_registration_with_different_rps_test() -> Result<()> {
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║   E2E Test: Multiple Relying Parties          ║");
     println!("╚════════════════════════════════════════════════╝\n");
@@ -463,4 +598,28 @@ fn test_registration_with_different_rps() -> Result<()> {
     println!("╚════════════════════════════════════════════════╝\n");
 
     Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_local_registration_with_different_rps() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_registration_with_different_rps_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_registration_with_different_rps() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_registration_with_different_rps_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_registration_with_different_rps() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_registration_with_different_rps_test()
+    })
 }

@@ -1904,6 +1904,7 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.17",
  "toml",
  "tss-esapi",
