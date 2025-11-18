@@ -246,6 +246,32 @@ pub struct PassBackendConfig {
     pub gpg_backend: Option<String>,
 }
 
+/// TPM (Trusted Platform Module) backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
+#[group(id = "tpm")]
+pub struct TpmBackendConfig {
+    /// Path to TPM storage directory
+    #[arg(
+        long = "tpm-path",
+        env = "PASSLESS_TPM_PATH",
+        id = "tpm.path",
+        value_name = "PATH"
+    )]
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// TPM TCTI (TPM Command Transmission Interface) configuration
+    /// Examples: "device:/dev/tpm0", "device:/dev/tpmrm0", "tabrmd:", "swtpm:"
+    #[arg(
+        long = "tpm-tcti",
+        env = "PASSLESS_TPM_TCTI",
+        id = "tpm.tcti",
+        value_name = "TCTI"
+    )]
+    #[serde(default)]
+    pub tcti: Option<String>,
+}
+
 /// Storage backend configuration (type-safe enum)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -254,6 +280,8 @@ pub enum BackendConfig {
     Local(LocalBackendConfig),
     /// Pass (password-store) backend
     Pass(PassBackendConfig),
+    /// TPM (Trusted Platform Module) backend
+    Tpm(TpmBackendConfig),
 }
 
 impl Default for BackendConfig {
@@ -265,7 +293,7 @@ impl Default for BackendConfig {
 /// Application-level configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Backend type: "local" or "pass"
+    /// Backend type: "local", "pass", or "tpm"
     #[serde(default = "default_backend_type")]
     pub backend_type: String,
 
@@ -280,6 +308,10 @@ pub struct AppConfig {
     /// Pass backend configuration
     #[serde(default)]
     pub pass: PassBackendConfig,
+
+    /// TPM backend configuration
+    #[serde(default)]
+    pub tpm: TpmBackendConfig,
 
     /// Security hardening configuration
     #[serde(default)]
@@ -301,6 +333,7 @@ impl Default for AppConfig {
             verbose: defaults::VERBOSE,
             local: LocalBackendConfig::default(),
             pass: PassBackendConfig::default(),
+            tpm: TpmBackendConfig::default(),
             security: SecurityConfig::default(),
             user_verification: UserVerificationConfig::default(),
         }
@@ -312,6 +345,7 @@ impl AppConfig {
     pub fn backend(&self) -> BackendConfig {
         match self.backend_type.as_str() {
             "pass" => BackendConfig::Pass(self.pass.clone()),
+            "tpm" => BackendConfig::Tpm(self.tpm.clone()),
             _ => BackendConfig::Local(self.local.clone()),
         }
     }
@@ -322,6 +356,7 @@ pub trait CliArgs {
     fn backend_type(&self) -> Option<String>;
     fn local_config(&self) -> &LocalBackendConfig;
     fn pass_config(&self) -> &PassBackendConfig;
+    fn tpm_config(&self) -> &TpmBackendConfig;
     fn verbose(&self) -> bool;
     fn security_config(&self) -> &SecurityConfig;
     fn user_verification_config(&self) -> &UserVerificationConfig;
@@ -349,6 +384,10 @@ impl AppConfig {
                 store_path: Some(defaults::pass_store_path()),
                 path: Some(defaults::PASS_PATH.to_string()),
                 gpg_backend: Some(defaults::PASS_GPG_BACKEND.to_string()),
+            },
+            tpm: TpmBackendConfig {
+                path: Some(defaults::tpm_path_display()),
+                tcti: Some(defaults::TPM_TCTI.to_string()),
             },
             security: SecurityConfig {
                 use_mlock: Some(defaults::SECURITY_USE_MLOCK),
@@ -395,11 +434,18 @@ impl AppConfig {
             ),
         };
 
+        // Merge TPM backend config
+        let tpm = TpmBackendConfig {
+            path: merge_opt(cli.tpm_config().path.clone(), self.tpm.path.clone()),
+            tcti: merge_opt(cli.tpm_config().tcti.clone(), self.tpm.tcti.clone()),
+        };
+
         AppConfig {
             backend_type,
             verbose: cli.verbose() || self.verbose,
             local,
             pass,
+            tpm,
             security: SecurityConfig {
                 use_mlock: merge_opt(cli.security_config().use_mlock, self.security.use_mlock),
                 disable_core_dumps: merge_opt(

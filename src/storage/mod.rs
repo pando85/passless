@@ -4,12 +4,14 @@
 
 pub mod local;
 pub mod pass;
+pub mod tpm;
 
 use keylib::credential::RelyingParty;
 use keylib::{Credential, CredentialRef, Result};
 
 pub use local::LocalStorageAdapter;
 pub use pass::{GpgBackend, PassStorageAdapter};
+pub use tpm::TpmStorageAdapter;
 
 /// Filter criteria for reading credentials
 #[derive(Debug, Clone)]
