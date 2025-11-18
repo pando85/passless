@@ -55,30 +55,20 @@ test: lint
 	cargo test
 
 .PHONY: test-e2e
-test-e2e:	## run E2E tests (starts authenticator if needed)
-	@if pgrep -f "^target/debug/passless$$" > /dev/null || pgrep -f "/target/debug/passless$$" > /dev/null; then \
-		echo "Passless authenticator already running"; \
-		STARTED_BY_MAKE=0; \
-	else \
-		echo "Starting passless authenticator with E2E mode..."; \
-		PASSLESS_E2E_AUTO_ACCEPT_UV=1 PASSLESS_LOCAL_PATH=/tmp/passless/fido2 cargo run & \
-		PASSLESS_PID=$$!; \
-		STARTED_BY_MAKE=1; \
-		echo "Waiting for authenticator to initialize..."; \
-		sleep 2; \
-	fi; \
-	echo "Running E2E tests..."; \
-	if cargo test --test e2e_webauthn -- --test-threads=1 --ignored --nocapture; then \
-		TEST_RESULT=0; \
-	else \
-		TEST_RESULT=$$?; \
-	fi; \
-	if [ $$STARTED_BY_MAKE -eq 1 ]; then \
-		echo "Stopping passless authenticator (PID: $$PASSLESS_PID)..."; \
-		kill $$PASSLESS_PID 2>/dev/null || true; \
-		wait $$PASSLESS_PID 2>/dev/null || true; \
-	fi; \
-	exit $$TEST_RESULT
+test-e2e:	## run E2E tests (automatically manages authenticator)
+	cargo test --test e2e_webauthn -- --test-threads=1 --ignored --nocapture
+
+.PHONY: test-e2e-local
+test-e2e-local:	## run E2E tests for local backend only
+	cargo test --test e2e_webauthn local -- --test-threads=1 --ignored --nocapture
+
+.PHONY: test-e2e-pass
+test-e2e-pass:	## run E2E tests for password-store backend only
+	cargo test --test e2e_webauthn pass -- --test-threads=1 --ignored --nocapture
+
+.PHONY: test-e2e-tpm
+test-e2e-tpm:	## run E2E tests for TPM backend only (requires swtpm)
+	cargo test --test e2e_webauthn tpm -- --test-threads=1 --ignored --nocapture
 
 .PHONY: update-changelog
 update-changelog:	## automatically update changelog based on commits
