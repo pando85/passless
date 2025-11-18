@@ -3,6 +3,8 @@
 //! This adapter implements the CredentialStorage trait using prs-lib.
 //! Credentials are stored as GPG-encrypted files in the password store.
 
+pub mod init;
+
 use crate::error::{Error, Result};
 use crate::storage::{CredentialFilter, CredentialStorage};
 
@@ -92,8 +94,8 @@ impl PassStorageAdapter {
     ///
     /// # Note
     ///
-    /// Assumes the password store is already initialized.
-    /// Use `pass init <gpg-key>` to initialize the store before using this adapter.
+    /// If the password store is not initialized, this will prompt the user
+    /// via desktop notifications to initialize it.
     pub fn new(store_path: PathBuf, path: PathBuf, gpg_backend: GpgBackend) -> Result<Self> {
         info!("Using pass (password-store) backend");
         info!("Store path: {}", store_path.display());
@@ -101,6 +103,11 @@ impl PassStorageAdapter {
         info!("GPG backend: {}", gpg_backend);
 
         debug!("Opening password store at: {:?}", store_path);
+
+        // Ensure the password store is initialized
+        // This will prompt the user via notifications if not initialized
+        self::init::ensure_initialized(&store_path, gpg_backend)?;
+
         if !store_path.exists() {
             return Err(Error::Storage(format!(
                 "Password store path does not exist: {:?}",
