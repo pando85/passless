@@ -16,7 +16,7 @@ use config::AppConfig;
 use env_logger::{Builder, Env};
 use error::Result;
 use log::{debug, error, info};
-use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter};
+use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
 
 /// Helper function to run the main loop with any storage backend
 fn run_with_service<S: CredentialStorage + 'static>(
@@ -121,7 +121,7 @@ struct RunArgs {
     #[arg(short, long, env = "PASSLESS_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Storage backend type: local, pass
+    /// Storage backend type: local, pass, tpm
     #[arg(short = 't', long, env = "PASSLESS_BACKEND_TYPE")]
     backend_type: Option<String>,
 
@@ -132,6 +132,10 @@ struct RunArgs {
     /// Pass backend configuration
     #[command(flatten)]
     pass: config::PassBackendConfig,
+
+    /// TPM backend configuration
+    #[command(flatten)]
+    tpm: config::TpmBackendConfig,
 
     /// Security hardening configuration
     #[command(flatten)]
@@ -161,6 +165,10 @@ impl config::CliArgs for RunArgs {
 
     fn pass_config(&self) -> &config::PassBackendConfig {
         &self.pass
+    }
+
+    fn tpm_config(&self) -> &config::TpmBackendConfig {
+        &self.tpm
     }
 
     fn verbose(&self) -> bool {
@@ -290,6 +298,16 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| config::defaults::PASS_GPG_BACKEND.to_string());
             let gpg_backend = storage::GpgBackend::from_str(&gpg_backend_str)?;
             let storage = PassStorageAdapter::new(store_path.into(), path.into(), gpg_backend)?;
+            let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
+            run_with_service(service, uhid)
+        }
+        config::BackendConfig::Tpm(tpm_config) => {
+            let path = tpm_config
+                .path
+                .clone()
+                .unwrap_or_else(config::defaults::tpm_path);
+            let tcti = tpm_config.tcti.clone();
+            let storage = TpmStorageAdapter::new(path.into(), tcti)?;
             let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
             run_with_service(service, uhid)
         }

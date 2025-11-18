@@ -9,7 +9,7 @@ Passless is a software FIDO2 authenticator emulator written in Rust. It creates 
 **Key characteristics:**
 - Uses the `keylib` crate for FIDO2/CTAP protocol implementation
 - Operates as a platform authenticator with resident key (passkey) support
-- Supports multiple storage backends: local filesystem and password-store (pass)
+- Supports multiple storage backends: local filesystem, password-store (pass), and TPM 2.0
 - Implements security hardening (mlock, core dump prevention)
 - Desktop notifications for user verification prompts
 
@@ -97,7 +97,16 @@ cargo run -- --verbose
 # With custom backend
 cargo run -- --backend-type pass
 cargo run -- --backend-type local --local-path /tmp/passless
+cargo run -- --backend-type tpm --tpm-tcti "device:/dev/tpmrm0"
+
+# With swtpm (software TPM for testing)
+cargo run -- --backend-type tpm --tpm-tcti "swtpm:path=$HOME/.local/run/swtpm-sock"
 ```
+
+**TPM Backend Setup:**
+For detailed TPM and swtpm setup instructions, see:
+- `docs/TPM_SETUP.md` - Comprehensive TPM setup guide
+- `docs/SWTPM_QUICK_START.md` - Quick swtpm reference
 
 ## Architecture
 
@@ -129,18 +138,25 @@ cargo run -- --backend-type local --local-path /tmp/passless
   - Git pull on initialization: Ensures latest credentials are loaded
   - Git commit + push on write/delete: Automatically commits with descriptive messages and pushes to remote
   - Non-blocking: Git failures are logged as warnings and don't prevent credential operations
+- `TpmStorageAdapter` (`src/storage/tpm.rs`): TPM 2.0 hardware-backed storage
+  - Credentials sealed by TPM, can only be unsealed on the same machine
+  - Uses `tss-esapi` crate for TPM operations
+  - Supports hardware TPM and software TPM (swtpm) via TCTI configuration
+  - Stores sealed credentials as files with `.tpm` extension
+  - Uses owner hierarchy for sealing/unsealing operations
 
 **CTAP Command Handlers** (`src/commands/`):
 - `credential_mgmt.rs`: Implements credential management subcommands (enumerate, delete)
 - `custom.rs`: Wraps credential management as custom CTAP commands (0x0a standard, 0x41 Yubikey-compatible)
 - Commands use storage backend directly for operations
 
-**Configuration** (`src/config.rs`):
+**Configuration** (`src/config/mod.rs`):
 - `AppConfig`: Main config structure with backend selection
-- `BackendConfig`: Enum for Local vs Pass backend
+- `BackendConfig`: Enum for Local, Pass, or TPM backend
 - `SecurityConfig`: Memory locking, core dump prevention
 - CLI args merged with TOML config (CLI takes precedence)
 - Default config location: `~/.config/passless/config.toml`
+- TPM-specific config: TCTI string (e.g., `device:/dev/tpmrm0`, `swtpm:path=/path/to/socket`)
 
 **Security Hardening** (`src/config.rs:74-113`):
 - `mlockall()`: Locks all memory to prevent swapping credentials to disk
@@ -220,11 +236,13 @@ The authenticator is configured as a FIDO 2.1 platform authenticator with:
 
 Configuration can be set via environment variables:
 - `PASSLESS_CONFIG`: Path to config file
-- `PASSLESS_BACKEND_TYPE`: "local" or "pass"
+- `PASSLESS_BACKEND_TYPE`: "local", "pass", or "tpm"
 - `PASSLESS_LOCAL_PATH`: Local storage directory
 - `PASSLESS_PASS_STORE_PATH`: Password store path
 - `PASSLESS_PASS_PATH`: Relative path in password store (default: "fido2")
 - `PASSLESS_PASS_GPG_BACKEND`: "gpgme" or "gnupg-bin"
+- `PASSLESS_TPM_PATH`: TPM storage directory
+- `PASSLESS_TPM_TCTI`: TPM TCTI configuration (e.g., "device:/dev/tpmrm0", "swtpm:path=/path/to/socket")
 - `PASSLESS_USE_MLOCK`: Enable memory locking (default: true)
 - `PASSLESS_DISABLE_CORE_DUMPS`: Disable core dumps (default: true)
 - `PASSLESS_NO_NEW_PRIVS`: Set no new privileges (default: true)
