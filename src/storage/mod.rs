@@ -2,6 +2,7 @@
 //!
 //! This module provides storage backends for FIDO2 credentials.
 
+pub mod index;
 pub mod local;
 pub mod pass;
 pub mod tpm;
