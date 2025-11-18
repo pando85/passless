@@ -12,25 +12,27 @@
 //! Indexes are built by scanning directory structure (no unsealing needed)
 //! Credentials are only unsealed when needed for authentication
 
+use crate::storage::index::{
+    CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
+    update_indexes_on_delete, update_indexes_on_write,
+};
 use crate::storage::{CredentialFilter, CredentialStorage};
 
 use keylib::credential::RelyingParty;
 use keylib::{Credential, CredentialRef, Result};
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use log::{debug, info};
 use rand::RngCore;
 use sha2::digest::generic_array::GenericArray;
-use sha2::{Digest, Sha256};
 use tss_esapi::constants::SessionType;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
@@ -43,19 +45,6 @@ use tss_esapi::structures::{
 use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
 use tss_esapi::{Context, Tcti};
 
-/// Time-to-live for cached credentials (30 seconds)
-/// Short enough to minimize exposure, long enough for a single auth flow
-const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(30);
-
-/// Maximum number of cached credentials (prevents unbounded memory growth)
-const MAX_CACHE_SIZE: usize = 10;
-
-/// Cached credential with expiration time
-struct CachedCredential {
-    credential: Credential,
-    expires_at: Instant,
-}
-
 /// TPM storage adapter
 ///
 /// Stores credentials as TPM-sealed files in a directory structure.
@@ -65,21 +54,10 @@ pub struct TpmStorageAdapter {
     storage_dir: PathBuf,
     indexes: CredentialIndexes,
     /// Time-limited cache: file_path -> (credential, expiry_time)
-    cache: HashMap<PathBuf, CachedCredential>,
+    cache: CredentialCache,
     iteration_index: usize,
     iteration_entries: Vec<PathBuf>,
     context: Mutex<Context>,
-}
-
-/// Indexes for efficient credential lookups
-#[derive(Default)]
-struct CredentialIndexes {
-    /// Map credential ID to file path
-    id: HashMap<Vec<u8>, PathBuf>,
-    /// Map RP ID to list of credential file paths
-    rp: HashMap<String, Vec<PathBuf>>,
-    /// Map RP hash to list of credential file paths
-    rp_hash: HashMap<[u8; 32], Vec<PathBuf>>,
 }
 
 /// Represents a sealed credential blob stored on disk
@@ -158,170 +136,22 @@ impl TpmStorageAdapter {
 
         info!("TPM context initialized successfully");
 
-        let mut adapter = Self {
+        // Load indexes by scanning directory structure (no unsealing!)
+        let indexes = load_credential_paths(&storage_dir, "tpm").map_err(|e| {
+            log::error!("Failed to load credential paths: {}", e);
+            keylib::Error::Other
+        })?;
+
+        let adapter = Self {
             storage_dir,
-            indexes: Default::default(),
+            indexes,
             cache: Default::default(),
             iteration_index: 0,
             iteration_entries: Vec::new(),
             context: Mutex::new(context),
         };
 
-        // Load indexes by scanning directory structure (no unsealing!)
-        adapter.indexes = adapter.load_credential_paths()?;
-
         Ok(adapter)
-    }
-
-    /// Get the filename for a credential based on credential ID
-    /// Format: {cred_id_hex}.tpm
-    /// The credential ID is hex-encoded for safe, unique filenames
-    fn get_filename(cred_id: &[u8]) -> String {
-        let cred_id_hex: String = cred_id.iter().map(|b| format!("{:02x}", b)).collect();
-        format!("{}.tpm", cred_id_hex)
-    }
-
-    /// Parse credential ID from filename
-    /// Returns None if filename doesn't match expected format
-    fn parse_cred_id_from_filename(filename: &str) -> Option<Vec<u8>> {
-        // Remove .tpm extension
-        let name = filename.strip_suffix(".tpm")?;
-
-        // Decode hex string to bytes
-        if name.len() % 2 != 0 {
-            return None; // Invalid hex (must be even length)
-        }
-
-        let mut bytes = Vec::with_capacity(name.len() / 2);
-        for i in (0..name.len()).step_by(2) {
-            let byte = u8::from_str_radix(&name[i..i + 2], 16).ok()?;
-            bytes.push(byte);
-        }
-
-        Some(bytes)
-    }
-
-    /// Get the full path for a credential file
-    /// Structure: {storage_dir}/{rp_id}/{cred_id_hex}.tpm
-    fn get_credential_path(&self, rp_id: &str, cred_id: &[u8]) -> PathBuf {
-        self.storage_dir
-            .join(rp_id)
-            .join(Self::get_filename(cred_id))
-    }
-
-    /// Load all credential paths into the indexes
-    /// Scans directories (rp_id) and files (cred_id_hex.tpm) within
-    /// Builds three indexes: by credential ID, by RP ID, and by RP hash
-    /// NO UNSEALING NEEDED - credential ID is extracted from filename
-    fn load_credential_paths(&self) -> Result<CredentialIndexes> {
-        debug!("Loading credential paths from TPM storage (no unsealing)");
-
-        // List all directories in the storage (each directory is an rp_id)
-        let entries = match std::fs::read_dir(&self.storage_dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                debug!("Failed to read storage directory: {}", e);
-                return Ok(CredentialIndexes::default());
-            }
-        };
-
-        // Collect all valid RP directories
-        let rp_dirs: Vec<(String, PathBuf)> = entries
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                // Skip files and hidden directories
-                if !path.is_dir()
-                    || path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|s| s.starts_with('.'))
-                {
-                    return None;
-                }
-
-                // Extract rp_id from directory name
-                let rp_id = path.file_name().and_then(|s| s.to_str())?.to_string();
-                Some((rp_id, path))
-            })
-            .collect();
-
-        debug!("Found {} RP directories", rp_dirs.len());
-
-        // Process all credential files and build indexes functionally
-        let indexes = rp_dirs.into_iter().fold(
-            CredentialIndexes::default(),
-            |mut indexes, (rp_id, rp_path)| {
-                debug!("Scanning RP directory: {} ({:?})", rp_id, rp_path);
-
-                // Read all .tpm files in this RP directory
-                let tpm_files = match std::fs::read_dir(&rp_path) {
-                    Ok(entries) => entries
-                        .filter_map(|entry| entry.ok())
-                        .filter_map(|entry| {
-                            let path = entry.path();
-                            // Only process .tpm files
-                            if path.extension().and_then(|s| s.to_str()) == Some("tpm") {
-                                Some(path)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                    Err(_) => Vec::new(),
-                };
-
-                // Process each credential file
-                for cred_path in tpm_files {
-                    // Extract credential ID from filename (no unsealing!)
-                    let filename = match cred_path.file_name().and_then(|s| s.to_str()) {
-                        Some(name) => name,
-                        None => continue,
-                    };
-
-                    if let Some(cred_id) = Self::parse_cred_id_from_filename(filename) {
-                        debug!(
-                            "Found credential file: {:?} (ID: {:02x?}...)",
-                            cred_path,
-                            &cred_id[..cred_id.len().min(8)]
-                        );
-
-                        // Index by credential ID
-                        indexes.id.insert(cred_id.clone(), cred_path.clone());
-
-                        // Index by RP ID
-                        indexes
-                            .rp
-                            .entry(rp_id.clone())
-                            .or_default()
-                            .push(cred_path.clone());
-
-                        // Index by RP hash (SHA-256 of RP ID)
-                        let mut hasher = Sha256::new();
-                        hasher.update(rp_id.as_bytes());
-                        let rp_hash: [u8; 32] = hasher.finalize().into();
-                        indexes
-                            .rp_hash
-                            .entry(rp_hash)
-                            .or_default()
-                            .push(cred_path.clone());
-
-                        debug!("Indexed credential for RP: {}", rp_id);
-                    } else {
-                        debug!(
-                            "Skipping file with invalid credential ID format: {:?}",
-                            cred_path
-                        );
-                    }
-                }
-
-                indexes
-            },
-        );
-
-        debug!("Loaded {} credentials into indexes", indexes.id.len());
-
-        Ok(indexes)
     }
 
     /// Create a primary storage key in the owner hierarchy
@@ -618,26 +448,6 @@ impl TpmStorageAdapter {
         Ok(decrypted_data)
     }
 
-    /// Evict all expired cache entries
-    fn evict_expired_cache_entries(&mut self) {
-        let now = Instant::now();
-        self.cache.retain(|path, cached| {
-            let keep = now < cached.expires_at;
-            if !keep {
-                debug!("Evicting expired cache entry: {:?}", path);
-            }
-            keep
-        });
-    }
-
-    /// Find the oldest cache entry (by expiry time)
-    fn find_oldest_cache_entry(&self) -> Option<PathBuf> {
-        self.cache
-            .iter()
-            .min_by_key(|(_, cached)| cached.expires_at)
-            .map(|(path, _)| path.clone())
-    }
-
     /// Read a credential from a specific file path WITHOUT caching
     /// Used for operations that need &self
     fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<Credential> {
@@ -678,15 +488,10 @@ impl TpmStorageAdapter {
         );
 
         // Evict expired entries before adding new one
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         // If cache is full, evict oldest entry
-        if self.cache.len() >= MAX_CACHE_SIZE
-            && let Some(oldest_path) = self.find_oldest_cache_entry()
-        {
-            debug!("Cache full - evicting oldest entry: {:?}", oldest_path);
-            self.cache.remove(&oldest_path);
-        }
+        self.cache.evict_oldest_if_full();
 
         let mut file = File::open(path).map_err(|e| {
             log::error!("Failed to open credential file {}: {}", path.display(), e);
@@ -704,16 +509,8 @@ impl TpmStorageAdapter {
 
         let credential = Credential::from_bytes(&unsealed_data)?;
 
-        // Cache the unsealed credential with expiry time
-        let cached = CachedCredential {
-            credential: credential.clone(),
-            expires_at: Instant::now() + CREDENTIAL_CACHE_TTL,
-        };
-        self.cache.insert(path.to_path_buf(), cached);
-        debug!(
-            "Cached credential (expires in {}s)",
-            CREDENTIAL_CACHE_TTL.as_secs()
-        );
+        // Cache the unsealed credential with automatic TTL
+        self.cache.insert(path.to_path_buf(), credential.clone());
 
         Ok(credential)
     }
@@ -771,13 +568,12 @@ impl TpmStorageAdapter {
         self.read_credential_from_path(&path)
     }
 
-
     /// Write a credential to storage
     /// Uses new directory structure: {storage_dir}/{rp_id}/{cred_id_hex}.tpm
     fn write_credential(&mut self, cred: &Credential) -> Result<()> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
-        let path = self.get_credential_path(&cred.rp.id, &cred.id);
+        let path = get_credential_path(&self.storage_dir, &cred.rp.id, &cred.id, "tpm");
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists
@@ -805,30 +601,20 @@ impl TpmStorageAdapter {
 
         debug!("Successfully wrote and sealed credential");
 
-        // Update all indexes
-        self.indexes.id.insert(cred.id.to_vec(), path.clone());
-
-        self.indexes
-            .rp
-            .entry(cred.rp.id.clone())
-            .or_default()
-            .push(path.clone());
-
-        let mut hasher = Sha256::new();
-        hasher.update(cred.rp.id.as_bytes());
-        let rp_hash: [u8; 32] = hasher.finalize().into();
-        self.indexes
-            .rp_hash
-            .entry(rp_hash)
-            .or_default()
-            .push(path);
+        // Update all indexes using shared function
+        update_indexes_on_write(
+            &mut self.indexes,
+            path,
+            cred.id.to_vec(),
+            cred.rp.id.clone(),
+        );
 
         Ok(())
     }
 
     /// Delete a credential from storage
     fn delete_credential(&mut self, id: &[u8]) -> Result<()> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         debug!(
             "Deleting credential with ID: {:02x?}",
@@ -857,27 +643,8 @@ impl TpmStorageAdapter {
         // Remove from cache
         self.cache.remove(&path);
 
-        // Remove from all indexes
-        self.indexes.id.remove(id);
-
-        // Remove from RP index
-        if let Some(paths) = self.indexes.rp.get_mut(&cred.rp.id) {
-            paths.retain(|p| p != &path);
-            if paths.is_empty() {
-                self.indexes.rp.remove(&cred.rp.id);
-            }
-        }
-
-        // Remove from RP hash index
-        let mut hasher = Sha256::new();
-        hasher.update(cred.rp.id.as_bytes());
-        let rp_hash: [u8; 32] = hasher.finalize().into();
-        if let Some(paths) = self.indexes.rp_hash.get_mut(&rp_hash) {
-            paths.retain(|p| p != &path);
-            if paths.is_empty() {
-                self.indexes.rp_hash.remove(&rp_hash);
-            }
-        }
+        // Remove from all indexes using shared function
+        update_indexes_on_delete(&mut self.indexes, &path, id, &cred.rp.id);
 
         debug!("Successfully deleted credential");
 
@@ -887,7 +654,7 @@ impl TpmStorageAdapter {
 
 impl CredentialStorage for TpmStorageAdapter {
     fn read_first(&mut self, filter: CredentialFilter) -> Result<Credential> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         debug!("read_first called with filter: {:?}", filter);
 
@@ -935,14 +702,14 @@ impl CredentialStorage for TpmStorageAdapter {
     }
 
     fn read_next(&mut self) -> Result<Credential> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         debug!("read_next called");
         self.find_next()
     }
 
     fn read(&mut self, id: &str, _rp: &str) -> Result<Vec<u8>> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         debug!("read called with id: {}", id);
 
@@ -953,7 +720,7 @@ impl CredentialStorage for TpmStorageAdapter {
     }
 
     fn write(&mut self, _id: &str, _rp: &str, cred_ref: CredentialRef) -> Result<()> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);
 
@@ -969,7 +736,7 @@ impl CredentialStorage for TpmStorageAdapter {
     }
 
     fn delete(&mut self, id: &str) -> Result<()> {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
 
         debug!("delete called with id: {}", id);
         let id_bytes = id.as_bytes();
@@ -1012,6 +779,6 @@ impl CredentialStorage for TpmStorageAdapter {
     }
 
     fn cleanup_expired_cache(&mut self) {
-        self.evict_expired_cache_entries();
+        self.cache.evict_expired();
     }
 }
