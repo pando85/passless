@@ -2,10 +2,10 @@
 //!
 //! This adapter implements the CredentialStorage trait using the local file system.
 
+use crate::config::{self, LocalBackendConfig};
 use crate::storage::{CredentialFilter, CredentialStorage};
 
-use keylib::credential::RelyingParty;
-use keylib::{Credential, CredentialRef, Result};
+use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -37,7 +37,7 @@ impl LocalStorageAdapter {
     pub fn new(storage_dir: PathBuf) -> Result<Self> {
         info!("Using local file system backend");
         info!("Storage path: {}", storage_dir.display());
-        fs::create_dir_all(&storage_dir).map_err(|_| keylib::Error::Other)?;
+        fs::create_dir_all(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
 
         Ok(Self {
             storage_dir,
@@ -45,6 +45,16 @@ impl LocalStorageAdapter {
             iteration_files: Vec::new(),
             iteration_filter: CredentialFilter::None,
         })
+    }
+
+    /// Create a new local storage adapter from configuration
+    pub fn from_config(config: &LocalBackendConfig) -> Result<Self> {
+        let path = config
+            .path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config::defaults::local_path().into());
+        Self::new(path)
     }
 
     /// Load all credentials from storage
@@ -67,10 +77,10 @@ impl LocalStorageAdapter {
 
     /// Load a credential from a file
     fn load_credential(&self, path: &PathBuf) -> Result<Credential> {
-        let mut file = File::open(path).map_err(|_| keylib::Error::DoesNotExist)?;
+        let mut file = File::open(path).map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
-            .map_err(|_| keylib::Error::Other)?;
+            .map_err(|_| soft_fido2::Error::Other)?;
 
         Credential::from_bytes(&contents)
     }
@@ -82,8 +92,9 @@ impl LocalStorageAdapter {
 
         let bytes = cred.to_bytes()?;
 
-        let mut file = File::create(&path).map_err(|_| keylib::Error::Other)?;
-        file.write_all(&bytes).map_err(|_| keylib::Error::Other)?;
+        let mut file = File::create(&path).map_err(|_| soft_fido2::Error::Other)?;
+        file.write_all(&bytes)
+            .map_err(|_| soft_fido2::Error::Other)?;
 
         Ok(())
     }
@@ -114,7 +125,7 @@ impl LocalStorageAdapter {
             }
         }
 
-        Err(keylib::Error::DoesNotExist)
+        Err(soft_fido2::Error::DoesNotExist)
     }
 
     /// Check if a credential matches the current filter
@@ -162,7 +173,7 @@ impl CredentialStorage for LocalStorageAdapter {
     fn read(&mut self, id: &str, rp: &str) -> Result<Vec<u8>> {
         let cred = self.read_first(CredentialFilter::ById(id.as_bytes().to_vec()))?;
         if cred.rp.id != rp {
-            return Err(keylib::Error::DoesNotExist);
+            return Err(soft_fido2::Error::DoesNotExist);
         }
         cred.to_bytes()
     }
@@ -187,12 +198,12 @@ impl CredentialStorage for LocalStorageAdapter {
             if cred.id == id_bytes {
                 let filename = self.get_filename_for_cred(&cred.user.id);
                 let path = self.storage_dir.join(filename);
-                fs::remove_file(path).map_err(|_| keylib::Error::Other)?;
+                fs::remove_file(path).map_err(|_| soft_fido2::Error::Other)?;
                 return Ok(());
             }
         }
 
-        Err(keylib::Error::DoesNotExist)
+        Err(soft_fido2::Error::DoesNotExist)
     }
 
     fn select_users(&self, rp_id: &str) -> Vec<String> {

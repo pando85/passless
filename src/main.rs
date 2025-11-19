@@ -5,18 +5,61 @@ mod error;
 mod notification;
 mod storage;
 
-use keylib::ctaphid::{Cmd, Ctaphid};
-use keylib::uhid::Uhid;
+use soft_fido2::Uhid;
+use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
 
 use std::path::PathBuf;
 
 use authenticator::AuthenticatorService;
 use clap::{Args, Parser, Subcommand};
+use commands::custom::register_yubikey_credential_mgmt;
 use config::AppConfig;
 use env_logger::{Builder, Env};
 use error::Result;
-use log::{debug, error, info};
+use log::{error, info};
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
+
+/// Wrapper for AuthenticatorService that implements CommandHandler
+struct ServiceHandler<S: CredentialStorage> {
+    service: std::sync::Mutex<AuthenticatorService<S>>,
+}
+
+impl<S: CredentialStorage> ServiceHandler<S> {
+    fn new(service: AuthenticatorService<S>) -> Self {
+        Self {
+            service: std::sync::Mutex::new(service),
+        }
+    }
+}
+
+impl<S: CredentialStorage + 'static> CommandHandler for ServiceHandler<S> {
+    fn handle_command(&mut self, cmd: Cmd, data: &[u8]) -> soft_fido2_transport::Result<Vec<u8>> {
+        // Only handle CBOR commands (CTAP2)
+        if cmd != Cmd::Cbor {
+            return Err(soft_fido2_transport::Error::InvalidCommand);
+        }
+
+        let mut service = self.service.lock().map_err(|_| {
+            soft_fido2_transport::Error::Other("Failed to lock service".to_string())
+        })?;
+
+        let mut response = Vec::new();
+        service
+            .handle(data, &mut response)
+            .map_err(|_| soft_fido2_transport::Error::Other("Command failed".to_string()))?;
+
+        Ok(response)
+    }
+}
+
+/// Macro to create and run a storage backend
+macro_rules! run_backend {
+    ($adapter:ty, $config:expr, $uhid:expr, $uv_config:expr) => {{
+        let storage = <$adapter>::from_config($config)?;
+        let service = AuthenticatorService::new(storage, $uv_config)?;
+        run_with_service(service, $uhid)
+    }};
+}
 
 /// Helper function to run the main loop with any storage backend
 fn run_with_service<S: CredentialStorage + 'static>(
@@ -25,13 +68,19 @@ fn run_with_service<S: CredentialStorage + 'static>(
 ) -> Result<()> {
     info!("{}", service.storage_info());
 
+    // Register custom commands for compatibility (placeholder for now)
+    register_yubikey_credential_mgmt(&mut service);
+
     // Main loop - process CTAP packets
     info!("Authenticator is running");
     info!("Press Ctrl+C to stop");
 
-    let mut ctaphid = Ctaphid::new()?;
+    // Store a reference to storage for periodic cleanup (before moving service)
+    let service_ref = service.storage.clone();
+
+    let handler = ServiceHandler::new(service);
+    let mut ctaphid_handler = CtapHidHandler::new(handler);
     let mut buffer = [0u8; 64];
-    let mut response_buffer = Vec::new();
 
     // Track time for periodic cache cleanup
     let mut last_cache_cleanup = std::time::Instant::now();
@@ -39,7 +88,9 @@ fn run_with_service<S: CredentialStorage + 'static>(
 
     loop {
         if last_cache_cleanup.elapsed() >= CACHE_CLEANUP_INTERVAL {
-            service.cleanup_expired_cache();
+            if let Ok(mut storage) = service_ref.lock() {
+                storage.cleanup_expired_cache();
+            }
             last_cache_cleanup = std::time::Instant::now();
         }
 
@@ -50,33 +101,22 @@ fn run_with_service<S: CredentialStorage + 'static>(
                 continue;
             }
             Ok(_) => {
-                // Handle CTAPHID packet
-                if let Some(mut response) = ctaphid.handle(&buffer) {
-                    if let Cmd::Cbor = response.command() {
-                        // Process CTAP request through the service
-                        match service.handle(response.data(), &mut response_buffer) {
-                            Ok(_) => {
-                                if let Err(e) = response.set_data(&response_buffer) {
-                                    error!("Failed to set response data: {:?}", e);
-                                    continue;
-                                }
-                                debug!("Request processed successfully");
-                            }
-                            Err(e) => {
-                                error!("Authenticator error: {:?}", e);
-                                continue;
-                            }
-                        }
-                    }
+                // Parse packet
+                let packet = Packet::from_bytes(buffer);
 
-                    // Send response packets back to the host
-                    for packet in response.packets() {
-                        uhid.write_packet(&packet)?;
-                    }
+                // Process through CTAP HID handler
+                let response_packets = ctaphid_handler
+                    .process_packet(packet)
+                    .map_err(|_| error::Error::Other("CTAP HID processing failed".to_string()))?;
+
+                // Write response packets
+                for response_packet in response_packets {
+                    uhid.write_packet(response_packet.as_bytes())
+                        .map_err(|_| error::Error::Other("Failed to write packet".to_string()))?;
                 }
             }
             Err(e) => {
-                error!("Error reading USB packet: {:?}", e);
+                error!("Error reading packet: {:?}", e);
                 break;
             }
         }
@@ -274,42 +314,29 @@ fn main() -> Result<()> {
 
     info!("Creating authenticator service...");
     match config.backend() {
-        config::BackendConfig::Local(local_config) => {
-            let path = local_config
-                .path
-                .clone()
-                .unwrap_or_else(config::defaults::local_path);
-            let storage = LocalStorageAdapter::new(path.into())?;
-            let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
-            run_with_service(service, uhid)
+        config::BackendConfig::Local(cfg) => {
+            run_backend!(
+                LocalStorageAdapter,
+                &cfg,
+                uhid,
+                config.user_verification.clone()
+            )
         }
-        config::BackendConfig::Pass(pass_config) => {
-            let store_path = pass_config
-                .store_path
-                .clone()
-                .unwrap_or_else(config::defaults::pass_store_path);
-            let path = pass_config
-                .path
-                .clone()
-                .unwrap_or_else(|| config::defaults::PASS_PATH.to_string());
-            let gpg_backend_str = pass_config
-                .gpg_backend
-                .clone()
-                .unwrap_or_else(|| config::defaults::PASS_GPG_BACKEND.to_string());
-            let gpg_backend = storage::GpgBackend::from_str(&gpg_backend_str)?;
-            let storage = PassStorageAdapter::new(store_path.into(), path.into(), gpg_backend)?;
-            let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
-            run_with_service(service, uhid)
+        config::BackendConfig::Pass(cfg) => {
+            run_backend!(
+                PassStorageAdapter,
+                &cfg,
+                uhid,
+                config.user_verification.clone()
+            )
         }
-        config::BackendConfig::Tpm(tpm_config) => {
-            let path = tpm_config
-                .path
-                .clone()
-                .unwrap_or_else(config::defaults::tpm_path);
-            let tcti = tpm_config.tcti.clone();
-            let storage = TpmStorageAdapter::new(path.into(), tcti)?;
-            let service = AuthenticatorService::new(storage, config.user_verification.clone())?;
-            run_with_service(service, uhid)
+        config::BackendConfig::Tpm(cfg) => {
+            run_backend!(
+                TpmStorageAdapter,
+                &cfg,
+                uhid,
+                config.user_verification.clone()
+            )
         }
     }
 }

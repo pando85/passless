@@ -32,12 +32,12 @@
 mod harness;
 
 use harness::AuthenticatorHarness;
-use keylib::client::{
-    Client, ClientDataHash, GetAssertionRequest, MakeCredentialRequest, TransportList, User,
-};
-use keylib::credential::RelyingParty;
-use keylib::error::Result;
 use sha2::{Digest, Sha256};
+use soft_fido2::client::Client;
+use soft_fido2::{
+    ClientDataHash, GetAssertionRequest, MakeCredentialRequest, RelyingParty, Result,
+    TransportList, User,
+};
 use std::io::Write;
 
 const RP_ID: &str = "example.com";
@@ -131,7 +131,7 @@ fn print_operation(message: &str) {
 }
 
 /// Connect to the first available authenticator
-fn connect_to_authenticator() -> Result<keylib::client::Transport> {
+fn connect_to_authenticator() -> Result<soft_fido2::Transport> {
     println!("🔍 Looking for authenticators...");
     let list = match TransportList::enumerate() {
         Ok(l) => l,
@@ -145,12 +145,12 @@ fn connect_to_authenticator() -> Result<keylib::client::Transport> {
         eprintln!("❌ No authenticators found!");
         eprintln!("   Please start the authenticator:");
         eprintln!("   cargo run");
-        return Err(keylib::Error::Other);
+        return Err(soft_fido2::Error::Other);
     }
 
     println!("   ✓ Found {} authenticator(s)", list.len());
 
-    let transport = list.get(0).ok_or(keylib::Error::Other)?;
+    let transport = list.get(0).ok_or(soft_fido2::Error::Other)?;
 
     // Note: We don't call transport.open() here because the authenticator
     // has already created a UHID virtual device that's accessible via USB HID.
@@ -184,12 +184,14 @@ fn run_registration_and_authentication_test() -> Result<()> {
 
     let user = User {
         id: vec![1, 2, 3, 4],
-        name: "alice@example.com".to_string(),
+        name: Some("alice@example.com".to_string()),
         display_name: Some("Alice".to_string()),
     };
 
     println!("   RP: {}", rp.id);
-    println!("   User: {}", user.name);
+    if let Some(ref name) = user.name {
+        println!("   User: {}", name);
+    }
 
     let request = MakeCredentialRequest::new(client_data_hash, rp, user)
         .with_user_verification(true) // Request user verification
@@ -321,7 +323,7 @@ fn run_registration_multiple_users_test() -> Result<()> {
 
         let user = User {
             id: user_id.clone(),
-            name: email.to_string(),
+            name: Some(email.to_string()),
             display_name: Some(display_name.to_string()),
         };
 
@@ -390,7 +392,7 @@ fn run_authentication_with_multiple_credentials_test() -> Result<()> {
 
     let user = User {
         id: vec![99, 100, 101, 102],
-        name: "test@example.com".to_string(),
+        name: Some("test@example.com".to_string()),
         display_name: Some("Test User".to_string()),
     };
 
@@ -571,7 +573,7 @@ fn run_registration_with_different_rps_test() -> Result<()> {
 
         let user = User {
             id: vec![i as u8, (i + 1) as u8, (i + 2) as u8, (i + 3) as u8],
-            name: format!("user@{}", rp_id),
+            name: Some(format!("user@{}", rp_id)),
             display_name: Some(format!("User at {}", rp_name)),
         };
 

@@ -4,37 +4,14 @@
 
 pub mod defaults;
 
-use crate::commands::custom::{
-    CMD_CREDENTIAL_MGMT, CMD_CUSTOM_CREDENTIAL_MGMT, create_credential_mgmt_command,
-};
-use crate::storage::CredentialStorage;
-
-use keylib::{AuthenticatorConfig, AuthenticatorOptions, CtapCommand};
-
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use clap::Args;
 use libc::{MCL_CURRENT, MCL_FUTURE, PR_SET_DUMPABLE, mlockall, prctl};
 use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
 use serde::{Deserialize, Serialize};
-
-/// AAGUID for the passless authenticator
-/// "fido.passless.rs" encoded as hex
-pub const AAGUID: [u8; 16] = [
-    0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73, 0x2E, 0x72, 0x73,
-];
-
-/// Supported extensions
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["credProtect"];
-
-/// Maximum number of resident credentials
-pub const MAX_RESIDENT_CREDENTIALS: u32 = 100;
-
-/// Firmware version
-pub const FIRMWARE_VERSION: u32 = 0x0001;
 
 /// User verification configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
@@ -127,73 +104,6 @@ impl SecurityConfig {
         }
         Ok(())
     }
-}
-
-/// Build the authenticator configuration
-///
-/// This creates a configuration matching the Zig example with:
-/// - FIDO 2.0 and 2.1 support
-/// - Credential management enabled
-/// - Resident keys (discoverable credentials)
-/// - User verification
-/// - PIN support
-/// - Platform authenticator mode
-///
-/// # Arguments
-///
-/// * `storage` - Storage backend wrapped in Arc<Mutex<S>>
-pub fn build_authenticator_config<S: CredentialStorage + 'static>(
-    storage: Arc<Mutex<S>>,
-) -> AuthenticatorConfig {
-    let options = AuthenticatorOptions {
-        // Resident keys (discoverable credentials, a.k.a passkeys)
-        rk: true,
-        // User presence
-        up: true,
-        // User verification
-        uv: Some(true),
-        // Platform authenticator
-        plat: true,
-        // Client PIN support
-        client_pin: Some(false),
-        // PIN UV auth token support
-        pin_uv_auth_token: Some(true),
-        // Credential management support
-        cred_mgmt: Some(true),
-        // Bio enrollment not supported
-        bio_enroll: None,
-        // Large blobs not supported
-        large_blobs: None,
-        // Enterprise attestation
-        ep: None,
-        // Always require user verification
-        always_uv: Some(true),
-    };
-
-    AuthenticatorConfig::builder()
-        .aaguid(AAGUID)
-        .options(options)
-        .firmware_version(FIRMWARE_VERSION)
-        .commands(vec![
-            CtapCommand::MakeCredential,   // 0x01
-            CtapCommand::GetAssertion,     // 0x02
-            CtapCommand::GetInfo,          // 0x04
-            CtapCommand::ClientPin,        // 0x06
-            CtapCommand::GetNextAssertion, // 0x08
-            CtapCommand::Selection,        // 0x0b
-        ])
-        .custom_commands(vec![
-            create_credential_mgmt_command(CMD_CREDENTIAL_MGMT, storage.clone()), // 0x0a (standard)
-            create_credential_mgmt_command(CMD_CUSTOM_CREDENTIAL_MGMT, storage),  // 0x41 (Yubikey)
-        ])
-        .max_credentials(MAX_RESIDENT_CREDENTIALS)
-        .extensions(
-            SUPPORTED_EXTENSIONS
-                .iter()
-                .map(|&s| s.to_string())
-                .collect(),
-        )
-        .build()
 }
 
 /// Local storage backend configuration

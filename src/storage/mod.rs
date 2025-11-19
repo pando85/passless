@@ -7,11 +7,10 @@ pub mod local;
 pub mod pass;
 pub mod tpm;
 
-use keylib::credential::RelyingParty;
-use keylib::{Credential, CredentialRef, Result};
+use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
 pub use local::LocalStorageAdapter;
-pub use pass::{GpgBackend, PassStorageAdapter};
+pub use pass::PassStorageAdapter;
 pub use tpm::TpmStorageAdapter;
 
 /// Filter criteria for reading credentials
@@ -24,6 +23,7 @@ pub enum CredentialFilter {
     /// Filter by relying party ID
     ByRp(String),
     /// Filter by relying party ID hash
+    #[allow(dead_code)]
     ByHash([u8; 32]),
 }
 
@@ -94,6 +94,7 @@ pub trait CredentialStorage: Send + Sync {
     /// # Returns
     ///
     /// Vector of user names
+    #[allow(dead_code)]
     fn select_users(&self, rp_id: &str) -> Vec<String>;
 
     /// Count total number of stored credentials
@@ -107,7 +108,8 @@ pub trait CredentialStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Vector of relying party IDs
+    /// # Vector of relying party IDs
+    #[allow(dead_code)]
     fn get_relying_parties(&self) -> Result<Vec<RelyingParty>>;
 
     /// Check if user verification should be disabled for this backend

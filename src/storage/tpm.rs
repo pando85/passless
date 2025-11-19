@@ -12,14 +12,14 @@
 //! Indexes are built by scanning directory structure (no unsealing needed)
 //! Credentials are only unsealed when needed for authentication
 
+use crate::config::{self, TpmBackendConfig};
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
     update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 
-use keylib::credential::RelyingParty;
-use keylib::{Credential, CredentialRef, Result};
+use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -80,7 +80,7 @@ impl TpmStorageAdapter {
         info!("Storage path: {}", storage_dir.display());
         fs::create_dir_all(&storage_dir).map_err(|e| {
             log::error!("Failed to create storage directory: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Initialize TPM context
@@ -92,7 +92,7 @@ impl TpmStorageAdapter {
                 log::error!("  - Hardware TPM: device:/dev/tpmrm0");
                 log::error!("  - swtpm socket: swtpm:path=/path/to/socket");
 
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?
         } else {
             // Default TCTI (device or simulator)
@@ -110,7 +110,7 @@ impl TpmStorageAdapter {
             log::error!("Troubleshooting steps:");
             log::error!("  1. Verify TPM device exists: ls -l /dev/tpm*");
             log::error!("  2. Check permissions on TPM device");
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Start auth session for encryption
@@ -125,11 +125,11 @@ impl TpmStorageAdapter {
             )
             .map_err(|e| {
                 log::error!("Failed to start TPM auth session: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?
             .ok_or_else(|| {
                 log::error!("TPM auth session returned None");
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         context.set_sessions((Some(session), None, None));
@@ -139,7 +139,7 @@ impl TpmStorageAdapter {
         // Load indexes by scanning directory structure (no unsealing!)
         let indexes = load_credential_paths(&storage_dir, "tpm").map_err(|e| {
             log::error!("Failed to load credential paths: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let adapter = Self {
@@ -152,6 +152,17 @@ impl TpmStorageAdapter {
         };
 
         Ok(adapter)
+    }
+
+    /// Create a new TPM storage adapter from configuration
+    pub fn from_config(config: &TpmBackendConfig) -> Result<Self> {
+        let path = config
+            .path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config::defaults::tpm_path().into());
+        let tcti = config.tcti.clone();
+        Self::new(path, tcti)
     }
 
     /// Create a primary storage key in the owner hierarchy
@@ -170,7 +181,7 @@ impl TpmStorageAdapter {
             .build()
             .map_err(|e| {
                 log::error!("Failed to build object attributes: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         // For a storage key, we need to specify the symmetric algorithm used to encrypt child objects
@@ -185,7 +196,7 @@ impl TpmStorageAdapter {
             .build()
             .map_err(|e| {
                 log::error!("Failed to build RSA parameters: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         let primary_pub = PublicBuilder::new()
@@ -197,14 +208,14 @@ impl TpmStorageAdapter {
             .build()
             .map_err(|e| {
                 log::error!("Failed to build primary key public: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         let primary_key_result = context
             .create_primary(Hierarchy::Owner, primary_pub, None, None, None, None)
             .map_err(|e| {
                 log::error!("Failed to create primary key: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         Ok(primary_key_result.key_handle)
@@ -220,7 +231,7 @@ impl TpmStorageAdapter {
             .build()
             .map_err(|e| {
                 log::error!("Failed to build sealing object attributes: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         // Create keyed hash parameters for sealing (Null scheme)
@@ -236,7 +247,7 @@ impl TpmStorageAdapter {
             .build()
             .map_err(|e| {
                 log::error!("Failed to build sealing object public: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })
     }
 
@@ -259,12 +270,12 @@ impl TpmStorageAdapter {
         // Encrypt the credential data with AES-GCM
         let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
             log::error!("Failed to create AES cipher: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let encrypted_data = cipher.encrypt(nonce, data).map_err(|e| {
             log::error!("Failed to encrypt data with AES-GCM: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         debug!(
@@ -276,7 +287,7 @@ impl TpmStorageAdapter {
         // Now seal only the AES key (32 bytes) with TPM
         let mut context = self.context.lock().map_err(|e| {
             log::error!("Failed to lock TPM context: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Create primary key
@@ -289,7 +300,7 @@ impl TpmStorageAdapter {
         let sensitive_data = tss_esapi::structures::SensitiveData::try_from(aes_key.to_vec())
             .map_err(|e| {
                 log::error!("Failed to create sensitive data for AES key: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         let create_result = context
@@ -303,13 +314,13 @@ impl TpmStorageAdapter {
             )
             .map_err(|e| {
                 log::error!("Failed to create sealed object: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         // Flush the primary key (we'll recreate it when unsealing)
         context.flush_context(primary_key.into()).map_err(|e| {
             log::error!("Failed to flush primary key: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let private_tpm: TPM2B_PRIVATE = create_result.out_private.into();
@@ -319,7 +330,7 @@ impl TpmStorageAdapter {
         #[allow(clippy::unnecessary_fallible_conversions)]
         let public_tpm: TPM2B_PUBLIC = create_result.out_public.try_into().map_err(|e| {
             log::error!("Failed to convert public to TPM2B: {:?}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // For Public, we need to store the entire TPM2B_PUBLIC structure as bytes
@@ -339,7 +350,7 @@ impl TpmStorageAdapter {
         // Serialize the blob to JSON
         serde_json::to_vec(&sealed_blob).map_err(|e| {
             log::error!("Failed to serialize sealed blob: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })
     }
 
@@ -351,12 +362,12 @@ impl TpmStorageAdapter {
 
         let mut context = self.context.lock().map_err(|e| {
             log::error!("Failed to lock TPM context: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let sealed_blob: SealedBlob = serde_json::from_slice(sealed_data).map_err(|e| {
             log::error!("Failed to deserialize sealed blob: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let primary_key = self.create_primary_key(&mut context)?;
@@ -385,35 +396,35 @@ impl TpmStorageAdapter {
         // Convert to tss-esapi types
         let private = tss_esapi::structures::Private::try_from(private_tpm).map_err(|e| {
             log::error!("Failed to convert TPM2B_PRIVATE to Private: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let public = tss_esapi::structures::Public::try_from(public_tpm).map_err(|e| {
             log::error!("Failed to convert TPM2B_PUBLIC to Public: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Load the sealed object
         let sealed_handle = context.load(primary_key, private, public).map_err(|e| {
             log::error!("Failed to load sealed object: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Unseal the AES key from TPM
         let unsealed_key = context.unseal(sealed_handle.into()).map_err(|e| {
             log::error!("Failed to unseal AES key: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Flush handles
         context.flush_context(sealed_handle.into()).map_err(|e| {
             log::error!("Failed to flush sealed handle: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         context.flush_context(primary_key.into()).map_err(|e| {
             log::error!("Failed to flush primary key: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Drop the mutex before AES decryption
@@ -426,21 +437,21 @@ impl TpmStorageAdapter {
                 "Unsealed key has wrong size: {} (expected 32)",
                 aes_key.len()
             );
-            return Err(keylib::Error::Other);
+            return Err(soft_fido2::Error::Other);
         }
 
         // Decrypt the data with AES-GCM
         let nonce = Nonce::from_slice(&sealed_blob.nonce);
         let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
             log::error!("Failed to create AES cipher: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         let decrypted_data = cipher
             .decrypt(nonce, sealed_blob.encrypted_data.as_ref())
             .map_err(|e| {
                 log::error!("Failed to decrypt data with AES-GCM: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
 
         debug!("Successfully decrypted {} bytes", decrypted_data.len());
@@ -450,18 +461,19 @@ impl TpmStorageAdapter {
 
     /// Read a credential from a specific file path WITHOUT caching
     /// Used for operations that need &self
+    #[allow(dead_code)]
     fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<Credential> {
         debug!("Reading credential (no cache) from path: {:?}", path);
 
         let mut file = File::open(path).map_err(|e| {
             log::error!("Failed to open credential file {}: {}", path.display(), e);
-            keylib::Error::DoesNotExist
+            soft_fido2::Error::DoesNotExist
         })?;
 
         let mut sealed_data = Vec::new();
         file.read_to_end(&mut sealed_data).map_err(|e| {
             log::error!("Failed to read credential file {}: {}", path.display(), e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Unseal the data using TPM
@@ -495,13 +507,13 @@ impl TpmStorageAdapter {
 
         let mut file = File::open(path).map_err(|e| {
             log::error!("Failed to open credential file {}: {}", path.display(), e);
-            keylib::Error::DoesNotExist
+            soft_fido2::Error::DoesNotExist
         })?;
 
         let mut sealed_data = Vec::new();
         file.read_to_end(&mut sealed_data).map_err(|e| {
             log::error!("Failed to read credential file {}: {}", path.display(), e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Unseal the data using TPM
@@ -525,7 +537,7 @@ impl TpmStorageAdapter {
             .get(id)
             .ok_or_else(|| {
                 debug!("Credential not found in index");
-                keylib::Error::DoesNotExist
+                soft_fido2::Error::DoesNotExist
             })?
             .clone();
 
@@ -534,6 +546,7 @@ impl TpmStorageAdapter {
 
     /// Load all credentials from storage (non-caching version)
     /// Used for operations that need &self
+    #[allow(dead_code)]
     fn load_all_credentials_no_cache(&self) -> Vec<Credential> {
         debug!("Loading all credentials from storage (no cache)");
         let mut credentials = Vec::new();
@@ -559,7 +572,7 @@ impl TpmStorageAdapter {
 
         if self.iteration_index >= self.iteration_entries.len() {
             debug!("No more credentials matching filter");
-            return Err(keylib::Error::DoesNotExist);
+            return Err(soft_fido2::Error::DoesNotExist);
         }
 
         let path = self.iteration_entries[self.iteration_index].clone();
@@ -580,7 +593,7 @@ impl TpmStorageAdapter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 debug!("Failed to create directory: {}", e);
-                keylib::Error::Other
+                soft_fido2::Error::Other
             })?;
         }
 
@@ -591,12 +604,12 @@ impl TpmStorageAdapter {
 
         let mut file = File::create(&path).map_err(|e| {
             log::error!("Failed to create credential file {}: {}", path.display(), e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         file.write_all(&sealed_data).map_err(|e| {
             log::error!("Failed to write credential file {}: {}", path.display(), e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         debug!("Successfully wrote and sealed credential");
@@ -627,7 +640,7 @@ impl TpmStorageAdapter {
             .get(id)
             .ok_or_else(|| {
                 debug!("Credential not found in index");
-                keylib::Error::DoesNotExist
+                soft_fido2::Error::DoesNotExist
             })?
             .clone();
 
@@ -637,7 +650,7 @@ impl TpmStorageAdapter {
         // Delete the file
         std::fs::remove_file(&path).map_err(|e| {
             debug!("Failed to delete file: {}", e);
-            keylib::Error::Other
+            soft_fido2::Error::Other
         })?;
 
         // Remove from cache
