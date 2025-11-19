@@ -50,24 +50,28 @@ pub enum Error {
     /// Invalid data format
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    /// Generic other error
+    #[error("Other error: {0}")]
+    Other(String),
 }
 
-/// Convert keylib::Error to Error for error handling
-impl From<keylib::Error> for Error {
-    fn from(err: keylib::Error) -> Self {
+/// Convert soft_fido2::Error to Error for error handling
+impl From<soft_fido2::Error> for Error {
+    fn from(err: soft_fido2::Error) -> Self {
         Error::CredentialManagement(format!("{:?}", err))
     }
 }
 
-/// Convert Error to keylib::Error for compatibility
-impl From<Error> for keylib::Error {
+/// Convert Error to soft_fido2::Error for compatibility
+impl From<Error> for soft_fido2::Error {
     fn from(err: Error) -> Self {
         match err {
-            Error::Storage(ref msg) if msg.contains("not found") => keylib::Error::DoesNotExist,
+            Error::Storage(ref msg) if msg.contains("not found") => soft_fido2::Error::DoesNotExist,
             Error::Storage(ref msg) if msg.contains("No more credentials") => {
-                keylib::Error::DoesNotExist
+                soft_fido2::Error::DoesNotExist
             }
-            _ => keylib::Error::Other,
+            _ => soft_fido2::Error::Other,
         }
     }
 }
@@ -77,11 +81,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_keylib_error_conversion() {
-        let err: Error = keylib::Error::DoesNotExist.into();
+    fn test_soft_fido2_error_conversion() {
+        let err: Error = soft_fido2::Error::DoesNotExist.into();
         assert!(matches!(err, Error::CredentialManagement(_)));
 
-        let err: keylib::Error = Error::Storage("not found".to_string()).into();
-        assert!(matches!(err, keylib::Error::DoesNotExist));
+        let err: soft_fido2::Error = Error::Storage("not found".to_string()).into();
+        assert!(matches!(err, soft_fido2::Error::DoesNotExist));
     }
 }

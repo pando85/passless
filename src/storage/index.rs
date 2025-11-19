@@ -1,8 +1,8 @@
 //! Shared indexing and caching for credential storage backends
 
-use keylib::Credential;
 use log::debug;
 use sha2::{Digest, Sha256};
+use soft_fido2::Credential;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

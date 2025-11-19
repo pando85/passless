@@ -11,7 +11,7 @@
 ![passless license](https://img.shields.io/github/license/pando85/passless)
 
 Software FIDO2 authenticator that emulates a hardware security key. Built with
-[rust-keylib](https://github.com/pando85/rust-keylib) and runs as a virtual UHID device on Linux.
+[soft-fido2](https://github.com/pando85/soft-fido2) and runs as a virtual UHID device on Linux.
 
 ## ⚠️ Security Disclaimer <!-- omit in toc -->
 

@@ -356,7 +356,7 @@ impl AuthenticatorHarness {
 
     /// Wait for the authenticator to be ready
     fn wait_for_ready(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use keylib::client::TransportList;
+        use soft_fido2::TransportList;
 
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(10);

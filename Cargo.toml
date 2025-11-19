@@ -19,8 +19,8 @@ path = "src/main.rs"
 [dependencies]
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
-#keylib = { path = "../rust-keylib/keylib" }
-keylib = { version = "0.2.3", features = ["bundled"] }
+soft-fido2 = { path = "../soft-fido2/soft-fido2" }
+soft-fido2-transport = { path = "../soft-fido2/soft-fido2-transport" }
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
@@ -36,6 +36,7 @@ notify-rust = "4.11"
 tss-esapi = "7.6.0"
 aes-gcm = "0.10"
 rand = "0.8"
+hex = "0.4"
 
 [dev-dependencies]
 base64 = "0.22"

@@ -5,6 +5,7 @@
 
 pub mod init;
 
+use crate::config::{self, PassBackendConfig};
 use crate::error::{Error, Result};
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
@@ -12,8 +13,7 @@ use crate::storage::index::{
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 
-use keylib::credential::RelyingParty;
-use keylib::{Credential, CredentialRef};
+use soft_fido2::{Credential, CredentialRef, RelyingParty};
 
 use core::fmt;
 use std::fmt::Display;
@@ -127,6 +127,26 @@ impl PassStorageAdapter {
         Ok(adapter)
     }
 
+    /// Create a new pass storage adapter from configuration
+    pub fn from_config(config: &PassBackendConfig) -> Result<Self> {
+        let store_path = config
+            .store_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config::defaults::pass_store_path().into());
+        let path = config
+            .path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(config::defaults::PASS_PATH));
+        let gpg_backend_str = config
+            .gpg_backend
+            .as_deref()
+            .unwrap_or(config::defaults::PASS_GPG_BACKEND);
+        let gpg_backend = GpgBackend::from_str(gpg_backend_str)?;
+        Self::new(store_path, path, gpg_backend)
+    }
+
     /// Get the FIDO path within the password store
     fn get_fido2_path(&self) -> PathBuf {
         self.store_path.join(&self.path)
@@ -199,6 +219,7 @@ impl PassStorageAdapter {
 
     /// Read a credential from a specific file path WITHOUT caching
     /// Used for operations that need &self (select_users, get_relying_parties, etc.)
+    #[allow(dead_code)]
     fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<Credential> {
         debug!("Reading credential (no cache) from path: {:?}", path);
 
@@ -451,6 +472,7 @@ impl PassStorageAdapter {
 
     /// Load all credentials from the store (non-caching version)
     /// Used for operations that need &self
+    #[allow(dead_code)]
     fn load_all_credentials_no_cache(&self) -> Vec<Credential> {
         debug!("Loading all credentials from store (no cache)");
         let mut credentials = Vec::new();
@@ -487,7 +509,7 @@ impl PassStorageAdapter {
 }
 
 impl CredentialStorage for PassStorageAdapter {
-    fn read_first(&mut self, filter: CredentialFilter) -> keylib::Result<Credential> {
+    fn read_first(&mut self, filter: CredentialFilter) -> soft_fido2::Result<Credential> {
         self.cache.evict_expired();
 
         debug!("read_first called with filter: {:?}", filter);
@@ -535,14 +557,14 @@ impl CredentialStorage for PassStorageAdapter {
         self.find_next().map_err(Into::into)
     }
 
-    fn read_next(&mut self) -> keylib::Result<Credential> {
+    fn read_next(&mut self) -> soft_fido2::Result<Credential> {
         self.cache.evict_expired();
 
         debug!("read_next called");
         self.find_next().map_err(Into::into)
     }
 
-    fn read(&mut self, id: &str, _rp: &str) -> keylib::Result<Vec<u8>> {
+    fn read(&mut self, id: &str, _rp: &str) -> soft_fido2::Result<Vec<u8>> {
         self.cache.evict_expired();
 
         debug!("read called with id: {}", id);
@@ -556,7 +578,7 @@ impl CredentialStorage for PassStorageAdapter {
         cred.to_bytes()
     }
 
-    fn write(&mut self, _id: &str, _rp: &str, cred_ref: CredentialRef) -> keylib::Result<()> {
+    fn write(&mut self, _id: &str, _rp: &str, cred_ref: CredentialRef) -> soft_fido2::Result<()> {
         self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);
@@ -577,7 +599,7 @@ impl CredentialStorage for PassStorageAdapter {
             .map_err(Into::into)
     }
 
-    fn delete(&mut self, id: &str) -> keylib::Result<()> {
+    fn delete(&mut self, id: &str) -> soft_fido2::Result<()> {
         self.cache.evict_expired();
 
         debug!("delete called with id: {}", id);
@@ -605,7 +627,7 @@ impl CredentialStorage for PassStorageAdapter {
         count
     }
 
-    fn get_relying_parties(&self) -> keylib::Result<Vec<RelyingParty>> {
+    fn get_relying_parties(&self) -> soft_fido2::Result<Vec<RelyingParty>> {
         debug!("get_relying_parties called");
 
         let credentials = self.load_all_credentials_no_cache();
