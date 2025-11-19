@@ -7,7 +7,7 @@
   <br>
 </h1>
 
-![Build status](https://img.shields.io/github/actions/workflow/status/pando85/passless/rust.yml?branch=main)
+![Build status](https://img.shields.io/github/actions/workflow/status/pando85/passless/rust.yml?branch=master)
 ![passless license](https://img.shields.io/github/license/pando85/passless)
 
 Software FIDO2 authenticator that emulates a hardware security key. Built with
