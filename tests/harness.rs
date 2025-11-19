@@ -320,10 +320,9 @@ impl AuthenticatorHarness {
             .arg("-f")
             .arg("^target/debug/passless$")
             .output()
+            && output.status.success() && !output.stdout.is_empty()
         {
-            if output.status.success() && !output.stdout.is_empty() {
-                return true;
-            }
+            return true;
         }
 
         // Also check alternative pattern
@@ -331,10 +330,9 @@ impl AuthenticatorHarness {
             .arg("-f")
             .arg("/target/debug/passless$")
             .output()
+            && output.status.success() && !output.stdout.is_empty()
         {
-            if output.status.success() && !output.stdout.is_empty() {
-                return true;
-            }
+            return true;
         }
 
         false
@@ -348,11 +346,11 @@ impl AuthenticatorHarness {
         let timeout = Duration::from_secs(10);
 
         while start.elapsed() < timeout {
-            if let Ok(list) = TransportList::enumerate() {
-                if !list.is_empty() {
-                    println!("   ✓ Authenticator is ready");
-                    return Ok(());
-                }
+            if let Ok(list) = TransportList::enumerate()
+                && !list.is_empty()
+            {
+                println!("   ✓ Authenticator is ready");
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -401,13 +399,13 @@ impl AuthenticatorHarness {
 
     /// Stop the authenticator (if we started it)
     pub fn stop(&mut self) {
-        if self.started_by_harness {
-            if let Some(mut process) = self.process.take() {
-                println!("Stopping passless authenticator...");
-                let _ = process.kill();
-                let _ = process.wait();
-                println!("   ✓ Authenticator stopped");
-            }
+        if self.started_by_harness
+            && let Some(mut process) = self.process.take()
+        {
+            println!("Stopping passless authenticator...");
+            let _ = process.kill();
+            let _ = process.wait();
+            println!("   ✓ Authenticator stopped");
         }
 
         self.backend.cleanup();

@@ -31,7 +31,7 @@
 
 mod harness;
 
-use harness::{AuthenticatorHarness, BackendSetup};
+use harness::AuthenticatorHarness;
 use keylib::client::{
     Client, ClientDataHash, GetAssertionRequest, MakeCredentialRequest, TransportList, User,
 };
@@ -44,17 +44,18 @@ const RP_ID: &str = "example.com";
 const ORIGIN: &str = "https://example.com";
 
 /// Run a test with the specified backend
-fn with_backend<F>(
+fn with_backend<BF, F>(
     backend_name: &str,
-    backend_factory: fn() -> Result<AuthenticatorHarness, Box<dyn std::error::Error>>,
+    backend_factory: BF,
     test_fn: F,
 ) -> Result<()>
 where
+    BF: FnOnce() -> std::result::Result<AuthenticatorHarness, Box<dyn std::error::Error>>,
     F: FnOnce() -> Result<()>,
 {
-    println!("\n┌{'─' as char:─<60}┐");
+    println!("\n┌────────────────────────────────────────────────────────────┐");
     println!("│ Backend: {:<51} │", backend_name);
-    println!("└{'─' as char:─<60}┘");
+    println!("└────────────────────────────────────────────────────────────┘");
 
     let mut harness = match backend_factory() {
         Ok(h) => h,
