@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -162,10 +161,7 @@ impl BackendSetup for PassBackend {
             "PASSLESS_PASS_STORE_PATH".to_string(),
             self.pass_store.display().to_string(),
         );
-        env.insert(
-            "GNUPGHOME".to_string(),
-            self.gpg_home.display().to_string(),
-        );
+        env.insert("GNUPGHOME".to_string(), self.gpg_home.display().to_string());
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
 
         Ok(env)
@@ -239,12 +235,19 @@ impl BackendSetup for TpmBackend {
         println!("🔧 Setting up TPM backend (swtpm)...");
 
         self.start_swtpm()?;
-        println!("   ✓ swtpm started on socket: {}", self.socket_path.display());
+        println!(
+            "   ✓ swtpm started on socket: {}",
+            self.socket_path.display()
+        );
 
         let mut env = HashMap::new();
         env.insert(
             "PASSLESS_TPM_PATH".to_string(),
-            self.temp_dir.path().join("credentials").display().to_string(),
+            self.temp_dir
+                .path()
+                .join("credentials")
+                .display()
+                .to_string(),
         );
         env.insert(
             "PASSLESS_TPM_TCTI".to_string(),
@@ -262,7 +265,11 @@ impl BackendSetup for TpmBackend {
             "--tpm-tcti".to_string(),
             format!("swtpm:path={}", self.socket_path.display()),
             "--tpm-path".to_string(),
-            self.temp_dir.path().join("credentials").display().to_string(),
+            self.temp_dir
+                .path()
+                .join("credentials")
+                .display()
+                .to_string(),
         ]
     }
 
@@ -320,7 +327,8 @@ impl AuthenticatorHarness {
             .arg("-f")
             .arg("^target/debug/passless$")
             .output()
-            && output.status.success() && !output.stdout.is_empty()
+            && output.status.success()
+            && !output.stdout.is_empty()
         {
             return true;
         }
@@ -330,7 +338,8 @@ impl AuthenticatorHarness {
             .arg("-f")
             .arg("/target/debug/passless$")
             .output()
-            && output.status.success() && !output.stdout.is_empty()
+            && output.status.success()
+            && !output.stdout.is_empty()
         {
             return true;
         }
@@ -416,37 +425,4 @@ impl Drop for AuthenticatorHarness {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// Thread-safe harness wrapper for use across multiple tests
-pub struct SharedHarness {
-    harness: Arc<Mutex<AuthenticatorHarness>>,
-}
-
-impl SharedHarness {
-    pub fn new(harness: AuthenticatorHarness) -> Self {
-        Self {
-            harness: Arc::new(Mutex::new(harness)),
-        }
-    }
-
-    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.harness.lock().unwrap().start()
-    }
-
-    pub fn stop(&self) {
-        self.harness.lock().unwrap().stop()
-    }
-}
-
-/// Helper macro to run E2E tests with a specific backend
-#[macro_export]
-macro_rules! with_backend {
-    ($backend:expr, $test_fn:expr) => {{
-        let mut harness = $backend?;
-        harness.start()?;
-        let result = $test_fn();
-        harness.stop();
-        result
-    }};
 }

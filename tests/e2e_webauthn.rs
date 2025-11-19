@@ -44,11 +44,7 @@ const RP_ID: &str = "example.com";
 const ORIGIN: &str = "https://example.com";
 
 /// Run a test with the specified backend
-fn with_backend<BF, F>(
-    backend_name: &str,
-    backend_factory: BF,
-    test_fn: F,
-) -> Result<()>
+fn with_backend<BF, F>(backend_name: &str, backend_factory: BF, test_fn: F) -> Result<()>
 where
     BF: FnOnce() -> std::result::Result<AuthenticatorHarness, Box<dyn std::error::Error>>,
     F: FnOnce() -> Result<()>,
