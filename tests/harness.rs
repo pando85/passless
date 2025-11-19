@@ -181,14 +181,12 @@ impl BackendSetup for PassBackend {
 pub struct TpmBackend {
     temp_dir: TempDir,
     swtpm_process: Option<Child>,
-    socket_path: PathBuf,
     storage_path: PathBuf,
 }
 
 impl TpmBackend {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let socket_path = temp_dir.path().join("swtpm.sock");
         let storage_path = temp_dir.path().join("tpm-storage");
 
         std::fs::create_dir_all(&storage_path)?;
@@ -196,30 +194,43 @@ impl TpmBackend {
         Ok(Self {
             temp_dir,
             swtpm_process: None,
-            socket_path,
             storage_path,
         })
     }
 
     /// Start swtpm process
     fn start_swtpm(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Stdio;
+
         // Start swtpm socket server
         let child = Command::new("swtpm")
             .arg("socket")
+            .arg("--tpm2")
             .arg("--tpmstate")
             .arg(format!("dir={}", self.storage_path.display()))
+            .arg("--server")
+            .arg("type=tcp,port=2321")
             .arg("--ctrl")
-            .arg(format!("type=unixio,path={}", self.socket_path.display()))
-            .arg("--tpm2")
+            .arg("type=tcp,port=2322")
             .arg("--flags")
-            .arg("not-need-init")
+            .arg("not-need-init,startup-clear")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()?;
 
         self.swtpm_process = Some(child);
 
         // Wait for socket to be created
         let start = std::time::Instant::now();
-        while !self.socket_path.exists() {
+        // Wait for TCP port 2321 to be open on 127.0.0.1
+        while std::net::TcpStream::connect("127.0.0.1:2321").is_err() {
+            // Check if the process is still alive
+            if let Some(ref mut process) = self.swtpm_process
+                && let Ok(Some(status)) = process.try_wait()
+            {
+                return Err(format!("swtpm exited early with status: {}", status).into());
+            }
+
             if start.elapsed() > Duration::from_secs(5) {
                 return Err("Timeout waiting for swtpm socket".into());
             }
@@ -235,11 +246,7 @@ impl BackendSetup for TpmBackend {
         println!("🔧 Setting up TPM backend (swtpm)...");
 
         self.start_swtpm()?;
-        println!(
-            "   ✓ swtpm started on socket: {}",
-            self.socket_path.display()
-        );
-
+        println!("   ✓ swtpm started");
         let mut env = HashMap::new();
         env.insert(
             "PASSLESS_TPM_PATH".to_string(),
@@ -251,7 +258,7 @@ impl BackendSetup for TpmBackend {
         );
         env.insert(
             "PASSLESS_TPM_TCTI".to_string(),
-            format!("swtpm:path={}", self.socket_path.display()),
+            "swtpm:host=localhost,port=2321".to_string(),
         );
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
 
@@ -263,7 +270,7 @@ impl BackendSetup for TpmBackend {
             "--backend-type".to_string(),
             "tpm".to_string(),
             "--tpm-tcti".to_string(),
-            format!("swtpm:path={}", self.socket_path.display()),
+            "swtpm:host=localhost,port=2321".to_string(),
             "--tpm-path".to_string(),
             self.temp_dir
                 .path()
