@@ -478,6 +478,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
+name = "core2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1818,10 +1827,13 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "soft-fido2"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes",
  "cbc",
@@ -1843,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes",
  "cbc",
@@ -1858,13 +1870,15 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cbor4ii",
+ "core2",
  "rand",
  "serde",
  "serde_bytes",
  "sha2",
+ "smallvec",
  "soft-fido2-crypto",
  "subtle",
  "thiserror 1.0.69",
@@ -1872,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-transport"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hex",
  "hidapi",

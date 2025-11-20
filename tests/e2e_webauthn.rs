@@ -35,8 +35,8 @@ use harness::AuthenticatorHarness;
 use sha2::{Digest, Sha256};
 use soft_fido2::client::Client;
 use soft_fido2::{
-    ClientDataHash, GetAssertionRequest, MakeCredentialRequest, RelyingParty, Result,
-    TransportList, User,
+    ClientDataHash, CredentialDescriptor, CredentialType, GetAssertionRequest,
+    MakeCredentialRequest, RelyingParty, Result, TransportList, User,
 };
 use std::io::Write;
 
@@ -69,6 +69,10 @@ where
     }
 
     let result = test_fn();
+
+    // Always print authenticator output for debugging
+    // Give the output capture threads time to finish reading
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     harness.stop();
 
@@ -209,7 +213,26 @@ fn run_registration_and_authentication_test() -> Result<()> {
     };
 
     println!("   ✓ Credential created ({} bytes)", attestation.len());
+    if attestation.len() < 10 {
+        println!(
+            "   [DEBUG] Short response! Hex: {}",
+            hex::encode(&attestation)
+        );
+        if attestation.len() == 1 {
+            panic!(
+                "makeCredential failed with CTAP error: 0x{:02x}",
+                attestation[0]
+            );
+        }
+    }
     assert!(!attestation.is_empty(), "Attestation should not be empty");
+
+    // First byte is CTAP status code (0x00 = success)
+    assert_eq!(
+        attestation[0], 0x00,
+        "makeCredential failed with CTAP status: 0x{:02x}",
+        attestation[0]
+    );
 
     // ========================================
     // PHASE 2: AUTHENTICATION
@@ -239,11 +262,30 @@ fn run_registration_and_authentication_test() -> Result<()> {
     };
 
     println!("   ✓ Authentication successful ({} bytes)", assertion.len());
+    if assertion.len() < 10 {
+        println!(
+            "   [DEBUG] Short response! Hex: {}",
+            hex::encode(&assertion)
+        );
+        if assertion.len() == 1 {
+            panic!(
+                "getAssertion failed with CTAP error: 0x{:02x}",
+                assertion[0]
+            );
+        }
+    }
     assert!(!assertion.is_empty(), "Assertion should not be empty");
 
-    // Verify response structure
+    // First byte is CTAP status code (0x00 = success)
+    assert_eq!(
+        assertion[0], 0x00,
+        "getAssertion failed with CTAP status: 0x{:02x}",
+        assertion[0]
+    );
+
+    // Verify response structure (skip status byte)
     println!("[2.3] Validating assertion response...");
-    match ciborium::from_reader::<ciborium::value::Value, _>(assertion.as_slice()) {
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[1..]) {
         Ok(ciborium::value::Value::Map(map)) => {
             println!("   ✓ Valid CBOR response with {} fields", map.len());
 
@@ -466,6 +508,183 @@ fn test_tpm_authentication_with_multiple_credentials() -> Result<()> {
     })
 }
 
+/// Core test logic for authentication with specific credential from allowList
+/// This test reproduces the webauthn-rs compact_tester AuthMultipleCredentials scenario
+fn run_authentication_with_allow_list_test() -> Result<()> {
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║ E2E Test: Auth with Specific Credential (Allow List) ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    let mut transport = connect_to_authenticator()?;
+
+    // Register first credential (User A)
+    println!("📝 [1/2] Registering first credential (User A)...");
+    let challenge_a = generate_challenge();
+    let client_data_hash_a = generate_client_data_hash_for_registration(&challenge_a);
+
+    let rp = RelyingParty {
+        id: RP_ID.to_string(),
+        name: Some("Example Corp".to_string()),
+    };
+
+    let user_a = User {
+        id: vec![1, 2, 3, 4], // User A ID
+        name: Some("user_a@example.com".to_string()),
+        display_name: Some("User A".to_string()),
+    };
+
+    let request_a = MakeCredentialRequest::new(client_data_hash_a, rp.clone(), user_a)
+        .with_user_verification(true)
+        .with_resident_key(true) // Force resident key
+        .with_timeout(30000);
+
+    print_operation("Register credential for User A");
+    let attestation_a = Client::make_credential(&mut transport, request_a)?;
+    assert_eq!(
+        attestation_a[0], 0x00,
+        "First credential registration failed with CTAP status: 0x{:02x}",
+        attestation_a[0]
+    );
+    println!("   ✓ User A registered ({} bytes)\n", attestation_a.len());
+
+    // Extract credential ID from User A's attestation
+    let cred_id_a = extract_credential_id(&attestation_a[1..])?;
+    println!("   Credential ID A: {} bytes", cred_id_a.len());
+
+    // Register second credential (User B)
+    println!("📝 [2/2] Registering second credential (User B)...");
+    let challenge_b = generate_challenge();
+    let client_data_hash_b = generate_client_data_hash_for_registration(&challenge_b);
+
+    let user_b = User {
+        id: vec![5, 6, 7, 8], // User B ID - different from A
+        name: Some("user_b@example.com".to_string()),
+        display_name: Some("User B".to_string()),
+    };
+
+    let request_b = MakeCredentialRequest::new(client_data_hash_b, rp.clone(), user_b)
+        .with_user_verification(true)
+        .with_resident_key(true) // Force resident key
+        .with_timeout(30000);
+
+    print_operation("Register credential for User B");
+    let attestation_b = Client::make_credential(&mut transport, request_b)?;
+    assert_eq!(
+        attestation_b[0], 0x00,
+        "Second credential registration failed with CTAP status: 0x{:02x}",
+        attestation_b[0]
+    );
+    println!("   ✓ User B registered ({} bytes)\n", attestation_b.len());
+
+    let cred_id_b = extract_credential_id(&attestation_b[1..])?;
+    println!("   Credential ID B: {} bytes\n", cred_id_b.len());
+
+    // Now authenticate with User A's credential ID in allowList
+    println!("🔐 Authenticating with User A's credential (via allowList)...\n");
+
+    let challenge_auth = generate_challenge();
+    let client_data_hash_auth = generate_client_data_hash_for_authentication(&challenge_auth);
+
+    let request_auth = GetAssertionRequest::new(client_data_hash_auth, RP_ID)
+        .with_credentials(vec![CredentialDescriptor {
+            id: cred_id_a.clone(),
+            credential_type: CredentialType::PublicKey,
+        }]) // Specify User A's credential
+        .with_user_verification(true)
+        .with_timeout(30000);
+
+    print_operation("Authenticate with User A via allowList");
+    let assertion = Client::get_assertion(&mut transport, request_auth)?;
+
+    assert_eq!(
+        assertion[0], 0x00,
+        "Authentication failed with CTAP status: 0x{:02x}",
+        assertion[0]
+    );
+    println!(
+        "   ✓ Authentication succeeded ({} bytes)\n",
+        assertion.len()
+    );
+
+    // Verify the response is valid CBOR
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[1..]) {
+        Ok(ciborium::value::Value::Map(_)) => {
+            println!("   ✓ Response is valid CBOR map");
+        }
+        Ok(_) => panic!("Response is not a CBOR map"),
+        Err(e) => panic!("Failed to parse assertion: {}", e),
+    }
+
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║  ✓ Allow List Credential Selection Works!     ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    Ok(())
+}
+
+/// Extract credential ID from attestation response
+fn extract_credential_id(attestation_cbor: &[u8]) -> Result<Vec<u8>> {
+    let value: ciborium::value::Value =
+        ciborium::from_reader(attestation_cbor).map_err(|_e| soft_fido2::Error::Other)?;
+
+    if let ciborium::value::Value::Map(map) = value {
+        // Look for authData (key 0x02)
+        for (key, val) in map {
+            if let ciborium::value::Value::Integer(i) = key {
+                let i_val: i128 = i.into();
+                if i_val == 2
+                    && let ciborium::value::Value::Bytes(auth_data) = val
+                {
+                    // Auth data format: rpIdHash(32) + flags(1) + counter(4) + attested_cred_data
+                    // Attested cred data: aaguid(16) + credIdLen(2) + credId(credIdLen) + ...
+                    if auth_data.len() < 37 + 16 + 2 {
+                        return Err(soft_fido2::Error::Other);
+                    }
+
+                    let cred_id_len_offset = 37 + 16; // Skip rpIdHash(32) + flags(1) + counter(4) + aaguid(16)
+                    let cred_id_len = u16::from_be_bytes([
+                        auth_data[cred_id_len_offset],
+                        auth_data[cred_id_len_offset + 1],
+                    ]) as usize;
+
+                    let cred_id_offset = cred_id_len_offset + 2;
+                    if auth_data.len() < cred_id_offset + cred_id_len {
+                        return Err(soft_fido2::Error::Other);
+                    }
+
+                    return Ok(auth_data[cred_id_offset..cred_id_offset + cred_id_len].to_vec());
+                }
+            }
+        }
+    }
+
+    Err(soft_fido2::Error::Other)
+}
+
+#[test]
+#[ignore]
+fn test_local_authentication_with_allow_list() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_authentication_with_allow_list_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_authentication_with_allow_list() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_authentication_with_allow_list_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_authentication_with_allow_list() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_authentication_with_allow_list_test()
+    })
+}
+
 /// Core test logic for authentication without credential (should fail)
 fn run_authentication_without_credential_fails_test() -> Result<()> {
     println!("\n╔════════════════════════════════════════════════╗");
@@ -489,14 +708,24 @@ fn run_authentication_without_credential_fails_test() -> Result<()> {
 
     println!("   Sending getAssertion...");
 
-    match Client::get_assertion(&mut transport, request) {
-        Ok(_) => {
-            panic!("Authentication should have failed for non-existent credential");
-        }
-        Err(e) => {
-            println!("   ✓ Authentication failed as expected: {:?}", e);
-        }
+    let result = Client::get_assertion(&mut transport, request)?;
+
+    // Check if the response is an error (status byte != 0x00)
+    if result.is_empty() {
+        panic!("Received empty response");
     }
+
+    let status = result[0];
+    if status == 0x00 {
+        panic!(
+            "Authentication should have failed for non-existent credential, but got success (status 0x00)"
+        );
+    }
+
+    println!(
+        "   ✓ Authentication failed as expected: CTAP status 0x{:02x}",
+        status
+    );
 
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║        ✓ Correctly Rejected Invalid Auth!     ║");

@@ -73,11 +73,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             return Ok(UpResult::Accepted);
         }
 
-        match show_verification_notification(
-            info.split(":").next().unwrap_or("Unknown"),
-            Some(rp),
-            user,
-        ) {
+        match show_verification_notification(info, Some(rp), user) {
             Ok(crate::notification::NotificationResult::Accepted) => Ok(UpResult::Accepted),
             Ok(crate::notification::NotificationResult::Denied) => Ok(UpResult::Denied),
             Err(e) => {
@@ -98,11 +94,8 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         rp_id: &str,
         credential: &CredentialRef,
     ) -> Result<()> {
-        info!(
-            "Storing credential: id={}, rp_id={}",
-            hex::encode(cred_id),
-            rp_id
-        );
+        info!("Storing credential for RP: {}", rp_id);
+        debug!("Credential ID: {:?}", cred_id);
         let mut storage = self.storage.lock().unwrap();
         storage.write(cred_id, rp_id, *credential)?;
         info!("Credential persisted successfully for RP: {}", rp_id);
@@ -110,11 +103,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     }
 
     fn read_credential(&self, cred_id: &[u8], rp_id: &str) -> Result<Option<Credential>> {
-        debug!(
-            "Reading credential: rp={}, id={}",
-            rp_id,
-            hex::encode(cred_id)
-        );
+        debug!("Reading credential: rp={}, id={:?}", rp_id, cred_id);
         let mut storage = self.storage.lock().unwrap();
 
         match storage.read(cred_id, rp_id) {
@@ -140,7 +129,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     }
 
     fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
-        info!("Removing credential ID: {}", hex::encode(cred_id));
+        info!("Removing credential ID: {:?}", cred_id);
         let mut storage = self.storage.lock().unwrap();
         storage.delete(cred_id)?;
         debug!("Credential removed");
@@ -243,15 +232,6 @@ pub struct AuthenticatorService<S: CredentialStorage> {
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     /// Create a new authenticator service
-    ///
-    /// # Arguments
-    ///
-    /// * `storage` - The storage backend implementation
-    /// * `user_verification_config` - User verification configuration
-    ///
-    /// # Returns
-    ///
-    /// A new AuthenticatorService instance
     pub fn new(storage: S, user_verification_config: UserVerificationConfig) -> Result<Self> {
         let storage = Arc::new(Mutex::new(storage));
         let callbacks = PasslessCallbacks::new(storage.clone(), user_verification_config);
@@ -264,14 +244,14 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             up: true,                      // User presence
             uv: Some(true),                // User verification
             plat: true,                    // Platform authenticator
-            client_pin: Some(false),       // Client PIN support
+            client_pin: Some(true),        // Client PIN support
             pin_uv_auth_token: Some(true), // PIN UV auth token
             cred_mgmt: Some(true),         // Credential management enabled
             bio_enroll: None,
             large_blobs: None,
             ep: None,
             always_uv: Some(true),
-            make_cred_uv_not_required: None,
+            make_cred_uv_not_required: Some(true),
         };
 
         let config = AuthenticatorConfig::builder()
@@ -304,14 +284,6 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     }
 
     /// Process a CTAP request and generate a response
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The CTAP request data
-    /// * `response_buffer` - Buffer to write the response into
-    ///
-    /// # Returns
-    ///
     /// Ok(()) on success or an error
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         self.authenticator.handle(request, response_buffer)?;

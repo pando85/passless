@@ -5,7 +5,7 @@
 use crate::authenticator::AuthenticatorService;
 use crate::storage::CredentialStorage;
 
-use log::{debug, info};
+use log::debug;
 
 /// Command byte for custom credential management (0x41 - Yubikey variant)
 pub const CMD_CUSTOM_CREDENTIAL_MGMT: u8 = 0x41;
@@ -22,7 +22,7 @@ pub const CMD_CUSTOM_CREDENTIAL_MGMT: u8 = 0x41;
 pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static>(
     service: &mut AuthenticatorService<S>,
 ) {
-    info!("Registering Yubikey credential management command (0x41)");
+    debug!("Registering Yubikey credential management command (0x41)");
 
     service.register_custom_command(CMD_CUSTOM_CREDENTIAL_MGMT, |request| {
         debug!(
@@ -42,7 +42,7 @@ pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static>(
         Ok(vec![0xa0])
     });
 
-    info!("Yubikey credential management command (0x41) registered successfully");
+    debug!("Yubikey credential management command (0x41) registered successfully");
 }
 
 #[cfg(test)]
