@@ -19,8 +19,10 @@ path = "src/main.rs"
 [dependencies]
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
-soft-fido2 = { path = "../soft-fido2/soft-fido2" }
-soft-fido2-transport = { path = "../soft-fido2/soft-fido2-transport" }
+#soft-fido2 = { path = "../soft-fido2/soft-fido2" }
+#soft-fido2-transport = { path = "../soft-fido2/soft-fido2-transport" }
+soft-fido2 = "0.1.0"
+soft-fido2-transport = "0.1.0"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
