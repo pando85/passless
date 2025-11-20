@@ -54,6 +54,7 @@ impl BackendSetup for LocalBackend {
             "local".to_string(),
             "--local-path".to_string(),
             self.temp_dir.path().join("fido2").display().to_string(),
+            "-v".to_string(),
         ]
     }
 }
@@ -173,6 +174,7 @@ impl BackendSetup for PassBackend {
             "pass".to_string(),
             "--pass-store-path".to_string(),
             self.pass_store.display().to_string(),
+            "-v".to_string(),
         ]
     }
 }
@@ -277,6 +279,7 @@ impl BackendSetup for TpmBackend {
                 .join("credentials")
                 .display()
                 .to_string(),
+            "-v".to_string(),
         ]
     }
 

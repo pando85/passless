@@ -59,7 +59,7 @@ pub trait CredentialStorage: Send + Sync {
     /// # Returns
     ///
     /// The credential bytes or an error
-    fn read(&mut self, id: &str, rp: &str) -> Result<Vec<u8>>;
+    fn read(&mut self, id: &[u8], rp: &str) -> Result<Vec<u8>>;
 
     /// Store a new credential
     ///
@@ -72,7 +72,7 @@ pub trait CredentialStorage: Send + Sync {
     /// # Returns
     ///
     /// Ok(()) on success or an error
-    fn write(&mut self, id: &str, rp: &str, cred: CredentialRef) -> Result<()>;
+    fn write(&mut self, id: &[u8], rp: &str, cred: CredentialRef) -> Result<()>;
 
     /// Delete a credential by ID
     ///
@@ -83,7 +83,7 @@ pub trait CredentialStorage: Send + Sync {
     /// # Returns
     ///
     /// Ok(()) on success or an error
-    fn delete(&mut self, id: &str) -> Result<()>;
+    fn delete(&mut self, id: &[u8]) -> Result<()>;
 
     /// Get all user names for a given relying party
     ///

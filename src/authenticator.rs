@@ -98,11 +98,14 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         rp_id: &str,
         credential: &CredentialRef,
     ) -> Result<()> {
-        info!("Storing credential for RP: {}", rp_id);
+        info!(
+            "Storing credential: id={}, rp_id={}",
+            hex::encode(cred_id),
+            rp_id
+        );
         let mut storage = self.storage.lock().unwrap();
-        let id_hex = hex::encode(cred_id);
-        storage.write(&id_hex, rp_id, *credential)?;
-        debug!("Credential persisted");
+        storage.write(cred_id, rp_id, *credential)?;
+        info!("Credential persisted successfully for RP: {}", rp_id);
         Ok(())
     }
 
@@ -113,9 +116,8 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             hex::encode(cred_id)
         );
         let mut storage = self.storage.lock().unwrap();
-        let id_hex = hex::encode(cred_id);
 
-        match storage.read(&id_hex, rp_id) {
+        match storage.read(cred_id, rp_id) {
             Ok(bytes) => {
                 debug!("Credential found, deserializing");
                 // Deserialize the credential from bytes
@@ -140,14 +142,13 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
         info!("Removing credential ID: {}", hex::encode(cred_id));
         let mut storage = self.storage.lock().unwrap();
-        let id_hex = hex::encode(cred_id);
-        storage.delete(&id_hex)?;
+        storage.delete(cred_id)?;
         debug!("Credential removed");
         Ok(())
     }
 
     fn list_credentials(&self, rp_id: &str, _user_id: Option<&[u8]>) -> Result<Vec<Credential>> {
-        debug!("Listing credentials for RP: {}", rp_id);
+        info!("Listing credentials for RP: {}", rp_id);
         let mut storage = self.storage.lock().unwrap();
 
         let filter = CredentialFilter::ByRp(rp_id.to_string());
@@ -155,16 +156,31 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         let mut credentials = Vec::new();
 
         // Read first credential
-        if let Ok(first_cred) = storage.read_first(filter) {
-            credentials.push(first_cred);
+        match storage.read_first(filter) {
+            Ok(first_cred) => {
+                info!(
+                    "Found first credential for RP {}: id={}",
+                    rp_id,
+                    hex::encode(&first_cred.id)
+                );
+                credentials.push(first_cred);
 
-            // Read remaining credentials
-            while let Ok(cred) = storage.read_next() {
-                credentials.push(cred);
+                // Read remaining credentials
+                while let Ok(cred) = storage.read_next() {
+                    info!("Found additional credential: id={}", hex::encode(&cred.id));
+                    credentials.push(cred);
+                }
+            }
+            Err(e) => {
+                info!("No credentials found for RP {}: {:?}", rp_id, e);
             }
         }
 
-        debug!("Found {} credentials for RP: {}", credentials.len(), rp_id);
+        info!(
+            "Total credentials found for RP {}: {}",
+            rp_id,
+            credentials.len()
+        );
         Ok(credentials)
     }
 

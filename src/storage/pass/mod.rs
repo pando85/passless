@@ -564,13 +564,12 @@ impl CredentialStorage for PassStorageAdapter {
         self.find_next().map_err(Into::into)
     }
 
-    fn read(&mut self, id: &str, _rp: &str) -> soft_fido2::Result<Vec<u8>> {
+    fn read(&mut self, id: &[u8], _rp: &str) -> soft_fido2::Result<Vec<u8>> {
         self.cache.evict_expired();
 
-        debug!("read called with id: {}", id);
+        debug!("read called with id: {}", hex::encode(id));
 
-        let id_bytes = id.as_bytes();
-        let cred = self.read_credential_by_id(id_bytes).map_err(|e| {
+        let cred = self.read_credential_by_id(id).map_err(|e| {
             debug!("Failed to read credential: {:?}", e);
             e
         })?;
@@ -578,7 +577,7 @@ impl CredentialStorage for PassStorageAdapter {
         cred.to_bytes()
     }
 
-    fn write(&mut self, _id: &str, _rp: &str, cred_ref: CredentialRef) -> soft_fido2::Result<()> {
+    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> soft_fido2::Result<()> {
         self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);
@@ -599,12 +598,11 @@ impl CredentialStorage for PassStorageAdapter {
             .map_err(Into::into)
     }
 
-    fn delete(&mut self, id: &str) -> soft_fido2::Result<()> {
+    fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
         self.cache.evict_expired();
 
-        debug!("delete called with id: {}", id);
-        let id_bytes = id.as_bytes();
-        self.delete_credential(id_bytes).map_err(Into::into)
+        debug!("delete called with id: {}", hex::encode(id));
+        self.delete_credential(id).map_err(Into::into)
     }
 
     fn select_users(&self, rp_id: &str) -> Vec<String> {

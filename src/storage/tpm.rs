@@ -721,18 +721,17 @@ impl CredentialStorage for TpmStorageAdapter {
         self.find_next()
     }
 
-    fn read(&mut self, id: &str, _rp: &str) -> Result<Vec<u8>> {
+    fn read(&mut self, id: &[u8], _rp: &str) -> Result<Vec<u8>> {
         self.cache.evict_expired();
 
-        debug!("read called with id: {}", id);
+        debug!("read called with id: {}", hex::encode(id));
 
-        let id_bytes = id.as_bytes();
-        let cred = self.read_credential_by_id(id_bytes)?;
+        let cred = self.read_credential_by_id(id)?;
 
         cred.to_bytes()
     }
 
-    fn write(&mut self, _id: &str, _rp: &str, cred_ref: CredentialRef) -> Result<()> {
+    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> Result<()> {
         self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);
@@ -748,12 +747,11 @@ impl CredentialStorage for TpmStorageAdapter {
         self.write_credential(&credential)
     }
 
-    fn delete(&mut self, id: &str) -> Result<()> {
+    fn delete(&mut self, id: &[u8]) -> Result<()> {
         self.cache.evict_expired();
 
-        debug!("delete called with id: {}", id);
-        let id_bytes = id.as_bytes();
-        self.delete_credential(id_bytes)
+        debug!("delete called with id: {}", hex::encode(id));
+        self.delete_credential(id)
     }
 
     fn select_users(&self, rp_id: &str) -> Vec<String> {
