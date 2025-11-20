@@ -736,14 +736,10 @@ impl CredentialStorage for TpmStorageAdapter {
 
         debug!("write called for RP: {}", cred_ref.rp_id);
 
-        let mut credential = cred_ref.to_owned();
-        credential.sign_count = 0;
-        credential.created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        credential.discoverable = true;
-
+        // Just save the credential as provided by soft-fido2
+        // This is called both during registration (new credential) and
+        // during authentication (updating sign counter)
+        let credential = cred_ref.to_owned();
         self.write_credential(&credential)
     }
 

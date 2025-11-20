@@ -625,7 +625,7 @@ fn run_authentication_with_allow_list_test() -> Result<()> {
 /// Extract credential ID from attestation response
 fn extract_credential_id(attestation_cbor: &[u8]) -> Result<Vec<u8>> {
     let value: ciborium::value::Value =
-        ciborium::from_reader(attestation_cbor).map_err(|_e| soft_fido2::Error::Other)?;
+        ciborium::from_reader(attestation_cbor).map_err(|_| soft_fido2::Error::Other)?;
 
     if let ciborium::value::Value::Map(map) = value {
         // Look for authData (key 0x02)

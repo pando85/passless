@@ -582,14 +582,7 @@ impl CredentialStorage for PassStorageAdapter {
 
         debug!("write called for RP: {}", cred_ref.rp_id);
 
-        let mut credential = cred_ref.to_owned();
-        credential.sign_count = 0;
-        credential.created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        credential.discoverable = true;
-
+        let credential = cred_ref.to_owned();
         let cred_json = serde_json::to_string(&credential).map_err(|e| {
             debug!("Failed to serialize credential: {:?}", e);
             Error::Storage(format!("Failed to serialize credential: {:?}", e))
