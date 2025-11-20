@@ -8,8 +8,10 @@
 //! - Waiting for the authenticator to be ready
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -394,7 +396,11 @@ impl AuthenticatorHarness {
 
         // Build the cargo command
         let mut cmd = Command::new("cargo");
-        cmd.arg("run").arg("--").args(&args);
+        cmd.arg("run")
+            .arg("--")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         // Add environment variables
         for (key, value) in env_vars {
@@ -402,7 +408,25 @@ impl AuthenticatorHarness {
         }
 
         // Spawn the process
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
+
+        // Spawn threads to capture stdout/stderr using a small helper
+        fn spawn_log_thread<R: Read + Send + 'static>(r: R) {
+            thread::spawn(move || {
+                let reader = BufReader::new(r);
+                for line in reader.lines().map_while(Result::ok) {
+                    println!("{}", line);
+                }
+            });
+        }
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_log_thread(stdout);
+        }
+
+        if let Some(stderr) = child.stderr.take() {
+            spawn_log_thread(stderr);
+        }
 
         self.process = Some(child);
         self.started_by_harness = true;
