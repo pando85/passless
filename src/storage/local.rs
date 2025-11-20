@@ -176,14 +176,10 @@ impl CredentialStorage for LocalStorageAdapter {
     }
 
     fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> Result<()> {
-        let mut cred = cred_ref.to_owned();
-        cred.sign_count = 0;
-        cred.created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        cred.discoverable = true;
-
+        // Just save the credential as provided by soft-fido2
+        // This is called both during registration (new credential) and
+        // during authentication (updating sign counter)
+        let cred = cred_ref.to_owned();
         self.save_credential(&cred)
     }
 
