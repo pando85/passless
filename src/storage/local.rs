@@ -87,7 +87,7 @@ impl LocalStorageAdapter {
 
     /// Save a credential to a file
     fn save_credential(&self, cred: &Credential) -> Result<()> {
-        let filename = self.get_filename_for_cred(&cred.user.id);
+        let filename = self.get_filename_for_cred(&cred.id);
         let path = self.storage_dir.join(filename);
 
         let bytes = cred.to_bytes()?;
@@ -99,10 +99,10 @@ impl LocalStorageAdapter {
         Ok(())
     }
 
-    /// Generate a filename for a credential based on user ID
-    fn get_filename_for_cred(&self, user_id: &[u8]) -> String {
+    /// Generate a filename for a credential based on ID
+    fn get_filename_for_cred(&self, id: &[u8]) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(user_id);
+        hasher.update(id);
         let hash: [u8; 32] = hasher.finalize().into();
         format!(
             "cred_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
@@ -170,15 +170,12 @@ impl CredentialStorage for LocalStorageAdapter {
         self.find_next()
     }
 
-    fn read(&mut self, id: &str, rp: &str) -> Result<Vec<u8>> {
-        let cred = self.read_first(CredentialFilter::ById(id.as_bytes().to_vec()))?;
-        if cred.rp.id != rp {
-            return Err(soft_fido2::Error::DoesNotExist);
-        }
+    fn read(&mut self, id: &[u8], _rp: &str) -> Result<Vec<u8>> {
+        let cred = self.read_first(CredentialFilter::ById(id.to_vec()))?;
         cred.to_bytes()
     }
 
-    fn write(&mut self, _id: &str, _rp: &str, cred_ref: CredentialRef) -> Result<()> {
+    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> Result<()> {
         let mut cred = cred_ref.to_owned();
         cred.sign_count = 0;
         cred.created = std::time::SystemTime::now()
@@ -190,13 +187,11 @@ impl CredentialStorage for LocalStorageAdapter {
         self.save_credential(&cred)
     }
 
-    fn delete(&mut self, id: &str) -> Result<()> {
-        let id_bytes = id.as_bytes();
-
+    fn delete(&mut self, id: &[u8]) -> Result<()> {
         let credentials = self.load_all_credentials();
         for cred in credentials {
-            if cred.id == id_bytes {
-                let filename = self.get_filename_for_cred(&cred.user.id);
+            if cred.id == id {
+                let filename = self.get_filename_for_cred(&cred.id);
                 let path = self.storage_dir.join(filename);
                 fs::remove_file(path).map_err(|_| soft_fido2::Error::Other)?;
                 return Ok(());
