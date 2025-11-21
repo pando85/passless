@@ -48,16 +48,16 @@ pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::UserVerificationConfig;
+
+    use crate::config::SecurityConfig;
     use crate::storage::LocalStorageAdapter;
 
     #[test]
     fn test_register_yubikey_command() {
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
-        let uv_config = UserVerificationConfig::default();
 
-        let mut service = AuthenticatorService::new(storage, uv_config).unwrap();
+        let mut service = AuthenticatorService::new(storage, SecurityConfig::default()).unwrap();
         register_yubikey_credential_mgmt(&mut service);
 
         // Test that custom command was registered
