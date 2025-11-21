@@ -181,10 +181,6 @@ struct RunArgs {
     #[command(flatten)]
     security: config::SecurityConfig,
 
-    /// User verification configuration
-    #[command(flatten)]
-    user_verification: config::UserVerificationConfig,
-
     /// Enable verbose logging
     #[arg(
         short,
@@ -217,10 +213,6 @@ impl config::CliArgs for RunArgs {
 
     fn security_config(&self) -> &config::SecurityConfig {
         &self.security
-    }
-
-    fn user_verification_config(&self) -> &config::UserVerificationConfig {
-        &self.user_verification
     }
 }
 
@@ -315,28 +307,13 @@ fn main() -> Result<()> {
     info!("Creating authenticator service...");
     match config.backend() {
         config::BackendConfig::Local(cfg) => {
-            run_backend!(
-                LocalStorageAdapter,
-                &cfg,
-                uhid,
-                config.user_verification.clone()
-            )
+            run_backend!(LocalStorageAdapter, &cfg, uhid, config.security.clone())
         }
         config::BackendConfig::Pass(cfg) => {
-            run_backend!(
-                PassStorageAdapter,
-                &cfg,
-                uhid,
-                config.user_verification.clone()
-            )
+            run_backend!(PassStorageAdapter, &cfg, uhid, config.security.clone())
         }
         config::BackendConfig::Tpm(cfg) => {
-            run_backend!(
-                TpmStorageAdapter,
-                &cfg,
-                uhid,
-                config.user_verification.clone()
-            )
+            run_backend!(TpmStorageAdapter, &cfg, uhid, config.security.clone())
         }
     }
 }

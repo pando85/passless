@@ -13,29 +13,6 @@ use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
 use serde::{Deserialize, Serialize};
 
-/// User verification configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
-#[group(id = "user_verification")]
-pub struct UserVerificationConfig {
-    /// Enable user verification notification for registration
-    #[arg(
-        long = "user-verification-registration",
-        env = "PASSLESS_USER_VERIFICATION_REGISTRATION",
-        help = "Show user verification notification during registration"
-    )]
-    #[serde(default)]
-    pub registration: Option<bool>,
-
-    /// Enable user verification notification for authentication
-    #[arg(
-        long = "user-verification-authentication",
-        env = "PASSLESS_USER_VERIFICATION_AUTHENTICATION",
-        help = "Show user verification notification during authentication"
-    )]
-    #[serde(default)]
-    pub authentication: Option<bool>,
-}
-
 /// Security hardening configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Args, Default)]
 #[group(id = "security")]
@@ -58,6 +35,34 @@ pub struct SecurityConfig {
     )]
     #[serde(default)]
     pub disable_core_dumps: Option<bool>,
+
+    /// Enable constant signature counter helps RPs (relying parties) detect cloned or duplicated
+    /// authenticators
+    #[arg(
+        long = "constant-signature-counter",
+        env = "PASSLESS_CONSTANT_SIGNATURE_COUNTER",
+        help = "Enable constant signature counter to help RPs detect cloned or duplicated authenticators"
+    )]
+    #[serde(default)]
+    pub constant_signature_counter: Option<bool>,
+
+    /// Enable user verification notification for registration
+    #[arg(
+        long = "user-verification-registration",
+        env = "PASSLESS_USER_VERIFICATION_REGISTRATION",
+        help = "Show user verification notification during registration"
+    )]
+    #[serde(default)]
+    pub user_verification_registration: Option<bool>,
+
+    /// Enable user verification notification for authentication
+    #[arg(
+        long = "user-verification-authentication",
+        env = "PASSLESS_USER_VERIFICATION_AUTHENTICATION",
+        help = "Show user verification notification during authentication"
+    )]
+    #[serde(default)]
+    pub user_verification_authentication: Option<bool>,
 }
 
 /// Security hardening functions
@@ -226,10 +231,6 @@ pub struct AppConfig {
     /// Security hardening configuration
     #[serde(default)]
     pub security: SecurityConfig,
-
-    /// User verification configuration
-    #[serde(default)]
-    pub user_verification: UserVerificationConfig,
 }
 
 fn default_backend_type() -> String {
@@ -245,7 +246,6 @@ impl Default for AppConfig {
             pass: PassBackendConfig::default(),
             tpm: TpmBackendConfig::default(),
             security: SecurityConfig::default(),
-            user_verification: UserVerificationConfig::default(),
         }
     }
 }
@@ -269,7 +269,6 @@ pub trait CliArgs {
     fn tpm_config(&self) -> &TpmBackendConfig;
     fn verbose(&self) -> bool;
     fn security_config(&self) -> &SecurityConfig;
-    fn user_verification_config(&self) -> &UserVerificationConfig;
 }
 
 impl AppConfig {
@@ -302,10 +301,13 @@ impl AppConfig {
             security: SecurityConfig {
                 use_mlock: Some(defaults::SECURITY_USE_MLOCK),
                 disable_core_dumps: Some(defaults::SECURITY_DISABLE_CORE_DUMPS),
-            },
-            user_verification: UserVerificationConfig {
-                registration: Some(defaults::USER_VERIFICATION_REGISTRATION),
-                authentication: Some(defaults::USER_VERIFICATION_AUTHENTICATION),
+                constant_signature_counter: Some(defaults::SECURITY_CONSTANT_SIGNATURE_COUNTER),
+                user_verification_registration: Some(
+                    defaults::SECURITY_USER_VERIFICATION_REGISTRATION,
+                ),
+                user_verification_authentication: Some(
+                    defaults::SECURITY_USER_VERIFICATION_AUTHENTICATION,
+                ),
             },
         }
     }
@@ -362,15 +364,17 @@ impl AppConfig {
                     cli.security_config().disable_core_dumps,
                     self.security.disable_core_dumps,
                 ),
-            },
-            user_verification: UserVerificationConfig {
-                registration: merge_opt(
-                    cli.user_verification_config().registration,
-                    self.user_verification.registration,
+                constant_signature_counter: merge_opt(
+                    cli.security_config().constant_signature_counter,
+                    self.security.constant_signature_counter,
                 ),
-                authentication: merge_opt(
-                    cli.user_verification_config().authentication,
-                    self.user_verification.authentication,
+                user_verification_registration: merge_opt(
+                    cli.security_config().user_verification_registration,
+                    self.security.user_verification_registration,
+                ),
+                user_verification_authentication: merge_opt(
+                    cli.security_config().user_verification_authentication,
+                    self.security.user_verification_authentication,
                 ),
             },
         }

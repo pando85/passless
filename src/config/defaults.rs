@@ -12,11 +12,14 @@ pub const SECURITY_USE_MLOCK: bool = true;
 /// Default value for disable_core_dumps security setting
 pub const SECURITY_DISABLE_CORE_DUMPS: bool = true;
 
+/// Default value for constant signature counter
+pub const SECURITY_CONSTANT_SIGNATURE_COUNTER: bool = false;
+
 /// Default value for user verification during registration
-pub const USER_VERIFICATION_REGISTRATION: bool = true;
+pub const SECURITY_USER_VERIFICATION_REGISTRATION: bool = true;
 
 /// Default value for user verification during authentication
-pub const USER_VERIFICATION_AUTHENTICATION: bool = true;
+pub const SECURITY_USER_VERIFICATION_AUTHENTICATION: bool = true;
 
 /// Default relative path within password-store for FIDO2 credentials
 pub const PASS_PATH: &str = "fido2";
