@@ -404,6 +404,9 @@ impl PassStorageAdapter {
 
         debug!("Successfully wrote and encrypted credential");
 
+        // Invalidate cache entry for this credential to ensure fresh reads
+        self.cache.remove(&path);
+
         // Update all indexes using shared function
         update_indexes_on_write(
             &mut self.indexes,
