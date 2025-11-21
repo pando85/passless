@@ -1,9 +1,7 @@
 //! Store initialized, ready for optional git setup
 
 use crate::error::{Error, Result};
-use crate::notification::{
-    YesNoResult, show_error_notification, show_info_notification, show_yes_no_notification,
-};
+use crate::notification::{show_error_notification, show_info_notification};
 
 use super::complete::Complete;
 
@@ -20,20 +18,8 @@ pub struct StoreInitialized {
 
 impl StoreInitialized {
     pub fn setup_git(self) -> Result<Complete> {
-        match show_yes_no_notification(
-            "Git Sync Setup",
-            "Would you like to set up git sync for your password store?\n\n\
-             This will initialize a git repository in the store directory.\n\
-             You can add a remote later using: git remote add origin <url>",
-        ) {
-            Ok(YesNoResult::Accepted) => {
-                info!("Setting up git");
-                initialize_git_repo(&self.store_path)?;
-            }
-            Ok(YesNoResult::Denied) => info!("Git setup declined"),
-            Err(e) => warn!("Failed to show git setup prompt: {}", e),
-        }
-
+        info!("Setting up git");
+        initialize_git_repo(&self.store_path)?;
         Ok(Complete {
             store_path: self.store_path,
             fingerprint: self.fingerprint,
