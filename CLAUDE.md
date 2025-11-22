@@ -250,6 +250,43 @@ Configuration can be set via environment variables:
 - `PASSLESS_LOG_STYLE`: Log style
 - `PASSLESS_E2E_AUTO_ACCEPT_UV`: Auto-accept UV in E2E tests (debug only)
 
+**Formatting Rules:**
+- Imports from different crate paths must be on separate lines
+- Imports from the same crate path (same submodule) must be grouped with braces
+- Each import line must end with a semicolon
+
+**Correct Example:**
+```rust
+use super::SomeType;
+
+use crate::error::Error;
+use crate::pin_token::{Permission, PinToken, PinTokenManager};
+
+use soft_fido2_crypto::{ecdsa, pin_protocol};
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use ciborium::cbor;
+use serde::Serialize;
+```
+
+**Incorrect Examples:**
+```rust
+// ❌ Wrong: combining different submodules with braces
+use std::{collections::HashMap, sync::{Arc, Mutex}};
+
+// ❌ Wrong: not grouping same submodule imports
+use crate::pin_token::Permission;
+use crate::pin_token::PinToken;
+use crate::pin_token::PinTokenManager;
+
+// ❌ Wrong: imports not in correct order
+use serde::Serialize;
+use crate::error::Error;
+use std::sync::Arc;
+```
+
 ## CI/CD
 
 The project uses GitHub Actions (`.github/workflows/rust.yml`):

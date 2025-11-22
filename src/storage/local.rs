@@ -2,7 +2,7 @@
 //!
 //! This adapter implements the CredentialStorage trait using the local file system.
 
-use crate::config::{self, LocalBackendConfig};
+use crate::config::{LocalBackendConfig, Resolved};
 use crate::storage::{CredentialFilter, CredentialStorage};
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
@@ -48,12 +48,8 @@ impl LocalStorageAdapter {
     }
 
     /// Create a new local storage adapter from configuration
-    pub fn from_config(config: &LocalBackendConfig) -> Result<Self> {
-        let path = config
-            .path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config::defaults::local_path().into());
+    pub fn from_config(config: &LocalBackendConfig<Resolved>) -> Result<Self> {
+        let path = PathBuf::from(&config.path);
         Self::new(path)
     }
 

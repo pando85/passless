@@ -12,7 +12,7 @@
 //! Indexes are built by scanning directory structure (no unsealing needed)
 //! Credentials are only unsealed when needed for authentication
 
-use crate::config::{self, TpmBackendConfig};
+use crate::config::{Resolved, TpmBackendConfig};
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
     update_indexes_on_delete, update_indexes_on_write,
@@ -155,13 +155,9 @@ impl TpmStorageAdapter {
     }
 
     /// Create a new TPM storage adapter from configuration
-    pub fn from_config(config: &TpmBackendConfig) -> Result<Self> {
-        let path = config
-            .path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config::defaults::tpm_path().into());
-        let tcti = config.tcti.clone();
+    pub fn from_config(config: &TpmBackendConfig<Resolved>) -> Result<Self> {
+        let path = PathBuf::from(&config.path);
+        let tcti = Some(config.tcti.clone());
         Self::new(path, tcti)
     }
 
