@@ -13,6 +13,7 @@ RestartSec=5s
 # The application already handles its own memory locking and core dump prevention
 # but we can add additional systemd protections
 NoNewPrivileges=true
+LimitMEMLOCK=32M
 
 # Logging
 StandardOutput=journal
