@@ -19,7 +19,7 @@ use config::{
 };
 use env_logger::{Builder, Env};
 use error::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
 
 /// Wrapper for AuthenticatorService that implements CommandHandler
@@ -293,8 +293,7 @@ fn main() -> Result<()> {
 
     info!("Applying security hardening...");
     if let Err(e) = config.security.apply_hardening() {
-        error!("Failed to apply security hardening: {}", e);
-        // Don't exit, just warn - some hardening may require privileges
+        warn!("Failed to apply security hardening: {}", e);
     }
 
     info!("Opening UHID device...");

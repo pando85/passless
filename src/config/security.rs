@@ -61,7 +61,8 @@ impl SecurityConfig<Resolved> {
         let r = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
         if r != 0 {
             return Err(format!(
-                "mlockall failed (errno {}). Consider increasing RLIMIT_MEMLOCK.\n\
+                "mlockall failed (errno {}).\n\
+                 Hint: increase DefaultLimitMEMLOCK at /etc/systemd/system.conf and /etc/systemd/user.conf level.\n\
                  Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'",
                 std::io::Error::last_os_error()
             )
