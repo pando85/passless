@@ -12,7 +12,6 @@
 //! Indexes are built by scanning directory structure (no unsealing needed)
 //! Credentials are only unsealed when needed for authentication
 
-use crate::config::{Resolved, TpmBackendConfig};
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
     update_indexes_on_delete, update_indexes_on_write,
@@ -152,13 +151,6 @@ impl TpmStorageAdapter {
         };
 
         Ok(adapter)
-    }
-
-    /// Create a new TPM storage adapter from configuration
-    pub fn from_config(config: &TpmBackendConfig<Resolved>) -> Result<Self> {
-        let path = PathBuf::from(&config.path);
-        let tcti = Some(config.tcti.clone());
-        Self::new(path, tcti)
     }
 
     /// Create a primary storage key in the owner hierarchy

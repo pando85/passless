@@ -1,4 +1,4 @@
-use crate::config::{Resolved, SecurityConfig};
+use crate::config::SecurityConfig;
 use crate::notification::show_verification_notification;
 use crate::storage::{CredentialFilter, CredentialStorage};
 
@@ -14,11 +14,11 @@ use log::{debug, error, info};
 /// Passless authenticator callbacks implementation
 pub struct PasslessCallbacks<S: CredentialStorage> {
     storage: Arc<Mutex<S>>,
-    security_config: SecurityConfig<Resolved>,
+    security_config: SecurityConfig,
 }
 
 impl<S: CredentialStorage> PasslessCallbacks<S> {
-    pub fn new(storage: Arc<Mutex<S>>, security_config: SecurityConfig<Resolved>) -> Self {
+    pub fn new(storage: Arc<Mutex<S>>, security_config: SecurityConfig) -> Self {
         Self {
             storage,
             security_config,
@@ -229,7 +229,7 @@ pub struct AuthenticatorService<S: CredentialStorage> {
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     /// Create a new authenticator service
-    pub fn new(storage: S, security_config: SecurityConfig<Resolved>) -> Result<Self> {
+    pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
             up: true,                      // User presence
@@ -320,7 +320,15 @@ mod tests {
         let temp_dir = std::env::temp_dir().join("test_passless");
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
 
-        let service = AuthenticatorService::new(storage, SecurityConfig::default());
+        let security_config = SecurityConfig {
+            use_mlock: false,
+            disable_core_dumps: false,
+            constant_signature_counter: false,
+            user_verification_registration: true,
+            user_verification_authentication: true,
+        };
+
+        let service = AuthenticatorService::new(storage, security_config);
         assert!(service.is_ok());
 
         // Cleanup
