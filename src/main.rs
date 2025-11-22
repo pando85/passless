@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use authenticator::AuthenticatorService;
 use clap::{Args, Parser, Subcommand};
 use commands::custom::register_yubikey_credential_mgmt;
-use config::AppConfig;
+use config::{
+    AppConfig, LocalBackendConfigArgs, PassBackendConfigArgs, Raw, Resolved, SecurityConfigArgs,
+    TpmBackendConfigArgs,
+};
 use env_logger::{Builder, Env};
 use error::Result;
 use log::{error, info};
@@ -167,19 +170,19 @@ struct RunArgs {
 
     /// Local backend configuration
     #[command(flatten)]
-    local: config::LocalBackendConfig,
+    local: LocalBackendConfigArgs,
 
     /// Pass backend configuration
     #[command(flatten)]
-    pass: config::PassBackendConfig,
+    pass: PassBackendConfigArgs,
 
     /// TPM backend configuration
     #[command(flatten)]
-    tpm: config::TpmBackendConfig,
+    tpm: TpmBackendConfigArgs,
 
     /// Security hardening configuration
     #[command(flatten)]
-    security: config::SecurityConfig,
+    security: SecurityConfigArgs,
 
     /// Enable verbose logging
     #[arg(
@@ -190,29 +193,17 @@ struct RunArgs {
     verbose: bool,
 }
 
-impl config::CliArgs for RunArgs {
-    fn backend_type(&self) -> Option<String> {
-        self.backend_type.clone()
-    }
-
-    fn local_config(&self) -> &config::LocalBackendConfig {
-        &self.local
-    }
-
-    fn pass_config(&self) -> &config::PassBackendConfig {
-        &self.pass
-    }
-
-    fn tpm_config(&self) -> &config::TpmBackendConfig {
-        &self.tpm
-    }
-
-    fn verbose(&self) -> bool {
-        self.verbose
-    }
-
-    fn security_config(&self) -> &config::SecurityConfig {
-        &self.security
+impl RunArgs {
+    /// Convert CLI args to a Raw config
+    fn to_raw_config(&self) -> AppConfig<Raw> {
+        AppConfig::new(
+            self.backend_type.clone(),
+            Some(self.verbose),
+            self.local.to_raw_config(),
+            self.pass.to_raw_config(),
+            self.tpm.to_raw_config(),
+            self.security.to_raw_config(),
+        )
     }
 }
 
@@ -234,7 +225,7 @@ fn main() -> Result<()> {
             Commands::Config { action } => match action {
                 ConfigAction::Print => {
                     // Generate default configuration with all defaults filled in
-                    let default_config = AppConfig::with_defaults_filled();
+                    let default_config = AppConfig::<Resolved>::with_defaults_filled();
                     let toml_string = toml::to_string_pretty(&default_config).map_err(|e| {
                         error::Error::Config(format!("Failed to serialize config: {}", e))
                     })?;
@@ -263,10 +254,11 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    // Load configuration
-    let config_file = if let Some(config_path) = &run_args.config {
+    // Load configuration using type-state pattern
+    // 1. Load TOML config (Raw state with Options)
+    let toml_config = if let Some(config_path) = &run_args.config {
         info!("Loading configuration from: {}", config_path.display());
-        AppConfig::from_toml(config_path).map_err(|e| {
+        AppConfig::<Raw>::from_toml(config_path).map_err(|e| {
             error!("Failed to load config file: {}", e);
             error::Error::Config(format!("Failed to load config file: {}", e))
         })?
@@ -277,20 +269,27 @@ fn main() -> Result<()> {
         if let Some(ref path) = default_config_path {
             if path.exists() {
                 info!("Loading configuration from: {}", path.display());
-                AppConfig::from_toml(path).map_err(|e| {
+                AppConfig::<Raw>::from_toml(path).map_err(|e| {
                     error!("Failed to load config file: {}", e);
                     error::Error::Config(format!("Failed to load config file: {}", e))
                 })?
             } else {
                 info!("No config file found, using defaults");
-                AppConfig::default()
+                AppConfig::<Raw>::default()
             }
         } else {
-            AppConfig::default()
+            AppConfig::<Raw>::default()
         }
     };
 
-    let config = config_file.merge_cli_overrides(run_args);
+    // 2. Convert CLI args to Raw config
+    let cli_config = run_args.to_raw_config();
+
+    // 3. Merge CLI overrides (CLI takes precedence)
+    let merged_config = toml_config.merge(cli_config);
+
+    // 4. Resolve to concrete config with all defaults applied (Resolved state)
+    let config = merged_config.resolve();
 
     info!("Applying security hardening...");
     if let Err(e) = config.security.apply_hardening() {
@@ -305,7 +304,10 @@ fn main() -> Result<()> {
     })?;
 
     info!("Creating authenticator service...");
-    match config.backend() {
+    match config.backend().map_err(|e| {
+        error!("Failed to load backend config: {}", e);
+        e
+    })? {
         config::BackendConfig::Local(cfg) => {
             run_backend!(LocalStorageAdapter, &cfg, uhid, config.security.clone())
         }

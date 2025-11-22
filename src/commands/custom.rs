@@ -49,11 +49,12 @@ pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static>(
 mod tests {
     use super::*;
 
-    use crate::config::SecurityConfig;
     use crate::storage::LocalStorageAdapter;
 
     #[test]
     fn test_register_yubikey_command() {
+        use crate::config::SecurityConfig;
+
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
 

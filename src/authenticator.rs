@@ -1,7 +1,6 @@
-use crate::config::defaults::SECURITY_CONSTANT_SIGNATURE_COUNTER;
+use crate::config::{Resolved, SecurityConfig};
 use crate::notification::show_verification_notification;
-use crate::storage::CredentialStorage;
-use crate::{config::SecurityConfig, storage::CredentialFilter};
+use crate::storage::{CredentialFilter, CredentialStorage};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
@@ -15,11 +14,11 @@ use log::{debug, error, info};
 /// Passless authenticator callbacks implementation
 pub struct PasslessCallbacks<S: CredentialStorage> {
     storage: Arc<Mutex<S>>,
-    security_config: SecurityConfig,
+    security_config: SecurityConfig<Resolved>,
 }
 
 impl<S: CredentialStorage> PasslessCallbacks<S> {
-    pub fn new(storage: Arc<Mutex<S>>, security_config: SecurityConfig) -> Self {
+    pub fn new(storage: Arc<Mutex<S>>, security_config: SecurityConfig<Resolved>) -> Self {
         Self {
             storage,
             security_config,
@@ -43,13 +42,9 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
 
         // Check if user verification should be bypassed for this operation
         let should_verify = if is_registration {
-            self.security_config
-                .user_verification_registration
-                .unwrap_or(crate::config::defaults::SECURITY_USER_VERIFICATION_REGISTRATION)
+            self.security_config.user_verification_registration
         } else {
-            self.security_config
-                .user_verification_authentication
-                .unwrap_or(crate::config::defaults::SECURITY_USER_VERIFICATION_AUTHENTICATION)
+            self.security_config.user_verification_authentication
         };
 
         // If backend handles verification (e.g., GPG) and not registration, skip notification
@@ -234,7 +229,7 @@ pub struct AuthenticatorService<S: CredentialStorage> {
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     /// Create a new authenticator service
-    pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
+    pub fn new(storage: S, security_config: SecurityConfig<Resolved>) -> Result<Self> {
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
             up: true,                      // User presence
@@ -269,11 +264,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             .max_credentials(100)
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(0x0001)
-            .constant_sign_count(
-                security_config
-                    .constant_signature_counter
-                    .unwrap_or(SECURITY_CONSTANT_SIGNATURE_COUNTER),
-            )
+            .constant_sign_count(security_config.constant_signature_counter)
             .build();
 
         let storage = Arc::new(Mutex::new(storage));
@@ -328,9 +319,8 @@ mod tests {
     fn test_service_creation() {
         let temp_dir = std::env::temp_dir().join("test_passless");
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
-        let security_config = crate::config::SecurityConfig::default();
 
-        let service = AuthenticatorService::new(storage, security_config);
+        let service = AuthenticatorService::new(storage, SecurityConfig::default());
         assert!(service.is_ok());
 
         // Cleanup

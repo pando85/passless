@@ -5,7 +5,7 @@
 
 pub mod init;
 
-use crate::config::{self, PassBackendConfig};
+use crate::config::{PassBackendConfig, Resolved};
 use crate::error::{Error, Result};
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
@@ -128,22 +128,10 @@ impl PassStorageAdapter {
     }
 
     /// Create a new pass storage adapter from configuration
-    pub fn from_config(config: &PassBackendConfig) -> Result<Self> {
-        let store_path = config
-            .store_path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config::defaults::pass_store_path().into());
-        let path = config
-            .path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(config::defaults::PASS_PATH));
-        let gpg_backend_str = config
-            .gpg_backend
-            .as_deref()
-            .unwrap_or(config::defaults::PASS_GPG_BACKEND);
-        let gpg_backend = GpgBackend::from_str(gpg_backend_str)?;
+    pub fn from_config(config: &PassBackendConfig<Resolved>) -> Result<Self> {
+        let store_path = PathBuf::from(&config.store_path);
+        let path = PathBuf::from(&config.path);
+        let gpg_backend = GpgBackend::from_str(&config.gpg_backend)?;
         Self::new(store_path, path, gpg_backend)
     }
 
