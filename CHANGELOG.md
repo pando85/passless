@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.0](https://github.com/pando85/passless/tree/v0.2.0) - 2025-11-22
+
+### Added
+
+- Switch to soft-fido2 crate and deprecate keylib ([f41e59b](https://github.com/pando85/passless/commit/f41e59baaa60b5e0e2ccea43749d840f40636c8f))
+- Support constant signature counter ([805aa24](https://github.com/pando85/passless/commit/805aa2413a0718178f808584ebb504fe978a1c9f))
+  - **BREAKING**: Move user_verification config section into security.
+Check new config file for migration.
+
+### Fixed
+
+- Use credential ID bytes directly ([cb562e6](https://github.com/pando85/passless/commit/cb562e6d5840caca32112b2c79b96aa83561c63c))
+  - **BREAKING**: Local storage use cred ID instead of user ID for
+generating file path.
+- Write credentials without initializen sign_count and created ([57b3d36](https://github.com/pando85/passless/commit/57b3d367b683c5ea8adf3baa3e80ecc341e9e159))
+- Clean cache when updating credential ([faf63ca](https://github.com/pando85/passless/commit/faf63ca8fb6b24d6055003a30b135307df44ba35))
+- Remove init pass question related to git init ([7d05d9f](https://github.com/pando85/passless/commit/7d05d9f1b97e598fe03b12b4c5da2504ef04e4ec))
+
+### Documentation
+
+- Fix build status branch name ([73f29e8](https://github.com/pando85/passless/commit/73f29e8a58965e8a78bf7e14349af260bdbbdb0f))
+- Fix rust-keylib link ([49dfe35](https://github.com/pando85/passless/commit/49dfe356d29473105cb8866a7995f2d9e091b795))
+- Add temporal logo ([57ea1fe](https://github.com/pando85/passless/commit/57ea1fe7d338886868d24da714394de948839d06))
+
+### Build
+
+- deps: Change to soft-fido2 from crates.io ([9c45b02](https://github.com/pando85/passless/commit/9c45b02cf405fa5c361d283646fca0f2636ce38d))
+
+### Refactor
+
+- config: Use type-state pattern to centralize configuration ([1dd798b](https://github.com/pando85/passless/commit/1dd798b19d54a95e2384bdf9fcd87ceddd99d359))
+
+### Testing
+
+- Fix e2e client code and show authenticator logs when fails ([7836c69](https://github.com/pando85/passless/commit/7836c69064d19643b151d17a81262788e530078a))
+
 ## [v0.1.0](https://github.com/pando85/passless/tree/v0.1.0) - 2025-11-19
 
 ### Added
