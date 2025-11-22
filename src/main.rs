@@ -9,6 +9,8 @@ use soft_fido2::Uhid;
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use authenticator::AuthenticatorService;
 use clap::{Args, Parser, Subcommand};
@@ -57,10 +59,10 @@ impl<S: CredentialStorage + 'static> CommandHandler for ServiceHandler<S> {
 
 /// Macro to create and run a storage backend
 macro_rules! run_backend {
-    ($adapter:ty, $config:expr, $uhid:expr, $uv_config:expr) => {{
+    ($adapter:ty, $config:expr, $uhid:expr, $uv_config:expr, $shutdown:expr) => {{
         let storage = <$adapter>::from_config($config)?;
         let service = AuthenticatorService::new(storage, $uv_config)?;
-        run_with_service(service, $uhid)
+        run_with_service(service, $uhid, $shutdown)
     }};
 }
 
@@ -68,6 +70,7 @@ macro_rules! run_backend {
 fn run_with_service<S: CredentialStorage + 'static>(
     mut service: AuthenticatorService<S>,
     uhid: Uhid,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("{}", service.storage_info());
 
@@ -90,6 +93,12 @@ fn run_with_service<S: CredentialStorage + 'static>(
     const CACHE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     loop {
+        // Check if shutdown was requested
+        if shutdown.load(Ordering::Relaxed) {
+            info!("Shutdown signal received, cleaning up...");
+            break;
+        }
+
         if last_cache_cleanup.elapsed() >= CACHE_CLEANUP_INTERVAL {
             if let Ok(mut storage) = service_ref.lock() {
                 storage.cleanup_expired_cache();
@@ -124,6 +133,13 @@ fn run_with_service<S: CredentialStorage + 'static>(
             }
         }
     }
+
+    // Cleanup before exit
+    info!("Performing final cache cleanup...");
+    if let Ok(mut storage) = service_ref.lock() {
+        storage.cleanup_expired_cache();
+    }
+    info!("Authenticator stopped gracefully");
 
     Ok(())
 }
@@ -302,19 +318,43 @@ fn main() -> Result<()> {
         error!("\n{}", UHID_ERROR_MESSAGE);
     })?;
 
+    // Set up graceful shutdown handler
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    ctrlc::set_handler(move || {
+        info!("Received interrupt signal (Ctrl+C)");
+        shutdown_clone.store(true, Ordering::Relaxed);
+    })
+    .map_err(|e| error::Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
+
     info!("Creating authenticator service...");
     match config.backend().map_err(|e| {
         error!("Failed to load backend config: {}", e);
         e
     })? {
-        config::BackendConfig::Local(cfg) => {
-            run_backend!(LocalStorageAdapter, &cfg, uhid, config.security.clone())
-        }
-        config::BackendConfig::Pass(cfg) => {
-            run_backend!(PassStorageAdapter, &cfg, uhid, config.security.clone())
-        }
+        config::BackendConfig::Local(cfg) => run_backend!(
+            LocalStorageAdapter,
+            &cfg,
+            uhid,
+            config.security.clone(),
+            shutdown
+        ),
+        config::BackendConfig::Pass(cfg) => run_backend!(
+            PassStorageAdapter,
+            &cfg,
+            uhid,
+            config.security.clone(),
+            shutdown
+        ),
         config::BackendConfig::Tpm(cfg) => {
-            run_backend!(TpmStorageAdapter, &cfg, uhid, config.security.clone())
+            run_backend!(
+                TpmStorageAdapter,
+                &cfg,
+                uhid,
+                config.security.clone(),
+                shutdown
+            )
         }
     }
 }
