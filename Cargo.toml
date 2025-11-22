@@ -39,6 +39,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 ctrlc = "3.4"
+dhat = "0.3"
 
 # Dev dependencies
 base64 = "0.22"
@@ -56,3 +57,5 @@ codegen-units = 1
 lto = "fat"
 panic = "abort"
 strip = "symbols"
+debug = 1
+

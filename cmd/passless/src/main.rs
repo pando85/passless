@@ -1,3 +1,7 @@
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 mod authenticator;
 mod commands;
 mod notification;
@@ -137,6 +141,8 @@ Run the following commands as root:\n\
   udevadm control --reload-rules && udevadm trigger";
 
 fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
     // Parse CLI arguments
     let mut args = Args::parse();
 

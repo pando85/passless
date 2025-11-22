@@ -34,8 +34,13 @@ rand.workspace = true
 hex.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
+dhat = { version = "0.3", optional = true }
 
 [build-dependencies]
 passless-core.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+
+[features]
+default = ["dhat-heap"]
+dhat-heap = ["dhat"]
