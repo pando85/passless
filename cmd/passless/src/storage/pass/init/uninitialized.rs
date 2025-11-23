@@ -1,10 +1,11 @@
 //! Initial uninitialized state
 
+use super::directory_created::DirectoryCreated;
+
 use crate::notification::{YesNoResult, show_info_notification, show_yes_no_notification};
 use crate::storage::pass::GpgBackend;
-use passless_core::error::{Error, Result};
 
-use super::directory_created::DirectoryCreated;
+use passless_core::error::{Error, Result};
 
 use std::fs;
 use std::path::PathBuf;

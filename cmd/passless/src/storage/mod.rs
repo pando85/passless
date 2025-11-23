@@ -7,11 +7,11 @@ pub mod local;
 pub mod pass;
 pub mod tpm;
 
-use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
-
 pub use local::LocalStorageAdapter;
 pub use pass::PassStorageAdapter;
 pub use tpm::TpmStorageAdapter;
+
+use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
 /// Filter criteria for reading credentials
 #[derive(Debug, Clone)]

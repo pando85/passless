@@ -38,8 +38,8 @@ use tss_esapi::constants::SessionType;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::{algorithm::HashingAlgorithm, resource_handles::Hierarchy};
-use tss_esapi::structures::{KeyedHashScheme, PublicKeyedHashParameters};
-use tss_esapi::structures::{Public, PublicBuilder};
+use tss_esapi::structures::{KeyedHashScheme, Public, PublicBuilder, PublicKeyedHashParameters};
+
 use tss_esapi::structures::{
     PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme, SymmetricDefinitionObject,
 };

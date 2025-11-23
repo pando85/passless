@@ -3,9 +3,10 @@
 //! This module provides desktop notification support with compatibility for
 //! different notification servers (notify-osd, mako, etc.).
 
+use std::sync::{Arc, Mutex};
+
 use log::{debug, info, warn};
 use notify_rust::{Notification, Timeout};
-use std::sync::{Arc, Mutex};
 
 /// Result of user verification via notification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

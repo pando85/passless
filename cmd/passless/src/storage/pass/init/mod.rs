@@ -11,7 +11,9 @@ mod uninitialized;
 pub use uninitialized::Uninitialized;
 
 use crate::storage::pass::GpgBackend;
+
 use passless_core::error::Result;
+
 use std::path::Path;
 
 /// Initialize password store, prompting user via desktop notifications if needed

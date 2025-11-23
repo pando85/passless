@@ -1,7 +1,7 @@
 //! Test configuration with clap-serde-derive to validate the pattern
 
-use clap::Parser;
-use clap_serde_derive::ClapSerde;
+use clap::{Parser};
+use clap_serde_derive::{ClapSerde};
 use serde::{Deserialize, Serialize};
 
 /// Simple backend config

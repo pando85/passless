@@ -31,14 +31,17 @@
 
 mod harness;
 
-use harness::AuthenticatorHarness;
-use sha2::{Digest, Sha256};
 use soft_fido2::client::Client;
 use soft_fido2::{
     ClientDataHash, CredentialDescriptor, CredentialType, GetAssertionRequest,
     MakeCredentialRequest, RelyingParty, Result, TransportList, User,
 };
+
 use std::io::Write;
+
+use base64::Engine;
+use harness::AuthenticatorHarness;
+use sha2::{Digest, Sha256};
 
 const RP_ID: &str = "example.com";
 const ORIGIN: &str = "https://example.com";
@@ -105,7 +108,6 @@ fn generate_client_data_hash_for_authentication(challenge: &[u8]) -> ClientDataH
 
 /// Helper for base64url encoding
 fn base64_url_encode(data: &[u8]) -> String {
-    use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 

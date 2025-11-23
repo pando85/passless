@@ -1,9 +1,10 @@
 //! GPG key selected, ready to write .gpg-id file
 
-use crate::notification::show_error_notification;
-use passless_core::error::{Error, Result};
-
 use super::store_initialized::StoreInitialized;
+
+use crate::notification::show_error_notification;
+
+use passless_core::error::{Error, Result};
 
 use std::fs;
 use std::path::PathBuf;

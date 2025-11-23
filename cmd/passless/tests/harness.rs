@@ -7,12 +7,16 @@
 //! - Managing temporary directories and cleanup
 //! - Waiting for the authenticator to be ready
 
+use soft_fido2::TransportList;
+
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
+
 use tempfile::TempDir;
 
 /// Backend-specific setup and configuration
@@ -139,7 +143,6 @@ impl BackendSetup for PassBackend {
         // Set restrictive permissions on GPG home
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&self.gpg_home, std::fs::Permissions::from_mode(0o700))?;
         }
 
@@ -187,8 +190,6 @@ impl TpmBackend {
 
     /// Start swtpm process
     fn start_swtpm(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        use std::process::Stdio;
-
         // Start swtpm socket server
         let child = Command::new("swtpm")
             .arg("socket")
@@ -338,8 +339,6 @@ impl AuthenticatorHarness {
 
     /// Wait for the authenticator to be ready
     fn wait_for_ready(&self) -> Result<(), Box<dyn std::error::Error>> {
-        use soft_fido2::TransportList;
-
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(10);
 
