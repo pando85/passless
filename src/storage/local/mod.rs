@@ -2,6 +2,8 @@
 //!
 //! This adapter implements the CredentialStorage trait using the local file system.
 
+pub mod init;
+
 use crate::storage::{CredentialFilter, CredentialStorage};
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
@@ -33,10 +35,18 @@ impl LocalStorageAdapter {
     /// # Returns
     ///
     /// A new LocalStorageAdapter instance
+    ///
+    /// # Note
+    ///
+    /// If the storage directory does not exist, this will prompt the user
+    /// via desktop notifications to create it.
     pub fn new(storage_dir: PathBuf) -> Result<Self> {
         info!("Using local file system backend");
         info!("Storage path: {}", storage_dir.display());
-        fs::create_dir_all(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
+
+        // Ensure the storage directory is initialized
+        // This will prompt the user via notifications if not initialized
+        self::init::ensure_initialized(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
 
         Ok(Self {
             storage_dir,

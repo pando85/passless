@@ -12,6 +12,8 @@
 //! Indexes are built by scanning directory structure (no unsealing needed)
 //! Credentials are only unsealed when needed for authentication
 
+pub mod init;
+
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
     update_indexes_on_delete, update_indexes_on_write,
@@ -20,7 +22,7 @@ use crate::storage::{CredentialFilter, CredentialStorage};
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -74,13 +76,18 @@ struct SealedBlob {
 
 impl TpmStorageAdapter {
     /// Create a new TPM storage adapter
+    ///
+    /// # Note
+    ///
+    /// If the storage directory does not exist, this will prompt the user
+    /// via desktop notifications to create it.
     pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
         info!("Using TPM 2.0 backend");
         info!("Storage path: {}", storage_dir.display());
-        fs::create_dir_all(&storage_dir).map_err(|e| {
-            log::error!("Failed to create storage directory: {}", e);
-            soft_fido2::Error::Other
-        })?;
+
+        // Ensure the storage directory is initialized
+        // This will prompt the user via notifications if not initialized
+        self::init::ensure_initialized(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
 
         // Initialize TPM context
         let tcti_conf = if let Some(ref tcti_str) = tcti {
