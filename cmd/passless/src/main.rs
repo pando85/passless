@@ -14,7 +14,9 @@ use clap::Parser;
 use commands::custom::register_yubikey_credential_mgmt;
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
-use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, Result};
+use passless_core::{
+    AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, LockedBuffer, Result,
+};
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
 
 /// Wrapper for AuthenticatorService that implements CommandHandler
@@ -67,10 +69,14 @@ fn run_with_service<S: CredentialStorage + 'static>(
 
     // Store a reference to storage for periodic cleanup (before moving service)
     let service_ref = service.storage.clone();
+    // Get use_mlock before moving service
+    let use_mlock = service.security_config.use_mlock;
 
     let handler = ServiceHandler::new(service);
     let mut ctaphid_handler = CtapHidHandler::new(handler);
-    let mut buffer = [0u8; 64];
+    // Use locked buffer for UHID communication to prevent credential data from being swapped
+    // Only lock if use_mlock is enabled
+    let mut buffer = LockedBuffer::<u8, 64>::new(use_mlock);
 
     // Track time for periodic cache cleanup
     let mut last_cache_cleanup = std::time::Instant::now();
@@ -90,6 +96,7 @@ fn run_with_service<S: CredentialStorage + 'static>(
             last_cache_cleanup = std::time::Instant::now();
         }
 
+        // Deref LockedBuffer to &mut [u8; 64]
         match uhid.read_packet(&mut buffer) {
             Ok(0) => {
                 // No data, sleep briefly to avoid busy-waiting
@@ -97,8 +104,8 @@ fn run_with_service<S: CredentialStorage + 'static>(
                 continue;
             }
             Ok(_) => {
-                // Parse packet
-                let packet = Packet::from_bytes(buffer);
+                // Parse packet (deref to [u8; 64])
+                let packet = Packet::from_bytes(*buffer);
 
                 // Process through CTAP HID handler
                 let response_packets = ctaphid_handler
@@ -203,16 +210,13 @@ fn main() -> Result<()> {
 
     info!("Creating authenticator service...");
 
-    // Get security config
-    let security_config = config.security_config();
-
     match config.backend().map_err(|e| {
         error!("Failed to load backend config: {}", e);
         e
     })? {
         BackendConfig::Local { path } => {
             let storage = LocalStorageAdapter::new(path.into())?;
-            let service = AuthenticatorService::new(storage, security_config)?;
+            let service = AuthenticatorService::new(storage, config.security)?;
             run_with_service(service, uhid, shutdown)
         }
         BackendConfig::Pass {
@@ -221,13 +225,19 @@ fn main() -> Result<()> {
             gpg_backend,
         } => {
             let gpg_backend = storage::pass::GpgBackend::from_str(&gpg_backend)?;
-            let storage = PassStorageAdapter::new(store_path.into(), path.into(), gpg_backend)?;
-            let service = AuthenticatorService::new(storage, security_config)?;
+            let storage = PassStorageAdapter::new(
+                store_path.into(),
+                path.into(),
+                gpg_backend,
+                config.security.use_mlock,
+            )?;
+            let service = AuthenticatorService::new(storage, config.security)?;
             run_with_service(service, uhid, shutdown)
         }
         BackendConfig::Tpm { path, tcti } => {
-            let storage = TpmStorageAdapter::new(path.into(), Some(tcti))?;
-            let service = AuthenticatorService::new(storage, security_config)?;
+            let storage =
+                TpmStorageAdapter::new(path.into(), Some(tcti), config.security.use_mlock)?;
+            let service = AuthenticatorService::new(storage, config.security)?;
             run_with_service(service, uhid, shutdown)
         }
     }

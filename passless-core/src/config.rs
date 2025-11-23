@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 use clap_serde_derive::ClapSerde;
-use libc::{MCL_CURRENT, MCL_FUTURE, PR_SET_DUMPABLE, mlockall, prctl};
+use libc::{PR_SET_DUMPABLE, prctl};
 use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
 use passless_config_doc::ConfigDoc;
@@ -119,7 +119,7 @@ pub struct TpmBackendConfig {
 }
 
 /// Security configuration
-#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[derive(ClapSerde, Debug, Clone, Copy, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "security")]
 pub struct SecurityConfig {
     /// Use mlock to prevent credentials from being swapped to disk (requires CAP_IPC_LOCK)
@@ -173,7 +173,10 @@ impl SecurityConfig {
             self.disable_core_dumps_impl()?;
         }
         if self.use_mlock {
-            self.lock_all_memory()?;
+            // Credential cache and UHID buffers are locked automatically via
+            // LockedCredentialArena and LockedBuffer (see secure_memory.rs)
+            log::info!("Using selective mlock() for credential protection");
+            log::info!("Credentials and UHID buffers will be locked in memory");
         }
         Ok(())
     }
@@ -185,22 +188,6 @@ impl SecurityConfig {
         let r = unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) };
         if r != 0 {
             log::warn!("prctl(PR_SET_DUMPABLE) failed: {}", r);
-        }
-        Ok(())
-    }
-
-    /// Lock all current and future memory mappings to prevent swapping
-    fn lock_all_memory(&self) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Locking all memory to prevent swapping");
-        let r = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
-        if r != 0 {
-            return Err(format!(
-                "mlockall failed (errno {}).\n\
-                 Hint: increase DefaultLimitMEMLOCK at /etc/systemd/system.conf and /etc/systemd/user.conf level.\n\
-                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'",
-                std::io::Error::last_os_error()
-            )
-            .into());
         }
         Ok(())
     }
@@ -332,7 +319,7 @@ impl AppConfig {
 
     /// Get security configuration
     pub fn security_config(&self) -> SecurityConfig {
-        self.security.clone()
+        self.security
     }
 }
 

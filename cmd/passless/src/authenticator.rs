@@ -225,6 +225,8 @@ pub struct AuthenticatorService<S: CredentialStorage> {
     pub authenticator: Authenticator<PasslessCallbacks<S>>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
+    /// Security configuration
+    pub security_config: SecurityConfig,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
@@ -274,6 +276,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
         Ok(Self {
             authenticator,
             storage,
+            security_config,
         })
     }
 

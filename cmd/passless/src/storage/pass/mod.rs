@@ -75,7 +75,9 @@ impl PassStorageAdapter {
     /// # Arguments
     ///
     /// * `store_path` - Root directory of the password store (not including fido2 subdir)
+    /// * `path` - Relative path within password store for FIDO2 entries
     /// * `gpg_backend` - GPG backend selection
+    /// * `use_mlock` - If true, lock credentials in memory to prevent swapping
     ///
     /// # Returns
     ///
@@ -85,7 +87,12 @@ impl PassStorageAdapter {
     ///
     /// If the password store is not initialized, this will prompt the user
     /// via desktop notifications to initialize it.
-    pub fn new(store_path: PathBuf, path: PathBuf, gpg_backend: GpgBackend) -> Result<Self> {
+    pub fn new(
+        store_path: PathBuf,
+        path: PathBuf,
+        gpg_backend: GpgBackend,
+        use_mlock: bool,
+    ) -> Result<Self> {
         info!("Using pass (password-store) backend");
         info!("Store path: {}", store_path.display());
         info!("Path: {}", path.display());
@@ -111,7 +118,7 @@ impl PassStorageAdapter {
             path,
             gpg_backend,
             indexes: Default::default(),
-            cache: Default::default(),
+            cache: CredentialCache::new(use_mlock),
             iteration_index: Default::default(),
             iteration_entries: Default::default(),
         };

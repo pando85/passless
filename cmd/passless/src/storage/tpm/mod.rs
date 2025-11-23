@@ -77,11 +77,17 @@ struct SealedBlob {
 impl TpmStorageAdapter {
     /// Create a new TPM storage adapter
     ///
+    /// # Arguments
+    ///
+    /// * `storage_dir` - Directory path where sealed credentials will be stored
+    /// * `tcti` - Optional TPM TCTI configuration string
+    /// * `use_mlock` - If true, lock credentials in memory to prevent swapping
+    ///
     /// # Note
     ///
     /// If the storage directory does not exist, this will prompt the user
     /// via desktop notifications to create it.
-    pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
+    pub fn new(storage_dir: PathBuf, tcti: Option<String>, use_mlock: bool) -> Result<Self> {
         info!("Using TPM 2.0 backend");
         info!("Storage path: {}", storage_dir.display());
 
@@ -151,7 +157,7 @@ impl TpmStorageAdapter {
         let adapter = Self {
             storage_dir,
             indexes,
-            cache: Default::default(),
+            cache: CredentialCache::new(use_mlock),
             iteration_index: 0,
             iteration_entries: Vec::new(),
             context: Mutex::new(context),

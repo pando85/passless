@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod error;
+pub mod secure_memory;
 
 pub use config::{AppConfig, Args, BackendConfig, Commands, ConfigAction, SecurityConfig};
 pub use error::{Error, Result};
+pub use secure_memory::{LockedBuffer, LockedCredentialArena};

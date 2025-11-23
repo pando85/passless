@@ -1,6 +1,7 @@
 //! Shared indexing and caching for credential storage backends
 
 use log::debug;
+use passless_core::LockedCredentialArena;
 use sha2::{Digest, Sha256};
 use soft_fido2::Credential;
 use std::collections::HashMap;
@@ -10,6 +11,10 @@ use std::time::{Duration, Instant};
 /// 30s TTL: short enough to minimize exposure, long enough for single auth flow
 pub const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(30);
 pub const MAX_CACHE_SIZE: usize = 10;
+
+/// Maximum size for a serialized credential (JSON format)
+/// Typical credential: ~200 bytes, we use 512 for safety margin
+const CREDENTIAL_SLOT_SIZE: usize = 512;
 
 #[derive(Default)]
 pub struct CredentialIndexes {
@@ -21,16 +26,24 @@ pub struct CredentialIndexes {
 pub struct CachedCredential {
     pub credential: Credential,
     pub expires_at: Instant,
+    pub arena_slot: usize,
 }
 
 pub struct CredentialCache {
     cache: HashMap<PathBuf, CachedCredential>,
+    /// Pre-allocated memory arena for storing credentials (optionally locked)
+    arena: LockedCredentialArena<MAX_CACHE_SIZE, CREDENTIAL_SLOT_SIZE>,
 }
 
 impl CredentialCache {
-    pub fn new() -> Self {
+    /// Create a new credential cache
+    ///
+    /// # Arguments
+    /// * `use_mlock` - If true, lock the arena in memory to prevent swapping
+    pub fn new(use_mlock: bool) -> Self {
         Self {
             cache: HashMap::new(),
+            arena: LockedCredentialArena::new(use_mlock),
         }
     }
 
@@ -39,30 +52,83 @@ impl CredentialCache {
     }
 
     pub fn insert(&mut self, path: PathBuf, credential: Credential) {
+        // Allocate slot in locked arena
+        let (slot, slot_data) = match self.arena.allocate() {
+            Some(allocation) => allocation,
+            None => {
+                // Arena is full, evict oldest entry first
+                debug!("Credential arena full - evicting oldest entry");
+                self.evict_oldest_if_full();
+                // Try again after eviction
+                match self.arena.allocate() {
+                    Some(allocation) => allocation,
+                    None => {
+                        debug!("Failed to allocate arena slot even after eviction");
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Serialize credential to the locked memory slot
+        match serde_json::to_vec(&credential) {
+            Ok(serialized) => {
+                if serialized.len() > CREDENTIAL_SLOT_SIZE {
+                    debug!(
+                        "Credential too large ({} bytes > {} bytes), not caching",
+                        serialized.len(),
+                        CREDENTIAL_SLOT_SIZE
+                    );
+                    self.arena.free(slot);
+                    return;
+                }
+                // Copy serialized data to locked arena
+                slot_data[..serialized.len()].copy_from_slice(&serialized);
+                debug!(
+                    "Cached credential in locked slot {} ({} bytes, expires in {}s)",
+                    slot,
+                    serialized.len(),
+                    CREDENTIAL_CACHE_TTL.as_secs()
+                );
+            }
+            Err(e) => {
+                debug!("Failed to serialize credential: {}", e);
+                self.arena.free(slot);
+                return;
+            }
+        }
+
         let cached = CachedCredential {
             credential,
             expires_at: Instant::now() + CREDENTIAL_CACHE_TTL,
+            arena_slot: slot,
         };
         self.cache.insert(path, cached);
-        debug!(
-            "Cached credential (expires in {}s)",
-            CREDENTIAL_CACHE_TTL.as_secs()
-        );
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.cache.remove(path);
+        if let Some(cached) = self.cache.remove(path) {
+            // Free the arena slot (will zero the memory)
+            self.arena.free(cached.arena_slot);
+            debug!("Removed credential from cache and freed locked slot");
+        }
     }
 
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
-        self.cache.retain(|path, cached| {
-            let keep = now < cached.expires_at;
-            if !keep {
-                debug!("Evicting expired cache entry: {:?}", path);
+        let expired_paths: Vec<PathBuf> = self
+            .cache
+            .iter()
+            .filter(|(_, cached)| now >= cached.expires_at)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        for path in expired_paths {
+            if let Some(cached) = self.cache.remove(&path) {
+                self.arena.free(cached.arena_slot);
+                debug!("Evicted expired cache entry: {:?}", path);
             }
-            keep
-        });
+        }
     }
 
     fn find_oldest(&self) -> Option<PathBuf> {
@@ -77,14 +143,17 @@ impl CredentialCache {
             && let Some(oldest) = self.find_oldest()
         {
             debug!("Cache full - evicting oldest entry: {:?}", oldest);
-            self.cache.remove(&oldest);
+            if let Some(cached) = self.cache.remove(&oldest) {
+                self.arena.free(cached.arena_slot);
+            }
         }
     }
 }
 
 impl Default for CredentialCache {
     fn default() -> Self {
-        Self::new()
+        // Default to not using mlock (safer for tests and when config is unknown)
+        Self::new(false)
     }
 }
 
