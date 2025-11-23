@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use clap_serde_derive::ClapSerde;
 use libc::{MCL_CURRENT, MCL_FUTURE, PR_SET_DUMPABLE, mlockall, prctl};
 use log::debug;
@@ -347,4 +347,25 @@ pub struct Args {
     /// Application configuration (can come from CLI or config file)
     #[command(flatten)]
     pub config: <AppConfig as ClapSerde>::Opt,
+
+    /// Subcommands
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+/// Subcommands for passless
+#[derive(Subcommand, Debug, Clone)]
+pub enum Commands {
+    /// Configuration management commands
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+/// Configuration actions
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfigAction {
+    /// Print the default configuration in TOML format
+    Print,
 }

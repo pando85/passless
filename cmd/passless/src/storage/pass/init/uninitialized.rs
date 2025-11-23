@@ -1,8 +1,8 @@
 //! Initial uninitialized state
 
-use crate::error::{Error, Result};
 use crate::notification::{YesNoResult, show_info_notification, show_yes_no_notification};
 use crate::storage::pass::GpgBackend;
+use passless_core::error::{Error, Result};
 
 use super::directory_created::DirectoryCreated;
 

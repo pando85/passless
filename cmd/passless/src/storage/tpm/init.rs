@@ -1,18 +1,18 @@
-//! Local storage initialization
+//! TPM storage initialization
 //!
 //! Simple initialization that prompts user if storage directory doesn't exist.
 
-use crate::error::{Error, Result};
 use crate::notification::{
     YesNoResult, show_error_notification, show_info_notification, show_yes_no_notification,
 };
+use passless_core::error::{Error, Result};
 
 use std::fs;
 use std::path::Path;
 
 use log::{info, warn};
 
-/// Ensure local storage directory is initialized
+/// Ensure TPM storage directory is initialized
 ///
 /// If the directory doesn't exist, prompts the user via desktop notification
 /// to confirm creation.
@@ -21,26 +21,23 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    info!(
-        "Local storage directory does not exist at {:?}",
-        storage_path
-    );
+    info!("TPM storage directory does not exist at {:?}", storage_path);
 
     match show_yes_no_notification(
-        "🔐 Local Storage Not Initialized",
+        "🔐 TPM Storage Not Initialized",
         &format!(
-            "The local storage directory does not exist at:\n{}\n\nWould you like to create it now?",
+            "The TPM storage directory does not exist at:\n{}\n\nWould you like to create it now?",
             storage_path.display()
         ),
     ) {
         Ok(YesNoResult::Accepted) => {
-            info!("User agreed to create local storage directory");
+            info!("User agreed to create TPM storage directory");
         }
         Ok(YesNoResult::Denied) => {
-            warn!("Local storage initialization cancelled by user");
+            warn!("TPM storage initialization cancelled by user");
             let _ = show_info_notification(
                 "Initialization Cancelled",
-                "Local storage initialization cancelled by user",
+                "TPM storage initialization cancelled by user",
             );
             return Err(Error::Config("Initialization cancelled".to_string()));
         }
@@ -59,12 +56,12 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
         Error::Storage(msg)
     })?;
 
-    info!("Created local storage directory at {:?}", storage_path);
+    info!("Created TPM storage directory at {:?}", storage_path);
 
     let _ = show_info_notification(
-        "✅ Local Storage Initialized",
+        "✅ TPM Storage Initialized",
         &format!(
-            "Successfully created local storage directory at:\n{}",
+            "Successfully created TPM storage directory at:\n{}",
             storage_path.display()
         ),
     );

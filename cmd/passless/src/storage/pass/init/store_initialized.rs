@@ -1,7 +1,7 @@
 //! Store initialized, ready for optional git setup
 
-use crate::error::{Error, Result};
 use crate::notification::{show_error_notification, show_info_notification};
+use passless_core::error::{Error, Result};
 
 use super::complete::Complete;
 

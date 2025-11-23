@@ -1,6 +1,6 @@
-use crate::config::SecurityConfig;
 use crate::notification::show_verification_notification;
 use crate::storage::{CredentialFilter, CredentialStorage};
+use passless_core::config::SecurityConfig;
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
