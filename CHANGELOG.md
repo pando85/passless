@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.3](https://github.com/pando85/passless/tree/v0.3.3) - 2025-11-23
+
+### Fixed
+
+- Change systemd dependency from `network` to `network-online` ([61989b6](https://github.com/pando85/passless/commit/61989b62a77f150eb285227769e00fca7815ff3d))
+- Add completions programatically, refactor core in a new crate ([c768792](https://github.com/pando85/passless/commit/c76879205a7ee3d4dfa5f39ef3cfb3f610309661))
+
+### Documentation
+
+- Update changelog with breaking changes for 0.3.0 ([cff653b](https://github.com/pando85/passless/commit/cff653b81b02ac2b53ff43136d8c6e622d34cb3e))
+
 ## [v0.3.2](https://github.com/pando85/passless/tree/v0.3.2) - 2025-11-23
 
 ### Fixed
