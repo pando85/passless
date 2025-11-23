@@ -141,5 +141,6 @@ jobs:
             ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz
             ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
             vendor.tar.gz
+            passless-completions-${{ env.PROJECT_VERSION }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -17,5 +17,7 @@ vendor
 vendor.tar.gz
 passless-*.tar.gz
 passless-*.tar.gz.sha256
+passless-completions-*.tar.gz
 /PKGBUILD
 /PKGBUILD-bin
+completions-tmp
