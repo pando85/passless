@@ -374,6 +374,7 @@ impl PassStorageAdapter {
 
         // Encrypt and write the credential data directly to file
         let plaintext = Plaintext::from(cred_json);
+
         context
             .encrypt_file(&recipients, plaintext, &path)
             .map_err(|e| {

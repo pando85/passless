@@ -56,6 +56,7 @@ mod tests {
         use crate::config::SecurityConfig;
 
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
+        std::fs::create_dir_all(&temp_dir).unwrap();
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
 
         let mut service = AuthenticatorService::new(storage, SecurityConfig::default()).unwrap();
