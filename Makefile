@@ -103,7 +103,7 @@ update-version: */Cargo.toml
 
 .PHONY: publish
 publish:	## publish crate
-	cargo publish
+	cargo publish --workspace
 
 # Installation targets
 .PHONY: install-binary
