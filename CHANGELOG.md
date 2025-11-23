@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.0](https://github.com/pando85/passless/tree/v0.3.0) - 2025-11-23
+
+### Added
+
+- Add prompt when initializing local or tpm backends ([5ca3420](https://github.com/pando85/passless/commit/5ca3420f9a241707cf5495352d65d992a92245bc))
+- Add shell completions and PKGBUILD ([ece791f](https://github.com/pando85/passless/commit/ece791f124f3607c97e713e4cbb048e5e8af9d29))
+- Integrate shell completions into PKGBUILD templates ([1e1c2d4](https://github.com/pando85/passless/commit/1e1c2d4b53021e92ddac0776ea002485462da729))
+
+### Fixed
+
+- security: Improve error handling for memory locking and update logging level ([adfb1e1](https://github.com/pando85/passless/commit/adfb1e12577efb06cba5e5cee46506403a8277cb))
+- Add network as a requirement for systemd service ([843a3d4](https://github.com/pando85/passless/commit/843a3d405da4f4bc10a54a797237b3e205ad3008))
+- Gracefull shutdown when Ctrl+C press ([060d485](https://github.com/pando85/passless/commit/060d485ed81f32de7b13e9497f348a2454fe6ea6))
+- Change default local backend path ([821944a](https://github.com/pando85/passless/commit/821944a1832f9d78b598b524e4c3c73a84393fca))
+
+### Documentation
+
+- Add docs comments to programmatic config generation ([1be6161](https://github.com/pando85/passless/commit/1be6161b326bf3471e9fde06f8cfea24724e12cc))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.2.1 ([bc2c3da](https://github.com/pando85/passless/commit/bc2c3da7dcd228a8162b7734d47bf37a66625415))
+
+### Refactor
+
+- Simplify config and CLI parsing using clap-serde-derive ([04d51b0](https://github.com/pando85/passless/commit/04d51b085bf963b6c0b147046214110946367f0a))
+
+### Testing
+
+- Create dirs for e2e and unit tests ([f46934d](https://github.com/pando85/passless/commit/f46934dcecbcd6665022dea36e94169e572985d2))
+- Check commit message in pre-commit ([df23f52](https://github.com/pando85/passless/commit/df23f52770ebbeee01ae8cd843b87f5a279df4e1))
+
 ## [v0.2.0](https://github.com/pando85/passless/tree/v0.2.0) - 2025-11-22
 
 ### Added
