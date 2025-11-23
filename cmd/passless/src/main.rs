@@ -1,7 +1,5 @@
 mod authenticator;
 mod commands;
-mod config;
-mod error;
 mod notification;
 mod storage;
 
@@ -12,12 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use authenticator::AuthenticatorService;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use commands::custom::register_yubikey_credential_mgmt;
-use config::{AppConfig, Args};
 use env_logger::{Builder, Env};
-use error::Result;
 use log::{debug, error, info, warn};
+use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, Result};
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
 
 /// Wrapper for AuthenticatorService that implements CommandHandler
@@ -106,12 +103,12 @@ fn run_with_service<S: CredentialStorage + 'static>(
                 // Process through CTAP HID handler
                 let response_packets = ctaphid_handler
                     .process_packet(packet)
-                    .map_err(|_| error::Error::Other("CTAP HID processing failed".to_string()))?;
+                    .map_err(|_| Error::Other("CTAP HID processing failed".to_string()))?;
 
                 // Write response packets
                 for response_packet in response_packets {
                     uhid.write_packet(response_packet.as_bytes())
-                        .map_err(|_| error::Error::Other("Failed to write packet".to_string()))?;
+                        .map_err(|_| Error::Other("Failed to write packet".to_string()))?;
                 }
             }
             Err(e) => {
@@ -131,31 +128,6 @@ fn run_with_service<S: CredentialStorage + 'static>(
     Ok(())
 }
 
-/// Passless - Software FIDO2 Authenticator (wrapper for subcommands)
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-/// Subcommands for passless
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Configuration management commands
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-}
-
-/// Configuration actions
-#[derive(Subcommand, Debug)]
-enum ConfigAction {
-    /// Print the default configuration in TOML format
-    Print,
-}
-
 const UHID_ERROR_MESSAGE: &str = "Make sure you have the uhid kernel module loaded and proper permissions.\n\
 Run the following commands as root:\n\
   modprobe uhid\n\
@@ -165,10 +137,11 @@ Run the following commands as root:\n\
   udevadm control --reload-rules && udevadm trigger";
 
 fn main() -> Result<()> {
-    // Try to parse as subcommand first
-    if let Ok(cli) = Cli::try_parse()
-        && let Some(command) = cli.command
-    {
+    // Parse CLI arguments
+    let mut args = Args::parse();
+
+    // Handle subcommands first
+    if let Some(command) = &args.command {
         return match command {
             Commands::Config { action } => match action {
                 ConfigAction::Print => {
@@ -181,9 +154,6 @@ fn main() -> Result<()> {
             },
         };
     }
-
-    // Parse CLI arguments with config
-    let mut args = Args::parse();
 
     // Initialize logging with appropriate level
     let log_level = if args.config.verbose == Some(true) {
@@ -229,7 +199,7 @@ fn main() -> Result<()> {
         info!("Received interrupt signal (Ctrl+C)");
         shutdown_clone.store(true, Ordering::Relaxed);
     })
-    .map_err(|e| error::Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
+    .map_err(|e| Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
 
     info!("Creating authenticator service...");
 
@@ -240,12 +210,12 @@ fn main() -> Result<()> {
         error!("Failed to load backend config: {}", e);
         e
     })? {
-        config::BackendConfig::Local { path } => {
+        BackendConfig::Local { path } => {
             let storage = LocalStorageAdapter::new(path.into())?;
             let service = AuthenticatorService::new(storage, security_config)?;
             run_with_service(service, uhid, shutdown)
         }
-        config::BackendConfig::Pass {
+        BackendConfig::Pass {
             store_path,
             path,
             gpg_backend,
@@ -255,7 +225,7 @@ fn main() -> Result<()> {
             let service = AuthenticatorService::new(storage, security_config)?;
             run_with_service(service, uhid, shutdown)
         }
-        config::BackendConfig::Tpm { path, tcti } => {
+        BackendConfig::Tpm { path, tcti } => {
             let storage = TpmStorageAdapter::new(path.into(), Some(tcti))?;
             let service = AuthenticatorService::new(storage, security_config)?;
             run_with_service(service, uhid, shutdown)

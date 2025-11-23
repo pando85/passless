@@ -5,12 +5,12 @@
 
 pub mod init;
 
-use crate::error::{Error, Result};
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
     update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
+use passless_core::error::{Error, Result};
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty};
 

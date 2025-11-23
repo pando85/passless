@@ -81,7 +81,7 @@ release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	cargo build --frozen --release --all-features --target ${CARGO_TARGET}
 	tar -czf $(PKG_BASE_NAME).tar.gz -C $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release passless
 	@# Create completions tarball
-	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build/passless-rs-*/out/completions -type d 2>/dev/null | head -1); \
+	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build/passless-*/out/completions -type d 2>/dev/null | head -1); \
 	if [ -n "$$COMPLETION_DIR" ]; then \
 		mkdir -p completions-tmp; \
 		cp "$$COMPLETION_DIR"/* completions-tmp/ 2>/dev/null || true; \

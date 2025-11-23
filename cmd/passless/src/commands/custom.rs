@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn test_register_yubikey_command() {
-        use crate::config::SecurityConfig;
+        use passless_core::config::SecurityConfig;
 
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
         std::fs::create_dir_all(&temp_dir).unwrap();
