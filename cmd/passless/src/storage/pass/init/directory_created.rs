@@ -1,12 +1,13 @@
 //! Directory created, ready for GPG key selection
 
+use super::gpg_key_selected::GpgKeySelected;
 use crate::notification::{
     YesNoResult, show_error_notification, show_info_notification, show_yes_no_notification,
 };
-use crate::storage::pass::GpgBackend;
-use passless_core::error::{Error, Result};
 
-use super::gpg_key_selected::GpgKeySelected;
+use crate::storage::pass::GpgBackend;
+
+use passless_core::error::{Error, Result};
 
 use std::path::PathBuf;
 

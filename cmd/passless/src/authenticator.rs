@@ -1,5 +1,6 @@
 use crate::notification::show_verification_notification;
 use crate::storage::{CredentialFilter, CredentialStorage};
+
 use passless_core::config::SecurityConfig;
 
 use soft_fido2::{
@@ -313,6 +314,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::storage::LocalStorageAdapter;
 
     #[test]

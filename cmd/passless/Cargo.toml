@@ -35,6 +35,11 @@ hex.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
 
+[dev-dependencies]
+base64 = "0.22"
+ciborium = "0.2"
+tempfile = "3.14"
+
 [build-dependencies]
 passless-core.workspace = true
 clap.workspace = true

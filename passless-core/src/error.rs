@@ -4,6 +4,7 @@
 //! We use `thiserror` for structured error handling with proper error context.
 
 use std::io;
+
 use thiserror::Error;
 
 /// Result type alias using PasslessError

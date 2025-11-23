@@ -10,15 +10,16 @@ use crate::storage::index::{
     update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
+
 use passless_core::error::{Error, Result};
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty};
 
-use core::fmt;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use core::fmt;
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
 use prs_lib::{Ciphertext, Plaintext, Store};

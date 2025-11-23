@@ -40,11 +40,6 @@ rand = "0.8"
 hex = "0.4"
 ctrlc = "3.4"
 
-# Dev dependencies
-base64 = "0.22"
-ciborium = "0.2"
-tempfile = "3.14"
-
 # Proc macro dependencies
 syn = { version = "2.0", features = ["full", "extra-traits"] }
 quote = "1.0"

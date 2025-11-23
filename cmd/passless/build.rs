@@ -1,6 +1,5 @@
-use std::env;
-use std::fs;
 use std::path::PathBuf;
+use std::{env, fs};
 
 use clap::CommandFactory;
 use clap_complete::{Shell, generate_to};

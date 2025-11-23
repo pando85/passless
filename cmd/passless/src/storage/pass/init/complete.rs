@@ -1,6 +1,7 @@
 //! Initialization complete
 
 use crate::notification::show_info_notification;
+
 use passless_core::error::Result;
 
 use std::path::PathBuf;

@@ -1,11 +1,13 @@
 //! Shared indexing and caching for credential storage backends
 
-use log::debug;
-use sha2::{Digest, Sha256};
 use soft_fido2::Credential;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use log::debug;
+use sha2::{Digest, Sha256};
 
 /// 30s TTL: short enough to minimize exposure, long enough for single auth flow
 pub const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(30);

@@ -3,6 +3,8 @@ mod commands;
 mod notification;
 mod storage;
 
+use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, Result};
+
 use soft_fido2::Uhid;
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
 
@@ -14,7 +16,6 @@ use clap::Parser;
 use commands::custom::register_yubikey_credential_mgmt;
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
-use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, Result};
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
 
 /// Wrapper for AuthenticatorService that implements CommandHandler
