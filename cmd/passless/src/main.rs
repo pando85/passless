@@ -8,8 +8,11 @@ use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Erro
 use soft_fido2::Uhid;
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
 
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use authenticator::AuthenticatorService;
 use clap::Parser;
@@ -198,7 +201,15 @@ fn main() -> Result<()> {
 
     ctrlc::set_handler(move || {
         info!("Received interrupt signal (Ctrl+C)");
+        info!("Initiating graceful shutdown... (will force exit in 5 seconds)");
         shutdown_clone.store(true, Ordering::Relaxed);
+
+        // Spawn a thread that will forcefully exit after 5 seconds
+        thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+            error!("Graceful shutdown timeout reached, forcing exit");
+            process::exit(1);
+        });
     })
     .map_err(|e| Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
 
