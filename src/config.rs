@@ -14,6 +14,7 @@ use clap_serde_derive::ClapSerde;
 use libc::{MCL_CURRENT, MCL_FUTURE, PR_SET_DUMPABLE, mlockall, prctl};
 use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
+use passless_config_doc::ConfigDoc;
 use serde::{Deserialize, Serialize};
 
 /// Compute default local storage path
@@ -26,7 +27,7 @@ pub fn local_path() -> String {
 }
 
 /// Local backend configuration
-#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize)]
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "local-backend-config")]
 pub struct LocalBackendConfig {
     /// Path to local storage directory
@@ -49,8 +50,8 @@ pub fn pass_store_path() -> String {
         .to_string_lossy()
         .into_owned()
 }
-/// Pass backend configuration
-#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize)]
+/// Pass (password-store) backend configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "pass-backend-config")]
 pub struct PassBackendConfig {
     /// Path to password store directory
@@ -96,7 +97,7 @@ pub fn tpm_path() -> String {
 }
 
 /// TPM backend configuration
-#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize)]
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "tpm-backend-config")]
 pub struct TpmBackendConfig {
     /// Path to TPM storage directory
@@ -118,7 +119,7 @@ pub struct TpmBackendConfig {
 }
 
 /// Security configuration
-#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize)]
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "security")]
 pub struct SecurityConfig {
     /// Use mlock to prevent credentials from being swapped to disk (requires CAP_IPC_LOCK)
@@ -207,7 +208,7 @@ impl SecurityConfig {
 
 /// Main application configuration
 /// Note: Cannot derive Clone/Debug because it has #[clap_serde] fields
-#[derive(ClapSerde, Serialize, Deserialize, Debug)]
+#[derive(ClapSerde, Serialize, Deserialize, Debug, ConfigDoc)]
 pub struct AppConfig {
     /// Storage backend type: local, pass, or tpm
     #[arg(short = 't', long = "backend-type", env = "PASSLESS_BACKEND_TYPE")]

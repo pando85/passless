@@ -17,6 +17,7 @@ name = "passless"
 path = "src/main.rs"
 
 [dependencies]
+passless-config-doc = { path = "./passless-config-doc" }
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
 clap-serde-derive = "0.2"
