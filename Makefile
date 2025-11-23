@@ -75,11 +75,22 @@ update-changelog:	## automatically update changelog based on commits
 	git cliff -t v$(PROJECT_VERSION) -u -p CHANGELOG.md
 
 .PHONY: release
-release:	## generate vendor.tar.gz and $(PKG_BASE_NAME).tar.gz
+release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	cargo vendor
 	tar -czf vendor.tar.gz vendor
 	cargo build --frozen --release --all-features --target ${CARGO_TARGET}
 	tar -czf $(PKG_BASE_NAME).tar.gz -C $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release passless
+	@# Create completions tarball
+	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build/passless-rs-*/out/completions -type d 2>/dev/null | head -1); \
+	if [ -n "$$COMPLETION_DIR" ]; then \
+		mkdir -p completions-tmp; \
+		cp "$$COMPLETION_DIR"/* completions-tmp/ 2>/dev/null || true; \
+		tar -czf passless-completions-$(PROJECT_VERSION).tar.gz -C completions-tmp .; \
+		rm -rf completions-tmp; \
+		echo "Created completions tarball: passless-completions-$(PROJECT_VERSION).tar.gz"; \
+	else \
+		echo "Warning: Completions directory not found"; \
+	fi
 	@echo Released in $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/passless
 
 .PHONY: publish

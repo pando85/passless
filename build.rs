@@ -2,8 +2,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use clap::{Command, CommandFactory, Parser, Subcommand};
-use clap_complete::{generate_to, Shell};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate_to};
 
 /// Passless - Software FIDO2 Authenticator (wrapper for subcommands)
 #[derive(Parser, Debug)]
@@ -47,5 +47,8 @@ fn main() {
         generate_to(shell, &mut cmd, "passless", &completions_dir).unwrap();
     }
 
-    println!("cargo:warning=Shell completions generated in {:?}", completions_dir);
+    println!(
+        "cargo:warning=Shell completions generated in {:?}",
+        completions_dir
+    );
 }
