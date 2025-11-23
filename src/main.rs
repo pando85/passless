@@ -172,13 +172,10 @@ fn main() -> Result<()> {
         return match command {
             Commands::Config { action } => match action {
                 ConfigAction::Print => {
-                    // Generate default configuration (all defaults applied)
+                    // Generate default configuration with helpful comments
                     let mut default_args = Args::parse_from(["passless"]);
                     let default_config = AppConfig::from(&mut default_args.config);
-                    let toml_string = toml::to_string_pretty(&default_config).map_err(|e| {
-                        error::Error::Config(format!("Failed to serialize config: {}", e))
-                    })?;
-                    println!("{}", toml_string);
+                    println!("{}", default_config.to_toml_with_comments());
                     Ok(())
                 }
             },
