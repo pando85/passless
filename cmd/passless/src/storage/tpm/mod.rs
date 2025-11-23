@@ -27,7 +27,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::time::Instant;
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -486,13 +485,9 @@ impl TpmStorageAdapter {
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant TPM unsealing
     fn read_credential_from_path(&mut self, path: &Path) -> Result<Credential> {
-        if let Some(cached) = self.cache.get(path) {
-            if Instant::now() < cached.expires_at {
-                debug!("Cache HIT for path: {:?}", path);
-                return Ok(cached.credential.clone());
-            } else {
-                debug!("Cache entry expired for path: {:?}", path);
-            }
+        if let Some(cred) = self.cache.get_valid(path) {
+            debug!("Cache HIT for path: {:?}", path);
+            return Ok(cred);
         }
 
         debug!(
@@ -522,8 +517,8 @@ impl TpmStorageAdapter {
 
         let credential = Credential::from_bytes(&unsealed_data)?;
 
-        // Cache the unsealed credential with automatic TTL
-        self.cache.insert(path.to_path_buf(), credential.clone());
+        // Cache the serialized bytes in the locked arena (avoid storing unlocked struct)
+        self.cache.insert(path.to_path_buf(), &unsealed_data);
 
         Ok(credential)
     }

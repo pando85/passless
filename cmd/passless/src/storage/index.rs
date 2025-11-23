@@ -24,9 +24,10 @@ pub struct CredentialIndexes {
 }
 
 pub struct CachedCredential {
-    pub credential: Credential,
     pub expires_at: Instant,
     pub arena_slot: usize,
+    /// Actual length of the serialized credential stored in the arena slot
+    pub len: usize,
 }
 
 pub struct CredentialCache {
@@ -47,11 +48,22 @@ impl CredentialCache {
         }
     }
 
-    pub fn get(&self, path: &Path) -> Option<&CachedCredential> {
-        self.cache.get(path)
+    /// Get a deserialized credential if present and not expired
+    pub fn get_valid(&self, path: &Path) -> Option<Credential> {
+        if let Some(cached) = self.cache.get(path) {
+            if Instant::now() < cached.expires_at {
+                if let Some(slot_bytes) = self.arena.get_slot(cached.arena_slot) {
+                    let len = cached.len;
+                    let slice = &slot_bytes[..len];
+                    return serde_json::from_slice(slice).ok();
+                }
+            }
+        }
+        None
     }
 
-    pub fn insert(&mut self, path: PathBuf, credential: Credential) {
+    /// Insert serialized credential bytes into locked arena and record metadata
+    pub fn insert(&mut self, path: PathBuf, serialized: &[u8]) {
         // Allocate slot in locked arena
         let (slot, slot_data) = match self.arena.allocate() {
             Some(allocation) => allocation,
@@ -70,38 +82,29 @@ impl CredentialCache {
             }
         };
 
-        // Serialize credential to the locked memory slot
-        match serde_json::to_vec(&credential) {
-            Ok(serialized) => {
-                if serialized.len() > CREDENTIAL_SLOT_SIZE {
-                    debug!(
-                        "Credential too large ({} bytes > {} bytes), not caching",
-                        serialized.len(),
-                        CREDENTIAL_SLOT_SIZE
-                    );
-                    self.arena.free(slot);
-                    return;
-                }
-                // Copy serialized data to locked arena
-                slot_data[..serialized.len()].copy_from_slice(&serialized);
-                debug!(
-                    "Cached credential in locked slot {} ({} bytes, expires in {}s)",
-                    slot,
-                    serialized.len(),
-                    CREDENTIAL_CACHE_TTL.as_secs()
-                );
-            }
-            Err(e) => {
-                debug!("Failed to serialize credential: {}", e);
-                self.arena.free(slot);
-                return;
-            }
+        if serialized.len() > CREDENTIAL_SLOT_SIZE {
+            debug!(
+                "Credential too large ({} bytes > {} bytes), not caching",
+                serialized.len(),
+                CREDENTIAL_SLOT_SIZE
+            );
+            self.arena.free(slot);
+            return;
         }
 
+        // Copy serialized data to locked arena
+        slot_data[..serialized.len()].copy_from_slice(serialized);
+        debug!(
+            "Cached credential in locked slot {} ({} bytes, expires in {}s)",
+            slot,
+            serialized.len(),
+            CREDENTIAL_CACHE_TTL.as_secs()
+        );
+
         let cached = CachedCredential {
-            credential,
             expires_at: Instant::now() + CREDENTIAL_CACHE_TTL,
             arena_slot: slot,
+            len: serialized.len(),
         };
         self.cache.insert(path, cached);
     }

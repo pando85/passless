@@ -17,7 +17,6 @@ use soft_fido2::{Credential, CredentialRef, RelyingParty};
 use core::fmt;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
@@ -235,13 +234,9 @@ impl PassStorageAdapter {
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant GPG decryption
     fn read_credential_from_path(&mut self, path: &Path) -> Result<Credential> {
-        if let Some(cached) = self.cache.get(path) {
-            if Instant::now() < cached.expires_at {
-                debug!("Cache HIT for path: {:?}", path);
-                return Ok(cached.credential.clone());
-            } else {
-                debug!("Cache entry expired for path: {:?}", path);
-            }
+        if let Some(cred) = self.cache.get_valid(path) {
+            debug!("Cache HIT for path: {:?}", path);
+            return Ok(cred);
         }
 
         debug!(
@@ -274,11 +269,13 @@ impl PassStorageAdapter {
         debug!("Successfully decrypted credential");
 
         // Parse credential from decrypted bytes
+        // Parse credential from decrypted bytes
         let credential: Credential = serde_json::from_slice(plaintext.unsecure_ref())
             .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))?;
 
-        // Cache the decrypted credential with automatic TTL
-        self.cache.insert(path.to_path_buf(), credential.clone());
+        // Cache the serialized bytes in the locked arena (avoid storing unlocked struct)
+        self.cache
+            .insert(path.to_path_buf(), plaintext.unsecure_ref());
 
         Ok(credential)
     }
