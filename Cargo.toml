@@ -23,8 +23,8 @@ clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] 
 clap-serde-derive = "0.2"
 #soft-fido2 = { path = "../soft-fido2/soft-fido2" }
 #soft-fido2-transport = { path = "../soft-fido2/soft-fido2-transport" }
-soft-fido2 = "0.2.0"
-soft-fido2-transport = "0.2.0"
+soft-fido2 = "0.2.1"
+soft-fido2-transport = "0.2.1"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
