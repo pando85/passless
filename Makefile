@@ -93,6 +93,14 @@ release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	fi
 	@echo Released in $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/passless
 
+.PHONY: update-version
+update-version: ## update version from VERSION file in all Cargo.toml manifests
+update-version: */Cargo.toml
+	@VERSION=$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1); \
+	sed -i -E "s/(passless-[a-z0-9-]+ = \{ path = \"[^\"]+\", version = )\"[^\"]+\"/\1\"$$VERSION\"/g" Cargo.toml && \
+	cargo update --workspace ; \
+	echo updated to version "$$VERSION" cargo files ; \
+
 .PHONY: publish
 publish:	## publish crate
 	cargo publish

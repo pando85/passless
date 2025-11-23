@@ -4,8 +4,7 @@ set -e
 # bump version
 vim ./Cargo.toml
 
-# update lock file
-cargo update -p passless-rs
+make update-version
 
 make update-changelog
 
