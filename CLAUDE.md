@@ -119,12 +119,17 @@ For detailed TPM and swtpm setup instructions, see:
 
 ### Core Components
 
-**Main Loop** (`src/main.rs:22-86`):
+**Main Loop** (`cmd/passless/src/main.rs`):
 - Runs in `run_with_service()` function
 - Reads CTAPHID packets from UHID device in 64-byte chunks
 - Processes CBOR commands through `AuthenticatorService`
 - Sends response packets back through UHID
 - Periodically cleans up expired credential cache (every 5 seconds)
+- Implements graceful shutdown on Ctrl+C with 5-second timeout:
+  - Sets shutdown flag when Ctrl+C is received
+  - Spawns a timeout thread that forcefully exits after 5 seconds
+  - Performs final cache cleanup before normal exit
+  - If graceful shutdown takes longer than 5 seconds, process is forcefully terminated
 
 **AuthenticatorService** (`src/authenticator.rs`):
 - Orchestrates FIDO2 operations using dependency-injected `CredentialStorage`
