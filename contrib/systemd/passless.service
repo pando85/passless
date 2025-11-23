@@ -1,8 +1,8 @@
 [Unit]
 Description=Passless FIDO2 Software Authenticator
 Documentation=https://github.com/pando85/passless
-After=network.target
-Wants=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
