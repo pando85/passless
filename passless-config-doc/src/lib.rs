@@ -7,14 +7,12 @@ fn extract_doc(attrs: &[syn::Attribute]) -> String {
     attrs
         .iter()
         .filter_map(|attr| {
-            if attr.path().is_ident("doc") {
-                if let Meta::NameValue(nv) = &attr.meta {
-                    if let Expr::Lit(expr_lit) = &nv.value {
-                        if let Lit::Str(lit_str) = &expr_lit.lit {
-                            return Some(lit_str.value().trim().to_string());
-                        }
-                    }
-                }
+            if attr.path().is_ident("doc")
+                && let Meta::NameValue(nv) = &attr.meta
+                && let Expr::Lit(expr_lit) = &nv.value
+                && let Lit::Str(lit_str) = &expr_lit.lit
+            {
+                return Some(lit_str.value().trim().to_string());
             }
             None
         })
@@ -25,16 +23,16 @@ fn extract_doc(attrs: &[syn::Attribute]) -> String {
 /// Extract default value from #[default(...)] attribute
 fn extract_default(attrs: &[syn::Attribute]) -> Option<String> {
     for attr in attrs {
-        if attr.path().is_ident("default") {
+        if attr.path().is_ident("default") &&
             // Extract the tokens inside #[default(...)]
-            if let Ok(tokens) = attr.parse_args::<proc_macro2::TokenStream>() {
-                let default_str = tokens.to_string();
-                // Clean up the string - remove quotes if it's a string literal
-                if default_str.starts_with("\"") && default_str.ends_with("\"") {
-                    return Some(default_str.trim_matches('"').to_string());
-                }
-                return Some(default_str);
+            let Ok(tokens) = attr.parse_args::<proc_macro2::TokenStream>()
+        {
+            let default_str = tokens.to_string();
+            // Clean up the string - remove quotes if it's a string literal
+            if default_str.starts_with("\"") && default_str.ends_with("\"") {
+                return Some(default_str.trim_matches('"').to_string());
             }
+            return Some(default_str);
         }
     }
     None
@@ -42,10 +40,10 @@ fn extract_default(attrs: &[syn::Attribute]) -> Option<String> {
 
 /// Get the type name from a Type
 fn get_type_name(ty: &Type) -> Option<String> {
-    if let Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            return Some(segment.ident.to_string());
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return Some(segment.ident.to_string());
     }
     None
 }
@@ -150,6 +148,7 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
 }
 
 /// Generate the to_toml_with_comments method for AppConfig
+#[allow(clippy::type_complexity)]
 fn generate_toml_method(
     fields: &[(syn::Ident, String, Option<String>, bool, Option<String>)],
 ) -> proc_macro2::TokenStream {
