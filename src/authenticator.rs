@@ -318,6 +318,7 @@ mod tests {
     #[test]
     fn test_service_creation() {
         let temp_dir = std::env::temp_dir().join("test_passless");
+        std::fs::create_dir_all(&temp_dir).unwrap();
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
 
         let security_config = SecurityConfig {

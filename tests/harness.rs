@@ -42,10 +42,6 @@ impl LocalBackend {
 impl BackendSetup for LocalBackend {
     fn setup(&mut self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let mut env = HashMap::new();
-        env.insert(
-            "PASSLESS_LOCAL_PATH".to_string(),
-            self.temp_dir.path().join("fido2").display().to_string(),
-        );
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
         Ok(env)
     }
@@ -55,7 +51,7 @@ impl BackendSetup for LocalBackend {
             "--backend-type".to_string(),
             "local".to_string(),
             "--local-path".to_string(),
-            self.temp_dir.path().join("fido2").display().to_string(),
+            self.temp_dir.path().display().to_string(),
             "-v".to_string(),
         ]
     }
@@ -65,30 +61,14 @@ impl BackendSetup for LocalBackend {
 pub struct PassBackend {
     temp_dir: TempDir,
     gpg_home: PathBuf,
-    pass_store: PathBuf,
 }
 
 impl PassBackend {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let gpg_home = temp_dir.path().join(".gnupg");
-        let pass_store = temp_dir.path().join("password-store");
 
-        std::fs::create_dir_all(&gpg_home)?;
-        std::fs::create_dir_all(&pass_store)?;
-
-        // Set restrictive permissions on GPG home
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gpg_home, std::fs::Permissions::from_mode(0o700))?;
-        }
-
-        Ok(Self {
-            temp_dir,
-            gpg_home,
-            pass_store,
-        })
+        Ok(Self { temp_dir, gpg_home })
     }
 
     /// Initialize GPG key for testing
@@ -131,7 +111,7 @@ Expire-Date: 0
     /// Initialize password store
     fn init_pass(&self) -> Result<(), Box<dyn std::error::Error>> {
         let output = Command::new("pass")
-            .env("PASSWORD_STORE_DIR", &self.pass_store)
+            .env("PASSWORD_STORE_DIR", self.temp_dir.path())
             .env("GNUPGHOME", &self.gpg_home)
             .arg("init")
             .arg("passless-e2e@test.local")
@@ -153,6 +133,16 @@ impl BackendSetup for PassBackend {
     fn setup(&mut self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         println!("🔧 Setting up password-store backend...");
 
+        std::fs::create_dir_all(&self.gpg_home)?;
+        std::fs::create_dir_all(self.temp_dir.path().join("fido2"))?;
+
+        // Set restrictive permissions on GPG home
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.gpg_home, std::fs::Permissions::from_mode(0o700))?;
+        }
+
         self.init_gpg()?;
         println!("   ✓ GPG key generated");
 
@@ -160,10 +150,6 @@ impl BackendSetup for PassBackend {
         println!("   ✓ Password store initialized");
 
         let mut env = HashMap::new();
-        env.insert(
-            "PASSLESS_PASS_STORE_PATH".to_string(),
-            self.pass_store.display().to_string(),
-        );
         env.insert("GNUPGHOME".to_string(), self.gpg_home.display().to_string());
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
 
@@ -175,7 +161,9 @@ impl BackendSetup for PassBackend {
             "--backend-type".to_string(),
             "pass".to_string(),
             "--pass-store-path".to_string(),
-            self.pass_store.display().to_string(),
+            self.temp_dir.path().display().to_string(),
+            "--pass-path".to_string(),
+            "fido2".to_string(),
             "-v".to_string(),
         ]
     }
@@ -185,20 +173,15 @@ impl BackendSetup for PassBackend {
 pub struct TpmBackend {
     temp_dir: TempDir,
     swtpm_process: Option<Child>,
-    storage_path: PathBuf,
 }
 
 impl TpmBackend {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let storage_path = temp_dir.path().join("tpm-storage");
-
-        std::fs::create_dir_all(&storage_path)?;
 
         Ok(Self {
             temp_dir,
             swtpm_process: None,
-            storage_path,
         })
     }
 
@@ -211,7 +194,7 @@ impl TpmBackend {
             .arg("socket")
             .arg("--tpm2")
             .arg("--tpmstate")
-            .arg(format!("dir={}", self.storage_path.display()))
+            .arg(format!("dir={}", self.temp_dir.path().display()))
             .arg("--server")
             .arg("type=tcp,port=2321")
             .arg("--ctrl")
@@ -251,15 +234,9 @@ impl BackendSetup for TpmBackend {
 
         self.start_swtpm()?;
         println!("   ✓ swtpm started");
+
+        std::fs::create_dir_all(self.temp_dir.path().join("credentials"))?;
         let mut env = HashMap::new();
-        env.insert(
-            "PASSLESS_TPM_PATH".to_string(),
-            self.temp_dir
-                .path()
-                .join("credentials")
-                .display()
-                .to_string(),
-        );
         env.insert(
             "PASSLESS_TPM_TCTI".to_string(),
             "swtpm:host=localhost,port=2321".to_string(),
