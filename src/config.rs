@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub fn local_path() -> String {
     dirs::data_dir()
         .expect("Could not determine data directory: $XDG_DATA_HOME or $HOME/.local/share")
-        .join("passless")
+        .join("passless/local")
         .to_string_lossy()
         .into_owned()
 }
