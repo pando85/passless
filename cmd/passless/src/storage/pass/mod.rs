@@ -223,7 +223,7 @@ impl PassStorageAdapter {
         debug!("Successfully decrypted credential");
 
         // Parse credential from decrypted bytes
-        serde_json::from_slice(plaintext.unsecure_ref())
+        Credential::from_bytes(plaintext.unsecure_ref())
             .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))
     }
 
@@ -269,7 +269,7 @@ impl PassStorageAdapter {
         debug!("Successfully decrypted credential");
 
         // Parse credential from decrypted bytes
-        let credential: Credential = serde_json::from_slice(plaintext.unsecure_ref())
+        let credential: Credential = Credential::from_bytes(plaintext.unsecure_ref())
             .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))?;
 
         // Cache the decrypted credential with automatic TTL
@@ -287,7 +287,7 @@ impl PassStorageAdapter {
             Error::Storage("Credential not found".to_string())
         })?;
 
-        let path = path_info.to_path(&self.path);
+        let path = path_info.to_path(&self.get_fido2_path());
         self.read_credential_from_path(&path)
     }
 
@@ -350,7 +350,7 @@ impl PassStorageAdapter {
     }
 
     /// Write a credential to the store
-    fn write_credential(&mut self, cred: &Credential, cred_json: &str) -> Result<()> {
+    fn write_credential_bytes(&mut self, cred: &Credential, cred_bytes: &[u8]) -> Result<()> {
         self.cache.evict_expired();
 
         let path = get_credential_path(&self.get_fido2_path(), &cred.rp.id, &cred.id, "gpg");
@@ -371,7 +371,7 @@ impl PassStorageAdapter {
         let mut context = self.create_crypto_context()?;
 
         // Encrypt and write the credential data directly to file
-        let plaintext = Plaintext::from(cred_json);
+        let plaintext = Plaintext::from(cred_bytes.to_vec());
 
         context
             .encrypt_file(&recipients, plaintext, &path)
@@ -421,7 +421,7 @@ impl PassStorageAdapter {
             .clone();
 
         // Convert to actual path
-        let path = path_info.to_path(&self.path);
+        let path = path_info.to_path(&self.get_fido2_path());
 
         // Delete the file
         std::fs::remove_file(&path).map_err(|e| {
@@ -483,13 +483,13 @@ impl CredentialStorage for PassStorageAdapter {
                 self.indexes
                     .id
                     .values()
-                    .map(|path_info| path_info.to_path(&self.path))
+                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
                     .collect()
             }
             CredentialFilter::ById(id) => {
                 // ById: direct lookup in index_by_id
                 if let Some(path_info) = self.indexes.id.get(id.as_slice()) {
-                    vec![path_info.to_path(&self.path)]
+                    vec![path_info.to_path(&self.get_fido2_path())]
                 } else {
                     Vec::new()
                 }
@@ -506,7 +506,7 @@ impl CredentialStorage for PassStorageAdapter {
                                 self.indexes
                                     .id
                                     .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.path))
+                                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
                             })
                             .collect()
                     })
@@ -524,7 +524,7 @@ impl CredentialStorage for PassStorageAdapter {
                                 self.indexes
                                     .id
                                     .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.path))
+                                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
                             })
                             .collect()
                     })
@@ -569,12 +569,12 @@ impl CredentialStorage for PassStorageAdapter {
         debug!("write called for RP: {}", cred_ref.rp_id);
 
         let credential = cred_ref.to_owned();
-        // Use Zeroizing to ensure credential JSON is cleared from memory after use
-        let cred_json = Zeroizing::new(serde_json::to_string(&credential).map_err(|e| {
+        // Use Zeroizing to ensure credential bytes are cleared from memory after use
+        let cred_bytes = Zeroizing::new(credential.to_bytes().map_err(|e| {
             debug!("Failed to serialize credential: {:?}", e);
             Error::Storage(format!("Failed to serialize credential: {:?}", e))
         })?);
-        self.write_credential(&credential, &cred_json)
+        self.write_credential_bytes(&credential, &cred_bytes)
             .map_err(Into::into)
     }
 
@@ -602,7 +602,7 @@ impl CredentialStorage for PassStorageAdapter {
             .iter()
             .filter_map(|cred_id| {
                 let path_info = self.indexes.id.get(cred_id)?;
-                let path = path_info.to_path(&self.path);
+                let path = path_info.to_path(&self.get_fido2_path());
                 let cred = self.read_credential_from_path_no_cache(&path).ok()?;
                 Some(String::from_utf8_lossy(&cred.user.id).to_string())
             })
