@@ -189,19 +189,54 @@ impl SecurityConfig {
         Ok(())
     }
 
+    /// Probe mlock capability by testing with a small allocation
+    /// Returns true if mlock is available, false otherwise
+    fn probe_mlock_capability(&self) -> bool {
+        use libc::{mlock, munlock};
+
+        // Allocate a small test buffer (1 page = 4KB)
+        let test_size = 4096;
+        let test_buffer = vec![0u8; test_size];
+        let ptr = test_buffer.as_ptr() as *const libc::c_void;
+
+        // Try to lock the test buffer
+        let lock_result = unsafe { mlock(ptr, test_size) };
+
+        // Clean up: unlock if lock succeeded
+        if lock_result == 0 {
+            unsafe { munlock(ptr, test_size) };
+            true
+        } else {
+            false
+        }
+    }
+
     /// Lock all current and future memory mappings to prevent swapping
     fn lock_all_memory(&self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Locking all memory to prevent swapping");
+
+        // First probe if mlock is available
+        if !self.probe_mlock_capability() {
+            log::warn!(
+                "mlock capability probe failed - memory locking may not be available.\n\
+                 Hint: increase DefaultLimitMEMLOCK in /etc/systemd/system.conf and /etc/systemd/user.conf\n\
+                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'"
+            );
+            return Ok(()); // Don't fail, just warn
+        }
+
         let r = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
         if r != 0 {
-            return Err(format!(
-                "mlockall failed (errno {}).\n\
-                 Hint: increase DefaultLimitMEMLOCK at /etc/systemd/system.conf and /etc/systemd/user.conf level.\n\
+            log::warn!(
+                "mlockall failed (errno {}). Continuing without memory locking.\n\
+                 Hint: increase DefaultLimitMEMLOCK in /etc/systemd/system.conf and /etc/systemd/user.conf\n\
                  Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'",
                 std::io::Error::last_os_error()
-            )
-            .into());
+            );
+            return Ok(()); // Don't fail, just warn
         }
+
+        log::info!("Successfully locked all memory to prevent swapping");
         Ok(())
     }
 }
