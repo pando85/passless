@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.0](https://github.com/pando85/passless/tree/v0.4.0) - 2025-11-24
+
+### Added
+
+- Add memory security hardening with zeroizing and mlock probe ([afefc1d](https://github.com/pando85/passless/commit/afefc1d233246e10ab61180fcc20301379c56827))
+- Disable mlockall option in flavor of the new mlock just sensitive data ([2247b01](https://github.com/pando85/passless/commit/2247b01fde0a762b4db0681e400e99fd28906f86))
+  - **BREAKING**: config `use_mlock` changed to `check_mlock`.
+
+### Fixed
+
+- Force shutdown after 5s trying graceful shutdown ([1646b58](https://github.com/pando85/passless/commit/1646b58204260f48b433d097c0c269de3116239b))
+- Use indexes to get metadata from credentials ([1662323](https://github.com/pando85/passless/commit/1662323fd887b3175ac7fe545e00636d8f5da59f))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.3.0 ([cc704e6](https://github.com/pando85/passless/commit/cc704e6839c4f1fce2ae4fad62db43df3a4a8310))
+- deps: Update soft-fido2 to version 0.3.1 ([d195555](https://github.com/pando85/passless/commit/d195555a052363ae01869b004995f5c3499cb921))
+  - **BREAKING**: The `pass` backend now uses binary credential storage
+format instead of JSON. Existing password stores must be recreated as
+no migration path is provided. We don't expect more breaking changes
+like this in the future. We don't offer a migration mechanism because
+probably there are no users but in the future we will offer a way if
+this is needed.
+
+### Refactor
+
+- Fix import order according to style ([dc9c479](https://github.com/pando85/passless/commit/dc9c4798a22f0258278fbe1d600a98aa26ecdead))
+- Deprecate example for testing config ([960272c](https://github.com/pando85/passless/commit/960272c950040a1e909c0fa771d503bd27a240e7))
+
 ## [v0.3.3](https://github.com/pando85/passless/tree/v0.3.3) - 2025-11-23
 
 ### Fixed
