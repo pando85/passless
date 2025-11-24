@@ -324,7 +324,7 @@ mod tests {
         let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
 
         let security_config = SecurityConfig {
-            use_mlock: false,
+            check_mlock: false,
             disable_core_dumps: false,
             constant_signature_counter: false,
             user_verification_registration: true,
