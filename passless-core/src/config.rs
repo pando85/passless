@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 use clap_serde_derive::ClapSerde;
-use libc::{MCL_CURRENT, MCL_FUTURE, PR_SET_DUMPABLE, mlockall, prctl};
+use libc::{PR_SET_DUMPABLE, prctl};
+use libc::{mlock, munlock};
 use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
 use passless_config_doc::ConfigDoc;
@@ -122,11 +123,11 @@ pub struct TpmBackendConfig {
 #[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "security")]
 pub struct SecurityConfig {
-    /// Use mlock to prevent credentials from being swapped to disk (requires CAP_IPC_LOCK)
-    #[arg(long = "use-mlock", env = "PASSLESS_USE_MLOCK")]
+    /// Check if mlock is available to prevent credentials from being swapped to disk
+    #[arg(long = "check-mlock", env = "PASSLESS_CHECK_MLOCK")]
     #[serde(default)]
     #[default(true)]
-    pub use_mlock: bool,
+    pub check_mlock: bool,
 
     /// Disable core dumps to prevent credential leakage
     #[arg(long = "disable-core-dumps", env = "PASSLESS_DISABLE_CORE_DUMPS")]
@@ -172,8 +173,8 @@ impl SecurityConfig {
         if self.disable_core_dumps {
             self.disable_core_dumps_impl()?;
         }
-        if self.use_mlock {
-            self.lock_all_memory()?;
+        if self.check_mlock {
+            self.probe_mlock_capability()?;
         }
         Ok(())
     }
@@ -190,53 +191,24 @@ impl SecurityConfig {
     }
 
     /// Probe mlock capability by testing with a small allocation
-    /// Returns true if mlock is available, false otherwise
-    fn probe_mlock_capability(&self) -> bool {
-        use libc::{mlock, munlock};
+    fn probe_mlock_capability(&self) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("Check mlock capability");
 
-        // Allocate a small test buffer (1 page = 4KB)
         let test_size = 4096;
         let test_buffer = vec![0u8; test_size];
         let ptr = test_buffer.as_ptr() as *const libc::c_void;
 
-        // Try to lock the test buffer
         let lock_result = unsafe { mlock(ptr, test_size) };
 
-        // Clean up: unlock if lock succeeded
         if lock_result == 0 {
             unsafe { munlock(ptr, test_size) };
-            true
+            log::info!("MLOCK is enabled - sensitive data will not be swapped to disk");
         } else {
-            false
-        }
-    }
-
-    /// Lock all current and future memory mappings to prevent swapping
-    fn lock_all_memory(&self) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Locking all memory to prevent swapping");
-
-        // First probe if mlock is available
-        if !self.probe_mlock_capability() {
             log::warn!(
                 "mlock capability probe failed - memory locking may not be available.\n\
-                 Hint: increase DefaultLimitMEMLOCK in /etc/systemd/system.conf and /etc/systemd/user.conf\n\
                  Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'"
             );
-            return Ok(()); // Don't fail, just warn
         }
-
-        let r = unsafe { mlockall(MCL_CURRENT | MCL_FUTURE) };
-        if r != 0 {
-            log::warn!(
-                "mlockall failed (errno {}). Continuing without memory locking.\n\
-                 Hint: increase DefaultLimitMEMLOCK in /etc/systemd/system.conf and /etc/systemd/user.conf\n\
-                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'",
-                std::io::Error::last_os_error()
-            );
-            return Ok(()); // Don't fail, just warn
-        }
-
-        log::info!("Successfully locked all memory to prevent swapping");
         Ok(())
     }
 }
