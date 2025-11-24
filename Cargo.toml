@@ -39,6 +39,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 ctrlc = "3.4"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 # Proc macro dependencies
 syn = { version = "2.0", features = ["full", "extra-traits"] }

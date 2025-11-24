@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use log::{debug, info};
+use zeroize::Zeroizing;
 
 /// Local file system storage adapter
 ///
@@ -94,11 +95,14 @@ impl LocalStorageAdapter {
             fs::create_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
         }
 
-        let bytes = cred.to_bytes()?;
+        // Use Zeroizing to ensure credential bytes are cleared from memory after use
+        let bytes = Zeroizing::new(cred.to_bytes()?);
 
         let mut file = File::create(&path).map_err(|_| soft_fido2::Error::Other)?;
         file.write_all(&bytes)
             .map_err(|_| soft_fido2::Error::Other)?;
+
+        // bytes is automatically zeroed when it goes out of scope
 
         // Update indexes
         update_indexes_on_write(&mut self.indexes, path_info);

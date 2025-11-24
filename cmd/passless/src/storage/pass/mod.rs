@@ -23,6 +23,7 @@ use core::fmt;
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
 use prs_lib::{Ciphertext, Plaintext, Store};
+use zeroize::Zeroizing;
 
 /// Pass (password-store) storage adapter
 ///
@@ -568,10 +569,11 @@ impl CredentialStorage for PassStorageAdapter {
         debug!("write called for RP: {}", cred_ref.rp_id);
 
         let credential = cred_ref.to_owned();
-        let cred_json = serde_json::to_string(&credential).map_err(|e| {
+        // Use Zeroizing to ensure credential JSON is cleared from memory after use
+        let cred_json = Zeroizing::new(serde_json::to_string(&credential).map_err(|e| {
             debug!("Failed to serialize credential: {:?}", e);
             Error::Storage(format!("Failed to serialize credential: {:?}", e))
-        })?;
+        })?);
         self.write_credential(&credential, &cred_json)
             .map_err(Into::into)
     }

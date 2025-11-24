@@ -1444,6 +1444,7 @@ dependencies = [
  "soft-fido2-transport",
  "tempfile",
  "tss-esapi",
+ "zeroize",
 ]
 
 [[package]]

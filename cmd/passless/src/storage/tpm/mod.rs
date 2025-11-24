@@ -45,6 +45,7 @@ use tss_esapi::structures::{
 };
 use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
 use tss_esapi::{Context, Tcti};
+use zeroize::Zeroizing;
 
 /// TPM storage adapter
 ///
@@ -343,10 +344,13 @@ impl TpmStorageAdapter {
         };
 
         // Serialize the blob to JSON
-        serde_json::to_vec(&sealed_blob).map_err(|e| {
+        // Use Zeroizing to ensure the serialization buffer is cleared from memory after use
+        let serialized = Zeroizing::new(serde_json::to_vec(&sealed_blob).map_err(|e| {
             log::error!("Failed to serialize sealed blob: {}", e);
             soft_fido2::Error::Other
-        })
+        })?);
+
+        Ok(serialized.to_vec())
     }
 
     /// Unseal data using TPM with hybrid decryption
@@ -472,7 +476,8 @@ impl TpmStorageAdapter {
         })?;
 
         // Unseal the data using TPM
-        let unsealed_data = self.unseal_data(&sealed_data)?;
+        // Use Zeroizing to ensure the unsealed data is cleared from memory after use
+        let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data)?);
 
         Credential::from_bytes(&unsealed_data)
     }
@@ -512,7 +517,8 @@ impl TpmStorageAdapter {
         })?;
 
         // Unseal the data using TPM
-        let unsealed_data = self.unseal_data(&sealed_data)?;
+        // Use Zeroizing to ensure the unsealed data is cleared from memory after use
+        let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data)?);
 
         let credential = Credential::from_bytes(&unsealed_data)?;
 
@@ -571,7 +577,8 @@ impl TpmStorageAdapter {
             })?;
         }
 
-        let bytes = cred.to_bytes()?;
+        // Use Zeroizing to ensure credential bytes are cleared from memory after use
+        let bytes = Zeroizing::new(cred.to_bytes()?);
 
         // Seal the data using TPM
         let sealed_data = self.seal_data(&bytes)?;

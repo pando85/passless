@@ -110,18 +110,30 @@ impl CredentialCache {
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.cache.remove(path);
+        // Explicitly drop the credential to ensure SecVec is zeroized immediately
+        if let Some(cached) = self.cache.remove(path) {
+            drop(cached.credential);
+        }
     }
 
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
-        self.cache.retain(|path, cached| {
-            let keep = now < cached.expires_at;
-            if !keep {
-                debug!("Evicting expired cache entry: {:?}", path);
+
+        // Collect expired entries to explicitly drop their credentials
+        let expired: Vec<PathBuf> = self
+            .cache
+            .iter()
+            .filter(|(_, cached)| now >= cached.expires_at)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        // Explicitly drop credentials before removing from cache
+        for path in expired {
+            debug!("Evicting expired cache entry: {:?}", path);
+            if let Some(cached) = self.cache.remove(&path) {
+                drop(cached.credential);
             }
-            keep
-        });
+        }
     }
 
     fn find_oldest(&self) -> Option<PathBuf> {
@@ -136,7 +148,10 @@ impl CredentialCache {
             && let Some(oldest) = self.find_oldest()
         {
             debug!("Cache full - evicting oldest entry: {:?}", oldest);
-            self.cache.remove(&oldest);
+            // Explicitly drop the credential before removing from cache
+            if let Some(cached) = self.cache.remove(&oldest) {
+                drop(cached.credential);
+            }
         }
     }
 }
