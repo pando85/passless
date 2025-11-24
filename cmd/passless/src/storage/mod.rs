@@ -19,6 +19,7 @@ pub enum CredentialFilter {
     /// No filter - return all credentials
     None,
     /// Filter by credential ID
+    #[allow(dead_code)]
     ById(Vec<u8>),
     /// Filter by relying party ID
     ByRp(String),

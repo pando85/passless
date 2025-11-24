@@ -15,8 +15,8 @@
 pub mod init;
 
 use crate::storage::index::{
-    CredentialCache, CredentialIndexes, get_credential_path, load_credential_paths,
-    update_indexes_on_delete, update_indexes_on_write,
+    CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
+    load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 
@@ -526,34 +526,13 @@ impl TpmStorageAdapter {
     fn read_credential_by_id(&mut self, id: &[u8]) -> Result<Credential> {
         debug!("Reading credential by ID: {:02x?}", &id[..id.len().min(8)]);
 
-        let path = self
-            .indexes
-            .id
-            .get(id)
-            .ok_or_else(|| {
-                debug!("Credential not found in index");
-                soft_fido2::Error::DoesNotExist
-            })?
-            .clone();
+        let path_info = self.indexes.id.get(id).ok_or_else(|| {
+            debug!("Credential not found in index");
+            soft_fido2::Error::DoesNotExist
+        })?;
 
+        let path = path_info.to_path(&self.storage_dir);
         self.read_credential_from_path(&path)
-    }
-
-    /// Load all credentials from storage (non-caching version)
-    /// Used for operations that need &self
-    #[allow(dead_code)]
-    fn load_all_credentials_no_cache(&self) -> Vec<Credential> {
-        debug!("Loading all credentials from storage (no cache)");
-        let mut credentials = Vec::new();
-
-        for path in self.indexes.id.values() {
-            if let Ok(cred) = self.read_credential_from_path_no_cache(path) {
-                credentials.push(cred);
-            }
-        }
-
-        debug!("Loaded {} credentials", credentials.len());
-        credentials
     }
 
     /// Find the next credential matching the current filter
@@ -613,12 +592,9 @@ impl TpmStorageAdapter {
         self.cache.remove(&path);
 
         // Update all indexes using shared function
-        update_indexes_on_write(
-            &mut self.indexes,
-            path,
-            cred.id.to_vec(),
-            cred.rp.id.clone(),
-        );
+        let path_info =
+            CredentialPathInfo::new(cred.rp.id.clone(), cred.id.to_vec(), "tpm".to_string());
+        update_indexes_on_write(&mut self.indexes, path_info);
 
         Ok(())
     }
@@ -632,7 +608,7 @@ impl TpmStorageAdapter {
             &id[..id.len().min(8)]
         );
 
-        let path = self
+        let path_info = self
             .indexes
             .id
             .get(id)
@@ -642,8 +618,7 @@ impl TpmStorageAdapter {
             })?
             .clone();
 
-        // Read credential to get RP info for index cleanup
-        let cred = self.read_credential_from_path(&path)?;
+        let path = path_info.to_path(&self.storage_dir);
 
         // Delete the file
         std::fs::remove_file(&path).map_err(|e| {
@@ -655,7 +630,7 @@ impl TpmStorageAdapter {
         self.cache.remove(&path);
 
         // Remove from all indexes using shared function
-        update_indexes_on_delete(&mut self.indexes, &path, id, &cred.rp.id);
+        update_indexes_on_delete(&mut self.indexes, id);
 
         debug!("Successfully deleted credential");
 
@@ -673,31 +648,55 @@ impl CredentialStorage for TpmStorageAdapter {
         self.iteration_entries = match &filter {
             CredentialFilter::None => {
                 // No filter: iterate all credentials
-                self.indexes.id.values().cloned().collect()
+                self.indexes
+                    .id
+                    .values()
+                    .map(|path_info| path_info.to_path(&self.storage_dir))
+                    .collect()
             }
             CredentialFilter::ById(id) => {
                 // ById: direct lookup in index
-                if let Some(path) = self.indexes.id.get(id.as_slice()) {
-                    vec![path.clone()]
+                if let Some(path_info) = self.indexes.id.get(id.as_slice()) {
+                    vec![path_info.to_path(&self.storage_dir)]
                 } else {
                     Vec::new()
                 }
             }
             CredentialFilter::ByRp(rp_id) => {
                 // ByRp: lookup in index
-                if let Some(paths) = self.indexes.rp.get(rp_id.as_str()) {
-                    paths.clone()
-                } else {
-                    Vec::new()
-                }
+                self.indexes
+                    .rp
+                    .get(rp_id.as_str())
+                    .map(|cred_ids| {
+                        cred_ids
+                            .iter()
+                            .filter_map(|cred_id| {
+                                self.indexes
+                                    .id
+                                    .get(cred_id)
+                                    .map(|path_info| path_info.to_path(&self.storage_dir))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
             }
             CredentialFilter::ByHash(hash) => {
                 // ByHash: lookup in index
-                if let Some(paths) = self.indexes.rp_hash.get(hash) {
-                    paths.clone()
-                } else {
-                    Vec::new()
-                }
+                self.indexes
+                    .rp_hash
+                    .get(hash)
+                    .map(|cred_ids| {
+                        cred_ids
+                            .iter()
+                            .filter_map(|cred_id| {
+                                self.indexes
+                                    .id
+                                    .get(cred_id)
+                                    .map(|path_info| path_info.to_path(&self.storage_dir))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
             }
         };
 
@@ -751,11 +750,23 @@ impl CredentialStorage for TpmStorageAdapter {
     fn select_users(&self, rp_id: &str) -> Vec<String> {
         debug!("select_users called for RP: {}", rp_id);
 
-        let credentials = self.load_all_credentials_no_cache();
-        let users: Vec<String> = credentials
+        let cred_ids = match self.indexes.rp.get(rp_id) {
+            Some(ids) => ids,
+            None => {
+                debug!("No credentials found for RP: {}", rp_id);
+                return Vec::new();
+            }
+        };
+
+        // Load only credentials for this specific RP (unseal only what's needed)
+        let users: Vec<String> = cred_ids
             .iter()
-            .filter(|cred| cred.rp.id == rp_id)
-            .map(|cred| String::from_utf8_lossy(&cred.user.id).to_string())
+            .filter_map(|cred_id| {
+                let path_info = self.indexes.id.get(cred_id)?;
+                let path = path_info.to_path(&self.storage_dir);
+                let cred = self.read_credential_from_path_no_cache(&path).ok()?;
+                Some(String::from_utf8_lossy(&cred.user.id).to_string())
+            })
             .collect();
 
         debug!("Found {} users for RP: {}", users.len(), rp_id);
@@ -771,9 +782,17 @@ impl CredentialStorage for TpmStorageAdapter {
     fn get_relying_parties(&self) -> Result<Vec<RelyingParty>> {
         debug!("get_relying_parties called");
 
-        let credentials = self.load_all_credentials_no_cache();
+        // Extract RP info directly from path structure - no file loading/unsealing needed!
+        let rp_list: Vec<RelyingParty> = self
+            .indexes
+            .rp
+            .keys()
+            .map(|rp_id| RelyingParty {
+                id: rp_id.clone(),
+                name: None, // Name not available in path structure
+            })
+            .collect();
 
-        let rp_list: Vec<RelyingParty> = credentials.into_iter().map(|c| c.rp).collect();
         debug!("Found {} relying parties", rp_list.len());
         Ok(rp_list)
     }

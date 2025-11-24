@@ -1,28 +1,35 @@
 //! Local file system storage adapter
 //!
 //! This adapter implements the CredentialStorage trait using the local file system.
+//! File structure: {storage_dir}/{rp_id}/{cred_id_hex}.bin
+//! Uses indexes for efficient lookups without loading all credentials.
 
 pub mod init;
 
+use crate::storage::index::{
+    CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
+    update_indexes_on_write,
+};
 use crate::storage::{CredentialFilter, CredentialStorage};
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use log::info;
-use sha2::{Digest, Sha256};
+use log::{debug, info};
 
 /// Local file system storage adapter
 ///
-/// Stores credentials as individual files in a directory.
+/// Stores credentials as files in a hierarchical directory structure.
+/// File structure: {storage_dir}/{rp_id}/{cred_id_hex}.bin
+/// Uses indexes for efficient lookups without loading all credentials.
 pub struct LocalStorageAdapter {
     storage_dir: PathBuf,
+    indexes: CredentialIndexes,
     iteration_index: usize,
     iteration_files: Vec<PathBuf>,
-    iteration_filter: CredentialFilter,
 }
 
 impl LocalStorageAdapter {
@@ -48,34 +55,23 @@ impl LocalStorageAdapter {
         // This will prompt the user via notifications if not initialized
         self::init::ensure_initialized(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
 
+        // Load indexes from directory structure (no credential loading needed)
+        let indexes =
+            load_credential_paths(&storage_dir, "bin").map_err(|_| soft_fido2::Error::Other)?;
+
+        debug!("Loaded {} credentials into indexes", indexes.id.len());
+
         Ok(Self {
             storage_dir,
+            indexes,
             iteration_index: 0,
             iteration_files: Vec::new(),
-            iteration_filter: CredentialFilter::None,
         })
     }
 
-    /// Load all credentials from storage
-    fn load_all_credentials(&self) -> Vec<Credential> {
-        let mut credentials = Vec::new();
-
-        if let Ok(entries) = fs::read_dir(&self.storage_dir) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type()
-                    && file_type.is_file()
-                    && let Ok(cred) = self.load_credential(&entry.path())
-                {
-                    credentials.push(cred);
-                }
-            }
-        }
-
-        credentials
-    }
-
-    /// Load a credential from a file
-    fn load_credential(&self, path: &PathBuf) -> Result<Credential> {
+    /// Load a credential from a file path
+    fn load_credential_from_path(&self, path: &Path) -> Result<Credential> {
+        debug!("Loading credential from: {:?}", path);
         let mut file = File::open(path).map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
@@ -85,9 +81,18 @@ impl LocalStorageAdapter {
     }
 
     /// Save a credential to a file
-    fn save_credential(&self, cred: &Credential) -> Result<()> {
-        let filename = self.get_filename_for_cred(&cred.id);
-        let path = self.storage_dir.join(filename);
+    /// Uses hierarchical structure: {storage_dir}/{rp_id}/{cred_id_hex}.bin
+    fn save_credential(&mut self, cred: &Credential) -> Result<()> {
+        // Create path info for this credential
+        let path_info =
+            CredentialPathInfo::new(cred.rp.id.clone(), cred.id.clone(), "bin".to_string());
+
+        let path = path_info.to_path(&self.storage_dir);
+
+        // Ensure the RP directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
+        }
 
         let bytes = cred.to_bytes()?;
 
@@ -95,71 +100,93 @@ impl LocalStorageAdapter {
         file.write_all(&bytes)
             .map_err(|_| soft_fido2::Error::Other)?;
 
+        // Update indexes
+        update_indexes_on_write(&mut self.indexes, path_info);
+
+        debug!("Saved credential for RP: {}", cred.rp.id);
         Ok(())
     }
 
-    /// Generate a filename for a credential based on ID
-    fn get_filename_for_cred(&self, id: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(id);
-        let hash: [u8; 32] = hasher.finalize().into();
-        format!(
-            "cred_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.bin",
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]
-        )
-    }
-
     /// Find the next credential matching the current filter
+    /// Uses indexes for efficient lookup
     fn find_next(&mut self) -> Result<Credential> {
-        while self.iteration_index < self.iteration_files.len() {
-            let path = &self.iteration_files[self.iteration_index];
-            self.iteration_index += 1;
+        debug!(
+            "Finding next credential (index: {}/{})",
+            self.iteration_index,
+            self.iteration_files.len()
+        );
 
-            if let Ok(loaded_cred) = self.load_credential(path) {
-                let matches = self.matches_filter(&loaded_cred);
-
-                if matches {
-                    return Ok(loaded_cred);
-                }
-            }
+        if self.iteration_index >= self.iteration_files.len() {
+            debug!("No more credentials matching filter");
+            return Err(soft_fido2::Error::DoesNotExist);
         }
 
-        Err(soft_fido2::Error::DoesNotExist)
-    }
+        let path = &self.iteration_files[self.iteration_index];
+        self.iteration_index += 1;
 
-    /// Check if a credential matches the current filter
-    fn matches_filter(&self, cred: &Credential) -> bool {
-        match &self.iteration_filter {
-            CredentialFilter::None => true,
-            CredentialFilter::ById(id) => &cred.id == id,
-            CredentialFilter::ByRp(rp) => &cred.rp.id == rp,
-            CredentialFilter::ByHash(hash) => {
-                let mut hasher = Sha256::new();
-                hasher.update(cred.rp.id.as_bytes());
-                let rp_hash: [u8; 32] = hasher.finalize().into();
-                &rp_hash == hash
-            }
-        }
+        self.load_credential_from_path(path)
     }
 }
 
 impl CredentialStorage for LocalStorageAdapter {
     fn read_first(&mut self, filter: CredentialFilter) -> Result<Credential> {
+        debug!("read_first called with filter: {:?}", filter);
+
         // Reset iteration
         self.iteration_index = 0;
         self.iteration_files.clear();
-        self.iteration_filter = filter;
 
-        // Load all credential file paths
-        if let Ok(entries) = fs::read_dir(&self.storage_dir) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type()
-                    && file_type.is_file()
-                {
-                    self.iteration_files.push(entry.path());
+        // Use indexes to build iteration list efficiently
+        // Convert path info to actual paths
+        self.iteration_files = match &filter {
+            CredentialFilter::None => self
+                .indexes
+                .id
+                .values()
+                .map(|path_info| path_info.to_path(&self.storage_dir))
+                .collect(),
+            CredentialFilter::ById(id) => {
+                if let Some(path_info) = self.indexes.id.get(id) {
+                    vec![path_info.to_path(&self.storage_dir)]
+                } else {
+                    Vec::new()
                 }
             }
-        }
+            CredentialFilter::ByRp(rp) => self
+                .indexes
+                .rp
+                .get(rp)
+                .map(|cred_ids| {
+                    cred_ids
+                        .iter()
+                        .filter_map(|cred_id| {
+                            self.indexes
+                                .id
+                                .get(cred_id)
+                                .map(|path_info| path_info.to_path(&self.storage_dir))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            CredentialFilter::ByHash(hash) => self
+                .indexes
+                .rp_hash
+                .get(hash)
+                .map(|cred_ids| {
+                    cred_ids
+                        .iter()
+                        .filter_map(|cred_id| {
+                            self.indexes
+                                .id
+                                .get(cred_id)
+                                .map(|path_info| path_info.to_path(&self.storage_dir))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+
+        debug!("Found {} matching paths", self.iteration_files.len());
 
         // Find first matching credential
         self.find_next()
@@ -170,7 +197,17 @@ impl CredentialStorage for LocalStorageAdapter {
     }
 
     fn read(&mut self, id: &[u8], _rp: &str) -> Result<Vec<u8>> {
-        let cred = self.read_first(CredentialFilter::ById(id.to_vec()))?;
+        debug!("read called for credential ID");
+
+        // Use index for direct path lookup
+        let path_info = self
+            .indexes
+            .id
+            .get(id)
+            .ok_or(soft_fido2::Error::DoesNotExist)?;
+
+        let path = path_info.to_path(&self.storage_dir);
+        let cred = self.load_credential_from_path(&path)?;
         cred.to_bytes()
     }
 
@@ -183,33 +220,76 @@ impl CredentialStorage for LocalStorageAdapter {
     }
 
     fn delete(&mut self, id: &[u8]) -> Result<()> {
-        let credentials = self.load_all_credentials();
-        for cred in credentials {
-            if cred.id == id {
-                let filename = self.get_filename_for_cred(&cred.id);
-                let path = self.storage_dir.join(filename);
-                fs::remove_file(path).map_err(|_| soft_fido2::Error::Other)?;
-                return Ok(());
-            }
-        }
+        debug!("delete called for credential ID");
 
-        Err(soft_fido2::Error::DoesNotExist)
+        // Use index for direct path lookup
+        let path_info = self
+            .indexes
+            .id
+            .get(id)
+            .ok_or(soft_fido2::Error::DoesNotExist)?;
+
+        let path = path_info.to_path(&self.storage_dir);
+        let rp_id = path_info.rp_id.clone();
+
+        // Delete the file
+        fs::remove_file(&path).map_err(|_| soft_fido2::Error::Other)?;
+
+        // Update indexes (extracts RP ID from path info internally)
+        update_indexes_on_delete(&mut self.indexes, id);
+
+        debug!("Deleted credential for RP: {}", rp_id);
+        Ok(())
     }
 
     fn select_users(&self, rp_id: &str) -> Vec<String> {
-        self.load_all_credentials()
+        debug!("select_users called for RP: {}", rp_id);
+
+        // Use index to get credential IDs for this RP
+        let cred_ids = match self.indexes.rp.get(rp_id) {
+            Some(ids) => ids,
+            None => {
+                debug!("No credentials found for RP: {}", rp_id);
+                return Vec::new();
+            }
+        };
+
+        // Load only credentials for this RP
+        let users: Vec<String> = cred_ids
             .iter()
-            .filter(|cred| cred.rp.id == rp_id)
-            .map(|cred| String::from_utf8_lossy(&cred.user.id).to_string())
-            .collect()
+            .filter_map(|cred_id| {
+                let path_info = self.indexes.id.get(cred_id)?;
+                let path = path_info.to_path(&self.storage_dir);
+                let cred = self.load_credential_from_path(&path).ok()?;
+                Some(String::from_utf8_lossy(&cred.user.id).to_string())
+            })
+            .collect();
+
+        debug!("Found {} users for RP: {}", users.len(), rp_id);
+        users
     }
 
     fn count_credentials(&self) -> usize {
-        self.load_all_credentials().len()
+        let count = self.indexes.id.len();
+        debug!("count_credentials: {}", count);
+        count
     }
 
     fn get_relying_parties(&self) -> Result<Vec<RelyingParty>> {
-        let credentials = self.load_all_credentials();
-        Ok(credentials.into_iter().map(|c| c.rp).collect())
+        debug!("get_relying_parties called");
+
+        // Extract RP info directly from path structure - no file loading needed!
+        let rp_list: Vec<RelyingParty> = self
+            .indexes
+            .rp
+            .keys()
+            .map(|rp_id| RelyingParty {
+                id: rp_id.clone(),
+                name: None, // Name not available in path structure
+            })
+            .collect();
+
+        debug!("Found {} relying parties", rp_list.len());
+        Ok(rp_list)
     }
 }

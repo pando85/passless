@@ -13,11 +13,68 @@ use sha2::{Digest, Sha256};
 pub const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(30);
 pub const MAX_CACHE_SIZE: usize = 10;
 
+/// Represents the structured path of a credential file
+/// Path structure: {base_dir}/{rp_id}/{cred_id_hex}.{extension}
+/// This allows extracting RP ID and cred ID without loading the file
+#[derive(Debug, Clone)]
+pub struct CredentialPathInfo {
+    /// Relying Party ID (extracted from directory name)
+    pub rp_id: String,
+    /// Credential ID (decoded from filename)
+    pub cred_id: Vec<u8>,
+    /// File extension (e.g., "bin", "gpg", "tpm")
+    pub extension: String,
+}
+
+impl CredentialPathInfo {
+    /// Create from path components
+    pub fn new(rp_id: String, cred_id: Vec<u8>, extension: String) -> Self {
+        Self {
+            rp_id,
+            cred_id,
+            extension,
+        }
+    }
+
+    /// Parse from a file path
+    /// Expects structure: {base_dir}/{rp_id}/{cred_id_hex}.{extension}
+    pub fn from_path(path: &Path, extension: &str) -> Option<Self> {
+        // Get filename and parse cred_id
+        let filename = path.file_name()?.to_str()?;
+        let cred_id = parse_cred_id_from_filename(filename, extension)?;
+
+        // Get rp_id from parent directory name
+        let parent = path.parent()?;
+        let rp_id = parent.file_name()?.to_str()?.to_string();
+
+        Some(Self {
+            rp_id,
+            cred_id,
+            extension: extension.to_string(),
+        })
+    }
+
+    /// Reconstruct the full path for this credential
+    pub fn to_path(&self, base_dir: &Path) -> PathBuf {
+        get_credential_path(base_dir, &self.rp_id, &self.cred_id, &self.extension)
+    }
+
+    /// Get the RP ID hash for this credential
+    pub fn rp_id_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.rp_id.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
 #[derive(Default)]
 pub struct CredentialIndexes {
-    pub id: HashMap<Vec<u8>, PathBuf>,
-    pub rp: HashMap<String, Vec<PathBuf>>,
-    pub rp_hash: HashMap<[u8; 32], Vec<PathBuf>>,
+    /// Map credential ID to path info
+    pub id: HashMap<Vec<u8>, CredentialPathInfo>,
+    /// Map RP ID to list of credential IDs
+    pub rp: HashMap<String, Vec<Vec<u8>>>,
+    /// Map RP ID hash to list of credential IDs
+    pub rp_hash: HashMap<[u8; 32], Vec<Vec<u8>>>,
 }
 
 pub struct CachedCredential {
@@ -120,7 +177,8 @@ pub fn get_credential_path(
         .join(get_filename(cred_id, extension))
 }
 
-/// Build indexes from directory structure - no decryption/unsealing needed
+/// Build indexes from directory structure - no credential loading needed!
+/// Extracts RP ID and cred ID directly from the file path structure
 pub fn load_credential_paths(
     storage_dir: &Path,
     extension: &str,
@@ -135,7 +193,7 @@ pub fn load_credential_paths(
         }
     };
 
-    let rp_dirs: Vec<(String, PathBuf)> = entries
+    let rp_dirs: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let path = entry.path();
@@ -147,104 +205,88 @@ pub fn load_credential_paths(
             {
                 return None;
             }
-
-            let rp_id = path.file_name().and_then(|s| s.to_str())?.to_string();
-            Some((rp_id, path))
+            Some(path)
         })
         .collect();
 
     debug!("Found {} RP directories", rp_dirs.len());
 
-    let indexes = rp_dirs.into_iter().fold(
-        CredentialIndexes::default(),
-        |mut indexes, (rp_id, rp_path)| {
-            debug!("Scanning RP directory: {}", rp_id);
+    let mut indexes = CredentialIndexes::default();
 
-            let cred_files = match std::fs::read_dir(&rp_path) {
-                Ok(entries) => entries
-                    .filter_map(|entry| entry.ok())
-                    .filter_map(|entry| {
-                        let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some(extension) {
-                            Some(path)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-                Err(_) => Vec::new(),
-            };
+    for rp_dir in rp_dirs {
+        let cred_files = match std::fs::read_dir(&rp_dir) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some(extension) {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
 
-            for cred_path in cred_files {
-                let filename = match cred_path.file_name().and_then(|s| s.to_str()) {
-                    Some(name) => name,
-                    None => continue,
-                };
+        for cred_path in cred_files {
+            // Parse path info from the file path structure
+            if let Some(path_info) = CredentialPathInfo::from_path(&cred_path, extension) {
+                let cred_id = path_info.cred_id.clone();
+                let rp_id = path_info.rp_id.clone();
+                let rp_hash = path_info.rp_id_hash();
 
-                if let Some(cred_id) = parse_cred_id_from_filename(filename, extension) {
-                    indexes.id.insert(cred_id.clone(), cred_path.clone());
-                    indexes
-                        .rp
-                        .entry(rp_id.clone())
-                        .or_default()
-                        .push(cred_path.clone());
+                // Index by credential ID
+                indexes.id.insert(cred_id.clone(), path_info);
 
-                    let mut hasher = Sha256::new();
-                    hasher.update(rp_id.as_bytes());
-                    let rp_hash: [u8; 32] = hasher.finalize().into();
-                    indexes.rp_hash.entry(rp_hash).or_default().push(cred_path);
-                }
+                // Index by RP ID
+                indexes.rp.entry(rp_id).or_default().push(cred_id.clone());
+
+                // Index by RP ID hash
+                indexes.rp_hash.entry(rp_hash).or_default().push(cred_id);
             }
-
-            indexes
-        },
-    );
+        }
+    }
 
     debug!("Loaded {} credentials into indexes", indexes.id.len());
     Ok(indexes)
 }
 
-pub fn update_indexes_on_write(
-    indexes: &mut CredentialIndexes,
-    path: PathBuf,
-    cred_id: Vec<u8>,
-    rp_id: String,
-) {
-    indexes.id.insert(cred_id, path.clone());
-    indexes
-        .rp
-        .entry(rp_id.clone())
-        .or_default()
-        .push(path.clone());
+pub fn update_indexes_on_write(indexes: &mut CredentialIndexes, path_info: CredentialPathInfo) {
+    let cred_id = path_info.cred_id.clone();
+    let rp_id = path_info.rp_id.clone();
+    let rp_hash = path_info.rp_id_hash();
 
-    let mut hasher = Sha256::new();
-    hasher.update(rp_id.as_bytes());
-    let rp_hash: [u8; 32] = hasher.finalize().into();
-    indexes.rp_hash.entry(rp_hash).or_default().push(path);
+    // Index by credential ID
+    indexes.id.insert(cred_id.clone(), path_info);
+
+    // Index by RP ID
+    indexes.rp.entry(rp_id).or_default().push(cred_id.clone());
+
+    // Index by RP ID hash
+    indexes.rp_hash.entry(rp_hash).or_default().push(cred_id);
 }
 
-pub fn update_indexes_on_delete(
-    indexes: &mut CredentialIndexes,
-    path: &Path,
-    cred_id: &[u8],
-    rp_id: &str,
-) {
-    indexes.id.remove(cred_id);
+pub fn update_indexes_on_delete(indexes: &mut CredentialIndexes, cred_id: &[u8]) {
+    // Get the path info to extract RP ID
+    if let Some(path_info) = indexes.id.remove(cred_id) {
+        let rp_id = &path_info.rp_id;
+        let rp_hash = path_info.rp_id_hash();
 
-    if let Some(paths) = indexes.rp.get_mut(rp_id) {
-        paths.retain(|p| p != path);
-        if paths.is_empty() {
-            indexes.rp.remove(rp_id);
+        // Remove from RP index
+        if let Some(cred_ids) = indexes.rp.get_mut(rp_id) {
+            cred_ids.retain(|id| id != cred_id);
+            if cred_ids.is_empty() {
+                indexes.rp.remove(rp_id);
+            }
         }
-    }
 
-    let mut hasher = Sha256::new();
-    hasher.update(rp_id.as_bytes());
-    let rp_hash: [u8; 32] = hasher.finalize().into();
-    if let Some(paths) = indexes.rp_hash.get_mut(&rp_hash) {
-        paths.retain(|p| p != path);
-        if paths.is_empty() {
-            indexes.rp_hash.remove(&rp_hash);
+        // Remove from RP hash index
+        if let Some(cred_ids) = indexes.rp_hash.get_mut(&rp_hash) {
+            cred_ids.retain(|id| id != cred_id);
+            if cred_ids.is_empty() {
+                indexes.rp_hash.remove(&rp_hash);
+            }
         }
     }
 }
