@@ -136,6 +136,7 @@ fn run_with_service<S: CredentialStorage + 'static>(
 const UHID_ERROR_MESSAGE: &str = "Make sure you have the uhid kernel module loaded and proper permissions.\n\
 Run the following commands as root:\n\
   modprobe uhid\n\
+  echo uhid > /etc/modules-load.d/fido.conf\n\
   groupadd fido 2>/dev/null || true\n\
   usermod -a -G fido $USER\n\
   echo 'KERNEL==\"uhid\", GROUP=\"fido\", MODE=\"0660\"' > /etc/udev/rules.d/90-uinput.rules\n\
