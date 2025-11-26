@@ -111,7 +111,7 @@ install-binary:	## install passless binary to ~/.cargo/bin
 	cargo install --path .
 
 .PHONY: install
-install: install-binary install-sysusers install-udev install-systemd	## install everything (binary, sysusers, udev, systemd)
+install: install-binary install-sysusers install-udev install-systemd install-modules	## install everything (binary, sysusers, udev, systemd)
 	@bash -c '. .ci/passless.install && post_install'
 
 .PHONY: install-systemd
@@ -159,12 +159,24 @@ uninstall-sysusers:	## uninstall sysusers configuration (requires sudo)
 	@echo "Sysusers configuration removed."
 	@echo "Note: The 'fido' group still exists and must be removed manually if desired."
 
+.PHONY: install-modules
+install-modules:	## install modules-load configuration (requires sudo)
+	@echo "Installing modules-load configuration (requires sudo)..."
+	@sudo cp contrib/modules-load.d/fido.conf /etc/modules-load.d/
+	@echo "Modules-load configuration installed."
+
+.PHONY: uninstall-modules
+uninstall-modules:	## uninstall modules-load configuration (requires sudo)
+	@echo "Removing modules-load configuration (requires sudo)..."
+	@sudo rm -f /etc/modules-load.d/fido.conf
+	@echo "Modules-load configuration removed."
+
 .PHONY: uninstall-binary
 uninstall-binary:	## uninstall passless binary (requires cargo)
 	cargo uninstall passless
 
 .PHONY: uninstall
-uninstall: uninstall-systemd uninstall-udev uninstall-sysusers uninstall-binary	## uninstall everything (systemd, udev, sysusers, binary)
+uninstall: uninstall-systemd uninstall-udev uninstall-sysusers uninstall-binary uninstall-modules	## uninstall everything (systemd, udev, sysusers, binary)
 	@bash -c '. .ci/passless.install && post_remove'
 	@echo "    Note: The 'fido' group still exists. To remove it:"
 	@echo "      sudo groupdel fido"
