@@ -94,7 +94,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         credential: &CredentialRef,
     ) -> Result<()> {
         info!("Storing credential for RP: {}", rp_id);
-        debug!("Credential ID: {:?}", cred_id);
+        debug!("Credential ID: {}", bytes_to_hex(cred_id));
         let mut storage = self.storage.lock().unwrap();
         storage.write(cred_id, rp_id, *credential)?;
         info!("Credential persisted successfully for RP: {}", rp_id);
@@ -132,7 +132,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     }
 
     fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
-        info!("Removing credential ID: {:?}", cred_id);
+        info!("Removing credential ID: {}", bytes_to_hex(cred_id));
         let mut storage = self.storage.lock().unwrap();
         storage.delete(cred_id)?;
         debug!("Credential removed");
