@@ -48,4 +48,6 @@ package() {
 		"${pkgdir}/usr/lib/udev/rules.d/90-passless.rules"
 	install -Dm0644 "passless-${pkgver}/contrib/sysusers.d/passless.conf" \
 		"${pkgdir}/usr/lib/sysusers.d/passless.conf"
+	install -Dm0644 "passless-${pkgver}/contrib/modules-load.d/fido.conf" \
+		"${pkgdir}/etc/modules-load.d/fido.conf"
 }
