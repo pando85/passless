@@ -19,6 +19,7 @@ use crate::storage::index::{
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
+use crate::util::bytes_to_hex;
 
 use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
 
@@ -530,8 +531,6 @@ impl TpmStorageAdapter {
 
     /// Read a credential by its ID
     fn read_credential_by_id(&mut self, id: &[u8]) -> Result<Credential> {
-        debug!("Reading credential by ID: {:02x?}", &id[..id.len().min(8)]);
-
         let path_info = self.indexes.id.get(id).ok_or_else(|| {
             debug!("Credential not found in index");
             soft_fido2::Error::DoesNotExist
@@ -728,7 +727,7 @@ impl CredentialStorage for TpmStorageAdapter {
     fn read(&mut self, id: &[u8], _rp: &str) -> Result<Vec<u8>> {
         self.cache.evict_expired();
 
-        debug!("read called with id: {}", hex::encode(id));
+        debug!("read called with id: {}", bytes_to_hex(id));
 
         let cred = self.read_credential_by_id(id)?;
 
@@ -750,7 +749,7 @@ impl CredentialStorage for TpmStorageAdapter {
     fn delete(&mut self, id: &[u8]) -> Result<()> {
         self.cache.evict_expired();
 
-        debug!("delete called with id: {}", hex::encode(id));
+        debug!("delete called with id: {}", bytes_to_hex(id));
         self.delete_credential(id)
     }
 

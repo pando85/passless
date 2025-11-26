@@ -2,6 +2,7 @@ mod authenticator;
 mod commands;
 mod notification;
 mod storage;
+mod util;
 
 use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, Result};
 

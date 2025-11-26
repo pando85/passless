@@ -31,7 +31,6 @@ notify-rust.workspace = true
 tss-esapi.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
-hex.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
 zeroize.workspace = true
@@ -40,6 +39,7 @@ zeroize.workspace = true
 base64 = "0.22"
 ciborium = "0.2"
 tempfile = "3.14"
+hex = "0.4"
 
 [build-dependencies]
 passless-core.workspace = true

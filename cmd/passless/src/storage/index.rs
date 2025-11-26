@@ -1,5 +1,7 @@
 //! Shared indexing and caching for credential storage backends
 
+use crate::util::bytes_to_hex;
+
 use soft_fido2::Credential;
 
 use std::collections::HashMap;
@@ -163,8 +165,7 @@ impl Default for CredentialCache {
 }
 
 pub fn get_filename(cred_id: &[u8], extension: &str) -> String {
-    let cred_id_hex: String = cred_id.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}.{}", cred_id_hex, extension)
+    format!("{}.{}", bytes_to_hex(cred_id), extension)
 }
 
 pub fn parse_cred_id_from_filename(filename: &str, extension: &str) -> Option<Vec<u8>> {

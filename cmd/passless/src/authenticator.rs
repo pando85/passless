@@ -1,5 +1,6 @@
 use crate::notification::show_verification_notification;
 use crate::storage::{CredentialFilter, CredentialStorage};
+use crate::util::bytes_to_hex;
 
 use passless_core::config::SecurityConfig;
 
@@ -101,7 +102,11 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     }
 
     fn read_credential(&self, cred_id: &[u8], rp_id: &str) -> Result<Option<Credential>> {
-        debug!("Reading credential: rp={}, id={:?}", rp_id, cred_id);
+        debug!(
+            "Reading credential: rp={}, id={}",
+            rp_id,
+            bytes_to_hex(cred_id)
+        );
         let mut storage = self.storage.lock().unwrap();
 
         match storage.read(cred_id, rp_id) {
@@ -148,13 +153,13 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
                 info!(
                     "Found first credential for RP {}: id={}",
                     rp_id,
-                    hex::encode(&first_cred.id)
+                    bytes_to_hex(&first_cred.id)
                 );
                 credentials.push(first_cred);
 
                 // Read remaining credentials
                 while let Ok(cred) = storage.read_next() {
-                    info!("Found additional credential: id={}", hex::encode(&cred.id));
+                    info!("Found additional credential: id={}", bytes_to_hex(&cred.id));
                     credentials.push(cred);
                 }
             }
