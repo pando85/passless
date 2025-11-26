@@ -609,10 +609,7 @@ impl TpmStorageAdapter {
     fn delete_credential(&mut self, id: &[u8]) -> Result<()> {
         self.cache.evict_expired();
 
-        debug!(
-            "Deleting credential with ID: {:02x?}",
-            &id[..id.len().min(8)]
-        );
+        debug!("Deleting credential with ID: {}", bytes_to_hex(id));
 
         let path_info = self
             .indexes
