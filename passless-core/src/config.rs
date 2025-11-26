@@ -202,7 +202,7 @@ impl SecurityConfig {
 
         if lock_result == 0 {
             unsafe { munlock(ptr, test_size) };
-            log::info!("MLOCK is enabled - sensitive data will not be swapped to disk");
+            log::debug!("MLOCK is enabled - sensitive data will not be swapped to disk");
         } else {
             log::warn!(
                 "mlock capability probe failed - memory locking may not be available.\n\

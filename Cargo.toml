@@ -37,7 +37,6 @@ notify-rust = "4.11"
 tss-esapi = "7.6.0"
 aes-gcm = "0.10"
 rand = "0.8"
-hex = "0.4"
 ctrlc = "3.4"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
