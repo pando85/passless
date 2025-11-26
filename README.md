@@ -13,6 +13,14 @@
 Software FIDO2 authenticator that emulates a hardware security key. Built with
 [soft-fido2](https://github.com/pando85/soft-fido2) and runs as a virtual UHID device on Linux.
 
+> [!IMPORTANT]
+>
+> Browsers running in sandboxed environments (for example, installed via the Ubuntu App Center) may
+> not be able to communicate with the authenticator out of the box. To enable this, you can use the
+> `credentialsd` service provided by the
+> ["Credentials for Linux" project](https://github.com/linux-credentials/credentialsd) to allow
+> sandboxed apps — including browsers — to access FIDO2 / WebAuthn credentials on Linux.
+
 ## ⚠️ Security Disclaimer <!-- omit in toc -->
 
 **Software authenticators lack the physical isolation of dedicated hardware security keys.** While
@@ -29,6 +37,7 @@ dedicated hardware security keys remain the recommended option.
 - [Installation](#installation)
   - [Cargo](#cargo)
   - [Arch Linux](#arch-linux)
+- [Acknowledgements](#acknowledgements)
 
 ## Features
 
@@ -89,3 +98,9 @@ or the binary from AUR:
 ```bash
 yay -S passless-bin
 ```
+
+## Acknowledgements
+
+A big thank you to the [PassKeeZ](https://github.com/Zig-Sec/PassKeeZ) project for being such a
+great source of inspiration. Their work on a FIDO2 / Passkey-compatible Linux authenticator gave
+this project both motivation and direction.
