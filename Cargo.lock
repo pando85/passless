@@ -1952,9 +1952,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eae29b09df30b3585e1d102e8bb898476acafd3d30329e00f7debb1fcca9307b"
+checksum = "98319a97e4fdad6acfea4292e1a855ca04fa38c772a5fb1ad7b0e9953fe6a3d2"
 dependencies = [
  "aes",
  "cbc",
@@ -1977,9 +1977,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-crypto"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ff20803de0c775ac93ed8752da311406124a2ad5dcbee48ba7eccebbc1d2eca"
+checksum = "3391c17f9ae4734001b4b2f1331d58eec9f77ac94ad8997e22ec1aad265680f0"
 dependencies = [
  "aes",
  "cbc",
@@ -1994,9 +1994,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53779299754dd9e0c727329b506164a583d7e41bf4852bde50fc52758676a482"
+checksum = "411ac73c7869086e92f982d32ff6e6391bfa591a20b3b08a8fa254e5006c4318"
 dependencies = [
  "cbor4ii",
  "core2",
@@ -2014,12 +2014,13 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-transport"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdbe467d48649f877080c817489e15101cae36bf3f41b24d1479bf1ac5eb7f5c"
+checksum = "ebaeb1892baed8819312cb032ce673ada474334c9e12537537cd2a76264ffebb"
 dependencies = [
  "hex",
  "hidapi",
+ "lazy_static",
  "nix 0.29.0",
  "smallvec",
 ]

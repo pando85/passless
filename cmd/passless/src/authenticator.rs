@@ -9,9 +9,17 @@ use soft_fido2::{
     CredentialRef, CtapCommand, Result, UpResult, UvResult,
 };
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use log::{debug, error, info};
+
+static VERSION: LazyLock<u32> = LazyLock::new(|| {
+    let major = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0);
+    let minor = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
+    let patch = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0);
+
+    (major << 16) | (minor << 8) | patch
+});
 
 /// Passless authenticator callbacks implementation
 pub struct PasslessCallbacks<S: CredentialStorage> {
@@ -237,18 +245,18 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     /// Create a new authenticator service
     pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
         let options = AuthenticatorOptions {
-            rk: true,                      // Resident keys (passkeys)
-            up: true,                      // User presence
-            uv: Some(true),                // User verification
-            plat: true,                    // Platform authenticator
-            client_pin: Some(true),        // Client PIN support
-            pin_uv_auth_token: Some(true), // PIN UV auth token
-            cred_mgmt: Some(true),         // Credential management enabled
+            rk: true,                       // Resident keys (passkeys)
+            up: true,                       // User presence
+            uv: Some(true),                 // User verification
+            plat: true,                     // Platform authenticator
+            client_pin: None,               // Client PIN support
+            pin_uv_auth_token: Some(false), // PIN UV auth token
+            cred_mgmt: Some(true),          // Credential management enabled
             bio_enroll: None,
             large_blobs: None,
             ep: None,
             always_uv: Some(true),
-            make_cred_uv_not_required: Some(true),
+            make_cred_uv_not_required: Some(false),
         };
 
         let config = AuthenticatorConfig::builder()
@@ -269,7 +277,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             ])
             .max_credentials(100)
             .extensions(vec!["credProtect".to_string()])
-            .firmware_version(0x0001)
+            .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
             .build();
 
