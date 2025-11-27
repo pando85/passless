@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.2](https://github.com/pando85/passless/tree/v0.4.2) - 2025-11-27
+
+### Fixed
+
+- Replace more bytes prints by credentials ID strings ([7d0da28](https://github.com/pando85/passless/commit/7d0da28f072dd9a65c740439a6267929386614a8))
+
+### Documentation
+
+- Add permanent uhid config to error message ([7666aef](https://github.com/pando85/passless/commit/7666aef5c574b934ac974f30d950426fbdd0cf72))
+- Add logo ([9e24da4](https://github.com/pando85/passless/commit/9e24da4720c6d315e72ff3e3750867a0cd938881))
+- Resize logo ([08239bf](https://github.com/pando85/passless/commit/08239bfa14cc19810a3da758be5d0644cb6131ce))
+- Add white background to the logo ([31b2de1](https://github.com/pando85/passless/commit/31b2de16c32cb6b399893928e42703b9dc96636d))
+- Round edges to the logo ([cdc4e0c](https://github.com/pando85/passless/commit/cdc4e0c5427df34c48606012acb4d9d9fe082516))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.3.2 ([e901cbd](https://github.com/pando85/passless/commit/e901cbdfd11b9a508ac85c30dd70bfa62700d2c6))
+
 ## [v0.4.1](https://github.com/pando85/passless/tree/v0.4.1) - 2025-11-26
 
 ### Fixed
