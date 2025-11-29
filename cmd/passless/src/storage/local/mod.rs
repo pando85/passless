@@ -246,6 +246,41 @@ impl CredentialStorage for LocalStorageAdapter {
         Ok(())
     }
 
+    fn update_user_info(
+        &mut self,
+        id: &[u8],
+        user_name: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<()> {
+        debug!("update_user_info called for credential ID");
+
+        // Use index for direct path lookup
+        let path_info = self
+            .indexes
+            .id
+            .get(id)
+            .ok_or(soft_fido2::Error::DoesNotExist)?;
+
+        let path = path_info.to_path(&self.storage_dir);
+
+        // Load the credential
+        let mut cred = self.load_credential_from_path(&path)?;
+
+        // Update user information
+        if let Some(name) = user_name {
+            cred.user.name = Some(name.to_string());
+        }
+        if let Some(display) = display_name {
+            cred.user.display_name = Some(display.to_string());
+        }
+
+        // Save the updated credential
+        self.save_credential(&cred)?;
+
+        debug!("Updated user info for credential on RP: {}", cred.rp.id);
+        Ok(())
+    }
+
     fn select_users(&self, rp_id: &str) -> Vec<String> {
         debug!("select_users called for RP: {}", rp_id);
 

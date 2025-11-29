@@ -56,7 +56,7 @@ test: lint
 
 .PHONY: test-e2e
 test-e2e:	## run E2E tests (automatically manages authenticator)
-	cargo test --test e2e_webauthn -- --test-threads=1 --ignored
+	cargo test -- --test-threads=1 --ignored
 
 .PHONY: test-e2e-local
 test-e2e-local:	## run E2E tests for local backend only

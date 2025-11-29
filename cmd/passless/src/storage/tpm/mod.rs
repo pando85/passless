@@ -750,6 +750,37 @@ impl CredentialStorage for TpmStorageAdapter {
         self.delete_credential(id)
     }
 
+    fn update_user_info(
+        &mut self,
+        id: &[u8],
+        user_name: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<()> {
+        self.cache.evict_expired();
+
+        debug!("update_user_info called with id: {}", bytes_to_hex(id));
+
+        // Read the credential
+        let mut cred = self.read_credential_by_id(id)?;
+
+        // Update user information
+        if let Some(name) = user_name {
+            cred.user.name = Some(name.to_string());
+        }
+        if let Some(display) = display_name {
+            cred.user.display_name = Some(display.to_string());
+        }
+
+        // Write back the credential
+        self.write_credential(&cred)?;
+
+        debug!(
+            "Successfully updated user info for credential on RP: {}",
+            cred.rp.id
+        );
+        Ok(())
+    }
+
     fn select_users(&self, rp_id: &str) -> Vec<String> {
         debug!("select_users called for RP: {}", rp_id);
 

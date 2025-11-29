@@ -6,5 +6,8 @@
 pub mod config;
 pub mod error;
 
-pub use config::{AppConfig, Args, BackendConfig, Commands, ConfigAction, SecurityConfig};
+pub use config::{
+    AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, OutputFormat, PinAction,
+    SecurityConfig,
+};
 pub use error::{Error, Result};

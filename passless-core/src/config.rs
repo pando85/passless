@@ -360,6 +360,39 @@ pub struct Args {
     pub command: Option<Commands>,
 }
 
+/// Output format for client commands
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable plain text output
+    Plain,
+    /// JSON output for programmatic consumption
+    Json,
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "plain" => Ok(OutputFormat::Plain),
+            "json" => Ok(OutputFormat::Json),
+            _ => Err(format!(
+                "Invalid output format '{}'. Must be 'plain' or 'json'",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Plain => write!(f, "plain"),
+            OutputFormat::Json => write!(f, "json"),
+        }
+    }
+}
+
 /// Subcommands for passless
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
@@ -368,6 +401,29 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// FIDO2 client commands for managing authenticators
+    ///
+    /// These commands require a running authenticator. For testing:
+    /// 1. Start authenticator: PASSLESS_E2E_AUTO_ACCEPT_UV=1 cargo run -- --backend-type local
+    /// 2. Run client commands in another terminal with the same environment variable
+    Client {
+        /// Select device by index (0-based) or name. Use 'devices' subcommand to list available devices.
+        #[arg(short = 'D', long = "device", value_name = "INDEX|NAME", global = true)]
+        device: Option<String>,
+
+        /// Output format: plain (default) or json
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FORMAT",
+            default_value = "plain",
+            global = true
+        )]
+        output: OutputFormat,
+
+        #[command(subcommand)]
+        action: ClientAction,
+    },
 }
 
 /// Configuration actions
@@ -375,4 +431,74 @@ pub enum Commands {
 pub enum ConfigAction {
     /// Print the default configuration in TOML format
     Print,
+}
+
+/// Client actions for FIDO2 authenticator management
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClientAction {
+    /// List all available FIDO2 authenticators/devices
+    Devices,
+    /// Get authenticator information (capabilities, AAGUID, versions, etc.)
+    Info,
+    /// Reset the authenticator (WARNING: deletes ALL credentials)
+    Reset {
+        /// Confirmation flag that must be provided twice for safety
+        #[arg(long = "yes-i-really-want-to-reset-my-device", action = ArgAction::Count)]
+        confirm: u8,
+    },
+    /// List all credentials on the authenticator
+    List {
+        /// Filter by relying party ID (domain)
+        #[arg(short = 'd', long = "domain", value_name = "DOMAIN")]
+        rp_id: Option<String>,
+    },
+    /// Show detailed information about a specific credential
+    Show {
+        /// Credential ID in hexadecimal format
+        #[arg(value_name = "CREDENTIAL_ID")]
+        credential_id: String,
+    },
+    /// Delete a specific credential by ID
+    Delete {
+        /// Credential ID in hexadecimal format
+        #[arg(value_name = "CREDENTIAL_ID")]
+        credential_id: String,
+    },
+    /// Rename a credential (update user name and/or display name)
+    Rename {
+        /// Credential ID in hexadecimal format
+        #[arg(value_name = "CREDENTIAL_ID")]
+        credential_id: String,
+        /// New user name (login identifier)
+        #[arg(short = 'u', long = "user-name", value_name = "NAME")]
+        user_name: Option<String>,
+        /// New display name (friendly name)
+        #[arg(short = 'n', long = "display-name", value_name = "NAME")]
+        display_name: Option<String>,
+    },
+    /// PIN management commands
+    Pin {
+        #[command(subcommand)]
+        action: PinAction,
+    },
+}
+
+/// PIN management actions
+#[derive(Subcommand, Debug, Clone)]
+pub enum PinAction {
+    /// Set a new PIN (authenticator must not have a PIN set)
+    Set {
+        /// The new PIN (minimum 4 characters)
+        #[arg(value_name = "PIN")]
+        pin: String,
+    },
+    /// Change the existing PIN
+    Change {
+        /// The current PIN
+        #[arg(value_name = "OLD_PIN")]
+        old_pin: String,
+        /// The new PIN (minimum 4 characters)
+        #[arg(value_name = "NEW_PIN")]
+        new_pin: String,
+    },
 }

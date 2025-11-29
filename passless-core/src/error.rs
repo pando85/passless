@@ -53,8 +53,28 @@ pub enum Error {
     InvalidData(String),
 
     /// Generic other error
-    #[error("Other error: {0}")]
+    #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// Format error for command-line output
+    ///
+    /// Provides clean, user-friendly error messages without Rust Debug formatting
+    pub fn format_cli(&self) -> String {
+        match self {
+            Error::Storage(msg) => format!("Storage error: {}", msg),
+            Error::Config(msg) => format!("Configuration error: {}", msg),
+            Error::Uhid(msg) => format!("UHID error: {}", msg),
+            Error::CredentialManagement(msg) => format!("Credential management error: {}", msg),
+            Error::UserVerificationFailed(msg) => format!("User verification failed: {}", msg),
+            Error::Cancelled => "Operation cancelled by user".to_string(),
+            Error::Io(err) => format!("IO error: {}", err),
+            Error::Serialization(msg) => format!("Serialization error: {}", msg),
+            Error::InvalidData(msg) => format!("Invalid data: {}", msg),
+            Error::Other(msg) => msg.clone(),
+        }
+    }
 }
 
 /// Convert soft_fido2::Error to Error for error handling
