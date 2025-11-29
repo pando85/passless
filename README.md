@@ -45,9 +45,9 @@ dedicated hardware security keys remain the recommended option.
 - Passkey support (resident credentials)
 - User verification via desktop notifications
 - Storage backends:
-  - Local filesystem (JSON)
   - [pass](https://www.passwordstore.org/) (encrypted, git-synced)
-  - TPM 2.0
+  - TPM 2.0 (Experimental)
+  - Local filesystem (testing only)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
 

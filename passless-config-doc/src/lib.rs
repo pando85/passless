@@ -20,24 +20,6 @@ fn extract_doc(attrs: &[syn::Attribute]) -> String {
         .join(" ")
 }
 
-/// Extract default value from #[default(...)] attribute
-fn extract_default(attrs: &[syn::Attribute]) -> Option<String> {
-    for attr in attrs {
-        if attr.path().is_ident("default") &&
-            // Extract the tokens inside #[default(...)]
-            let Ok(tokens) = attr.parse_args::<proc_macro2::TokenStream>()
-        {
-            let default_str = tokens.to_string();
-            // Clean up the string - remove quotes if it's a string literal
-            if default_str.starts_with("\"") && default_str.ends_with("\"") {
-                return Some(default_str.trim_matches('"').to_string());
-            }
-            return Some(default_str);
-        }
-    }
-    None
-}
-
 /// Get the type name from a Type
 fn get_type_name(ty: &Type) -> Option<String> {
     if let Type::Path(type_path) = ty
@@ -63,7 +45,6 @@ fn is_config_type(ty: &Type) -> bool {
 /// Documentation is extracted from:
 /// - Struct-level doc comments (for section headers)
 /// - Field-level doc comments (for field descriptions)
-/// - #[default(...)] attributes (for default values)
 #[proc_macro_derive(ConfigDoc, attributes(config_example))]
 pub fn derive_config_doc(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -83,28 +64,23 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
     for field in fields {
         let field_name = field.ident.as_ref().unwrap();
         let doc = extract_doc(&field.attrs);
-        let default_value = extract_default(&field.attrs);
         let type_name = get_type_name(&field.ty);
         let is_config = is_config_type(&field.ty);
 
-        field_info.push((field_name.clone(), doc, default_value, is_config, type_name));
+        field_info.push((field_name.clone(), doc, is_config, type_name));
     }
 
     let field_names: Vec<_> = field_info
         .iter()
-        .map(|(n, _, _, _, _)| n.to_string())
+        .map(|(n, _, _, _)| n.to_string())
         .collect();
-    let field_help: Vec<_> = field_info.iter().map(|(_, d, _, _, _)| d).collect();
-    let field_defaults: Vec<_> = field_info
-        .iter()
-        .map(|(_, _, default, _, _)| default.as_deref().unwrap_or(""))
-        .collect();
+    let field_help: Vec<_> = field_info.iter().map(|(_, d, _, _)| d).collect();
 
     // Build field access expressions for to_toml_fields
     let field_accessors: Vec<_> = field_info
         .iter()
-        .filter(|(_, _, _, is_config, _)| !is_config)
-        .map(|(field_name, _, _, _, _)| {
+        .filter(|(_, _, is_config, _)| !is_config)
+        .map(|(field_name, _, _, _)| {
             quote! {
                 (stringify!(#field_name), format!("{:?}", self.#field_name))
             }
@@ -114,10 +90,10 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
     let mut expanded = quote! {
         impl #name {
             /// Get documentation for all fields
-            /// Returns an array of (field_name, documentation, default) tuples
-            pub fn field_docs() -> &'static [(&'static str, &'static str, &'static str)] {
+            /// Returns an array of (field_name, documentation) tuples
+            pub fn field_docs() -> &'static [(&'static str, &'static str)] {
                 &[
-                    #((#field_names, #field_help, #field_defaults),)*
+                    #((#field_names, #field_help),)*
                 ]
             }
 
@@ -150,7 +126,7 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
 /// Generate the to_toml_with_comments method for AppConfig
 #[allow(clippy::type_complexity)]
 fn generate_toml_method(
-    fields: &[(syn::Ident, String, Option<String>, bool, Option<String>)],
+    fields: &[(syn::Ident, String, bool, Option<String>)],
 ) -> proc_macro2::TokenStream {
     let mut output_parts = Vec::new();
 
@@ -161,7 +137,7 @@ fn generate_toml_method(
     });
 
     // Process fields
-    for (field_name, doc, default_value, is_config, type_name) in fields {
+    for (field_name, doc, is_config, type_name) in fields {
         let field_name_str = field_name.to_string();
 
         if !is_config {
@@ -169,13 +145,6 @@ fn generate_toml_method(
             if !doc.is_empty() {
                 output_parts.push(quote! {
                     output.push_str(&format!("# {}\n", #doc));
-                });
-            }
-
-            // Add default comment if available
-            if let Some(default) = default_value {
-                output_parts.push(quote! {
-                    output.push_str(&format!("# Default: {}\n", #default));
                 });
             }
 
@@ -202,7 +171,7 @@ fn generate_toml_method(
                 let field_values = self.#field_name.to_toml_fields();
 
                 // Iterate through all fields in the config struct
-                for (name, doc, default) in #type_ident::field_docs() {
+                for (name, doc) in #type_ident::field_docs() {
                     // Field documentation
                     if !doc.is_empty() {
                         output.push_str(&format!("# {}\n", doc));
