@@ -581,6 +581,45 @@ impl CredentialStorage for PassStorageAdapter {
         self.delete_credential(id).map_err(Into::into)
     }
 
+    fn update_user_info(
+        &mut self,
+        id: &[u8],
+        user_name: Option<&str>,
+        display_name: Option<&str>,
+    ) -> soft_fido2::Result<()> {
+        self.cache.evict_expired();
+
+        debug!("update_user_info called with id: {}", bytes_to_hex(id));
+
+        // Read the credential
+        let mut cred = self
+            .read_credential_by_id(id)
+            .map_err(Into::<soft_fido2::Error>::into)?;
+
+        // Update user information
+        if let Some(name) = user_name {
+            cred.user.name = Some(name.to_string());
+        }
+        if let Some(display) = display_name {
+            cred.user.display_name = Some(display.to_string());
+        }
+
+        // Serialize the updated credential
+        let cred_bytes = Zeroizing::new(cred.to_bytes().map_err(|e| {
+            debug!("Failed to serialize credential: {:?}", e);
+            Error::Storage(format!("Failed to serialize credential: {:?}", e))
+        })?);
+
+        // Write back the credential
+        self.write_credential_bytes(&cred, &cred_bytes)?;
+
+        debug!(
+            "Successfully updated user info for credential on RP: {}",
+            cred.rp.id
+        );
+        Ok(())
+    }
+
     fn select_users(&self, rp_id: &str) -> Vec<String> {
         debug!("select_users called for RP: {}", rp_id);
 

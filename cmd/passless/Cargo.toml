@@ -18,6 +18,7 @@ path = "src/main.rs"
 passless-core.workspace = true
 soft-fido2.workspace = true
 soft-fido2-transport.workspace = true
+soft-fido2-ctap.workspace = true
 log.workspace = true
 env_logger.workspace = true
 sha2.workspace = true
@@ -34,6 +35,11 @@ rand.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
 zeroize.workspace = true
+hex.workspace = true
+hmac = "0.12"
+rpassword = "7.3"
+atty = "0.2"
+
 
 [dev-dependencies]
 base64 = "0.22"

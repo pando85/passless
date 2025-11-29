@@ -91,6 +91,15 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     }
 
     fn request_uv(&self, _info: &str, _user: Option<&str>, _rp: &str) -> Result<UvResult> {
+        // Check for E2E test mode (only available in debug builds)
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+                info!("E2E test mode: Auto-accepting user verification");
+                return Ok(UvResult::Accepted);
+            }
+        }
+
         info!("User verification confirmed");
         Ok(UvResult::Accepted)
     }
@@ -251,7 +260,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             plat: true,                    // Platform authenticator
             client_pin: None,              // Client PIN support
             pin_uv_auth_token: Some(true), // PIN UV auth token
-            cred_mgmt: Some(true),         // Credential management enabled
+            cred_mgmt: None, // Credential management disabled (using custom implementation)
             bio_enroll: None,
             large_blobs: None,
             ep: None,
@@ -272,7 +281,6 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
                 CtapCommand::GetInfo,
                 CtapCommand::ClientPin,
                 CtapCommand::GetNextAssertion,
-                CtapCommand::CredentialManagement, // Standard credential management (0x0a)
                 CtapCommand::Selection,
             ])
             .max_credentials(100)

@@ -86,6 +86,25 @@ pub trait CredentialStorage: Send + Sync {
     /// Ok(()) on success or an error
     fn delete(&mut self, id: &[u8]) -> Result<()>;
 
+    /// Update user information for a credential
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The credential ID to update
+    /// * `user_name` - Optional new user name (login identifier)
+    /// * `display_name` - Optional new display name (friendly name)
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) on success or an error
+    #[allow(dead_code)]
+    fn update_user_info(
+        &mut self,
+        id: &[u8],
+        user_name: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<()>;
+
     /// Get all user names for a given relying party
     ///
     /// # Arguments

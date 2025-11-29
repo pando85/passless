@@ -4,7 +4,9 @@ mod notification;
 mod storage;
 mod util;
 
-use passless_core::{AppConfig, Args, BackendConfig, Commands, ConfigAction, Error, Result};
+use passless_core::{
+    AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
+};
 
 use soft_fido2::Uhid;
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use authenticator::AuthenticatorService;
 use clap::Parser;
-use commands::custom::register_yubikey_credential_mgmt;
+use commands::custom::{register_standard_credential_mgmt, register_yubikey_credential_mgmt};
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
@@ -62,6 +64,7 @@ fn run_with_service<S: CredentialStorage + 'static>(
     info!("{}", service.storage_info());
 
     // Register custom commands for compatibility (placeholder for now)
+    register_standard_credential_mgmt(&mut service);
     register_yubikey_credential_mgmt(&mut service);
 
     // Main loop - process CTAP packets
@@ -140,7 +143,15 @@ Run the following commands as root:\n\
   echo 'KERNEL==\"uhid\", GROUP=\"fido\", MODE=\"0660\"' > /etc/udev/rules.d/90-uinput.rules\n\
   udevadm control --reload-rules && udevadm trigger";
 
-fn main() -> Result<()> {
+fn main() {
+    // Run main logic and format errors cleanly
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e.format_cli());
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     // Parse CLI arguments
     let mut args = Args::parse();
 
@@ -155,6 +166,45 @@ fn main() -> Result<()> {
                     println!("{}", default_config.to_toml_with_comments());
                     Ok(())
                 }
+            },
+            Commands::Client {
+                device,
+                output,
+                action,
+            } => match action {
+                ClientAction::Devices => commands::client::devices(*output),
+                ClientAction::Info => commands::client::info(*output, device.as_deref()),
+                ClientAction::Reset { confirm } => {
+                    commands::client::reset(*output, device.as_deref(), *confirm)
+                }
+                ClientAction::List { rp_id } => {
+                    commands::client::list(*output, device.as_deref(), rp_id.as_deref())
+                }
+                ClientAction::Delete { credential_id } => {
+                    commands::client::delete(*output, device.as_deref(), credential_id)
+                }
+                ClientAction::Show { credential_id } => {
+                    commands::client::show(*output, device.as_deref(), credential_id)
+                }
+                ClientAction::Rename {
+                    credential_id,
+                    user_name,
+                    display_name,
+                } => commands::client::rename(
+                    *output,
+                    device.as_deref(),
+                    credential_id,
+                    user_name.as_deref(),
+                    display_name.as_deref(),
+                ),
+                ClientAction::Pin { action } => match action {
+                    PinAction::Set { pin } => {
+                        commands::client::pin_set(*output, device.as_deref(), pin)
+                    }
+                    PinAction::Change { old_pin, new_pin } => {
+                        commands::client::pin_change(*output, device.as_deref(), old_pin, new_pin)
+                    }
+                },
             },
         };
     }
