@@ -217,10 +217,10 @@ impl SecurityConfig {
 /// Note: Cannot derive Clone/Debug because it has #[clap_serde] fields
 #[derive(ClapSerde, Serialize, Deserialize, Debug, ConfigDoc)]
 pub struct AppConfig {
-    /// Storage backend type: local, pass, or tpm
+    /// Storage backend type: pass, tpm (experimental), or local (for testing)
     #[arg(short = 't', long = "backend-type", env = "PASSLESS_BACKEND_TYPE")]
     #[serde(default)]
-    #[default("local".to_string())]
+    #[default("pass".to_string())]
     pub backend_type: String,
 
     /// Enable verbose logging
@@ -238,12 +238,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub verbose: bool,
 
-    /// Local backend configuration
-    #[clap_serde]
-    #[serde(default)]
-    #[command(flatten)]
-    pub local: LocalBackendConfig,
-
     /// Pass backend configuration
     #[clap_serde]
     #[serde(default)]
@@ -255,6 +249,12 @@ pub struct AppConfig {
     #[serde(default)]
     #[command(flatten)]
     pub tpm: TpmBackendConfig,
+
+    /// Local backend configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub local: LocalBackendConfig,
 
     /// Security hardening configuration
     #[clap_serde]
