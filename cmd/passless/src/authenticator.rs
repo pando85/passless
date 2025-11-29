@@ -245,13 +245,13 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
     /// Create a new authenticator service
     pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
         let options = AuthenticatorOptions {
-            rk: true,                       // Resident keys (passkeys)
-            up: true,                       // User presence
-            uv: Some(true),                 // User verification
-            plat: true,                     // Platform authenticator
-            client_pin: None,               // Client PIN support
-            pin_uv_auth_token: Some(false), // PIN UV auth token
-            cred_mgmt: Some(true),          // Credential management enabled
+            rk: true,                      // Resident keys (passkeys)
+            up: true,                      // User presence
+            uv: Some(true),                // User verification
+            plat: true,                    // Platform authenticator
+            client_pin: None,              // Client PIN support
+            pin_uv_auth_token: Some(true), // PIN UV auth token
+            cred_mgmt: Some(true),         // Credential management enabled
             bio_enroll: None,
             large_blobs: None,
             ep: None,
