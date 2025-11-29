@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.0](https://github.com/pando85/passless/tree/v0.5.0) - 2025-11-29
+
+### Fixed
+
+- config: Change default backend to pass ([9d3c048](https://github.com/pando85/passless/commit/9d3c048005c6052c59e9147b629b74dc4c2adc68))
+  - **BREAKING**: Default backend is now `pass`.
+- Enable pinUvAuthToken ([787101e](https://github.com/pando85/passless/commit/787101e4821cbf35471b9b4eddcd875c30fe34af))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.4.0 ([85d889b](https://github.com/pando85/passless/commit/85d889b8ef6ae87dcb224d3604264e37371f013e))
+
 ## [v0.4.2](https://github.com/pando85/passless/tree/v0.4.2) - 2025-11-27
 
 ### Fixed
