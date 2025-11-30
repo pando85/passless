@@ -9,14 +9,13 @@ version = "0.5.2"
 license-file = "./LICENSE"
 homepage = "https://github.com/pando85/passless"
 repository = "https://github.com/pando85/passless"
-
 [workspace.dependencies]
 # Workspace crates
 passless-core = { path = "./passless-core", version = "0.5.2" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.5.2" }
 
-soft-fido2 = "0.3.2"
-soft-fido2-transport = "0.3.2"
+soft-fido2 = "0.4.3"
+soft-fido2-transport = "0.4.3"
 
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
