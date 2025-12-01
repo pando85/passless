@@ -40,6 +40,7 @@ base64 = "0.22"
 ciborium = "0.2"
 tempfile = "3.14"
 hex = "0.4"
+soft-fido2-ctap.workspace = true
 
 [build-dependencies]
 passless-core.workspace = true

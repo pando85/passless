@@ -34,8 +34,9 @@ mod harness;
 use soft_fido2::client::Client;
 use soft_fido2::{
     ClientDataHash, CredentialDescriptor, CredentialType, GetAssertionRequest,
-    MakeCredentialRequest, RelyingParty, Result, TransportList, User,
+    MakeCredentialRequest, Result, TransportList,
 };
+use soft_fido2_ctap::types::{RelyingParty, User};
 
 use std::io::Write;
 
