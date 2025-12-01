@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.3](https://github.com/pando85/passless/tree/v0.5.3) - 2025-12-01
+
+### Fixed
+
+- Enable pinUvAuthToken in authenticator ([c91d9ce](https://github.com/pando85/passless/commit/c91d9ceb0c09428c4f625725bac244fbee6b57b2))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.4.3 ([fbbe89f](https://github.com/pando85/passless/commit/fbbe89fcd2260d9dba08a64a18bff4e79a6de769))
+- deps: Update soft-fido2 to version 0.4.4 ([ed87dc5](https://github.com/pando85/passless/commit/ed87dc54fd701b4d6a06c48cfff310081b775d6a))
+
 ## [v0.5.2](https://github.com/pando85/passless/tree/v0.5.2) - 2025-11-30
 
 ### Fixed
