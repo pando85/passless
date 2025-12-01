@@ -12,8 +12,6 @@ use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
 
 use authenticator::AuthenticatorService;
 use clap::Parser;
@@ -200,18 +198,17 @@ fn main() -> Result<()> {
     // Set up graceful shutdown handler
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
+    let ctrlc_pressed = Arc::new(AtomicBool::new(false));
 
     ctrlc::set_handler(move || {
-        info!("Received interrupt signal (Ctrl+C)");
-        info!("Initiating graceful shutdown... (will force exit in 5 seconds)");
-        shutdown_clone.store(true, Ordering::Relaxed);
-
-        // Spawn a thread that will forcefully exit after 5 seconds
-        thread::spawn(|| {
-            thread::sleep(Duration::from_secs(5));
-            error!("Graceful shutdown timeout reached, forcing exit");
+        if ctrlc_pressed.load(Ordering::Relaxed) {
+            error!("Second interrupt signal received, forcing immediate exit");
             process::exit(1);
-        });
+        }
+        info!("Received interrupt signal (Ctrl+C)");
+        info!("Initiating graceful shutdown... (press Ctrl+C again to force exit)");
+        shutdown_clone.store(true, Ordering::Relaxed);
+        ctrlc_pressed.store(true, Ordering::Relaxed);
     })
     .map_err(|e| Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
 
