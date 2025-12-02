@@ -230,13 +230,6 @@ fn run_registration_and_authentication_test() -> Result<()> {
     }
     assert!(!attestation.is_empty(), "Attestation should not be empty");
 
-    // First byte is CTAP status code (0x00 = success)
-    assert_eq!(
-        attestation[0], 0x00,
-        "makeCredential failed with CTAP status: 0x{:02x}",
-        attestation[0]
-    );
-
     // ========================================
     // PHASE 2: AUTHENTICATION
     // ========================================
@@ -279,16 +272,9 @@ fn run_registration_and_authentication_test() -> Result<()> {
     }
     assert!(!assertion.is_empty(), "Assertion should not be empty");
 
-    // First byte is CTAP status code (0x00 = success)
-    assert_eq!(
-        assertion[0], 0x00,
-        "getAssertion failed with CTAP status: 0x{:02x}",
-        assertion[0]
-    );
-
     // Verify response structure (skip status byte)
     println!("[2.3] Validating assertion response...");
-    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[1..]) {
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[..]) {
         Ok(ciborium::value::Value::Map(map)) => {
             println!("   ✓ Valid CBOR response with {} fields", map.len());
 
@@ -543,15 +529,10 @@ fn run_authentication_with_allow_list_test() -> Result<()> {
 
     print_operation("Register credential for User A");
     let attestation_a = Client::make_credential(&mut transport, request_a)?;
-    assert_eq!(
-        attestation_a[0], 0x00,
-        "First credential registration failed with CTAP status: 0x{:02x}",
-        attestation_a[0]
-    );
     println!("   ✓ User A registered ({} bytes)\n", attestation_a.len());
 
     // Extract credential ID from User A's attestation
-    let cred_id_a = extract_credential_id(&attestation_a[1..])?;
+    let cred_id_a = extract_credential_id(&attestation_a)?;
     println!("   Credential ID A: {} bytes", cred_id_a.len());
 
     // Register second credential (User B)
@@ -572,14 +553,9 @@ fn run_authentication_with_allow_list_test() -> Result<()> {
 
     print_operation("Register credential for User B");
     let attestation_b = Client::make_credential(&mut transport, request_b)?;
-    assert_eq!(
-        attestation_b[0], 0x00,
-        "Second credential registration failed with CTAP status: 0x{:02x}",
-        attestation_b[0]
-    );
     println!("   ✓ User B registered ({} bytes)\n", attestation_b.len());
 
-    let cred_id_b = extract_credential_id(&attestation_b[1..])?;
+    let cred_id_b = extract_credential_id(&attestation_b)?;
     println!("   Credential ID B: {} bytes\n", cred_id_b.len());
 
     // Now authenticate with User A's credential ID in allowList
@@ -599,18 +575,13 @@ fn run_authentication_with_allow_list_test() -> Result<()> {
     print_operation("Authenticate with User A via allowList");
     let assertion = Client::get_assertion(&mut transport, request_auth)?;
 
-    assert_eq!(
-        assertion[0], 0x00,
-        "Authentication failed with CTAP status: 0x{:02x}",
-        assertion[0]
-    );
     println!(
         "   ✓ Authentication succeeded ({} bytes)\n",
         assertion.len()
     );
 
     // Verify the response is valid CBOR
-    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[1..]) {
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[..]) {
         Ok(ciborium::value::Value::Map(_)) => {
             println!("   ✓ Response is valid CBOR map");
         }
@@ -711,24 +682,24 @@ fn run_authentication_without_credential_fails_test() -> Result<()> {
 
     println!("   Sending getAssertion...");
 
-    let result = Client::get_assertion(&mut transport, request)?;
+    let result = Client::get_assertion(&mut transport, request);
 
     // Check if the response is an error (status byte != 0x00)
-    if result.is_empty() {
-        panic!("Received empty response");
-    }
-
-    let status = result[0];
-    if status == 0x00 {
+    if result.is_ok() {
         panic!(
             "Authentication should have failed for non-existent credential, but got success (status 0x00)"
         );
     }
 
-    println!(
-        "   ✓ Authentication failed as expected: CTAP status 0x{:02x}",
-        status
-    );
+    let err = result.err().unwrap();
+    if err != soft_fido2::Error::NoCredentials {
+        panic!(
+            "Expected CTAP error for non-existent credential, but got different error: {:?}",
+            err
+        );
+    }
+
+    println!("   ✓ Authentication failed as expected: CTAP status NoCredentials");
 
     println!("\n╔════════════════════════════════════════════════╗");
     println!("║        ✓ Correctly Rejected Invalid Auth!     ║");
