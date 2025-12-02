@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.4](https://github.com/pando85/passless/tree/v0.5.4) - 2025-12-02
+
+### Added
+
+- Shutdown immediately when pressing ctrl+c twice ([429dcc1](https://github.com/pando85/passless/commit/429dcc13e440c871491ffaf37a29f918d7678bf3))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.5.0 ([87c1e67](https://github.com/pando85/passless/commit/87c1e6759f3b37444dc13ddf764dd36063d3168c))
+
 ## [v0.5.3](https://github.com/pando85/passless/tree/v0.5.3) - 2025-12-01
 
 ### Fixed
