@@ -120,7 +120,7 @@ jobs:
         shell: bash
         run: |
           echo "${CRATES_IO_TOKEN}" | cargo login
-          make publish
+          make publish || true
 
       - name: Get Changelog Entry
         if: startsWith(github.ref, 'refs/tags/')
@@ -130,17 +130,28 @@ jobs:
           version: v${{ env.PROJECT_VERSION }}
           path: ./CHANGELOG.md
 
-      - name: Publish
+      - name: Prepare release files list
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_files
+        shell: bash
+        run: |
+          FILES="${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz"
+          FILES="${FILES}"$'\n'"${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256"
+          if [[ "${{ matrix.job.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            FILES="${FILES}"$'\n'"vendor.tar.gz"
+            FILES="${FILES}"$'\n'"passless-completions-${{ env.PROJECT_VERSION }}.tar.gz"
+          fi
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           body: ${{ steps.changelog_reader.outputs.changes }}
           prerelease: ${{ steps.changelog_reader.outputs.status == 'prereleased' }}
           draft: ${{ steps.changelog_reader.outputs.status == 'unreleased' }}
-          files: |
-            ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz
-            ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
-            vendor.tar.gz
-            passless-completions-${{ env.PROJECT_VERSION }}.tar.gz
+          files: ${{ steps.release_files.outputs.files }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
