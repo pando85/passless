@@ -191,50 +191,81 @@ fn open_device_by_index(list: &TransportList, idx: usize) -> Result<Transport> {
 
 /// Try to open a device by name or AAGUID substring match
 fn open_device_by_selector(list: &TransportList, selector: &str) -> Result<Transport> {
-    let devices = enumerate_device_info(list);
     let sel_lower = selector.to_lowercase();
+    let mut matches: Vec<(DeviceInfo, Transport)> = Vec::new();
+    let mut non_matches: Vec<DeviceInfo> = Vec::new();
 
-    let matches: Vec<&DeviceInfo> = devices
-        .iter()
-        .filter(|d| {
-            d.name.to_lowercase().contains(&sel_lower)
-                || d.aaguid_hex.to_lowercase().contains(&sel_lower)
-        })
-        .collect();
+    for i in 0..list.len() {
+        let Some(mut transport) = list.get(i) else {
+            continue;
+        };
+
+        let (aaguid_hex, versions) = if transport.open().is_ok() {
+            query_device_info(&mut transport)
+        } else {
+            non_matches.push(DeviceInfo {
+                index: i,
+                name: "Unavailable".to_string(),
+                aaguid_hex: "unavailable".to_string(),
+                versions: "FIDO2".to_string(),
+            });
+            continue;
+        };
+
+        let name = aaguid_hex_to_name(&aaguid_hex);
+        let device_info = DeviceInfo {
+            index: i,
+            name,
+            aaguid_hex,
+            versions,
+        };
+
+        let is_match = device_info.name.to_lowercase().contains(&sel_lower)
+            || device_info.aaguid_hex.to_lowercase().contains(&sel_lower);
+
+        if is_match {
+            matches.push((device_info, transport));
+        } else {
+            transport.close();
+            non_matches.push(device_info);
+        }
+    }
 
     match matches.len() {
-        0 => Err(passless_core::Error::Other(format!(
-            "No device found matching '{}'\n\n\
-             Available devices:\n{}\n\n\
-             Use 'passless client devices' to list all devices.",
-            selector,
-            format_device_list(&devices)
-        ))),
+        0 => {
+            let all_devices: Vec<DeviceInfo> = non_matches
+                .into_iter()
+                .chain(matches.into_iter().map(|(d, _)| d))
+                .collect();
+            Err(passless_core::Error::Other(format!(
+                "No device found matching '{}'\n\n\
+                 Available devices:\n{}\n\n\
+                 Use 'passless client devices' to list all devices.",
+                selector,
+                format_device_list(&all_devices)
+            )))
+        }
         1 => {
-            let device = matches[0];
-            let mut transport = list.get(device.index).ok_or_else(|| {
-                passless_core::Error::Other(format!(
-                    "Failed to get device at index {}",
-                    device.index
-                ))
-            })?;
-
-            transport.open().map_err(|e| {
-                passless_core::Error::Other(format!(
-                    "Failed to open device '{}' at index {}: {:?}",
-                    device.name, device.index, e
-                ))
-            })?;
-
+            let (_device_info, transport) = matches.into_iter().next().unwrap();
             Ok(transport)
         }
-        _ => Err(passless_core::Error::Other(format!(
-            "Ambiguous device selector '{}' matches {} devices:\n{}\n\n\
-             Please use a more specific selector or numeric index.",
-            selector,
-            matches.len(),
-            format_device_list(&matches.iter().map(|&d| d.clone()).collect::<Vec<_>>())
-        ))),
+        _ => {
+            let matched_devices: Vec<DeviceInfo> = matches
+                .into_iter()
+                .map(|(d, mut t)| {
+                    t.close();
+                    d
+                })
+                .collect();
+
+            Err(passless_core::Error::Other(format!(
+                "Ambiguous device selector '{}' matches {} devices:\n{}\n\n\
+                 Please use a more specific selector or numeric index.",
+                selector,
+                matched_devices.len(),
+                format_device_list(&matched_devices)
+            )))
+        }
     }
 }
 
