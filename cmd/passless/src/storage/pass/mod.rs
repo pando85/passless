@@ -5,6 +5,7 @@
 
 pub mod init;
 
+use crate::storage::credential::Credential;
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
@@ -13,8 +14,6 @@ use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
 
 use passless_core::error::{Error, Result};
-
-use soft_fido2::{Credential, CredentialRef, RelyingParty};
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -202,7 +201,7 @@ impl PassStorageAdapter {
     /// Read a credential from a specific file path WITHOUT caching
     /// Used for operations that need &self (select_users, get_relying_parties, etc.)
     #[allow(dead_code)]
-    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<Credential> {
+    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<soft_fido2::Credential> {
         debug!("Reading credential (no cache) from path: {:?}", path);
 
         // Read the encrypted GPG file
@@ -223,14 +222,15 @@ impl PassStorageAdapter {
 
         debug!("Successfully decrypted credential");
 
-        // Parse credential from decrypted bytes
+        // Parse credential from decrypted bytes using auto format
         Credential::from_bytes(plaintext.unsecure_ref())
+            .map(|cred| cred.to_soft_fido2())
             .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))
     }
 
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant GPG decryption
-    fn read_credential_from_path(&mut self, path: &Path) -> Result<Credential> {
+    fn read_credential_from_path(&mut self, path: &Path) -> Result<soft_fido2::Credential> {
         if let Some(cached) = self.cache.get(path) {
             if Instant::now() < cached.expires_at {
                 debug!("Cache HIT for path: {:?}", path);
@@ -270,7 +270,8 @@ impl PassStorageAdapter {
         debug!("Successfully decrypted credential");
 
         // Parse credential from decrypted bytes
-        let credential: Credential = Credential::from_bytes(plaintext.unsecure_ref())
+        let credential: soft_fido2::Credential = Credential::from_bytes(plaintext.unsecure_ref())
+            .map(|cred| cred.to_soft_fido2())
             .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))?;
 
         // Cache the decrypted credential with automatic TTL
@@ -280,7 +281,7 @@ impl PassStorageAdapter {
     }
 
     /// Read a credential by its ID
-    fn read_credential_by_id(&mut self, id: &[u8]) -> Result<Credential> {
+    fn read_credential_by_id(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
         let path_info = self.indexes.id.get(id).ok_or_else(|| {
             debug!("Credential not found in index");
             Error::Storage("Credential not found".to_string())
@@ -349,7 +350,11 @@ impl PassStorageAdapter {
     }
 
     /// Write a credential to the store
-    fn write_credential_bytes(&mut self, cred: &Credential, cred_bytes: &[u8]) -> Result<()> {
+    fn write_credential_bytes(
+        &mut self,
+        cred: &soft_fido2::Credential,
+        cred_bytes: &[u8],
+    ) -> Result<()> {
         self.cache.evict_expired();
 
         let path = get_credential_path(&self.get_fido2_path(), &cred.rp.id, &cred.id, "gpg");
@@ -446,7 +451,7 @@ impl PassStorageAdapter {
 
     /// Find the next credential matching the current filter
     /// Uses indexes for efficient lookup
-    fn find_next(&mut self) -> Result<Credential> {
+    fn find_next(&mut self) -> Result<soft_fido2::Credential> {
         debug!(
             "Finding next credential (index: {}/{})",
             self.iteration_index,
@@ -466,7 +471,10 @@ impl PassStorageAdapter {
 }
 
 impl CredentialStorage for PassStorageAdapter {
-    fn read_first(&mut self, filter: CredentialFilter) -> soft_fido2::Result<Credential> {
+    fn read_first(
+        &mut self,
+        filter: CredentialFilter,
+    ) -> soft_fido2::Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read_first called with filter: {:?}", filter);
@@ -539,34 +547,37 @@ impl CredentialStorage for PassStorageAdapter {
         self.find_next().map_err(Into::into)
     }
 
-    fn read_next(&mut self) -> soft_fido2::Result<Credential> {
+    fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read_next called");
         self.find_next().map_err(Into::into)
     }
 
-    fn read(&mut self, id: &[u8], _rp: &str) -> soft_fido2::Result<Vec<u8>> {
+    fn read(&mut self, id: &[u8], _rp: &str) -> soft_fido2::Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read called with id: {}", bytes_to_hex(id));
 
-        let cred = self.read_credential_by_id(id).map_err(|e| {
-            debug!("Failed to read credential: {:?}", e);
-            e
-        })?;
-
-        cred.to_bytes()
+        // Load and return credential directly (no re-serialization)
+        self.read_credential_by_id(id).map_err(Into::into)
     }
 
-    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> soft_fido2::Result<()> {
+    fn write(
+        &mut self,
+        _id: &[u8],
+        _rp: &str,
+        cred_ref: soft_fido2::CredentialRef,
+    ) -> soft_fido2::Result<()> {
         self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);
 
         let credential = cred_ref.to_owned();
+        // Convert to our format for controlled serialization
+        let our_cred = Credential::from_soft_fido2(&credential);
         // Use Zeroizing to ensure credential bytes are cleared from memory after use
-        let cred_bytes = Zeroizing::new(credential.to_bytes().map_err(|e| {
+        let cred_bytes = Zeroizing::new(our_cred.to_bytes().map_err(|e| {
             debug!("Failed to serialize credential: {:?}", e);
             Error::Storage(format!("Failed to serialize credential: {:?}", e))
         })?);
@@ -604,8 +615,9 @@ impl CredentialStorage for PassStorageAdapter {
             cred.user.display_name = Some(display.to_string());
         }
 
-        // Serialize the updated credential
-        let cred_bytes = Zeroizing::new(cred.to_bytes().map_err(|e| {
+        // Convert to our format and serialize
+        let our_cred = Credential::from_soft_fido2(&cred);
+        let cred_bytes = Zeroizing::new(our_cred.to_bytes().map_err(|e| {
             debug!("Failed to serialize credential: {:?}", e);
             Error::Storage(format!("Failed to serialize credential: {:?}", e))
         })?);
@@ -653,15 +665,15 @@ impl CredentialStorage for PassStorageAdapter {
         count
     }
 
-    fn get_relying_parties(&self) -> soft_fido2::Result<Vec<RelyingParty>> {
+    fn get_relying_parties(&self) -> soft_fido2::Result<Vec<soft_fido2_ctap::types::RelyingParty>> {
         debug!("get_relying_parties called");
 
         // Extract RP info directly from path structure - no file loading/decryption needed!
-        let rp_list: Vec<RelyingParty> = self
+        let rp_list: Vec<soft_fido2_ctap::types::RelyingParty> = self
             .indexes
             .rp
             .keys()
-            .map(|rp_id| RelyingParty {
+            .map(|rp_id| soft_fido2_ctap::types::RelyingParty {
                 id: rp_id.clone(),
                 name: None, // Name not available in path structure
             })

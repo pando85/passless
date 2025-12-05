@@ -14,6 +14,7 @@
 
 pub mod init;
 
+use crate::storage::credential::Credential;
 use crate::storage::index::{
     CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
@@ -21,7 +22,7 @@ use crate::storage::index::{
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
 
-use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
+use soft_fido2::Result;
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -462,7 +463,7 @@ impl TpmStorageAdapter {
     /// Read a credential from a specific file path WITHOUT caching
     /// Used for operations that need &self
     #[allow(dead_code)]
-    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<Credential> {
+    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<soft_fido2::Credential> {
         debug!("Reading credential (no cache) from path: {:?}", path);
 
         let mut file = File::open(path).map_err(|e| {
@@ -480,12 +481,13 @@ impl TpmStorageAdapter {
         // Use Zeroizing to ensure the unsealed data is cleared from memory after use
         let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data)?);
 
-        Credential::from_bytes(&unsealed_data)
+        // Load using auto format (tries our format, falls back to soft-fido2 format)
+        Credential::from_bytes(&unsealed_data).map(|cred| cred.to_soft_fido2())
     }
 
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant TPM unsealing
-    fn read_credential_from_path(&mut self, path: &Path) -> Result<Credential> {
+    fn read_credential_from_path(&mut self, path: &Path) -> Result<soft_fido2::Credential> {
         if let Some(cached) = self.cache.get(path) {
             if Instant::now() < cached.expires_at {
                 debug!("Cache HIT for path: {:?}", path);
@@ -521,7 +523,8 @@ impl TpmStorageAdapter {
         // Use Zeroizing to ensure the unsealed data is cleared from memory after use
         let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data)?);
 
-        let credential = Credential::from_bytes(&unsealed_data)?;
+        // Load using auto format (tries our format, falls back to soft-fido2 format)
+        let credential = Credential::from_bytes(&unsealed_data).map(|cred| cred.to_soft_fido2())?;
 
         // Cache the unsealed credential with automatic TTL
         self.cache.insert(path.to_path_buf(), credential.clone());
@@ -530,7 +533,7 @@ impl TpmStorageAdapter {
     }
 
     /// Read a credential by its ID
-    fn read_credential_by_id(&mut self, id: &[u8]) -> Result<Credential> {
+    fn read_credential_by_id(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
         let path_info = self.indexes.id.get(id).ok_or_else(|| {
             debug!("Credential not found in index");
             soft_fido2::Error::DoesNotExist
@@ -542,7 +545,7 @@ impl TpmStorageAdapter {
 
     /// Find the next credential matching the current filter
     /// Uses indexes for efficient lookup
-    fn find_next(&mut self) -> Result<Credential> {
+    fn find_next(&mut self) -> Result<soft_fido2::Credential> {
         debug!(
             "Finding next credential (index: {}/{})",
             self.iteration_index,
@@ -562,7 +565,7 @@ impl TpmStorageAdapter {
 
     /// Write a credential to storage
     /// Uses new directory structure: {storage_dir}/{rp_id}/{cred_id_hex}.tpm
-    fn write_credential(&mut self, cred: &Credential) -> Result<()> {
+    fn write_credential(&mut self, cred: &soft_fido2::Credential) -> Result<()> {
         self.cache.evict_expired();
 
         let path = get_credential_path(&self.storage_dir, &cred.rp.id, &cred.id, "tpm");
@@ -576,8 +579,10 @@ impl TpmStorageAdapter {
             })?;
         }
 
+        // Convert to our format for controlled serialization
+        let our_cred = Credential::from_soft_fido2(cred);
         // Use Zeroizing to ensure credential bytes are cleared from memory after use
-        let bytes = Zeroizing::new(cred.to_bytes()?);
+        let bytes = Zeroizing::new(our_cred.to_bytes()?);
 
         // Seal the data using TPM
         let sealed_data = self.seal_data(&bytes)?;
@@ -642,7 +647,7 @@ impl TpmStorageAdapter {
 }
 
 impl CredentialStorage for TpmStorageAdapter {
-    fn read_first(&mut self, filter: CredentialFilter) -> Result<Credential> {
+    fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read_first called with filter: {:?}", filter);
@@ -714,24 +719,23 @@ impl CredentialStorage for TpmStorageAdapter {
         self.find_next()
     }
 
-    fn read_next(&mut self) -> Result<Credential> {
+    fn read_next(&mut self) -> Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read_next called");
         self.find_next()
     }
 
-    fn read(&mut self, id: &[u8], _rp: &str) -> Result<Vec<u8>> {
+    fn read(&mut self, id: &[u8], _rp: &str) -> Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read called with id: {}", bytes_to_hex(id));
 
-        let cred = self.read_credential_by_id(id)?;
-
-        cred.to_bytes()
+        // Load and return credential directly (no re-serialization)
+        self.read_credential_by_id(id)
     }
 
-    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> Result<()> {
+    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
         self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);
@@ -813,15 +817,15 @@ impl CredentialStorage for TpmStorageAdapter {
         count
     }
 
-    fn get_relying_parties(&self) -> Result<Vec<RelyingParty>> {
+    fn get_relying_parties(&self) -> Result<Vec<soft_fido2_ctap::types::RelyingParty>> {
         debug!("get_relying_parties called");
 
         // Extract RP info directly from path structure - no file loading/unsealing needed!
-        let rp_list: Vec<RelyingParty> = self
+        let rp_list: Vec<soft_fido2_ctap::types::RelyingParty> = self
             .indexes
             .rp
             .keys()
-            .map(|rp_id| RelyingParty {
+            .map(|rp_id| soft_fido2_ctap::types::RelyingParty {
                 id: rp_id.clone(),
                 name: None, // Name not available in path structure
             })

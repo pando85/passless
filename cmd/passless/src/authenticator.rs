@@ -127,19 +127,9 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         let mut storage = self.storage.lock().unwrap();
 
         match storage.read(cred_id, rp_id) {
-            Ok(bytes) => {
-                debug!("Credential found, deserializing");
-                // Deserialize the credential from bytes
-                match serde_cbor::from_slice::<Credential>(&bytes) {
-                    Ok(cred) => {
-                        debug!("Credential deserialized successfully");
-                        Ok(Some(cred))
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize credential: {}", e);
-                        Err(soft_fido2::Error::Other)
-                    }
-                }
+            Ok(cred) => {
+                debug!("Credential found");
+                Ok(Some(cred))
             }
             Err(_) => {
                 debug!("Credential not found");

@@ -2,16 +2,20 @@
 //!
 //! This module provides storage backends for FIDO2 credentials.
 
+pub mod credential;
 pub mod index;
 pub mod local;
 pub mod pass;
 pub mod tpm;
 
+// Internal credential type with controlled serialization
+#[allow(unused_imports)]
+pub(crate) use credential::Credential;
 pub use local::LocalStorageAdapter;
 pub use pass::PassStorageAdapter;
 pub use tpm::TpmStorageAdapter;
 
-use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
+use soft_fido2::Result;
 
 /// Filter criteria for reading credentials
 #[derive(Debug, Clone)]
@@ -41,14 +45,14 @@ pub trait CredentialStorage: Send + Sync {
     /// # Returns
     ///
     /// The first matching credential or an error if none found
-    fn read_first(&mut self, filter: CredentialFilter) -> Result<Credential>;
+    fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential>;
 
     /// Continue the current iteration and return the next credential
     ///
     /// # Returns
     ///
     /// The next matching credential or an error if no more credentials
-    fn read_next(&mut self) -> Result<Credential>;
+    fn read_next(&mut self) -> Result<soft_fido2::Credential>;
 
     /// Read a specific credential by ID and RP
     ///
@@ -59,8 +63,8 @@ pub trait CredentialStorage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// The credential bytes or an error
-    fn read(&mut self, id: &[u8], rp: &str) -> Result<Vec<u8>>;
+    /// The credential or an error
+    fn read(&mut self, id: &[u8], rp: &str) -> Result<soft_fido2::Credential>;
 
     /// Store a new credential
     ///
@@ -73,7 +77,7 @@ pub trait CredentialStorage: Send + Sync {
     /// # Returns
     ///
     /// Ok(()) on success or an error
-    fn write(&mut self, id: &[u8], rp: &str, cred: CredentialRef) -> Result<()>;
+    fn write(&mut self, id: &[u8], rp: &str, cred: soft_fido2::CredentialRef) -> Result<()>;
 
     /// Delete a credential by ID
     ///
@@ -130,7 +134,7 @@ pub trait CredentialStorage: Send + Sync {
     ///
     /// # Vector of relying party IDs
     #[allow(dead_code)]
-    fn get_relying_parties(&self) -> Result<Vec<RelyingParty>>;
+    fn get_relying_parties(&self) -> Result<Vec<soft_fido2_ctap::types::RelyingParty>>;
 
     /// Check if user verification should be disabled for this backend
     ///

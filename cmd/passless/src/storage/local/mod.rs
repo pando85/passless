@@ -6,13 +6,14 @@
 
 pub mod init;
 
+use crate::storage::credential::Credential;
 use crate::storage::index::{
     CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
     update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 
-use soft_fido2::{Credential, CredentialRef, RelyingParty, Result};
+use soft_fido2::Result;
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -71,19 +72,23 @@ impl LocalStorageAdapter {
     }
 
     /// Load a credential from a file path
-    fn load_credential_from_path(&self, path: &Path) -> Result<Credential> {
+    fn load_credential_from_path(&self, path: &Path) -> Result<soft_fido2::Credential> {
         debug!("Loading credential from: {:?}", path);
         let mut file = File::open(path).map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .map_err(|_| soft_fido2::Error::Other)?;
 
-        Credential::from_bytes(&contents)
+        // Load using auto format (tries our format, falls back to soft-fido2 format)
+        Credential::from_bytes(&contents).map(|cred| cred.to_soft_fido2())
     }
 
     /// Save a credential to a file
     /// Uses hierarchical structure: {storage_dir}/{rp_id}/{cred_id_hex}.bin
-    fn save_credential(&mut self, cred: &Credential) -> Result<()> {
+    fn save_credential(&mut self, cred: &soft_fido2::Credential) -> Result<()> {
+        // Convert to our format for controlled serialization
+        let our_cred = Credential::from_soft_fido2(cred);
+
         // Create path info for this credential
         let path_info =
             CredentialPathInfo::new(cred.rp.id.clone(), cred.id.clone(), "bin".to_string());
@@ -96,7 +101,7 @@ impl LocalStorageAdapter {
         }
 
         // Use Zeroizing to ensure credential bytes are cleared from memory after use
-        let bytes = Zeroizing::new(cred.to_bytes()?);
+        let bytes = Zeroizing::new(our_cred.to_bytes()?);
 
         let mut file = File::create(&path).map_err(|_| soft_fido2::Error::Other)?;
         file.write_all(&bytes)
@@ -113,7 +118,7 @@ impl LocalStorageAdapter {
 
     /// Find the next credential matching the current filter
     /// Uses indexes for efficient lookup
-    fn find_next(&mut self) -> Result<Credential> {
+    fn find_next(&mut self) -> Result<soft_fido2::Credential> {
         debug!(
             "Finding next credential (index: {}/{})",
             self.iteration_index,
@@ -133,7 +138,7 @@ impl LocalStorageAdapter {
 }
 
 impl CredentialStorage for LocalStorageAdapter {
-    fn read_first(&mut self, filter: CredentialFilter) -> Result<Credential> {
+    fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential> {
         debug!("read_first called with filter: {:?}", filter);
 
         // Reset iteration
@@ -196,11 +201,11 @@ impl CredentialStorage for LocalStorageAdapter {
         self.find_next()
     }
 
-    fn read_next(&mut self) -> Result<Credential> {
+    fn read_next(&mut self) -> Result<soft_fido2::Credential> {
         self.find_next()
     }
 
-    fn read(&mut self, id: &[u8], _rp: &str) -> Result<Vec<u8>> {
+    fn read(&mut self, id: &[u8], _rp: &str) -> Result<soft_fido2::Credential> {
         debug!("read called for credential ID");
 
         // Use index for direct path lookup
@@ -211,11 +216,11 @@ impl CredentialStorage for LocalStorageAdapter {
             .ok_or(soft_fido2::Error::DoesNotExist)?;
 
         let path = path_info.to_path(&self.storage_dir);
-        let cred = self.load_credential_from_path(&path)?;
-        cred.to_bytes()
+        // Load and return credential directly (no re-serialization)
+        self.load_credential_from_path(&path)
     }
 
-    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: CredentialRef) -> Result<()> {
+    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
         // Just save the credential as provided by soft-fido2
         // This is called both during registration (new credential) and
         // during authentication (updating sign counter)
@@ -314,15 +319,15 @@ impl CredentialStorage for LocalStorageAdapter {
         count
     }
 
-    fn get_relying_parties(&self) -> Result<Vec<RelyingParty>> {
+    fn get_relying_parties(&self) -> Result<Vec<soft_fido2_ctap::types::RelyingParty>> {
         debug!("get_relying_parties called");
 
         // Extract RP info directly from path structure - no file loading needed!
-        let rp_list: Vec<RelyingParty> = self
+        let rp_list: Vec<soft_fido2_ctap::types::RelyingParty> = self
             .indexes
             .rp
             .keys()
-            .map(|rp_id| RelyingParty {
+            .map(|rp_id| soft_fido2_ctap::types::RelyingParty {
                 id: rp_id.clone(),
                 name: None, // Name not available in path structure
             })
