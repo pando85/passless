@@ -40,7 +40,7 @@ hmac = "0.12"
 rpassword = "7.3"
 atty = "0.2"
 serde_bytes = "0.11.19"
-
+shadow-rs.workspace = true
 
 [dev-dependencies]
 base64 = "0.22"
@@ -53,3 +53,4 @@ soft-fido2-ctap.workspace = true
 passless-core.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+shadow-rs.workspace = true
