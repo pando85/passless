@@ -20,7 +20,23 @@ use clap::Parser;
 use commands::custom::{register_standard_credential_mgmt, register_yubikey_credential_mgmt};
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
+use shadow_rs::shadow;
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
+
+shadow!(build);
+
+/// CLI arguments with custom version string
+#[derive(Parser)]
+#[command(
+    author,
+    about,
+    long_version = build::CLAP_LONG_VERSION,
+    version = build::PKG_VERSION
+)]
+struct CliArgs {
+    #[command(flatten)]
+    args: passless_core::Args,
+}
 
 /// Wrapper for AuthenticatorService that implements CommandHandler
 struct ServiceHandler<S: CredentialStorage> {
@@ -153,7 +169,8 @@ fn main() {
 
 fn run() -> Result<()> {
     // Parse CLI arguments
-    let mut args = Args::parse();
+    let cli_args = CliArgs::parse();
+    let mut args = cli_args.args;
 
     // Handle subcommands first
     if let Some(command) = &args.command {
