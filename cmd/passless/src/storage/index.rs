@@ -2,8 +2,6 @@
 
 use crate::util::bytes_to_hex;
 
-use soft_fido2::Credential;
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -80,7 +78,7 @@ pub struct CredentialIndexes {
 }
 
 pub struct CachedCredential {
-    pub credential: Credential,
+    pub credential: soft_fido2::Credential,
     pub expires_at: Instant,
 }
 
@@ -99,7 +97,7 @@ impl CredentialCache {
         self.cache.get(path)
     }
 
-    pub fn insert(&mut self, path: PathBuf, credential: Credential) {
+    pub fn insert(&mut self, path: PathBuf, credential: soft_fido2::Credential) {
         let cached = CachedCredential {
             credential,
             expires_at: Instant::now() + CREDENTIAL_CACHE_TTL,
