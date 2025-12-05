@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.2](https://github.com/pando85/passless/tree/v0.6.2) - 2025-12-05
+
+### Added
+
+- Decouple storage format from soft-fido2 serialization ([85980df](https://github.com/pando85/passless/commit/85980dfc6a7cfce4b789fd65afa52f8a3cada794))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.6.1 ([03c618f](https://github.com/pando85/passless/commit/03c618fea13d205eeaa2be7e0c8163069a068b12))
+
 ## [v0.6.1](https://github.com/pando85/passless/tree/v0.6.1) - 2025-12-02
 
 ### Build
