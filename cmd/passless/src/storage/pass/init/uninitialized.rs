@@ -43,7 +43,7 @@ impl Uninitialized {
 
     pub fn prompt_user(self) -> Result<DirectoryCreated> {
         match show_yes_no_notification(
-            "🔐 Password Store Not Initialized",
+            "Password Store Not Initialized",
             &format!(
                 "The password store directory does not exist at:\n{}\n\nWould you like to initialize it now?",
                 self.store_path.display()

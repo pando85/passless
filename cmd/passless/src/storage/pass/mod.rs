@@ -1,7 +1,4 @@
 //! Pass (password-store) storage adapter
-//!
-//! This adapter implements the CredentialStorage trait using prs-lib.
-//! Credentials are stored as GPG-encrypted files in the password store.
 
 pub mod init;
 
@@ -34,8 +31,6 @@ pub struct PassStorageAdapter {
     path: PathBuf,
     gpg_backend: GpgBackend,
     indexes: CredentialIndexes,
-    /// Time-limited cache: file_path -> (credential, expiry_time)
-    /// Credentials are automatically evicted after CREDENTIAL_CACHE_TTL
     cache: CredentialCache,
     iteration_index: usize,
     iteration_entries: Vec<PathBuf>,
@@ -73,20 +68,6 @@ impl Display for GpgBackend {
 
 impl PassStorageAdapter {
     /// Create a new pass storage adapter
-    ///
-    /// # Arguments
-    ///
-    /// * `store_path` - Root directory of the password store (not including fido2 subdir)
-    /// * `gpg_backend` - GPG backend selection
-    ///
-    /// # Returns
-    ///
-    /// A new PassStorageAdapter instance
-    ///
-    /// # Note
-    ///
-    /// If the password store is not initialized, this will prompt the user
-    /// via desktop notifications to initialize it.
     pub fn new(store_path: PathBuf, path: PathBuf, gpg_backend: GpgBackend) -> Result<Self> {
         info!("Using pass (password-store) backend");
         info!("Store path: {}", store_path.display());

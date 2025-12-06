@@ -24,7 +24,7 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
     info!("TPM storage directory does not exist at {:?}", storage_path);
 
     match show_yes_no_notification(
-        "🔐 TPM Storage Not Initialized",
+        "TPM Storage Not Initialized",
         &format!(
             "The TPM storage directory does not exist at:\n{}\n\nWould you like to create it now?",
             storage_path.display()

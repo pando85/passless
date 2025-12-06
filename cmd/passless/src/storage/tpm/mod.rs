@@ -1,16 +1,4 @@
 //! TPM (Trusted Platform Module) storage adapter
-//!
-//! This adapter implements the CredentialStorage trait using TPM 2.0 for secure credential storage.
-//! Credentials are sealed using the TPM, ensuring they can only be unsealed on the same machine.
-//!
-//! The implementation uses:
-//! - TPM2_CreatePrimary to create a primary storage key in the owner hierarchy
-//! - TPM2_Create to seal the credential data under the primary key
-//! - TPM2_Load and TPM2_Unseal to retrieve sealed credentials
-//!
-//! File structure: {storage_dir}/{rp_id}/{cred_id_hex}.tpm
-//! Indexes are built by scanning directory structure (no unsealing needed)
-//! Credentials are only unsealed when needed for authentication
 
 pub mod init;
 
@@ -57,7 +45,6 @@ use zeroize::Zeroizing;
 pub struct TpmStorageAdapter {
     storage_dir: PathBuf,
     indexes: CredentialIndexes,
-    /// Time-limited cache: file_path -> (credential, expiry_time)
     cache: CredentialCache,
     iteration_index: usize,
     iteration_entries: Vec<PathBuf>,
@@ -79,11 +66,6 @@ struct SealedBlob {
 
 impl TpmStorageAdapter {
     /// Create a new TPM storage adapter
-    ///
-    /// # Note
-    ///
-    /// If the storage directory does not exist, this will prompt the user
-    /// via desktop notifications to create it.
     pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
         info!("Using TPM 2.0 backend");
         info!("Storage path: {}", storage_dir.display());
