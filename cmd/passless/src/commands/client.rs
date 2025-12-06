@@ -1,14 +1,4 @@
 //! FIDO2 Client Management Commands
-//!
-//! This module implements client-side FIDO2 commands for managing authenticators.
-//! It provides functionality for:
-//! - Device enumeration and selection (by index, name, or AAGUID)
-//! - Authenticator information queries
-//! - Credential management (list, delete)
-//! - Authenticator reset operations
-//! - PIN management
-//!
-//! All commands support both human-readable and JSON output formats.
 
 use std::collections::HashMap;
 
@@ -21,10 +11,6 @@ use soft_fido2::request::{
     UpdateUserRequest,
 };
 use soft_fido2::{Client, PinProtocol, Transport, TransportList};
-
-// ============================================================================
-// Data Structures
-// ============================================================================
 
 /// Device information for enumeration
 #[derive(Debug, Clone)]
@@ -73,10 +59,6 @@ struct CredentialOutput {
     cred_protect: Option<u8>,
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
 /// Serialize byte vectors as hex strings in JSON output
 fn serialize_hex<S>(data: &Vec<u8>, serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
@@ -86,10 +68,6 @@ where
 }
 
 /// Convert AAGUID hex string to human-readable device name
-///
-/// Attempts to decode the AAGUID as an ASCII string. If successful and the
-/// string contains only printable ASCII characters, returns it as the name.
-/// Otherwise, returns a generic "FIDO2 Authenticator" name.
 fn aaguid_hex_to_name(aaguid_hex: &str) -> String {
     if let Ok(bytes) = hex::decode(aaguid_hex)
         && let Ok(s) = String::from_utf8(bytes)
@@ -102,9 +80,6 @@ fn aaguid_hex_to_name(aaguid_hex: &str) -> String {
 }
 
 /// Query authenticator information via getInfo command
-///
-/// Returns a tuple of (aaguid_hex, versions_string). On failure, returns
-/// ("unknown", "FIDO2") as fallback values.
 fn query_device_info(transport: &mut Transport) -> (String, String) {
     match Client::authenticator_get_info(transport) {
         Ok(response) => {
@@ -130,9 +105,6 @@ fn query_device_info(transport: &mut Transport) -> (String, String) {
 }
 
 /// Collect information about all available devices
-///
-/// Iterates through the transport list, attempts to open each device,
-/// queries its information, and constructs a DeviceInfo struct for each.
 fn enumerate_device_info(list: &TransportList) -> Vec<DeviceInfo> {
     (0..list.len())
         .filter_map(|i| {
@@ -296,24 +268,6 @@ fn open_default_device(list: &TransportList) -> Result<Transport> {
 }
 
 /// Open a FIDO2 authenticator by index, name, or AAGUID selector
-///
-/// Selection priority:
-/// 1. If selector is None: Opens first available device (searches newest first)
-/// 2. If selector is numeric: Opens device at that index
-/// 3. Otherwise: Performs case-insensitive substring match on name or AAGUID
-///
-/// # Arguments
-/// * `selector` - Optional device selector (index, name substring, or AAGUID)
-///
-/// # Returns
-/// An opened Transport ready for communication
-///
-/// # Errors
-/// Returns error if:
-/// - No devices are available
-/// - Selector doesn't match any device
-/// - Selector matches multiple devices (ambiguous)
-/// - Selected device cannot be opened
 fn open_authenticator(selector: Option<&str>) -> Result<Transport> {
     let list = TransportList::enumerate().map_err(|e| {
         passless_core::Error::Other(format!("Failed to enumerate authenticators: {:?}", e))
@@ -338,23 +292,18 @@ fn open_authenticator(selector: Option<&str>) -> Result<Transport> {
 }
 
 /// Authenticate for credential management operations
-///
-/// Attempts user verification (UV) first, which may use biometrics or
-/// platform authentication. For Passless authenticator, credential management
-/// commands handle their own authentication via the notification system.
 fn authenticate_for_credential_management(
     transport: &mut Transport,
     output: OutputFormat,
 ) -> Result<soft_fido2::request::PinUvAuth> {
     if output == OutputFormat::Plain {
-        println!("🔐 Credential management requires authentication\n");
         println!("Attempting user verification...");
     }
 
     match Client::get_uv_token_for_credential_management(transport, PinProtocol::V2) {
         Ok(token) => {
             if output == OutputFormat::Plain {
-                println!("✓ User verification successful\n");
+                println!("User verification successful\n");
             }
             Ok(token)
         }
@@ -371,14 +320,7 @@ fn authenticate_for_credential_management(
     }
 }
 
-// ============================================================================
-// Public Command Functions
-// ============================================================================
-
 /// List all available FIDO2 authenticators
-///
-/// Enumerates all FIDO2 devices, queries their information, and displays them
-/// with their index, name (derived from AAGUID), supported versions, and AAGUID.
 pub fn devices(output: OutputFormat) -> Result<()> {
     let list = TransportList::enumerate().map_err(|e| {
         passless_core::Error::Other(format!("Failed to enumerate authenticators: {:?}", e))
@@ -525,7 +467,7 @@ pub fn reset(output: OutputFormat, device: Option<&str>, confirm_count: u8) -> R
     }
 
     match output {
-        OutputFormat::Plain => println!("✓ Authenticator reset successfully!"),
+        OutputFormat::Plain => println!("Authenticator reset successfully!"),
         OutputFormat::Json => {
             #[derive(Serialize)]
             struct ResetResult {
@@ -569,8 +511,8 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
 
     // Get metadata (optional, only for plain output)
     if output == OutputFormat::Plain {
-        println!("📊 Credential Storage Metadata");
-        println!("================================");
+        println!("Credential Storage Metadata");
+        println!("===========================");
         let request = CredentialManagementRequest::new(pin_uv_auth.clone());
         match Client::get_credentials_metadata(&mut transport, request) {
             Ok(metadata) => {
@@ -585,7 +527,7 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
                 println!();
             }
             Err(e) => {
-                println!("⚠ Could not get metadata: {:?}", e);
+                println!("Could not get metadata: {:?}", e);
                 println!("Continuing with enumeration...\n");
             }
         }
@@ -593,8 +535,8 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
 
     // Enumerate RPs
     if output == OutputFormat::Plain {
-        println!("🌐 Relying Parties");
-        println!("==================");
+        println!("Relying Parties");
+        println!("===============");
     }
 
     let request = CredentialManagementRequest::new(pin_uv_auth.clone());
@@ -747,7 +689,7 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
             }
             Err(e) => {
                 if output == OutputFormat::Plain {
-                    println!("   ❌ Failed to enumerate credentials: {:?}", e);
+                    println!("   Failed to enumerate credentials: {:?}", e);
                 }
             }
         }
@@ -793,18 +735,6 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
 }
 
 /// Show detailed information about a specific credential
-///
-/// Displays all available information about a credential including user details,
-/// credential ID, protection level, and associated relying party.
-///
-/// # Arguments
-/// * `output` - Output format (plain or JSON)
-/// * `device` - Optional device selector
-/// * `credential_id_hex` - Credential ID in hexadecimal format
-///
-/// # Returns
-/// * `Ok(())` on success
-/// * `Err(Error)` if credential is not found or enumeration fails
 pub fn show(output: OutputFormat, device: Option<&str>, credential_id_hex: &str) -> Result<()> {
     if output == OutputFormat::Plain {
         println!("Showing credential: {}\n", credential_id_hex);
@@ -859,8 +789,8 @@ pub fn show(output: OutputFormat, device: Option<&str>, credential_id_hex: &str)
 
     match output {
         OutputFormat::Plain => {
-            println!("🔑 Credential Details");
-            println!("=====================\n");
+            println!("Credential Details");
+            println!("==================\n");
 
             println!("Relying Party:");
             println!("  ID:           {}", rp.id);
@@ -989,7 +919,7 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
         .map_err(|e| passless_core::Error::Other(format!("Invalid credential ID hex: {:?}", e)))?;
 
     if output == OutputFormat::Plain {
-        println!("🗑️  Deleting credential...");
+        println!("Deleting credential...");
     }
 
     let request = DeleteCredentialRequest::new(pin_uv_auth, credential_id);
@@ -998,7 +928,7 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
     })?;
 
     match output {
-        OutputFormat::Plain => println!("✓ Credential deleted successfully!"),
+        OutputFormat::Plain => println!("Credential deleted successfully!"),
         OutputFormat::Json => {
             #[derive(Serialize)]
             struct DeleteResult {
@@ -1018,31 +948,6 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
 }
 
 /// Rename a credential (update user name and/or display name)
-///
-/// Updates the user information for a credential using the CTAP2.1
-/// updateUserInformation command (credential management subcommand 0x07).
-/// At least one of user_name or display_name must be provided.
-///
-/// Use "-" as the value to clear/delete a field (kubectl-style syntax):
-/// * `--user-name=-` clears the user name
-/// * `--display-name=-` clears the display name
-///
-/// # Arguments
-/// * `output` - Output format (plain or JSON)
-/// * `device` - Optional device selector
-/// * `credential_id_hex` - Credential ID in hexadecimal format
-/// * `user_name` - Optional new user name (login identifier), or "-" to clear
-/// * `display_name` - Optional new display name (friendly name), or "-" to clear
-///
-/// # Returns
-/// * `Ok(())` on success
-/// * `Err(Error)` if validation fails or the rename operation fails
-///
-/// # Errors
-/// * Invalid credential ID hex format
-/// * Neither user_name nor display_name provided
-/// * Credential not found
-/// * Authentication failure
 pub fn rename(
     output: OutputFormat,
     device: Option<&str>,
@@ -1081,7 +986,7 @@ pub fn rename(
     // First, we need to get the current credential to retrieve the user.id
     // We'll enumerate credentials and find the matching one
     if output == OutputFormat::Plain {
-        println!("📋 Fetching credential information...");
+        println!("Fetching credential information...");
     }
 
     // Get authenticator info to check credential management support
@@ -1150,7 +1055,7 @@ pub fn rename(
     };
 
     if output == OutputFormat::Plain {
-        println!("📝 Updating user information...");
+        println!("Updating user information...");
     }
 
     // Send the update request
@@ -1161,7 +1066,7 @@ pub fn rename(
 
     match output {
         OutputFormat::Plain => {
-            println!("✓ Credential renamed successfully!");
+            println!("Credential renamed successfully!");
 
             // Show what was updated
             match user_name {
@@ -1206,16 +1111,7 @@ pub fn rename(
     Ok(())
 }
 
-/// Set a new PIN
 /// Set PIN on authenticator
-///
-/// Sets a new PIN on a FIDO2 authenticator that doesn't currently have one.
-/// The PIN must be at least 4 characters (CTAP2 minimum) and at most 63 bytes in UTF-8.
-///
-/// # Arguments
-/// * `output` - Output format (plain or JSON)
-/// * `device` - Optional device selector
-/// * `pin` - The PIN to set
 pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<()> {
     // Validate PIN length (CTAP2 spec: 4-63 UTF-8 bytes)
     if pin.len() < 4 {
@@ -1267,9 +1163,9 @@ pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<
 
     match output {
         OutputFormat::Plain => {
-            println!("⚠ Full PIN protocol implementation pending");
-            println!("  PIN setting requires CTAP2 PIN protocol implementation with encryption");
-            println!("  For Passless authenticator, UV via notifications is recommended");
+            println!("Full PIN protocol implementation pending");
+            println!("PIN setting requires CTAP2 PIN protocol implementation with encryption");
+            println!("For Passless authenticator, UV via notifications is recommended");
         }
         OutputFormat::Json => {
             #[derive(Serialize)]
@@ -1291,15 +1187,6 @@ pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<
 }
 
 /// Change PIN on authenticator
-///
-/// Changes an existing PIN on a FIDO2 authenticator.
-/// Both old and new PINs must meet CTAP2 requirements (4-63 UTF-8 bytes).
-///
-/// # Arguments
-/// * `output` - Output format (plain or JSON)
-/// * `device` - Optional device selector
-/// * `old_pin` - Current PIN
-/// * `new_pin` - New PIN to set
 pub fn pin_change(
     output: OutputFormat,
     device: Option<&str>,
@@ -1357,9 +1244,9 @@ pub fn pin_change(
 
     match output {
         OutputFormat::Plain => {
-            println!("⚠ Full PIN protocol implementation pending");
-            println!("  PIN change requires CTAP2 PIN protocol implementation with encryption");
-            println!("  For Passless authenticator, UV via notifications is recommended");
+            println!("Full PIN protocol implementation pending");
+            println!("PIN change requires CTAP2 PIN protocol implementation with encryption");
+            println!("For Passless authenticator, UV via notifications is recommended");
         }
         OutputFormat::Json => {
             #[derive(Serialize)]
@@ -1379,10 +1266,6 @@ pub fn pin_change(
     transport.close();
     Ok(())
 }
-
-// ============================================================================
-// Helper Structures and Parsing
-// ============================================================================
 
 #[derive(Debug, Default, Serialize)]
 struct AuthenticatorInfo {

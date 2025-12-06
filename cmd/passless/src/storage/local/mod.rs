@@ -1,8 +1,4 @@
 //! Local file system storage adapter
-//!
-//! This adapter implements the CredentialStorage trait using the local file system.
-//! File structure: {storage_dir}/{rp_id}/{cred_id_hex}.bin
-//! Uses indexes for efficient lookups without loading all credentials.
 
 pub mod init;
 
@@ -36,19 +32,6 @@ pub struct LocalStorageAdapter {
 
 impl LocalStorageAdapter {
     /// Create a new local storage adapter
-    ///
-    /// # Arguments
-    ///
-    /// * `storage_dir` - Directory path where credentials will be stored
-    ///
-    /// # Returns
-    ///
-    /// A new LocalStorageAdapter instance
-    ///
-    /// # Note
-    ///
-    /// If the storage directory does not exist, this will prompt the user
-    /// via desktop notifications to create it.
     pub fn new(storage_dir: PathBuf) -> Result<Self> {
         info!("Using local file system backend");
         info!("Storage path: {}", storage_dir.display());

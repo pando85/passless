@@ -23,21 +23,16 @@ It also includes client capabilities for interacting with any FIDO2 authenticato
 > ["Credentials for Linux" project](https://github.com/linux-credentials/credentialsd) to allow
 > sandboxed apps — including browsers — to access FIDO2 / WebAuthn credentials on Linux.
 
-## ⚠️ Security warning <!-- omit in toc -->
+## ⚠️ Security Warning <!-- omit in toc -->
 
-**Passless is a software authenticator and cannot match hardware isolation.** Short differences
-between backends (strong → weak):
+**Software authenticators lack the physical isolation of dedicated hardware security keys.** While
+Passless uses GPG encryption, memory protection, and prevents core dumps to minimize exposure,
+credentials stored in software are inherently more vulnerable to system-level compromise than
+hardware-isolated keys.
 
-- **Platform authenticators (Android, Windows Hello):** use a secure element / TEE and OS-managed
-  attestation — _best hardware isolation and strong resistance to memory/firmware attacks_.
-- **TPM backend:** keys are sealed to the device TPM — _good protection against offline extraction
-  and disk theft_, but runtime memory and kernel compromise remain a risk.
-- **Pass backend (password-store / GPG):** protection depends on your GPG key; if that key is
-  TPM-backed it gains TPM-like protections, otherwise it’s only as safe as the host system and GPG
-  key storage.
-
-For high-risk scenarios or protection against local attackers with elevated privileges, prefer a
-dedicated hardware security key or a platform authenticator.
+For most use cases, Passless provides a reasonable security model. However, for highly sensitive
+accounts or threat models requiring protection against local attackers with elevated privileges,
+dedicated hardware security keys remain the recommended option.
 
 - [Features](#features)
 - [Configuration](#configuration)

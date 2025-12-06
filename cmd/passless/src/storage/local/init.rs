@@ -27,7 +27,7 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
     );
 
     match show_yes_no_notification(
-        "🔐 Local Storage Not Initialized",
+        "Local Storage Not Initialized",
         &format!(
             "The local storage directory does not exist at:\n{}\n\nWould you like to create it now?",
             storage_path.display()
