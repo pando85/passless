@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.3](https://github.com/pando85/passless/tree/v0.6.3) - 2025-12-09
+
+### Added
+
+- Add build information to version arg ([5871272](https://github.com/pando85/passless/commit/58712721269e70a4b524d2a907b2e0e1a4aa37ef))
+
+### Documentation
+
+- Extend security warning with detailed information ([93c243c](https://github.com/pando85/passless/commit/93c243cac56be4f92bd724a927354bf61acc5364))
+
+### Build
+
+- Update AUR packages description ([d6fd966](https://github.com/pando85/passless/commit/d6fd9667133c13183f5a18a9021b6e4a25640dde))
+
+### Refactor
+
+- Remove AI slop ([19d24fd](https://github.com/pando85/passless/commit/19d24fd75a895373ac2196c84839a034ffce9c62))
+
+### Testing
+
+- Support configurable USB device IDs for multi-device e2e test ([aa5a482](https://github.com/pando85/passless/commit/aa5a48269f3841d6fa6e46fab858a753a1c6d0dc))
+
 ## [v0.6.2](https://github.com/pando85/passless/tree/v0.6.2) - 2025-12-05
 
 ### Added
