@@ -8,8 +8,7 @@ use passless_core::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
 };
 
-use soft_fido2::Uhid;
-use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet};
+use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet, UhidDevice};
 
 use std::process;
 use std::sync::Arc;
@@ -74,7 +73,7 @@ impl<S: CredentialStorage + 'static> CommandHandler for ServiceHandler<S> {
 /// Helper function to run the main loop with any storage backend
 fn run_with_service<S: CredentialStorage + 'static>(
     mut service: AuthenticatorService<S>,
-    uhid: Uhid,
+    uhid: UhidDevice,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("{}", service.storage_info());
@@ -113,12 +112,7 @@ fn run_with_service<S: CredentialStorage + 'static>(
         }
 
         match uhid.read_packet(&mut buffer) {
-            Ok(0) => {
-                // No data, sleep briefly to avoid busy-waiting
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
-            }
-            Ok(_) => {
+            Ok(Some(_)) => {
                 // Parse packet
                 let packet = Packet::from_bytes(buffer);
 
@@ -132,6 +126,11 @@ fn run_with_service<S: CredentialStorage + 'static>(
                     uhid.write_packet(response_packet.as_bytes())
                         .map_err(|_| Error::Other("Failed to write packet".to_string()))?;
                 }
+            }
+            Ok(None) => {
+                // No data, sleep briefly to avoid busy-waiting
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
             Err(e) => {
                 error!("Error reading packet: {:?}", e);
@@ -256,11 +255,32 @@ fn run() -> Result<()> {
         warn!("Failed to apply security hardening: {}", e);
     }
 
-    info!("Opening UHID device...");
-    let uhid = Uhid::open().inspect_err(|_e| {
-        error!("Failed to open UHID device");
-        error!("\n{}", UHID_ERROR_MESSAGE);
-    })?;
+    info!("Creating UHID device...");
+
+    #[cfg(debug_assertions)]
+    let (vendor_id, product_id) = {
+        let vendor_id = std::env::var("PASSLESS_TEST_VENDOR_ID").ok().and_then(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(&s);
+            u16::from_str_radix(s, 16).ok()
+        });
+        let product_id = std::env::var("PASSLESS_TEST_PRODUCT_ID")
+            .ok()
+            .and_then(|s| {
+                let s = s.strip_prefix("0x").unwrap_or(&s);
+                u16::from_str_radix(s, 16).ok()
+            });
+        (vendor_id, product_id)
+    };
+
+    #[cfg(not(debug_assertions))]
+    let (vendor_id, product_id) = (Some(0x15d9), Some(0x0a37));
+
+    let uhid = UhidDevice::create_fido_device_with_ids(None, vendor_id, product_id, None)
+        .map_err(|e| Error::Uhid(format!("{:?}", e)))
+        .inspect_err(|_e| {
+            error!("Failed to create UHID device");
+            error!("\n{}", UHID_ERROR_MESSAGE);
+        })?;
 
     // Set up graceful shutdown handler
     let shutdown = Arc::new(AtomicBool::new(false));

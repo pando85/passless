@@ -20,12 +20,15 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 /// Backend-specific setup and configuration
+#[allow(dead_code)]
 pub trait BackendSetup: Send {
     /// Set up the backend and return environment variables for the authenticator
     fn setup(&mut self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>>;
 
     /// Return command-line arguments for the authenticator
     fn args(&self) -> Vec<String>;
+
+    fn set_device_ids(&mut self, _vendor_id: u16, _product_id: u16) {}
 
     /// Clean up any resources (called on drop)
     fn cleanup(&mut self) {}
@@ -34,12 +37,18 @@ pub trait BackendSetup: Send {
 /// Local filesystem backend setup
 pub struct LocalBackend {
     temp_dir: TempDir,
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
 }
 
 impl LocalBackend {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        Ok(Self { temp_dir })
+        Ok(Self {
+            temp_dir,
+            vendor_id: None,
+            product_id: None,
+        })
     }
 }
 
@@ -47,6 +56,20 @@ impl BackendSetup for LocalBackend {
     fn setup(&mut self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let mut env = HashMap::new();
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+
+        if let Some(vendor_id) = self.vendor_id {
+            env.insert(
+                "PASSLESS_TEST_VENDOR_ID".to_string(),
+                format!("0x{:04x}", vendor_id),
+            );
+        }
+        if let Some(product_id) = self.product_id {
+            env.insert(
+                "PASSLESS_TEST_PRODUCT_ID".to_string(),
+                format!("0x{:04x}", product_id),
+            );
+        }
+
         Ok(env)
     }
 
@@ -59,12 +82,19 @@ impl BackendSetup for LocalBackend {
             "-v".to_string(),
         ]
     }
+
+    fn set_device_ids(&mut self, vendor_id: u16, product_id: u16) {
+        self.vendor_id = Some(vendor_id);
+        self.product_id = Some(product_id);
+    }
 }
 
 /// Password-store backend setup
 pub struct PassBackend {
     temp_dir: TempDir,
     gpg_home: PathBuf,
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
 }
 
 impl PassBackend {
@@ -72,7 +102,12 @@ impl PassBackend {
         let temp_dir = TempDir::new()?;
         let gpg_home = temp_dir.path().join(".gnupg");
 
-        Ok(Self { temp_dir, gpg_home })
+        Ok(Self {
+            temp_dir,
+            gpg_home,
+            vendor_id: None,
+            product_id: None,
+        })
     }
 
     /// Initialize GPG key for testing
@@ -156,6 +191,19 @@ impl BackendSetup for PassBackend {
         env.insert("GNUPGHOME".to_string(), self.gpg_home.display().to_string());
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
 
+        if let Some(vendor_id) = self.vendor_id {
+            env.insert(
+                "PASSLESS_TEST_VENDOR_ID".to_string(),
+                format!("0x{:04x}", vendor_id),
+            );
+        }
+        if let Some(product_id) = self.product_id {
+            env.insert(
+                "PASSLESS_TEST_PRODUCT_ID".to_string(),
+                format!("0x{:04x}", product_id),
+            );
+        }
+
         Ok(env)
     }
 
@@ -170,12 +218,19 @@ impl BackendSetup for PassBackend {
             "-v".to_string(),
         ]
     }
+
+    fn set_device_ids(&mut self, vendor_id: u16, product_id: u16) {
+        self.vendor_id = Some(vendor_id);
+        self.product_id = Some(product_id);
+    }
 }
 
 /// TPM backend setup (using swtpm)
 pub struct TpmBackend {
     temp_dir: TempDir,
     swtpm_process: Option<Child>,
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
 }
 
 impl TpmBackend {
@@ -185,6 +240,8 @@ impl TpmBackend {
         Ok(Self {
             temp_dir,
             swtpm_process: None,
+            vendor_id: None,
+            product_id: None,
         })
     }
 
@@ -244,6 +301,19 @@ impl BackendSetup for TpmBackend {
         );
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
 
+        if let Some(vendor_id) = self.vendor_id {
+            env.insert(
+                "PASSLESS_TEST_VENDOR_ID".to_string(),
+                format!("0x{:04x}", vendor_id),
+            );
+        }
+        if let Some(product_id) = self.product_id {
+            env.insert(
+                "PASSLESS_TEST_PRODUCT_ID".to_string(),
+                format!("0x{:04x}", product_id),
+            );
+        }
+
         Ok(env)
     }
 
@@ -261,6 +331,11 @@ impl BackendSetup for TpmBackend {
                 .to_string(),
             "-v".to_string(),
         ]
+    }
+
+    fn set_device_ids(&mut self, vendor_id: u16, product_id: u16) {
+        self.vendor_id = Some(vendor_id);
+        self.product_id = Some(product_id);
     }
 
     fn cleanup(&mut self) {
@@ -310,41 +385,22 @@ impl AuthenticatorHarness {
         Ok(Self::new(Box::new(TpmBackend::new()?)))
     }
 
-    /// Check if passless is already running
-    fn is_passless_running() -> bool {
-        // Try pgrep to detect running instance
-        if let Ok(output) = Command::new("pgrep")
-            .arg("-f")
-            .arg("^target/debug/passless$")
-            .output()
-            && output.status.success()
-            && !output.stdout.is_empty()
-        {
-            return true;
-        }
-
-        // Also check alternative pattern
-        if let Ok(output) = Command::new("pgrep")
-            .arg("-f")
-            .arg("/target/debug/passless$")
-            .output()
-            && output.status.success()
-            && !output.stdout.is_empty()
-        {
-            return true;
-        }
-
-        false
+    #[allow(dead_code)]
+    pub fn set_device_ids(&mut self, vendor_id: u16, product_id: u16) {
+        self.backend.set_device_ids(vendor_id, product_id);
     }
 
-    /// Wait for the authenticator to be ready
-    fn wait_for_ready(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Wait for a specific number of devices to be available
+    fn wait_for_device_count(
+        &self,
+        expected_count: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(10);
 
         while start.elapsed() < timeout {
             if let Ok(list) = TransportList::enumerate()
-                && !list.is_empty()
+                && list.len() >= expected_count
             {
                 println!("   ✓ Authenticator is ready");
                 return Ok(());
@@ -352,18 +408,23 @@ impl AuthenticatorHarness {
             std::thread::sleep(Duration::from_millis(200));
         }
 
-        Err("Timeout waiting for authenticator to be ready".into())
+        Err(format!(
+            "Timeout waiting for {} device(s) to be ready",
+            expected_count
+        )
+        .into())
     }
 
     /// Start the authenticator
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Check if already running
-        if Self::is_passless_running() {
-            println!("Passless authenticator already running (using existing instance)");
-            self.started_by_harness = false;
-            return Ok(());
-        }
+        self.start_and_wait_for_device_count(1)
+    }
 
+    /// Start the authenticator and wait for a specific number of total devices
+    pub fn start_and_wait_for_device_count(
+        &mut self,
+        expected_device_count: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         println!("Starting passless authenticator...");
 
         // Set up backend
@@ -411,7 +472,7 @@ impl AuthenticatorHarness {
         println!("Waiting for authenticator to initialize...");
 
         // Wait for it to be ready
-        self.wait_for_ready()?;
+        self.wait_for_device_count(expected_device_count)?;
 
         Ok(())
     }
