@@ -513,21 +513,24 @@ fn test_client_device_selection() {
 "
     );
 
-    // Start two authenticators with different storage paths
+    // Start two authenticators with different storage paths and unique device IDs
     let mut harness1 = AuthenticatorHarness::with_local().expect("Failed to create harness 1");
+    harness1.set_device_ids(0x1111, 0x0001);
+
     let mut harness2 = AuthenticatorHarness::with_local().expect("Failed to create harness 2");
+    harness2.set_device_ids(0x2222, 0x0002);
 
     println!("Starting first authenticator...");
     harness1.start().expect("Failed to start authenticator 1");
-    std::thread::sleep(std::time::Duration::from_millis(500));
     println!(
         "   ✓ First authenticator started
 "
     );
 
     println!("Starting second authenticator...");
-    harness2.start().expect("Failed to start authenticator 2");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    harness2
+        .start_and_wait_for_device_count(2)
+        .expect("Failed to start authenticator 2");
     println!(
         "   ✓ Second authenticator started
 "
