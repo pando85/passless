@@ -104,29 +104,23 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         Ok(UvResult::Accepted)
     }
 
-    fn write_credential(
-        &self,
-        cred_id: &[u8],
-        rp_id: &str,
-        credential: &CredentialRef,
-    ) -> Result<()> {
-        info!("Storing credential for RP: {}", rp_id);
-        debug!("Credential ID: {}", bytes_to_hex(cred_id));
+    fn write_credential(&self, credential: &CredentialRef) -> Result<()> {
+        info!("Storing credential for RP: {}", credential.rp_id);
+        debug!("Credential ID: {}", bytes_to_hex(credential.id));
         let mut storage = self.storage.lock().unwrap();
-        storage.write(cred_id, rp_id, *credential)?;
-        info!("Credential persisted successfully for RP: {}", rp_id);
+        storage.write(*credential)?;
+        info!(
+            "Credential persisted successfully for RP: {}",
+            credential.rp_id
+        );
         Ok(())
     }
 
-    fn read_credential(&self, cred_id: &[u8], rp_id: &str) -> Result<Option<Credential>> {
-        debug!(
-            "Reading credential: rp={}, id={}",
-            rp_id,
-            bytes_to_hex(cred_id)
-        );
+    fn read_credential(&self, cred_id: &[u8]) -> Result<Option<Credential>> {
+        debug!("Reading credential: id={}", bytes_to_hex(cred_id));
         let mut storage = self.storage.lock().unwrap();
 
-        match storage.read(cred_id, rp_id) {
+        match storage.read(cred_id) {
             Ok(cred) => {
                 debug!("Credential found");
                 Ok(Some(cred))

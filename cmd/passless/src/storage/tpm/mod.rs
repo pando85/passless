@@ -708,7 +708,7 @@ impl CredentialStorage for TpmStorageAdapter {
         self.find_next()
     }
 
-    fn read(&mut self, id: &[u8], _rp: &str) -> Result<soft_fido2::Credential> {
+    fn read(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
         self.cache.evict_expired();
 
         debug!("read called with id: {}", bytes_to_hex(id));
@@ -717,7 +717,7 @@ impl CredentialStorage for TpmStorageAdapter {
         self.read_credential_by_id(id)
     }
 
-    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
+    fn write(&mut self, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
         self.cache.evict_expired();
 
         debug!("write called for RP: {}", cred_ref.rp_id);

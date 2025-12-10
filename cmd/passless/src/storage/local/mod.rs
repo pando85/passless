@@ -188,7 +188,7 @@ impl CredentialStorage for LocalStorageAdapter {
         self.find_next()
     }
 
-    fn read(&mut self, id: &[u8], _rp: &str) -> Result<soft_fido2::Credential> {
+    fn read(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
         debug!("read called for credential ID");
 
         // Use index for direct path lookup
@@ -203,7 +203,7 @@ impl CredentialStorage for LocalStorageAdapter {
         self.load_credential_from_path(&path)
     }
 
-    fn write(&mut self, _id: &[u8], _rp: &str, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
+    fn write(&mut self, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
         // Just save the credential as provided by soft-fido2
         // This is called both during registration (new credential) and
         // during authentication (updating sign counter)

@@ -37,70 +37,21 @@ pub enum CredentialFilter {
 /// Any storage backend must implement this trait.
 pub trait CredentialStorage: Send + Sync {
     /// Start a new iteration and return the first matching credential
-    ///
-    /// # Arguments
-    ///
-    /// * `filter` - Filter criteria to apply
-    ///
-    /// # Returns
-    ///
-    /// The first matching credential or an error if none found
     fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential>;
 
     /// Continue the current iteration and return the next credential
-    ///
-    /// # Returns
-    ///
-    /// The next matching credential or an error if no more credentials
     fn read_next(&mut self) -> Result<soft_fido2::Credential>;
 
     /// Read a specific credential by ID and RP
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The credential ID
-    /// * `rp` - The relying party ID
-    ///
-    /// # Returns
-    ///
-    /// The credential or an error
-    fn read(&mut self, id: &[u8], rp: &str) -> Result<soft_fido2::Credential>;
+    fn read(&mut self, id: &[u8]) -> Result<soft_fido2::Credential>;
 
     /// Store a new credential
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The credential ID
-    /// * `rp` - The relying party ID
-    /// * `cred` - The credential reference to store
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success or an error
-    fn write(&mut self, id: &[u8], rp: &str, cred: soft_fido2::CredentialRef) -> Result<()>;
+    fn write(&mut self, cred: soft_fido2::CredentialRef) -> Result<()>;
 
     /// Delete a credential by ID
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The credential ID to delete
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success or an error
     fn delete(&mut self, id: &[u8]) -> Result<()>;
 
     /// Update user information for a credential
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The credential ID to update
-    /// * `user_name` - Optional new user name (login identifier)
-    /// * `display_name` - Optional new display name (friendly name)
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success or an error
     #[allow(dead_code)]
     fn update_user_info(
         &mut self,
@@ -110,29 +61,13 @@ pub trait CredentialStorage: Send + Sync {
     ) -> Result<()>;
 
     /// Get all user names for a given relying party
-    ///
-    /// # Arguments
-    ///
-    /// * `rp_id` - The relying party ID
-    ///
-    /// # Returns
-    ///
-    /// Vector of user names
     #[allow(dead_code)]
     fn select_users(&self, rp_id: &str) -> Vec<String>;
 
     /// Count total number of stored credentials
-    ///
-    /// # Returns
-    ///
-    /// The number of credentials in storage
     fn count_credentials(&self) -> usize;
 
     /// Get all relying parties that have credentials
-    ///
-    /// # Returns
-    ///
-    /// # Vector of relying party IDs
     #[allow(dead_code)]
     fn get_relying_parties(&self) -> Result<Vec<soft_fido2_ctap::types::RelyingParty>>;
 
