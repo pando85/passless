@@ -51,25 +51,8 @@ pub trait CredentialStorage: Send + Sync {
     /// Delete a credential by ID
     fn delete(&mut self, id: &[u8]) -> Result<()>;
 
-    /// Update user information for a credential
-    #[allow(dead_code)]
-    fn update_user_info(
-        &mut self,
-        id: &[u8],
-        user_name: Option<&str>,
-        display_name: Option<&str>,
-    ) -> Result<()>;
-
-    /// Get all user names for a given relying party
-    #[allow(dead_code)]
-    fn select_users(&self, rp_id: &str) -> Vec<String>;
-
     /// Count total number of stored credentials
     fn count_credentials(&self) -> usize;
-
-    /// Get all relying parties that have credentials
-    #[allow(dead_code)]
-    fn get_relying_parties(&self) -> Result<Vec<soft_fido2_ctap::types::RelyingParty>>;
 
     /// Check if user verification should be disabled for this backend
     ///

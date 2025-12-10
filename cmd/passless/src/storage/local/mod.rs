@@ -234,89 +234,9 @@ impl CredentialStorage for LocalStorageAdapter {
         Ok(())
     }
 
-    fn update_user_info(
-        &mut self,
-        id: &[u8],
-        user_name: Option<&str>,
-        display_name: Option<&str>,
-    ) -> Result<()> {
-        debug!("update_user_info called for credential ID");
-
-        // Use index for direct path lookup
-        let path_info = self
-            .indexes
-            .id
-            .get(id)
-            .ok_or(soft_fido2::Error::DoesNotExist)?;
-
-        let path = path_info.to_path(&self.storage_dir);
-
-        // Load the credential
-        let mut cred = self.load_credential_from_path(&path)?;
-
-        // Update user information
-        if let Some(name) = user_name {
-            cred.user.name = Some(name.to_string());
-        }
-        if let Some(display) = display_name {
-            cred.user.display_name = Some(display.to_string());
-        }
-
-        // Save the updated credential
-        self.save_credential(&cred)?;
-
-        debug!("Updated user info for credential on RP: {}", cred.rp.id);
-        Ok(())
-    }
-
-    fn select_users(&self, rp_id: &str) -> Vec<String> {
-        debug!("select_users called for RP: {}", rp_id);
-
-        // Use index to get credential IDs for this RP
-        let cred_ids = match self.indexes.rp.get(rp_id) {
-            Some(ids) => ids,
-            None => {
-                debug!("No credentials found for RP: {}", rp_id);
-                return Vec::new();
-            }
-        };
-
-        // Load only credentials for this RP
-        let users: Vec<String> = cred_ids
-            .iter()
-            .filter_map(|cred_id| {
-                let path_info = self.indexes.id.get(cred_id)?;
-                let path = path_info.to_path(&self.storage_dir);
-                let cred = self.load_credential_from_path(&path).ok()?;
-                Some(String::from_utf8_lossy(&cred.user.id).to_string())
-            })
-            .collect();
-
-        debug!("Found {} users for RP: {}", users.len(), rp_id);
-        users
-    }
-
     fn count_credentials(&self) -> usize {
         let count = self.indexes.id.len();
         debug!("count_credentials: {}", count);
         count
-    }
-
-    fn get_relying_parties(&self) -> Result<Vec<soft_fido2_ctap::types::RelyingParty>> {
-        debug!("get_relying_parties called");
-
-        // Extract RP info directly from path structure - no file loading needed!
-        let rp_list: Vec<soft_fido2_ctap::types::RelyingParty> = self
-            .indexes
-            .rp
-            .keys()
-            .map(|rp_id| soft_fido2_ctap::types::RelyingParty {
-                id: rp_id.clone(),
-                name: None, // Name not available in path structure
-            })
-            .collect();
-
-        debug!("Found {} relying parties", rp_list.len());
-        Ok(rp_list)
     }
 }
