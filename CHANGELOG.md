@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.4](https://github.com/pando85/passless/tree/v0.6.4) - 2025-12-10
+
+### Build
+
+- deps: Update soft-fido2 to version 0.8.0 ([83109a4](https://github.com/pando85/passless/commit/83109a452e1bd26882187f6852b2c318c688a1b8))
+
+### Refactor
+
+- Remove dead code ([d1c1a6c](https://github.com/pando85/passless/commit/d1c1a6cefc8a99ea7f94301235308a0e767f31c3))
+
 ## [v0.6.3](https://github.com/pando85/passless/tree/v0.6.3) - 2025-12-09
 
 ### Added
