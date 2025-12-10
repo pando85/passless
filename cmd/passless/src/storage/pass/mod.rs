@@ -568,95 +568,10 @@ impl CredentialStorage for PassStorageAdapter {
         self.delete_credential(id).map_err(Into::into)
     }
 
-    fn update_user_info(
-        &mut self,
-        id: &[u8],
-        user_name: Option<&str>,
-        display_name: Option<&str>,
-    ) -> soft_fido2::Result<()> {
-        self.cache.evict_expired();
-
-        debug!("update_user_info called with id: {}", bytes_to_hex(id));
-
-        // Read the credential
-        let mut cred = self
-            .read_credential_by_id(id)
-            .map_err(Into::<soft_fido2::Error>::into)?;
-
-        // Update user information
-        if let Some(name) = user_name {
-            cred.user.name = Some(name.to_string());
-        }
-        if let Some(display) = display_name {
-            cred.user.display_name = Some(display.to_string());
-        }
-
-        // Convert to our format and serialize
-        let our_cred = Credential::from_soft_fido2(&cred);
-        let cred_bytes = Zeroizing::new(our_cred.to_bytes().map_err(|e| {
-            debug!("Failed to serialize credential: {:?}", e);
-            Error::Storage(format!("Failed to serialize credential: {:?}", e))
-        })?);
-
-        // Write back the credential
-        self.write_credential_bytes(&cred, &cred_bytes)?;
-
-        debug!(
-            "Successfully updated user info for credential on RP: {}",
-            cred.rp.id
-        );
-        Ok(())
-    }
-
-    fn select_users(&self, rp_id: &str) -> Vec<String> {
-        debug!("select_users called for RP: {}", rp_id);
-
-        // Use index to get credential IDs for this RP
-        let cred_ids = match self.indexes.rp.get(rp_id) {
-            Some(ids) => ids,
-            None => {
-                debug!("No credentials found for RP: {}", rp_id);
-                return Vec::new();
-            }
-        };
-
-        // Load only credentials for this specific RP (decrypt only what's needed)
-        let users: Vec<String> = cred_ids
-            .iter()
-            .filter_map(|cred_id| {
-                let path_info = self.indexes.id.get(cred_id)?;
-                let path = path_info.to_path(&self.get_fido2_path());
-                let cred = self.read_credential_from_path_no_cache(&path).ok()?;
-                Some(String::from_utf8_lossy(&cred.user.id).to_string())
-            })
-            .collect();
-
-        debug!("Found {} users for RP: {}", users.len(), rp_id);
-        users
-    }
-
     fn count_credentials(&self) -> usize {
         let count = self.indexes.id.len();
         debug!("count_credentials: {}", count);
         count
-    }
-
-    fn get_relying_parties(&self) -> soft_fido2::Result<Vec<soft_fido2_ctap::types::RelyingParty>> {
-        debug!("get_relying_parties called");
-
-        // Extract RP info directly from path structure - no file loading/decryption needed!
-        let rp_list: Vec<soft_fido2_ctap::types::RelyingParty> = self
-            .indexes
-            .rp
-            .keys()
-            .map(|rp_id| soft_fido2_ctap::types::RelyingParty {
-                id: rp_id.clone(),
-                name: None, // Name not available in path structure
-            })
-            .collect();
-
-        debug!("Found {} relying parties", rp_list.len());
-        Ok(rp_list)
     }
 
     fn disable_user_verification(&self) -> bool {
