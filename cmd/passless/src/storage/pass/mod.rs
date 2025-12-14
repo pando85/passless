@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use core::fmt;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use prs_lib::crypto::IsContext;
 use prs_lib::{Ciphertext, Plaintext, Store};
 use zeroize::Zeroizing;
@@ -197,7 +197,7 @@ impl PassStorageAdapter {
         // Decrypt the data
         let ciphertext = Ciphertext::from(encrypted_data);
         let plaintext = context.decrypt(ciphertext).map_err(|e| {
-            debug!("Failed to decrypt credential: {:?}", e);
+            error!("Failed to decrypt credential: {:?}", e);
             Error::Storage(format!("Failed to decrypt credential: {:?}", e))
         })?;
 
@@ -244,7 +244,7 @@ impl PassStorageAdapter {
         // Decrypt the data
         let ciphertext = Ciphertext::from(encrypted_data);
         let plaintext = context.decrypt(ciphertext).map_err(|e| {
-            debug!("Failed to decrypt credential: {:?}", e);
+            error!("Failed to decrypt credential: {:?}", e);
             Error::Storage(format!("Failed to decrypt credential: {:?}", e))
         })?;
 
