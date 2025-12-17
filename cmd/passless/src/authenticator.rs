@@ -81,7 +81,12 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             return Ok(UpResult::Accepted);
         }
 
-        match show_verification_notification(info, Some(rp), user) {
+        match show_verification_notification(
+            info,
+            Some(rp),
+            user,
+            self.security_config.notification_timeout,
+        ) {
             Ok(crate::notification::NotificationResult::Accepted) => Ok(UpResult::Accepted),
             Ok(crate::notification::NotificationResult::Denied) => Ok(UpResult::Denied),
             Err(e) => {
@@ -343,6 +348,7 @@ mod tests {
             constant_signature_counter: false,
             user_verification_registration: true,
             user_verification_authentication: true,
+            notification_timeout: 30,
         };
 
         let service = AuthenticatorService::new(storage, security_config);

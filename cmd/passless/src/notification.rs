@@ -48,21 +48,11 @@ fn requires_default_action() -> bool {
 }
 
 /// Show a user verification notification and wait for response
-///
-/// # Arguments
-///
-/// * `operation` - Description of the operation (e.g., "Registration", "Authentication")
-/// * `relying_party` - Optional relying party identifier
-/// * `user` - Optional user identifier
-///
-/// # Returns
-///
-/// Result indicating whether the user accepted or denied the operation,
-/// or an error if the notification failed to show.
 pub fn show_verification_notification(
     operation: &str,
     relying_party: Option<&str>,
     user: Option<&str>,
+    timeout_seconds: u32,
 ) -> Result<NotificationResult, String> {
     // Build notification message
     let mut message = format!("Operation: {}", operation);
@@ -88,7 +78,7 @@ pub fn show_verification_notification(
         .summary("🔒 User Verification Required")
         .body(&message)
         .icon("security-high")
-        .timeout(Timeout::Never); // Wait for user action
+        .timeout(Timeout::Milliseconds(timeout_seconds * 1000));
 
     if default_means_user_present {
         // For servers that don't support action buttons properly,

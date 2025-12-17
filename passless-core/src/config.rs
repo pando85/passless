@@ -165,6 +165,16 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[default(true)]
     pub user_verification_authentication: bool,
+
+    /// Notification timeout in seconds (0 = no timeout)
+    #[arg(
+        long = "notification-timeout",
+        env = "PASSLESS_NOTIFICATION_TIMEOUT",
+        value_name = "SECONDS"
+    )]
+    #[serde(default)]
+    #[default(30)]
+    pub notification_timeout: u32,
 }
 
 impl SecurityConfig {
