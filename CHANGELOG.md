@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.0](https://github.com/pando85/passless/tree/v0.7.0) - 2025-12-17
+
+### Added
+
+- Add notification timeout for user presence ([5966fb8](https://github.com/pando85/passless/commit/5966fb8ccebe4ac34caeb84592d0612cacff5af6))
+
+### Build
+
+- deps: Update soft-fido2 to version 0.10.0 ([f7d5311](https://github.com/pando85/passless/commit/f7d53116fe2cc7551a264981f8906fae342df90b))
+
 ## [v0.6.6](https://github.com/pando85/passless/tree/v0.6.6) - 2025-12-14
 
 ### Fixed
