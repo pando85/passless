@@ -67,7 +67,7 @@ jobs:
       - name: Update apt
         run: sudo apt update
 
-      - name: Install udev and tss2 for TPM support
+      - name: Install udev and tss2
         run: sudo apt-get install -y libudev-dev libtss2-dev
 
       - uses: Swatinem/rust-cache@v2
