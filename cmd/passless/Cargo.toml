@@ -14,6 +14,10 @@ version.workspace = true
 name = "passless"
 path = "src/main.rs"
 
+[features]
+default = []
+tpm = ["passless-core/tpm", "tss-esapi"]
+
 [dependencies]
 passless-core.workspace = true
 soft-fido2.workspace = true
@@ -29,18 +33,18 @@ serde_json.workspace = true
 libc.workspace = true
 nix.workspace = true
 notify-rust.workspace = true
-tss-esapi.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
 zeroize.workspace = true
 hex.workspace = true
+shadow-rs.workspace = true
 hmac = "0.12"
 rpassword = "7.3"
 atty = "0.2"
 serde_bytes = "0.11.19"
-shadow-rs.workspace = true
+tss-esapi = { version = "7.6.0", optional = true }
 
 [dev-dependencies]
 base64 = "0.22"

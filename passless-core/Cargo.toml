@@ -6,6 +6,10 @@ edition.workspace = true
 license-file.workspace = true
 version.workspace = true
 
+[features]
+default = []
+tpm = []
+
 [dependencies]
 clap.workspace = true
 clap-serde-derive.workspace = true

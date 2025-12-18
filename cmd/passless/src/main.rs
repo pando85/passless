@@ -20,7 +20,9 @@ use commands::custom::{register_standard_credential_mgmt, register_yubikey_crede
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
 use shadow_rs::shadow;
-use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter, TpmStorageAdapter};
+#[cfg(feature = "tpm")]
+use storage::TpmStorageAdapter;
+use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter};
 
 shadow!(build);
 
@@ -323,6 +325,7 @@ fn run() -> Result<()> {
             let service = AuthenticatorService::new(storage, security_config)?;
             run_with_service(service, uhid, shutdown)
         }
+        #[cfg(feature = "tpm")]
         BackendConfig::Tpm { path, tcti } => {
             let storage = TpmStorageAdapter::new(path.into(), Some(tcti))?;
             let service = AuthenticatorService::new(storage, security_config)?;

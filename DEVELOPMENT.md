@@ -11,7 +11,8 @@
 **System Dependencies:**
 
 - `libudev-dev` - Required for UHID device access
-- `libtss2-dev` - TPM 2.0 TSS libraries (includes tss2-esys, tss2-tctildr, tss2-mu)
+- `libtss2-dev` - TPM 2.0 TSS libraries (includes tss2-esys, tss2-tctildr, tss2-mu) for `tpm`
+  feature.
 
 **Ubuntu/Debian:**
 

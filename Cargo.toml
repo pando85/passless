@@ -34,7 +34,6 @@ serde_json = "1.0"
 libc = "0.2"
 nix = { version = "0.27", features = ["resource"] }
 notify-rust = "4.11"
-tss-esapi = "7.6.0"
 aes-gcm = "0.10"
 rand = "0.8"
 ctrlc = "3.4"
