@@ -72,7 +72,8 @@ Command-line arguments will override settings from the configuration file.
 
 ### Cargo
 
-Install from source with full system integration:
+Install from source with full system integration. See [DEVELOPMENT.md](DEVELOPMENT.md#prerequisites)
+for required dependencies.
 
 ```bash
 # Clone the repository
