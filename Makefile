@@ -52,20 +52,19 @@ lint-fix: fmt clippy-fix ## run all linting with automatic fixes
 .PHONY: test
 test:	## run tests
 test: lint
-	cargo test
+	cargo test --all-features
 
 .PHONY: test-e2e
 test-e2e:	## run E2E tests (automatically manages authenticator)
-	cargo test -- --test-threads=1 --ignored
+	cargo test --all-features -- --test-threads=1 --ignored
 
 .PHONY: test-e2e-local
 test-e2e-local:	## run E2E tests for local backend only
-	cargo test --test e2e_webauthn local -- --test-threads=1 --ignored
+	cargo test --all-features --test e2e_webauthn local -- --test-threads=1 --ignored
 
 .PHONY: test-e2e-pass
 test-e2e-pass:	## run E2E tests for password-store backend only
-	cargo test --test e2e_webauthn pass -- --test-threads=1 --ignored
-
+	cargo test --all-features --test e2e_webauthn pass -- --test-threads=1 --ignored
 .PHONY: test-e2e-tpm
 test-e2e-tpm:	## run E2E tests for TPM backend only (requires swtpm)
 	cargo test --test e2e_webauthn tpm -- --test-threads=1 --ignored

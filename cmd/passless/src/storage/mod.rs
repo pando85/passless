@@ -6,6 +6,7 @@ pub mod credential;
 pub mod index;
 pub mod local;
 pub mod pass;
+#[cfg(feature = "tpm")]
 pub mod tpm;
 
 // Internal credential type with controlled serialization
@@ -13,6 +14,7 @@ pub mod tpm;
 pub(crate) use credential::Credential;
 pub use local::LocalStorageAdapter;
 pub use pass::PassStorageAdapter;
+#[cfg(feature = "tpm")]
 pub use tpm::TpmStorageAdapter;
 
 use soft_fido2::Result;

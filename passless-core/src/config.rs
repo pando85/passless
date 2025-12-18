@@ -98,6 +98,7 @@ pub fn tpm_path() -> String {
 }
 
 /// TPM backend configuration
+#[cfg(feature = "tpm")]
 #[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "tpm-backend-config")]
 pub struct TpmBackendConfig {
@@ -255,6 +256,7 @@ pub struct AppConfig {
     pub pass: PassBackendConfig,
 
     /// TPM backend configuration
+    #[cfg(feature = "tpm")]
     #[clap_serde]
     #[serde(default)]
     #[command(flatten)]
@@ -284,6 +286,7 @@ pub enum BackendConfig {
         path: String,
         gpg_backend: String,
     },
+    #[cfg(feature = "tpm")]
     Tpm {
         path: String,
         tcti: String,
@@ -331,6 +334,7 @@ impl AppConfig {
                 path: self.pass.path.clone(),
                 gpg_backend: self.pass.gpg_backend.clone(),
             }),
+            #[cfg(feature = "tpm")]
             "tpm" => Ok(BackendConfig::Tpm {
                 path: self.tpm.path.clone(),
                 tcti: self.tpm.tcti.clone(),
