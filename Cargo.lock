@@ -1438,18 +1438,6 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
-dependencies = [
- "bitflags 2.10.0",
- "cfg-if 1.0.4",
- "cfg_aliases",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
@@ -1645,7 +1633,7 @@ dependencies = [
  "passless-config-doc",
  "serde",
  "soft-fido2",
- "thiserror 2.0.18",
+ "thiserror",
  "toml",
 ]
 
@@ -1875,7 +1863,7 @@ dependencies = [
  "secstr",
  "shellexpand",
  "shlex",
- "thiserror 2.0.18",
+ "thiserror",
  "version-compare",
  "walkdir",
  "which",
@@ -1944,7 +1932,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.16",
  "libredox",
- "thiserror 2.0.18",
+ "thiserror",
 ]
 
 [[package]]
@@ -2222,9 +2210,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "699422312928d9c07d671b4fec6b95261c64c23c1709e8ccee537752191e2432"
+checksum = "c6c2c1927bbcafc8529e78aeb9ab0aeeaf6ed92365ac59ee47fc0ca9c57fc6ca"
 dependencies = [
  "aes",
  "cbc",
@@ -2248,9 +2236,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-crypto"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cb88055bddde7a40a86e94fbbe316a0eaa157d30ad41de1af0cd235028f6452"
+checksum = "d44664fa41bb20c774c4ae51571d2fd36f27c72725384b86843fd4b7bef1d82a"
 dependencies = [
  "aes",
  "cbc",
@@ -2260,15 +2248,15 @@ dependencies = [
  "rand",
  "sha2",
  "subtle",
- "thiserror 1.0.69",
+ "thiserror",
  "zeroize",
 ]
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d168feb70f027fa1d496a25bdb491feee0bbb540f2e1692ac039ba83cbaec42"
+checksum = "7b2d77e18296c21b415eff59f322c4c35b9ea13dd98fb7b80e15d2b38680d158"
 dependencies = [
  "cbor4ii",
  "core2",
@@ -2280,28 +2268,28 @@ dependencies = [
  "smallvec",
  "soft-fido2-crypto",
  "subtle",
- "thiserror 1.0.69",
+ "thiserror",
  "zeroize",
 ]
 
 [[package]]
 name = "soft-fido2-transport"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e48fc0bb0d1acb0becfe0ef0a461a5d45f936b3af860dd822d3b739a84d896d"
+checksum = "a12676dc1e0377c5b72835e7d20c62333f2cc56941da35e1a1f9625f23ed9c27"
 dependencies = [
  "hex",
  "hidapi",
  "lazy_static",
- "nix 0.29.0",
+ "nix 0.30.1",
  "smallvec",
 ]
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 dependencies = [
  "lock_api",
 ]
@@ -2386,7 +2374,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b1e66e07de489fe43a46678dd0b8df65e0c973909df1b60ba33874e297ba9b9"
 dependencies = [
  "quick-xml",
- "thiserror 2.0.18",
+ "thiserror",
  "windows",
  "windows-version",
 ]
@@ -2406,31 +2394,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.18",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.114",
+ "thiserror-impl",
 ]
 
 [[package]]
