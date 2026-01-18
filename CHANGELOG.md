@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.1](https://github.com/pando85/passless/tree/v0.7.1) - 2026-01-18
+
+### Documentation
+
+- Add build requirements to development docs ([55f6e4b](https://github.com/pando85/passless/commit/55f6e4b502dcc0b9c097fdb67d5c2709998c1cd3))
+
+### Build
+
+- deps: Update Rust crate clap to v4.5.54 ([b6dada4](https://github.com/pando85/passless/commit/b6dada4f0e99ee22c40e1ca197501809fdb15a46))
+- deps: Update Rust crate clap_complete to v4.5.65 ([cd86593](https://github.com/pando85/passless/commit/cd8659363c0aa4d6d0141b68652b9877decaf113))
+- deps: Update Rust crate proc-macro2 to v1.0.105 ([666c737](https://github.com/pando85/passless/commit/666c7370e8f190e82a9fcdb4a314eeacccd44e35))
+- deps: Update Rust crate syn to v2.0.114 ([dc572a8](https://github.com/pando85/passless/commit/dc572a83474259b16c5d9897a32628c442e4e3a2))
+- deps: Update Rust crate serde_json to v1.0.149 ([724774b](https://github.com/pando85/passless/commit/724774bc54ab93223b9a8d4479e2d1842c30abdc))
+- deps: Update Rust crate quote to v1.0.43 ([3a14816](https://github.com/pando85/passless/commit/3a14816c13d4668479d9600260c9dd8aecd8ef6f))
+- deps: Update Rust crate libc to v0.2.180 ([1df5108](https://github.com/pando85/passless/commit/1df510834979f46a1ff3828ede26e08345686ba5))
+- deps: Update Rust crate log to v0.4.29 ([53982bd](https://github.com/pando85/passless/commit/53982bd2cd7e304973982b39458890c86432f2bf))
+- deps: Update pre-commit hook adrienverge/yamllint to v1.38.0 ([dd08a66](https://github.com/pando85/passless/commit/dd08a66d28eea7f42788e7cf24e8b21e25896f7a))
+- deps: Update pre-commit hook alessandrojcm/commitlint-pre-commit-hook to v9.24.0 ([b5289d7](https://github.com/pando85/passless/commit/b5289d7811075fbdbe1ffbeea746934b14dd63c4))
+- deps: Update Rust crate darling to 0.23 ([6431cc4](https://github.com/pando85/passless/commit/6431cc46f6766f0b26d6c7529c1d00d5af4e97f8))
+- deps: Update Rust crate nix to 0.30 ([38e8432](https://github.com/pando85/passless/commit/38e8432a3c8449fd77724f529b7502fe6b0d49ce))
+- deps: Update Rust crate shadow-rs to v1.5.0 ([6d04f0f](https://github.com/pando85/passless/commit/6d04f0f2ba1382e621ec188dc770e1567063f75d))
+- deps: Update Rust crate tempfile to v3.24.0 ([de0e411](https://github.com/pando85/passless/commit/de0e4114e027c6c2a3d7590f2eb4b2e7660f0b81))
+- deps: Update Rust crate toml to 0.9 ([4674965](https://github.com/pando85/passless/commit/4674965978f4a2de66b5e87645dc281f41154444))
+- deps: Update actions/cache action to v5 ([5d9f68e](https://github.com/pando85/passless/commit/5d9f68ec1bfe30a1b9ea34203c949d8cb7c15a78))
+- deps: Update actions/checkout action to v6 ([b446d73](https://github.com/pando85/passless/commit/b446d73850c5809c44193654c502e262ae825f12))
+- deps: Update Rust crate prs-lib to v0.5.6 ([cd01c34](https://github.com/pando85/passless/commit/cd01c34a9b510bcc066d48bb0eeef9cff361049a))
+- deps: Update Rust crate dirs to v6 ([82868e2](https://github.com/pando85/passless/commit/82868e23b0b3c1401706d4a0b20fe7b39070dc1f))
+- deps: Update Rust crate thiserror to v2.0.18 ([4d519ce](https://github.com/pando85/passless/commit/4d519ce0392d5d52d76352b375032caede0513f0))
+- deps: Update soft-fido2 to 0.10.1 ([2356efb](https://github.com/pando85/passless/commit/2356efb10cd06315e38bf58345350ab3468c3aee))
+
+### Refactor
+
+- Move tpm backend to feature gate ([66dc244](https://github.com/pando85/passless/commit/66dc2446aa0162c404e12a90e23c64f61b762d7b))
+
 ## [v0.7.0](https://github.com/pando85/passless/tree/v0.7.0) - 2025-12-17
 
 ### Added
