@@ -25,14 +25,17 @@ It also includes client capabilities for interacting with any FIDO2 authenticato
 
 ## ⚠️ Security Warning <!-- omit in toc -->
 
-**Software authenticators lack the physical isolation of dedicated hardware security keys.** While
-Passless uses GPG encryption, memory protection, and prevents core dumps to minimize exposure,
-credentials stored in software are inherently more vulnerable to system-level compromise than
-hardware-isolated keys.
+**Passless is a software FIDO2 authenticator and does not provide the same hardware-backed isolation
+as dedicated security keys.** While Passless applies multiple hardening measures (GPG encryption,
+memory protection, core dump prevention), credentials stored in software remain more exposed to
+system-level compromise than non-exportable keys protected by secure hardware.
 
-For most use cases, Passless provides a reasonable security model. However, for highly sensitive
-accounts or threat models requiring protection against local attackers with elevated privileges,
-dedicated hardware security keys remain the recommended option.
+For many users, this trade-off is acceptable in exchange for better availability, usability, and
+Linux-native integration. However, hardware FIDO2 authenticators offer stronger guarantees against
+credential exfiltration and OS-level compromise, and remain the recommended option for high-value
+accounts or stricter threat models.
+
+Users should choose the solution that best fits their own security and practicality requirements.
 
 - [Features](#features)
 - [Configuration](#configuration)
