@@ -9,7 +9,11 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/pando85/passless"
 license=('GPL')
 install=passless.install
-depends=('gcc-libs')
+depends=('gcc-libs'
+         'libgit2'
+         'hidapi'
+         'systemd-libs'
+         'zlib')
 makedepends=('cargo'
              'pkgconf'
              'git')
