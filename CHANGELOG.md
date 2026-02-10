@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.4](https://github.com/pando85/passless/tree/v0.7.4) - 2026-02-10
+
+### Build
+
+- deps: Update Rust crate toml to v0.9.12 ([d3a9c03](https://github.com/pando85/passless/commit/d3a9c03712bf8064039bb8e4849a670808858386))
+- Force system libgit2 for AUR build compatibility ([1f62032](https://github.com/pando85/passless/commit/1f620328965e99df1fccdca1a689c2587dea227b))
+- Force system hidapi for AUR build compatibility ([7c9d6b7](https://github.com/pando85/passless/commit/7c9d6b70060cb207792709fc207b958aa47c3c02))
+
 ## [v0.7.3](https://github.com/pando85/passless/tree/v0.7.3) - 2026-02-10
 
 ### Build
