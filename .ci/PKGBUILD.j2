@@ -15,6 +15,7 @@ depends=('gcc-libs'
          'systemd-libs'
          'zlib')
 makedepends=('cargo'
+             'libgit2'
              'pkgconf'
              'git')
 provides=("${_pkgname}")
@@ -34,6 +35,8 @@ build() {
     cd "$srcdir/passless"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
+    export LIBGIT2_SYS_USE_PKG_CONFIG=1
+    export LIBGIT2_NO_VENDOR=1
     cargo build --frozen --release --all-features
 }
 
