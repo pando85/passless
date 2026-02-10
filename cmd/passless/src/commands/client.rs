@@ -218,7 +218,10 @@ fn open_device_by_selector(list: &TransportList, selector: &str) -> Result<Trans
             )))
         }
         1 => {
-            let (_device_info, transport) = matches.into_iter().next().unwrap();
+            let (_device_info, transport) = matches.into_iter().next()
+                .ok_or_else(|| {
+                    passless_core::Error::Other("No device found after filtering".to_string())
+                })?;
             Ok(transport)
         }
         _ => {

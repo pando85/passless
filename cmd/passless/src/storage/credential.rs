@@ -460,8 +460,11 @@ mod tests {
         let _bytes = our_cred.to_bytes().expect("Serialization should succeed");
 
         // Test migration: read soft-fido2 bytes using auto deserializer
-        let deserialized = Credential::from_bytes(&soft_cred.to_bytes().unwrap())
-            .expect("Should migrate from soft-fido2 format");
+        let soft_bytes = soft_cred
+            .to_bytes()
+            .expect("Should be able to serialize soft-fido2 credential");
+        let deserialized =
+            Credential::from_bytes(&soft_bytes).expect("Should migrate from soft-fido2 format");
 
         // Verify all fields match
         assert_eq!(deserialized.id.as_ref(), &[1, 2, 3, 4]);
@@ -496,10 +499,13 @@ mod tests {
         };
 
         // Serialize in soft-fido2's native format
-        let soft_bytes = soft_cred.to_bytes().unwrap();
+        let soft_bytes = soft_cred
+            .to_bytes()
+            .expect("Should be able to serialize soft-fido2 credential");
 
         // Read using auto deserializer (should use soft-fido2 bridge for migration)
-        let our_cred = Credential::from_bytes(&soft_bytes).unwrap();
+        let our_cred =
+            Credential::from_bytes(&soft_bytes).expect("Should migrate from soft-fido2 format");
 
         assert_eq!(our_cred.id.as_ref(), &[1, 2, 3, 4]);
         assert_eq!(our_cred.rp.id, "example.com");
@@ -533,7 +539,9 @@ mod tests {
 
         // Serialize with our format
         let our_cred = Credential::from_soft_fido2(&soft_cred);
-        let our_bytes = our_cred.to_bytes().unwrap();
+        let our_bytes = our_cred
+            .to_bytes()
+            .expect("Should be able to serialize our credential format");
 
         // Deserialize and verify
         let deserialized =

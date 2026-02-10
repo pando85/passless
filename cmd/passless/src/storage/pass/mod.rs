@@ -4,8 +4,8 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
-    load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    get_credential_path, load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    CredentialCache, CredentialIndexes, CredentialPathInfo,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
@@ -52,7 +52,39 @@ impl GpgBackend {
         match s.to_lowercase().as_str() {
             "gpgme" => Ok(Self::Gpgme),
             "gnupg-bin" | "gnupg_bin" | "gnupg" => Ok(Self::GnupgBin),
-            _ => Err(Error::Config(format!("Invalid GPG backend: {}", s))),
+            _ => Err(Error::Config(format!(
+                "Invalid GPG backend: '{}'. Must be 'gpgme' or 'gnupg-bin'",
+                s
+            ))),
+        }
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Gpgme => {
+                debug!("Validating GPGME backend configuration");
+                Ok(())
+            }
+            Self::GnupgBin => {
+                debug!("Validating GnuPG binary backend configuration");
+                use std::process::Command;
+                let result = Command::new("gpg").arg("--version").output();
+
+                match result {
+                    Ok(output) if output.status.success() => {
+                        debug!(
+                            "GPG binary is available: {:?}",
+                            String::from_utf8_lossy(&output.stdout)
+                        );
+                        Ok(())
+                    }
+                    _ => {
+                        warn!("GPG binary not found or not executable");
+                        Ok(()) // Don't fail, just warn
+                    }
+                }
+            }
         }
     }
 }

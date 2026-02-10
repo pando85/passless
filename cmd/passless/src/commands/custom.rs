@@ -152,11 +152,18 @@ mod tests {
         use passless_core::config::SecurityConfig;
 
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create temp directory: {}", e);
+        }
+        let storage = match LocalStorageAdapter::new(temp_dir.clone()) {
+            Ok(s) => s,
+            Err(e) => panic!("Failed to create local storage: {}", e),
+        };
 
-        let mut service = AuthenticatorService::new(storage, SecurityConfig::default()).unwrap();
-        register_yubikey_credential_mgmt(&mut service);
+        let mut service = AuthenticatorService::new(storage, SecurityConfig::default());
+        assert!(service.is_ok(), "Service creation should succeed");
+
+        register_yubikey_credential_mgmt(&mut service.unwrap());
 
         // Test that custom command was registered
         // (Further testing would require CTAP protocol simulation)

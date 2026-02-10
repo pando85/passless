@@ -59,10 +59,21 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         };
 
         // If backend handles verification (e.g., GPG) and not registration, skip notification
-        if self.storage.lock().unwrap().disable_user_verification()
-            && !is_registration
-            && !should_verify
-        {
+        let should_verify = if is_registration {
+            self.security_config.user_verification_registration
+        } else {
+            self.security_config.user_verification_authentication
+        };
+
+        let storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock during user verification request");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
+
+        if storage.disable_user_verification() && !is_registration && !should_verify {
             debug!("User verification handled by backend (e.g., GPG): {}", info);
             return Ok(UpResult::Accepted);
         }
@@ -113,7 +124,15 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     fn write_credential(&self, credential: &CredentialRef) -> Result<()> {
         info!("Storing credential for RP: {}", credential.rp_id);
         debug!("Credential ID: {}", bytes_to_hex(credential.id));
-        let mut storage = self.storage.lock().unwrap();
+
+        let mut storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock while writing credential");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
+
         storage.write(*credential)?;
         info!(
             "Credential persisted successfully for RP: {}",
@@ -124,7 +143,14 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
 
     fn read_credential(&self, cred_id: &[u8]) -> Result<Option<Credential>> {
         debug!("Reading credential: id={}", bytes_to_hex(cred_id));
-        let mut storage = self.storage.lock().unwrap();
+
+        let mut storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock while reading credential");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
 
         match storage.read(cred_id) {
             Ok(cred) => {
@@ -140,7 +166,15 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
 
     fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
         info!("Removing credential ID: {}", bytes_to_hex(cred_id));
-        let mut storage = self.storage.lock().unwrap();
+
+        let mut storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock while deleting credential");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
+
         storage.delete(cred_id)?;
         debug!("Credential removed");
         Ok(())
@@ -148,7 +182,14 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
 
     fn list_credentials(&self, rp_id: &str, _user_id: Option<&[u8]>) -> Result<Vec<Credential>> {
         info!("Listing credentials for RP: {}", rp_id);
-        let mut storage = self.storage.lock().unwrap();
+
+        let mut storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock while listing credentials");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
 
         let filter = CredentialFilter::ByRp(rp_id.to_string());
 
@@ -185,7 +226,14 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
 
     fn enumerate_rps(&self) -> Result<Vec<(String, Option<String>, usize)>> {
         debug!("Enumerating relying parties");
-        let mut storage = self.storage.lock().unwrap();
+
+        let mut storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock while enumerating RPs");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
 
         // Get all credentials
         let filter = CredentialFilter::None;
@@ -221,7 +269,15 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
 
     fn credential_count(&self) -> Result<usize> {
         debug!("Counting total credentials");
-        let storage = self.storage.lock().unwrap();
+
+        let storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock while counting credentials");
+                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+            }
+        };
+
         let count = storage.count_credentials();
         debug!("Total credentials: {}", count);
         Ok(count)
@@ -339,8 +395,13 @@ mod tests {
     #[test]
     fn test_service_creation() {
         let temp_dir = std::env::temp_dir().join("test_passless");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let storage = LocalStorageAdapter::new(temp_dir.clone()).unwrap();
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create temp directory: {}", e);
+        }
+        let storage = match LocalStorageAdapter::new(temp_dir.clone()) {
+            Ok(s) => s,
+            Err(e) => panic!("Failed to create local storage: {}", e),
+        };
 
         let security_config = SecurityConfig {
             check_mlock: false,
@@ -352,7 +413,7 @@ mod tests {
         };
 
         let service = AuthenticatorService::new(storage, security_config);
-        assert!(service.is_ok());
+        assert!(service.is_ok(), "Service creation should succeed");
 
         // Cleanup
         let _ = std::fs::remove_dir_all(temp_dir);
