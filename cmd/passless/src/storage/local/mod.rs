@@ -4,8 +4,8 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
-    update_indexes_on_write,
+    load_credential_paths, update_indexes_on_delete, update_indexes_on_write, CredentialIndexes,
+    CredentialPathInfo,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 
@@ -35,6 +35,13 @@ impl LocalStorageAdapter {
     pub fn new(storage_dir: PathBuf) -> Result<Self> {
         info!("Using local file system backend");
         info!("Storage path: {}", storage_dir.display());
+
+        // Validate storage directory path
+        if storage_dir.is_absolute() {
+            warn!("Storage path is absolute: {}", storage_dir.display());
+        } else {
+            debug!("Storage path is relative: {}", storage_dir.display());
+        }
 
         // Ensure the storage directory is initialized
         // This will prompt the user via notifications if not initialized

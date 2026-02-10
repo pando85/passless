@@ -98,14 +98,16 @@ pub fn show_verification_notification(
     // Wait for user action
     handle.wait_for_action(|action| {
         debug!("User action received: {}", action);
-        let mut result = action_result_clone.lock().unwrap();
+        let mut result = action_result_clone
+            .lock()
+            .expect("Failed to lock action result");
         *result = Some(action.to_string());
     });
 
     // Process the action taken
     let action = action_result
         .lock()
-        .unwrap()
+        .expect("Failed to lock action result")
         .clone()
         .unwrap_or_else(|| "__closed".to_string());
 
@@ -174,14 +176,16 @@ pub fn show_yes_no_notification(title: &str, question: &str) -> Result<YesNoResu
     // Wait for user action
     handle.wait_for_action(|action| {
         debug!("User action received: {}", action);
-        let mut result = action_result_clone.lock().unwrap();
+        let mut result = action_result_clone
+            .lock()
+            .expect("Failed to lock action result");
         *result = Some(action.to_string());
     });
 
     // Process the action taken
     let action = action_result
         .lock()
-        .unwrap()
+        .expect("Failed to lock action result")
         .clone()
         .unwrap_or_else(|| "__closed".to_string());
 
