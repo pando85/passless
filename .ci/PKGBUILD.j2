@@ -15,6 +15,7 @@ depends=('gcc-libs'
          'systemd-libs'
          'zlib')
 makedepends=('cargo'
+             'hidapi'
              'libgit2'
              'pkgconf'
              'git')
@@ -37,6 +38,9 @@ build() {
     export CARGO_TARGET_DIR=target
     export LIBGIT2_SYS_USE_PKG_CONFIG=1
     export LIBGIT2_NO_VENDOR=1
+    export HIDAPI_SYS_USE_PKG_CONFIG=1
+    export HIDAPI_LIBRARIES=hidapi-hidraw
+    export LD_LIBRARY_PATH="/usr/lib:$LD_LIBRARY_PATH"
     cargo build --frozen --release --all-features
 }
 
