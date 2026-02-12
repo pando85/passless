@@ -32,16 +32,16 @@ pub const MAX_CACHE_SIZE: usize = 10;
 /// Path structure: {base_dir}/{rp_id}/{cred_id_hex}.{extension}
 ///
 /// This structure allows efficient metadata extraction without loading the file:
-//! - RP ID is in the directory name (parent of file)
-//! - Credential ID is decoded from the filename
-//! - Extension determines storage type (bin, gpg, tpm)
+/// - RP ID is in the directory name (parent of file)
+/// - Credential ID is decoded from the filename
+/// - Extension determines storage type (bin, gpg, tpm)
 ///
 /// # Example
-//!
-//! For path `{store_dir}/example.com/a1b2c3d4.gpg`:
-//! - RP ID: "example.com"
-//! - Credential ID: [0xa1, 0xb2, 0xc3, 0xd4]
-//! - Extension: "gpg"
+///
+/// For path `{store_dir}/example.com/a1b2c3d4.gpg`:
+/// - RP ID: "example.com"
+/// - Credential ID: [0xa1, 0xb2, 0xc3, 0xd4]
+/// - Extension: "gpg"
 #[derive(Debug, Clone)]
 pub struct CredentialPathInfo {
     /// Relying Party ID (extracted from directory name)
@@ -224,35 +224,35 @@ pub fn get_credential_path(
 /// fast lookups by credential ID, RP ID, and RP ID hash.
 ///
 /// # Performance
-//!
-//! O(n) complexity where n = total credentials (single directory traversal)
-//!
-//! Uses lazy evaluation with path parsing rather than loading file contents.
-//!
-//! # Arguments
-//!
-//! * `storage_dir` - The root directory containing credential files
-//! * `extension` - Expected file extension (e.g., "bin", "gpg", "tpm")
-//!
-//! # Returns
-//!
-//! A `CredentialIndexes` structure containing:
-//! - `id`: Map of credential ID to path information
-//! - `rp`: Map of RP ID to list of credential IDs
-//! - `rp_hash`: Map of RP ID hash to list of credential IDs
-//!
-//! # Error Handling
-//!
-//! Returns default indexes if directory is inaccessible or empty.
-//! Errors are logged at debug level and don't affect the calling code.
-//!
-//! # Examples
-//!
-//! ```
-//! let indexes = load_credential_paths(&Path::new("/path/to/store"), "gpg")?;
-//! assert_eq!(indexes.id.len(), 10); // 10 credentials indexed
-//! assert!(indexes.rp.contains_key("example.com"));
-//! ```
+///
+/// O(n) complexity where n = total credentials (single directory traversal)
+///
+/// Uses lazy evaluation with path parsing rather than loading file contents.
+///
+/// # Arguments
+///
+/// * `storage_dir` - The root directory containing credential files
+/// * `extension` - Expected file extension (e.g., "bin", "gpg", "tpm")
+///
+/// # Returns
+///
+/// A `CredentialIndexes` structure containing:
+/// - `id`: Map of credential ID to path information
+/// - `rp`: Map of RP ID to list of credential IDs
+/// - `rp_hash`: Map of RP ID hash to list of credential IDs
+///
+/// # Error Handling
+///
+/// Returns default indexes if directory is inaccessible or empty.
+/// Errors are logged at debug level and don't affect the calling code.
+///
+/// # Examples
+///
+/// ```
+/// let indexes = load_credential_paths(&Path::new("/path/to/store"), "gpg")?;
+/// assert_eq!(indexes.id.len(), 10); // 10 credentials indexed
+/// assert!(indexes.rp.contains_key("example.com"));
+/// ```
 pub fn load_credential_paths(
     storage_dir: &Path,
     extension: &str,

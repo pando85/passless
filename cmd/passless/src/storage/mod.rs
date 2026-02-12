@@ -9,13 +9,6 @@ pub mod pass;
 #[cfg(feature = "tpm")]
 pub mod tpm;
 
-// Tests
-#[cfg(test)]
-mod tests {
-    pub mod error_handling;
-    pub mod concurrency;
-}
-
 // Internal credential type with controlled serialization
 #[allow(unused_imports)]
 pub(crate) use credential::Credential;

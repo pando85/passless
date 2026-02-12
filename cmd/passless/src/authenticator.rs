@@ -58,18 +58,11 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             self.security_config.user_verification_authentication
         };
 
-        // If backend handles verification (e.g., GPG) and not registration, skip notification
-        let should_verify = if is_registration {
-            self.security_config.user_verification_registration
-        } else {
-            self.security_config.user_verification_authentication
-        };
-
         let storage = match self.storage.lock() {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock during user verification request");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 
@@ -129,7 +122,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock while writing credential");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 
@@ -148,7 +141,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock while reading credential");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 
@@ -171,7 +164,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock while deleting credential");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 
@@ -187,7 +180,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock while listing credentials");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 
@@ -231,7 +224,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock while enumerating RPs");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 
@@ -274,7 +267,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
             Ok(s) => s,
             Err(_) => {
                 error!("Failed to acquire storage lock while counting credentials");
-                return Err(soft_fido2::Error::Other("Storage unavailable".to_string()));
+                return Err(soft_fido2::Error::Other);
             }
         };
 

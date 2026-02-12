@@ -160,7 +160,7 @@ mod tests {
             Err(e) => panic!("Failed to create local storage: {}", e),
         };
 
-        let mut service = AuthenticatorService::new(storage, SecurityConfig::default());
+        let service = AuthenticatorService::new(storage, SecurityConfig::default());
         assert!(service.is_ok(), "Service creation should succeed");
 
         register_yubikey_credential_mgmt(&mut service.unwrap());
