@@ -3,7 +3,7 @@
 //! Simple initialization that prompts user if storage directory doesn't exist.
 
 use crate::notification::{
-    show_error_notification, show_info_notification, show_yes_no_notification, YesNoResult,
+    YesNoResult, show_error_notification, show_info_notification, show_yes_no_notification,
 };
 use passless_core::error::{Error, Result};
 

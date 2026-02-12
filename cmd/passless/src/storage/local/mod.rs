@@ -4,8 +4,8 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    load_credential_paths, update_indexes_on_delete, update_indexes_on_write, CredentialIndexes,
-    CredentialPathInfo,
+    CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
+    update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 
@@ -15,7 +15,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Local file system storage adapter
