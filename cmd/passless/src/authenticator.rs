@@ -307,7 +307,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             plat: true,                    // Platform authenticator
             client_pin: None,              // Client PIN support
             pin_uv_auth_token: Some(true), // PIN UV auth token
-            cred_mgmt: None, // Credential management disabled (using custom implementation)
+            cred_mgmt: Some(true),         // Credential management enabled
             bio_enroll: None,
             large_blobs: None,
             ep: None,
