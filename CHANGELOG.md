@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.6](https://github.com/pando85/passless/tree/v0.7.6) - 2026-02-14
+
+### Added
+
+- Improve error handling and add comprehensive tests ([3ebd823](https://github.com/pando85/passless/commit/3ebd823ba5a3ec9b36ace4aa806b52cba676e024))
+
+### Fixed
+
+- Resolve all compilation errors in error handling and testing branch ([faad274](https://github.com/pando85/passless/commit/faad2743e5986c4ef156f62068a65516e039a15f))
+- Credential list now reflects changes immediately ([508541a](https://github.com/pando85/passless/commit/508541a1ed927cb43f8b4017f95621f5b7a2e610))
+
+### Build
+
+- deps: Update Rust crate ctrlc to v3.5.2 ([2e7edf9](https://github.com/pando85/passless/commit/2e7edf92a78d7cfdd976e1056a5625e922ea2117))
+- deps: Update Rust crate clap_complete to v4.5.66 ([72ccd25](https://github.com/pando85/passless/commit/72ccd2562b651ab4fc363ba464af4725b6a4238e))
+- deps: Update Rust crate clap to v4.5.58 ([abc38c0](https://github.com/pando85/passless/commit/abc38c0b7fe602c8e0e5884ea12cf208f4301977))
+- deps: Update Rust crate env_logger to v0.11.9 ([dd761a8](https://github.com/pando85/passless/commit/dd761a89a10421b768b8bc9f1322e1ea0e335dc0))
+- deps: Update Rust crate toml to v1 ([6ca7e1a](https://github.com/pando85/passless/commit/6ca7e1ad60a7f64713f94d50a995de11df5afcc9))
+- deps: Update Rust crate syn to v2.0.115 ([f71ac70](https://github.com/pando85/passless/commit/f71ac70407da544ae62ac4922fc565d02df2cd1e))
+- deps: Update Rust crate toml to v1.0.1 ([9eb463b](https://github.com/pando85/passless/commit/9eb463bb324f9d7bd9db37cf266e7bce5e4a7489))
+
 ## [v0.7.5](https://github.com/pando85/passless/tree/v0.7.5) - 2026-02-10
 
 ### Build
