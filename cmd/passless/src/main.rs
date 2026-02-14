@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use authenticator::AuthenticatorService;
 use clap::Parser;
-use commands::custom::{register_standard_credential_mgmt, register_yubikey_credential_mgmt};
+use commands::custom::register_yubikey_credential_mgmt;
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
 use shadow_rs::shadow;
@@ -81,7 +81,6 @@ fn run_with_service<S: CredentialStorage + 'static>(
     info!("{}", service.storage_info());
 
     // Register custom commands for compatibility (placeholder for now)
-    register_standard_credential_mgmt(&mut service);
     register_yubikey_credential_mgmt(&mut service);
 
     // Main loop - process CTAP packets
