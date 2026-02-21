@@ -305,13 +305,13 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             up: true,                      // User presence
             uv: Some(true),                // User verification
             plat: true,                    // Platform authenticator
-            client_pin: None,              // Client PIN support
+            client_pin: Some(false),       // PIN supported but not set
             pin_uv_auth_token: Some(true), // PIN UV auth token
             cred_mgmt: Some(true),         // Credential management enabled
             bio_enroll: None,
             large_blobs: None,
             ep: None,
-            always_uv: Some(true),
+            always_uv: Some(false), // Allow operations without UV (notification-based UP)
             make_cred_uv_not_required: Some(true),
         };
 
