@@ -2,7 +2,7 @@
 ///
 /// This module provides compatibility with the Yubikey credential management variant (0x41).
 /// The standard credential management (0x0a) is handled by soft-fido2's built-in implementation,
-/// which properly calls the AuthenticatorCallbacks methods (enumerate_rps, list_credentials, etc.)
+/// which properly calls the AuthenticatorCallbacks methods (enumerate_rps, read_credentials, etc.)
 /// that read from the actual storage backend.
 use crate::authenticator::AuthenticatorService;
 use crate::storage::CredentialStorage;
