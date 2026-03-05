@@ -173,7 +173,7 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
         Ok(())
     }
 
-    fn read_credentials(&self, rp_id: &str, _user_id: Option<&[u8]>) -> Result<Vec<Credential>> {
+    fn list_credentials(&self, rp_id: &str, _user_id: Option<&[u8]>) -> Result<Vec<Credential>> {
         info!("Listing credentials for RP: {}", rp_id);
 
         let mut storage = match self.storage.lock() {
