@@ -303,7 +303,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
         let options = AuthenticatorOptions {
             rk: true,
             up: true,
-            uv: None,
+            uv: Some(true), // Support user verification via request_up callback
             plat: true,
             client_pin: Some(false),
             pin_uv_auth_token: Some(true),
@@ -311,7 +311,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             bio_enroll: None,
             large_blobs: None,
             ep: None,
-            always_uv: None,
+            always_uv: Some(false), // Don't require UV for all operations
             make_cred_uv_not_required: Some(true),
         };
 

@@ -825,3 +825,333 @@ fn test_tpm_registration_with_different_rps() -> Result<()> {
         run_registration_with_different_rps_test()
     })
 }
+
+/// Core test logic for passwordless login (single credential)
+/// This tests GetAssertion WITHOUT allowList, using resident key discovery
+fn run_passwordless_login_test() -> Result<()> {
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║   E2E Test: Passwordless Login (Single User)  ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    let mut transport = connect_to_authenticator()?;
+
+    println!("📝 [1/2] Registering passkey (resident key)...");
+    let challenge = generate_challenge();
+    let client_data_hash = generate_client_data_hash_for_registration(&challenge);
+
+    let rp = RelyingParty {
+        id: RP_ID.to_string(),
+        name: Some("Example Corp".to_string()),
+    };
+
+    let user = User {
+        id: vec![1, 2, 3, 4],
+        name: Some("alice@example.com".to_string()),
+        display_name: Some("Alice".to_string()),
+    };
+
+    println!("   RP: {}", rp.id);
+    println!("   User: {}", user.name.as_ref().unwrap());
+
+    let request = MakeCredentialRequest::new(client_data_hash, rp, user.clone())
+        .with_resident_key(true)
+        .with_user_verification(true)
+        .with_timeout(30000);
+
+    print_operation("Register passkey for passwordless login");
+    let attestation = Client::make_credential(&mut transport, request)?;
+    println!("   ✓ Passkey registered ({} bytes)\n", attestation.len());
+
+    println!("🔐 [2/2] Passwordless authentication (no username/allowList)...\n");
+    println!("   Note: Authenticator discovers credential via resident key lookup");
+
+    let challenge = generate_challenge();
+    let client_data_hash = generate_client_data_hash_for_authentication(&challenge);
+
+    let request = GetAssertionRequest::new(client_data_hash, RP_ID)
+        .with_user_verification(true)
+        .with_timeout(30000);
+
+    print_operation("Passwordless login - just tap to authenticate");
+
+    let assertion = Client::get_assertion(&mut transport, request)?;
+    println!(
+        "   ✓ Passwordless authentication succeeded ({} bytes)\n",
+        assertion.len()
+    );
+
+    println!("📋 Validating assertion response...");
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[..]) {
+        Ok(ciborium::value::Value::Map(map)) => {
+            println!("   ✓ Valid CBOR response with {} fields", map.len());
+
+            let mut has_credential = false;
+            let mut has_auth_data = false;
+            let mut has_signature = false;
+            let mut has_user = false;
+            let mut user_info: Option<(Vec<u8>, Option<String>, Option<String>)> = None;
+
+            for (k, v) in &map {
+                if let ciborium::value::Value::Integer(i) = k {
+                    let key: i128 = (*i).into();
+                    match key {
+                        1 => {
+                            has_credential = true;
+                            println!("   ✓ Response contains credential (key 0x01)");
+                        }
+                        2 => {
+                            has_auth_data = true;
+                            println!("   ✓ Response contains authData (key 0x02)");
+                        }
+                        3 => {
+                            has_signature = true;
+                            println!("   ✓ Response contains signature (key 0x03)");
+                        }
+                        4 => {
+                            has_user = true;
+                            println!("   ✓ Response contains user info (key 0x04)");
+
+                            if let ciborium::value::Value::Map(user_map) = v {
+                                let mut user_id: Option<Vec<u8>> = None;
+                                let mut user_name: Option<String> = None;
+                                let mut user_display_name: Option<String> = None;
+
+                                for (uk, uv) in user_map {
+                                    if let ciborium::value::Value::Text(key_name) = uk {
+                                        match key_name.as_str() {
+                                            "id" => {
+                                                if let ciborium::value::Value::Bytes(id) = uv {
+                                                    user_id = Some(id.clone());
+                                                }
+                                            }
+                                            "name" => {
+                                                if let ciborium::value::Value::Text(name) = uv {
+                                                    user_name = Some(name.clone());
+                                                }
+                                            }
+                                            "displayName" => {
+                                                if let ciborium::value::Value::Text(dn) = uv {
+                                                    user_display_name = Some(dn.clone());
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+
+                                if let Some(id) = user_id {
+                                    user_info = Some((id, user_name, user_display_name));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            assert!(has_credential, "Response should contain credential");
+            assert!(has_auth_data, "Response should contain authData");
+            assert!(has_signature, "Response should contain signature");
+            assert!(
+                has_user,
+                "Response should contain user info for passwordless login"
+            );
+
+            if let Some((id, name, display_name)) = user_info {
+                println!("\n   ✓ User info returned:");
+                println!("     ID: {} bytes", id.len());
+                if let Some(n) = name {
+                    println!("     Name: {}", n);
+                    assert_eq!(&n, user.name.as_ref().unwrap(), "User name should match");
+                }
+                if let Some(dn) = display_name {
+                    println!("     Display Name: {}", dn);
+                    assert_eq!(
+                        &dn,
+                        user.display_name.as_ref().unwrap(),
+                        "Display name should match"
+                    );
+                }
+                assert_eq!(id, user.id, "User ID should match");
+            } else {
+                panic!("User info should be present and complete for passwordless login");
+            }
+        }
+        Ok(_) => panic!("Response should be a CBOR map"),
+        Err(e) => panic!("Failed to parse CBOR response: {}", e),
+    }
+
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║       ✓ Passwordless Login Works!             ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_local_passwordless_login() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_passwordless_login_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_passwordless_login() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_passwordless_login_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_passwordless_login() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_passwordless_login_test()
+    })
+}
+
+/// Core test logic for passwordless login with multiple users
+/// Tests that the authenticator can handle multiple passkeys for the same RP
+fn run_passwordless_login_multiple_users_test() -> Result<()> {
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║ E2E Test: Passwordless Login (Multiple Users) ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    let mut transport = connect_to_authenticator()?;
+
+    let users = [
+        ("alice@example.com", "Alice", vec![1, 2, 3, 4]),
+        ("bob@example.com", "Bob", vec![5, 6, 7, 8]),
+    ];
+
+    println!("📝 Registering {} passkeys...\n", users.len());
+
+    let rp = RelyingParty {
+        id: RP_ID.to_string(),
+        name: Some("Example Corp".to_string()),
+    };
+
+    for (i, (email, display_name, user_id)) in users.iter().enumerate() {
+        println!("[{}/{}] Registering {}...", i + 1, users.len(), email);
+
+        let challenge = generate_challenge();
+        let client_data_hash = generate_client_data_hash_for_registration(&challenge);
+
+        let user = User {
+            id: user_id.clone(),
+            name: Some(email.to_string()),
+            display_name: Some(display_name.to_string()),
+        };
+
+        let request = MakeCredentialRequest::new(client_data_hash, rp.clone(), user)
+            .with_resident_key(true)
+            .with_user_verification(true)
+            .with_timeout(30000);
+
+        print_operation(&format!("Register passkey for {}", email));
+        let attestation = Client::make_credential(&mut transport, request)?;
+        println!("   ✓ Registered {} ({} bytes)\n", email, attestation.len());
+    }
+
+    println!("🔐 Passwordless authentication (no username specified)...\n");
+    println!(
+        "   Note: Authenticator will select from {} available passkeys",
+        users.len()
+    );
+
+    let challenge = generate_challenge();
+    let client_data_hash = generate_client_data_hash_for_authentication(&challenge);
+
+    let request = GetAssertionRequest::new(client_data_hash, RP_ID)
+        .with_user_verification(true)
+        .with_timeout(30000);
+
+    print_operation("Passwordless login - select from multiple accounts");
+
+    let assertion = Client::get_assertion(&mut transport, request)?;
+    println!(
+        "   ✓ Authentication succeeded ({} bytes)\n",
+        assertion.len()
+    );
+
+    println!("📋 Validating assertion response...");
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[..]) {
+        Ok(ciborium::value::Value::Map(map)) => {
+            println!("   ✓ Valid CBOR response with {} fields", map.len());
+
+            let mut has_user = false;
+            let mut has_number_of_credentials = false;
+            let mut number_of_credentials: Option<u64> = None;
+
+            for (k, v) in &map {
+                if let ciborium::value::Value::Integer(i) = k {
+                    let key: i128 = (*i).into();
+                    match key {
+                        4 => {
+                            has_user = true;
+                            println!("   ✓ Response contains user info (key 0x04)");
+                        }
+                        5 => {
+                            has_number_of_credentials = true;
+                            if let ciborium::value::Value::Integer(n) = v {
+                                let n_val: i128 = (*n).into();
+                                number_of_credentials = Some(n_val as u64);
+                                println!(
+                                    "   ✓ numberOfCredentials = {} (key 0x05)",
+                                    number_of_credentials.unwrap()
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            assert!(
+                has_user,
+                "Response should contain user info for passwordless login"
+            );
+
+            if has_number_of_credentials {
+                assert!(
+                    number_of_credentials.unwrap_or(0) > 1,
+                    "numberOfCredentials should indicate multiple credentials"
+                );
+            }
+        }
+        Ok(_) => panic!("Response should be a CBOR map"),
+        Err(e) => panic!("Failed to parse CBOR response: {}", e),
+    }
+
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║   ✓ Multiple User Passwordless Login Works!   ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_local_passwordless_login_multiple_users() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_passwordless_login_multiple_users_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_passwordless_login_multiple_users() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_passwordless_login_multiple_users_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_passwordless_login_multiple_users() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_passwordless_login_multiple_users_test()
+    })
+}

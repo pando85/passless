@@ -402,6 +402,8 @@ impl AuthenticatorHarness {
             if let Ok(list) = TransportList::enumerate()
                 && list.len() >= expected_count
             {
+                // Wait extra time for the authenticator to fully initialize
+                std::thread::sleep(Duration::from_millis(1000));
                 println!("   ✓ Authenticator is ready");
                 return Ok(());
             }
@@ -449,10 +451,12 @@ impl AuthenticatorHarness {
 
         // Spawn threads to capture stdout/stderr using a small helper
         fn spawn_log_thread<R: Read + Send + 'static>(r: R) {
+            use std::io::Write;
             thread::spawn(move || {
                 let reader = BufReader::new(r);
                 for line in reader.lines().map_while(Result::ok) {
-                    println!("{}", line);
+                    eprintln!("{}", line);
+                    let _ = std::io::stderr().flush();
                 }
             });
         }

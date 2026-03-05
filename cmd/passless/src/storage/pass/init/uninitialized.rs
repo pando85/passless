@@ -42,6 +42,24 @@ impl Uninitialized {
     }
 
     pub fn prompt_user(self) -> Result<DirectoryCreated> {
+        // Check for E2E test mode (only available in debug builds)
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+                info!("E2E test mode: Auto-creating password store directory");
+                if !self.store_path.exists() {
+                    fs::create_dir_all(&self.store_path).map_err(|e| {
+                        Error::Storage(format!("Failed to create store directory: {}", e))
+                    })?;
+                    info!("Created store directory at {:?}", self.store_path);
+                }
+                return Ok(DirectoryCreated {
+                    store_path: self.store_path,
+                    gpg_backend: self.gpg_backend,
+                });
+            }
+        }
+
         match show_yes_no_notification(
             "Password Store Not Initialized",
             &format!(

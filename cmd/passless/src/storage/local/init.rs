@@ -14,7 +14,7 @@ use log::{info, warn};
 
 /// Ensure local storage directory is initialized
 ///
-/// If the directory doesn't exist, prompts the user via desktop notification
+/// If the directory doesn't exist, prompts user via desktop notification
 /// to confirm creation.
 pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
     if storage_path.exists() {
@@ -25,6 +25,19 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
         "Local storage directory does not exist at {:?}",
         storage_path
     );
+
+    // Check for E2E test mode (only available in debug builds)
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+            info!("E2E test mode: Auto-creating local storage directory");
+            fs::create_dir_all(storage_path).map_err(|e| {
+                Error::Storage(format!("Failed to create storage directory: {}", e))
+            })?;
+            info!("Created local storage directory at {:?}", storage_path);
+            return Ok(());
+        }
+    }
 
     match show_yes_no_notification(
         "Local Storage Not Initialized",
