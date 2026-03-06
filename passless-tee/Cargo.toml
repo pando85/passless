@@ -1,0 +1,12 @@
+[package]
+name = "passless-tee"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+
+[dependencies]
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

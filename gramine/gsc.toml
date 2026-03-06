@@ -1,0 +1,67 @@
+# GSC Configuration for Passless
+# This file configures Gramine Shielded Container settings
+
+[gsc]
+# Image name
+image_name = "passless-sgx"
+
+# Base image for the container
+base_image = "ubuntu:22.04"
+
+# Gramine version
+gramine_version = "1.7"
+
+# Build arguments
+[gsc.build]
+# Use multi-stage build for smaller image
+multi_stage = true
+
+# Enable debug symbols in development
+debug = false
+
+# Enclave configuration
+[gsc.enclave]
+# Enclave size (256MB)
+size = "256M"
+
+# Number of threads
+threads = 4
+
+# Enable EDMM for dynamic memory management
+enable_edmm = true
+
+# Enable remote attestation (set to "dcap" for production)
+attestation = "none"
+
+# Filesystem configuration
+[gsc.filesystem]
+# Use encrypted mount for credential storage
+encrypted_mount = true
+
+# Mount points
+[gsc.filesystem.mounts]
+# Credential storage directory
+data = "/var/lib/passless"
+
+# UHID device
+[gsc.devices]
+uhid = "/dev/uhid"
+
+# Security configuration
+[gsc.security]
+# Disable debugging in production
+debug = false
+
+# Memory protection
+mlock = true
+
+# Allowed syscalls (minimal set for FIDO2 operations)
+[gsc.syscalls]
+# Required for UHID operations
+allowed = [
+    "read", "write", "open", "close", "ioctl",
+    "mmap", "munmap", "mprotect",
+    "socket", "connect", "bind", "listen", "accept",
+    "getrandom", "clock_gettime", "nanosleep",
+    "exit", "exit_group"
+]

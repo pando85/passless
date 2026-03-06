@@ -53,6 +53,7 @@ Users should choose the solution that best fits their own security and practical
   - [pass](https://www.passwordstore.org/) (encrypted, git-synced)
   - TPM 2.0 (Experimental)
   - Local filesystem (testing only)
+- **Intel SGX support via Gramine** (hardware memory isolation)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
 
@@ -99,11 +100,23 @@ make install
 yay -S passless
 ```
 
-or the binary from AUR:
+### Gramine/Intel SGX
 
+For enhanced security with hardware memory isolation, Passless can run in an Intel SGX enclave using Gramine.
+
+**Requirements:**
+- Intel SGX-capable CPU (6th gen or newer)
+- SGX enabled in BIOS
+- Linux kernel 5.11+
+
+**Quick start:**
 ```bash
-yay -S passless-bin
+# Build and run with SGX
+make gramine-build
+make gramine-run
 ```
+
+See [Gramine Integration Guide](docs/GRAMINE_INTEGRATION.md) for detailed setup instructions.
 
 ## Acknowledgements
 

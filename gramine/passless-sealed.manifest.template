@@ -1,0 +1,77 @@
+# Passless Gramine Manifest Template with SGX Sealed Storage
+# This manifest uses encrypted mount for hardware-bound credential storage
+
+# Entry point - the passless binary
+loader.entrypoint = "file:/usr/bin/passless"
+
+# Library path for dynamically linked libraries
+loader.env.LD_LIBRARY_PATH = "/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
+
+# Disable ASLR for deterministic behavior (optional)
+loader.insecure__use_cmdline_argv = true
+
+# Mount host filesystem directories
+# Lib directory - required for dynamic libraries
+fs.mount.lib.type = "chroot"
+fs.mount.lib.path = "/lib"
+fs.mount.lib.uri = "file:/lib"
+
+# Usr lib directory - additional libraries
+fs.mount.usr_lib.type = "chroot"
+fs.mount.usr_lib.path = "/usr/lib"
+fs.mount.usr_lib.uri = "file:/usr/lib"
+
+# Encrypted data directory - SGX sealed storage
+# This provides hardware-bound encryption for credentials
+# The key is derived from the SGX seal key, making it hardware-specific
+fs.mount.data.type = "encrypted"
+fs.mount.data.path = "/var/lib/passless"
+fs.mount.data.uri = "file:/var/lib/passless-sgx"
+fs.mount.data.key_name = "passless_sgx_key"
+
+# Configuration directory
+fs.mount.etc.type = "chroot"
+fs.mount.etc.path = "/etc"
+fs.mount.etc.uri = "file:/etc"
+
+# Runtime directory for sockets
+fs.mount.run.type = "chroot"
+fs.mount.run.path = "/run"
+fs.mount.run.uri = "file:/run"
+
+# Home directory for user config
+fs.mount.home.type = "chroot"
+fs.mount.home.path = "/home"
+fs.mount.home.uri = "file:/home"
+
+# Device access
+# UHID device for FIDO2 communication
+sgx.allowed_files.dev_uhid = "file:/dev/uhid"
+
+# SGX configuration
+# Enclave size - 256MB should be sufficient for Passless
+sgx.enclave_size = "256M"
+
+# Number of threads - 4 is a good default for FIDO2 operations
+sgx.thread_num = 4
+
+# Enable EDMM (Enclave Dynamic Memory Management) if available
+sgx.enable_edmm = true
+
+# Trusted files - the passless binary and its dependencies
+sgx.trusted_files.passless = "file:/usr/bin/passless"
+
+# Debugging options (disable in production)
+sgx.debug = false
+
+# Attestation type - none for local use
+sgx.remote_attestation = "none"
+
+# Allowed environment variables
+loader.env.PASSLESS_BACKEND_TYPE = "local"
+loader.env.PASSLESS_LOCAL_PATH = "/var/lib/passless"
+loader.env.PASSLESS_LOG_LEVEL = "info"
+loader.env.RUST_LOG = "info"
+
+# Enable non-PIE binaries (Passless is compiled as PIE by default)
+loader.insecure__disable_aslr = false

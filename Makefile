@@ -180,3 +180,37 @@ uninstall: uninstall-systemd uninstall-udev uninstall-sysusers uninstall-binary 
 	@echo "    Note: The 'fido' group still exists. To remove it:"
 	@echo "      sudo groupdel fido"
 	@echo ""
+
+# Gramine/SGX targets
+.PHONY: gramine-build
+gramine-build:	## build Passless with Gramine/SGX support
+	@echo "Building Passless with Gramine/SGX..."
+	cd gramine && ./build.sh
+
+.PHONY: gramine-clean
+gramine-clean:	## clean Gramine build artifacts
+	@echo "Cleaning Gramine artifacts..."
+	cd gramine && ./build.sh clean
+
+.PHONY: gramine-run
+gramine-run:	## run Passless in SGX enclave (standard storage)
+	@echo "Running Passless in SGX enclave..."
+	cd gramine && ./run.sh
+
+.PHONY: gramine-run-sealed
+gramine-run-sealed:	## run Passless in SGX enclave (sealed storage)
+	@echo "Running Passless in SGX enclave with sealed storage..."
+	cd gramine && ./run.sh --sealed
+
+.PHONY: gramine-keygen
+gramine-keygen:	## generate Gramine enclave signing key
+	cd gramine && ./build.sh keygen
+
+.PHONY: docker-sgx
+docker-sgx:	## build Docker image with Gramine/SGX support
+	@echo "Building Docker image with SGX support..."
+	docker build -f gramine/Dockerfile -t passless-sgx .
+
+.PHONY: test-tee-detection
+test-tee-detection:	## test TEE hardware detection
+	cargo test -p passless-tee --all-features

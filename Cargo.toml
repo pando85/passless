@@ -1,5 +1,5 @@
 [workspace]
-members = ["cmd/passless", "passless-config-doc", "passless-core"]
+members = ["cmd/passless", "passless-config-doc", "passless-core", "passless-tee"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ repository = "https://github.com/pando85/passless"
 # Workspace crates
 passless-core = { path = "./passless-core", version = "0.7.6" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.7.6" }
+passless-tee = { path = "./passless-tee", version = "0.7.6" }
 
 soft-fido2 = "0.10.1"
 soft-fido2-ctap = "0.10.1"
