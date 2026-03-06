@@ -4,8 +4,8 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    get_credential_path, load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
-    CredentialCache, CredentialIndexes, CredentialPathInfo,
+    CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
+    load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{bytes_to_hex, create_secure_dir_all};
