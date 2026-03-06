@@ -4,14 +4,15 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
-    update_indexes_on_write,
+    load_credential_paths, update_indexes_on_delete, update_indexes_on_write, CredentialIndexes,
+    CredentialPathInfo,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
+use crate::util::{create_secure_dir_all, create_secure_file};
 
 use soft_fido2::Result;
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -64,7 +65,7 @@ impl LocalStorageAdapter {
     /// Load a credential from a file path
     fn load_credential_from_path(&self, path: &Path) -> Result<soft_fido2::Credential> {
         debug!("Loading credential from: {:?}", path);
-        let mut file = File::open(path).map_err(|_| soft_fido2::Error::DoesNotExist)?;
+        let mut file = fs::File::open(path).map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .map_err(|_| soft_fido2::Error::Other)?;
@@ -85,15 +86,15 @@ impl LocalStorageAdapter {
 
         let path = path_info.to_path(&self.storage_dir);
 
-        // Ensure the RP directory exists
+        // Ensure the RP directory exists with secure permissions
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
+            create_secure_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
         }
 
         // Use Zeroizing to ensure credential bytes are cleared from memory after use
         let bytes = Zeroizing::new(our_cred.to_bytes()?);
 
-        let mut file = File::create(&path).map_err(|_| soft_fido2::Error::Other)?;
+        let mut file = create_secure_file(&path).map_err(|_| soft_fido2::Error::Other)?;
         file.write_all(&bytes)
             .map_err(|_| soft_fido2::Error::Other)?;
 
