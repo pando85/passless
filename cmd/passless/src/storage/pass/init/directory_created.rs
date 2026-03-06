@@ -2,7 +2,7 @@
 
 use super::gpg_key_selected::GpgKeySelected;
 use crate::notification::{
-    show_error_notification, show_info_notification, show_yes_no_notification, YesNoResult,
+    YesNoResult, show_error_notification, show_info_notification, show_yes_no_notification,
 };
 
 use crate::storage::pass::GpgBackend;

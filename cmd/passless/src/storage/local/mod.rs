@@ -4,15 +4,15 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    load_credential_paths, update_indexes_on_delete, update_indexes_on_write, CredentialIndexes,
-    CredentialPathInfo,
+    CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
+    update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{create_secure_dir_all, create_secure_file};
 
 use soft_fido2::Result;
 
-use std::fs::File;
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
