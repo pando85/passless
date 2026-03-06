@@ -25,6 +25,7 @@ pub fn create_secure_file<P: AsRef<Path>>(path: P) -> io::Result<File> {
 ///
 /// This is a convenience function that creates the file with secure permissions
 /// and writes the data in one operation.
+#[allow(dead_code)]
 pub fn write_secure_file<P: AsRef<Path>>(path: P, data: &[u8]) -> io::Result<()> {
     let mut file = create_secure_file(path)?;
     file.write_all(data)
