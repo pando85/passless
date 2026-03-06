@@ -4,12 +4,11 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
-    load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    get_credential_path, load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    CredentialCache, CredentialIndexes, CredentialPathInfo,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
-use crate::util::bytes_to_hex;
-
+use crate::util::{bytes_to_hex, create_secure_dir_all};
 use passless_core::error::{Error, Result};
 
 use std::fmt::Display;
@@ -373,9 +372,9 @@ impl PassStorageAdapter {
         let path = get_credential_path(&self.get_fido2_path(), &cred.rp.id, &cred.id, "gpg");
         debug!("Writing credential to: {:?}", path);
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists with secure permissions
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_secure_dir_all(parent).map_err(|e| {
                 debug!("Failed to create directory: {}", e);
                 Error::Storage(format!("Failed to create directory: {}", e))
             })?;
