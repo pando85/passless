@@ -1,7 +1,7 @@
 # TEE (Trusted Execution Environment) Analysis for Passless
 
-**Issue:** #168  
-**Date:** 2026-03-06  
+**Issue:** #168
+**Date:** 2026-03-06
 **Status:** Analysis Complete
 
 ## Executive Summary
@@ -444,3 +444,4 @@ The same user experience is preserved through Gramine's transparent execution mo
 - [Enarx Project](https://enarx.dev/)
 - [Confidential Containers (CNCF)](https://confidentialcontainers.org/)
 - [Occlum Project](https://github.com/occlum/occlum)
+
