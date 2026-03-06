@@ -47,17 +47,6 @@ pub fn create_secure_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
 
-    let mut current = path;
-    while let Some(parent) = current.parent() {
-        if parent.exists() && parent != current {
-            let metadata = fs::metadata(parent)?;
-            if metadata.is_dir() {
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            }
-        }
-        current = parent;
-    }
-
     Ok(())
 }
 
@@ -117,18 +106,14 @@ mod tests {
 
         assert!(nested_path.exists());
 
-        for component in &["a", "a/b", "a/b/c"] {
-            let path = dir.path().join(component);
-            let metadata = fs::metadata(&path).expect("Failed to get metadata");
-            assert!(metadata.is_dir());
-            let mode = metadata.permissions().mode();
-            assert_eq!(
-                mode & 0o777,
-                0o700,
-                "Directory {} should have 0o700 permissions",
-                component
-            );
-        }
+        let metadata = fs::metadata(&nested_path).expect("Failed to get metadata");
+        assert!(metadata.is_dir());
+        let mode = metadata.permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "Directory a/b/c should have 0o700 permissions"
+        );
     }
 
     #[test]
