@@ -444,4 +444,3 @@ The same user experience is preserved through Gramine's transparent execution mo
 - [Enarx Project](https://enarx.dev/)
 - [Confidential Containers (CNCF)](https://confidentialcontainers.org/)
 - [Occlum Project](https://github.com/occlum/occlum)
-
