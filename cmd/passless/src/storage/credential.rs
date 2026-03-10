@@ -133,6 +133,31 @@ pub struct Extensions {
     pub cred_protect: Option<u8>,
     /// HMAC secret extension
     pub hmac_secret: Option<bool>,
+    /// Credential random value (stored as bytes)
+    #[serde(default, with = "optional_bytes")]
+    pub cred_random: Option<Vec<u8>>,
+}
+
+/// Optional bytes serialization helper
+mod optional_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => bytes.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<Vec<u8>>::deserialize(deserializer)
+    }
 }
 
 /// Storage credential (internal to storage module)
@@ -180,6 +205,11 @@ impl<'a> Credential<'a> {
             extensions: Extensions {
                 cred_protect: cred.extensions.cred_protect,
                 hmac_secret: cred.extensions.hmac_secret,
+                cred_random: cred
+                    .extensions
+                    .cred_random
+                    .as_ref()
+                    .map(|sb| sb.as_slice().to_vec()),
             },
         }
     }
@@ -207,6 +237,7 @@ impl<'a> Credential<'a> {
             extensions: Extensions {
                 cred_protect: cred_ref.cred_protect.copied(),
                 hmac_secret: None,
+                cred_random: None,
             },
         }
     }
@@ -225,6 +256,11 @@ impl<'a> Credential<'a> {
             extensions: soft_fido2::Extensions {
                 cred_protect: self.extensions.cred_protect,
                 hmac_secret: self.extensions.hmac_secret,
+                cred_random: self
+                    .extensions
+                    .cred_random
+                    .as_ref()
+                    .map(|b| SecBytes::new(b.clone())),
             },
         }
     }
@@ -450,6 +486,7 @@ mod tests {
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
+                cred_random: None,
             },
         };
 
@@ -534,6 +571,7 @@ mod tests {
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
+                cred_random: None,
             },
         };
 
