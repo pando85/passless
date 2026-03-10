@@ -305,7 +305,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             up: true,                      // User presence
             uv: Some(true),                // User verification (via notifications/biometrics)
             plat: true,                    // Platform authenticator
-            client_pin: None,              // Client PIN capability (required for SSH SK keys)
+            client_pin: Some(true),        // Client PIN capability (required for SSH SK keys)
             pin_uv_auth_token: Some(true), // PIN UV auth token
             cred_mgmt: Some(true),         // Credential management enabled
             bio_enroll: None,
