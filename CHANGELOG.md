@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.0](https://github.com/pando85/passless/tree/v0.8.0) - 2026-03-10
+
+### Added
+
+- Add eddsa support for ssh sk keys ([f1c5770](https://github.com/pando85/passless/commit/f1c5770f5aefeee35f49e9003da583ea77df0a97))
+
+### Fixed
+
+- Ensure files and directories are created with user-only permissions ([1c5ca50](https://github.com/pando85/passless/commit/1c5ca50b43a591cfe658d0661cdcfd55c7b57cb9))
+- Remove duplicate code in local/init.rs ([cf3e7c9](https://github.com/pando85/passless/commit/cf3e7c9567f1e91c745ada815ef3c6aeb0fc4f59))
+- Resolve duplicate definitions and import issues ([d07e629](https://github.com/pando85/passless/commit/d07e629a3dcb45b0f8466dc73e54f9cbb59a0220))
+- Allow dead code for write_secure_file utility ([b82a9ee](https://github.com/pando85/passless/commit/b82a9eec535f4cb3893fc4c2e7156ec946dbc002))
+- Simplify create_secure_dir_all to only set permissions on target ([ac43b10](https://github.com/pando85/passless/commit/ac43b101b60c79fa8a208babd9a1a808d0e6a445))
+
+### Build
+
+- deps: Update Rust crate syn to v2.0.116 ([9898065](https://github.com/pando85/passless/commit/9898065836fc749ce25a2777348c02aaff77262c))
+- deps: Update Rust crate toml to v1.0.2 ([2fb012e](https://github.com/pando85/passless/commit/2fb012ed09654470ea08e6dfffce855cd134ae67))
+- deps: Update Rust crate clap to v4.5.59 ([a889c11](https://github.com/pando85/passless/commit/a889c1139021cf1ab21869e70d80909816ff4fe4))
+- deps: Update Rust crate toml to v1.0.3 ([72388a6](https://github.com/pando85/passless/commit/72388a6073b35ac8aa1286104ea1acdc6fea4c9d))
+- deps: Update Rust crate clap to v4.5.60 ([1137a85](https://github.com/pando85/passless/commit/1137a8564e37dd16b0a6cc1a01ff39e41a567664))
+- deps: Update Rust crate syn to v2.0.117 ([5e25d7d](https://github.com/pando85/passless/commit/5e25d7de6a91201a0a35c0fe53088e056f3c1f40))
+- deps: Update Rust crate nix to v0.31.2 ([39a8e95](https://github.com/pando85/passless/commit/39a8e95d2c996468ef1c49a6e62cd0e48a7aac77))
+- deps: Update Rust crate tempfile to v3.26.0 ([6f93f2e](https://github.com/pando85/passless/commit/6f93f2e2f6e1b6cb5d0d9ff8513f73e574c9131d))
+- deps: Update Rust crate quote to v1.0.45 ([e1d8fa0](https://github.com/pando85/passless/commit/e1d8fa027ad5291870dcc4f37492624995ad26d7))
+- deps: Update Rust crate toml to v1.0.4 ([4631c1d](https://github.com/pando85/passless/commit/4631c1d6ff18f1267085e8b4d87674b2ab128227))
+- deps: Update Rust crate toml to v1.0.6 ([e5ae4cc](https://github.com/pando85/passless/commit/e5ae4ccf37ac197f652b05564b3831af4ab17328))
+- deps: Update Rust crate libc to v0.2.183 ([c54a03d](https://github.com/pando85/passless/commit/c54a03d4273868ac3068fa7967890d9097e85358))
+- deps: Update Rust crate shadow-rs to v1.7.1 ([6f29752](https://github.com/pando85/passless/commit/6f297525df3c2fe3e6a2b70739bc1651a5f3be1a))
+
 ## [v0.7.6](https://github.com/pando85/passless/tree/v0.7.6) - 2026-02-14
 
 ### Added
