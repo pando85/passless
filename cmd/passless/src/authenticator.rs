@@ -303,9 +303,9 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
             up: true,                      // User presence
-            uv: Some(true),                // User verification
+            uv: Some(true),                // User verification (via notifications/biometrics)
             plat: true,                    // Platform authenticator
-            client_pin: None,              // Client PIN support
+            client_pin: Some(true),        // Client PIN capability (required for SSH SK keys)
             pin_uv_auth_token: Some(true), // PIN UV auth token
             cred_mgmt: Some(true),         // Credential management enabled
             bio_enroll: None,
