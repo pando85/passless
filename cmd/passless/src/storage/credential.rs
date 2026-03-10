@@ -133,10 +133,6 @@ pub struct Extensions {
     pub cred_protect: Option<u8>,
     /// HMAC secret extension
     pub hmac_secret: Option<bool>,
-    /// HMAC secret credential random (32 bytes)
-    /// Used to compute HMAC outputs for the hmac-secret extension
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub cred_random: Option<Vec<u8>>,
 }
 
 /// Storage credential (internal to storage module)
@@ -184,7 +180,6 @@ impl<'a> Credential<'a> {
             extensions: Extensions {
                 cred_protect: cred.extensions.cred_protect,
                 hmac_secret: cred.extensions.hmac_secret,
-                cred_random: cred.extensions.cred_random.as_ref().map(|cr| cr.to_vec()),
             },
         }
     }
@@ -212,7 +207,6 @@ impl<'a> Credential<'a> {
             extensions: Extensions {
                 cred_protect: cred_ref.cred_protect.copied(),
                 hmac_secret: None,
-                cred_random: cred_ref.cred_random.map(|cr| cr.to_vec()),
             },
         }
     }
@@ -231,11 +225,6 @@ impl<'a> Credential<'a> {
             extensions: soft_fido2::Extensions {
                 cred_protect: self.extensions.cred_protect,
                 hmac_secret: self.extensions.hmac_secret,
-                cred_random: self
-                    .extensions
-                    .cred_random
-                    .as_ref()
-                    .map(|cr| soft_fido2_ctap::SecBytes::from_slice(cr)),
             },
         }
     }
@@ -461,7 +450,6 @@ mod tests {
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
-                cred_random: None,
             },
         };
 
@@ -546,7 +534,6 @@ mod tests {
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
-                cred_random: None,
             },
         };
 
