@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.0](https://github.com/pando85/passless/tree/v0.9.0) - 2026-03-11
+
+### Added
+
+- Add PIN storage infrastructure ([69336a4](https://github.com/pando85/passless/commit/69336a420382f4c5251be3c22145efecc8ad5c19))
+- Implement PIN set and change commands ([bee72b9](https://github.com/pando85/passless/commit/bee72b9625a491191c184f1edfb0ec6e9e0544c5))
+- Wire up PIN storage backends in main.rs ([f683e45](https://github.com/pando85/passless/commit/f683e45b9d06aab4d43fae549e5b88334acba2bc))
+
+### Build
+
+- deps: Update Rust crate tempfile to v3.27.0 ([d9bb6d1](https://github.com/pando85/passless/commit/d9bb6d15249aa5e4248223790da8d1cf6a65fd34))
+
+### Testing
+
+- Add E2E test for PIN set and change commands ([7d26fac](https://github.com/pando85/passless/commit/7d26fac7ee8fe53b4b4f9cc982f5cf230fb4c608))
+
+### Chore
+
+- Disable subject-case commitlint rule ([7a0e6c3](https://github.com/pando85/passless/commit/7a0e6c3571c9e6e97d88d301124b9a27c79454b9))
+
 ## [v0.8.2](https://github.com/pando85/passless/tree/v0.8.2) - 2026-03-11
 
 ### Build
