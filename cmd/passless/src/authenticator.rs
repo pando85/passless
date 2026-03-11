@@ -1,4 +1,5 @@
 use crate::notification::show_verification_notification;
+use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
 
@@ -6,7 +7,7 @@ use passless_core::config::SecurityConfig;
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
-    CredentialRef, CtapCommand, Result, UpResult, UvResult,
+    CredentialRef, CtapCommand, PinState, Result, UpResult, UvResult,
 };
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -23,21 +24,27 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
 });
 
 /// Passless authenticator callbacks implementation
-pub struct PasslessCallbacks<S: CredentialStorage> {
+pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     storage: Arc<Mutex<S>>,
+    pin_storage: Option<Arc<Mutex<P>>>,
     security_config: SecurityConfig,
 }
 
-impl<S: CredentialStorage> PasslessCallbacks<S> {
-    pub fn new(storage: Arc<Mutex<S>>, security_config: SecurityConfig) -> Self {
+impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
+    pub fn new(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+    ) -> Self {
         Self {
             storage,
+            pin_storage,
             security_config,
         }
     }
 }
 
-impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
+impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
     fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
         // Check for E2E test mode (only available in debug builds)
         #[cfg(debug_assertions)]
@@ -285,21 +292,58 @@ impl<S: CredentialStorage> AuthenticatorCallbacks for PasslessCallbacks<S> {
     }
 }
 
+impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
+    for PasslessCallbacks<S, P>
+{
+    fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
+        if let Some(pin_storage) = &self.pin_storage {
+            let storage = pin_storage
+                .lock()
+                .map_err(|_| soft_fido2::StatusCode::Other)?;
+            storage.load_pin_state()
+        } else {
+            Ok(PinState::new())
+        }
+    }
+
+    fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
+        if let Some(pin_storage) = &self.pin_storage {
+            let storage = pin_storage
+                .lock()
+                .map_err(|_| soft_fido2::StatusCode::Other)?;
+            storage.save_pin_state(state)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Main authenticator service
 ///
 /// This service orchestrates the FIDO2 authenticator:
 /// - Storage is injected through the CredentialStorage trait
 /// - Handles CTAP requests and generates responses
-pub struct AuthenticatorService<S: CredentialStorage> {
+pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
     /// The underlying soft_fido2 authenticator
-    pub authenticator: Authenticator<PasslessCallbacks<S>>,
+    pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
 }
 
-impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
-    /// Create a new authenticator service
+impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
+    /// Create a new authenticator service without PIN storage
     pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
+        Self::with_pin_storage(storage, None, security_config)
+    }
+}
+
+impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorService<S, P> {
+    /// Create a new authenticator service with optional PIN storage
+    pub fn with_pin_storage(
+        storage: S,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+    ) -> Result<Self> {
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
             up: true,                      // User presence
@@ -341,7 +385,8 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             .build();
 
         let storage = Arc::new(Mutex::new(storage));
-        let callbacks = PasslessCallbacks::new(storage.clone(), security_config);
+        let callbacks =
+            PasslessCallbacks::new(storage.clone(), pin_storage.clone(), security_config);
         let authenticator = Authenticator::with_config(callbacks, config)?;
 
         Ok(Self {
