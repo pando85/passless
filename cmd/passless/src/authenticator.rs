@@ -332,6 +332,7 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
     /// Create a new authenticator service without PIN storage
+    #[allow(dead_code)]
     pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
         Self::with_pin_storage(storage, None, security_config)
     }

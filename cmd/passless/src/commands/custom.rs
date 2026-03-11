@@ -5,6 +5,7 @@
 /// which properly calls the AuthenticatorCallbacks methods (enumerate_rps, list_credentials, etc.)
 /// that read from the actual storage backend.
 use crate::authenticator::AuthenticatorService;
+use crate::pin_storage::PinStorage;
 use crate::storage::CredentialStorage;
 
 use log::debug;
@@ -21,8 +22,8 @@ pub const CMD_CUSTOM_CREDENTIAL_MGMT: u8 = 0x41;
 /// # Arguments
 ///
 /// * `service` - Mutable reference to the authenticator service
-pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static>(
-    service: &mut AuthenticatorService<S>,
+pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static, P: PinStorage + 'static>(
+    service: &mut AuthenticatorService<S, P>,
 ) {
     debug!("Registering Yubikey credential management command (0x41)");
 

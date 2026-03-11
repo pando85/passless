@@ -1157,10 +1157,14 @@ pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<
     }
 
     // Use soft-fido2 PIN protocol implementation
-    let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
-        .map_err(|e| passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e)))?;
+    let mut encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+            .map_err(|e| {
+                passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e))
+            })?;
 
-    encapsulation.set_pin(&mut transport, pin)
+    encapsulation
+        .set_pin(&mut transport, pin)
         .map_err(|e| passless_core::Error::Other(format!("Failed to set PIN: {:?}", e)))?;
 
     match output {
@@ -1239,10 +1243,14 @@ pub fn pin_change(
     }
 
     // Use soft-fido2 PIN protocol implementation
-    let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
-        .map_err(|e| passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e)))?;
+    let mut encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+            .map_err(|e| {
+                passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e))
+            })?;
 
-    encapsulation.change_pin(&mut transport, old_pin, new_pin)
+    encapsulation
+        .change_pin(&mut transport, old_pin, new_pin)
         .map_err(|e| passless_core::Error::Other(format!("Failed to change PIN: {:?}", e)))?;
 
     match output {
