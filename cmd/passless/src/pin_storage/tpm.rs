@@ -86,11 +86,11 @@ impl TpmPinStorage {
         #[cfg(feature = "tpm")]
         {
             use tss_esapi::{
+                Context,
                 attributes::SessionAttributesBuilder,
                 handles::KeyHandle,
                 interface_types::{resource_handles::Hierarchy, session_handles::PolicySession},
                 structures::{Auth, MaxBuffer, SensitiveData},
-                Context,
             };
 
             let tcti_str = self.tcti.as_str();
@@ -143,8 +143,8 @@ impl TpmPinStorage {
         #[cfg(feature = "tpm")]
         {
             use tss_esapi::{
-                attributes::SessionAttributesBuilder, handles::KeyHandle,
-                interface_types::session_handles::PolicySession, structures::MaxBuffer, Context,
+                Context, attributes::SessionAttributesBuilder, handles::KeyHandle,
+                interface_types::session_handles::PolicySession, structures::MaxBuffer,
             };
 
             let tcti_str = self.tcti.as_str();
