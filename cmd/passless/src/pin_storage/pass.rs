@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use log::{debug, warn};
 use prs_lib::crypto::IsContext;
-use prs_lib::{Ciphertext, Plaintext, Store};
+use prs_lib::{Ciphertext, Plaintext};
 
 const PIN_STATE_ENTRY: &str = "pin_state";
 

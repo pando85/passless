@@ -1156,18 +1156,16 @@ pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<
         ));
     }
 
-    // Send clientPIN command (0x06) with subCommand setPin (0x03)
-    // This is a simplified implementation - full implementation would require:
-    // 1. Get key agreement from authenticator
-    // 2. Establish shared secret
-    // 3. Encrypt PIN
-    // 4. Send encrypted PIN to authenticator
+    // Use soft-fido2 PIN protocol implementation
+    let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+        .map_err(|e| passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e)))?;
+
+    encapsulation.set_pin(&mut transport, pin)
+        .map_err(|e| passless_core::Error::Other(format!("Failed to set PIN: {:?}", e)))?;
 
     match output {
         OutputFormat::Plain => {
-            println!("Full PIN protocol implementation pending");
-            println!("PIN setting requires CTAP2 PIN protocol implementation with encryption");
-            println!("For Passless authenticator, UV via notifications is recommended");
+            println!("PIN set successfully!");
         }
         OutputFormat::Json => {
             #[derive(Serialize)]
@@ -1176,9 +1174,8 @@ pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<
                 message: String,
             }
             let result = PinSetResult {
-                success: false,
-                message: "PIN protocol encryption not yet implemented. Use UV via notifications."
-                    .to_string(),
+                success: true,
+                message: "PIN set successfully".to_string(),
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }
@@ -1241,14 +1238,16 @@ pub fn pin_change(
         ));
     }
 
-    // Send clientPIN command (0x06) with subCommand changePin (0x04)
-    // Full implementation requires PIN protocol with encryption
+    // Use soft-fido2 PIN protocol implementation
+    let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+        .map_err(|e| passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e)))?;
+
+    encapsulation.change_pin(&mut transport, old_pin, new_pin)
+        .map_err(|e| passless_core::Error::Other(format!("Failed to change PIN: {:?}", e)))?;
 
     match output {
         OutputFormat::Plain => {
-            println!("Full PIN protocol implementation pending");
-            println!("PIN change requires CTAP2 PIN protocol implementation with encryption");
-            println!("For Passless authenticator, UV via notifications is recommended");
+            println!("PIN changed successfully!");
         }
         OutputFormat::Json => {
             #[derive(Serialize)]
@@ -1257,9 +1256,8 @@ pub fn pin_change(
                 message: String,
             }
             let result = PinChangeResult {
-                success: false,
-                message: "PIN protocol encryption not yet implemented. Use UV via notifications."
-                    .to_string(),
+                success: true,
+                message: "PIN changed successfully".to_string(),
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }
