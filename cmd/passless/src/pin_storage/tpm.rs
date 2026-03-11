@@ -85,51 +85,206 @@ impl TpmPinStorage {
     fn seal(&self, data: &[u8]) -> Result<Vec<u8>, StatusCode> {
         #[cfg(feature = "tpm")]
         {
-            use tss_esapi::{
-                Context,
-                attributes::SessionAttributesBuilder,
-                handles::KeyHandle,
-                interface_types::{resource_handles::Hierarchy, session_handles::PolicySession},
-                structures::{Auth, MaxBuffer, SensitiveData},
-            };
+            use std::str::FromStr;
 
-            let tcti_str = self.tcti.as_str();
-            let mut context = Context::new(tss_esapi::tcti_ldr::TctiNameConf::from_str(tcti_str))
-                .map_err(|e| {
+            use aes_gcm::Aes256Gcm;
+            use aes_gcm::aead::{Aead, KeyInit, OsRng};
+            use rand::RngCore;
+            use sha2::digest::generic_array::GenericArray;
+            use tss_esapi::attributes::ObjectAttributesBuilder;
+            use tss_esapi::constants::SessionType;
+            use tss_esapi::interface_types::algorithm::PublicAlgorithm;
+            use tss_esapi::interface_types::key_bits::RsaKeyBits;
+            use tss_esapi::interface_types::{
+                algorithm::HashingAlgorithm, resource_handles::Hierarchy,
+            };
+            use tss_esapi::structures::{
+                KeyedHashScheme, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters,
+                PublicRsaParametersBuilder, RsaExponent, RsaScheme, SensitiveData,
+                SymmetricDefinitionObject,
+            };
+            use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
+            use tss_esapi::{Context, Tcti};
+            use zeroize::Zeroizing;
+
+            let tcti_conf = Tcti::from_str(&self.tcti).map_err(|e| {
+                warn!(
+                    "Failed to parse TCTI configuration '{}': {:?}",
+                    self.tcti, e
+                );
+                StatusCode::Other
+            })?;
+
+            let mut context = Context::new(tcti_conf).map_err(|e| {
                 warn!("Failed to connect to TPM: {:?}", e);
                 StatusCode::Other
             })?;
 
-            let parent = context
-                .execute_without_session(|ctx| {
-                    ctx.tr_from_tpm_public(Hierarchy::Owner.try_into().unwrap())
-                        .map(|h| KeyHandle::from(h))
-                })
+            let session = context
+                .start_auth_session(
+                    None,
+                    None,
+                    None,
+                    SessionType::Hmac,
+                    SymmetricDefinitionObject::AES_128_CFB.into(),
+                    HashingAlgorithm::Sha256,
+                )
                 .map_err(|e| {
-                    warn!("Failed to get owner hierarchy: {:?}", e);
+                    warn!("Failed to start TPM auth session: {:?}", e);
+                    StatusCode::Other
+                })?
+                .ok_or_else(|| {
+                    warn!("TPM auth session returned None");
                     StatusCode::Other
                 })?;
 
-            let auth = Auth::try_from(vec![]).map_err(|_| StatusCode::Other)?;
+            context.set_sessions((Some(session), None, None));
 
-            let sensitive_data =
-                SensitiveData::try_from(data.to_vec()).map_err(|_| StatusCode::Other)?;
-
-            let (sealed, _auth_value) = context
-                .execute_with_session(Some(SessionAttributesBuilder::new().build()), |ctx| {
-                    ctx.seal(parent, sensitive_data, auth)
-                })
+            let object_attributes = ObjectAttributesBuilder::new()
+                .with_fixed_tpm(true)
+                .with_fixed_parent(true)
+                .with_sensitive_data_origin(true)
+                .with_user_with_auth(true)
+                .with_decrypt(true)
+                .with_restricted(true)
+                .build()
                 .map_err(|e| {
-                    warn!("Failed to seal data: {:?}", e);
+                    warn!("Failed to build object attributes: {:?}", e);
                     StatusCode::Other
                 })?;
 
-            let sealed_bytes = bincode::serialize(&sealed).map_err(|e| {
-                warn!("Failed to serialize sealed data: {:?}", e);
+            let rsa_params = PublicRsaParametersBuilder::new()
+                .with_symmetric(SymmetricDefinitionObject::AES_128_CFB)
+                .with_scheme(RsaScheme::Null)
+                .with_key_bits(RsaKeyBits::Rsa2048)
+                .with_exponent(RsaExponent::default())
+                .with_is_signing_key(false)
+                .with_is_decryption_key(true)
+                .with_restricted(true)
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build RSA parameters: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let primary_pub = PublicBuilder::new()
+                .with_public_algorithm(PublicAlgorithm::Rsa)
+                .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+                .with_object_attributes(object_attributes)
+                .with_rsa_parameters(rsa_params)
+                .with_rsa_unique_identifier(PublicKeyRsa::default())
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build primary key public: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let primary_key_result = context
+                .create_primary(Hierarchy::Owner, primary_pub, None, None, None, None)
+                .map_err(|e| {
+                    warn!("Failed to create primary key: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let primary_key = primary_key_result.key_handle;
+
+            let sealing_attributes = ObjectAttributesBuilder::new()
+                .with_fixed_tpm(true)
+                .with_fixed_parent(true)
+                .with_user_with_auth(true)
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build sealing object attributes: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let sealing_pub = PublicBuilder::new()
+                .with_public_algorithm(PublicAlgorithm::KeyedHash)
+                .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+                .with_object_attributes(sealing_attributes)
+                .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+                .with_keyed_hash_unique_identifier(tss_esapi::structures::Digest::default())
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build sealing object public: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let mut aes_key = [0u8; 32];
+            OsRng.fill_bytes(&mut aes_key);
+
+            let mut nonce_bytes = [0u8; 12];
+            OsRng.fill_bytes(&mut nonce_bytes);
+            let nonce = GenericArray::from_slice(&nonce_bytes);
+
+            let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
+                warn!("Failed to create AES cipher: {:?}", e);
                 StatusCode::Other
             })?;
 
-            Ok(sealed_bytes)
+            let encrypted_data = cipher.encrypt(nonce, data).map_err(|e| {
+                warn!("Failed to encrypt data with AES-GCM: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let sensitive_data = SensitiveData::try_from(aes_key.to_vec()).map_err(|e| {
+                warn!("Failed to create sensitive data for AES key: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let create_result = context
+                .create(
+                    primary_key,
+                    sealing_pub,
+                    None,
+                    Some(sensitive_data),
+                    None,
+                    None,
+                )
+                .map_err(|e| {
+                    warn!("Failed to create sealed object: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            context.flush_context(primary_key.into()).map_err(|e| {
+                warn!("Failed to flush primary key: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let private_tpm: TPM2B_PRIVATE = create_result.out_private.into();
+            let private_bytes = private_tpm.buffer[..private_tpm.size as usize].to_vec();
+
+            let public_tpm: TPM2B_PUBLIC = create_result.out_public.try_into().map_err(|e| {
+                warn!("Failed to convert public to TPM2B: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let public_bytes = unsafe {
+                let ptr = &public_tpm as *const TPM2B_PUBLIC as *const u8;
+                std::slice::from_raw_parts(ptr, std::mem::size_of::<TPM2B_PUBLIC>()).to_vec()
+            };
+
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct SealedBlob {
+                encrypted_data: Vec<u8>,
+                nonce: Vec<u8>,
+                tpm_private: Vec<u8>,
+                tpm_public: Vec<u8>,
+            }
+
+            let sealed_blob = SealedBlob {
+                encrypted_data,
+                nonce: nonce_bytes.to_vec(),
+                tpm_private: private_bytes,
+                tpm_public: public_bytes,
+            };
+
+            let serialized = Zeroizing::new(serde_json::to_vec(&sealed_blob).map_err(|e| {
+                warn!("Failed to serialize sealed blob: {:?}", e);
+                StatusCode::Other
+            })?);
+
+            Ok(serialized.to_vec())
         }
 
         #[cfg(not(feature = "tpm"))]
@@ -142,34 +297,191 @@ impl TpmPinStorage {
     fn unseal(&self, sealed_data: &[u8]) -> Result<Vec<u8>, StatusCode> {
         #[cfg(feature = "tpm")]
         {
-            use tss_esapi::{
-                Context, attributes::SessionAttributesBuilder, handles::KeyHandle,
-                interface_types::session_handles::PolicySession, structures::MaxBuffer,
-            };
+            use std::str::FromStr;
 
-            let tcti_str = self.tcti.as_str();
-            let mut context = Context::new(tss_esapi::tcti_ldr::TctiNameConf::from_str(tcti_str))
-                .map_err(|e| {
+            use aes_gcm::aead::{Aead, KeyInit};
+            use aes_gcm::{Aes256Gcm, Nonce};
+            use tss_esapi::constants::SessionType;
+            use tss_esapi::interface_types::algorithm::HashingAlgorithm;
+            use tss_esapi::structures::{Private, Public, SymmetricDefinitionObject};
+            use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
+            use tss_esapi::{Context, Tcti};
+
+            #[derive(serde::Serialize, serde::Deserialize)]
+            struct SealedBlob {
+                encrypted_data: Vec<u8>,
+                nonce: Vec<u8>,
+                tpm_private: Vec<u8>,
+                tpm_public: Vec<u8>,
+            }
+
+            let tcti_conf = Tcti::from_str(&self.tcti).map_err(|e| {
+                warn!(
+                    "Failed to parse TCTI configuration '{}': {:?}",
+                    self.tcti, e
+                );
+                StatusCode::Other
+            })?;
+
+            let mut context = Context::new(tcti_conf).map_err(|e| {
                 warn!("Failed to connect to TPM: {:?}", e);
                 StatusCode::Other
             })?;
 
-            let sealed: tss_esapi::structures::Sealed =
-                bincode::deserialize(sealed_data).map_err(|e| {
-                    warn!("Failed to deserialize sealed data: {:?}", e);
-                    StatusCode::Other
-                })?;
-
-            let unsealed = context
-                .execute_with_session(Some(SessionAttributesBuilder::new().build()), |ctx| {
-                    ctx.unseal(sealed)
-                })
+            let session = context
+                .start_auth_session(
+                    None,
+                    None,
+                    None,
+                    SessionType::Hmac,
+                    SymmetricDefinitionObject::AES_128_CFB.into(),
+                    HashingAlgorithm::Sha256,
+                )
                 .map_err(|e| {
-                    warn!("Failed to unseal data: {:?}", e);
+                    warn!("Failed to start TPM auth session: {:?}", e);
+                    StatusCode::Other
+                })?
+                .ok_or_else(|| {
+                    warn!("TPM auth session returned None");
                     StatusCode::Other
                 })?;
 
-            Ok(unsealed.to_vec())
+            context.set_sessions((Some(session), None, None));
+
+            let sealed_blob: SealedBlob = serde_json::from_slice(sealed_data).map_err(|e| {
+                warn!("Failed to deserialize sealed blob: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let object_attributes = tss_esapi::attributes::ObjectAttributesBuilder::new()
+                .with_fixed_tpm(true)
+                .with_fixed_parent(true)
+                .with_sensitive_data_origin(true)
+                .with_user_with_auth(true)
+                .with_decrypt(true)
+                .with_restricted(true)
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build object attributes: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            use tss_esapi::interface_types::algorithm::PublicAlgorithm;
+            use tss_esapi::interface_types::key_bits::RsaKeyBits;
+            use tss_esapi::interface_types::resource_handles::Hierarchy;
+            use tss_esapi::structures::{
+                PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme,
+            };
+
+            let rsa_params = PublicRsaParametersBuilder::new()
+                .with_symmetric(SymmetricDefinitionObject::AES_128_CFB)
+                .with_scheme(RsaScheme::Null)
+                .with_key_bits(RsaKeyBits::Rsa2048)
+                .with_exponent(RsaExponent::default())
+                .with_is_signing_key(false)
+                .with_is_decryption_key(true)
+                .with_restricted(true)
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build RSA parameters: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let primary_pub = tss_esapi::structures::PublicBuilder::new()
+                .with_public_algorithm(PublicAlgorithm::Rsa)
+                .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+                .with_object_attributes(object_attributes)
+                .with_rsa_parameters(rsa_params)
+                .with_rsa_unique_identifier(PublicKeyRsa::default())
+                .build()
+                .map_err(|e| {
+                    warn!("Failed to build primary key public: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let primary_key_result = context
+                .create_primary(Hierarchy::Owner, primary_pub, None, None, None, None)
+                .map_err(|e| {
+                    warn!("Failed to create primary key: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            let primary_key = primary_key_result.key_handle;
+
+            let mut private_tpm = TPM2B_PRIVATE {
+                size: sealed_blob.tpm_private.len() as u16,
+                buffer: [0u8; 1550],
+            };
+            private_tpm.buffer[..sealed_blob.tpm_private.len()]
+                .copy_from_slice(&sealed_blob.tpm_private);
+
+            let public_tpm: TPM2B_PUBLIC = unsafe {
+                let mut public_struct: TPM2B_PUBLIC = std::mem::zeroed();
+                let ptr = &mut public_struct as *mut TPM2B_PUBLIC as *mut u8;
+                std::ptr::copy_nonoverlapping(
+                    sealed_blob.tpm_public.as_ptr(),
+                    ptr,
+                    std::cmp::min(
+                        sealed_blob.tpm_public.len(),
+                        std::mem::size_of::<TPM2B_PUBLIC>(),
+                    ),
+                );
+                public_struct
+            };
+
+            let private = Private::try_from(private_tpm).map_err(|e| {
+                warn!("Failed to convert TPM2B_PRIVATE to Private: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let public = Public::try_from(public_tpm).map_err(|e| {
+                warn!("Failed to convert TPM2B_PUBLIC to Public: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let sealed_handle = context.load(primary_key, private, public).map_err(|e| {
+                warn!("Failed to load sealed object: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let unsealed_key = context.unseal(sealed_handle.into()).map_err(|e| {
+                warn!("Failed to unseal AES key: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            context.flush_context(sealed_handle.into()).map_err(|e| {
+                warn!("Failed to flush sealed handle: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            context.flush_context(primary_key.into()).map_err(|e| {
+                warn!("Failed to flush primary key: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let aes_key = unsealed_key.value();
+            if aes_key.len() != 32 {
+                warn!(
+                    "Unsealed key has wrong size: {} (expected 32)",
+                    aes_key.len()
+                );
+                return Err(StatusCode::Other);
+            }
+
+            let nonce = Nonce::from_slice(&sealed_blob.nonce);
+            let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
+                warn!("Failed to create AES cipher: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            let decrypted_data = cipher
+                .decrypt(nonce, sealed_blob.encrypted_data.as_ref())
+                .map_err(|e| {
+                    warn!("Failed to decrypt data with AES-GCM: {:?}", e);
+                    StatusCode::Other
+                })?;
+
+            Ok(decrypted_data)
         }
 
         #[cfg(not(feature = "tpm"))]

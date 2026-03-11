@@ -635,3 +635,104 @@ fn test_client_device_selection() {
     println!("   - Each device maintains separate credential storage");
     println!("   - Devices can be accessed independently by index");
 }
+
+#[test]
+#[ignore]
+fn test_client_pin_set_and_change() {
+    println!("\n═══════════════════════════════════════");
+    println!("  TEST: Client PIN Set and Change");
+    println!("═══════════════════════════════════════\n");
+
+    let mut harness = AuthenticatorHarness::with_local().expect("Failed to create harness");
+    harness.start().expect("Failed to start authenticator");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut transport = connect_to_authenticator().expect("Failed to connect");
+
+    // Get initial authenticator info
+    println!("📋 Getting initial authenticator info...");
+    let response = Client::authenticator_get_info(&mut transport).expect("Failed to get info");
+
+    use ciborium::Value;
+    let cbor_value: Value = ciborium::from_reader(&response[..]).expect("Failed to decode CBOR");
+
+    // Check if clientPin is supported (clientPin present means PIN is supported)
+    // According to CTAP spec:
+    // - clientPin: true = PIN capability AND PIN is set
+    // - clientPin: false = PIN capability but PIN is NOT set
+    // - clientPin not present = no PIN capability
+    let mut client_pin_present = false;
+    if let Value::Map(map) = &cbor_value {
+        for (k, v) in map {
+            if let Value::Integer(key) = k
+                && *key == 4.into()
+                && let Value::Map(options) = v
+            {
+                for (opt_k, opt_v) in options {
+                    if let (Value::Text(k), Value::Bool(_v)) = (opt_k, opt_v)
+                        && k == "clientPin"
+                    {
+                        client_pin_present = true;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(client_pin_present, "Authenticator should support clientPin");
+    println!("   ✓ Authenticator supports clientPin");
+
+    // Test PIN set
+    println!("\n🔐 Testing PIN set...");
+    let test_pin = "1234";
+
+    let mut encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+            .expect("Failed to create PIN encapsulation");
+
+    encapsulation
+        .set_pin(&mut transport, test_pin)
+        .expect("Failed to set PIN");
+    println!("   ✓ PIN set successfully");
+
+    // Verify PIN is set by checking authenticator info
+    println!("\n📋 Verifying PIN is set...");
+    let response = Client::authenticator_get_info(&mut transport).expect("Failed to get info");
+    let cbor_value: Value = ciborium::from_reader(&response[..]).expect("Failed to decode CBOR");
+
+    let mut pin_set = false;
+    if let Value::Map(map) = &cbor_value {
+        for (k, v) in map {
+            if let Value::Integer(key) = k
+                && *key == 4.into()
+                && let Value::Map(options) = v
+            {
+                for (opt_k, opt_v) in options {
+                    if let (Value::Text(k), Value::Bool(v)) = (opt_k, opt_v)
+                        && k == "clientPin"
+                    {
+                        pin_set = *v;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(pin_set, "PIN should be set");
+    println!("   ✓ PIN is set on authenticator");
+
+    // Test PIN change
+    println!("\n🔐 Testing PIN change...");
+    let new_pin = "5678";
+
+    let mut encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+            .expect("Failed to create PIN encapsulation");
+
+    encapsulation
+        .change_pin(&mut transport, test_pin, new_pin)
+        .expect("Failed to change PIN");
+    println!("   ✓ PIN changed successfully");
+
+    println!("\n✅ PIN set and change commands work!\n");
+}
