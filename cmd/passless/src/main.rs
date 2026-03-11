@@ -1,6 +1,7 @@
 mod authenticator;
 mod commands;
 mod notification;
+mod pin_storage;
 mod storage;
 mod util;
 
