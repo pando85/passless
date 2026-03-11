@@ -334,6 +334,10 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S> {
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
+            // Firefox is currently more reliable when GetInfo only advertises
+            // ES256. soft-fido2 still accepts hidden Ed25519 variants during
+            // makeCredential so SSH resident ed25519-sk enrollment keeps working.
+            .algorithms(vec![-7])
             .build();
 
         let storage = Arc::new(Mutex::new(storage));
