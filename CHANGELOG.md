@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.1](https://github.com/pando85/passless/tree/v0.9.1) - 2026-03-12
+
+### Added
+
+- Add configurable PIN enforcement policies ([456ad31](https://github.com/pando85/passless/commit/456ad31ee5f9d858365f201796f214b4cb725053))
+- Update soft-fido2 to 0.12.1 for proper PIN prompting ([fe549e2](https://github.com/pando85/passless/commit/fe549e2f4df73dcb9842b53b1675316116c15a37))
+
+### Fixed
+
+- Prevent duplicate credential entries when updating sign counter ([3d3f91a](https://github.com/pando85/passless/commit/3d3f91ae7e2cf7dcada1764326d8ae677602024c))
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.5.67 ([75aeba6](https://github.com/pando85/passless/commit/75aeba6d733a8798522dae510f6e0df03bfa00af))
+- deps: Update Rust crate clap to v4.5.61 ([1967937](https://github.com/pando85/passless/commit/19679375a6827410b869fa117e78654d7d910ee4))
+
 ## [v0.9.0](https://github.com/pando85/passless/tree/v0.9.0) - 2026-03-11
 
 ### Added
