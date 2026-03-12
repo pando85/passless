@@ -331,14 +331,19 @@ pub fn update_indexes_on_write(indexes: &mut CredentialIndexes, path_info: Crede
     let rp_id = path_info.rp_id.clone();
     let rp_hash = path_info.rp_id_hash();
 
+    let is_new = !indexes.id.contains_key(&cred_id);
+
     // Index by credential ID
     indexes.id.insert(cred_id.clone(), path_info);
 
-    // Index by RP ID
-    indexes.rp.entry(rp_id).or_default().push(cred_id.clone());
+    // Only update RP indexes for new credentials to avoid duplicates
+    if is_new {
+        // Index by RP ID
+        indexes.rp.entry(rp_id).or_default().push(cred_id.clone());
 
-    // Index by RP ID hash
-    indexes.rp_hash.entry(rp_hash).or_default().push(cred_id);
+        // Index by RP ID hash
+        indexes.rp_hash.entry(rp_hash).or_default().push(cred_id);
+    }
 }
 
 pub fn update_indexes_on_delete(indexes: &mut CredentialIndexes, cred_id: &[u8]) {
