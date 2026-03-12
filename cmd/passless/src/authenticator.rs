@@ -3,7 +3,7 @@ use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
 
-use passless_core::config::SecurityConfig;
+use passless_core::config::{PinConfig, SecurityConfig};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
@@ -333,8 +333,8 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
     /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
-    pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
-        Self::with_pin_storage(storage, None, security_config)
+    pub fn new(storage: S, security_config: SecurityConfig, pin_config: PinConfig) -> Result<Self> {
+        Self::with_pin_storage(storage, None, security_config, pin_config)
     }
 }
 
@@ -344,6 +344,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         storage: S,
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
+        pin_config: PinConfig,
     ) -> Result<Self> {
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
@@ -356,7 +357,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             bio_enroll: None,
             large_blobs: None,
             ep: None,
-            always_uv: Some(true),
+            always_uv: Some(pin_config.always_uv),
             make_cred_uv_not_required: Some(true),
         };
 
@@ -455,7 +456,9 @@ mod tests {
             notification_timeout: 30,
         };
 
-        let service = AuthenticatorService::new(storage, security_config);
+        let pin_config = PinConfig { always_uv: true };
+
+        let service = AuthenticatorService::new(storage, security_config, pin_config);
         assert!(service.is_ok(), "Service creation should succeed");
 
         // Cleanup

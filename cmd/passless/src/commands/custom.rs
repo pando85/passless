@@ -8,6 +8,8 @@ use crate::authenticator::AuthenticatorService;
 use crate::pin_storage::PinStorage;
 use crate::storage::CredentialStorage;
 
+use passless_core::PinConfig;
+
 use log::debug;
 
 /// Command byte for custom credential management (0x41 Yubikey variant)
@@ -61,7 +63,8 @@ mod tests {
             Err(e) => panic!("Failed to create local storage: {}", e),
         };
 
-        let service = AuthenticatorService::new(storage, SecurityConfig::default());
+        let service =
+            AuthenticatorService::new(storage, SecurityConfig::default(), PinConfig::default());
         assert!(service.is_ok(), "Service creation should succeed");
 
         register_yubikey_credential_mgmt(&mut service.unwrap());

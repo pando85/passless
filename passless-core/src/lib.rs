@@ -8,6 +8,6 @@ pub mod error;
 
 pub use config::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, OutputFormat, PinAction,
-    SecurityConfig,
+    PinConfig, SecurityConfig,
 };
 pub use error::{Error, Result};

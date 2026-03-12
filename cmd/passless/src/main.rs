@@ -6,7 +6,8 @@ mod storage;
 mod util;
 
 use passless_core::{
-    AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
+    AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction,
+    PinConfig, Result,
 };
 
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet, UhidDevice};
@@ -301,6 +302,9 @@ fn run() -> Result<()> {
     // Get security config
     let security_config = config.security_config();
 
+    // Get PIN config
+    let pin_config = config.pin_config();
+
     match config.backend().map_err(|e| {
         error!("Failed to load backend config: {}", e);
         e
@@ -313,6 +317,7 @@ fn run() -> Result<()> {
                 storage,
                 Some(pin_storage),
                 security_config,
+                pin_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }
@@ -333,6 +338,7 @@ fn run() -> Result<()> {
                 storage,
                 Some(pin_storage),
                 security_config,
+                pin_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }
@@ -345,6 +351,7 @@ fn run() -> Result<()> {
                 storage,
                 Some(pin_storage),
                 security_config,
+                pin_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }

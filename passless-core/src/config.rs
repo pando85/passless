@@ -224,6 +224,27 @@ impl SecurityConfig {
     }
 }
 
+/// PIN configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "pin")]
+pub struct PinConfig {
+    /// Always require user verification (PIN/biometrics) for all operations
+    #[arg(long = "always-uv", env = "PASSLESS_ALWAYS_UV")]
+    #[serde(default = "default_always_uv")]
+    #[default(true)]
+    pub always_uv: bool,
+}
+
+fn default_always_uv() -> bool {
+    true
+}
+
+impl Default for PinConfig {
+    fn default() -> Self {
+        Self { always_uv: true }
+    }
+}
+
 /// Main application configuration
 /// Note: Cannot derive Clone/Debug because it has #[clap_serde] fields
 #[derive(ClapSerde, Serialize, Deserialize, Debug, ConfigDoc)]
@@ -273,6 +294,12 @@ pub struct AppConfig {
     #[serde(default)]
     #[command(flatten)]
     pub security: SecurityConfig,
+
+    /// PIN configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub pin: PinConfig,
 }
 
 /// Backend-specific configuration
@@ -354,6 +381,11 @@ impl AppConfig {
     /// Get security configuration
     pub fn security_config(&self) -> SecurityConfig {
         self.security.clone()
+    }
+
+    /// Get PIN configuration
+    pub fn pin_config(&self) -> PinConfig {
+        self.pin.clone()
     }
 }
 
