@@ -1,10 +1,39 @@
 //! User Verification (UV) module for FIDO2 authenticator
 //!
 //! This module provides a pluggable user verification system with multiple providers:
-//! - FprintdProvider: Fingerprint verification via D-Bus
-//! - FaceIdProvider: Face recognition via webcam (requires "face" feature)
-//! - NotificationProvider: Desktop notification (fallback)
-//! - CommandProvider: Custom command/script execution
+//! - [`FprintdProvider`]: Fingerprint verification via D-Bus
+//! - [`FaceIdProvider`]: Face recognition via webcam (requires "face" feature)
+//! - [`NotificationProvider`]: Desktop notification (fallback)
+//! - [`CommandProvider`]: Custom command/script execution
+//!
+//! # Architecture
+//!
+//! Providers implement the [`UserVerificationProvider`] trait and are managed by
+//! [`UserVerificationManager`], which handles priority ordering and automatic fallback.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use passless::uv::{
+//!     UserVerificationManager, FprintdProvider, NotificationProvider,
+//!     VerificationContext, UserVerificationProvider,
+//! };
+//!
+//! let manager = UserVerificationManager::new(vec![
+//!     Box::new(FprintdProvider::new()),
+//!     Box::new(NotificationProvider::new(30)),
+//! ]);
+//!
+//! let ctx = VerificationContext::new("authentication")
+//!     .with_relying_party("example.com");
+//!
+//! match manager.verify(&ctx) {
+//!     Ok(VerificationResult::Accepted) => { /* success */ }
+//!     Ok(VerificationResult::Denied) => { /* denied */ }
+//!     Ok(VerificationResult::Timeout) => { /* timeout */ }
+//!     Err(e) => { /* error */ }
+//! }
+//! ```
 
 mod command;
 mod fprintd;
@@ -14,14 +43,28 @@ mod notification;
 #[cfg(feature = "face")]
 mod face;
 
-use std::fmt;
-
 pub use command::CommandProvider;
 #[cfg(feature = "face")]
 pub use face::FaceIdProvider;
 pub use fprintd::FprintdProvider;
 pub use manager::UserVerificationManager;
 pub use notification::NotificationProvider;
+
+/// Default timeout for user verification (seconds)
+pub const DEFAULT_TIMEOUT_SECONDS: u32 = 30;
+
+/// Provider priority constants (higher = preferred)
+pub mod priority {
+    /// Fingerprint provider priority (highest - most secure biometric)
+    pub const FPRINTD: u8 = 100;
+    /// Face recognition provider priority
+    #[cfg(feature = "face")]
+    pub const FACE: u8 = 90;
+    /// Custom command provider priority (configurable)
+    pub const COMMAND: u8 = 50;
+    /// Notification provider priority (lowest - fallback)
+    pub const NOTIFICATION: u8 = 10;
+}
 
 /// Result of a user verification attempt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,34 +78,54 @@ pub enum VerificationResult {
 }
 
 /// Error during user verification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum VerificationError {
     /// Provider is not available (not installed, no device, etc.)
+    #[error("Not available: {0}")]
     NotAvailable(String),
     /// Device or system error during verification
+    #[error("Device error: {0}")]
     DeviceError(String),
     /// User cancelled the operation
+    #[error("User cancelled")]
     #[allow(dead_code)]
     UserCancelled,
     /// Provider is not enrolled (no biometric data registered)
+    #[error("Not enrolled")]
     NotEnrolled,
     /// Unknown error
+    #[error("Error: {0}")]
     Other(String),
 }
 
-impl fmt::Display for VerificationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            VerificationError::NotAvailable(msg) => write!(f, "Not available: {}", msg),
-            VerificationError::DeviceError(msg) => write!(f, "Device error: {}", msg),
-            VerificationError::UserCancelled => write!(f, "User cancelled"),
-            VerificationError::NotEnrolled => write!(f, "Not enrolled"),
-            VerificationError::Other(msg) => write!(f, "Error: {}", msg),
+impl From<std::io::Error> for VerificationError {
+    fn from(err: std::io::Error) -> Self {
+        VerificationError::DeviceError(err.to_string())
+    }
+}
+
+impl From<zbus::Error> for VerificationError {
+    fn from(err: zbus::Error) -> Self {
+        match err {
+            zbus::Error::MethodError(_, _, _) => {
+                VerificationError::DeviceError(format!("D-Bus method failed: {}", err))
+            }
+            zbus::Error::InterfaceNotFound => {
+                VerificationError::NotAvailable("D-Bus interface not found".into())
+            }
+            zbus::Error::FDO(e) => {
+                VerificationError::DeviceError(format!("D-Bus freedesktop error: {}", e))
+            }
+            _ => VerificationError::DeviceError(format!("D-Bus error: {}", err)),
         }
     }
 }
 
-impl std::error::Error for VerificationError {}
+impl From<zbus::zvariant::Error> for VerificationError {
+    fn from(err: zbus::zvariant::Error) -> Self {
+        VerificationError::DeviceError(format!("D-Bus variant error: {}", err))
+    }
+}
 
 /// Context for user verification request
 #[derive(Debug, Clone)]
@@ -84,7 +147,7 @@ impl VerificationContext {
             operation: operation.into(),
             relying_party: None,
             user: None,
-            timeout_seconds: 30,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
         }
     }
 
@@ -132,12 +195,9 @@ pub trait UserVerificationProvider: Send + Sync {
 
     /// Priority of this provider (higher = preferred)
     ///
-    /// Default priorities:
-    /// - fprintd: 100
-    /// - face: 90
-    /// - notification: 10
+    /// See [`priority`] module for standard values.
     fn priority(&self) -> u8 {
-        50
+        priority::COMMAND
     }
 
     /// Whether this provider supports enrollment
@@ -174,7 +234,7 @@ mod tests {
         assert_eq!(ctx.operation, "registration");
         assert_eq!(ctx.relying_party, None);
         assert_eq!(ctx.user, None);
-        assert_eq!(ctx.timeout_seconds, 30);
+        assert_eq!(ctx.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
     }
 
     #[test]
@@ -209,5 +269,12 @@ mod tests {
             VerificationError::Other("oops".into()).to_string(),
             "Error: oops"
         );
+    }
+
+    #[test]
+    fn test_verification_error_from_io() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let uv_err: VerificationError = err.into();
+        assert!(matches!(uv_err, VerificationError::DeviceError(_)));
     }
 }

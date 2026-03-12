@@ -2,8 +2,8 @@ use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
 use crate::uv::{
-    FprintdProvider, NotificationProvider, UserVerificationManager, UserVerificationProvider,
-    VerificationContext, VerificationResult,
+    CommandProvider, FprintdProvider, NotificationProvider, UserVerificationManager,
+    UserVerificationProvider, VerificationContext, VerificationResult,
 };
 
 #[cfg(feature = "face")]
@@ -141,49 +141,37 @@ fn build_uv_manager(config: &UvConfig) -> UserVerificationManager {
 
     match config.provider {
         UvProviderType::Auto => {
-            if config.fprintd.enabled {
-                providers.push(Box::new(FprintdProvider::new()));
-            }
+            providers.extend(FprintdProvider::from_config(config.fprintd.enabled));
             #[cfg(feature = "face")]
-            if config.face.enabled {
-                providers.push(Box::new(FaceIdProvider::new(
-                    config.face.camera_index,
-                    config.face.threshold,
-                    None,
-                )));
-            }
-            providers.push(Box::new(NotificationProvider::new(config.timeout_seconds)));
+            providers.extend(FaceIdProvider::from_config(
+                config.face.enabled,
+                config.face.camera_index,
+                config.face.threshold,
+            ));
+            providers.push(NotificationProvider::from_config(config.timeout_seconds));
         }
         UvProviderType::Fprintd => {
-            if config.fprintd.enabled {
-                providers.push(Box::new(FprintdProvider::new()));
-            }
+            providers.extend(FprintdProvider::from_config(config.fprintd.enabled));
         }
         UvProviderType::Face => {
             #[cfg(feature = "face")]
-            if config.face.enabled {
-                providers.push(Box::new(FaceIdProvider::new(
-                    config.face.camera_index,
-                    config.face.threshold,
-                    None,
-                )));
-            }
+            providers.extend(FaceIdProvider::from_config(
+                config.face.enabled,
+                config.face.camera_index,
+                config.face.threshold,
+            ));
             #[cfg(not(feature = "face"))]
-            {
-                log::warn!("Face provider requested but 'face' feature not enabled");
-            }
+            log::warn!("Face provider requested but 'face' feature not enabled");
         }
         UvProviderType::Notification => {
-            providers.push(Box::new(NotificationProvider::new(config.timeout_seconds)));
+            providers.push(NotificationProvider::from_config(config.timeout_seconds));
         }
         UvProviderType::Command => {
-            if config.command.enabled && !config.command.command.is_empty() {
-                use crate::uv::CommandProvider;
-                providers.push(Box::new(CommandProvider::new(
-                    config.command.command.clone(),
-                    config.timeout_seconds,
-                )));
-            }
+            providers.extend(CommandProvider::from_config(
+                config.command.enabled,
+                config.command.command.clone(),
+                config.timeout_seconds,
+            ));
         }
     }
 

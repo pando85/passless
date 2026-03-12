@@ -8,23 +8,48 @@
 //! - A fingerprint reader must be connected
 //! - User must have enrolled fingerprints
 
-use super::{UserVerificationProvider, VerificationContext, VerificationError, VerificationResult};
+use super::{
+    UserVerificationProvider, VerificationContext, VerificationError, VerificationResult, priority,
+};
 
 use log::{debug, error, info, warn};
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// fprintd-based fingerprint verification provider
 pub struct FprintdProvider {
-    available_cache: Arc<Mutex<Option<bool>>>,
+    available_cache: Mutex<Option<bool>>,
+    runtime: Mutex<Option<Arc<tokio::runtime::Runtime>>>,
 }
 
 impl FprintdProvider {
     /// Create a new fprintd provider
     pub fn new() -> Self {
         Self {
-            available_cache: Arc::new(Mutex::new(None)),
+            available_cache: Mutex::new(None),
+            runtime: Mutex::new(None),
         }
+    }
+
+    /// Create a provider if enabled in config
+    pub fn from_config(enabled: bool) -> Option<Box<dyn UserVerificationProvider>> {
+        if enabled {
+            Some(Box::new(Self::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Get or create the tokio runtime
+    fn get_runtime(&self) -> Result<Arc<tokio::runtime::Runtime>, VerificationError> {
+        let mut runtime_guard = self.runtime.lock().unwrap();
+        if runtime_guard.is_none() {
+            *runtime_guard = Some(Arc::new(tokio::runtime::Runtime::new().map_err(|e| {
+                VerificationError::DeviceError(format!("Failed to create runtime: {}", e))
+            })?));
+        }
+        Ok(runtime_guard.as_ref().unwrap().clone())
     }
 
     async fn do_verify(timeout_secs: u32) -> Result<VerificationResult, VerificationError> {
@@ -195,8 +220,8 @@ impl FprintdProvider {
         Ok(result)
     }
 
-    fn check_available_sync() -> bool {
-        let rt = match tokio::runtime::Runtime::new() {
+    fn check_available(&self) -> bool {
+        let rt = match self.get_runtime() {
             Ok(rt) => rt,
             Err(_) => return false,
         };
@@ -252,7 +277,7 @@ impl UserVerificationProvider for FprintdProvider {
             return cached;
         }
 
-        let available = Self::check_available_sync();
+        let available = self.check_available();
         *self.available_cache.lock().unwrap() = Some(available);
         available
     }
@@ -262,22 +287,13 @@ impl UserVerificationProvider for FprintdProvider {
         context: &VerificationContext,
     ) -> Result<VerificationResult, VerificationError> {
         let timeout_secs = context.timeout_seconds;
+        let rt = self.get_runtime()?;
 
-        let result = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().map_err(|e| {
-                VerificationError::DeviceError(format!("Failed to create runtime: {}", e))
-            })?;
-
-            rt.block_on(async { Self::do_verify(timeout_secs).await })
-        })
-        .join()
-        .map_err(|_| VerificationError::Other("Verification thread panicked".into()))??;
-
-        Ok(result)
+        rt.block_on(async { Self::do_verify(timeout_secs).await })
     }
 
     fn priority(&self) -> u8 {
-        100
+        priority::FPRINTD
     }
 
     fn supports_enrollment(&self) -> bool {
@@ -306,7 +322,7 @@ mod tests {
     #[test]
     fn test_fprintd_provider_priority() {
         let provider = FprintdProvider::new();
-        assert_eq!(provider.priority(), 100);
+        assert_eq!(provider.priority(), priority::FPRINTD);
     }
 
     #[test]

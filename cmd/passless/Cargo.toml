@@ -42,6 +42,7 @@ zeroize.workspace = true
 hex.workspace = true
 shadow-rs.workspace = true
 dirs.workspace = true
+thiserror.workspace = true
 hmac = "0.12"
 rpassword = "7.3"
 atty = "0.2"

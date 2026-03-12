@@ -16,7 +16,9 @@
 //! - `PASSLESS_UV_USER`: User identifier (if available)
 //! - `PASSLESS_UV_TIMEOUT`: Timeout in seconds
 
-use super::{UserVerificationProvider, VerificationContext, VerificationError, VerificationResult};
+use super::{
+    UserVerificationProvider, VerificationContext, VerificationError, VerificationResult, priority,
+};
 
 use log::{debug, info};
 
@@ -40,6 +42,19 @@ impl CommandProvider {
         Self {
             command,
             timeout_seconds,
+        }
+    }
+
+    /// Create a provider if enabled and configured
+    pub fn from_config(
+        enabled: bool,
+        command: Vec<String>,
+        timeout_seconds: u32,
+    ) -> Option<Box<dyn UserVerificationProvider>> {
+        if enabled && !command.is_empty() {
+            Some(Box::new(Self::new(command, timeout_seconds)))
+        } else {
+            None
         }
     }
 
@@ -129,7 +144,7 @@ impl UserVerificationProvider for CommandProvider {
     }
 
     fn priority(&self) -> u8 {
-        50
+        priority::COMMAND
     }
 }
 
@@ -146,7 +161,7 @@ mod tests {
     #[test]
     fn test_command_provider_priority() {
         let provider = CommandProvider::new(vec!["echo".to_string()], 30);
-        assert_eq!(provider.priority(), 50);
+        assert_eq!(provider.priority(), priority::COMMAND);
     }
 
     #[test]

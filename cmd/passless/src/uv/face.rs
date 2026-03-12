@@ -13,7 +13,9 @@
 //! During enrollment, multiple face embeddings are captured and averaged
 //! to create a robust template. The template is stored securely.
 
-use super::{UserVerificationProvider, VerificationContext, VerificationError, VerificationResult};
+use super::{
+    UserVerificationProvider, VerificationContext, VerificationError, VerificationResult, priority,
+};
 
 use log::{debug, info, warn};
 
@@ -55,6 +57,19 @@ impl FaceIdProvider {
             embeddings_path,
             enrolled: Arc::new(Mutex::new(None)),
             analyzer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Create a provider if enabled in config
+    pub fn from_config(
+        enabled: bool,
+        camera_index: usize,
+        threshold: f32,
+    ) -> Option<Box<dyn UserVerificationProvider>> {
+        if enabled {
+            Some(Box::new(Self::new(camera_index, threshold, None)))
+        } else {
+            None
         }
     }
 
@@ -275,7 +290,7 @@ impl UserVerificationProvider for FaceIdProvider {
     }
 
     fn priority(&self) -> u8 {
-        90
+        priority::FACE
     }
 
     fn supports_enrollment(&self) -> bool {
@@ -358,7 +373,7 @@ mod tests {
     #[test]
     fn test_face_provider_priority() {
         let provider = FaceIdProvider::new(0, DEFAULT_THRESHOLD, None);
-        assert_eq!(provider.priority(), 90);
+        assert_eq!(provider.priority(), priority::FACE);
     }
 
     #[test]

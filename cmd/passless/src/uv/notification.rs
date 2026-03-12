@@ -3,7 +3,9 @@
 //! Uses desktop notifications for user verification.
 //! This is the fallback provider when no biometric methods are available.
 
-use super::{UserVerificationProvider, VerificationContext, VerificationError, VerificationResult};
+use super::{
+    UserVerificationProvider, VerificationContext, VerificationError, VerificationResult, priority,
+};
 
 use log::debug;
 
@@ -45,6 +47,11 @@ impl NotificationProvider {
     /// Create a new notification provider
     pub fn new(timeout_seconds: u32) -> Self {
         Self { timeout_seconds }
+    }
+
+    /// Create a provider with timeout
+    pub fn from_config(timeout_seconds: u32) -> Box<dyn UserVerificationProvider> {
+        Box::new(Self::new(timeout_seconds))
     }
 
     /// Show verification notification and wait for response
@@ -136,7 +143,7 @@ impl UserVerificationProvider for NotificationProvider {
     }
 
     fn priority(&self) -> u8 {
-        10
+        priority::NOTIFICATION
     }
 }
 
@@ -153,7 +160,7 @@ mod tests {
     #[test]
     fn test_notification_provider_priority() {
         let provider = NotificationProvider::new(30);
-        assert_eq!(provider.priority(), 10);
+        assert_eq!(provider.priority(), priority::NOTIFICATION);
     }
 
     #[test]

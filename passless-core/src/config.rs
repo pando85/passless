@@ -390,6 +390,19 @@ pub struct FaceConfig {
     pub threshold: f32,
 }
 
+impl FaceConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if self.threshold < 0.0 || self.threshold > 1.0 {
+            return Err(format!(
+                "Face threshold must be between 0.0 and 1.0, got {}",
+                self.threshold
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Command provider configuration
 #[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[group(id = "uv-cmd")]
@@ -668,6 +681,12 @@ impl AppConfig {
     /// Get user verification configuration
     pub fn uv_config(&self) -> UvConfig {
         self.uv.clone()
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        self.uv.face.validate()?;
+        Ok(())
     }
 }
 

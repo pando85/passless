@@ -3276,6 +3276,7 @@ dependencies = [
  "soft-fido2-ctap",
  "soft-fido2-transport",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tss-esapi",
  "which 7.0.3",
