@@ -3,7 +3,7 @@ use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
 
-use passless_core::config::SecurityConfig;
+use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
@@ -13,7 +13,7 @@ use soft_fido2::{
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 static VERSION: LazyLock<u32> = LazyLock::new(|| {
     let major = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0);
@@ -23,11 +23,27 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
     (major << 16) | (minor << 8) | patch
 });
 
+/// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
+struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
+
+impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
+    fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
+        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
+        storage.load_pin_state()
+    }
+
+    fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
+        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
+        storage.save_pin_state(state)
+    }
+}
+
 /// Passless authenticator callbacks implementation
 pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     storage: Arc<Mutex<S>>,
     pin_storage: Option<Arc<Mutex<P>>>,
     security_config: SecurityConfig,
+    pin_config: PinConfig,
 }
 
 impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
@@ -35,11 +51,13 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         storage: Arc<Mutex<S>>,
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
+        pin_config: PinConfig,
     ) -> Self {
         Self {
             storage,
             pin_storage,
             security_config,
+            pin_config,
         }
     }
 }
@@ -58,7 +76,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         let is_registration = info.to_lowercase().contains("registration")
             && !info.to_lowercase().contains("credential excluded");
 
-        // Check if user verification should be bypassed for this operation
         let should_verify = if is_registration {
             self.security_config.user_verification_registration
         } else {
@@ -78,7 +95,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             return Ok(UpResult::Accepted);
         }
 
-        // If user verification is disabled for this operation type, auto-accept
         if !should_verify {
             debug!(
                 "User verification disabled for {}: {}",
@@ -107,7 +123,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         }
     }
 
-    fn request_uv(&self, _info: &str, _user: Option<&str>, _rp: &str) -> Result<UvResult> {
+    fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
         // Check for E2E test mode (only available in debug builds)
         #[cfg(debug_assertions)]
         {
@@ -117,8 +133,54 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        info!("User verification confirmed");
-        Ok(UvResult::Accepted)
+        // Check if PIN is set and apply enforcement policy
+        if let Some(pin_storage) = &self.pin_storage
+            && let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?
+            && let Ok(state) = storage.load_pin_state()
+            && state.is_pin_set()
+        {
+            match self.pin_config.enforcement {
+                PinEnforcement::Required => {
+                    info!("PIN is set and enforcement=required, denying built-in UV to force PIN");
+                    return Ok(UvResult::Denied);
+                }
+                PinEnforcement::Optional => {
+                    if self.security_config.always_uv {
+                        info!(
+                            "PIN is set, always_uv=true, enforcement=optional, denying built-in UV"
+                        );
+                        return Ok(UvResult::Denied);
+                    }
+                    info!(
+                        "PIN is set, always_uv=false, enforcement=optional, using notification fallback"
+                    );
+                }
+                PinEnforcement::Never => {
+                    info!("PIN is set but enforcement=never, using notification fallback");
+                }
+            }
+        }
+
+        // No PIN set or enforcement allows notification fallback
+        match show_verification_notification(
+            info,
+            Some(rp),
+            user,
+            self.security_config.notification_timeout,
+        ) {
+            Ok(crate::notification::NotificationResult::Accepted) => {
+                info!("User verification via notification: accepted");
+                Ok(UvResult::Accepted)
+            }
+            Ok(crate::notification::NotificationResult::Denied) => {
+                warn!("User verification via notification: denied");
+                Ok(UvResult::Denied)
+            }
+            Err(e) => {
+                error!("Failed to show notification: {}", e);
+                Err(soft_fido2::Error::Other)
+            }
+        }
     }
 
     fn write_credential(&self, credential: &CredentialRef) -> Result<()> {
@@ -195,7 +257,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         let mut credentials = Vec::new();
 
-        // Read first credential
         match storage.read_first(filter) {
             Ok(first_cred) => {
                 info!(
@@ -205,7 +266,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                 );
                 credentials.push(first_cred);
 
-                // Read remaining credentials
                 while let Ok(cred) = storage.read_next() {
                     info!("Found additional credential: id={}", bytes_to_hex(&cred.id));
                     credentials.push(cred);
@@ -235,7 +295,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         };
 
-        // Get all credentials
         let filter = CredentialFilter::None;
         let mut all_credentials = Vec::new();
 
@@ -247,7 +306,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        // Group by RP ID and count
         use std::collections::HashMap;
         let mut rp_map: HashMap<String, (Option<String>, usize)> = HashMap::new();
 
@@ -333,8 +391,8 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
     /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
-    pub fn new(storage: S, security_config: SecurityConfig) -> Result<Self> {
-        Self::with_pin_storage(storage, None, security_config)
+    pub fn new(storage: S, security_config: SecurityConfig, pin_config: PinConfig) -> Result<Self> {
+        Self::with_pin_storage(storage, None, security_config, pin_config)
     }
 }
 
@@ -344,19 +402,22 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         storage: S,
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
+        pin_config: PinConfig,
     ) -> Result<Self> {
+        // Hardcoded authenticator options (FIDO2 spec compliant)
+        // These are platform authenticator defaults and shouldn't need configuration
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
             up: true,                      // User presence
-            uv: Some(true),                // User verification (via notifications/biometrics)
+            uv: Some(true),                // Built-in UV capability (notification-based)
             plat: true,                    // Platform authenticator
-            client_pin: Some(true),        // Client PIN capability (required for SSH SK keys)
-            pin_uv_auth_token: Some(true), // PIN UV auth token
-            cred_mgmt: Some(true),         // Credential management enabled
-            bio_enroll: None,
-            large_blobs: None,
-            ep: None,
-            always_uv: Some(true),
+            client_pin: Some(true),        // Client PIN capability
+            pin_uv_auth_token: Some(true), // PIN/UV auth token support
+            cred_mgmt: Some(true),         // Credential management
+            bio_enroll: None,              // No biometric enrollment
+            large_blobs: None,             // No large blob storage
+            ep: None,                      // Enterprise attestation not enabled
+            always_uv: Some(security_config.always_uv),
             make_cred_uv_not_required: Some(true),
         };
 
@@ -379,16 +440,24 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
-            // Firefox is currently more reliable when GetInfo only advertises
-            // ES256. soft-fido2 still accepts hidden Ed25519 variants during
-            // makeCredential so SSH resident ed25519-sk enrollment keeps working.
             .algorithms(vec![-7])
+            .max_pin_retries(pin_config.max_retries)
+            .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
         let storage = Arc::new(Mutex::new(storage));
-        let callbacks =
-            PasslessCallbacks::new(storage.clone(), pin_storage.clone(), security_config);
-        let authenticator = Authenticator::with_config(callbacks, config)?;
+        let callbacks = PasslessCallbacks::new(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config,
+            pin_config,
+        );
+
+        let authenticator = if let Some(ps) = pin_storage {
+            Authenticator::with_config_and_pin_storage(callbacks, config, PinStorageWrapper(ps))
+        } else {
+            Authenticator::with_config(callbacks, config)
+        }?;
 
         Ok(Self {
             authenticator,
@@ -450,12 +519,15 @@ mod tests {
             check_mlock: false,
             disable_core_dumps: false,
             constant_signature_counter: false,
+            always_uv: true,
             user_verification_registration: true,
             user_verification_authentication: true,
             notification_timeout: 30,
         };
 
-        let service = AuthenticatorService::new(storage, security_config);
+        let pin_config = PinConfig::default();
+
+        let service = AuthenticatorService::new(storage, security_config, pin_config);
         assert!(service.is_ok(), "Service creation should succeed");
 
         // Cleanup

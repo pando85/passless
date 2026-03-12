@@ -37,6 +37,9 @@ pub struct SerializablePinState {
     /// Force PIN change flag
     #[serde(default)]
     pub force_pin_change: bool,
+    /// Auto-lock timestamp in milliseconds since Unix epoch (None = not locked)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_until: Option<u64>,
 }
 
 fn default_uv_retries() -> u8 {
@@ -52,6 +55,7 @@ impl Default for SerializablePinState {
             min_pin_length: 4,
             version: 0,
             force_pin_change: false,
+            locked_until: None,
         }
     }
 }
@@ -65,6 +69,7 @@ impl From<&PinState> for SerializablePinState {
             min_pin_length: state.min_pin_length,
             version: state.version,
             force_pin_change: state.force_pin_change,
+            locked_until: state.locked_until,
         }
     }
 }
@@ -82,6 +87,7 @@ impl From<SerializablePinState> for PinState {
             min_pin_length: state.min_pin_length,
             version: state.version,
             force_pin_change: state.force_pin_change,
+            locked_until: state.locked_until,
         }
     }
 }

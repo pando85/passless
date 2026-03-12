@@ -1144,10 +1144,14 @@ pub fn pin_set(output: OutputFormat, device: Option<&str>, pin: &str) -> Result<
     let info = parse_authenticator_info(&info_value)?;
 
     // Check if PIN is supported
+    // According to CTAP spec:
+    // - clientPin: true = PIN capability AND PIN is set
+    // - clientPin: false = PIN capability but PIN is NOT set
+    // - clientPin absent = no PIN capability
+    // So we check for key presence, not the value
     let options = info.options.as_ref();
     let client_pin_supported = options
-        .and_then(|opts| opts.get("clientPin"))
-        .copied()
+        .map(|opts| opts.contains_key("clientPin"))
         .unwrap_or(false);
 
     if !client_pin_supported {
