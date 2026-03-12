@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 const PIN_STATE_FILENAME: &str = "pin_state.json";
 
@@ -80,6 +80,16 @@ impl PinStorage for LocalPinStorage {
 
     fn save_pin_state(&self, state: &PinState) -> Result<(), StatusCode> {
         let serializable = SerializablePinState::from(state);
+
+        if state.is_pin_set() {
+            info!(
+                "Saving PIN state (PIN is set, {} retries remaining)",
+                state.retries
+            );
+        } else {
+            info!("Saving PIN state (no PIN set)");
+        }
+
         self.save_state(&serializable)
     }
 }

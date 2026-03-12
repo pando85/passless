@@ -6,7 +6,7 @@ use soft_fido2::{PinState, StatusCode};
 
 use std::path::PathBuf;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 const PIN_STATE_FILENAME: &str = "pin_state.json.tpm";
 
@@ -57,6 +57,15 @@ impl PinStorage for TpmPinStorage {
     }
 
     fn save_pin_state(&self, state: &PinState) -> Result<(), StatusCode> {
+        if state.is_pin_set() {
+            info!(
+                "Saving PIN state (PIN is set, {} retries remaining)",
+                state.retries
+            );
+        } else {
+            info!("Saving PIN state (no PIN set)");
+        }
+
         debug!("Saving PIN state to TPM storage: {}", self.path.display());
 
         let serializable = SerializablePinState::from(state);

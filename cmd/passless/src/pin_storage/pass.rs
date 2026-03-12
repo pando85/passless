@@ -7,7 +7,7 @@ use passless_core::error::{Error, Result};
 
 use std::path::PathBuf;
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
 use prs_lib::{Ciphertext, Plaintext};
 
@@ -170,6 +170,16 @@ impl PinStorage for PassPinStorage {
         state: &soft_fido2::PinState,
     ) -> std::result::Result<(), soft_fido2::StatusCode> {
         let serializable = SerializablePinState::from(state);
+
+        if state.is_pin_set() {
+            info!(
+                "Saving PIN state (PIN is set, {} retries remaining)",
+                state.retries
+            );
+        } else {
+            info!("Saving PIN state (no PIN set)");
+        }
+
         self.save_state(&serializable)
     }
 }

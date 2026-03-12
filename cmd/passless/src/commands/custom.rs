@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn test_register_yubikey_command() {
-        use passless_core::config::SecurityConfig;
+        use passless_core::config::{PinConfig, SecurityConfig};
 
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
@@ -61,7 +61,8 @@ mod tests {
             Err(e) => panic!("Failed to create local storage: {}", e),
         };
 
-        let service = AuthenticatorService::new(storage, SecurityConfig::default());
+        let service =
+            AuthenticatorService::new(storage, SecurityConfig::default(), PinConfig::default());
         assert!(service.is_ok(), "Service creation should succeed");
 
         register_yubikey_credential_mgmt(&mut service.unwrap());

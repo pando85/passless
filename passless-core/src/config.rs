@@ -149,6 +149,23 @@ pub struct SecurityConfig {
     #[default(false)]
     pub constant_signature_counter: bool,
 
+    /// Always require user verification for all operations
+    /// - When PIN is set + pin.enforcement="required": requires PIN
+    /// - When PIN is set + pin.enforcement="optional": depends on context
+    /// - When PIN is set + pin.enforcement="never": uses notification fallback
+    /// - When PIN not set: uses notification
+    #[arg(
+        long = "always-uv",
+        env = "PASSLESS_ALWAYS_UV",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub always_uv: bool,
+
     /// Show user verification notification during registration
     #[arg(
         long = "user-verification-registration",
@@ -176,6 +193,94 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[default(30)]
     pub notification_timeout: u32,
+}
+
+/// PIN enforcement policy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PinEnforcement {
+    /// Never require PIN, always use notification fallback (backward compatible)
+    Never,
+    /// Use PIN only when always_uv=true or client requests UV
+    #[default]
+    Optional,
+    /// Always require PIN when set (most secure)
+    Required,
+}
+
+impl std::str::FromStr for PinEnforcement {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "never" => Ok(PinEnforcement::Never),
+            "optional" => Ok(PinEnforcement::Optional),
+            "required" => Ok(PinEnforcement::Required),
+            _ => Err(format!(
+                "Invalid PIN enforcement '{}'. Must be: never, optional, or required",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PinEnforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinEnforcement::Never => write!(f, "never"),
+            PinEnforcement::Optional => write!(f, "optional"),
+            PinEnforcement::Required => write!(f, "required"),
+        }
+    }
+}
+
+/// PIN configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "pin")]
+pub struct PinConfig {
+    /// PIN enforcement policy when PIN is set:
+    /// - "never": Always use notification fallback (backward compatible, convenience)
+    /// - "optional": Use PIN only when always_uv=true or client requests UV
+    /// - "required": Always require PIN when set (most secure)
+    #[arg(
+        long = "pin-enforcement",
+        env = "PASSLESS_PIN_ENFORCEMENT",
+        value_name = "POLICY"
+    )]
+    #[serde(default)]
+    #[default(PinEnforcement::Optional)]
+    pub enforcement: PinEnforcement,
+
+    /// Minimum PIN length in characters (CTAP spec: 4-63)
+    #[arg(
+        long = "pin-min-length",
+        env = "PASSLESS_PIN_MIN_LENGTH",
+        value_name = "LENGTH"
+    )]
+    #[serde(default)]
+    #[default(4)]
+    pub min_length: u8,
+
+    /// Maximum PIN retry attempts before lockout (CTAP spec: 8)
+    #[arg(
+        long = "pin-max-retries",
+        env = "PASSLESS_PIN_MAX_RETRIES",
+        value_name = "RETRIES"
+    )]
+    #[serde(default)]
+    #[default(8)]
+    pub max_retries: u8,
+
+    /// Auto-lock timeout in seconds after max failed attempts (0 = disabled)
+    /// After lockout, authenticator must be reset to use PIN again
+    #[arg(
+        long = "pin-auto-lock-timeout",
+        env = "PASSLESS_PIN_AUTO_LOCK_TIMEOUT",
+        value_name = "SECONDS"
+    )]
+    #[serde(default)]
+    #[default(0)]
+    pub auto_lock_timeout: u32,
 }
 
 impl SecurityConfig {
@@ -273,6 +378,12 @@ pub struct AppConfig {
     #[serde(default)]
     #[command(flatten)]
     pub security: SecurityConfig,
+
+    /// PIN configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub pin: PinConfig,
 }
 
 /// Backend-specific configuration
@@ -354,6 +465,11 @@ impl AppConfig {
     /// Get security configuration
     pub fn security_config(&self) -> SecurityConfig {
         self.security.clone()
+    }
+
+    /// Get PIN configuration
+    pub fn pin_config(&self) -> PinConfig {
+        self.pin.clone()
     }
 }
 
