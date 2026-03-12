@@ -1,9 +1,15 @@
-use crate::notification::show_verification_notification;
 use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
+use crate::uv::{
+    FprintdProvider, NotificationProvider, UserVerificationManager, UserVerificationProvider,
+    VerificationContext, VerificationResult,
+};
 
-use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
+#[cfg(feature = "face")]
+use crate::uv::FaceIdProvider;
+
+use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig, UvConfig, UvProviderType};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
@@ -23,7 +29,6 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
     (major << 16) | (minor << 8) | patch
 });
 
-/// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
 struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
@@ -38,12 +43,12 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
     }
 }
 
-/// Passless authenticator callbacks implementation
 pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     storage: Arc<Mutex<S>>,
     pin_storage: Option<Arc<Mutex<P>>>,
     security_config: SecurityConfig,
     pin_config: PinConfig,
+    uv_manager: UserVerificationManager,
 }
 
 impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
@@ -52,29 +57,35 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Self {
+        let uv_manager = build_uv_manager(&uv_config);
+
         Self {
             storage,
             pin_storage,
             security_config,
             pin_config,
+            uv_manager,
         }
     }
-}
 
-impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
-    fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
-        // Check for E2E test mode (only available in debug builds)
+    fn do_user_verification(
+        &self,
+        operation: &str,
+        user: Option<&str>,
+        rp: &str,
+    ) -> Result<VerificationResult> {
         #[cfg(debug_assertions)]
         {
             if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
                 info!("E2E test mode: Auto-accepting user verification");
-                return Ok(UpResult::Accepted);
+                return Ok(VerificationResult::Accepted);
             }
         }
 
-        let is_registration = info.to_lowercase().contains("registration")
-            && !info.to_lowercase().contains("credential excluded");
+        let is_registration = operation.to_lowercase().contains("registration")
+            && !operation.to_lowercase().contains("credential excluded");
 
         let should_verify = if is_registration {
             self.security_config.user_verification_registration
@@ -82,17 +93,22 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             self.security_config.user_verification_authentication
         };
 
-        let storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock during user verification request");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        {
+            let storage = match self.storage.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    error!("Failed to acquire storage lock during user verification request");
+                    return Err(soft_fido2::Error::Other);
+                }
+            };
 
-        if storage.disable_user_verification() && !is_registration && !should_verify {
-            debug!("User verification handled by backend (e.g., GPG): {}", info);
-            return Ok(UpResult::Accepted);
+            if storage.disable_user_verification() && !is_registration && !should_verify {
+                debug!(
+                    "User verification handled by backend (e.g., GPG): {}",
+                    operation
+                );
+                return Ok(VerificationResult::Accepted);
+            }
         }
 
         if !should_verify {
@@ -103,37 +119,87 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                 } else {
                     "authentication"
                 },
-                info
+                operation
             );
-            return Ok(UpResult::Accepted);
+            return Ok(VerificationResult::Accepted);
         }
 
-        match show_verification_notification(
-            info,
-            Some(rp),
-            user,
-            self.security_config.notification_timeout,
-        ) {
-            Ok(crate::notification::NotificationResult::Accepted) => Ok(UpResult::Accepted),
-            Ok(crate::notification::NotificationResult::Denied) => Ok(UpResult::Denied),
-            Err(e) => {
-                error!("Failed to show notification: {}", e);
-                Err(soft_fido2::Error::Other)
+        let context = VerificationContext::new(operation)
+            .with_relying_party(rp)
+            .with_user(user.unwrap_or(""))
+            .with_timeout(self.security_config.notification_timeout);
+
+        self.uv_manager.verify(&context).map_err(|e| {
+            warn!("User verification failed: {}", e);
+            soft_fido2::Error::Other
+        })
+    }
+}
+
+fn build_uv_manager(config: &UvConfig) -> UserVerificationManager {
+    let mut providers: Vec<Box<dyn UserVerificationProvider>> = Vec::new();
+
+    match config.provider {
+        UvProviderType::Auto => {
+            if config.fprintd.enabled {
+                providers.push(Box::new(FprintdProvider::new()));
+            }
+            #[cfg(feature = "face")]
+            if config.face.enabled {
+                providers.push(Box::new(FaceIdProvider::new(
+                    config.face.camera_index,
+                    config.face.threshold,
+                    None,
+                )));
+            }
+            providers.push(Box::new(NotificationProvider::new(config.timeout_seconds)));
+        }
+        UvProviderType::Fprintd => {
+            if config.fprintd.enabled {
+                providers.push(Box::new(FprintdProvider::new()));
+            }
+        }
+        UvProviderType::Face => {
+            #[cfg(feature = "face")]
+            if config.face.enabled {
+                providers.push(Box::new(FaceIdProvider::new(
+                    config.face.camera_index,
+                    config.face.threshold,
+                    None,
+                )));
+            }
+            #[cfg(not(feature = "face"))]
+            {
+                log::warn!("Face provider requested but 'face' feature not enabled");
+            }
+        }
+        UvProviderType::Notification => {
+            providers.push(Box::new(NotificationProvider::new(config.timeout_seconds)));
+        }
+        UvProviderType::Command => {
+            if config.command.enabled && !config.command.command.is_empty() {
+                use crate::uv::CommandProvider;
+                providers.push(Box::new(CommandProvider::new(
+                    config.command.command.clone(),
+                    config.timeout_seconds,
+                )));
             }
         }
     }
 
-    fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
-        // Check for E2E test mode (only available in debug builds)
-        #[cfg(debug_assertions)]
-        {
-            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
-                info!("E2E test mode: Auto-accepting user verification");
-                return Ok(UvResult::Accepted);
-            }
-        }
+    UserVerificationManager::new(providers)
+}
 
-        // Check if PIN is set and apply enforcement policy
+impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
+    fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
+        match self.do_user_verification(info, user, rp)? {
+            VerificationResult::Accepted => Ok(UpResult::Accepted),
+            VerificationResult::Denied => Ok(UpResult::Denied),
+            VerificationResult::Timeout => Ok(UpResult::Denied),
+        }
+    }
+
+    fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
         if let Some(pin_storage) = &self.pin_storage
             && let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?
             && let Ok(state) = storage.load_pin_state()
@@ -152,33 +218,29 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                         return Ok(UvResult::Denied);
                     }
                     info!(
-                        "PIN is set, always_uv=false, enforcement=optional, using notification fallback"
+                        "PIN is set, always_uv=false, enforcement=optional, using biometric/notification fallback"
                     );
                 }
                 PinEnforcement::Never => {
-                    info!("PIN is set but enforcement=never, using notification fallback");
+                    info!(
+                        "PIN is set but enforcement=never, using biometric/notification fallback"
+                    );
                 }
             }
         }
 
-        // No PIN set or enforcement allows notification fallback
-        match show_verification_notification(
-            info,
-            Some(rp),
-            user,
-            self.security_config.notification_timeout,
-        ) {
-            Ok(crate::notification::NotificationResult::Accepted) => {
-                info!("User verification via notification: accepted");
+        match self.do_user_verification(info, user, rp)? {
+            VerificationResult::Accepted => {
+                info!("User verification accepted");
                 Ok(UvResult::Accepted)
             }
-            Ok(crate::notification::NotificationResult::Denied) => {
-                warn!("User verification via notification: denied");
+            VerificationResult::Denied => {
+                warn!("User verification denied");
                 Ok(UvResult::Denied)
             }
-            Err(e) => {
-                error!("Failed to show notification: {}", e);
-                Err(soft_fido2::Error::Other)
+            VerificationResult::Timeout => {
+                warn!("User verification timed out");
+                Ok(UvResult::Denied)
             }
         }
     }
@@ -376,54 +438,48 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
     }
 }
 
-/// Main authenticator service
-///
-/// This service orchestrates the FIDO2 authenticator:
-/// - Storage is injected through the CredentialStorage trait
-/// - Handles CTAP requests and generates responses
 pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
-    /// The underlying soft_fido2 authenticator
     pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
-    /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
-    /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
-    pub fn new(storage: S, security_config: SecurityConfig, pin_config: PinConfig) -> Result<Self> {
-        Self::with_pin_storage(storage, None, security_config, pin_config)
+    pub fn new(
+        storage: S,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        uv_config: UvConfig,
+    ) -> Result<Self> {
+        Self::with_pin_storage(storage, None, security_config, pin_config, uv_config)
     }
 }
 
 impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorService<S, P> {
-    /// Create a new authenticator service with optional PIN storage
     pub fn with_pin_storage(
         storage: S,
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
     ) -> Result<Self> {
-        // Hardcoded authenticator options (FIDO2 spec compliant)
-        // These are platform authenticator defaults and shouldn't need configuration
         let options = AuthenticatorOptions {
-            rk: true,                      // Resident keys (passkeys)
-            up: true,                      // User presence
-            uv: Some(true),                // Built-in UV capability (notification-based)
-            plat: true,                    // Platform authenticator
-            client_pin: Some(true),        // Client PIN capability
-            pin_uv_auth_token: Some(true), // PIN/UV auth token support
-            cred_mgmt: Some(true),         // Credential management
-            bio_enroll: None,              // No biometric enrollment
-            large_blobs: None,             // No large blob storage
-            ep: None,                      // Enterprise attestation not enabled
+            rk: true,
+            up: true,
+            uv: Some(true),
+            plat: true,
+            client_pin: Some(true),
+            pin_uv_auth_token: Some(true),
+            cred_mgmt: Some(true),
+            bio_enroll: None,
+            large_blobs: None,
+            ep: None,
             always_uv: Some(security_config.always_uv),
             make_cred_uv_not_required: Some(true),
         };
 
         let config = AuthenticatorConfig::builder()
             .aaguid([
-                // "fido.passless.rs"
                 0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73, 0x2E,
                 0x72, 0x73,
             ])
@@ -451,6 +507,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             pin_storage.clone(),
             security_config,
             pin_config,
+            uv_config,
         );
 
         let authenticator = if let Some(ps) = pin_storage {
@@ -465,28 +522,16 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         })
     }
 
-    /// Process a CTAP request and generate a response
-    /// Ok(()) on success or an error
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         self.authenticator.handle(request, response_buffer)?;
         Ok(())
     }
 
-    /// Get storage information
     pub fn storage_info(&self) -> String {
         let storage = self.storage.lock().unwrap();
         format!("Credentials in storage: {}", storage.count_credentials())
     }
 
-    /// Register a custom CTAP command handler
-    ///
-    /// This allows registering vendor-specific commands (0x40-0xFF range).
-    /// Useful for compatibility with different authenticator variants.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - Command byte (0x40-0xFF vendor range)
-    /// * `handler` - Handler function that processes the command
     pub fn register_custom_command<F>(&mut self, command: u8, handler: F)
     where
         F: Fn(&[u8]) -> core::result::Result<Vec<u8>, soft_fido2::StatusCode>
@@ -526,11 +571,81 @@ mod tests {
         };
 
         let pin_config = PinConfig::default();
+        let uv_config = UvConfig::default();
 
-        let service = AuthenticatorService::new(storage, security_config, pin_config);
+        let service = AuthenticatorService::new(storage, security_config, pin_config, uv_config);
         assert!(service.is_ok(), "Service creation should succeed");
 
-        // Cleanup
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_service_with_custom_uv_config() {
+        let temp_dir = std::env::temp_dir().join("test_passless_uv");
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create temp directory: {}", e);
+        }
+        let storage = match LocalStorageAdapter::new(temp_dir.clone()) {
+            Ok(s) => s,
+            Err(e) => panic!("Failed to create local storage: {}", e),
+        };
+
+        let security_config = SecurityConfig {
+            check_mlock: false,
+            disable_core_dumps: false,
+            constant_signature_counter: false,
+            always_uv: false,
+            user_verification_registration: false,
+            user_verification_authentication: false,
+            notification_timeout: 30,
+        };
+
+        let pin_config = PinConfig::default();
+        let uv_config = UvConfig {
+            provider: passless_core::config::UvProviderType::Notification,
+            timeout_seconds: 60,
+            ..Default::default()
+        };
+
+        let service = AuthenticatorService::new(storage, security_config, pin_config, uv_config);
+        assert!(
+            service.is_ok(),
+            "Service creation with custom UV config should succeed"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_service_with_uv_disabled() {
+        let temp_dir = std::env::temp_dir().join("test_passless_no_uv");
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            panic!("Failed to create temp directory: {}", e);
+        }
+        let storage = match LocalStorageAdapter::new(temp_dir.clone()) {
+            Ok(s) => s,
+            Err(e) => panic!("Failed to create local storage: {}", e),
+        };
+
+        let security_config = SecurityConfig {
+            check_mlock: false,
+            disable_core_dumps: false,
+            constant_signature_counter: false,
+            always_uv: false,
+            user_verification_registration: false,
+            user_verification_authentication: false,
+            notification_timeout: 30,
+        };
+
+        let pin_config = PinConfig::default();
+        let uv_config = UvConfig::default();
+
+        let service = AuthenticatorService::new(storage, security_config, pin_config, uv_config);
+        assert!(
+            service.is_ok(),
+            "Service creation with UV disabled should succeed"
+        );
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

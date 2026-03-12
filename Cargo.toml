@@ -41,6 +41,14 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
 shadow-rs = "1.4"
 
+# UV provider dependencies
+zbus = "5"
+nokhwa = { version = "0.10", features = ["input-native"] }
+face_id = "0.4"
+image = "0.25"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+which = "7"
+
 # Proc macro dependencies
 syn = { version = "2.0", features = ["full", "extra-traits"] }
 quote = "1.0"

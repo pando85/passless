@@ -4,6 +4,7 @@ mod notification;
 mod pin_storage;
 mod storage;
 mod util;
+mod uv;
 
 use passless_core::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
@@ -298,11 +299,9 @@ fn run() -> Result<()> {
 
     info!("Creating authenticator service...");
 
-    // Get security config
     let security_config = config.security_config();
-
-    // Get PIN config
     let pin_config = config.pin_config();
+    let uv_config = config.uv_config();
 
     match config.backend().map_err(|e| {
         error!("Failed to load backend config: {}", e);
@@ -317,6 +316,7 @@ fn run() -> Result<()> {
                 Some(pin_storage),
                 security_config,
                 pin_config,
+                uv_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }
@@ -338,6 +338,7 @@ fn run() -> Result<()> {
                 Some(pin_storage),
                 security_config,
                 pin_config,
+                uv_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }
@@ -351,6 +352,7 @@ fn run() -> Result<()> {
                 Some(pin_storage),
                 security_config,
                 pin_config,
+                uv_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }

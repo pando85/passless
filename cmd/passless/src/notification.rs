@@ -48,6 +48,7 @@ fn requires_default_action() -> bool {
 }
 
 /// Show a user verification notification and wait for response
+#[allow(dead_code)]
 pub fn show_verification_notification(
     operation: &str,
     relying_party: Option<&str>,
