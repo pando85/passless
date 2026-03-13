@@ -146,7 +146,6 @@ pub struct SecurityConfig {
         default_missing_value = "true"
     )]
     #[serde(default)]
-    #[default(false)]
     pub constant_signature_counter: bool,
 
     /// Always require user verification for all operations
