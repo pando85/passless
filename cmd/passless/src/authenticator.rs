@@ -162,6 +162,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         }
 
         // No PIN set or enforcement allows notification fallback
+        // Return AcceptedWithUp since notification-based UV also captures user presence
         match show_verification_notification(
             info,
             Some(rp),
@@ -170,7 +171,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         ) {
             Ok(crate::notification::NotificationResult::Accepted) => {
                 info!("User verification via notification: accepted");
-                Ok(UvResult::Accepted)
+                Ok(UvResult::AcceptedWithUp)
             }
             Ok(crate::notification::NotificationResult::Denied) => {
                 warn!("User verification via notification: denied");
