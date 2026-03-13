@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.2](https://github.com/pando85/passless/tree/v0.9.2) - 2026-03-13
+
+### Fixed
+
+- Return AcceptedWithUp from request_uv to prevent double notification ([1c94602](https://github.com/pando85/passless/commit/1c946023b66b284a8c433ddb17c1bb6fe2105875))
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.6.0 ([7ed53b8](https://github.com/pando85/passless/commit/7ed53b8c20844128b4c0f3c3d197e0c8571e9817))
+- deps: Update Rust crate clap to v4.6.0 ([3c5fe4e](https://github.com/pando85/passless/commit/3c5fe4ed182e8409017a2ed51a15fe1094e44eba))
+
 ## [v0.9.1](https://github.com/pando85/passless/tree/v0.9.1) - 2026-03-12
 
 ### Added
