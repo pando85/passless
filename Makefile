@@ -107,7 +107,7 @@ publish:	## publish crate
 # Installation targets
 .PHONY: install-binary
 install-binary:	## install passless binary to ~/.cargo/bin
-	cargo install --path .
+	cargo install --path cmd/passless
 
 .PHONY: install
 install: install-binary install-sysusers install-udev install-systemd install-modules	## install everything (binary, sysusers, udev, systemd)
