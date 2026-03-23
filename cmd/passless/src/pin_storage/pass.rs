@@ -1,25 +1,33 @@
 //! Pass (password-store) PIN storage
 
-use crate::pin_storage::{PinStorage, SerializablePinState};
+use crate::pin_storage::{
+    PinStorage, SerializablePinConfig, SerializablePinRetries, SerializablePinState,
+};
 use crate::storage::pass::GpgBackend;
 
 use passless_core::error::{Error, Result};
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
-use prs_lib::{Ciphertext, Plaintext};
+use prs_lib::{Ciphertext, Plaintext, Store};
 
-const PIN_STATE_ENTRY: &str = "pin_state";
+const PIN_CONFIG_ENTRY: &str = "pin_state";
+const PIN_RETRIES_ENTRY: &str = "pin_retries";
 
 /// Pass (password-store) PIN storage
 ///
-/// Stores PIN state as a GPG-encrypted entry in the password store.
+/// Stores PIN state as two GPG-encrypted entries in the password store:
+/// - `pin_state.gpg`: PIN config (hash, min length, version) - synced to git
+/// - `pin_retries.gpg`: Retry counters (retries, uv_retries, locked_until) - local only
 pub struct PassPinStorage {
     store_path: PathBuf,
     fido2_path: PathBuf,
     gpg_backend: GpgBackend,
+    /// Last known config state for change detection (for git sync optimization)
+    last_config: RefCell<Option<SerializablePinConfig>>,
 }
 
 impl PassPinStorage {
@@ -34,13 +42,20 @@ impl PassPinStorage {
             store_path,
             fido2_path,
             gpg_backend,
+            last_config: RefCell::new(None),
         }
     }
 
-    fn get_entry_path(&self) -> PathBuf {
+    fn get_config_path(&self) -> PathBuf {
         self.store_path
             .join(&self.fido2_path)
-            .join(format!("{}.gpg", PIN_STATE_ENTRY))
+            .join(format!("{}.gpg", PIN_CONFIG_ENTRY))
+    }
+
+    fn get_retries_path(&self) -> PathBuf {
+        self.store_path
+            .join(&self.fido2_path)
+            .join(format!("{}.gpg", PIN_RETRIES_ENTRY))
     }
 
     fn create_crypto_context(&self) -> Result<prs_lib::crypto::Context> {
@@ -88,18 +103,65 @@ impl PassPinStorage {
         }
     }
 
-    fn load_state(&self) -> std::result::Result<SerializablePinState, soft_fido2::StatusCode> {
-        debug!("Loading PIN state from pass store");
+    fn sync_prepare(&self) -> Result<()> {
+        debug!("Preparing password store sync for PIN config");
 
-        let path = self.get_entry_path();
+        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
+            debug!("Failed to open store for sync: {:?}", e);
+            Error::Storage(format!("Failed to open store for sync: {:?}", e))
+        })?;
+
+        let sync = store.sync();
+
+        match sync.prepare() {
+            Ok(()) => {
+                debug!("Successfully prepared store sync (pulled if remote configured)");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to prepare store sync: {:?}", e);
+                Ok(())
+            }
+        }
+    }
+
+    fn sync_finalize(&self, message: &str) -> Result<()> {
+        debug!("Finalizing password store sync: {}", message);
+
+        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
+            debug!("Failed to open store for sync: {:?}", e);
+            Error::Storage(format!("Failed to open store for sync: {:?}", e))
+        })?;
+
+        let sync = store.sync();
+
+        match sync.finalize(message) {
+            Ok(()) => {
+                debug!(
+                    "Successfully finalized store sync (committed and pushed if remote configured)"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                debug!("Failed to finalize store sync: {:?}", e);
+                warn!("Failed to finalize store sync: {:?}", e);
+                Ok(())
+            }
+        }
+    }
+
+    fn load_config(&self) -> std::result::Result<SerializablePinConfig, soft_fido2::StatusCode> {
+        debug!("Loading PIN config from pass store");
+
+        let path = self.get_config_path();
 
         if !path.exists() {
-            debug!("PIN state entry does not exist, returning default state");
-            return Ok(SerializablePinState::default());
+            debug!("PIN config entry does not exist, returning default state");
+            return Ok(SerializablePinConfig::default());
         }
 
         let encrypted_data = std::fs::read(&path).map_err(|e| {
-            warn!("Failed to read PIN state entry: {}", e);
+            warn!("Failed to read PIN config entry: {}", e);
             soft_fido2::StatusCode::Other
         })?;
 
@@ -110,23 +172,55 @@ impl PassPinStorage {
 
         let ciphertext = Ciphertext::from(encrypted_data);
         let plaintext = context.decrypt(ciphertext).map_err(|e| {
-            warn!("Failed to decrypt PIN state: {:?}", e);
+            warn!("Failed to decrypt PIN config: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
 
-        SerializablePinState::from_json_bytes(plaintext.unsecure_ref()).map_err(|e| {
-            warn!("Failed to parse PIN state: {:?}", e);
+        SerializablePinConfig::from_json_bytes(plaintext.unsecure_ref()).map_err(|e| {
+            warn!("Failed to parse PIN config: {:?}", e);
             soft_fido2::StatusCode::InvalidParameter
         })
     }
 
-    fn save_state(
-        &self,
-        state: &SerializablePinState,
-    ) -> std::result::Result<(), soft_fido2::StatusCode> {
-        debug!("Saving PIN state to pass store");
+    fn load_retries(&self) -> std::result::Result<SerializablePinRetries, soft_fido2::StatusCode> {
+        debug!("Loading PIN retries from pass store");
 
-        let bytes = state.to_json_bytes()?;
+        let path = self.get_retries_path();
+
+        if !path.exists() {
+            debug!("PIN retries entry does not exist, returning default state");
+            return Ok(SerializablePinRetries::default());
+        }
+
+        let encrypted_data = std::fs::read(&path).map_err(|e| {
+            warn!("Failed to read PIN retries entry: {}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        let mut context = self.create_crypto_context().map_err(|e| {
+            warn!("Failed to create crypto context: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        let ciphertext = Ciphertext::from(encrypted_data);
+        let plaintext = context.decrypt(ciphertext).map_err(|e| {
+            warn!("Failed to decrypt PIN retries: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        SerializablePinRetries::from_json_bytes(plaintext.unsecure_ref()).map_err(|e| {
+            warn!("Failed to parse PIN retries: {:?}", e);
+            soft_fido2::StatusCode::InvalidParameter
+        })
+    }
+
+    fn save_config(
+        &self,
+        config: &SerializablePinConfig,
+    ) -> std::result::Result<(), soft_fido2::StatusCode> {
+        debug!("Saving PIN config to pass store");
+
+        let bytes = config.to_json_bytes()?;
 
         let recipients = self.load_recipients_from_gpg_id().map_err(|e| {
             warn!("Failed to load GPG recipients: {:?}", e);
@@ -138,7 +232,7 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        let path = self.get_entry_path();
+        let path = self.get_config_path();
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -151,25 +245,91 @@ impl PassPinStorage {
         context
             .encrypt_file(&recipients, plaintext, &path)
             .map_err(|e| {
-                warn!("Failed to encrypt PIN state: {:?}", e);
+                warn!("Failed to encrypt PIN config: {:?}", e);
                 soft_fido2::StatusCode::Other
             })?;
 
-        debug!("PIN state saved successfully");
+        let relative_path = path
+            .strip_prefix(&self.store_path)
+            .unwrap_or(&path)
+            .display();
+        let commit_message = format!("Update PIN configuration: {}.", relative_path);
+        self.sync_finalize(&commit_message).map_err(|e| {
+            warn!("Failed to sync PIN config: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        *self.last_config.borrow_mut() = Some(config.clone());
+        debug!("PIN config saved and synced successfully");
         Ok(())
+    }
+
+    fn save_retries(
+        &self,
+        retries: &SerializablePinRetries,
+    ) -> std::result::Result<(), soft_fido2::StatusCode> {
+        debug!("Saving PIN retries to pass store (local only, no sync)");
+
+        let bytes = retries.to_json_bytes()?;
+
+        let recipients = self.load_recipients_from_gpg_id().map_err(|e| {
+            warn!("Failed to load GPG recipients: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        let mut context = self.create_crypto_context().map_err(|e| {
+            warn!("Failed to create crypto context: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        let path = self.get_retries_path();
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                warn!("Failed to create directory: {}", e);
+                soft_fido2::StatusCode::Other
+            })?;
+        }
+
+        let plaintext = Plaintext::from(bytes);
+        context
+            .encrypt_file(&recipients, plaintext, &path)
+            .map_err(|e| {
+                warn!("Failed to encrypt PIN retries: {:?}", e);
+                soft_fido2::StatusCode::Other
+            })?;
+
+        debug!("PIN retries saved successfully (no git sync)");
+        Ok(())
+    }
+
+    fn config_changed(&self, new_config: &SerializablePinConfig) -> bool {
+        let last = self.last_config.borrow();
+        match last.as_ref() {
+            Some(old) => old != new_config,
+            None => true,
+        }
     }
 }
 
 impl PinStorage for PassPinStorage {
     fn load_pin_state(&self) -> std::result::Result<soft_fido2::PinState, soft_fido2::StatusCode> {
-        self.load_state().map(|s| s.into())
+        let config = self.load_config()?;
+        let retries = self.load_retries()?;
+
+        // Cache the loaded config for change detection
+        *self.last_config.borrow_mut() = Some(config.clone());
+
+        let state = SerializablePinState::from_parts(&config, &retries);
+        Ok(state.into())
     }
 
     fn save_pin_state(
         &self,
         state: &soft_fido2::PinState,
     ) -> std::result::Result<(), soft_fido2::StatusCode> {
-        let serializable = SerializablePinState::from(state);
+        let new_config = SerializablePinConfig::from(state);
+        let new_retries = SerializablePinRetries::from(state);
 
         if state.is_pin_set() {
             info!(
@@ -180,6 +340,15 @@ impl PinStorage for PassPinStorage {
             info!("Saving PIN state (no PIN set)");
         }
 
-        self.save_state(&serializable)
+        if self.config_changed(&new_config) {
+            debug!("PIN config changed, saving and syncing");
+            self.save_config(&new_config)?;
+        } else {
+            debug!("PIN config unchanged, skipping save");
+        }
+
+        self.save_retries(&new_retries)?;
+
+        Ok(())
     }
 }
