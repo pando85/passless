@@ -96,8 +96,8 @@ impl TpmPinStorage {
         {
             use std::str::FromStr;
 
-            use aes_gcm::aead::{Aead, KeyInit, OsRng};
             use aes_gcm::Aes256Gcm;
+            use aes_gcm::aead::{Aead, KeyInit, OsRng};
             use rand::RngCore;
             use sha2::digest::generic_array::GenericArray;
             use tss_esapi::attributes::ObjectAttributesBuilder;
