@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0](https://github.com/pando85/passless/tree/v0.10.0) - 2026-03-23
+
+### Added
+
+- Split PIN state into config and retries files for pass backend ([42bea86](https://github.com/pando85/passless/commit/42bea860fc8cdb4302c810d346bfde0ed9e99166))
+
+### Fixed
+
+- Use correct path for cargo install in workspace ([82eed51](https://github.com/pando85/passless/commit/82eed5186347663a8034202529de3e786e9130fb))
+- Pull latest PIN config from git before loading ([19cf0d1](https://github.com/pando85/passless/commit/19cf0d1f08cf1dd5c1f946a6019c455d20657f1c))
+- Resolve thread safety and PartialEq issues in PassPinStorage ([902ef16](https://github.com/pando85/passless/commit/902ef1625c5fc451ee91a2b77bee972f30a51bd5))
+- Handle RwLock poisoning gracefully in PassPinStorage ([405ede5](https://github.com/pando85/passless/commit/405ede5a306036806118ee6c9fafc0fcbea7397e))
+
+### Build
+
+- deps: Update Rust crate toml to v1.0.7 ([05d19c4](https://github.com/pando85/passless/commit/05d19c416951332fa325aa83a883823a183a68fa))
+- deps: Update Rust crate toml to v1.1.0 ([47fc190](https://github.com/pando85/passless/commit/47fc1902063a8ac4141fdd2d321489410e7ed0d6))
+- deps: Update Rust crate env_logger to v0.11.10 ([6477b6a](https://github.com/pando85/passless/commit/6477b6a85a48bda70ef501b3cddb38e2abb099c7))
+
+### Styling
+
+- Fix import ordering in tpm.rs ([2fe755c](https://github.com/pando85/passless/commit/2fe755c72fe401c7018beb3810224e924924dae6))
+
 ## [v0.9.3](https://github.com/pando85/passless/tree/v0.9.3) - 2026-03-13
 
 ### Fixed
