@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.3](https://github.com/pando85/passless/tree/v0.9.3) - 2026-03-13
+
+### Fixed
+
+- Remove redundant default attribute on constant_signature_counter ([595f781](https://github.com/pando85/passless/commit/595f781216249460f6075d3617b8c735056f045c))
+- Use ClapSerde::Opt for config deserialization to respect defaults ([5fd2496](https://github.com/pando85/passless/commit/5fd2496e5dd1de669137c45cecdf120f3ee374c8))
+- Use toml::Value for proper serialization in config print ([ea680d0](https://github.com/pando85/passless/commit/ea680d0d8231fe6b395e5469cfcde5917c2851d9))
+
+### Build
+
+- deps: Update Rust crate soft-fido2 to v0.12.2 ([d9a58df](https://github.com/pando85/passless/commit/d9a58df21bc75027bc85e58184b8cbbca1f8ce75))
+
+## [v0.9.2](https://github.com/pando85/passless/tree/v0.9.2) - 2026-03-13
+
+### Fixed
+
+- Return AcceptedWithUp from request_uv to prevent double notification ([1c94602](https://github.com/pando85/passless/commit/1c946023b66b284a8c433ddb17c1bb6fe2105875))
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.6.0 ([7ed53b8](https://github.com/pando85/passless/commit/7ed53b8c20844128b4c0f3c3d197e0c8571e9817))
+- deps: Update Rust crate clap to v4.6.0 ([3c5fe4e](https://github.com/pando85/passless/commit/3c5fe4ed182e8409017a2ed51a15fe1094e44eba))
+
 ## [v0.9.1](https://github.com/pando85/passless/tree/v0.9.1) - 2026-03-12
 
 ### Added

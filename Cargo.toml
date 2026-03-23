@@ -5,18 +5,18 @@ resolver = "2"
 [workspace.package]
 authors = ["Pando85 <pando855@gmail.com>"]
 edition = "2024"
-version = "0.9.1"
+version = "0.9.3"
 license-file = "./LICENSE"
 homepage = "https://github.com/pando85/passless"
 repository = "https://github.com/pando85/passless"
 [workspace.dependencies]
 # Workspace crates
-passless-core = { path = "./passless-core", version = "0.9.1" }
-passless-config-doc = { path = "./passless-config-doc", version = "0.9.1" }
+passless-core = { path = "./passless-core", version = "0.9.3" }
+passless-config-doc = { path = "./passless-config-doc", version = "0.9.3" }
 
-soft-fido2 = "0.12.1"
-soft-fido2-ctap = "0.12.1"
-soft-fido2-transport = "0.12.1"
+soft-fido2 = "0.12.2"
+soft-fido2-ctap = "0.12.2"
+soft-fido2-transport = "0.12.2"
 
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }

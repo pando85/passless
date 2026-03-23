@@ -146,7 +146,6 @@ pub struct SecurityConfig {
         default_missing_value = "true"
     )]
     #[serde(default)]
-    #[default(false)]
     pub constant_signature_counter: bool,
 
     /// Always require user verification for all operations
@@ -160,6 +159,7 @@ pub struct SecurityConfig {
         action = ArgAction::Set,
         require_equals = true,
         num_args = 0..=1,
+        default_value = "true",
         default_missing_value = "true"
     )]
     #[serde(default)]
@@ -627,10 +627,10 @@ impl AppConfig {
         {
             log::info!("Loading configuration from: {}", path.display());
             let content = std::io::read_to_string(BufReader::new(f)).unwrap_or_default();
-            match toml::from_str::<AppConfig>(&content) {
+            match toml::from_str::<<AppConfig as ClapSerde>::Opt>(&content) {
                 Ok(file_config) => {
-                    // Merge: file config + CLI args (CLI takes precedence)
-                    return file_config.merge(&mut args.config);
+                    // Deserialize into Opt, then convert with defaults and merge CLI args
+                    return AppConfig::from(file_config).merge(&mut args.config);
                 }
                 Err(e) => log::warn!("Failed to parse config file {}: {}", path.display(), e),
             }

@@ -220,7 +220,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         match self.do_user_verification(info, user, rp)? {
             VerificationResult::Accepted => {
                 info!("User verification accepted");
-                Ok(UvResult::Accepted)
+                Ok(UvResult::AcceptedWithUp)
             }
             VerificationResult::Denied => {
                 warn!("User verification denied");

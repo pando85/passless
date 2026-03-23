@@ -82,7 +82,10 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
         .filter(|(_, _, is_config, _)| !is_config)
         .map(|(field_name, _, _, _)| {
             quote! {
-                (stringify!(#field_name), format!("{:?}", self.#field_name))
+                (stringify!(#field_name), match toml::Value::try_from(&self.#field_name) {
+                    Ok(v) => format!("{}", v),
+                    Err(_) => format!("{:?}", self.#field_name),
+                })
             }
         })
         .collect();
@@ -150,7 +153,10 @@ fn generate_toml_method(
 
             // Output the value
             output_parts.push(quote! {
-                output.push_str(&format!("{} = {:?}\n\n", #field_name_str, self.#field_name));
+                output.push_str(&format!("{} = {}\n\n", #field_name_str, match toml::Value::try_from(&self.#field_name) {
+                    Ok(v) => format!("{}", v),
+                    Err(_) => format!("{:?}", self.#field_name),
+                }));
             });
         } else if let Some(type_name) = type_name {
             // Config struct - generate section dynamically
