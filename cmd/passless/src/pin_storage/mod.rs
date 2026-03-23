@@ -19,7 +19,7 @@ use soft_fido2::{PinState, StatusCode};
 ///
 /// Contains PIN configuration that should be synchronized across all machines
 /// using the same password-store. Changes to this file are committed to git.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SerializablePinConfig {
     /// PIN hash as raw bytes (None if no PIN set)
     #[serde(skip_serializing_if = "Option::is_none")]

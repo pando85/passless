@@ -7,8 +7,8 @@ use crate::storage::pass::GpgBackend;
 
 use passless_core::error::{Error, Result};
 
-use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
@@ -27,7 +27,7 @@ pub struct PassPinStorage {
     fido2_path: PathBuf,
     gpg_backend: GpgBackend,
     /// Last known config state for change detection (for git sync optimization)
-    last_config: RefCell<Option<SerializablePinConfig>>,
+    last_config: RwLock<Option<SerializablePinConfig>>,
 }
 
 impl PassPinStorage {
@@ -42,7 +42,7 @@ impl PassPinStorage {
             store_path,
             fido2_path,
             gpg_backend,
-            last_config: RefCell::new(None),
+            last_config: RwLock::new(None),
         }
     }
 
@@ -259,7 +259,7 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        *self.last_config.borrow_mut() = Some(config.clone());
+        *self.last_config.write().unwrap() = Some(config.clone());
         debug!("PIN config saved and synced successfully");
         Ok(())
     }
@@ -304,7 +304,7 @@ impl PassPinStorage {
     }
 
     fn config_changed(&self, new_config: &SerializablePinConfig) -> bool {
-        let last = self.last_config.borrow();
+        let last = self.last_config.read().unwrap();
         match last.as_ref() {
             Some(old) => old != new_config,
             None => true,
@@ -324,7 +324,7 @@ impl PinStorage for PassPinStorage {
         let retries = self.load_retries()?;
 
         // Cache the loaded config for change detection
-        *self.last_config.borrow_mut() = Some(config.clone());
+        *self.last_config.write().unwrap() = Some(config.clone());
 
         let state = SerializablePinState::from_parts(&config, &retries);
         Ok(state.into())
