@@ -259,7 +259,10 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        *self.last_config.write().unwrap() = Some(config.clone());
+        *self.last_config.write().map_err(|e| {
+            warn!("Failed to acquire config lock: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })? = Some(config.clone());
         debug!("PIN config saved and synced successfully");
         Ok(())
     }
@@ -304,7 +307,10 @@ impl PassPinStorage {
     }
 
     fn config_changed(&self, new_config: &SerializablePinConfig) -> bool {
-        let last = self.last_config.read().unwrap();
+        let last = match self.last_config.read() {
+            Ok(l) => l,
+            Err(_) => return true,
+        };
         match last.as_ref() {
             Some(old) => old != new_config,
             None => true,
@@ -323,8 +329,10 @@ impl PinStorage for PassPinStorage {
         let config = self.load_config()?;
         let retries = self.load_retries()?;
 
-        // Cache the loaded config for change detection
-        *self.last_config.write().unwrap() = Some(config.clone());
+        *self.last_config.write().map_err(|e| {
+            warn!("Failed to acquire config lock: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })? = Some(config.clone());
 
         let state = SerializablePinState::from_parts(&config, &retries);
         Ok(state.into())
