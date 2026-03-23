@@ -73,11 +73,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           target: ${{ matrix.job.target }}
-          override: true
+        if: matrix.job.os != 'ubuntu-22.04'
+
+      - name: Install Rust toolchain (pinned for older glibc)
+        uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          target: ${{ matrix.job.target }}
+        if: matrix.job.os == 'ubuntu-22.04'
 
       - name: Build
         shell: bash
