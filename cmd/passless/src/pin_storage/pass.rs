@@ -314,6 +314,12 @@ impl PassPinStorage {
 
 impl PinStorage for PassPinStorage {
     fn load_pin_state(&self) -> std::result::Result<soft_fido2::PinState, soft_fido2::StatusCode> {
+        // Pull latest changes from git remote if configured
+        if let Err(e) = self.sync_prepare() {
+            warn!("Failed to prepare sync for PIN config: {:?}", e);
+            // Continue anyway - local state is still valid
+        }
+
         let config = self.load_config()?;
         let retries = self.load_retries()?;
 
