@@ -96,10 +96,10 @@ impl TpmPinStorage {
         {
             use std::str::FromStr;
 
-            use aes_gcm::Aes256Gcm;
             use aes_gcm::aead::{Aead, KeyInit, OsRng};
+            use aes_gcm::Aes256Gcm;
+            use aes_gcm::Nonce;
             use rand::RngCore;
-            use sha2::digest::generic_array::GenericArray;
             use tss_esapi::attributes::ObjectAttributesBuilder;
             use tss_esapi::constants::SessionType;
             use tss_esapi::interface_types::algorithm::PublicAlgorithm;
@@ -224,7 +224,7 @@ impl TpmPinStorage {
 
             let mut nonce_bytes = [0u8; 12];
             OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = GenericArray::from_slice(&nonce_bytes);
+            let nonce = Nonce::from_slice(&nonce_bytes);
 
             let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
                 warn!("Failed to create AES cipher: {:?}", e);
