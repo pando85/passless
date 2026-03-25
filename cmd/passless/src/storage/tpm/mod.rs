@@ -4,8 +4,8 @@ pub mod init;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
-    load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    get_credential_path, load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    CredentialCache, CredentialIndexes, CredentialPathInfo,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{bytes_to_hex, create_secure_dir_all, create_secure_file};
@@ -23,7 +23,6 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use log::{debug, info};
 use rand::RngCore;
-use sha2::digest::generic_array::GenericArray;
 use tss_esapi::constants::SessionType;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
@@ -245,7 +244,7 @@ impl TpmStorageAdapter {
         // Generate a random 96-bit nonce for AES-GCM
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = GenericArray::from_slice(&nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
         // Encrypt the credential data with AES-GCM
         let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
