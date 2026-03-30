@@ -33,6 +33,10 @@ pub struct SerializablePinConfig {
     /// Force PIN change flag
     #[serde(default)]
     pub force_pin_change: bool,
+    /// Modification timestamp in milliseconds since Unix epoch
+    /// Used for conflict resolution when syncing across machines
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<u64>,
 }
 
 fn default_min_pin_length() -> u8 {
@@ -58,11 +62,16 @@ impl SerializablePinConfig {
 
 impl From<&PinState> for SerializablePinConfig {
     fn from(state: &PinState) -> Self {
+        let modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .ok();
         Self {
             pin_hash: state.pin_hash.as_ref().map(|h| h.as_array().to_vec()),
             min_pin_length: state.min_pin_length,
             version: state.version,
             force_pin_change: state.force_pin_change,
+            modified_at,
         }
     }
 }

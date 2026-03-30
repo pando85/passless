@@ -17,6 +17,14 @@ use prs_lib::{Ciphertext, Plaintext, Store};
 const PIN_CONFIG_ENTRY: &str = "pin_state";
 const PIN_RETRIES_ENTRY: &str = "pin_retries";
 
+/// Tracked state for conflict detection
+#[derive(Debug, Clone)]
+struct SyncedConfig {
+    version: u64,
+    modified_at: Option<u64>,
+    pin_hash: Option<Vec<u8>>,
+}
+
 /// Pass (password-store) PIN storage
 ///
 /// Stores PIN state as two GPG-encrypted entries in the password store:
@@ -28,6 +36,8 @@ pub struct PassPinStorage {
     gpg_backend: GpgBackend,
     /// Last known config state for change detection (for git sync optimization)
     last_config: RwLock<Option<SerializablePinConfig>>,
+    /// Last synced config state for conflict detection
+    last_synced: RwLock<Option<SyncedConfig>>,
 }
 
 impl PassPinStorage {
@@ -43,6 +53,7 @@ impl PassPinStorage {
             fido2_path,
             gpg_backend,
             last_config: RwLock::new(None),
+            last_synced: RwLock::new(None),
         }
     }
 
@@ -316,6 +327,93 @@ impl PassPinStorage {
             None => true,
         }
     }
+
+    /// Check for conflict between local changes and remote config
+    /// Returns Some(resolved_config) if conflict was resolved, None if no conflict
+    fn check_and_resolve_conflict(
+        &self,
+        local_config: &SerializablePinConfig,
+    ) -> std::result::Result<Option<SerializablePinConfig>, soft_fido2::StatusCode> {
+        let last_synced = match self.last_synced.read() {
+            Ok(l) => l.clone(),
+            Err(_) => return Ok(None),
+        };
+
+        let Some(synced) = last_synced else {
+            debug!("No previous synced state, no conflict check needed");
+            return Ok(None);
+        };
+
+        // Pull latest from remote to check for conflicts
+        if let Err(e) = self.sync_prepare() {
+            warn!("Failed to prepare sync for conflict check: {:?}", e);
+        }
+
+        // Load remote config after pull
+        let remote_config = self.load_config()?;
+
+        // Check if remote changed since we last synced
+        let remote_changed =
+            remote_config.version != synced.version || remote_config.pin_hash != synced.pin_hash;
+
+        if !remote_changed {
+            debug!("Remote config unchanged since last sync, no conflict");
+            return Ok(None);
+        }
+
+        // Check if local changed since we last synced
+        let local_changed =
+            local_config.version != synced.version || local_config.pin_hash != synced.pin_hash;
+
+        if !local_changed {
+            debug!("Remote changed but local unchanged, using remote config");
+            return Ok(Some(remote_config));
+        }
+
+        // Both changed - conflict detected
+        warn!("PIN config conflict detected: both local and remote changed since last sync");
+        warn!(
+            "Local: version={}, modified_at={:?}",
+            local_config.version, local_config.modified_at
+        );
+        warn!(
+            "Remote: version={}, modified_at={:?}",
+            remote_config.version, remote_config.modified_at
+        );
+
+        // Timestamp-based resolution: newer wins
+        let local_time = local_config.modified_at.unwrap_or(0);
+        let remote_time = remote_config.modified_at.unwrap_or(0);
+
+        if remote_time > local_time {
+            info!(
+                "Conflict resolved: remote config is newer ({} > {}), using remote",
+                remote_time, local_time
+            );
+            return Ok(Some(remote_config));
+        } else if local_time > remote_time {
+            info!(
+                "Conflict resolved: local config is newer ({} > {}), keeping local",
+                local_time, remote_time
+            );
+            return Ok(None);
+        }
+
+        // Same timestamp or both missing - use version as tie-breaker
+        if remote_config.version > local_config.version {
+            info!(
+                "Conflict resolved: remote has higher version ({} > {})",
+                remote_config.version, local_config.version
+            );
+            return Ok(Some(remote_config));
+        }
+
+        info!(
+            "Conflict resolved: local has higher or equal version ({} >= {})",
+            local_config.version, remote_config.version
+        );
+        Ok(None)
+    }
 }
 
 impl PinStorage for PassPinStorage {
@@ -323,11 +421,20 @@ impl PinStorage for PassPinStorage {
         // Pull latest changes from git remote if configured
         if let Err(e) = self.sync_prepare() {
             warn!("Failed to prepare sync for PIN config: {:?}", e);
-            // Continue anyway - local state is still valid
         }
 
         let config = self.load_config()?;
         let retries = self.load_retries()?;
+
+        // Track synced state for conflict detection
+        *self.last_synced.write().map_err(|e| {
+            warn!("Failed to acquire synced lock: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })? = Some(SyncedConfig {
+            version: config.version,
+            modified_at: config.modified_at,
+            pin_hash: config.pin_hash.clone(),
+        });
 
         *self.last_config.write().map_err(|e| {
             warn!("Failed to acquire config lock: {:?}", e);
@@ -355,8 +462,55 @@ impl PinStorage for PassPinStorage {
         }
 
         if self.config_changed(&new_config) {
-            debug!("PIN config changed, saving and syncing");
+            debug!("PIN config changed, checking for conflicts...");
+
+            // Check for conflicts with remote
+            match self.check_and_resolve_conflict(&new_config)? {
+                Some(resolved_config) => {
+                    warn!("Conflict resolved by using remote config, updating local state");
+                    // Use resolved config from remote, but update retries locally
+                    let resolved_state =
+                        SerializablePinState::from_parts(&resolved_config, &new_retries);
+                    let resolved_pin_state: soft_fido2::PinState = resolved_state.into();
+
+                    // Update our tracked state
+                    *self.last_synced.write().map_err(|e| {
+                        warn!("Failed to acquire synced lock: {:?}", e);
+                        soft_fido2::StatusCode::Other
+                    })? = Some(SyncedConfig {
+                        version: resolved_config.version,
+                        modified_at: resolved_config.modified_at,
+                        pin_hash: resolved_config.pin_hash.clone(),
+                    });
+
+                    *self.last_config.write().map_err(|e| {
+                        warn!("Failed to acquire config lock: {:?}", e);
+                        soft_fido2::StatusCode::Other
+                    })? = Some(resolved_config);
+
+                    // Save retries locally (no sync)
+                    self.save_retries(&new_retries)?;
+
+                    // Return error to indicate the operation should be retried with updated state
+                    return Err(soft_fido2::StatusCode::Other);
+                }
+                None => {
+                    debug!("No conflict, proceeding with save");
+                }
+            }
+
+            debug!("Saving PIN config and syncing");
             self.save_config(&new_config)?;
+
+            // Update synced state after successful save
+            *self.last_synced.write().map_err(|e| {
+                warn!("Failed to acquire synced lock: {:?}", e);
+                soft_fido2::StatusCode::Other
+            })? = Some(SyncedConfig {
+                version: new_config.version,
+                modified_at: new_config.modified_at,
+                pin_hash: new_config.pin_hash.clone(),
+            });
         } else {
             debug!("PIN config unchanged, skipping save");
         }
