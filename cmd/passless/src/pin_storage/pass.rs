@@ -21,6 +21,7 @@ const PIN_RETRIES_ENTRY: &str = "pin_retries";
 #[derive(Debug, Clone)]
 struct SyncedConfig {
     version: u64,
+    #[allow(dead_code)]
     modified_at: Option<u64>,
     pin_hash: Option<Vec<u8>>,
 }
@@ -471,7 +472,7 @@ impl PinStorage for PassPinStorage {
                     // Use resolved config from remote, but update retries locally
                     let resolved_state =
                         SerializablePinState::from_parts(&resolved_config, &new_retries);
-                    let resolved_pin_state: soft_fido2::PinState = resolved_state.into();
+                    let _resolved_pin_state: soft_fido2::PinState = resolved_state.into();
 
                     // Update our tracked state
                     *self.last_synced.write().map_err(|e| {
