@@ -110,28 +110,28 @@ check_manifest() {
 run_gramine() {
     local manifest_name
     manifest_name=$(basename "$MANIFEST" .manifest.sgx)
-    
+
     echo "Starting Passless in Intel SGX enclave..."
     echo "Manifest: $manifest_name"
     echo "Storage: $([ "$USE_SEALED" = true ] && echo "SGX Sealed" || echo "Standard")"
     echo ""
-    
+
     cd "$GRAMINE_DIR"
-    
+
     # Build gramine-sgx command
     local cmd="gramine-sgx"
-    
+
     if $VERBOSE; then
         cmd="$cmd -v"
     fi
-    
+
     cmd="$cmd $manifest_name"
-    
+
     # Add passless args if provided
     if [ ${#PASSLESS_ARGS[@]} -gt 0 ]; then
         cmd="$cmd ${PASSLESS_ARGS[*]}"
     fi
-    
+
     exec $cmd
 }
 
