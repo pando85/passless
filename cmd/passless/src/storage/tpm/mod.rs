@@ -8,7 +8,7 @@ use crate::storage::index::{
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
-use crate::util::bytes_to_hex;
+use crate::util::{bytes_to_hex, create_secure_dir_all, create_secure_file};
 
 use soft_fido2::Result;
 
@@ -23,7 +23,6 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use log::{debug, info};
 use rand::RngCore;
-use sha2::digest::generic_array::GenericArray;
 use tss_esapi::constants::SessionType;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
@@ -245,7 +244,7 @@ impl TpmStorageAdapter {
         // Generate a random 96-bit nonce for AES-GCM
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = GenericArray::from_slice(&nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
         // Encrypt the credential data with AES-GCM
         let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
@@ -553,9 +552,9 @@ impl TpmStorageAdapter {
         let path = get_credential_path(&self.storage_dir, &cred.rp.id, &cred.id, "tpm");
         debug!("Writing credential to: {:?}", path);
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists with secure permissions
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_secure_dir_all(parent).map_err(|e| {
                 debug!("Failed to create directory: {}", e);
                 soft_fido2::Error::Other
             })?;
@@ -569,7 +568,7 @@ impl TpmStorageAdapter {
         // Seal the data using TPM
         let sealed_data = self.seal_data(&bytes)?;
 
-        let mut file = File::create(&path).map_err(|e| {
+        let mut file = create_secure_file(&path).map_err(|e| {
             log::error!("Failed to create credential file {}: {}", path.display(), e);
             soft_fido2::Error::Other
         })?;

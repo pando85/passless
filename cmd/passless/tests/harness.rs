@@ -39,6 +39,9 @@ pub struct LocalBackend {
     temp_dir: TempDir,
     vendor_id: Option<u16>,
     product_id: Option<u16>,
+    pin_enforcement: Option<String>,
+    always_uv: Option<bool>,
+    custom_path: Option<std::path::PathBuf>,
 }
 
 impl LocalBackend {
@@ -48,7 +51,34 @@ impl LocalBackend {
             temp_dir,
             vendor_id: None,
             product_id: None,
+            pin_enforcement: None,
+            always_uv: None,
+            custom_path: None,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn with_pin_enforcement(mut self, enforcement: &str) -> Self {
+        self.pin_enforcement = Some(enforcement.to_string());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_always_uv(mut self, always_uv: bool) -> Self {
+        self.always_uv = Some(always_uv);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_path(path: std::path::PathBuf) -> Self {
+        Self {
+            temp_dir: TempDir::new().unwrap(),
+            vendor_id: None,
+            product_id: None,
+            pin_enforcement: None,
+            always_uv: None,
+            custom_path: Some(path),
+        }
     }
 }
 
@@ -69,16 +99,28 @@ impl BackendSetup for LocalBackend {
                 format!("0x{:04x}", product_id),
             );
         }
+        if let Some(ref enforcement) = self.pin_enforcement {
+            env.insert("PASSLESS_PIN_ENFORCEMENT".to_string(), enforcement.clone());
+        }
+        if let Some(always_uv) = self.always_uv {
+            env.insert("PASSLESS_ALWAYS_UV".to_string(), always_uv.to_string());
+        }
 
         Ok(env)
     }
 
     fn args(&self) -> Vec<String> {
+        let path = self
+            .custom_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| self.temp_dir.path().display().to_string());
+
         vec![
             "--backend-type".to_string(),
             "local".to_string(),
             "--local-path".to_string(),
-            self.temp_dir.path().display().to_string(),
+            path,
             "-v".to_string(),
         ]
     }
@@ -373,6 +415,12 @@ impl AuthenticatorHarness {
     /// Create a harness with local backend
     pub fn with_local() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(LocalBackend::new()?)))
+    }
+
+    /// Create a harness with local backend at a specific path (for persistence testing)
+    #[allow(dead_code)]
+    pub fn with_local_path(path: std::path::PathBuf) -> Self {
+        Self::new(Box::new(LocalBackend::with_path(path)))
     }
 
     /// Create a harness with password-store backend

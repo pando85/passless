@@ -5,6 +5,130 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0](https://github.com/pando85/passless/tree/v0.10.0) - 2026-03-23
+
+### Added
+
+- Split PIN state into config and retries files for pass backend ([42bea86](https://github.com/pando85/passless/commit/42bea860fc8cdb4302c810d346bfde0ed9e99166))
+
+### Fixed
+
+- Use correct path for cargo install in workspace ([82eed51](https://github.com/pando85/passless/commit/82eed5186347663a8034202529de3e786e9130fb))
+- Pull latest PIN config from git before loading ([19cf0d1](https://github.com/pando85/passless/commit/19cf0d1f08cf1dd5c1f946a6019c455d20657f1c))
+- Resolve thread safety and PartialEq issues in PassPinStorage ([902ef16](https://github.com/pando85/passless/commit/902ef1625c5fc451ee91a2b77bee972f30a51bd5))
+- Handle RwLock poisoning gracefully in PassPinStorage ([405ede5](https://github.com/pando85/passless/commit/405ede5a306036806118ee6c9fafc0fcbea7397e))
+
+### Build
+
+- deps: Update Rust crate toml to v1.0.7 ([05d19c4](https://github.com/pando85/passless/commit/05d19c416951332fa325aa83a883823a183a68fa))
+- deps: Update Rust crate toml to v1.1.0 ([47fc190](https://github.com/pando85/passless/commit/47fc1902063a8ac4141fdd2d321489410e7ed0d6))
+- deps: Update Rust crate env_logger to v0.11.10 ([6477b6a](https://github.com/pando85/passless/commit/6477b6a85a48bda70ef501b3cddb38e2abb099c7))
+
+### Styling
+
+- Fix import ordering in tpm.rs ([2fe755c](https://github.com/pando85/passless/commit/2fe755c72fe401c7018beb3810224e924924dae6))
+
+## [v0.9.3](https://github.com/pando85/passless/tree/v0.9.3) - 2026-03-13
+
+### Fixed
+
+- Remove redundant default attribute on constant_signature_counter ([595f781](https://github.com/pando85/passless/commit/595f781216249460f6075d3617b8c735056f045c))
+- Use ClapSerde::Opt for config deserialization to respect defaults ([5fd2496](https://github.com/pando85/passless/commit/5fd2496e5dd1de669137c45cecdf120f3ee374c8))
+- Use toml::Value for proper serialization in config print ([ea680d0](https://github.com/pando85/passless/commit/ea680d0d8231fe6b395e5469cfcde5917c2851d9))
+
+### Build
+
+- deps: Update Rust crate soft-fido2 to v0.12.2 ([d9a58df](https://github.com/pando85/passless/commit/d9a58df21bc75027bc85e58184b8cbbca1f8ce75))
+
+## [v0.9.2](https://github.com/pando85/passless/tree/v0.9.2) - 2026-03-13
+
+### Fixed
+
+- Return AcceptedWithUp from request_uv to prevent double notification ([1c94602](https://github.com/pando85/passless/commit/1c946023b66b284a8c433ddb17c1bb6fe2105875))
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.6.0 ([7ed53b8](https://github.com/pando85/passless/commit/7ed53b8c20844128b4c0f3c3d197e0c8571e9817))
+- deps: Update Rust crate clap to v4.6.0 ([3c5fe4e](https://github.com/pando85/passless/commit/3c5fe4ed182e8409017a2ed51a15fe1094e44eba))
+
+## [v0.9.1](https://github.com/pando85/passless/tree/v0.9.1) - 2026-03-12
+
+### Added
+
+- Add configurable PIN enforcement policies ([456ad31](https://github.com/pando85/passless/commit/456ad31ee5f9d858365f201796f214b4cb725053))
+- Update soft-fido2 to 0.12.1 for proper PIN prompting ([fe549e2](https://github.com/pando85/passless/commit/fe549e2f4df73dcb9842b53b1675316116c15a37))
+
+### Fixed
+
+- Prevent duplicate credential entries when updating sign counter ([3d3f91a](https://github.com/pando85/passless/commit/3d3f91ae7e2cf7dcada1764326d8ae677602024c))
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.5.67 ([75aeba6](https://github.com/pando85/passless/commit/75aeba6d733a8798522dae510f6e0df03bfa00af))
+- deps: Update Rust crate clap to v4.5.61 ([1967937](https://github.com/pando85/passless/commit/19679375a6827410b869fa117e78654d7d910ee4))
+
+## [v0.9.0](https://github.com/pando85/passless/tree/v0.9.0) - 2026-03-11
+
+### Added
+
+- Add PIN storage infrastructure ([69336a4](https://github.com/pando85/passless/commit/69336a420382f4c5251be3c22145efecc8ad5c19))
+- Implement PIN set and change commands ([bee72b9](https://github.com/pando85/passless/commit/bee72b9625a491191c184f1edfb0ec6e9e0544c5))
+- Wire up PIN storage backends in main.rs ([f683e45](https://github.com/pando85/passless/commit/f683e45b9d06aab4d43fae549e5b88334acba2bc))
+
+### Build
+
+- deps: Update Rust crate tempfile to v3.27.0 ([d9bb6d1](https://github.com/pando85/passless/commit/d9bb6d15249aa5e4248223790da8d1cf6a65fd34))
+
+### Testing
+
+- Add E2E test for PIN set and change commands ([7d26fac](https://github.com/pando85/passless/commit/7d26fac7ee8fe53b4b4f9cc982f5cf230fb4c608))
+
+### Chore
+
+- Disable subject-case commitlint rule ([7a0e6c3](https://github.com/pando85/passless/commit/7a0e6c3571c9e6e97d88d301124b9a27c79454b9))
+
+## [v0.8.2](https://github.com/pando85/passless/tree/v0.8.2) - 2026-03-11
+
+### Build
+
+- Prepare for soft-fido2 0.11.2 ([3c00503](https://github.com/pando85/passless/commit/3c0050376c5f7d2be90ddf891aa508b9c164615d))
+
+## [v0.8.1](https://github.com/pando85/passless/tree/v0.8.1) - 2026-03-10
+
+### Revert
+
+- Downgrade to soft-fido 0.10 ([1b8cc91](https://github.com/pando85/passless/commit/1b8cc91c743b0ffb55ebf21f63b217af90c076b5))
+
+## [v0.8.0](https://github.com/pando85/passless/tree/v0.8.0) - 2026-03-10
+
+### Added
+
+- Add eddsa support for ssh sk keys ([f1c5770](https://github.com/pando85/passless/commit/f1c5770f5aefeee35f49e9003da583ea77df0a97))
+
+### Fixed
+
+- Ensure files and directories are created with user-only permissions ([1c5ca50](https://github.com/pando85/passless/commit/1c5ca50b43a591cfe658d0661cdcfd55c7b57cb9))
+- Remove duplicate code in local/init.rs ([cf3e7c9](https://github.com/pando85/passless/commit/cf3e7c9567f1e91c745ada815ef3c6aeb0fc4f59))
+- Resolve duplicate definitions and import issues ([d07e629](https://github.com/pando85/passless/commit/d07e629a3dcb45b0f8466dc73e54f9cbb59a0220))
+- Allow dead code for write_secure_file utility ([b82a9ee](https://github.com/pando85/passless/commit/b82a9eec535f4cb3893fc4c2e7156ec946dbc002))
+- Simplify create_secure_dir_all to only set permissions on target ([ac43b10](https://github.com/pando85/passless/commit/ac43b101b60c79fa8a208babd9a1a808d0e6a445))
+
+### Build
+
+- deps: Update Rust crate syn to v2.0.116 ([9898065](https://github.com/pando85/passless/commit/9898065836fc749ce25a2777348c02aaff77262c))
+- deps: Update Rust crate toml to v1.0.2 ([2fb012e](https://github.com/pando85/passless/commit/2fb012ed09654470ea08e6dfffce855cd134ae67))
+- deps: Update Rust crate clap to v4.5.59 ([a889c11](https://github.com/pando85/passless/commit/a889c1139021cf1ab21869e70d80909816ff4fe4))
+- deps: Update Rust crate toml to v1.0.3 ([72388a6](https://github.com/pando85/passless/commit/72388a6073b35ac8aa1286104ea1acdc6fea4c9d))
+- deps: Update Rust crate clap to v4.5.60 ([1137a85](https://github.com/pando85/passless/commit/1137a8564e37dd16b0a6cc1a01ff39e41a567664))
+- deps: Update Rust crate syn to v2.0.117 ([5e25d7d](https://github.com/pando85/passless/commit/5e25d7de6a91201a0a35c0fe53088e056f3c1f40))
+- deps: Update Rust crate nix to v0.31.2 ([39a8e95](https://github.com/pando85/passless/commit/39a8e95d2c996468ef1c49a6e62cd0e48a7aac77))
+- deps: Update Rust crate tempfile to v3.26.0 ([6f93f2e](https://github.com/pando85/passless/commit/6f93f2e2f6e1b6cb5d0d9ff8513f73e574c9131d))
+- deps: Update Rust crate quote to v1.0.45 ([e1d8fa0](https://github.com/pando85/passless/commit/e1d8fa027ad5291870dcc4f37492624995ad26d7))
+- deps: Update Rust crate toml to v1.0.4 ([4631c1d](https://github.com/pando85/passless/commit/4631c1d6ff18f1267085e8b4d87674b2ab128227))
+- deps: Update Rust crate toml to v1.0.6 ([e5ae4cc](https://github.com/pando85/passless/commit/e5ae4ccf37ac197f652b05564b3831af4ab17328))
+- deps: Update Rust crate libc to v0.2.183 ([c54a03d](https://github.com/pando85/passless/commit/c54a03d4273868ac3068fa7967890d9097e85358))
+- deps: Update Rust crate shadow-rs to v1.7.1 ([6f29752](https://github.com/pando85/passless/commit/6f297525df3c2fe3e6a2b70739bc1651a5f3be1a))
+
 ## [v0.7.6](https://github.com/pando85/passless/tree/v0.7.6) - 2026-02-14
 
 ### Added

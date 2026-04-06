@@ -4,10 +4,10 @@ use super::directory_created::DirectoryCreated;
 
 use crate::notification::{YesNoResult, show_info_notification, show_yes_no_notification};
 use crate::storage::pass::GpgBackend;
+use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
 
-use std::fs;
 use std::path::PathBuf;
 
 use log::{debug, info, warn};
@@ -83,7 +83,7 @@ impl Uninitialized {
         }
 
         if !self.store_path.exists() {
-            fs::create_dir_all(&self.store_path).map_err(|e| {
+            create_secure_dir_all(&self.store_path).map_err(|e| {
                 let msg = format!("Failed to create store directory: {}", e);
                 let _ = crate::notification::show_error_notification("Initialization Failed", &msg);
                 Error::Storage(msg)

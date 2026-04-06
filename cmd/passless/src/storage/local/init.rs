@@ -5,9 +5,9 @@
 use crate::notification::{
     YesNoResult, show_error_notification, show_info_notification, show_yes_no_notification,
 };
+use crate::util::create_secure_dir_all;
 use passless_core::error::{Error, Result};
 
-use std::fs;
 use std::path::Path;
 
 use log::{info, warn};
@@ -66,7 +66,7 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
         }
     }
 
-    fs::create_dir_all(storage_path).map_err(|e| {
+    create_secure_dir_all(storage_path).map_err(|e| {
         let msg = format!("Failed to create storage directory: {}", e);
         let _ = show_error_notification("Initialization Failed", &msg);
         Error::Storage(msg)
