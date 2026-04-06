@@ -1,6 +1,7 @@
 mod authenticator;
 mod commands;
 mod notification;
+mod pin_storage;
 mod storage;
 mod util;
 
@@ -12,6 +13,7 @@ use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet, UhidDevi
 
 use std::process;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use authenticator::AuthenticatorService;
@@ -19,6 +21,9 @@ use clap::Parser;
 use commands::custom::register_yubikey_credential_mgmt;
 use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
+#[cfg(feature = "tpm")]
+use pin_storage::TpmPinStorage;
+use pin_storage::{LocalPinStorage, PassPinStorage, PinStorage};
 use shadow_rs::shadow;
 #[cfg(feature = "tpm")]
 use storage::TpmStorageAdapter;
@@ -40,21 +45,22 @@ struct CliArgs {
 }
 
 /// Wrapper for AuthenticatorService that implements CommandHandler
-struct ServiceHandler<S: CredentialStorage> {
-    service: std::sync::Mutex<AuthenticatorService<S>>,
+struct ServiceHandler<S: CredentialStorage, P: PinStorage> {
+    service: std::sync::Mutex<AuthenticatorService<S, P>>,
 }
 
-impl<S: CredentialStorage> ServiceHandler<S> {
-    fn new(service: AuthenticatorService<S>) -> Self {
+impl<S: CredentialStorage, P: PinStorage> ServiceHandler<S, P> {
+    fn new(service: AuthenticatorService<S, P>) -> Self {
         Self {
             service: std::sync::Mutex::new(service),
         }
     }
 }
 
-impl<S: CredentialStorage + 'static> CommandHandler for ServiceHandler<S> {
+impl<S: CredentialStorage + 'static, P: PinStorage + 'static> CommandHandler
+    for ServiceHandler<S, P>
+{
     fn handle_command(&mut self, cmd: Cmd, data: &[u8]) -> soft_fido2_transport::Result<Vec<u8>> {
-        // Only handle CBOR commands (CTAP2)
         if cmd != Cmd::Cbor {
             return Err(soft_fido2_transport::Error::InvalidCommand);
         }
@@ -73,33 +79,28 @@ impl<S: CredentialStorage + 'static> CommandHandler for ServiceHandler<S> {
 }
 
 /// Helper function to run the main loop with any storage backend
-fn run_with_service<S: CredentialStorage + 'static>(
-    mut service: AuthenticatorService<S>,
+fn run_with_service<S: CredentialStorage + 'static, P: PinStorage + 'static>(
+    mut service: AuthenticatorService<S, P>,
     uhid: UhidDevice,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("{}", service.storage_info());
 
-    // Register custom commands for compatibility (placeholder for now)
     register_yubikey_credential_mgmt(&mut service);
 
-    // Main loop - process CTAP packets
     info!("Authenticator is running");
     info!("Press Ctrl+C to stop");
 
-    // Store a reference to storage for periodic cleanup (before moving service)
     let service_ref = service.storage.clone();
 
     let handler = ServiceHandler::new(service);
     let mut ctaphid_handler = CtapHidHandler::new(handler);
     let mut buffer = [0u8; 64];
 
-    // Track time for periodic cache cleanup
     let mut last_cache_cleanup = std::time::Instant::now();
     const CACHE_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     loop {
-        // Check if shutdown was requested
         if shutdown.load(Ordering::Relaxed) {
             info!("Shutdown signal received, cleaning up...");
             break;
@@ -114,22 +115,18 @@ fn run_with_service<S: CredentialStorage + 'static>(
 
         match uhid.read_packet(&mut buffer) {
             Ok(Some(_)) => {
-                // Parse packet
                 let packet = Packet::from_bytes(buffer);
 
-                // Process through CTAP HID handler
                 let response_packets = ctaphid_handler
                     .process_packet(packet)
                     .map_err(|_| Error::Other("CTAP HID processing failed".to_string()))?;
 
-                // Write response packets
                 for response_packet in response_packets {
                     uhid.write_packet(response_packet.as_bytes())
                         .map_err(|_| Error::Other("Failed to write packet".to_string()))?;
                 }
             }
             Ok(None) => {
-                // No data, sleep briefly to avoid busy-waiting
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
@@ -140,7 +137,6 @@ fn run_with_service<S: CredentialStorage + 'static>(
         }
     }
 
-    // Cleanup before exit
     info!("Performing final cache cleanup...");
     if let Ok(mut storage) = service_ref.lock() {
         storage.cleanup_expired_cache();
@@ -305,13 +301,23 @@ fn run() -> Result<()> {
     // Get security config
     let security_config = config.security_config();
 
+    // Get PIN config
+    let pin_config = config.pin_config();
+
     match config.backend().map_err(|e| {
         error!("Failed to load backend config: {}", e);
         e
     })? {
         BackendConfig::Local { path } => {
-            let storage = LocalStorageAdapter::new(path.into())?;
-            let service = AuthenticatorService::new(storage, security_config)?;
+            let storage = LocalStorageAdapter::new(path.clone().into())?;
+            let pin_storage = LocalPinStorage::new(path.into());
+            let pin_storage = Arc::new(Mutex::new(pin_storage));
+            let service = AuthenticatorService::with_pin_storage(
+                storage,
+                Some(pin_storage),
+                security_config,
+                pin_config,
+            )?;
             run_with_service(service, uhid, shutdown)
         }
         BackendConfig::Pass {
@@ -320,14 +326,32 @@ fn run() -> Result<()> {
             gpg_backend,
         } => {
             let gpg_backend = storage::pass::GpgBackend::from_str(&gpg_backend)?;
-            let storage = PassStorageAdapter::new(store_path.into(), path.into(), gpg_backend)?;
-            let service = AuthenticatorService::new(storage, security_config)?;
+            let storage = PassStorageAdapter::new(
+                store_path.clone().into(),
+                path.clone().into(),
+                gpg_backend,
+            )?;
+            let pin_storage = PassPinStorage::new(store_path.into(), path.into(), gpg_backend);
+            let pin_storage = Arc::new(Mutex::new(pin_storage));
+            let service = AuthenticatorService::with_pin_storage(
+                storage,
+                Some(pin_storage),
+                security_config,
+                pin_config,
+            )?;
             run_with_service(service, uhid, shutdown)
         }
         #[cfg(feature = "tpm")]
         BackendConfig::Tpm { path, tcti } => {
-            let storage = TpmStorageAdapter::new(path.into(), Some(tcti))?;
-            let service = AuthenticatorService::new(storage, security_config)?;
+            let storage = TpmStorageAdapter::new(path.clone().into(), Some(tcti.clone()))?;
+            let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
+            let pin_storage = Arc::new(Mutex::new(pin_storage));
+            let service = AuthenticatorService::with_pin_storage(
+                storage,
+                Some(pin_storage),
+                security_config,
+                pin_config,
+            )?;
             run_with_service(service, uhid, shutdown)
         }
     }

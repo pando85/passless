@@ -48,14 +48,68 @@ Users should choose the solution that best fits their own security and practical
 
 - FIDO2/WebAuthn authentication without hardware tokens
 - Passkey support (resident credentials)
-- User verification via desktop notifications
+- User verification via desktop notifications or PIN
+- PIN support with configurable enforcement policies
 - Storage backends:
   - [pass](https://www.passwordstore.org/) (encrypted, git-synced)
   - TPM 2.0 (Experimental)
   - Local filesystem (testing only)
-- **Intel SGX support via Gramine** (hardware memory isolation)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
+
+## PIN Support
+
+Passless supports optional PIN-based user verification. When a PIN is set, the authenticator
+requires PIN verification for WebAuthn operations based on the configured enforcement policy.
+
+### PIN Enforcement Policies
+
+| Policy | `always_uv=false` | `always_uv=true` |
+|--------|-------------------|------------------|
+| `never` | Notification | Notification |
+| `optional` | Notification | **PIN required** |
+| `required` | **PIN required** | **PIN required** |
+
+**Default:** `enforcement=optional`, `always_uv=true`
+
+### Behavior Matrix
+
+| PIN Set | `enforcement` | `always_uv` | User Verification Method |
+|---------|---------------|-------------|--------------------------|
+| No | any | any | Desktop notification |
+| Yes | `never` | `false` | Desktop notification |
+| Yes | `never` | `true` | Desktop notification |
+| Yes | `optional` | `false` | Desktop notification |
+| Yes | `optional` | `true` | PIN required |
+| Yes | `required` | `false` | PIN required |
+| Yes | `required` | `true` | PIN required |
+
+### Setting a PIN
+
+```bash
+# Set a new PIN
+passless client pin set 1234
+
+# Change existing PIN
+passless client pin change 1234 5678
+```
+
+### Configuration
+
+```toml
+[pin]
+# PIN enforcement policy: "never", "optional", "required"
+enforcement = "optional"
+
+# Minimum PIN length (4-63 characters)
+min_length = 4
+
+# Maximum retry attempts before lockout
+max_retries = 8
+```
+
+Note: For enhanced security with hardware-backed protection, consider using the TPM backend
+which seals credentials to the TPM hardware.
 
 ## Configuration
 
@@ -100,23 +154,11 @@ make install
 yay -S passless
 ```
 
-### Gramine/Intel SGX
+or the binary from AUR:
 
-For enhanced security with hardware memory isolation, Passless can run in an Intel SGX enclave using Gramine.
-
-**Requirements:**
-- Intel SGX-capable CPU (6th gen or newer)
-- SGX enabled in BIOS
-- Linux kernel 5.11+
-
-**Quick start:**
 ```bash
-# Build and run with SGX
-make gramine-build
-make gramine-run
+yay -S passless-bin
 ```
-
-See [Gramine Integration Guide](docs/GRAMINE_INTEGRATION.md) for detailed setup instructions.
 
 ## Acknowledgements
 
