@@ -1,0 +1,31 @@
+[Unit]
+Description=Passless FIDO2 Authenticator (Gramine/SGX)
+Documentation=https://github.com/pando85/passless
+After=network.target
+ConditionPathExists=/dev/sgx_enclave
+ConditionPathExists=/dev/uhid
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/passless-sgx
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/passless
+
+# SGX device access
+DeviceAllow=/dev/sgx_enclave rw
+DeviceAllow=/dev/sgx/provision rw
+DeviceAllow=/dev/uhid rw
+
+# Resource limits
+LimitNOFILE=1024
+TasksMax=10
+
+[Install]
+WantedBy=multi-user.target

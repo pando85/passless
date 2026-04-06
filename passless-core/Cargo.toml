@@ -1,0 +1,24 @@
+[package]
+name = "passless-core"
+description = "Core types and configuration for Passless"
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+version.workspace = true
+
+[features]
+default = []
+tpm = []
+
+[dependencies]
+clap.workspace = true
+clap-serde-derive.workspace = true
+passless-config-doc.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+log.workspace = true
+libc.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+soft-fido2.workspace = true
