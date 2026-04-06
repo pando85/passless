@@ -23,7 +23,7 @@ sudo chmod +x "$GRAMINE_DIR/build.sh"
 sudo chmod +x "$GRAMINE_DIR/run.sh"
 
 # Copy systemd wrapper
-sudo install -m 755 contrib/scripts/passless-sgx-wrapper "$BIN_DIR/passless-sgx"
+sudo install -m 755 contrib/systemd/passless-sgx-wrapper.sh "$BIN_DIR/passless-sgx"
 
 # Build manifest if not exists
 if [ ! -f "$GRAMINE_DIR/passless-sealed.manifest.sgx" ]; then
