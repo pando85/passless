@@ -2,7 +2,7 @@
 
 use super::directory_created::DirectoryCreated;
 
-use crate::notification::{show_info_notification, show_yes_no_notification, YesNoResult};
+use crate::notification::{YesNoResult, show_info_notification, show_yes_no_notification};
 use crate::storage::pass::GpgBackend;
 use crate::util::create_secure_dir_all;
 
