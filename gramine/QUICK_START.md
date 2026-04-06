@@ -92,6 +92,6 @@ cd gramine
 
 ## Next Steps
 
-- Read the full [Gramine Guide](GRAMINE_GUIDE.md) for detailed configuration
-- Learn about [SGX Sealed Storage](GRAMINE_GUIDE.md#storage-modes)
-- Configure [Docker deployment](GRAMINE_GUIDE.md#dockergsc-deployment)
+- Read the full [Gramine Integration Guide](../docs/GRAMINE_INTEGRATION.md) for detailed configuration
+- Learn about [SGX Sealed Storage](../docs/GRAMINE_INTEGRATION.md#storage-modes)
+- Configure [Docker deployment](../docs/GRAMINE_INTEGRATION.md#dockergsc-deployment)
