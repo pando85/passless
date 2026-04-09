@@ -345,7 +345,6 @@ fn authenticate_for_credential_management_opt(
         }
     }
 }
-
 /// Fallback to PIN authentication when UV fails
 fn fallback_to_pin_auth(
     transport: &mut Transport,
