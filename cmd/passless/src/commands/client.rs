@@ -327,6 +327,24 @@ fn authenticate_for_credential_management(
     }
 }
 
+/// Try to authenticate for credential management, returning None on failure
+///
+/// This is used by operations that may proceed without authentication
+/// (e.g., with passless authenticator that allows internal operations).
+fn authenticate_for_credential_management_opt(
+    transport: &mut Transport,
+    output: OutputFormat,
+) -> Option<soft_fido2::request::PinUvAuth> {
+    match authenticate_for_credential_management(transport, output) {
+        Ok(auth) => Some(auth),
+        Err(_) => {
+            if output == OutputFormat::Plain {
+                println!("Proceeding without explicit authentication...\n");
+            }
+            None
+        }
+    }
+}
 /// Fallback to PIN authentication when UV fails
 fn fallback_to_pin_auth(
     transport: &mut Transport,
@@ -594,16 +612,7 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
         }
     }
 
-    // Try to authenticate (may not be needed for passless)
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Get metadata (optional, only for plain output)
     if output == OutputFormat::Plain {
@@ -838,16 +847,7 @@ pub fn show(output: OutputFormat, device: Option<&str>, credential_id_hex: &str)
 
     let mut transport = open_authenticator(device)?;
 
-    // Try to authenticate
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
@@ -999,16 +999,7 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
 
     let mut transport = open_authenticator(device)?;
 
-    // Try to authenticate (may not be needed for passless)
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
@@ -1064,16 +1055,7 @@ pub fn rename(
 
     let mut transport = open_authenticator(device)?;
 
-    // Authenticate for credential management
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
