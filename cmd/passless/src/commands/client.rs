@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use passless_core::{OutputFormat, Result};
 
+use rpassword::read_password;
+
 use serde::Serialize;
 
 use soft_fido2::request::{
@@ -294,6 +296,12 @@ fn open_authenticator(selector: Option<&str>) -> Result<Transport> {
 }
 
 /// Authenticate for credential management operations
+///
+/// Tries the following authentication methods in order:
+/// 1. UV token (built-in user verification)
+/// 2. PIN token (if PIN is set on the authenticator)
+///
+/// Returns an error if neither method is available/supported.
 fn authenticate_for_credential_management(
     transport: &mut Transport,
     output: OutputFormat,
@@ -309,16 +317,102 @@ fn authenticate_for_credential_management(
             }
             Ok(token)
         }
-        Err(e) => {
+        Err(uv_error) => {
             if output == OutputFormat::Plain {
-                println!("  UV not available: {:?}", e);
-                println!("  This authenticator may not support UV tokens");
-                println!("  Trying without explicit authentication...\n");
+                println!("  UV not available: {:?}", uv_error);
             }
-            Err(passless_core::Error::Other(
-                "Authentication not required for this authenticator".to_string(),
-            ))
+
+            fallback_to_pin_auth(transport, output, uv_error)
         }
+    }
+}
+
+/// Fallback to PIN authentication when UV fails
+fn fallback_to_pin_auth(
+    transport: &mut Transport,
+    output: OutputFormat,
+    uv_error: soft_fido2::Error,
+) -> Result<soft_fido2::request::PinUvAuth> {
+    if output == OutputFormat::Plain {
+        println!("  Checking if PIN authentication is available...");
+    }
+
+    let info_response = Client::authenticator_get_info(transport).map_err(|e| {
+        passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
+    })?;
+
+    let info_value: soft_fido2_ctap::cbor::Value = soft_fido2_ctap::cbor::decode(&info_response)
+        .map_err(|e| {
+            passless_core::Error::Other(format!("Failed to decode info response: {:?}", e))
+        })?;
+
+    let info = parse_authenticator_info(&info_value)?;
+
+    let has_cred_mgmt = info
+        .options
+        .as_ref()
+        .and_then(|opts| opts.get("credMgmt").or(opts.get("credentialMgmtPreview")))
+        .copied()
+        .unwrap_or(false);
+
+    if !has_cred_mgmt {
+        return Err(passless_core::Error::Other(
+            "This authenticator does not support credential management".to_string(),
+        ));
+    }
+
+    let client_pin_option = info
+        .options
+        .as_ref()
+        .and_then(|opts| opts.get("clientPin"))
+        .copied();
+
+    match client_pin_option {
+        Some(true) => {
+            if output == OutputFormat::Plain {
+                println!("  PIN is set on this authenticator");
+                println!("  Falling back to PIN authentication...\n");
+                println!("Enter PIN: ");
+            }
+
+            let pin = read_password()
+                .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?;
+
+            if pin.is_empty() {
+                return Err(passless_core::Error::Other(
+                    "PIN is required for credential management on this authenticator".to_string(),
+                ));
+            }
+
+            if output == OutputFormat::Plain {
+                println!();
+            }
+
+            Client::get_pin_token_for_credential_management(transport, &pin, PinProtocol::V2)
+                .map_err(|e| {
+                    passless_core::Error::Other(format!(
+                        "PIN authentication failed: {:?}. UV was also unavailable: {:?}",
+                        e, uv_error
+                    ))
+                })
+        }
+        Some(false) => Err(passless_core::Error::Other(format!(
+            "Credential management requires authentication but:\n\
+                 - UV is unavailable: {:?}\n\
+                 - No PIN is set on this authenticator\n\
+                 \n\
+                 Please set a PIN first using: passless client pin set <PIN>",
+            uv_error
+        ))),
+        None => Err(passless_core::Error::Other(format!(
+            "Credential management requires authentication but:\n\
+                 - UV is unavailable: {:?}\n\
+                 - This authenticator does not support PIN\n\
+                 \n\
+                 This authenticator may require built-in UV (biometric/fingerprint) \
+                 which is currently blocked or unavailable.",
+            uv_error
+        ))),
     }
 }
 
