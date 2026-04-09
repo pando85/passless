@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.1](https://github.com/pando85/passless/tree/v0.10.1) - 2026-04-09
+
+### Fixed
+
+- Add PIN fallback for credential management when UV unavailable ([513d58c](https://github.com/pando85/passless/commit/513d58c6ecf8ac597e8a18ccc454d169e87f6b37))
+
 ## [v0.10.0](https://github.com/pando85/passless/tree/v0.10.0) - 2026-03-23
 
 ### Added
