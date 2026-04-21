@@ -90,8 +90,11 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         };
 
-        if storage.disable_user_verification() && !is_registration && !should_verify {
-            debug!("User verification handled by backend (e.g., GPG): {}", info);
+        if storage.disable_user_verification() && !is_registration {
+            debug!(
+                "User verification handled by backend (e.g., GPG pinentry): {}",
+                info
+            );
             return Ok(UpResult::Accepted);
         }
 
@@ -130,6 +133,30 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
                 info!("E2E test mode: Auto-accepting user verification");
                 return Ok(UvResult::Accepted);
+            }
+        }
+
+        // Check if backend handles user verification (e.g., pass backend with GPG pinentry)
+        // For backends like pass, GPG decryption during authentication provides user verification
+        // through pinentry, so we should not show additional notifications
+        {
+            let storage = match self.storage.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    error!("Failed to acquire storage lock during UV request");
+                    return Err(soft_fido2::Error::Other);
+                }
+            };
+
+            // Determine if this is an authentication request (not registration)
+            let is_authentication = !info.to_lowercase().contains("registration");
+
+            if storage.disable_user_verification() && is_authentication {
+                debug!(
+                    "User verification handled by backend (e.g., GPG pinentry): {}",
+                    info
+                );
+                return Ok(UvResult::AcceptedWithUp);
             }
         }
 
