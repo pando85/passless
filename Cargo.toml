@@ -39,7 +39,7 @@ rand = "0.8"
 ctrlc = "3.4"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
-shadow-rs = "1.4"
+shadow-rs = "2.0"
 
 # Proc macro dependencies
 syn = { version = "2.0", features = ["full", "extra-traits"] }
