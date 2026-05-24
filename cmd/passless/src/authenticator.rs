@@ -410,7 +410,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         let options = AuthenticatorOptions {
             rk: true,                      // Resident keys (passkeys)
             up: true,                      // User presence
-            uv: Some(true),                // Built-in UV capability (notification-based)
+            uv: Some(true),                // Notification-based user verification
             plat: true,                    // Platform authenticator
             client_pin: Some(true),        // Client PIN capability
             pin_uv_auth_token: Some(true), // PIN/UV auth token support
@@ -418,7 +418,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             bio_enroll: None,              // No biometric enrollment
             large_blobs: None,             // No large blob storage
             ep: None,                      // Enterprise attestation not enabled
-            always_uv: Some(security_config.always_uv),
+            always_uv: Some(false),        // Avoid browser userless-login PUAT requirements
             make_cred_uv_not_required: Some(true),
         };
 
