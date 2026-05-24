@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.11.0](https://github.com/pando85/passless/tree/v0.11.0) - 2026-05-24
+
+### Fixed
+
+- Use Critical urgency for prompt notifications (#246) ([d1214bd](https://github.com/pando85/passless/commit/d1214bd1067fca0312b9eb5109e22af0c492eda9))
+- Support userless passkey login (#265) ([a0965dc](https://github.com/pando85/passless/commit/a0965dc94e700e31d1aa6a6e54531627feab841d))
+  - **BREAKING**: Passless no longer advertises `alwaysUv=true` in authenticator options, even when `security.always_uv` is enabled. Notification-based user verification is still preserved internally, but clients that relied on CTAP `alwaysUv` capability advertisement may choose different PIN/UV flows. This change is required for browser userless passkey login compatibility.
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.6.1 (#231) ([c541dbc](https://github.com/pando85/passless/commit/c541dbc46c28817d9ceafe5389d955bef2c70769))
+- deps: Update Rust crate clap_complete to v4.6.2 (#233) ([c49bd62](https://github.com/pando85/passless/commit/c49bd620577a338175d2fffa3f75ebb5a72c729f))
+- deps: Update Rust crate libc to v0.2.185 (#234) ([e2a7f65](https://github.com/pando85/passless/commit/e2a7f6522634cf0d3ef5230759255eabb110bb5f))
+- deps: Update Rust crate notify-rust to v4.15.0 (#235) ([23990c5](https://github.com/pando85/passless/commit/23990c5baae71443ccaa74473112c835895d008e))
+- deps: Update Rust crate clap to v4.6.1 (#236) ([0f139b0](https://github.com/pando85/passless/commit/0f139b0f8c8dda2c4780a31f6c89d22942447848))
+- deps: Update KSXGitHub/github-actions-deploy-aur action to v4.1.3 (#237) ([dcc0e68](https://github.com/pando85/passless/commit/dcc0e6847cb8877751814a873c32308a6254d7ea))
+- deps: Update Rust crate notify-rust to v4.16.0 (#238) ([e88bdb1](https://github.com/pando85/passless/commit/e88bdb18be30518494e5f9754baf23b9eb919237))
+- deps: Update softprops/action-gh-release action to v3 (#232) ([337973d](https://github.com/pando85/passless/commit/337973d5aba43dc5ae60ca3769e2adaab454ba16))
+- deps: Update clechasseur/rs-clippy-check action to v6 - abandoned (#239) ([bc1c2d2](https://github.com/pando85/passless/commit/bc1c2d210d1200179439d8a84be88ca796706090))
+- deps: Update Rust crate shadow-rs to v2 (#242) ([477b389](https://github.com/pando85/passless/commit/477b389917c9f28695daff5556561294c8d6670d))
+- deps: Update Rust crate libc to v0.2.186 (#243) ([75d28bb](https://github.com/pando85/passless/commit/75d28bbd1c63ae92e26b3269d624f692053b66cd))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.3 (#244) ([dc0e691](https://github.com/pando85/passless/commit/dc0e691e4ad42ffaad73df48685280ecf9dd8adc))
+- deps: Update Rust crate tss-esapi to v7.7.0 (#245) ([b51820d](https://github.com/pando85/passless/commit/b51820d01ae216cde7f0bea362a69932679ecfa9))
+- deps: Update Rust crate clap_complete to v4.6.3 (#247) ([7cd530c](https://github.com/pando85/passless/commit/7cd530c7ca3e38712f57995f4d19b3d9c771cbd5))
+- deps: Update Rust crate rpassword to v7.5.0 (#248) ([81f0b1a](https://github.com/pando85/passless/commit/81f0b1abde704424fed495e6a31f22db9a0a1dd7))
+- deps: Update Rust crate rpassword to v7.5.1 (#249) ([fb1dc59](https://github.com/pando85/passless/commit/fb1dc5934d941483bb9d299a3357b7d050e1da03))
+- deps: Update Rust crate notify-rust to v4.16.1 (#250) ([78d8417](https://github.com/pando85/passless/commit/78d8417d59723949cc18feaf0c551981e1e06cf8))
+- deps: Update pre-commit hook alessandrojcm/commitlint-pre-commit-hook to v9.25.0 (#251) ([1ad97f6](https://github.com/pando85/passless/commit/1ad97f622dfcb3847cb9ddb632907963ffedebcb))
+- deps: Update Rust crate rpassword to v7.5.2 (#252) ([72fdec4](https://github.com/pando85/passless/commit/72fdec401d716d5c68454f3057fe5e6906de4a2c))
+- deps: Update Rust crate notify-rust to v4.17.0 (#253) ([9d4b9ab](https://github.com/pando85/passless/commit/9d4b9abd09e5ccca9794402a78517bc83ec85f42))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.4 (#254) ([89d0064](https://github.com/pando85/passless/commit/89d00645b1dbae183218ededdae90ce6a52fc1d1))
+- deps: Update Rust crate clap_complete to v4.6.4 (#255) ([3859979](https://github.com/pando85/passless/commit/3859979d4cd330c1447aed28035b49b8e4ffd2b9))
+- deps: Update Rust crate nix to v0.31.3 (#256) ([c2d5d0f](https://github.com/pando85/passless/commit/c2d5d0f7329a83383e5658994628d16c5f64aca9))
+- deps: Update Rust crate clap_complete to v4.6.5 (#258) ([d05b255](https://github.com/pando85/passless/commit/d05b255d342c9562ab50c81526b4ece32b8f81ec))
+- deps: Update Rust crate git2 to 0.21 (#259) ([c7a4177](https://github.com/pando85/passless/commit/c7a4177d8073dca98fece07df2706c58c3ab93e4))
+- deps: Update mindsers/changelog-reader-action action to v2.3.0 (#260) ([2071ad0](https://github.com/pando85/passless/commit/2071ad0a40ae16be8f4815f4a32b35683b42219c))
+- deps: Update mindsers/changelog-reader-action action to v2.4.0 (#261) ([6b74366](https://github.com/pando85/passless/commit/6b743662bea4fe72c6bb3f620e020396654a5d2e))
+- deps: Update Rust crate serde_json to v1.0.150 (#263) ([e65d495](https://github.com/pando85/passless/commit/e65d49566e765f21272c67d81b847492df230949))
+- deps: Update Rust crate rpassword to v7.5.3 (#264) ([27b4e48](https://github.com/pando85/passless/commit/27b4e485029c98671b05613833b1fd26bbb29ff4))
+
+### Refactor
+
+- Extract duplicated auth pattern to helper function ([d24eed3](https://github.com/pando85/passless/commit/d24eed3a494f059bcc0392e846a77a28a79abcd5))
+
+### Chore
+
+- Improve release script and update release skill (#262) ([7174096](https://github.com/pando85/passless/commit/71740969586b60d4aa4de655794a7a5d952edfc0))
+
 ## [v0.10.1](https://github.com/pando85/passless/tree/v0.10.1) - 2026-04-09
 
 ### Fixed
