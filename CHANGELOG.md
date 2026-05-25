@@ -5,13 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.11.1](https://github.com/pando85/passless/tree/v0.11.1) - 2026-05-25
+
+### Fixed
+
+- Restore `always_uv` setting to respect the security config instead of the hardcoded value introduced in v0.11.0. Users who have `security.always_uv` enabled will now have it applied correctly again (#270) ([1ad9128](https://github.com/pando85/passless/commit/1ad9128572e9dca398147011f3ca1dda6159552d))
+
+### Build
+
+- deps: Update Rust crate log to v0.4.30 (#269) ([c69e8f2](https://github.com/pando85/passless/commit/c69e8f289c96e7533073a0e4a6e9cc3e997e6042))
+
 ## [v0.11.0](https://github.com/pando85/passless/tree/v0.11.0) - 2026-05-24
 
 ### Fixed
 
 - Use Critical urgency for prompt notifications (#246) ([d1214bd](https://github.com/pando85/passless/commit/d1214bd1067fca0312b9eb5109e22af0c492eda9))
-- Support userless passkey login (#265) ([a0965dc](https://github.com/pando85/passless/commit/a0965dc94e700e31d1aa6a6e54531627feab841d))
-  - **BREAKING**: Passless no longer advertises `alwaysUv=true` in authenticator options, even when `security.always_uv` is enabled. Notification-based user verification is still preserved internally, but clients that relied on CTAP `alwaysUv` capability advertisement may choose different PIN/UV flows. This change is required for browser userless passkey login compatibility.
+- **BREAKING:** Support userless passkey login by no longer advertising `alwaysUv=true` in authenticator options (#265) ([a0965dc](https://github.com/pando85/passless/commit/a0965dc94e700e31d1aa6a6e54531627feab841d)). Even when `security.always_uv` is enabled, the CTAP `alwaysUv` capability is no longer advertised. Notification-based user verification is still preserved internally, but clients that relied on CTAP `alwaysUv` capability advertisement may choose different PIN/UV flows. This change is required for browser userless passkey login compatibility.
 
 ### Build
 
