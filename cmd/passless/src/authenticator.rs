@@ -418,7 +418,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             bio_enroll: None,              // No biometric enrollment
             large_blobs: None,             // No large blob storage
             ep: None,                      // Enterprise attestation not enabled
-            always_uv: Some(false),        // Avoid browser userless-login PUAT requirements
+            always_uv: Some(security_config.always_uv),
             make_cred_uv_not_required: Some(true),
         };
 
