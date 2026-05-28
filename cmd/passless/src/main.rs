@@ -62,18 +62,22 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> CommandHandler
 {
     fn handle_command(&mut self, cmd: Cmd, data: &[u8]) -> soft_fido2_transport::Result<Vec<u8>> {
         if cmd != Cmd::Cbor {
+            error!("Invalid command: {:?}", cmd);
             return Err(soft_fido2_transport::Error::InvalidCommand);
         }
 
-        let mut service = self.service.lock().map_err(|_| {
+        let mut service = self.service.lock().map_err(|e| {
+            error!("Failed to lock service: {}", e);
             soft_fido2_transport::Error::Other("Failed to lock service".to_string())
         })?;
 
         let mut response = Vec::new();
-        service
-            .handle(data, &mut response)
-            .map_err(|_| soft_fido2_transport::Error::Other("Command failed".to_string()))?;
+        service.handle(data, &mut response).map_err(|e| {
+            error!("CTAP command failed: {:?}", e);
+            soft_fido2_transport::Error::Other("Command failed".to_string())
+        })?;
 
+        debug!("CTAP response: {} bytes", response.len());
         Ok(response)
     }
 }
@@ -115,16 +119,22 @@ fn run_with_service<S: CredentialStorage + 'static, P: PinStorage + 'static>(
 
         match uhid.read_packet(&mut buffer) {
             Ok(Some(_)) => {
+                debug!("Received packet from host");
                 let packet = Packet::from_bytes(buffer);
 
-                let response_packets = ctaphid_handler
-                    .process_packet(packet)
-                    .map_err(|_| Error::Other("CTAP HID processing failed".to_string()))?;
+                let response_packets = ctaphid_handler.process_packet(packet).map_err(|e| {
+                    error!("CTAP HID processing failed: {:?}", e);
+                    Error::Other("CTAP HID processing failed".to_string())
+                })?;
 
+                debug!("Sending {} response packets", response_packets.len());
                 for response_packet in response_packets {
-                    uhid.write_packet(response_packet.as_bytes())
-                        .map_err(|_| Error::Other("Failed to write packet".to_string()))?;
+                    uhid.write_packet(response_packet.as_bytes()).map_err(|e| {
+                        error!("Failed to write packet: {:?}", e);
+                        Error::Other("Failed to write packet".to_string())
+                    })?;
                 }
+                debug!("Response sent successfully");
             }
             Ok(None) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
