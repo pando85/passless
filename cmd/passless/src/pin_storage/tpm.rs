@@ -31,15 +31,17 @@ impl TpmPinStorage {
 
 impl PinStorage for TpmPinStorage {
     fn load_pin_state(&self) -> Result<PinState, StatusCode> {
+        if !self.path.exists() {
+            debug!(
+                "PIN state file does not exist, returning default state (no TPM operation needed)"
+            );
+            return Ok(PinState::new());
+        }
+
         debug!(
             "Loading PIN state from TPM storage: {}",
             self.path.display()
         );
-
-        if !self.path.exists() {
-            debug!("PIN state file does not exist, returning default state");
-            return Ok(PinState::new());
-        }
 
         let sealed_data = std::fs::read(&self.path).map_err(|e| {
             warn!("Failed to read sealed PIN state: {}", e);
@@ -63,7 +65,8 @@ impl PinStorage for TpmPinStorage {
                 state.retries
             );
         } else {
-            info!("Saving PIN state (no PIN set)");
+            info!("Skipping PIN state save (no PIN set, no changes needed)");
+            return Ok(());
         }
 
         debug!("Saving PIN state to TPM storage: {}", self.path.display());

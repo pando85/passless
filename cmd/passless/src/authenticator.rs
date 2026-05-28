@@ -248,8 +248,11 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         let mut storage = match self.storage.lock() {
             Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while listing credentials");
+            Err(e) => {
+                error!(
+                    "Failed to acquire storage lock while listing credentials: {}",
+                    e
+                );
                 return Err(soft_fido2::Error::Other);
             }
         };
@@ -273,7 +276,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                 }
             }
             Err(e) => {
-                info!("No credentials found for RP {}: {:?}", rp_id, e);
+                debug!("No credentials found for RP {}: {:?}", rp_id, e);
             }
         }
 

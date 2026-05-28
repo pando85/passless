@@ -34,7 +34,7 @@ fn requires_default_action() -> bool {
             );
 
             match (server_name.as_str(), info.version.as_str()) {
-                ("notify-osd", "1.0") | ("mako", "0.0.0") => {
+                ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "") => {
                     info!("Detected {} - using default action mode", server_name);
                     true
                 }
