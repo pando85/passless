@@ -16,7 +16,7 @@ repos:
     hooks:
       - id: yamllint
 
-- repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
+  - repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
     rev: v9.25.0
     hooks:
       - id: commitlint
