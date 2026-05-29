@@ -166,6 +166,38 @@ fn test_client_info() {
                 assert!(!versions.is_empty(), "No versions");
             }
         }
+
+        let mut saw_options = false;
+        for (k, v) in &map {
+            if let Value::Integer(key) = k
+                && *key == 4.into()
+                && let Value::Map(options) = v
+            {
+                saw_options = true;
+
+                let option_bool = |option_name: &str| {
+                    options.iter().find_map(|(option_key, option_value)| {
+                        if let Value::Text(name) = option_key
+                            && name == option_name
+                            && let Value::Bool(value) = option_value
+                        {
+                            return Some(*value);
+                        }
+
+                        None
+                    })
+                };
+
+                assert_eq!(option_bool("rk"), Some(true));
+                assert_eq!(option_bool("up"), Some(true));
+                assert_eq!(option_bool("plat"), Some(true));
+                assert_eq!(option_bool("uv"), Some(true));
+                assert_eq!(option_bool("clientPin"), Some(false));
+                assert_eq!(option_bool("alwaysUv"), Some(false));
+            }
+        }
+
+        assert!(saw_options, "getInfo response should include options");
     } else {
         panic!("Expected CBOR map");
     }

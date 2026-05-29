@@ -43,7 +43,7 @@ hex.workspace = true
 shadow-rs.workspace = true
 dirs.workspace = true
 thiserror.workspace = true
-hmac = "0.12"
+hmac = "0.13"
 rpassword = "7.3"
 atty = "0.2"
 serde_bytes = "0.11.19"
@@ -72,4 +72,4 @@ passless-core.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 shadow-rs.workspace = true
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }

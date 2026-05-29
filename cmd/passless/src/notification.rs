@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use log::{debug, info, warn};
-use notify_rust::{Notification, Timeout};
+use notify_rust::{Notification, Timeout, Urgency};
 
 /// Result of user verification via notification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ fn requires_default_action() -> bool {
             );
 
             match (server_name.as_str(), info.version.as_str()) {
-                ("notify-osd", "1.0") | ("mako", "0.0.0") => {
+                ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "") => {
                     info!("Detected {} - using default action mode", server_name);
                     true
                 }
@@ -79,7 +79,8 @@ pub fn show_verification_notification(
         .summary("🔒 User Verification Required")
         .body(&message)
         .icon("security-high")
-        .timeout(Timeout::Milliseconds(timeout_seconds * 1000));
+        .timeout(Timeout::Milliseconds(timeout_seconds * 1000))
+        .urgency(Urgency::Critical);
 
     if default_means_user_present {
         // For servers that don't support action buttons properly,
@@ -158,7 +159,8 @@ pub fn show_yes_no_notification(title: &str, question: &str) -> Result<YesNoResu
         .summary(title)
         .body(question)
         .icon("dialog-question")
-        .timeout(Timeout::Never); // Wait for user action
+        .timeout(Timeout::Never) // Wait for user action
+        .urgency(Urgency::Critical);
 
     if default_means_yes {
         // For servers that don't support action buttons properly

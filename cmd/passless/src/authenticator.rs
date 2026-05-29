@@ -29,6 +29,7 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
     (major << 16) | (minor << 8) | patch
 });
 
+/// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
 struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
@@ -43,6 +44,7 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
     }
 }
 
+/// Passless authenticator callbacks implementation
 pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     storage: Arc<Mutex<S>>,
     pin_storage: Option<Arc<Mutex<P>>>,
@@ -93,22 +95,17 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             self.security_config.user_verification_authentication
         };
 
-        {
-            let storage = match self.storage.lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    error!("Failed to acquire storage lock during user verification request");
-                    return Err(soft_fido2::Error::Other);
-                }
-            };
-
-            if storage.disable_user_verification() && !is_registration && !should_verify {
-                debug!(
-                    "User verification handled by backend (e.g., GPG): {}",
-                    operation
-                );
-                return Ok(VerificationResult::Accepted);
+        let storage = match self.storage.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                error!("Failed to acquire storage lock during user verification request");
+                return Err(soft_fido2::Error::Other);
             }
+        };
+
+        if storage.disable_user_verification() && !is_registration && !should_verify {
+            debug!("User verification handled by backend (e.g., GPG): {}", operation);
+            return Ok(VerificationResult::Accepted);
         }
 
         if !should_verify {
@@ -188,6 +185,14 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     }
 
     fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+                info!("E2E test mode: Auto-accepting user verification");
+                return Ok(UvResult::Accepted);
+            }
+        }
+
         if let Some(pin_storage) = &self.pin_storage
             && let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?
             && let Ok(state) = storage.load_pin_state()
@@ -297,8 +302,11 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         let mut storage = match self.storage.lock() {
             Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while listing credentials");
+            Err(e) => {
+                error!(
+                    "Failed to acquire storage lock while listing credentials: {}",
+                    e
+                );
                 return Err(soft_fido2::Error::Other);
             }
         };
@@ -322,7 +330,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                 }
             }
             Err(e) => {
-                info!("No credentials found for RP {}: {:?}", rp_id, e);
+                debug!("No credentials found for RP {}: {:?}", rp_id, e);
             }
         }
 
@@ -426,12 +434,20 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
     }
 }
 
+/// Main authenticator service
+///
+/// This service orchestrates the FIDO2 authenticator:
+/// - Storage is injected through the CredentialStorage trait
+/// - Handles CTAP requests and generates responses
 pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
+    /// The underlying soft_fido2 authenticator
     pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
+    /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
+    /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
     pub fn new(
         storage: S,
@@ -444,6 +460,7 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
 }
 
 impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorService<S, P> {
+    /// Create a new authenticator service with optional PIN storage
     pub fn with_pin_storage(
         storage: S,
         pin_storage: Option<Arc<Mutex<P>>>,
@@ -510,16 +527,27 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         })
     }
 
+    /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         self.authenticator.handle(request, response_buffer)?;
         Ok(())
     }
 
+    /// Get storage information
     pub fn storage_info(&self) -> String {
         let storage = self.storage.lock().unwrap();
         format!("Credentials in storage: {}", storage.count_credentials())
     }
 
+    /// Register a custom CTAP command handler
+    ///
+    /// This allows registering vendor-specific commands (0x40-0xFF range).
+    /// Useful for compatibility with different authenticator variants.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - Command byte (0x40-0xFF vendor range)
+    /// * `handler` - Handler function that processes the command
     pub fn register_custom_command<F>(&mut self, command: u8, handler: F)
     where
         F: Fn(&[u8]) -> core::result::Result<Vec<u8>, soft_fido2::StatusCode>

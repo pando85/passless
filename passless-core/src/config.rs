@@ -522,7 +522,7 @@ impl SecurityConfig {
         } else {
             log::warn!(
                 "mlock capability probe failed - memory locking may not be available.\n\
-                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'"
+                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcaps cap_ipc_lock=+ep $(which passless)'"
             );
         }
         Ok(())

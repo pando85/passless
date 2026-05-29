@@ -5,18 +5,18 @@ resolver = "2"
 [workspace.package]
 authors = ["Pando85 <pando855@gmail.com>"]
 edition = "2024"
-version = "0.9.3"
+version = "0.11.2"
 license-file = "./LICENSE"
 homepage = "https://github.com/pando85/passless"
 repository = "https://github.com/pando85/passless"
 [workspace.dependencies]
 # Workspace crates
-passless-core = { path = "./passless-core", version = "0.9.3" }
-passless-config-doc = { path = "./passless-config-doc", version = "0.9.3" }
+passless-core = { path = "./passless-core", version = "0.11.2" }
+passless-config-doc = { path = "./passless-config-doc", version = "0.11.2" }
 
-soft-fido2 = "0.12.2"
-soft-fido2-ctap = "0.12.2"
-soft-fido2-transport = "0.12.2"
+soft-fido2 = "0.13.0"
+soft-fido2-ctap = "0.13.0"
+soft-fido2-transport = "0.13.0"
 
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
@@ -24,7 +24,7 @@ clap-serde-derive = "0.2"
 clap_complete = "4.5"
 log = "0.4"
 env_logger = "0.11"
-sha2 = "0.10"
+sha2 = "0.11"
 serde_cbor = "0.11.2"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0"
@@ -39,7 +39,7 @@ rand = "0.8"
 ctrlc = "3.4"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
-shadow-rs = "1.4"
+shadow-rs = "2.0"
 
 # UV provider dependencies
 zbus = "5"
