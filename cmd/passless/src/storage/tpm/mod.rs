@@ -244,7 +244,7 @@ impl TpmStorageAdapter {
         // Generate a random 96-bit nonce for AES-GCM
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+let nonce = Nonce::from_slice(&nonce_bytes);
 
         // Encrypt the credential data with AES-GCM
         let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {

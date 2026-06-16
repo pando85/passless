@@ -12,6 +12,7 @@
         "docs",
         "feat",
         "fix",
+        "merge",
         "refactor",
         "release",
         "revert",

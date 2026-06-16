@@ -2,6 +2,8 @@ CARGO_TARGET_DIR ?= target
 CARGO_TARGET ?= x86_64-unknown-linux-gnu
 PKG_BASE_NAME ?= passless-${CARGO_TARGET}
 PROJECT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | head -n1)
+# Default to tpm feature only, face feature requires glibc 2.38+
+CARGO_FEATURES ?= tpm
 
 .DEFAULT: help
 .PHONY: help
@@ -77,7 +79,7 @@ update-changelog:	## automatically update changelog based on commits
 release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	cargo vendor
 	tar -czf vendor.tar.gz vendor
-	cargo build --frozen --release --all-features --target ${CARGO_TARGET}
+cargo build --frozen --release --features ${CARGO_FEATURES} --target ${CARGO_TARGET}
 	tar -czf $(PKG_BASE_NAME).tar.gz -C $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release passless
 	@# Create completions tarball
 	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build/passless-*/out/completions -type d 2>/dev/null | head -1); \

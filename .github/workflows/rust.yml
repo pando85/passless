@@ -49,7 +49,7 @@ jobs:
 
       - uses: clechasseur/rs-clippy-check@v6.0.4
         with:
-          args: --all-features -- --deny warnings
+          args: --features tpm -- --deny warnings
 
   build:
     strategy:
@@ -73,19 +73,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           target: ${{ matrix.job.target }}
-          override: true
+        if: matrix.job.os != 'ubuntu-22.04'
+
+      - name: Install Rust toolchain (pinned for older glibc)
+        uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          target: ${{ matrix.job.target }}
+        if: matrix.job.os == 'ubuntu-22.04'
 
       - name: Build
         shell: bash
-        run: cargo build --verbose
+        run: cargo build --verbose --features tpm
 
       - name: Run tests
         shell: bash
-        run: cargo test --verbose
+        run: cargo test --verbose --features tpm
 
       - name: Extract crate information
         shell: bash

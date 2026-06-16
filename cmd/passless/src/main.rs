@@ -4,6 +4,7 @@ mod notification;
 mod pin_storage;
 mod storage;
 mod util;
+mod uv;
 
 use passless_core::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
@@ -136,6 +137,7 @@ fn run_with_service<S: CredentialStorage + 'static, P: PinStorage + 'static>(
                 }
                 debug!("Response sent successfully");
             }
+            }
             Ok(None) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
@@ -251,6 +253,12 @@ fn run() -> Result<()> {
     // Load config: CLI args + config file + defaults (CLI takes precedence)
     let config = AppConfig::load(&mut args);
 
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        error!("Configuration validation failed: {}", e);
+        process::exit(1);
+    }
+
     if config.verbose && log_level != log::LevelFilter::Debug {
         info!("Enabling verbose logging...");
         log::set_max_level(log::LevelFilter::Debug);
@@ -313,6 +321,7 @@ fn run() -> Result<()> {
 
     // Get PIN config
     let pin_config = config.pin_config();
+    let uv_config = config.uv_config();
 
     match config.backend().map_err(|e| {
         error!("Failed to load backend config: {}", e);
@@ -327,6 +336,7 @@ fn run() -> Result<()> {
                 Some(pin_storage),
                 security_config,
                 pin_config,
+                uv_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }
@@ -348,6 +358,7 @@ fn run() -> Result<()> {
                 Some(pin_storage),
                 security_config,
                 pin_config,
+                uv_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }
@@ -361,6 +372,7 @@ fn run() -> Result<()> {
                 Some(pin_storage),
                 security_config,
                 pin_config,
+                uv_config,
             )?;
             run_with_service(service, uhid, shutdown)
         }

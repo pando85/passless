@@ -17,6 +17,7 @@ path = "src/main.rs"
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi"]
+face = ["dep:nokhwa", "dep:face_id", "dep:image"]
 
 [dependencies]
 passless-core.workspace = true
@@ -40,11 +41,24 @@ clap.workspace = true
 zeroize.workspace = true
 hex.workspace = true
 shadow-rs.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
 hmac = "0.13"
 rpassword = "7.3"
 atty = "0.2"
 serde_bytes = "0.11.19"
 tss-esapi = { version = "7.6.0", optional = true }
+
+# UV provider dependencies
+zbus.workspace = true
+tokio.workspace = true
+which.workspace = true
+futures-util = "0.3"
+
+# Face recognition (optional, heavy dependencies)
+nokhwa = { workspace = true, optional = true }
+face_id = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64 = "0.22"

@@ -283,6 +283,206 @@ pub struct PinConfig {
     pub auto_lock_timeout: u32,
 }
 
+/// User verification provider type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UvProviderType {
+    /// Fingerprint verification via fprintd D-Bus service
+    Fprintd,
+    /// Face recognition via webcam
+    Face,
+    /// Desktop notification (fallback)
+    Notification,
+    /// Custom command/script
+    Command,
+    /// Use all available providers in priority order
+    #[default]
+    Auto,
+}
+
+impl std::str::FromStr for UvProviderType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fprintd" | "fingerprint" => Ok(UvProviderType::Fprintd),
+            "face" | "faceid" => Ok(UvProviderType::Face),
+            "notification" | "notify" => Ok(UvProviderType::Notification),
+            "command" | "cmd" => Ok(UvProviderType::Command),
+            "auto" | "all" => Ok(UvProviderType::Auto),
+            _ => Err(format!(
+                "Invalid UV provider '{}'. Must be: fprintd, face, notification, command, or auto",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for UvProviderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UvProviderType::Fprintd => write!(f, "fprintd"),
+            UvProviderType::Face => write!(f, "face"),
+            UvProviderType::Notification => write!(f, "notification"),
+            UvProviderType::Command => write!(f, "command"),
+            UvProviderType::Auto => write!(f, "auto"),
+        }
+    }
+}
+
+/// fprintd provider configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv-fprintd")]
+pub struct FprintdConfig {
+    /// Enable fprintd provider
+    #[arg(
+        long = "fprintd-enabled",
+        id = "fprintd-enabled",
+        env = "PASSLESS_FPRINTD_ENABLED",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub enabled: bool,
+}
+
+/// Face recognition provider configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv-face")]
+pub struct FaceConfig {
+    /// Enable face recognition provider
+    #[arg(
+        long = "face-enabled",
+        id = "face-enabled",
+        env = "PASSLESS_FACE_ENABLED",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub enabled: bool,
+
+    /// Camera device index (0 = first camera)
+    #[arg(
+        long = "face-camera-index",
+        id = "face-camera-index",
+        env = "PASSLESS_FACE_CAMERA_INDEX",
+        value_name = "INDEX"
+    )]
+    #[serde(default)]
+    #[default(0)]
+    pub camera_index: usize,
+
+    /// Face matching threshold (0.0-1.0, higher = stricter)
+    #[arg(
+        long = "face-threshold",
+        id = "face-threshold",
+        env = "PASSLESS_FACE_THRESHOLD",
+        value_name = "THRESHOLD"
+    )]
+    #[serde(default)]
+    #[default(0.6)]
+    pub threshold: f32,
+}
+
+impl FaceConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if self.threshold < 0.0 || self.threshold > 1.0 {
+            return Err(format!(
+                "Face threshold must be between 0.0 and 1.0, got {}",
+                self.threshold
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Command provider configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv-cmd")]
+pub struct CommandConfig {
+    /// Enable command provider
+    #[arg(
+        long = "uv-command-enabled",
+        id = "uv-command-enabled",
+        env = "PASSLESS_UV_COMMAND_ENABLED",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "false"
+    )]
+    #[serde(default)]
+    #[default(false)]
+    pub enabled: bool,
+
+    /// Command to execute for verification (exit 0 = accept, non-zero = deny)
+    /// Command receives context via environment variables:
+    /// PASSLESS_UV_OPERATION, PASSLESS_UV_RELYING_PARTY, PASSLESS_UV_USER
+    #[arg(
+        long = "uv-command",
+        id = "uv-command-arg",
+        env = "PASSLESS_UV_COMMAND",
+        value_name = "COMMAND",
+        value_delimiter = ' '
+    )]
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+/// User verification configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "uv")]
+pub struct UvConfig {
+    /// User verification provider selection
+    /// - "auto": Use all available providers in priority order (default)
+    /// - "fprintd": Fingerprint only
+    /// - "face": Face recognition only
+    /// - "notification": Desktop notification only
+    /// - "command": Custom command only
+    #[arg(
+        long = "uv-provider",
+        env = "PASSLESS_UV_PROVIDER",
+        value_name = "PROVIDER"
+    )]
+    #[serde(default)]
+    #[default(UvProviderType::Auto)]
+    pub provider: UvProviderType,
+
+    /// Default timeout for verification (seconds)
+    #[arg(
+        long = "uv-timeout",
+        env = "PASSLESS_UV_TIMEOUT",
+        value_name = "SECONDS"
+    )]
+    #[serde(default)]
+    #[default(30)]
+    pub timeout_seconds: u32,
+
+    /// fprintd configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub fprintd: FprintdConfig,
+
+    /// Face recognition configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub face: FaceConfig,
+
+    /// Command provider configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub command: CommandConfig,
+}
+
 impl SecurityConfig {
     /// Apply security hardening measures
     pub fn apply_hardening(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -322,7 +522,7 @@ impl SecurityConfig {
         } else {
             log::warn!(
                 "mlock capability probe failed - memory locking may not be available.\n\
-                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'"
+                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcaps cap_ipc_lock=+ep $(which passless)'"
             );
         }
         Ok(())
@@ -384,6 +584,12 @@ pub struct AppConfig {
     #[serde(default)]
     #[command(flatten)]
     pub pin: PinConfig,
+
+    /// User verification configuration
+    #[clap_serde]
+    #[serde(default)]
+    #[command(flatten)]
+    pub uv: UvConfig,
 }
 
 /// Backend-specific configuration
@@ -470,6 +676,17 @@ impl AppConfig {
     /// Get PIN configuration
     pub fn pin_config(&self) -> PinConfig {
         self.pin.clone()
+    }
+
+    /// Get user verification configuration
+    pub fn uv_config(&self) -> UvConfig {
+        self.uv.clone()
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        self.uv.face.validate()?;
+        Ok(())
     }
 }
 

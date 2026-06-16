@@ -2,8 +2,6 @@
 ///
 /// This module provides compatibility with the Yubikey credential management variant (0x41).
 /// The standard credential management (0x0a) is handled by soft-fido2's built-in implementation,
-/// which properly calls the AuthenticatorCallbacks methods (enumerate_rps, list_credentials, etc.)
-/// that read from the actual storage backend.
 use crate::authenticator::AuthenticatorService;
 use crate::pin_storage::PinStorage;
 use crate::storage::CredentialStorage;
@@ -50,7 +48,7 @@ mod tests {
 
     #[test]
     fn test_register_yubikey_command() {
-        use passless_core::config::{PinConfig, SecurityConfig};
+        use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
         let temp_dir = std::env::temp_dir().join("test_passless_custom");
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
@@ -61,8 +59,12 @@ mod tests {
             Err(e) => panic!("Failed to create local storage: {}", e),
         };
 
-        let service =
-            AuthenticatorService::new(storage, SecurityConfig::default(), PinConfig::default());
+        let service = AuthenticatorService::new(
+            storage,
+            SecurityConfig::default(),
+            PinConfig::default(),
+            UvConfig::default(),
+        );
         assert!(service.is_ok(), "Service creation should succeed");
 
         register_yubikey_credential_mgmt(&mut service.unwrap());

@@ -42,7 +42,6 @@ impl PinStorage for TpmPinStorage {
             "Loading PIN state from TPM storage: {}",
             self.path.display()
         );
-
         let sealed_data = std::fs::read(&self.path).map_err(|e| {
             warn!("Failed to read sealed PIN state: {}", e);
             StatusCode::Other
@@ -100,7 +99,7 @@ impl TpmPinStorage {
             use std::str::FromStr;
 
             use aes_gcm::Aes256Gcm;
-            use aes_gcm::Nonce;
+use aes_gcm::Nonce;
             use aes_gcm::aead::{Aead, KeyInit, OsRng};
             use rand::RngCore;
             use tss_esapi::attributes::ObjectAttributesBuilder;
@@ -227,7 +226,7 @@ impl TpmPinStorage {
 
             let mut nonce_bytes = [0u8; 12];
             OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::from_slice(&nonce_bytes);
+let nonce = Nonce::from_slice(&nonce_bytes);
 
             let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
                 warn!("Failed to create AES cipher: {:?}", e);
