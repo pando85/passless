@@ -228,14 +228,14 @@ impl TpmPinStorage {
 
             let mut nonce_bytes = [0u8; 12];
             OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let nonce = Nonce::try_from(&nonce_bytes[..]).expect("valid nonce length");
 
             let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
                 warn!("Failed to create AES cipher: {:?}", e);
                 StatusCode::Other
             })?;
 
-            let encrypted_data = cipher.encrypt(nonce, data).map_err(|e| {
+            let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
                 warn!("Failed to encrypt data with AES-GCM: {:?}", e);
                 StatusCode::Other
             })?;
@@ -481,14 +481,14 @@ impl TpmPinStorage {
                 return Err(StatusCode::Other);
             }
 
-            let nonce = Nonce::from_slice(&sealed_blob.nonce);
+            let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
             let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
                 warn!("Failed to create AES cipher: {:?}", e);
                 StatusCode::Other
             })?;
 
             let decrypted_data = cipher
-                .decrypt(nonce, sealed_blob.encrypted_data.as_ref())
+                .decrypt(&nonce, sealed_blob.encrypted_data.as_ref())
                 .map_err(|e| {
                     warn!("Failed to decrypt data with AES-GCM: {:?}", e);
                     StatusCode::Other
