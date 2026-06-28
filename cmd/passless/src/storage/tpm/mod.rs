@@ -19,9 +19,10 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use log::{debug, info};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use tss_esapi::constants::SessionType;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
