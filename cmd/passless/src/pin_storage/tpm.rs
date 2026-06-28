@@ -102,8 +102,8 @@ impl TpmPinStorage {
             use aes_gcm::Aes256Gcm;
             use aes_gcm::Nonce;
             use aes_gcm::aead::{Aead, KeyInit};
-            use rand::rngs::OsRng;
             use rand::RngCore;
+            use rand::rngs::OsRng;
             use tss_esapi::attributes::ObjectAttributesBuilder;
             use tss_esapi::constants::SessionType;
             use tss_esapi::interface_types::algorithm::PublicAlgorithm;
