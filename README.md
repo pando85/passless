@@ -38,6 +38,7 @@ accounts or stricter threat models.
 Users should choose the solution that best fits their own security and practicality requirements.
 
 - [Features](#features)
+- [Android](#android)
 - [Configuration](#configuration)
 - [Installation](#installation)
   - [Cargo](#cargo)
@@ -56,6 +57,14 @@ Users should choose the solution that best fits their own security and practical
   - Local filesystem (testing only)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
+
+## Android
+
+For passkey support on Android, use
+[Password Store (Passkey Edition)](https://github.com/pando85/Android-Password-Store). It is a
+`pass`-compatible manager that also registers as an Android WebAuthn/passkey Credential Provider,
+and reads from the same git-synced `pass` store used by passless — giving you a unified,
+cross-platform passkey setup.
 
 ## PIN Support
 
