@@ -491,63 +491,7 @@ impl CredentialStorage for PassStorageAdapter {
 
         debug!("read_first called with filter: {:?}", filter);
 
-        // Initialize iteration using the appropriate index
-        // Convert path info to actual paths
-        self.iteration_entries = match &filter {
-            CredentialFilter::None => {
-                // No filter: iterate all credentials
-                self.indexes
-                    .id
-                    .values()
-                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
-                    .collect()
-            }
-            CredentialFilter::ById(id) => {
-                // ById: direct lookup in index_by_id
-                if let Some(path_info) = self.indexes.id.get(id.as_slice()) {
-                    vec![path_info.to_path(&self.get_fido2_path())]
-                } else {
-                    Vec::new()
-                }
-            }
-            CredentialFilter::ByRp(rp_id) => {
-                // ByRp: lookup in index_by_rp
-                self.indexes
-                    .rp
-                    .get(rp_id.as_str())
-                    .map(|cred_ids| {
-                        cred_ids
-                            .iter()
-                            .filter_map(|cred_id| {
-                                self.indexes
-                                    .id
-                                    .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-            CredentialFilter::ByHash(hash) => {
-                // ByHash: lookup in index_by_rp_hash
-                self.indexes
-                    .rp_hash
-                    .get(hash)
-                    .map(|cred_ids| {
-                        cred_ids
-                            .iter()
-                            .filter_map(|cred_id| {
-                                self.indexes
-                                    .id
-                                    .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-        };
-
+        self.iteration_entries = self.indexes.resolve_filter(&filter, &self.get_fido2_path());
         self.iteration_index = 0;
 
         debug!(

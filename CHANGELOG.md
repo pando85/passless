@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.12.0](https://github.com/pando85/passless/tree/v0.12.0) - 2026-07-06
+
+### Added
+
+- Add authenticated uv retry reset (#295) ([6ea14bf](https://github.com/pando85/passless/commit/6ea14bf7c99bbf9f3c12fa5d17a424f7d0816f83))
+
+### Fixed
+
+- Add user directories to PATH in systemd service (#278) ([03ac850](https://github.com/pando85/passless/commit/03ac8504e74b26e18ff9cb033091b05ce6581f79))
+
+### Documentation
+
+- Add Android passkey compatibility section to README (#291) ([4e5cad4](https://github.com/pando85/passless/commit/4e5cad4061fc5f4270971399a6aa5486e30950e0))
+
+### Build
+
+- deps: Update Rust crate rpassword to v7.5.4 (#274) ([98bda86](https://github.com/pando85/passless/commit/98bda86169c27fc13d65da7ece9ce96c42f6761e))
+- deps: Update Rust crate log to v0.4.31 (#275) ([4ca1cfa](https://github.com/pando85/passless/commit/4ca1cfa2c2191156dddd7d8cc8c465f64e173ebb))
+- deps: Update Rust crate log to v0.4.32 (#276) ([a592636](https://github.com/pando85/passless/commit/a592636a55ad97e9e98a229ec58447e867ce944a))
+- deps: Update Rust crate zeroize to v1.9.0 (#279) ([fe2572a](https://github.com/pando85/passless/commit/fe2572a86c0377a78131925fdc2942db8a51cdec))
+- deps: Update Rust crate notify-rust to v4.18.0 (#281) ([f127707](https://github.com/pando85/passless/commit/f1277077013af060608c8bab60ad14212d2608ba))
+- deps: Update Rust crate syn to v2.0.118 (#280) ([349dc1f](https://github.com/pando85/passless/commit/349dc1f62a65da816510e53233854323e5d82048))
+- deps: Update actions/checkout action to v7 (#282) ([34958dc](https://github.com/pando85/passless/commit/34958dc474d6197d023955b4f416a69ba07e5434))
+- deps: Update Rust crate log to v0.4.33 (#283) ([8ad2861](https://github.com/pando85/passless/commit/8ad2861a0b6306f406abda7f45cb3b2e1ecbc1b0))
+- deps: Update Rust crate quote to v1.0.46 (#284) ([d97eb18](https://github.com/pando85/passless/commit/d97eb184a144cd6c6b10a3f3e444c4f5100bf22a))
+- deps: Update actions/cache action to v6 (#285) ([248d01f](https://github.com/pando85/passless/commit/248d01fcf48aa6e741b6ab2bd9133f2a1be45cc0))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.5 (#286) ([1ac1b1b](https://github.com/pando85/passless/commit/1ac1b1b58bfa77484fdaecbae4637a3dcdb4f5f8))
+- deps: Update pre-commit hook alessandrojcm/commitlint-pre-commit-hook to v9.26.0 (#287) ([9bd8637](https://github.com/pando85/passless/commit/9bd86373459f8ddb3752909504b7305980568f90))
+- deps: Update Rust crate env_logger to v0.11.11 (#288) ([36a298a](https://github.com/pando85/passless/commit/36a298a8b787378dba4e193cb4d5722164b4122b))
+- deps: Update Rust crate aes-gcm to 0.11 (#289) ([e282356](https://github.com/pando85/passless/commit/e2823567f0f5e3107424aa89633c5a61981684af))
+- deps: Update Rust crate clap_complete to v4.6.6 (#292) ([10b1be2](https://github.com/pando85/passless/commit/10b1be2530f9f1c4328503d64fbdac5d2db74ebd))
+- deps: Update Rust crate clap_complete to v4.6.7 (#293) ([499c73f](https://github.com/pando85/passless/commit/499c73fa183fd687481e1ee55e0e3cb79610c90e))
+
 ## [v0.11.2](https://github.com/pando85/passless/tree/v0.11.2) - 2026-05-28
 
 ### Fixed
