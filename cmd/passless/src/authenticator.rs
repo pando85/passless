@@ -7,7 +7,8 @@ use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
-    CredentialRef, CtapCommand, PinState, Result, UpResult, UvResult,
+    CredentialRef, CtapCommand, Error as SoftFido2Error, PinState, Result, StatusCode, UpResult,
+    UvResult,
 };
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -22,6 +23,18 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
 
     (major << 16) | (minor << 8) | patch
 });
+
+/// Passless vendor command for resetting built-in UV retries without deleting credentials.
+pub const CMD_PASSLESS_RESET_UV_RETRIES: u8 = 0x42;
+
+const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
+
+fn error_status_byte(error: SoftFido2Error) -> u8 {
+    match error {
+        SoftFido2Error::CtapError(code) => code,
+        error => StatusCode::from(error) as u8,
+    }
+}
 
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
 struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
@@ -401,13 +414,12 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
 }
 
 impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorService<S, P> {
-    /// Create a new authenticator service with optional PIN storage
-    pub fn with_pin_storage(
-        storage: S,
+    fn build_authenticator(
+        storage: Arc<Mutex<S>>,
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
-    ) -> Result<Self> {
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
         // Hardcoded authenticator options (FIDO2 spec compliant)
         // These are platform authenticator defaults and shouldn't need configuration
         let options = AuthenticatorOptions {
@@ -449,19 +461,30 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
-        let storage = Arc::new(Mutex::new(storage));
-        let callbacks = PasslessCallbacks::new(
-            storage.clone(),
-            pin_storage.clone(),
-            security_config,
-            pin_config,
-        );
+        let callbacks =
+            PasslessCallbacks::new(storage, pin_storage.clone(), security_config, pin_config);
 
-        let authenticator = if let Some(ps) = pin_storage {
+        if let Some(ps) = pin_storage {
             Authenticator::with_config_and_pin_storage(callbacks, config, PinStorageWrapper(ps))
         } else {
             Authenticator::with_config(callbacks, config)
-        }?;
+        }
+    }
+
+    /// Create a new authenticator service with optional PIN storage
+    pub fn with_pin_storage(
+        storage: S,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+    ) -> Result<Self> {
+        let storage = Arc::new(Mutex::new(storage));
+        let authenticator = Self::build_authenticator(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+        )?;
 
         Ok(Self {
             authenticator,
@@ -469,9 +492,79 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         })
     }
 
+    fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
+        // Use the high-level reset API from soft-fido2
+        self.authenticator
+            .reset_uv_retries()
+            .map_err(|_| StatusCode::Other)?;
+
+        Ok(())
+    }
+
     /// Process a CTAP request and generate a response
     /// Ok(()) on success or an error
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
+        if request.first() == Some(&CMD_PASSLESS_RESET_UV_RETRIES) {
+            response_buffer.clear();
+
+            let payload = &request[1..];
+            let parser = match soft_fido2_ctap::cbor::MapParser::from_bytes(payload) {
+                Ok(parser) => parser,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            let sub_command: u8 = match parser.get(1) {
+                Ok(sub_command) => sub_command,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            if sub_command != RESET_UV_RETRIES_SUBCOMMAND {
+                response_buffer.push(StatusCode::InvalidParameter as u8);
+                return Ok(());
+            }
+
+            let pin_uv_auth_protocol: u8 = match parser.get(3) {
+                Ok(protocol) => protocol,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            let pin_uv_auth_param: Vec<u8> = match parser.get_bytes(4) {
+                Ok(param) => param,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
+            if let Err(error) = self.authenticator.verify_credential_management_pin_uv_auth(
+                pin_uv_auth_protocol,
+                &pin_uv_auth_param,
+                &auth_data,
+            ) {
+                response_buffer.push(error_status_byte(error));
+                return Ok(());
+            }
+
+            match self.reset_uv_retries() {
+                Ok(()) => {
+                    response_buffer.push(0x00);
+                    response_buffer.push(0xa0);
+                }
+                Err(status) => response_buffer.push(status as u8),
+            }
+            return Ok(());
+        }
+
         self.authenticator.handle(request, response_buffer)?;
         Ok(())
     }
@@ -535,6 +628,32 @@ mod tests {
         assert!(service.is_ok(), "Service creation should succeed");
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_reset_uv_retries_command_requires_authentication() {
+        let temp_dir = std::env::temp_dir().join("test_passless_reset_uv_retries");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let storage =
+            LocalStorageAdapter::new(temp_dir.clone()).expect("Failed to create local storage");
+        let mut service = AuthenticatorService::with_pin_storage(
+            storage,
+            None::<Arc<Mutex<()>>>,
+            SecurityConfig::default(),
+            PinConfig::default(),
+        )
+        .expect("Service creation should succeed");
+
+        let mut response = Vec::new();
+        service
+            .handle(&[CMD_PASSLESS_RESET_UV_RETRIES], &mut response)
+            .expect("UV retry reset command should be handled");
+
+        assert_ne!(response, vec![0x00, 0xa0]);
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
