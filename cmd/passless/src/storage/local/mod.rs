@@ -132,63 +132,11 @@ impl CredentialStorage for LocalStorageAdapter {
     fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential> {
         debug!("read_first called with filter: {:?}", filter);
 
-        // Reset iteration
         self.iteration_index = 0;
-        self.iteration_files.clear();
-
-        // Use indexes to build iteration list efficiently
-        // Convert path info to actual paths
-        self.iteration_files = match &filter {
-            CredentialFilter::None => self
-                .indexes
-                .id
-                .values()
-                .map(|path_info| path_info.to_path(&self.storage_dir))
-                .collect(),
-            CredentialFilter::ById(id) => {
-                if let Some(path_info) = self.indexes.id.get(id) {
-                    vec![path_info.to_path(&self.storage_dir)]
-                } else {
-                    Vec::new()
-                }
-            }
-            CredentialFilter::ByRp(rp) => self
-                .indexes
-                .rp
-                .get(rp)
-                .map(|cred_ids| {
-                    cred_ids
-                        .iter()
-                        .filter_map(|cred_id| {
-                            self.indexes
-                                .id
-                                .get(cred_id)
-                                .map(|path_info| path_info.to_path(&self.storage_dir))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            CredentialFilter::ByHash(hash) => self
-                .indexes
-                .rp_hash
-                .get(hash)
-                .map(|cred_ids| {
-                    cred_ids
-                        .iter()
-                        .filter_map(|cred_id| {
-                            self.indexes
-                                .id
-                                .get(cred_id)
-                                .map(|path_info| path_info.to_path(&self.storage_dir))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
+        self.iteration_files = self.indexes.resolve_filter(&filter, &self.storage_dir);
 
         debug!("Found {} matching paths", self.iteration_files.len());
 
-        // Find first matching credential
         self.find_next()
     }
 
