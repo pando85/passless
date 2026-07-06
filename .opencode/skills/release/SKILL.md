@@ -24,6 +24,8 @@ Before releasing, verify:
 4. **No commits ahead of origin/master** (output of `git rev-list --count origin/master..HEAD` must be 0)
 5. **Repository is not a shallow clone** — git-cliff needs full history for accurate changelogs
 
+The release script handles shallow/latest-commit checkouts by fetching full history and tags before comparing against the remote default branch.
+
 Check with:
 ```bash
 git status --short
@@ -101,6 +103,8 @@ If this outputs `true`, unshallow the repo before proceeding:
 git fetch --unshallow origin
 git fetch --tags origin
 ```
+
+Alternatively, run `.ci/release.sh`; it performs the shallow-clone and tag fetch checks before preparing the release.
 
 ### Step 2: Determine Version
 

@@ -3,11 +3,13 @@ set -euo pipefail
 
 ensure_full_history() {
     if git rev-parse --is-shallow-repository 2>/dev/null | grep -q "true"; then
-        echo "Shallow clone detected. Fetching full history..."
+        echo "Shallow clone detected. Fetching full history and tags..."
         git fetch --unshallow --quiet
     fi
-    echo "Fetching tags..."
-    git fetch --tags --quiet
+    if [ -z "$(git tag -l)" ]; then
+        echo "No tags found. Fetching tags..."
+        git fetch --tags --quiet
+    fi
 }
 
 ensure_clean_state() {
@@ -16,24 +18,46 @@ ensure_clean_state() {
         exit 1
     fi
 
-    BRANCH=$(git rev-parse --abbrev-ref HEAD)
-    if [ "$BRANCH" != "master" ]; then
-        echo "Not on master branch. Current branch: $BRANCH"
+    REMOTE="origin"
+
+    if ! git remote | grep -q "^$REMOTE$"; then
+        echo "Remote '$REMOTE' does not exist. Please configure git remote."
         exit 1
     fi
 
-    git pull origin master --quiet
+    git fetch "$REMOTE" --quiet
 
-    if [ "$(git rev-list --count origin/master..HEAD 2>/dev/null || echo 1)" -ne 0 ]; then
-        echo "There are commits ahead of origin/master. Push or merge them first."
-        echo "CHANGELOG template needs master commit ID."
+    DEFAULT_BRANCH=$(git symbolic-ref "refs/remotes/$REMOTE/HEAD" 2>/dev/null | sed 's@^refs/remotes/[^/]*/@@' || git remote show "$REMOTE" 2>/dev/null | grep "HEAD branch" | sed 's/.*: //')
+
+    if [ -z "$DEFAULT_BRANCH" ]; then
+        echo "Could not determine default branch from remote '$REMOTE'."
+        echo "Please ensure git remote is properly configured."
         exit 1
+    fi
+
+    REMOTE_BRANCH="refs/remotes/$REMOTE/$DEFAULT_BRANCH"
+    if ! git show-ref --quiet "$REMOTE_BRANCH"; then
+        echo "Branch '$DEFAULT_BRANCH' does not exist in remote '$REMOTE'."
+        echo "Please ensure the remote has a default branch."
+        exit 1
+    fi
+
+    LOCAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$LOCAL_BRANCH" = "$DEFAULT_BRANCH" ]; then
+        git pull "$REMOTE" "$DEFAULT_BRANCH" --quiet
+    else
+        COMMIT_COUNT=$(git rev-list --count "$REMOTE_BRANCH"..HEAD 2>/dev/null || echo 1)
+        if [ "$COMMIT_COUNT" -ne 0 ]; then
+            echo "There are $COMMIT_COUNT commits in '$LOCAL_BRANCH' branch that are not in '$REMOTE/$DEFAULT_BRANCH'."
+            echo "Please merge them first. CHANGELOG template needs the latest commit from '$DEFAULT_BRANCH'."
+            exit 1
+        fi
     fi
 }
 
 echo "=== Checking repository state ==="
-ensure_clean_state
 ensure_full_history
+ensure_clean_state
 
 echo ""
 echo "=== Recent commits since last release ==="
