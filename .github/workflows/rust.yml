@@ -16,12 +16,6 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v7
 
-      - name: Checkout soft-fido2
-        uses: actions/checkout@v7
-        with:
-          repository: pando85/soft-fido2
-          path: ../soft-fido2
-
       - name: Install stable toolchain
         id: toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,12 +32,6 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7
-
-      - name: Checkout soft-fido2
-        uses: actions/checkout@v7
-        with:
-          repository: pando85/soft-fido2
-          path: ../soft-fido2
 
       - name: Update apt
         run: sudo apt update
@@ -75,12 +63,6 @@ jobs:
     runs-on: ${{ matrix.job.os }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Checkout soft-fido2
-        uses: actions/checkout@v7
-        with:
-          repository: pando85/soft-fido2
-          path: ../soft-fido2
 
       - name: Update apt
         run: sudo apt update
