@@ -928,7 +928,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1408,7 +1408,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2179,7 +2179,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2402,8 +2402,6 @@ dependencies = [
 [[package]]
 name = "soft-fido2"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85952b3d0bb48adee88e7233af66d196b139076dcb7a82db945426e5421f2fab"
 dependencies = [
  "aes",
  "cbc",
@@ -2428,8 +2426,6 @@ dependencies = [
 [[package]]
 name = "soft-fido2-crypto"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f74259700b8ce2efd348482ae9369cb2a00ae95cffecdd3714eb8d28a66f0b6"
 dependencies = [
  "aes",
  "cbc",
@@ -2447,8 +2443,6 @@ dependencies = [
 [[package]]
 name = "soft-fido2-ctap"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27838bfc975c317e6925ffeb1a85fcab642b14d6b8359ced25ee5d1dd9f06a4d"
 dependencies = [
  "cbor4ii",
  "rand",
@@ -2466,8 +2460,6 @@ dependencies = [
 [[package]]
 name = "soft-fido2-transport"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39e6f7f951c4f273ad3a42dd85040172bc5f491f8d686938963f0d6f10dde14d"
 dependencies = [
  "hex",
  "hidapi",
@@ -2478,9 +2470,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "783f3f6f6b01e295a669edfc402133a5f2553d1f0e81284b3ba4594e80bdd4a2"
+checksum = "bd5231412d905519dca6a5deb0327d407be68d6c941feec004533401d3a0a715"
 dependencies = [
  "lock_api",
 ]
@@ -2574,7 +2566,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2978,7 +2970,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
