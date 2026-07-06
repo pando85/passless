@@ -631,4 +631,6 @@ pub enum PinAction {
         #[arg(value_name = "NEW_PIN")]
         new_pin: String,
     },
+    /// Reset built-in user verification retries without deleting credentials
+    UvReset,
 }

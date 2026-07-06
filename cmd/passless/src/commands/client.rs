@@ -1,5 +1,7 @@
 //! FIDO2 Client Management Commands
 
+use crate::authenticator::CMD_PASSLESS_RESET_UV_RETRIES;
+
 use std::collections::HashMap;
 
 use passless_core::{OutputFormat, Result};
@@ -1346,6 +1348,47 @@ pub fn pin_change(
             let result = PinChangeResult {
                 success: true,
                 message: "PIN changed successfully".to_string(),
+            };
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        }
+    }
+
+    transport.close();
+    Ok(())
+}
+
+/// Reset built-in user verification retries on authenticator
+pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
+    let mut transport = open_authenticator(device)?;
+
+    if output == OutputFormat::Plain {
+        println!("Resetting built-in user verification retries...");
+    }
+
+    let response = transport
+        .send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &[], 30000)
+        .map_err(|e| passless_core::Error::Other(format!("UV retry reset failed: {:?}", e)))?;
+
+    if !response.is_empty() && response[0] != 0x00 {
+        return Err(passless_core::Error::Other(format!(
+            "UV retry reset failed with status: 0x{:02x}",
+            response[0]
+        )));
+    }
+
+    match output {
+        OutputFormat::Plain => {
+            println!("UV retries reset successfully!");
+        }
+        OutputFormat::Json => {
+            #[derive(Serialize)]
+            struct PinUvResetResult {
+                success: bool,
+                message: String,
+            }
+            let result = PinUvResetResult {
+                success: true,
+                message: "UV retries reset successfully".to_string(),
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }

@@ -227,6 +227,9 @@ fn run() -> Result<()> {
                     PinAction::Change { old_pin, new_pin } => {
                         commands::client::pin_change(*output, device.as_deref(), old_pin, new_pin)
                     }
+                    PinAction::UvReset => {
+                        commands::client::pin_uv_reset(*output, device.as_deref())
+                    }
                 },
             },
         };
