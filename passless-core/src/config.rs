@@ -5,9 +5,9 @@
 //! 2. Configuration file (medium priority)
 //! 3. Default values (lowest priority)
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand};
 use clap_serde_derive::ClapSerde;
@@ -441,6 +441,68 @@ pub enum BackendConfig {
     },
 }
 
+impl BackendConfig {
+    /// Canonicalize a path, resolving symlinks for existing parents.
+    ///
+    /// If the full path does not exist, canonicalize the longest existing
+    /// prefix and append the remaining components lexically.
+    pub fn canonicalize_path(path: &Path) -> PathBuf {
+        match fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => {
+                let mut current = path.to_path_buf();
+                let mut suffix = Vec::new();
+                loop {
+                    match fs::canonicalize(&current) {
+                        Ok(base) => {
+                            let mut result = base;
+                            for component in suffix.iter().rev() {
+                                result.push(component);
+                            }
+                            return result;
+                        }
+                        Err(_) => {
+                            if let Some(file_name) = current.file_name() {
+                                suffix.push(file_name.to_os_string());
+                                current = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                            } else {
+                                return path.to_path_buf();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the canonical state path for this backend.
+    ///
+    /// This is used as the identity for the instance lock: two daemons with the
+    /// same canonical state path will contend for the same lock.
+    pub fn state_path(&self) -> PathBuf {
+        match self {
+            BackendConfig::Local { path } => Self::canonicalize_path(Path::new(path)),
+            BackendConfig::Pass { store_path, path, .. } => {
+                Self::canonicalize_path(&Path::new(store_path).join(path))
+            }
+            #[cfg(feature = "tpm")]
+            BackendConfig::Tpm { path, .. } => Self::canonicalize_path(Path::new(path)),
+        }
+    }
+
+    /// Return a human-readable display string for the backend state path.
+    pub fn state_display(&self) -> String {
+        match self {
+            BackendConfig::Local { path } => path.clone(),
+            BackendConfig::Pass { store_path, path, .. } => {
+                format!("{}/{}", store_path, path)
+            }
+            #[cfg(feature = "tpm")]
+            BackendConfig::Tpm { path, .. } => path.clone(),
+        }
+    }
+}
+
 impl AppConfig {
     /// Load configuration with precedence: CLI > config file > defaults
     pub fn load(args: &mut Args) -> Self {
@@ -746,5 +808,77 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min_length"));
+    }
+
+    #[test]
+    fn test_canonicalize_path_existing() {
+        let dir = std::env::temp_dir();
+        let canonical = BackendConfig::canonicalize_path(&dir);
+        assert!(canonical.is_absolute());
+        assert!(canonical.exists());
+    }
+
+    #[test]
+    fn test_canonicalize_path_nonexistent() {
+        let base = std::env::temp_dir();
+        let nonexistent = base.join("passless_test_nonexistent_dir_12345/sub");
+        let canonical = BackendConfig::canonicalize_path(&nonexistent);
+        assert!(canonical.is_absolute());
+        assert!(canonical.starts_with(BackendConfig::canonicalize_path(&base)));
+    }
+
+    #[test]
+    fn test_canonicalize_path_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let canonical_real = BackendConfig::canonicalize_path(&real);
+        let canonical_link = BackendConfig::canonicalize_path(&link);
+        assert_eq!(canonical_real, canonical_link);
+    }
+
+    #[test]
+    fn test_local_state_path_relative_and_absolute() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let abs_path = std::fs::canonicalize(dir.path()).unwrap();
+        let rel_path = dir.path().to_path_buf();
+
+        let backend_abs = BackendConfig::Local {
+            path: abs_path.display().to_string(),
+        };
+        let backend_rel = BackendConfig::Local {
+            path: rel_path.display().to_string(),
+        };
+        assert_eq!(backend_abs.state_path(), backend_rel.state_path());
+    }
+
+    #[test]
+    fn test_pass_state_path_different_subpaths() {
+        let store = "/tmp/passless_test_store";
+        let backend_a = BackendConfig::Pass {
+            store_path: store.to_string(),
+            path: "fido2".to_string(),
+            gpg_backend: "gnupg-bin".to_string(),
+        };
+        let backend_b = BackendConfig::Pass {
+            store_path: store.to_string(),
+            path: "fido2-other".to_string(),
+            gpg_backend: "gnupg-bin".to_string(),
+        };
+        assert_ne!(backend_a.state_path(), backend_b.state_path());
+    }
+
+    #[test]
+    fn test_different_local_paths_produce_different_identities() {
+        let backend_a = BackendConfig::Local {
+            path: "/tmp/passless_a".to_string(),
+        };
+        let backend_b = BackendConfig::Local {
+            path: "/tmp/passless_b".to_string(),
+        };
+        assert_ne!(backend_a.state_path(), backend_b.state_path());
     }
 }

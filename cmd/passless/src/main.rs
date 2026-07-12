@@ -1,5 +1,6 @@
 mod authenticator;
 mod commands;
+mod instance_lock;
 mod notification;
 mod pin_storage;
 mod storage;
@@ -271,6 +272,15 @@ fn run() -> Result<()> {
         warn!("Failed to apply security hardening: {}", e);
     }
 
+    let backend = config.backend().map_err(|e| {
+        error!("Failed to load backend config: {}", e);
+        e
+    })?;
+
+    info!("Acquiring instance lock...");
+    let _instance_lock = instance_lock::InstanceLock::acquire(&backend)?;
+    debug!("Instance lock acquired at {}", _instance_lock.lock_path().display());
+
     info!("Creating UHID device...");
 
     #[cfg(debug_assertions)]
@@ -323,10 +333,7 @@ fn run() -> Result<()> {
     // Get PIN config
     let pin_config = config.pin_config();
 
-    match config.backend().map_err(|e| {
-        error!("Failed to load backend config: {}", e);
-        e
-    })? {
+    match backend {
         BackendConfig::Local { path } => {
             let storage = LocalStorageAdapter::new(path.clone().into())?;
             let pin_storage = LocalPinStorage::new(path.into());
