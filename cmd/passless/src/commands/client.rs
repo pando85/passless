@@ -1458,19 +1458,57 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
         )));
     }
 
+    // Parse the UV retries count from the response if available
+    let uv_retries_count = if response.len() > 1 {
+        // Response format: [status, ...cbor_map]
+        // Try to parse the CBOR map to extract the count
+        if let Ok(soft_fido2_ctap::cbor::Value::Map(map)) =
+            soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..])
+        {
+            map.iter()
+                .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
+                .and_then(|(_, v)| {
+                    if let soft_fido2_ctap::cbor::Value::Integer(n) = v {
+                        Some(*n as u8)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     match output {
         OutputFormat::Plain => {
-            println!("UV retries reset successfully (authenticated)!");
+            if let Some(count) = uv_retries_count {
+                println!(
+                    "UV retries reset successfully! Restored to {} attempts.",
+                    count
+                );
+            } else {
+                println!("UV retries reset successfully (authenticated)!");
+                println!("Note: The retry counter has been restored to the configured maximum.");
+            }
         }
         OutputFormat::Json => {
             #[derive(Serialize)]
             struct PinUvResetResult {
                 success: bool,
                 message: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                uv_retries: Option<u8>,
             }
             let result = PinUvResetResult {
                 success: true,
-                message: "UV retries reset successfully (authenticated)".to_string(),
+                message: if uv_retries_count.is_some() {
+                    "UV retries reset successfully".to_string()
+                } else {
+                    "UV retries reset successfully (authenticated)".to_string()
+                },
+                uv_retries: uv_retries_count,
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }

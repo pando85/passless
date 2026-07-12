@@ -271,6 +271,20 @@ pub struct PinConfig {
     #[default(8)]
     pub max_retries: u8,
 
+    /// Maximum user verification retry attempts before UV is blocked (default: 8)
+    ///
+    /// This controls how many consecutive UV failures are allowed before UV is blocked.
+    /// Use `passless client pin uv-reset` to restore the retry counter after authentication.
+    /// Higher values improve usability but may reduce security against brute-force attacks.
+    #[arg(
+        long = "pin-max-uv-retries",
+        env = "PASSLESS_PIN_MAX_UV_RETRIES",
+        value_name = "RETRIES"
+    )]
+    #[serde(default)]
+    #[default(8)]
+    pub max_uv_retries: u8,
+
     /// Auto-lock timeout in seconds after max failed attempts (0 = disabled)
     /// After lockout, authenticator must be reset to use PIN again
     #[arg(
@@ -281,6 +295,29 @@ pub struct PinConfig {
     #[serde(default)]
     #[default(0)]
     pub auto_lock_timeout: u32,
+}
+
+impl PinConfig {
+    /// Validate PIN configuration values
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.min_length < 4 || self.min_length > 63 {
+            return Err(crate::error::Error::Config(format!(
+                "pin.min_length must be between 4 and 63, got {}",
+                self.min_length
+            )));
+        }
+        if self.max_retries == 0 {
+            return Err(crate::error::Error::Config(
+                "pin.max_retries must be greater than 0".to_string(),
+            ));
+        }
+        if self.max_uv_retries == 0 {
+            return Err(crate::error::Error::Config(
+                "pin.max_uv_retries must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl SecurityConfig {
@@ -471,6 +508,12 @@ impl AppConfig {
     pub fn pin_config(&self) -> PinConfig {
         self.pin.clone()
     }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> crate::error::Result<()> {
+        self.pin.validate()?;
+        Ok(())
+    }
 }
 
 /// CLI arguments structure
@@ -633,4 +676,75 @@ pub enum PinAction {
     },
     /// Reset built-in user verification retries without deleting credentials
     UvReset,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pin_config_default_max_uv_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        assert_eq!(config.max_uv_retries, 8);
+    }
+
+    #[test]
+    fn test_pin_config_validate_success() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pin_config_validate_zero_max_uv_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 0,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_uv_retries"));
+    }
+
+    #[test]
+    fn test_pin_config_validate_zero_max_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 0,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_retries"));
+    }
+
+    #[test]
+    fn test_pin_config_validate_invalid_min_length() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 3,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min_length"));
+    }
 }

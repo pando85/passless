@@ -37,17 +37,49 @@ fn error_status_byte(error: SoftFido2Error) -> u8 {
 }
 
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
-struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
+///
+/// This wrapper intercepts PIN state load/save operations to enforce the configured
+/// max_uv_retries limit. Since soft-fido2 hardcodes MAX_UV_RETRIES=3 internally,
+/// we clamp the uv_retries value to the configured maximum during persistence.
+struct PinStorageWrapper<P: PinStorage> {
+    storage: Arc<Mutex<P>>,
+    max_uv_retries: u8,
+}
+
+impl<P: PinStorage> PinStorageWrapper<P> {
+    /// Clamp uv_retries to the configured maximum
+    fn clamp_uv_retries(&self, state: &mut PinState) {
+        if state.uv_retries > self.max_uv_retries {
+            state.uv_retries = self.max_uv_retries;
+        }
+    }
+}
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
-        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
-        storage.load_pin_state()
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        let mut state = storage.load_pin_state()?;
+        // Clamp uv_retries to configured max on load to handle:
+        // - State persisted with a different (higher) max_uv_retries
+        // - State from older versions with hardcoded uv_retries=3
+        self.clamp_uv_retries(&mut state);
+        Ok(state)
     }
 
     fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
-        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
-        storage.save_pin_state(state)
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        // Clamp uv_retries to configured max on save to handle:
+        // - soft-fido2 reset_uv_retries() which sets uv_retries to hardcoded MAX_UV_RETRIES=3
+        // - Any other internal soft-fido2 operations that may exceed our configured max
+        let mut clamped_state = state.clone();
+        self.clamp_uv_retries(&mut clamped_state);
+        storage.save_pin_state(&clamped_state)
     }
 }
 
@@ -403,6 +435,8 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
     pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
+    /// Maximum UV retries (configured value, not soft-fido2's hardcoded 3)
+    max_uv_retries: u8,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
@@ -461,11 +495,22 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
-        let callbacks =
-            PasslessCallbacks::new(storage, pin_storage.clone(), security_config, pin_config);
+        let callbacks = PasslessCallbacks::new(
+            storage,
+            pin_storage.clone(),
+            security_config,
+            pin_config.clone(),
+        );
 
         if let Some(ps) = pin_storage {
-            Authenticator::with_config_and_pin_storage(callbacks, config, PinStorageWrapper(ps))
+            Authenticator::with_config_and_pin_storage(
+                callbacks,
+                config,
+                PinStorageWrapper {
+                    storage: ps,
+                    max_uv_retries: pin_config.max_uv_retries,
+                },
+            )
         } else {
             Authenticator::with_config(callbacks, config)
         }
@@ -489,6 +534,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         Ok(Self {
             authenticator,
             storage,
+            max_uv_retries: pin_config.max_uv_retries,
         })
     }
 
@@ -558,7 +604,17 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             match self.reset_uv_retries() {
                 Ok(()) => {
                     response_buffer.push(0x00);
-                    response_buffer.push(0xa0);
+                    // Include the restored UV retries count in the response
+                    // Response format: CBOR map { 1: uv_retries_count }
+                    // Use configured max_uv_retries, not soft-fido2's hardcoded value
+                    if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
+                        .insert(1, self.max_uv_retries)
+                        .and_then(|b| b.build())
+                    {
+                        response_buffer.extend_from_slice(&cbor_data);
+                    } else {
+                        response_buffer.push(0xa0);
+                    }
                 }
                 Err(status) => response_buffer.push(status as u8),
             }
@@ -653,6 +709,74 @@ mod tests {
             .expect("UV retry reset command should be handled");
 
         assert_ne!(response, vec![0x00, 0xa0]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_clamps_on_save() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_pin_wrapper_save");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 5,
+        };
+
+        // Create a state with uv_retries higher than max
+        let mut state = PinState::new();
+        state.uv_retries = 10; // Higher than max_uv_retries=5
+
+        // Save should clamp to max_uv_retries
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+
+        // Load should return clamped value
+        let loaded = wrapper.load_pin_state().expect("Load should succeed");
+        assert_eq!(loaded.uv_retries, 5, "uv_retries should be clamped to max");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_clamps_on_load() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_pin_wrapper_load");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+
+        // First, save a state with uv_retries=8 using a wrapper with max=8
+        let wrapper_high = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+        };
+        let mut state = PinState::new();
+        state.uv_retries = 8;
+        wrapper_high
+            .save_pin_state(&state)
+            .expect("Save should succeed");
+
+        // Now load with a wrapper that has lower max_uv_retries
+        let pin_storage2 = LocalPinStorage::new(temp_dir.clone());
+        let wrapper_low = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage2)),
+            max_uv_retries: 3,
+        };
+
+        // Load should clamp to the lower max
+        let loaded = wrapper_low.load_pin_state().expect("Load should succeed");
+        assert_eq!(
+            loaded.uv_retries, 3,
+            "uv_retries should be clamped to lower max on load"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
