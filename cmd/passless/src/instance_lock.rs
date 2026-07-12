@@ -15,7 +15,18 @@ pub struct InstanceLock {
 
 impl InstanceLock {
     pub fn acquire(backend: &BackendConfig) -> passless_core::Result<Self> {
-        let runtime_dir = Self::resolve_runtime_dir()?;
+        Self::acquire_with_runtime_dir(backend, None)
+    }
+
+    fn acquire_with_runtime_dir(
+        backend: &BackendConfig,
+        runtime_dir_override: Option<&Path>,
+    ) -> passless_core::Result<Self> {
+        let runtime_dir = if let Some(dir) = runtime_dir_override {
+            dir.to_path_buf()
+        } else {
+            Self::resolve_runtime_dir()?
+        };
         let lock_dir = runtime_dir.join("passless");
         Self::ensure_secure_dir(&lock_dir)?;
 
@@ -208,11 +219,11 @@ mod tests {
     fn test_acquire_and_drop() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().to_path_buf();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
         let backend = test_backend(&dir.path().join("state_a").display().to_string());
 
-        let lock = InstanceLock::acquire(&backend).expect("first lock should succeed");
+        let lock = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
+            .expect("first lock should succeed");
         let lock_path = lock.lock_path().to_path_buf();
         assert!(lock_path.exists());
 
@@ -221,7 +232,8 @@ mod tests {
 
         drop(lock);
 
-        let lock2 = InstanceLock::acquire(&backend).expect("should reacquire after drop");
+        let lock2 = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
+            .expect("should reacquire after drop");
         drop(lock2);
     }
 
@@ -230,15 +242,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
         let state_dir = dir.path().join("state");
         fs::create_dir_all(&state_dir).unwrap();
         let backend = test_backend(&state_dir.display().to_string());
 
-        let _lock1 = InstanceLock::acquire(&backend).expect("first lock should succeed");
+        let _lock1 = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
+            .expect("first lock should succeed");
 
-        let result = InstanceLock::acquire(&backend);
+        let result = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir));
         assert!(result.is_err());
         match result.unwrap_err() {
             passless_core::Error::AlreadyRunning { path } => {
@@ -253,7 +265,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
         let state_a = dir.path().join("state_a");
         let state_b = dir.path().join("state_b");
@@ -263,8 +274,10 @@ mod tests {
         let backend_a = test_backend(&state_a.display().to_string());
         let backend_b = test_backend(&state_b.display().to_string());
 
-        let _lock_a = InstanceLock::acquire(&backend_a).expect("lock A should succeed");
-        let _lock_b = InstanceLock::acquire(&backend_b).expect("lock B should succeed");
+        let _lock_a = InstanceLock::acquire_with_runtime_dir(&backend_a, Some(&runtime_dir))
+            .expect("lock A should succeed");
+        let _lock_b = InstanceLock::acquire_with_runtime_dir(&backend_b, Some(&runtime_dir))
+            .expect("lock B should succeed");
     }
 
     #[test]
@@ -272,11 +285,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
         let backend = test_backend(&dir.path().join("state").display().to_string());
 
-        let _lock = InstanceLock::acquire(&backend).expect("lock should succeed");
+        let _lock = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
+            .expect("lock should succeed");
 
         let passless_dir = runtime_dir.join("passless");
         let metadata = fs::metadata(&passless_dir).unwrap();
@@ -288,19 +301,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
         let state_dir = dir.path().join("state");
         fs::create_dir_all(&state_dir).unwrap();
         let backend = test_backend(&state_dir.display().to_string());
 
-        let lock = InstanceLock::acquire(&backend).expect("first lock should succeed");
+        let lock = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
+            .expect("first lock should succeed");
         let lock_path = lock.lock_path().to_path_buf();
         drop(lock);
 
         assert!(lock_path.exists());
 
-        let lock2 = InstanceLock::acquire(&backend).expect("should acquire despite stale file");
+        let lock2 = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
+            .expect("should acquire despite stale file");
         drop(lock2);
     }
 }
