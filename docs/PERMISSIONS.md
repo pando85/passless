@@ -114,8 +114,7 @@ sudo usermod -a -G tss $USER    # or tss2, depending on distribution
 ```
 
 For software TPM (swtpm) during testing, no special device permissions are needed; access to the
-Unix socket or TCP port is sufficient. See [SWTPM_QUICK_START.md](SWTPM_QUICK_START.md) for
-details.
+Unix socket or TCP port is sufficient.
 
 ### Desktop Notifications
 
@@ -183,8 +182,9 @@ Set it permanently in `/etc/security/limits.d/`:
 
 ## Hardened Service Example
 
-The following systemd user service applies defense-in-depth hardening. It is compatible with the
-packaged `contrib/systemd/passless.service` and can be used as a reference for further lockdown.
+The following systemd user service applies defense-in-depth hardening. It extends the packaged
+`contrib/systemd/passless.service` with additional isolation directives and can be used as a
+reference for further lockdown.
 
 ```ini
 [Unit]
