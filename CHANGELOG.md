@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.13.0](https://github.com/pando85/passless/tree/v0.13.0) - 2026-07-12
+
+### Added
+
+- pin: Make UV retry limit configurable (#303) ([95319ae](https://github.com/pando85/passless/commit/95319aef6e7f696ef716bf80422ae2a86293368e))
+
+### Fixed
+
+- runtime: Prevent concurrent daemons from sharing backend state (#305) ([14c2d93](https://github.com/pando85/passless/commit/14c2d9392f715d38e98f20f5002d9b8159bf888d))
+- uv: Make UV retry exhaustion visible and preserve UV-blocked errors (#304) ([f72532b](https://github.com/pando85/passless/commit/f72532bab1b81498aa329092e5d7d68fed4736cb))
+
+### Documentation
+
+- Add runtime permissions and hardened setup guide (#299) ([c5b7b3a](https://github.com/pando85/passless/commit/c5b7b3a97ef87ef614f66f745d84317823202de5))
+
+### Chore
+
+- Improve release tooling for shallow clones (#296) ([ff430f0](https://github.com/pando85/passless/commit/ff430f04a3dba4e8c98e9c8bfd01e3c90dcbea08))
+
 ## [v0.12.0](https://github.com/pando85/passless/tree/v0.12.0) - 2026-07-06
 
 ### Added
