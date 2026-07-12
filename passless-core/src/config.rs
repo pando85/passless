@@ -677,3 +677,74 @@ pub enum PinAction {
     /// Reset built-in user verification retries without deleting credentials
     UvReset,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pin_config_default_max_uv_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        assert_eq!(config.max_uv_retries, 8);
+    }
+
+    #[test]
+    fn test_pin_config_validate_success() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pin_config_validate_zero_max_uv_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 0,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_uv_retries"));
+    }
+
+    #[test]
+    fn test_pin_config_validate_zero_max_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 0,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_retries"));
+    }
+
+    #[test]
+    fn test_pin_config_validate_invalid_min_length() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 3,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min_length"));
+    }
+}

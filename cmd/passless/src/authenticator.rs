@@ -693,4 +693,70 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_pin_storage_wrapper_clamps_on_save() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_pin_wrapper_save");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 5,
+        };
+
+        // Create a state with uv_retries higher than max
+        let mut state = PinState::new();
+        state.uv_retries = 10; // Higher than max_uv_retries=5
+
+        // Save should clamp to max_uv_retries
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+
+        // Load should return clamped value
+        let loaded = wrapper.load_pin_state().expect("Load should succeed");
+        assert_eq!(loaded.uv_retries, 5, "uv_retries should be clamped to max");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_clamps_on_load() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_pin_wrapper_load");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+
+        // First, save a state with uv_retries=8 using a wrapper with max=8
+        let wrapper_high = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+        };
+        let mut state = PinState::new();
+        state.uv_retries = 8;
+        wrapper_high.save_pin_state(&state).expect("Save should succeed");
+
+        // Now load with a wrapper that has lower max_uv_retries
+        let pin_storage2 = LocalPinStorage::new(temp_dir.clone());
+        let wrapper_low = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage2)),
+            max_uv_retries: 3,
+        };
+
+        // Load should clamp to the lower max
+        let loaded = wrapper_low.load_pin_state().expect("Load should succeed");
+        assert_eq!(
+            loaded.uv_retries, 3,
+            "uv_retries should be clamped to lower max on load"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }

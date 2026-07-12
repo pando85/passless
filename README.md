@@ -113,8 +113,12 @@ enforcement = "optional"
 # Minimum PIN length (4-63 characters)
 min_length = 4
 
-# Maximum retry attempts before lockout
+# Maximum PIN retry attempts before lockout
 max_retries = 8
+
+# Maximum user verification retry attempts before UV is blocked
+# Use `passless client pin uv-reset` to restore after authentication
+max_uv_retries = 8
 ```
 
 Note: For enhanced security with hardware-backed protection, consider using the TPM backend
