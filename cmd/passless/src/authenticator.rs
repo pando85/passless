@@ -46,6 +46,15 @@ struct PinStorageWrapper<P: PinStorage> {
     max_uv_retries: u8,
 }
 
+impl<P: PinStorage> PinStorageWrapper<P> {
+    /// Clamp uv_retries to the configured maximum
+    fn clamp_uv_retries(&self, state: &mut PinState) {
+        if state.uv_retries > self.max_uv_retries {
+            state.uv_retries = self.max_uv_retries;
+        }
+    }
+}
+
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
         let storage = self
@@ -56,9 +65,7 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
         // Clamp uv_retries to configured max on load to handle:
         // - State persisted with a different (higher) max_uv_retries
         // - State from older versions with hardcoded uv_retries=3
-        if state.uv_retries > self.max_uv_retries {
-            state.uv_retries = self.max_uv_retries;
-        }
+        self.clamp_uv_retries(&mut state);
         Ok(state)
     }
 
@@ -71,9 +78,7 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
         // - soft-fido2 reset_uv_retries() which sets uv_retries to hardcoded MAX_UV_RETRIES=3
         // - Any other internal soft-fido2 operations that may exceed our configured max
         let mut clamped_state = state.clone();
-        if clamped_state.uv_retries > self.max_uv_retries {
-            clamped_state.uv_retries = self.max_uv_retries;
-        }
+        self.clamp_uv_retries(&mut clamped_state);
         storage.save_pin_state(&clamped_state)
     }
 }
@@ -430,6 +435,8 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
     pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
+    /// Maximum UV retries (configured value, not soft-fido2's hardcoded 3)
+    max_uv_retries: u8,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
@@ -527,6 +534,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
         Ok(Self {
             authenticator,
             storage,
+            max_uv_retries: pin_config.max_uv_retries,
         })
     }
 
@@ -598,8 +606,9 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
                     response_buffer.push(0x00);
                     // Include the restored UV retries count in the response
                     // Response format: CBOR map { 1: uv_retries_count }
+                    // Use configured max_uv_retries, not soft-fido2's hardcoded value
                     if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
-                        .insert(1, self.authenticator.uv_retries().unwrap_or(0))
+                        .insert(1, self.max_uv_retries)
                         .and_then(|b| b.build())
                     {
                         response_buffer.extend_from_slice(&cbor_data);
