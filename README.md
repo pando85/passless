@@ -43,6 +43,7 @@ Users should choose the solution that best fits their own security and practical
 - [Installation](#installation)
   - [Cargo](#cargo)
   - [Arch Linux](#arch-linux)
+- [Permissions and Hardening](#permissions-and-hardening)
 - [Acknowledgements](#acknowledgements)
 
 ## Features
@@ -172,6 +173,14 @@ or the binary from AUR:
 ```bash
 yay -S passless-bin
 ```
+
+## Permissions and Hardening
+
+Passless runs as an unprivileged user and requires only regular-user read/write access to
+`/dev/uhid`. Root is neither required nor recommended.
+
+For detailed setup instructions, backend-specific permissions, hardened systemd service examples,
+and troubleshooting, see [docs/PERMISSIONS.md](docs/PERMISSIONS.md).
 
 ## Acknowledgements
 
