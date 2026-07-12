@@ -254,6 +254,12 @@ fn run() -> Result<()> {
     // Load config: CLI args + config file + defaults (CLI takes precedence)
     let config = AppConfig::load(&mut args);
 
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        error!("{}", e.format_cli());
+        return Err(e);
+    }
+
     if config.verbose && log_level != log::LevelFilter::Debug {
         info!("Enabling verbose logging...");
         log::set_max_level(log::LevelFilter::Debug);
