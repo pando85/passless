@@ -1462,7 +1462,9 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
     let uv_retries_count = if response.len() > 1 {
         // Response format: [status, ...cbor_map]
         // Try to parse the CBOR map to extract the count
-        if let Ok(value) = soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..]) {
+        if let Ok(value) =
+            soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..])
+        {
             if let soft_fido2_ctap::cbor::Value::Map(map) = value {
                 map.iter()
                     .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
@@ -1486,7 +1488,10 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
     match output {
         OutputFormat::Plain => {
             if let Some(count) = uv_retries_count {
-                println!("UV retries reset successfully! Restored to {} attempts.", count);
+                println!(
+                    "UV retries reset successfully! Restored to {} attempts.",
+                    count
+                );
             } else {
                 println!("UV retries reset successfully (authenticated)!");
                 println!("Note: The retry counter has been restored to the configured maximum.");

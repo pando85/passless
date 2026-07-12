@@ -48,7 +48,10 @@ struct PinStorageWrapper<P: PinStorage> {
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
-        let storage = self.storage.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
         let mut state = storage.load_pin_state()?;
         // Clamp uv_retries to configured max on load to handle:
         // - State persisted with a different (higher) max_uv_retries
@@ -60,7 +63,10 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
     }
 
     fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
-        let storage = self.storage.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
         // Clamp uv_retries to configured max on save to handle:
         // - soft-fido2 reset_uv_retries() which sets uv_retries to hardcoded MAX_UV_RETRIES=3
         // - Any other internal soft-fido2 operations that may exceed our configured max
@@ -482,8 +488,12 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
-        let callbacks =
-            PasslessCallbacks::new(storage, pin_storage.clone(), security_config, pin_config.clone());
+        let callbacks = PasslessCallbacks::new(
+            storage,
+            pin_storage.clone(),
+            security_config,
+            pin_config.clone(),
+        );
 
         if let Some(ps) = pin_storage {
             Authenticator::with_config_and_pin_storage(
@@ -741,7 +751,9 @@ mod tests {
         };
         let mut state = PinState::new();
         state.uv_retries = 8;
-        wrapper_high.save_pin_state(&state).expect("Save should succeed");
+        wrapper_high
+            .save_pin_state(&state)
+            .expect("Save should succeed");
 
         // Now load with a wrapper that has lower max_uv_retries
         let pin_storage2 = LocalPinStorage::new(temp_dir.clone());
