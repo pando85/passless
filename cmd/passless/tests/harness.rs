@@ -45,6 +45,7 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         Ok(Self {
@@ -140,6 +141,7 @@ pub struct PassBackend {
 }
 
 impl PassBackend {
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let gpg_home = temp_dir.path().join(".gnupg");
@@ -276,6 +278,7 @@ pub struct TpmBackend {
 }
 
 impl TpmBackend {
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
 
@@ -413,6 +416,7 @@ impl AuthenticatorHarness {
     }
 
     /// Create a harness with local backend
+    #[allow(dead_code)]
     pub fn with_local() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(LocalBackend::new()?)))
     }
@@ -424,11 +428,13 @@ impl AuthenticatorHarness {
     }
 
     /// Create a harness with password-store backend
+    #[allow(dead_code)]
     pub fn with_pass() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(PassBackend::new()?)))
     }
 
     /// Create a harness with TPM backend
+    #[allow(dead_code)]
     pub fn with_tpm() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(TpmBackend::new()?)))
     }

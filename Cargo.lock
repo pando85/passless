@@ -1754,6 +1754,7 @@ dependencies = [
  "passless-config-doc",
  "serde",
  "soft-fido2",
+ "tempfile",
  "thiserror",
  "toml",
 ]
@@ -1769,6 +1770,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "ctrlc",
+ "dirs",
  "env_logger",
  "git2 0.21.0",
  "hex",

@@ -4,6 +4,7 @@
 //! We use `thiserror` for structured error handling with proper error context.
 
 use std::io;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -52,6 +53,10 @@ pub enum Error {
     #[error("Invalid data: {0}")]
     InvalidData(String),
 
+    /// Another daemon instance is already running with the same backend state
+    #[error("another Passless instance is already using backend state at {path}")]
+    AlreadyRunning { path: PathBuf },
+
     /// Generic other error
     #[error("{0}")]
     Other(String),
@@ -72,6 +77,18 @@ impl Error {
             Error::Io(err) => format!("IO error: {}", err),
             Error::Serialization(msg) => format!("Serialization error: {}", msg),
             Error::InvalidData(msg) => format!("Invalid data: {}", msg),
+            Error::AlreadyRunning { path } => format!(
+                "another Passless instance is already using backend state:\n\
+                 \x20 {}\n\
+                 \n\
+                 Stop the existing process or disable the duplicate systemd user service.\n\
+                 \n\
+                 To diagnose:\n\
+                 \x20 systemctl --user status passless\n\
+                 \x20 pgrep -a passless\n\
+                 \x20 journalctl --user -u passless",
+                path.display()
+            ),
             Error::Other(msg) => msg.clone(),
         }
     }
