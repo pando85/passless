@@ -279,7 +279,10 @@ fn run() -> Result<()> {
 
     info!("Acquiring instance lock...");
     let _instance_lock = instance_lock::InstanceLock::acquire(&backend)?;
-    debug!("Instance lock acquired at {}", _instance_lock.lock_path().display());
+    debug!(
+        "Instance lock acquired at {}",
+        _instance_lock.lock_path().display()
+    );
 
     info!("Creating UHID device...");
 

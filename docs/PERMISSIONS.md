@@ -375,3 +375,32 @@ Add any required paths to `ReadWritePaths` in the service unit. Common additions
 
 - `%h/.gnupg` for GPG agent socket access (pass backend)
 - `%h/.local/share/passless` if using an alternative data directory
+
+### Another Passless instance is already running
+
+```
+Error: another Passless instance is already using backend state:
+  /home/user/.password-store/fido2
+```
+
+Passless enforces single-instance ownership per backend state directory. A second daemon targeting
+the same state is rejected immediately to prevent concurrent read/modify/write corruption.
+
+**Diagnosis:**
+
+```bash
+systemctl --user status passless
+pgrep -a passless
+journalctl --user -u passless -n 20
+```
+
+**Fix:**
+
+1. Stop the existing instance: `systemctl --user stop passless` (or kill the manual process).
+2. If a manually started process and a systemd service are both running, disable one:
+   `systemctl --user disable --now passless`.
+3. Multiple daemons are supported only when each uses a different backend state path.
+
+Lock files are stored in `$XDG_RUNTIME_DIR/passless/` (or `/tmp/passless-<uid>/passless/` as
+fallback). Stale lock files from crashed processes do not block restarts because lock ownership is
+attached to the file descriptor, not the file itself.

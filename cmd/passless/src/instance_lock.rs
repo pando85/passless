@@ -25,6 +25,7 @@ impl InstanceLock {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .mode(0o600)
             .open(&lock_path)
             .map_err(|e| {
@@ -53,12 +54,13 @@ impl InstanceLock {
             })?;
         }
 
-        let flock = Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| match e {
-            nix::errno::Errno::EWOULDBLOCK => passless_core::Error::AlreadyRunning {
-                path: backend.state_path(),
-            },
-            _ => passless_core::Error::Other(format!("Failed to acquire instance lock: {}", e)),
-        })?;
+        let flock =
+            Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| match e {
+                nix::errno::Errno::EWOULDBLOCK => passless_core::Error::AlreadyRunning {
+                    path: backend.state_path(),
+                },
+                _ => passless_core::Error::Other(format!("Failed to acquire instance lock: {}", e)),
+            })?;
 
         Self::write_metadata(&flock, backend);
 
@@ -140,7 +142,7 @@ impl InstanceLock {
     }
 
     fn write_metadata(flock: &Flock<File>, backend: &BackendConfig) {
-        let mut file: &File = &flock;
+        let mut file: &File = flock;
         let metadata = format!(
             "pid={}\nbackend={}\nstate={}\n",
             std::process::id(),
@@ -208,12 +210,7 @@ mod tests {
         let runtime_dir = dir.path().to_path_buf();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
-        let backend = test_backend(
-            &dir.path()
-                .join("state_a")
-                .display()
-                .to_string(),
-        );
+        let backend = test_backend(&dir.path().join("state_a").display().to_string());
 
         let lock = InstanceLock::acquire(&backend).expect("first lock should succeed");
         let lock_path = lock.lock_path().to_path_buf();
@@ -277,12 +274,7 @@ mod tests {
         fs::create_dir_all(&runtime_dir).unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
 
-        let backend = test_backend(
-            &dir.path()
-                .join("state")
-                .display()
-                .to_string(),
-        );
+        let backend = test_backend(&dir.path().join("state").display().to_string());
 
         let _lock = InstanceLock::acquire(&backend).expect("lock should succeed");
 

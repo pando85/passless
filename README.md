@@ -182,6 +182,15 @@ Passless runs as an unprivileged user and requires only regular-user read/write 
 For detailed setup instructions, backend-specific permissions, hardened systemd service examples,
 and troubleshooting, see [docs/PERMISSIONS.md](docs/PERMISSIONS.md).
 
+## Single-Instance Enforcement
+
+Only one Passless daemon may own a given backend state directory at a time. Starting a second
+daemon against the same backend fails immediately with a clear error. Multiple daemons are
+supported only when each uses a different backend state path.
+
+Client commands (`passless client ...`, `passless config print`) do not acquire the daemon lock
+and work normally while the authenticator is running.
+
 ## Acknowledgements
 
 A big thank you to the [PassKeeZ](https://github.com/Zig-Sec/PassKeeZ) project for being such a

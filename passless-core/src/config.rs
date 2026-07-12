@@ -464,7 +464,10 @@ impl BackendConfig {
                         Err(_) => {
                             if let Some(file_name) = current.file_name() {
                                 suffix.push(file_name.to_os_string());
-                                current = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                                current = current
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_default();
                             } else {
                                 return path.to_path_buf();
                             }
@@ -482,9 +485,9 @@ impl BackendConfig {
     pub fn state_path(&self) -> PathBuf {
         match self {
             BackendConfig::Local { path } => Self::canonicalize_path(Path::new(path)),
-            BackendConfig::Pass { store_path, path, .. } => {
-                Self::canonicalize_path(&Path::new(store_path).join(path))
-            }
+            BackendConfig::Pass {
+                store_path, path, ..
+            } => Self::canonicalize_path(&Path::new(store_path).join(path)),
             #[cfg(feature = "tpm")]
             BackendConfig::Tpm { path, .. } => Self::canonicalize_path(Path::new(path)),
         }
@@ -494,7 +497,9 @@ impl BackendConfig {
     pub fn state_display(&self) -> String {
         match self {
             BackendConfig::Local { path } => path.clone(),
-            BackendConfig::Pass { store_path, path, .. } => {
+            BackendConfig::Pass {
+                store_path, path, ..
+            } => {
                 format!("{}/{}", store_path, path)
             }
             #[cfg(feature = "tpm")]
