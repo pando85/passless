@@ -1,0 +1,4 @@
+# Udev rules for Passless FIDO2 authenticator
+# Allow users in the 'fido' group to access the UHID device
+
+KERNEL=="uhid", GROUP="fido", MODE="0660"

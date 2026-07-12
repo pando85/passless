@@ -1,0 +1,62 @@
+[package]
+name = "passless-rs"
+description = "FIDO2 security token emulator"
+categories = ["command-line-utilities"]
+keywords = ["passkeys", "fido2", "auth", "password-manager", "pass"]
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "passless"
+path = "src/main.rs"
+
+[features]
+default = []
+tpm = ["passless-core/tpm", "tss-esapi"]
+
+[dependencies]
+passless-core.workspace = true
+soft-fido2.workspace = true
+soft-fido2-transport.workspace = true
+soft-fido2-ctap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+sha2.workspace = true
+serde_cbor.workspace = true
+serde.workspace = true
+prs-lib.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+nix.workspace = true
+notify-rust.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+ctrlc.workspace = true
+clap.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+shadow-rs.workspace = true
+dirs.workspace = true
+hmac = "0.13"
+rpassword = "7.3"
+atty = "0.2"
+serde_bytes = "0.11.19"
+tss-esapi = { version = "7.6.0", optional = true }
+
+[dev-dependencies]
+base64 = "0.22"
+ciborium = "0.2"
+tempfile = "3.14"
+hex = "0.4"
+soft-fido2-ctap.workspace = true
+
+[build-dependencies]
+passless-core.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+shadow-rs.workspace = true
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
