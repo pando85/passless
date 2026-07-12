@@ -386,6 +386,11 @@ Error: another Passless instance is already using backend state:
 Passless enforces single-instance ownership per backend state directory. A second daemon targeting
 the same state is rejected immediately to prevent concurrent read/modify/write corruption.
 
+### Built-in UV stopped working (retry exhaustion)
+
+If authentication silently fails with a notification timeout instead of prompting for UV,
+built-in UV retries may be exhausted.
+
 **Diagnosis:**
 
 ```bash
@@ -404,3 +409,39 @@ journalctl --user -u passless -n 20
 Lock files are stored in `$XDG_RUNTIME_DIR/passless/` (or `/tmp/passless-<uid>/passless/` as
 fallback). Stale lock files from crashed processes do not block restarts because lock ownership is
 attached to the file descriptor, not the file itself.
+
+### Built-in UV stopped working (retry exhaustion)
+
+**Diagnosis:**
+
+```bash
+journalctl --user -u passless -n 50 | grep -i "uv"
+```
+
+Look for these log messages:
+
+| Message | Meaning |
+|---------|---------|
+| `UV retry limit is almost exhausted: 1 attempt remaining` | One UV attempt left |
+| `UV retries exhausted; built-in user verification is blocked` | UV is blocked (0 retries) |
+| `Built-in UV is blocked; falling back to notification-based verification` | Notification fallback active |
+
+**Fix:**
+
+Reset UV retries with an authenticated command:
+
+```bash
+passless client pin uv-reset
+```
+
+This requires PIN authentication and restores UV retries to the configured maximum
+(`pin.max_uv_retries` in config, default 8).
+
+**How `pin.enforcement` affects UV fallback:**
+
+| `pin.enforcement` | `always_uv` | Behavior when UV blocked |
+|-------------------|-------------|--------------------------|
+| `required` | any | Built-in UV denied; PIN required |
+| `optional` | `true` | Built-in UV denied; PIN required |
+| `optional` | `false` | Falls back to notification-based UV |
+| `never` | any | Falls back to notification-based UV |
