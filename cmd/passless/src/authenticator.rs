@@ -36,21 +36,77 @@ fn error_status_byte(error: SoftFido2Error) -> u8 {
     }
 }
 
+/// Classification of UV retry count transitions for diagnostic logging
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UvRetryTransition {
+    Initialized,
+    NoChange,
+    NormalChange,
+    Low,
+    Exhausted,
+    Recovered,
+}
+
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
 ///
 /// This wrapper intercepts PIN state load/save operations to enforce the configured
 /// max_uv_retries limit. Since soft-fido2 hardcodes MAX_UV_RETRIES=3 internally,
 /// we clamp the uv_retries value to the configured maximum during persistence.
+///
+/// It also tracks UV retry transitions to emit actionable warnings when retries
+/// approach or reach exhaustion, independent of the storage backend.
 struct PinStorageWrapper<P: PinStorage> {
     storage: Arc<Mutex<P>>,
     max_uv_retries: u8,
+    last_uv_retries: Mutex<Option<u8>>,
 }
 
 impl<P: PinStorage> PinStorageWrapper<P> {
-    /// Clamp uv_retries to the configured maximum
     fn clamp_uv_retries(&self, state: &mut PinState) {
         if state.uv_retries > self.max_uv_retries {
             state.uv_retries = self.max_uv_retries;
+        }
+    }
+
+    fn classify_uv_transition(old: Option<u8>, new: u8) -> UvRetryTransition {
+        match old {
+            None => UvRetryTransition::Initialized,
+            Some(prev) if prev == new => UvRetryTransition::NoChange,
+            Some(prev) if new == 0 && prev > 0 => UvRetryTransition::Exhausted,
+            Some(prev) if new == 1 && prev > 1 => UvRetryTransition::Low,
+            Some(prev) if new > prev && prev == 0 => UvRetryTransition::Recovered,
+            Some(_) => UvRetryTransition::NormalChange,
+        }
+    }
+
+    fn log_uv_retry_transition(&self, old: Option<u8>, new: u8) {
+        match Self::classify_uv_transition(old, new) {
+            UvRetryTransition::Initialized => {
+                debug!("UV retries initialized: {} remaining", new);
+            }
+            UvRetryTransition::NoChange => {}
+            UvRetryTransition::Exhausted => {
+                error!(
+                    "UV retries exhausted; built-in user verification is blocked. \
+                     Run `passless client pin uv-reset` to restore UV retries"
+                );
+            }
+            UvRetryTransition::Low => {
+                warn!(
+                    "UV retry limit is almost exhausted: 1 attempt remaining. \
+                     Run `passless client pin uv-reset` to restore UV retries"
+                );
+            }
+            UvRetryTransition::Recovered => {
+                info!("UV retries restored from 0 to {} (reset/recovery)", new);
+            }
+            UvRetryTransition::NormalChange => {
+                debug!(
+                    "UV retries changed: {} -> {} remaining",
+                    old.unwrap_or(0),
+                    new
+                );
+            }
         }
     }
 }
@@ -62,10 +118,12 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
             .lock()
             .map_err(|_| soft_fido2::StatusCode::Other)?;
         let mut state = storage.load_pin_state()?;
-        // Clamp uv_retries to configured max on load to handle:
-        // - State persisted with a different (higher) max_uv_retries
-        // - State from older versions with hardcoded uv_retries=3
         self.clamp_uv_retries(&mut state);
+        let mut last = self
+            .last_uv_retries
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        *last = Some(state.uv_retries);
         Ok(state)
     }
 
@@ -74,12 +132,20 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
             .storage
             .lock()
             .map_err(|_| soft_fido2::StatusCode::Other)?;
-        // Clamp uv_retries to configured max on save to handle:
-        // - soft-fido2 reset_uv_retries() which sets uv_retries to hardcoded MAX_UV_RETRIES=3
-        // - Any other internal soft-fido2 operations that may exceed our configured max
         let mut clamped_state = state.clone();
         self.clamp_uv_retries(&mut clamped_state);
-        storage.save_pin_state(&clamped_state)
+        storage.save_pin_state(&clamped_state)?;
+        let old = {
+            let mut last = self
+                .last_uv_retries
+                .lock()
+                .map_err(|_| soft_fido2::StatusCode::Other)?;
+            let old = *last;
+            *last = Some(clamped_state.uv_retries);
+            old
+        };
+        self.log_uv_retry_transition(old, clamped_state.uv_retries);
+        Ok(())
     }
 }
 
@@ -169,7 +235,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     }
 
     fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
-        // Check for E2E test mode (only available in debug builds)
         #[cfg(debug_assertions)]
         {
             if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
@@ -178,12 +243,42 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        // Check if PIN is set and apply enforcement policy
-        if let Some(pin_storage) = &self.pin_storage
-            && let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?
-            && let Ok(state) = storage.load_pin_state()
-            && state.is_pin_set()
-        {
+        let pin_set;
+        let uv_retries;
+
+        if let Some(pin_storage) = &self.pin_storage {
+            let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?;
+            match storage.load_pin_state() {
+                Ok(state) => {
+                    pin_set = state.is_pin_set();
+                    uv_retries = Some(state.uv_retries);
+                }
+                Err(_) => {
+                    pin_set = false;
+                    uv_retries = None;
+                }
+            }
+        } else {
+            pin_set = false;
+            uv_retries = None;
+        }
+
+        if let Some(retries) = uv_retries {
+            debug!(
+                "UV request: pin_set={}, uv_retries={}, enforcement={}, always_uv={}",
+                pin_set, retries, self.pin_config.enforcement, self.security_config.always_uv,
+            );
+            if retries == 0 {
+                warn!(
+                    "Built-in UV is blocked (0 retries remaining); \
+                     falling back to notification-based verification because \
+                     pin.enforcement={}",
+                    self.pin_config.enforcement,
+                );
+            }
+        }
+
+        if pin_set {
             match self.pin_config.enforcement {
                 PinEnforcement::Required => {
                     info!("PIN is set and enforcement=required, denying built-in UV to force PIN");
@@ -206,8 +301,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        // No PIN set or enforcement allows notification fallback
-        // Return AcceptedWithUp since notification-based UV also captures user presence
         match show_verification_notification(
             info,
             Some(rp),
@@ -509,6 +602,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
                 PinStorageWrapper {
                     storage: ps,
                     max_uv_retries: pin_config.max_uv_retries,
+                    last_uv_retries: Mutex::new(None),
                 },
             )
         } else {
@@ -621,7 +715,18 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             return Ok(());
         }
 
-        self.authenticator.handle(request, response_buffer)?;
+        let result = self.authenticator.handle(request, response_buffer);
+        if let Err(SoftFido2Error::CtapError(code)) = &result
+            && *code == StatusCode::UvBlocked as u8
+        {
+            warn!(
+                "CTAP request returned UV_BLOCKED (0x{:02x}); \
+                 built-in user verification retries are exhausted. \
+                 Run `passless client pin uv-reset` to restore",
+                code
+            );
+        }
+        result?;
         Ok(())
     }
 
@@ -726,11 +831,11 @@ mod tests {
         let wrapper = PinStorageWrapper {
             storage: Arc::new(Mutex::new(pin_storage)),
             max_uv_retries: 5,
+            last_uv_retries: Mutex::new(None),
         };
 
-        // Create a state with uv_retries higher than max
         let mut state = PinState::new();
-        state.uv_retries = 10; // Higher than max_uv_retries=5
+        state.uv_retries = 10;
 
         // Save should clamp to max_uv_retries
         wrapper.save_pin_state(&state).expect("Save should succeed");
@@ -753,10 +858,10 @@ mod tests {
 
         let pin_storage = LocalPinStorage::new(temp_dir.clone());
 
-        // First, save a state with uv_retries=8 using a wrapper with max=8
         let wrapper_high = PinStorageWrapper {
             storage: Arc::new(Mutex::new(pin_storage)),
             max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
         };
         let mut state = PinState::new();
         state.uv_retries = 8;
@@ -764,11 +869,11 @@ mod tests {
             .save_pin_state(&state)
             .expect("Save should succeed");
 
-        // Now load with a wrapper that has lower max_uv_retries
         let pin_storage2 = LocalPinStorage::new(temp_dir.clone());
         let wrapper_low = PinStorageWrapper {
             storage: Arc::new(Mutex::new(pin_storage2)),
             max_uv_retries: 3,
+            last_uv_retries: Mutex::new(None),
         };
 
         // Load should clamp to the lower max
@@ -777,6 +882,138 @@ mod tests {
             loaded.uv_retries, 3,
             "uv_retries should be clamped to lower max on load"
         );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_uv_retry_transition_classification() {
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(None, 3),
+            UvRetryTransition::Initialized,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(3), 2),
+            UvRetryTransition::NormalChange,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(2), 1),
+            UvRetryTransition::Low,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(1), 0),
+            UvRetryTransition::Exhausted,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(0), 0),
+            UvRetryTransition::NoChange,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(0), 8),
+            UvRetryTransition::Recovered,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(5), 5),
+            UvRetryTransition::NoChange,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(3), 1),
+            UvRetryTransition::Low,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(2), 0),
+            UvRetryTransition::Exhausted,
+        );
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_tracks_uv_retry_transitions() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_uv_transitions");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+        };
+
+        let mut state = PinState::new();
+        state.uv_retries = 3;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(3));
+        }
+
+        state.uv_retries = 2;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(2));
+        }
+
+        state.uv_retries = 1;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(1));
+        }
+
+        state.uv_retries = 0;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(0));
+        }
+
+        state.uv_retries = 0;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(0));
+        }
+
+        state.uv_retries = 8;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(8));
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_load_initializes_last_uv_retries() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_uv_load_init");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+        };
+
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, None);
+        }
+
+        let _state = wrapper.load_pin_state().expect("Load should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert!(last.is_some());
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

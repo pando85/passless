@@ -321,7 +321,11 @@ fn authenticate_for_credential_management(
         }
         Err(uv_error) => {
             if output == OutputFormat::Plain {
-                println!("  UV not available: {:?}", uv_error);
+                if is_uv_blocked_error(&uv_error) {
+                    println!("  {}", format_uv_blocked_message(&uv_error));
+                } else {
+                    println!("  UV not available: {:?}", uv_error);
+                }
             }
 
             fallback_to_pin_auth(transport, output, uv_error)
@@ -347,6 +351,24 @@ fn authenticate_for_credential_management_opt(
         }
     }
 }
+/// Check if a soft_fido2 error represents a UV-blocked condition
+fn is_uv_blocked_error(error: &soft_fido2::Error) -> bool {
+    match error {
+        soft_fido2::Error::CtapError(code) => *code == soft_fido2::StatusCode::UvBlocked as u8,
+        _ => false,
+    }
+}
+
+/// Format a UV-blocked error with actionable remediation
+fn format_uv_blocked_message(error: &soft_fido2::Error) -> String {
+    format!(
+        "Built-in user verification (UV) is blocked: {:?}\n\
+         UV retries have been exhausted.\n\
+         Run `passless client pin uv-reset` to restore UV retries.",
+        error
+    )
+}
+
 /// Fallback to PIN authentication when UV fails
 fn fallback_to_pin_auth(
     transport: &mut Transport,
@@ -416,23 +438,39 @@ fn fallback_to_pin_auth(
                     ))
                 })
         }
-        Some(false) => Err(passless_core::Error::Other(format!(
-            "Credential management requires authentication but:\n\
-                 - UV is unavailable: {:?}\n\
-                 - No PIN is set on this authenticator\n\
-                 \n\
-                 Please set a PIN first using: passless client pin set <PIN>",
-            uv_error
-        ))),
-        None => Err(passless_core::Error::Other(format!(
-            "Credential management requires authentication but:\n\
-                 - UV is unavailable: {:?}\n\
-                 - This authenticator does not support PIN\n\
-                 \n\
-                 This authenticator may require built-in UV (biometric/fingerprint) \
-                 which is currently blocked or unavailable.",
-            uv_error
-        ))),
+        Some(false) => {
+            if is_uv_blocked_error(&uv_error) {
+                Err(passless_core::Error::Other(format_uv_blocked_message(
+                    &uv_error,
+                )))
+            } else {
+                Err(passless_core::Error::Other(format!(
+                    "Credential management requires authentication but:\n\
+                         - UV is unavailable: {:?}\n\
+                         - No PIN is set on this authenticator\n\
+                         \n\
+                         Please set a PIN first using: passless client pin set <PIN>",
+                    uv_error
+                )))
+            }
+        }
+        None => {
+            if is_uv_blocked_error(&uv_error) {
+                Err(passless_core::Error::Other(format_uv_blocked_message(
+                    &uv_error,
+                )))
+            } else {
+                Err(passless_core::Error::Other(format!(
+                    "Credential management requires authentication but:\n\
+                         - UV is unavailable: {:?}\n\
+                         - This authenticator does not support PIN\n\
+                         \n\
+                         This authenticator may require built-in UV (biometric/fingerprint) \
+                         which is currently blocked or unavailable.",
+                    uv_error
+                )))
+            }
+        }
     }
 }
 
