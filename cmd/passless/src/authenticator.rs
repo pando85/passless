@@ -586,7 +586,16 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             match self.reset_uv_retries() {
                 Ok(()) => {
                     response_buffer.push(0x00);
-                    response_buffer.push(0xa0);
+                    // Include the restored UV retries count in the response
+                    // Response format: CBOR map { 1: uv_retries_count }
+                    if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
+                        .insert(1, self.authenticator.uv_retries().unwrap_or(0))
+                        .and_then(|b| b.build())
+                    {
+                        response_buffer.extend_from_slice(&cbor_data);
+                    } else {
+                        response_buffer.push(0xa0);
+                    }
                 }
                 Err(status) => response_buffer.push(status as u8),
             }
