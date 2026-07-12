@@ -351,6 +351,7 @@ fn authenticate_for_credential_management_opt(
         }
     }
 }
+
 /// Check if a soft_fido2 error represents a UV-blocked condition
 fn is_uv_blocked_error(error: &soft_fido2::Error) -> bool {
     match error {

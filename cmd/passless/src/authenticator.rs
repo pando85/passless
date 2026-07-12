@@ -253,7 +253,8 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                     pin_set = state.is_pin_set();
                     uv_retries = Some(state.uv_retries);
                 }
-                Err(_) => {
+                Err(e) => {
+                    debug!("Failed to load PIN state for UV request: {:?}", e);
                     pin_set = false;
                     uv_retries = None;
                 }
