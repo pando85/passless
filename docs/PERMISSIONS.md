@@ -375,3 +375,42 @@ Add any required paths to `ReadWritePaths` in the service unit. Common additions
 
 - `%h/.gnupg` for GPG agent socket access (pass backend)
 - `%h/.local/share/passless` if using an alternative data directory
+
+### Built-in UV stopped working (retry exhaustion)
+
+If authentication silently fails with a notification timeout instead of prompting for UV,
+built-in UV retries may be exhausted.
+
+**Diagnosis:**
+
+```bash
+journalctl --user -u passless -n 50 | grep -i "uv"
+```
+
+Look for these log messages:
+
+| Message | Meaning |
+|---------|---------|
+| `UV retry limit is almost exhausted: 1 attempt remaining` | One UV attempt left |
+| `UV retries exhausted; built-in user verification is blocked` | UV is blocked (0 retries) |
+| `Built-in UV is blocked; falling back to notification-based verification` | Notification fallback active |
+
+**Fix:**
+
+Reset UV retries with an authenticated command:
+
+```bash
+passless client pin uv-reset
+```
+
+This requires PIN authentication and restores UV retries to the configured maximum
+(`pin.max_uv_retries` in config, default 8).
+
+**How `pin.enforcement` affects UV fallback:**
+
+| `pin.enforcement` | `always_uv` | Behavior when UV blocked |
+|-------------------|-------------|--------------------------|
+| `required` | any | Built-in UV denied; PIN required |
+| `optional` | `true` | Built-in UV denied; PIN required |
+| `optional` | `false` | Falls back to notification-based UV |
+| `never` | any | Falls back to notification-based UV |
