@@ -1462,22 +1462,18 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
     let uv_retries_count = if response.len() > 1 {
         // Response format: [status, ...cbor_map]
         // Try to parse the CBOR map to extract the count
-        if let Ok(value) =
+        if let Ok(soft_fido2_ctap::cbor::Value::Map(map)) =
             soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..])
         {
-            if let soft_fido2_ctap::cbor::Value::Map(map) = value {
-                map.iter()
-                    .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
-                    .and_then(|(_, v)| {
-                        if let soft_fido2_ctap::cbor::Value::Integer(n) = v {
-                            Some(*n as u8)
-                        } else {
-                            None
-                        }
-                    })
-            } else {
-                None
-            }
+            map.iter()
+                .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
+                .and_then(|(_, v)| {
+                    if let soft_fido2_ctap::cbor::Value::Integer(n) = v {
+                        Some(*n as u8)
+                    } else {
+                        None
+                    }
+                })
         } else {
             None
         }
