@@ -85,7 +85,11 @@ pub struct SerializablePinRetries {
     /// Remaining PIN retry attempts (0-8)
     #[serde(default = "default_retries")]
     pub retries: u8,
-    /// Remaining UV retry attempts (0-3)
+    /// Remaining UV retry attempts
+    ///
+    /// The serde default of 3 maintains backward compatibility with existing stored state.
+    /// The actual maximum is enforced by the configured `pin.max_uv_retries` value,
+    /// which is applied by the PinStorageWrapper during load/save operations.
     #[serde(default = "default_uv_retries")]
     pub uv_retries: u8,
     /// Auto-lock timestamp in milliseconds since Unix epoch (None = not locked)
@@ -97,6 +101,8 @@ fn default_retries() -> u8 {
     8
 }
 
+/// Serde default for UV retries - preserves backward compatibility with existing stored state.
+/// The configured maximum is applied separately by PinStorageWrapper.
 fn default_uv_retries() -> u8 {
     3
 }
@@ -105,13 +111,22 @@ impl Default for SerializablePinRetries {
     fn default() -> Self {
         Self {
             retries: 8,
-            uv_retries: 3,
+            uv_retries: 8,
             locked_until: None,
         }
     }
 }
 
 impl SerializablePinRetries {
+    /// Create new retry state with configured maximums
+    pub fn new(max_retries: u8, max_uv_retries: u8) -> Self {
+        Self {
+            retries: max_retries,
+            uv_retries: max_uv_retries,
+            locked_until: None,
+        }
+    }
+
     /// Convert to JSON bytes
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, StatusCode> {
         serde_json::to_vec(self).map_err(|_| StatusCode::Other)
@@ -145,7 +160,10 @@ pub struct SerializablePinState {
     pub pin_hash: Option<Vec<u8>>,
     /// Remaining PIN retry attempts (0-8)
     pub retries: u8,
-    /// Remaining UV retry attempts (0-3)
+    /// Remaining UV retry attempts
+    ///
+    /// The serde default of 3 maintains backward compatibility with existing stored state.
+    /// The actual maximum is enforced by the configured `pin.max_uv_retries` value.
     #[serde(default = "default_uv_retries")]
     pub uv_retries: u8,
     /// Minimum PIN length (4-63)
@@ -165,7 +183,7 @@ impl Default for SerializablePinState {
         Self {
             pin_hash: None,
             retries: 8,
-            uv_retries: 3,
+            uv_retries: 8,
             min_pin_length: 4,
             version: 0,
             force_pin_change: false,

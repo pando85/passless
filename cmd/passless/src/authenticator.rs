@@ -37,17 +37,38 @@ fn error_status_byte(error: SoftFido2Error) -> u8 {
 }
 
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
-struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
+///
+/// This wrapper intercepts PIN state load/save operations to enforce the configured
+/// max_uv_retries limit. Since soft-fido2 hardcodes MAX_UV_RETRIES=3 internally,
+/// we clamp the uv_retries value to the configured maximum during persistence.
+struct PinStorageWrapper<P: PinStorage> {
+    storage: Arc<Mutex<P>>,
+    max_uv_retries: u8,
+}
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
-        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
-        storage.load_pin_state()
+        let storage = self.storage.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
+        let mut state = storage.load_pin_state()?;
+        // Clamp uv_retries to configured max on load to handle:
+        // - State persisted with a different (higher) max_uv_retries
+        // - State from older versions with hardcoded uv_retries=3
+        if state.uv_retries > self.max_uv_retries {
+            state.uv_retries = self.max_uv_retries;
+        }
+        Ok(state)
     }
 
     fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
-        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
-        storage.save_pin_state(state)
+        let storage = self.storage.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
+        // Clamp uv_retries to configured max on save to handle:
+        // - soft-fido2 reset_uv_retries() which sets uv_retries to hardcoded MAX_UV_RETRIES=3
+        // - Any other internal soft-fido2 operations that may exceed our configured max
+        let mut clamped_state = state.clone();
+        if clamped_state.uv_retries > self.max_uv_retries {
+            clamped_state.uv_retries = self.max_uv_retries;
+        }
+        storage.save_pin_state(&clamped_state)
     }
 }
 
@@ -462,10 +483,17 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             .build();
 
         let callbacks =
-            PasslessCallbacks::new(storage, pin_storage.clone(), security_config, pin_config);
+            PasslessCallbacks::new(storage, pin_storage.clone(), security_config, pin_config.clone());
 
         if let Some(ps) = pin_storage {
-            Authenticator::with_config_and_pin_storage(callbacks, config, PinStorageWrapper(ps))
+            Authenticator::with_config_and_pin_storage(
+                callbacks,
+                config,
+                PinStorageWrapper {
+                    storage: ps,
+                    max_uv_retries: pin_config.max_uv_retries,
+                },
+            )
         } else {
             Authenticator::with_config(callbacks, config)
         }
