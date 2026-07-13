@@ -1,0 +1,31 @@
+{
+  "generatedAt": "2026-07-13T08:27:29.259Z",
+  "chromium": "150.0.7871.114",
+  "origin": "http://localhost:37985",
+  "rawProxyEventKeys": [
+    "requestDetailsJson",
+    "requestId"
+  ],
+  "derivedContext": {
+    "documentId": "C5E7F23EC59DFA40500C497F38D60CF2",
+    "frameCount": 1,
+    "frameId": 0,
+    "origin": "http://localhost:37985",
+    "tabId": 1202363235,
+    "windowId": 1202363234
+  },
+  "pageResult": "NotAllowedError:Phase 0 probe rejection",
+  "proxyAttachedBeforeNavigation": true,
+  "navigationCanceled": true,
+  "validRegistrationAndAuthentication": true,
+  "relyingPartyVerifiedAssertionSignature": true,
+  "crossOriginNavigationRace": {
+    "requestOrigin": "http://localhost:37985",
+    "derivedOrigin": "http://localhost:37985",
+    "alternateOrigin": "http://localhost:46723",
+    "falselyBoundToNewDocument": false
+  },
+  "overallPhase0": "NO-GO",
+  "completedSubgate": "origin-document-no-fallback-probe",
+  "blockingReason": "webAuthenticationProxy does not bind a request to a source tab, frame, or document; querying current browser state cannot prove the request origin"
+}

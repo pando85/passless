@@ -1,12 +1,15 @@
 # Agent passkey implementation plan
 
-- **Status:** Approved plan; implementation not started
+- **Status:** Blocked at Phase 0 by [ADR 0004](../decisions/0004-reject-webauthn-proxy-origin-binding.md)
 - **Date:** 2026-07-13
 - **Owners:** Passless maintainers
-- **Covers:** [ADR 0001](../decisions/0001-agent-authentication-security-model.md), [ADR 0002](../decisions/0002-managed-browser-interactive-passkeys.md), [ADR 0003](../decisions/0003-autonomous-agent-authentication.md)
+- **Covers:** [ADR 0001](../decisions/0001-agent-authentication-security-model.md), [ADR 0002](../decisions/0002-managed-browser-interactive-passkeys.md), [ADR 0003](../decisions/0003-autonomous-agent-authentication.md), [ADR 0004](../decisions/0004-reject-webauthn-proxy-origin-binding.md)
 - **Initial platform:** Linux and managed Chromium
+- **Feasibility evidence:** [Managed-browser feasibility evidence](../../tools/agent-feasibility/evidence.md)
 
 ## Purpose
+
+> **Phase 0 outcome:** NO-GO. Chrome proxy events do not identify their source origin/document, and current browser state cannot be safely correlated after the fact. Phases 1 through 9 are retained as a complete plan but must not start unless a new ADR selects a transport that passes a replacement Phase 0 gate.
 
 This plan delivers standards-compliant, interactive passkey authentication for locally launched agents without exposing personal Passless credentials or weakening WebAuthn user-presence semantics.
 

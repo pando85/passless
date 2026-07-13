@@ -4,7 +4,7 @@
 - **Date:** 2026-07-13
 - **Decision owners:** Passless maintainers
 - **Implementation status:** Not implemented
-- **Related decisions:** [ADR 0002](0002-managed-browser-interactive-passkeys.md), [ADR 0003](0003-autonomous-agent-authentication.md)
+- **Related decisions:** [ADR 0002](0002-managed-browser-interactive-passkeys.md), [ADR 0003](0003-autonomous-agent-authentication.md), [ADR 0004](0004-reject-webauthn-proxy-origin-binding.md)
 - **Implementation plan:** [Agent passkey implementation plan](../plans/agent-passkey-implementation.md)
 - **Supersedes:** the earlier configurable agent passkey modes proposal in this pull request and the agent workflow proposed in pull request #308
 

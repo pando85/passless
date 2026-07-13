@@ -1,14 +1,17 @@
 # ADR 0002: Managed-browser interactive passkeys
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0004](0004-reject-webauthn-proxy-origin-binding.md)
 - **Date:** 2026-07-13
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Not implemented; gated by this ADR's feasibility and security evidence
+- **Implementation status:** Blocked by the failed Phase 0 origin-binding gate
 - **Depends on:** [ADR 0001](0001-agent-authentication-security-model.md)
 - **Related decision:** [ADR 0003](0003-autonomous-agent-authentication.md)
 - **Implementation plan:** [Agent passkey implementation plan](../plans/agent-passkey-implementation.md)
+- **Feasibility evidence:** [Managed-browser feasibility evidence](../../tools/agent-feasibility/evidence.md)
 
 ## Context
+
+> **Outcome:** The Phase 0 probe demonstrated valid proxy registration and authentication but could not establish a trustworthy binding between a proxy request and its source origin/document. No implementation phase after Phase 0 may proceed from this design. See ADR 0004.
 
 ADR 0001 permits a standards-compliant interactive agent passkey path while requiring structural separation from the human authenticator. This ADR chooses the browser integration and defines the policy, intent, principal, storage, audit, and protocol boundaries required to implement that path.
 

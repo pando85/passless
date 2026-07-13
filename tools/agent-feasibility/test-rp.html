@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Passless Phase 0 probe</title>
+  </head>
+  <body>
+    <button id="create" type="button">Create</button>
+    <button id="get" type="button">Get</button>
+    <button id="create-and-navigate" type="button">Create and navigate</button>
+    <button id="create-and-switch-origin" type="button">Create and switch origin</button>
+    <output id="result">idle</output>
+    <script>
+      function options() {
+        return {
+          publicKey: {
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            rp: { id: "localhost", name: "Passless Phase 0" },
+            user: {
+              id: crypto.getRandomValues(new Uint8Array(16)),
+              name: "phase0@example.test",
+              displayName: "Phase 0",
+            },
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            timeout: 5000,
+          },
+        };
+      }
+
+      async function create() {
+        try {
+          const credential = await navigator.credentials.create(options());
+          window.phase0Credential = credential.toJSON();
+          document.querySelector("#result").textContent = "create-success";
+        } catch (error) {
+          document.querySelector("#result").textContent = `${error.name}:${error.message}`;
+        }
+      }
+
+      async function get() {
+        try {
+          const credential = await navigator.credentials.get({
+            publicKey: {
+              challenge: crypto.getRandomValues(new Uint8Array(32)),
+              rpId: "localhost",
+              allowCredentials: [{
+                type: "public-key",
+                id: Uint8Array.from(atob(window.phase0Credential.rawId.replaceAll("-", "+").replaceAll("_", "/")), c => c.charCodeAt(0)),
+              }],
+              timeout: 5000,
+            },
+          });
+          window.phase0Assertion = credential.toJSON();
+          document.querySelector("#result").textContent = "get-success";
+        } catch (error) {
+          document.querySelector("#result").textContent = `${error.name}:${error.message}`;
+        }
+      }
+
+      document.querySelector("#create").addEventListener("click", () => void create());
+      document.querySelector("#get").addEventListener("click", () => void get());
+      document.querySelector("#create-and-navigate").addEventListener("click", () => {
+        void create();
+        setTimeout(() => location.assign("/?navigated=1"), 100);
+      });
+      document.querySelector("#create-and-switch-origin").addEventListener("click", () => {
+        void create();
+        location.assign("__ALT_ORIGIN__/?race=1");
+      });
+    </script>
+  </body>
+</html>

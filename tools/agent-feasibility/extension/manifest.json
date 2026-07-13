@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Passless WebAuthn proxy feasibility probe",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAop9zQB5pjzvFxPoZ4Pr8TK1aF1WvLer0iv2R18aUGiZFQ9ywCnMg21f4LBBKhBVhuaiLIz1VwwulxzymScnqrv7x5Yx6TObDy7Pw+pztCiCceDPnn2JW2niyxePTcTY1u7xCjLdkTXpbJnyNNZFELcarqOx4wCmGizNYfPXoelj/6PU9Vs1aBT/ntcUkcg7jyNiClpQALljFTPoeBsx94ke/77htG+xuJngPf83Jr6XqP59cLp6hHu6aUZAU/bzopt3UnNxoZDnDVSNBGAjJ0vPp2yVXVjp1qhAg1VcX2FVBhB5O+HoIvlvJdHf+XPfmQLNpFkPcyewLlG8+hWwOaQIDAQAB",
+  "permissions": [
+    "storage",
+    "tabs",
+    "webAuthenticationProxy",
+    "webNavigation"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
