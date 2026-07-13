@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_serde_derive::ClapSerde;
 use libc::{PR_SET_DUMPABLE, prctl};
 use libc::{mlock, munlock};
@@ -664,6 +664,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: ClientAction,
     },
+    /// Agent administration commands
+    AgentAdmin {
+        #[command(subcommand)]
+        action: AgentAdminAction,
+    },
 }
 
 /// Configuration actions
@@ -671,6 +676,41 @@ pub enum Commands {
 pub enum ConfigAction {
     /// Print the default configuration in TOML format
     Print,
+}
+
+/// Agent administration actions
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentAdminAction {
+    /// Install the Passless skill for a supported coding agent
+    Install {
+        /// Agent to install for; auto installs to every detected agent
+        #[arg(value_enum, default_value_t = AgentSkillTarget::Auto)]
+        target: AgentSkillTarget,
+
+        /// Install for the current user or the current Git worktree
+        #[arg(long, value_enum, default_value_t = AgentSkillScope::User)]
+        scope: AgentSkillScope,
+
+        /// Replace a different existing file at the skill target
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Supported coding-agent skill targets
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSkillTarget {
+    Auto,
+    Opencode,
+    Claude,
+    Pi,
+}
+
+/// Skill installation scope
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSkillScope {
+    User,
+    Project,
 }
 
 /// Client actions for FIDO2 authenticator management
@@ -748,6 +788,45 @@ pub enum PinAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_agent_admin_install_defaults() {
+        let args = Args::try_parse_from(["passless", "agent-admin", "install"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Install {
+                    target: AgentSkillTarget::Auto,
+                    scope: AgentSkillScope::User,
+                    force: false,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn test_agent_admin_install_explicit_options() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "install",
+            "claude",
+            "--scope",
+            "project",
+            "--force",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Install {
+                    target: AgentSkillTarget::Claude,
+                    scope: AgentSkillScope::Project,
+                    force: true,
+                },
+            })
+        ));
+    }
 
     #[test]
     fn test_pin_config_default_max_uv_retries() {

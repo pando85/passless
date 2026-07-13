@@ -7,7 +7,8 @@ mod storage;
 mod util;
 
 use passless_core::{
-    AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
+    AgentAdminAction, AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error,
+    PinAction, Result,
 };
 
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Packet, UhidDevice};
@@ -232,6 +233,13 @@ fn run() -> Result<()> {
                         commands::client::pin_uv_reset(*output, device.as_deref())
                     }
                 },
+            },
+            Commands::AgentAdmin { action } => match action {
+                AgentAdminAction::Install {
+                    target,
+                    scope,
+                    force,
+                } => commands::agent_admin::install(*target, *scope, *force),
             },
         };
     }

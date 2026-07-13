@@ -630,9 +630,12 @@ passless agent-admin credential list|show|revoke|delete
 passless agent-admin delegation show|list|revoke
 passless agent-admin session show|list|revoke
 passless agent-admin audit status|verify|export|recover
+passless agent-admin install [auto|opencode|claude|pi] [--scope user|project] [--force]
 ```
 
 Authority-changing and destructive commands use only the administrative channel and require trusted human confirmation where applicable.
+
+The skill installer writes the bundled `passless-agent` Agent Skill to the selected tool's native user or project directory. `auto` installs only for detected tools, existing different skills require `--force`, and installation does not enable an agent profile or grant authentication authority.
 
 ### Principal commands
 
