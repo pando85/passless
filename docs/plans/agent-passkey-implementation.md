@@ -1,767 +1,808 @@
-# Agent passkey implementation plan
+# Agent authentication implementation plan
 
-- **Status:** Blocked at Phase 0 by [ADR 0004](../decisions/0004-reject-webauthn-proxy-origin-binding.md)
+- **Status:** Approved for phased implementation
 - **Date:** 2026-07-13
 - **Owners:** Passless maintainers
-- **Covers:** [ADR 0001](../decisions/0001-agent-authentication-security-model.md), [ADR 0002](../decisions/0002-managed-browser-interactive-passkeys.md), [ADR 0003](../decisions/0003-autonomous-agent-authentication.md), [ADR 0004](../decisions/0004-reject-webauthn-proxy-origin-binding.md)
-- **Initial platform:** Linux and managed Chromium
-- **Feasibility evidence:** [Managed-browser feasibility evidence](../../tools/agent-feasibility/evidence.md)
+- **Covers:** [ADR 0001](../decisions/0001-agent-authentication-security-model.md) and [ADR 0002](../decisions/0002-native-webauthn-agent-architecture.md)
+- **Initial platform:** Linux with stock browser WebAuthn and UHID
 
 ## Purpose
 
-> **Phase 0 outcome:** NO-GO. Chrome proxy events do not identify their source origin/document, and current browser state cannot be safely correlated after the fact. Phases 1 through 9 are retained as a complete plan but must not start unless a new ADR selects a transport that passes a replacement Phase 0 gate.
+This plan implements two opt-in agent authentication modes without changing browser behavior:
 
-This plan delivers standards-compliant, interactive passkey authentication for locally launched agents without exposing personal Passless credentials or weakening WebAuthn user-presence semantics.
+- `isolated`: persistent, agent-only credentials with independent storage and revocation.
+- `delegated-session`: one human-approved assertion using one existing user credential for one RP ID, followed by a short-lived ephemeral browser lease.
 
-The plan is complete for the decisions recorded in ADRs 0001 through 0003. It includes feasibility work, repository structure, protocols, policy, principal isolation, credential storage, audit, browser integration, CLI, documentation, tests, migration, packaging, review, and release gates.
+The implementation uses separate UHID endpoints to classify human and agent requests. It does not use a browser extension, native messaging host, WebAuthn proxy, injected script, patched browser, raw signing API, or caller-supplied `clientDataHash`.
 
-Autonomous WebAuthn is not an implementation phase. The plan records controls that prevent it from being added accidentally and defines the separate evidence required for future autonomous work.
+Each phase has a security exit gate. A phase that depends on an unproven gate does not begin until the gate passes. Failure causes design revision rather than a weaker fallback.
 
 ## Outcomes
 
 The implementation is complete when:
 
-1. A trusted launcher starts an agent and managed Chromium profile inside a kernel-enforced principal boundary.
-2. The browser proxy is active before navigation and cannot fall back to personal authenticators.
-3. The agent creates a short-lived intent for one exact origin, RP ID, action, browser session, and credential where applicable.
-4. The daemon authenticates the principal and browser request, re-evaluates current policy, and presents a trusted human prompt.
-5. Registration or authentication completes only after a ceremony-specific gesture.
-6. UP and UV reflect the evidence actually collected.
-7. Machine credentials remain in a separate store and never appear through UHID.
-8. Durable protected audit records surround every credential creation and use.
-9. Existing human Passless behavior and storage formats remain unchanged.
-10. No code path provides autonomous WebAuthn or sets UP from prior delegation.
+1. Existing Passless behavior remains the default and passes its existing tests unchanged.
+2. A configured agent profile maps to an authenticated principal and a unique UHID endpoint.
+3. Kernel-enforced device permissions prevent human and agent browsers from seeing the wrong endpoint.
+4. Isolated credentials cannot cross human or agent-profile boundaries.
+5. Delegated mode exposes one exact existing credential for one exact RP assertion without copying key material.
+6. Every WebAuthn operation receives fresh, truthful UP and actual UV when required.
+7. A delegation grant is consumed by one terminal assertion result and cannot authorize later WebAuthn calls.
+8. A delegated browser is terminated at its local monotonic deadline or earlier revocation.
+9. Policy, authorization, credential use, browser leases, denial, and cleanup are protected by durable audit.
+10. No production path describes a local browser lease as RP-side revocation or continuing user presence.
 
 ## Explicit non-outcomes
 
 This work does not deliver:
 
-- Unattended browser login.
-- Delegated-machine presence.
-- OAuth, token exchange, or workload-identity issuance.
-- Remote agents.
-- Cross-origin iframe, related-origin, or conditional WebAuthn flows.
-- Firefox or Safari integration.
-- Conversion or delegation of human credentials.
-- Authorization of actions after login.
-- Protection from host root or kernel compromise.
+- Autonomous WebAuthn or automatic UP/UV during an authorization window.
+- A new RP-visible agent identity in delegated-session mode.
+- Business-action authorization after login.
+- Guaranteed invalidation of an RP session when the local browser lease ends.
+- Cookie, token, private-key, PIN, raw assertion, or arbitrary signing APIs.
+- Browser modification, browser extensions, or WebAuthn proxying.
+- Remote agent support or non-Unix isolation in the first release.
+- Protection from host root, kernel compromise, or a malicious Passless administrator.
+- RP-supported OAuth, workload identity, or service-account provisioning.
 
-## Repository baseline
+## Current repository baseline
 
-The current workspace contains:
+The current implementation has one service, backend, and UHID loop per process:
 
-```text
-passless-core/          configuration and shared errors
-passless-config-doc/    configuration documentation derive macro
-cmd/passless/           daemon, UHID authenticator, storage, PIN storage, CLI
-cmd/passless/tests/     current human-flow integration and E2E tests
-docs/                   project documentation
-```
-
-Relevant current code is concentrated in:
-
-- `cmd/passless/src/main.rs`: daemon startup, backend dispatch, and UHID loop.
-- `cmd/passless/src/authenticator.rs`: human authenticator service and callbacks.
-- `cmd/passless/src/notification.rs`: existing human presence and verification prompts.
-- `cmd/passless/src/storage/`: local, pass, and TPM credential backends.
+- `passless-core/src/config.rs`: `AppConfig`, backend, security, PIN, CLI, and TOML merging.
+- `cmd/passless/src/main.rs`: startup, instance locking, one UHID device, backend dispatch, and `run_with_service()`.
+- `cmd/passless/src/authenticator.rs`: `AuthenticatorService`, `PasslessCallbacks`, UP/UV handling, and storage callbacks.
+- `cmd/passless/src/storage/`: local, pass, and TPM implementations of `CredentialStorage`.
 - `cmd/passless/src/pin_storage/`: PIN state backends.
-- `cmd/passless/src/instance_lock.rs`: process-level backend locking.
-- `passless-core/src/config.rs`: CLI and TOML configuration model.
+- `cmd/passless/src/instance_lock.rs`: exclusive backend-state locking.
+- `cmd/passless/src/notification.rs`: current presence and verification prompts.
+- `cmd/passless/tests/`: human WebAuthn, client, backend, PIN, and instance-lock E2E tests.
 
-The current human implementation remains in place during v1. The agent path is additive and feature-gated until release readiness.
+Constraints that drive the implementation:
 
-## Target repository structure
+- `run_with_service()` currently owns one `UhidDevice` and one CTAPHID handler.
+- `AuthenticatorService::with_pin_storage()` creates its own shared storage owner.
+- The transport dependency currently fixes some UHID identity fields.
+- The instance lock prevents independent processes from opening the same human backend.
+- Existing storage adapters are mutable and depend on one external mutex for iteration and updates.
+- Authenticator callbacks receive RP ID but not exact browser origin or process identity.
+
+The design extends these boundaries. It does not bypass the instance lock or open the same human backend through multiple adapters.
+
+## Target structure
+
+The exact split may be adjusted during implementation, but responsibilities remain separate:
 
 ```text
-passless-core/
-    src/agent/                 policy and validated domain types
+passless-core/src/agent/
+    config.rs             validated profile configuration
+    ids.rs                opaque profile, endpoint, principal, intent, and grant IDs
+    policy.rs             immutable policy model and decisions
+    protocol.rs           versioned local IPC request and response types
 
-passless-protocol/
-    src/admin.rs               versioned administrative contracts
-    src/agent.rs               versioned principal and intent contracts
-    src/browser.rs             versioned browser proxy contracts
-    src/audit.rs               versioned audit event contracts
+cmd/passless/src/agent/
+    audit/                protected writer, verification, rotation, degradation
+    authorization.rs      intent and delegated-grant state machines
+    browser.rs            ephemeral browser process and lease lifecycle
+    device.rs             unique UHID endpoint registry and visibility checks
+    launcher.rs           principal authentication and Linux isolation
+    policy.rs             loaded policy generation and evaluator
+    prompt.rs             agent-specific trusted prompt
+    service.rs            endpoint-specific ceremony orchestration
+    storage/
+        delegated.rs      callback access filter over one human storage owner
+        isolated.rs       profile-scoped credential storage ports
+    worker.rs             independent CTAPHID endpoint worker
 
-cmd/passless/
-    src/agent/
-        audit/                 protected writer, verification, degradation
-        browser/               request validation and client-data construction
-        intent.rs              in-memory intent registry and state machine
-        launcher/              principal lifecycle and sandbox integration
-        policy.rs              current-policy evaluator
-        service.rs             interactive ceremony orchestration
-        storage/               machine credential ports and backend adapters
-    src/commands/agent.rs       principal-safe commands
-    src/commands/agent_admin.rs human administrative commands
-    src/daemon/                admin, agent, and browser Unix sockets
+cmd/passless/src/commands/
+    agent.rs              principal-safe commands
+    agent_admin.rs        human administrative commands
 
-cmd/passless-native-host/
-    src/main.rs                Chromium native messaging bridge
-
-browser-extension/
-    manifest.json
-    background.js              minimal WebAuthenticationProxy integration
-
-docs/agents/                  operator and agent documentation
-tools/agent-feasibility/      non-production Phase 0 evidence
+docs/agents/
+    README.md
+    security-model.md
+    configuration.md
+    isolated-mode.md
+    delegated-session.md
+    operations.md
+    audit.md
+    troubleshooting.md
 ```
 
-`passless-protocol` is a new workspace crate with only `serde`, `serde_json`, and `ciborium` dependencies. It contains versioned wire types and deterministic encoders, but no credential operations, policy decisions, filesystem access, process execution, or secrets. Agent implementation initially remains in `cmd/passless` to avoid extracting the stable human engine before the browser design is proven. A later refactor may extract an engine crate without changing protocols.
+Do not create a separate protocol crate unless two independently versioned binaries need the contract. Initial local protocol types belong in `passless-core` to minimize packages and dependencies.
 
 ## Requirement catalog
 
-The identifiers below are used by phase exits, tests, and review evidence.
+Requirement IDs are stable across implementation, tests, and review evidence.
 
 | ID | Requirement |
 |---|---|
-| AUTH-01 | Set UP if and only if a fresh gesture authorizes the exact bound ceremony. |
-| AUTH-02 | Set UV if and only if actual local user verification occurred for the ceremony. |
-| AUTH-03 | Reject unknown or autonomous modes; policy and capabilities expose `interactive` only. |
-| SEP-01 | Human and agent requests use structurally separate transports with no fallback. |
-| SEP-02 | Human and machine credentials use separate roots, interfaces, and enumeration paths. |
-| SEP-03 | Managed browsers cannot access UHID, personal browser profiles, or platform passkeys. |
-| PRIN-01 | Authenticate principals with launcher identity, peer credentials, a session capability, and sandbox identity. |
-| PRIN-02 | A secure profile requires a separate Unix user, container, or equivalent kernel-enforced boundary. |
-| PRIN-03 | Principals cannot access admin sockets, storage roots, audit files, or other principals. |
-| BIND-01 | Bind every intent to one exact HTTPS origin, RP ID, action, browser session, and expiry. |
-| BIND-02 | Bind authentication to exactly one credential. |
-| BIND-03 | Validate that RP ID is allowed for the exact origin under WebAuthn rules. |
-| BIND-04 | Canonicalize and digest every security-relevant WebAuthn request field. |
-| BIND-05 | Construct `clientDataJSON` in the daemon; reject raw signing and caller-provided hashes. |
-| POL-01 | Deny machine access by default and use exact principal/origin/RP/action grants. |
-| POL-02 | Re-evaluate policy at intent creation, request binding, and immediately before key use. |
-| POL-03 | Cancel affected intents on policy change, expiry, credential revocation, or principal termination. |
-| INT-01 | Permit one unbound intent and one active ceremony per principal in v1. |
-| INT-02 | Consume a bound intent on success, denial, failure, cancellation, or timeout. |
-| INT-03 | Require a new intent for every retry and lose all intents on daemon restart. |
-| STORE-01 | Keep private keys in the daemon and never return them through any protocol. |
-| STORE-02 | Store each machine credential in a versioned integrity-protected envelope. |
-| STORE-03 | Quarantine corrupt and unknown-version records; never reinterpret them as human credentials. |
-| STORE-04 | Make revocation immediate and preserve non-secret metadata for audit. |
-| SECRET-01 | Keep private keys, PINs, capabilities, cookies, tokens, and raw assertions out of protocols, CLI output, logs, errors, and audit. |
-| AUDIT-01 | Require protected-local audit assurance for every secure principal profile. |
-| AUDIT-02 | Durably append an authorization-reservation event before credential creation or use. |
-| AUDIT-03 | Append a terminal event and enter fail-closed degraded mode if it cannot be recorded. |
-| AUDIT-04 | Hash-chain records across rotation without placing secrets in audit data. |
-| PROTO-01 | Version every admin, agent, browser, and audit contract and reject incompatible peers. |
-| PROTO-02 | Authenticate browser and agent channels and validate every field before use. |
-| PROTO-03 | Return stable errors and safe recommended actions without downgrade instructions. |
-| OPS-01 | Version and authenticate distribution of the daemon, launcher, extension, and native host. |
-| OPS-02 | Preserve existing human configuration, storage, CLI, UHID behavior, and tests. |
-| AUTO-01 | Do not implement delegated-machine WebAuthn, autonomous registration, or false UP/UV. |
-| AUTO-02 | Document scoped RP-supported credentials as the preferred unattended mechanism. |
+| MODE-01 | Agent support is disabled by default and unknown modes fail validation. |
+| MODE-02 | Support only `isolated` and `delegated-session` profiles. |
+| MODE-03 | Delegated mode permits one authentication assertion and no registration or credential management. |
+| ROUTE-01 | Human and agent requests use distinct UHID endpoints. |
+| ROUTE-02 | Every agent endpoint is bound to one authenticated principal, profile, and mode. |
+| ROUTE-03 | Human and agent browser identities cannot open each other's hidraw nodes. |
+| ROUTE-04 | Endpoint failure never falls back to another Passless credential path. |
+| AUTH-01 | Set UP only after a fresh gesture for the exact active CTAP operation. |
+| AUTH-02 | Set UV only after actual local user verification for that operation. |
+| AUTH-03 | Policy, capabilities, grants, leases, and earlier gestures never produce UP or UV. |
+| RP-01 | The stock browser remains responsible for origin-to-RP validation and client-data construction. |
+| RP-02 | Passless exactly matches the CTAP RP ID against policy and active authorization. |
+| RP-03 | Passless never claims independent visibility of the exact web origin. |
+| PRIN-01 | Authenticate a principal with peer identity, launcher identity, sandbox identity, and a protected session capability. |
+| PRIN-02 | Secure profiles require a separate Unix identity, container, or equivalent kernel boundary. |
+| PRIN-03 | Principals cannot access admin channels, credential roots, audit, browser-profile files, `/dev/uhid`, or unrelated hidraw nodes. |
+| ISO-01 | Isolated credentials use profile-specific stores, PIN state, callbacks, and enumeration. |
+| ISO-02 | Isolated registration and authentication each require one-shot intents. |
+| ISO-03 | Isolated credentials are independently revocable. |
+| DEL-01 | A delegated grant binds one principal, endpoint, RP ID, credential, policy generation, login deadline, and maximum session lifetime. |
+| DEL-02 | A delegated credential view can read and update only the exact granted credential. |
+| DEL-03 | Human and delegated access serialize all mutable credential state. |
+| DEL-04 | Every terminal assertion result consumes the grant and removes delegated key access. |
+| DEL-05 | The delegated endpoint drains and is destroyed after the CTAP exchange. |
+| SESS-01 | Delegated browser leases use daemon-owned monotonic deadlines. |
+| SESS-02 | Principals cannot extend leases; exit, revocation, expiry, or isolation failure terminates them. |
+| SESS-03 | Ephemeral profiles contain no personal profile data and are never reused after failed cleanup. |
+| SESS-04 | Documentation distinguishes local lease expiry from RP-side session expiry. |
+| POL-01 | Agent policy is deny-by-default and administered outside the principal. |
+| POL-02 | Re-evaluate policy before endpoint creation, request binding, prompt display, and key use. |
+| POL-03 | Policy change, profile disablement, or credential revocation cancels affected work immediately. |
+| INT-01 | Permit one unbound authorization and one active ceremony per endpoint. |
+| INT-02 | Consume bound authorization on success, denial, failure, cancellation, mismatch, or timeout. |
+| INT-03 | Use monotonic time for authorization expiry and lose in-memory authorization on restart. |
+| STORE-01 | Private keys stay in daemon-owned storage and never cross local protocols. |
+| STORE-02 | Human storage remains format-compatible and is opened by one daemon-owned adapter. |
+| STORE-03 | Isolated stores use non-overlapping roots and quarantine invalid records. |
+| SECRET-01 | Secrets do not appear in CLI, IPC metadata, logs, errors, audit, arguments, or ordinary environment variables. |
+| AUDIT-01 | Durably record authorization before credential creation or use. |
+| AUDIT-02 | Hash-chain audit records across rotation and protect them from principals. |
+| AUDIT-03 | Terminal audit failure enters persistent fail-closed agent degradation. |
+| PROTO-01 | Version local admin, principal, and audit contracts and reject incompatible peers. |
+| PROTO-02 | Validate message sizes, fields, state transitions, and peer authorization before use. |
+| OPS-01 | Agent failure does not stop or weaken the existing human authenticator. |
+| OPS-02 | Agent configuration and data can be disabled or removed without migrating human credentials. |
+| AUTO-01 | No autonomous mode, delegated UP, cached UV, or repeated passkey use under one browser lease is exposed. |
 
 ## Delivery strategy
 
-Implementation proceeds through ten ordered phases, numbered 0 through 9. A phase can overlap another only when its inputs are stable and its security gate remains independently reviewable.
+Implementation proceeds through ten ordered phases. Phase 0 is a hard feasibility gate. Later phases may be split into reviewable pull requests, but no production agent mode is enabled until Phase 9 passes.
 
-No production agent feature is enabled by default before Phase 8. Phase 0 may invalidate the browser approach. If it does, implementation stops and ADR 0002 is superseded rather than weakened.
+Every phase must provide:
 
-## Phase 0: Managed-browser feasibility
+- Code and schema changes scoped to that phase.
+- Positive, negative, race, and failure tests appropriate to the boundary.
+- A requirement-to-test update.
+- Documentation of newly accepted residual risk.
+- A passing human regression suite.
+
+## Phase 0: Native UHID and isolation feasibility
 
 ### Objective
 
-Prove that Chromium's proxy API can provide the origin context, response control, failure behavior, and profile isolation required by ADR 0002.
+Prove the assumptions that cannot be established from the current single-device implementation.
 
 ### Deliverables
 
-- `tools/agent-feasibility/extension/`: minimal unpacked Manifest V3 extension using `webAuthenticationProxy`.
-- `tools/agent-feasibility/native-host/`: disposable native messaging bridge.
-- `tools/agent-feasibility/launch.sh`: reproducible dedicated-profile launcher.
-- `tools/agent-feasibility/test-rp/`: controlled HTTPS RP with registration and assertion verification.
-- `tools/agent-feasibility/evidence.md`: command transcript, Chromium version, policy, screenshots where useful, network-free reproduction steps, and pass/fail table.
-- Browser request and response fixtures for registration, authentication, cancellation, timeout, and proxy failure.
-- Provisional cross-component canonicalization vectors sufficient to prove the Phase 0 message path; Phase 1 freezes the final deterministic CBOR schema and vectors before any credential implementation begins.
+- A disposable multi-UHID probe under `tools/agent-uhid-feasibility/`.
+- A controlled RP test using stock browser WebAuthn.
+- Reproducible Linux device-policy and principal-isolation setup.
+- Packet and process evidence for UP, UV, endpoint routing, and teardown.
+- `tools/agent-uhid-feasibility/evidence.md` with commands, versions, pass/fail results, and unresolved limitations. The deleted proxy feasibility evidence does not satisfy this replacement gate.
+
+The Phase 0 tools are not linked into production and contain no production credentials.
 
 ### Experiments
 
-1. Attach the proxy before the first navigation.
-2. Capture the exact top-level origin, RP ID, request identifier, tab, document identity, and WebAuthn options.
-3. Determine which context comes from the proxy API and which requires another extension API.
-4. Complete one registration and authentication against the controlled RP.
-5. Cancel from the page and proxy independently and verify mutual propagation.
-6. Kill the extension service worker, native host, and daemon at each ceremony state.
-7. Verify that every failure is terminal and the browser never invokes another authenticator.
-8. Attempt cross-origin iframe, related-origin, conditional, and concurrent requests and verify rejection.
-9. Launch the profile without UHID access and without personal profile directories.
-10. Verify behavior across the minimum and latest supported Chromium versions.
+1. Add the minimum public transport API needed to create devices with deterministic, unique name, `phys`, `uniq`, vendor, and product identity. Prefer an upstream `soft-fido2-transport` change; if unavailable, document and review a minimal pinned fork before proceeding.
+2. Run the human endpoint and one agent endpoint concurrently for at least 1,000 create/destroy cycles.
+3. Identify each resulting hidraw node without relying on enumeration order.
+4. Prove the human browser identity cannot open the agent node.
+5. Prove the principal browser identity cannot open the human node or `/dev/uhid`.
+6. Launch a stock browser with a fresh profile and complete isolated registration and authentication through only the agent node.
+7. Complete delegated authentication with one existing human credential through an exact filtered view while the human endpoint remains responsive.
+8. Race simultaneous human and delegated assertions for the same credential and verify serialized counter/state updates without lost writes.
+9. Attempt delegated registration, resident enumeration, credential management, deletion, another RP, another credential, and a second assertion; verify terminal rejection.
+10. Deny and approve prompts and inspect authenticator flags at packet and RP levels.
+11. After successfully submitting the CTAP response, reject later requests before callback dispatch, exercise the transport's kernel acknowledgment or bounded drain procedure, and verify safe endpoint destruction without truncating the browser result.
+12. Kill the browser, agent, worker, daemon, and audit path at each state and verify cleanup and fail-closed behavior.
+13. Expire and revoke a browser lease; verify browser termination, control-channel closure, profile cleanup, and non-reuse after injected cleanup failure.
+14. Run existing human registration, assertion, PIN, client, storage, and instance-lock tests with agent support compiled but disabled.
+15. Test representative direct and federated or cross-site login flows from a fresh profile and document which RP patterns are supported; unsupported redirect patterns do not weaken endpoint or credential controls.
 
 ### Exit gate
 
-All ADR 0002 feasibility items must pass. Evidence must show trusted exact-origin correlation, complete response construction, deterministic fail-closed behavior, and no path to personal authenticators.
+All experiments must pass on the minimum and current supported Linux environments. Device identity must be deterministic, mutual endpoint invisibility must be kernel-enforced, delegated storage must remain single-owner and exact-credential-only, UP/UV must be truthful, and existing human behavior must remain compatible.
 
-Failure of origin trust, proxy attachment before navigation, or no-fallback behavior stops the project. Convenience fallbacks are prohibited.
+Failure of device routing, principal isolation, exact delegated filtering, shared-state synchronization, or endpoint teardown blocks implementation and requires an ADR revision.
 
-## Phase 1: Threat model, protocols, and validated types
+## Phase 1: Domain types, configuration, and local contracts
 
 ### Objective
 
-Freeze trust boundaries and wire contracts before implementing credential operations.
+Freeze validated configuration and state types before adding runtime authority.
 
 ### Changes
 
-- Add `passless-protocol` to the workspace.
-- Add `passless-core/src/agent/` for validated origin, RP ID, profile, credential reference, action, policy, and intent types.
-- Add `[agents]` configuration under an opt-in `agent` feature.
-- Define separate admin, agent, and browser socket addresses and permission models.
-- Define schema version negotiation and incompatible-version errors.
-- Define canonical CBOR for browser option digests and publish fixed test vectors.
-- Define stable request IDs, intent IDs, browser-session IDs, principal-session IDs, and policy versions.
-- Define all stable errors listed in ADR 0002 plus structured `agent_action` values.
+- Add `passless-core/src/agent/` behind an `agent` feature.
+- Add `agent = []` to `passless-core`, propagate it from `cmd/passless`, and gate module exports in `passless-core/src/lib.rs`.
+- Add `AgentConfig`, `AgentProfileConfig`, and `AgentMode` to `AppConfig`.
+- Make agent configuration independently cloneable and extract owned or `Arc`-wrapped validated profiles at startup; do not require `AppConfig` itself to implement `Clone`.
+- Represent `isolated` and `delegated-session` as a closed enum.
+- Add opaque typed IDs for profiles, principal sessions, endpoints, policies, intents, grants, credentials, and browser leases.
+- Add validated RP ID, duration, device identity, store reference, browser command, and principal identity types.
+- Define versioned admin and principal request/response envelopes with bounded sizes.
+- Define stable errors and safe recommended actions.
+- Add policy generation and deterministic policy digest types.
+- Use Unix `SOCK_SEQPACKET` local sockets with peer credentials for versioned admin and principal contracts.
+- Define the policy digest as SHA-256 over RFC 8949 deterministic CBOR for validated policy fields, with fixed golden fixtures; do not rely on a serializer's default map ordering or integer encoding.
+- Derive stable non-secret credential references as a full SHA-256 digest over a domain separator and credential ID, reject collisions, and resolve references only inside the daemon-owned credential index.
 
-### Workspace and feature integration
+### Configuration rules
 
-- Add `passless-protocol` to the root workspace members.
-- Give `passless-protocol` no default features and only the serialization dependencies listed in the target structure.
-- Add an `agent` feature to `passless-core` and `cmd/passless`; it gates agent config, daemon channels, launcher, and agent commands at compile time.
-- Keep the existing `tpm` feature independent. `agent,tpm` enables the TPM machine-storage adapter.
-- Default builds compile no agent runtime and preserve current behavior.
+- Existing files with no `[agents]` section retain current behavior.
+- `[agents].enabled` defaults to `false`.
+- `default` is always `deny` in the first release.
+- Profile IDs are unique, normalized, and safe for local path derivation.
+- RP IDs are exact normalized DNS names; reject schemes, ports, paths, wildcards, IPs outside explicit test configuration, trailing dots, and public suffixes.
+- `delegated-session` requires explicit credential references, `require_uv = true`, positive grant TTL, and positive session TTL.
+- `isolated` requires a non-overlapping storage root and explicitly configured registration policy.
+- Agent vendor/product/unique device identities cannot collide with the human endpoint or another enabled profile.
+- Agent credential, PIN, browser-profile, runtime, and audit paths cannot equal, contain, or be contained by human or other profile roots after canonical and symlink-safe validation.
+- Security-sensitive unknown fields fail loading instead of being ignored.
+- CLI values override TOML using the existing precedence model without exposing secrets.
+- Agent configuration structs derive the existing `ConfigDoc` support so generated TOML documentation remains authoritative. Extend the derive implementation for maps of named profile structs, or generate the `[agents.profiles.*]` section through a reviewed dedicated path if the macro cannot represent it safely.
 
-### RP ID validation
+### Illustrative configuration
 
-Normalize origins with the URL parser and domain names with IDNA processing before comparison. Apply WebAuthn RP ID rules to the authenticated origin: the RP ID must equal the origin's effective domain or be a registrable-domain suffix of it, must not be a public suffix, and must not include a scheme, port, path, wildcard, or trailing dot. Loopback IP origins are permitted only in the controlled test profile and require exact RP ID matching.
+```toml
+[agents]
+enabled = true
+default = "deny"
+audit_path = "/var/lib/passless-agent/audit/events.jsonl"
 
-### Security configuration behavior
+[agents.profiles.opencode]
+mode = "delegated-session"
+principal_user = "passless-opencode"
+rp_ids = ["github.com"]
+credential_refs = ["user-github"]
+max_grant_ttl = "2m"
+max_session_ttl = "15m"
+require_uv = true
 
-The agent authenticator inherits current Passless hardening requirements for core-dump prevention and memory handling. It uses the existing signature-counter policy. Presence and verification configuration is evaluated through agent-specific callbacks and cannot disable the mandatory interactive prompt. Existing `user_verification_registration`, `user_verification_authentication`, and `always_uv` settings may require additional verification, but cannot convert policy or launcher authentication into UV. The implementation review must document the exact interaction before Phase 6 exits.
-
-### Canonical browser request
-
-The canonical digest input is an explicitly versioned CBOR map. It includes each field whether present or absent and preserves list ordering. It covers challenge, RP ID, RP entity, user entity, algorithms, allow/exclude credentials, user verification, authenticator selection, extensions, timeout, origin, top origin, action, request ID, document ID, and browser session ID.
-
-JSON field order, optional whitespace, browser object property order, and unrecognized extension fields cannot affect interpretation. Unknown security-relevant fields cause rejection until a new schema supports them.
-
-The native host authenticates the complete message envelope. The daemon recomputes the digest from the decoded request before binding it to an intent.
-
-### Tests
-
-- Origin normalization and rejection tests.
-- RP ID validity and public-suffix rejection tests.
-- Canonicalization golden vectors shared by Rust and JavaScript.
-- Duplicate, missing, unknown, oversized, and malformed field tests.
-- Protocol downgrade and incompatible-version tests.
-- Property tests for serialization round trips and ID uniqueness.
-- Configuration tests proving default deny and interactive-only mode.
-
-### Exit gate
-
-The protocol crate has no credential or filesystem access. Cross-language fixtures produce identical digests. Security review approves the canonical field set and message-size limits.
-
-## Phase 2: Machine policy, intents, and credential storage
-
-### Objective
-
-Implement the daemon-owned authorization state without browser or key-use integration.
-
-### Policy work
-
-- Parse exact profile, origin, RP ID, and action grants.
-- Reject wildcard, public-suffix, registrable-domain, and mode values other than `interactive`.
-- Require exact credential references for authentication.
-- Require registration namespace, expiry, and budget for registration.
-- Assign a monotonically changing policy version and stable digest.
-- Reload policy atomically and notify the intent registry of changed or removed grants.
-
-Policy is stored in the main Passless TOML file under `[agents]`. It is loaded at daemon startup and reloaded only through `passless agent-admin policy reload`; v1 does not use filesystem watchers. A successful reload increments an in-memory generation and records the deterministic policy digest. Audit identity uses both generation and digest, so a daemon restart can restart the generation without confusing policy content.
-
-### Intent work
-
-- Implement an in-memory registry keyed by authenticated principal session.
-- Enforce one unbound intent and one bound ceremony per principal.
-- Implement explicit state transitions with no implicit retry.
-- Use a monotonic clock for timeout decisions and wall time only for display and audit.
-- Re-evaluate policy at creation, binding, and execution.
-- Cancel intents on principal termination, daemon shutdown, policy change, credential revocation, browser cancellation, and timeout.
-- Support idempotent creation without allowing a changed payload under the same idempotency key.
-
-### Storage work
-
-- Add a `MachineCredentialStorage` trait separate from `CredentialStorage`.
-- Implement local, pass, and TPM adapters under distinct configured roots.
-- Use one versioned envelope containing the credential and ownership metadata.
-- Integrity-protect envelopes with a daemon-held key stored outside the principal boundary.
-- Retain the selected backend's confidentiality model: owner-protected local files, GPG-encrypted pass records, or TPM-sealed records.
-- Zeroize serialized private material and integrity keys after use.
-- Support list, read-exact, write-new, revoke, quarantine, and delete-admin operations.
-- Never expose a generic iterator that can cross principals.
-
-`delete-admin` permanently removes already-revoked private material after retention and investigation requirements are satisfied. `revoke` immediately blocks use while preserving the envelope and metadata for audit. Only the administrative channel can delete.
-
-Machine storage configuration uses backend-specific roots that cannot equal, contain, or be contained by a human credential root after canonical path validation:
-
-```text
-local: $XDG_DATA_HOME/passless-agent/fido2
-pass:  fido2-agent inside the configured password store
-tpm:   $XDG_DATA_HOME/passless-agent/fido2-tpm
-```
-
-Operators may override these under `[agents.storage]`. The daemon refuses agent startup on overlap, symlink ambiguity, insecure ownership, or insecure permissions.
-
-### Credential envelope fields
-
-```text
-schema_version
-credential
-owner_profile
-credential_ref
-rp_id
-creation_origin
-created_at
-creation_policy_version
-creation_policy_digest
-revoked_at
-revocation_reason
-integrity_algorithm
-integrity_tag
+[agents.profiles.release-bot]
+mode = "isolated"
+principal_user = "passless-release"
+rp_ids = ["github.com"]
+credential_store = "/var/lib/passless-agent/release-bot/credentials"
+pin_store = "/var/lib/passless-agent/release-bot/pin"
+registration_allowed = true
+require_uv = true
 ```
 
 ### Tests
 
-- Shared backend conformance suite for local, pass, and TPM.
-- Human-to-machine and machine-to-human enumeration denial.
-- Cross-principal read and use denial.
-- Corruption, truncation, unknown-version, and wrong-key quarantine.
-- Create-only registration behavior; no overwrite.
-- Immediate revocation and revocation-during-binding races.
-- Policy-reload and expiry cancellation races.
-- Daemon restart removes all intents but preserves credentials and policy.
+- Default and backward-compatible configuration snapshots.
+- Unknown mode and field rejection.
+- RP ID normalization and public-suffix corpus.
+- Duration overflow, zero, maximum, and monotonic conversion tests.
+- Path overlap, symlink replacement, ownership, and permission tests.
+- Device identity collision tests.
+- Protocol missing, duplicate, malformed, oversized, and incompatible-version tests.
+- Serialization round trips and stable error snapshots.
 
 ### Exit gate
 
-No test or internal API can use a machine credential without exact profile, RP ID, and credential reference. Existing human storage fixtures remain byte-for-byte compatible.
+Configuration cannot enable an ambiguous or shared route. Existing configuration snapshots remain compatible. No contract contains private material, cookies, raw assertions, or caller-provided signing input.
 
-## Phase 3: Protected audit
+## Phase 2: Multi-endpoint daemon runtime
 
 ### Objective
 
-Create an audit subsystem that can gate key use and cannot be modified by the principal.
+Refactor the single-device loop into explicit independent endpoint workers while preserving the human service.
+
+### Changes
+
+- Extract a worker around `UhidDevice`, `CtapHidHandler`, command handler, shutdown signal, and cache cleanup.
+- Preserve or deliberately simplify the existing `ServiceHandler` command-handler wrapper as part of worker extraction.
+- Keep the current human worker construction and behavior as the default path.
+- Add an endpoint registry with atomic create, ready, activate, drain, fail, and destroy transitions.
+- Parameterize UHID identity using the Phase 0 result.
+- Route worker output only to the service injected at endpoint creation.
+- Add per-endpoint cancellation and a daemon-wide shutdown coordinator.
+- Prevent an agent worker from blocking the human worker while waiting for policy, prompt, audit, or browser state.
+- Acquire one existing-style canonical-path lock per human or isolated backend plus one daemon-wide lock for agent audit, sockets, and endpoint state; release all locks on failed startup.
+- Clean stale runtime metadata at startup without trusting it as proof that a kernel device still exists.
+
+### Concurrency model
+
+- One worker owns each CTAPHID channel state.
+- Human storage remains one `Arc<Mutex<S>>` or an equivalent single-owner abstraction.
+- Endpoint registry locks are never held during storage, prompt, audit sync, browser wait, or packet I/O.
+- Lock ordering is documented and tested.
+- Human requests receive bounded priority when delegated access contends for the human credential store.
+- Agent resource limits bound endpoint count, pending packets, message sizes, prompt count, and cleanup work.
+
+### Tests
+
+- Endpoint state-machine property tests.
+- Concurrent create, drain, destroy, daemon shutdown, and stale-handle tests.
+- Packet routing proving no service can receive another endpoint's frames.
+- Lock-order and contention tests with injected delays.
+- Worker crash isolation and human-worker continuity.
+- Repeated endpoint lifecycle tests under file-descriptor and process pressure.
+- Existing human E2E tests with zero configured profiles.
+
+### Exit gate
+
+An endpoint has exactly one service and profile identity for its lifetime. Agent-worker failure leaves the human worker operational. No shared lock is held across user interaction or browser lifecycle waits.
+
+## Phase 3: Principal launcher, device policy, and browser leases
+
+### Objective
+
+Build the enforced boundary that makes an agent endpoint a trustworthy routing signal.
+
+This phase begins only after maintainers review and accept the Phase 0 evidence.
+
+### Changes
+
+- Add the administrative launcher path and per-principal control socket.
+- Authenticate admin and principal peers with Unix credentials.
+- Generate a 256-bit session capability with the OS CSPRNG and transfer it through an inherited socket or pipe.
+- Bind the established principal connection to UID, PID, process start identity, and cgroup, namespace, or container identity.
+- Create a separate Unix identity or equivalent container boundary for each secure profile.
+- Create a daemon-owned `0700` runtime directory and ephemeral browser profile.
+- Durably record browser PID, process start identity, cgroup or transient-scope identity, endpoint, and profile path before exposing the principal session; recover verified orphan scopes on daemon startup.
+- Apply `no_new_privs`, resource limits, process limits, filesystem restrictions, device-node policy, and a reviewed syscall policy.
+- Start a stock browser without sync, personal profiles, unapproved extensions, saved credentials, or inherited sessions.
+- Expose only the profile's hidraw node and approved browser-control channel.
+- Add a browser lease manager using monotonic deadlines and explicit revoke, browser-exit, principal-exit, and cleanup states.
+- Quarantine profile paths after failed cleanup and require administrative recovery before removal.
+
+### Browser-control assumptions
+
+The implementation documents exactly which automation interface the principal receives. Passless does not return cookies or tokens, but the browser-control interface may expose session state. The security model therefore treats the principal as holding the full RP browser-session authority during the lease.
+
+The launcher navigates first to a configured HTTPS start URL whose host is valid for the profile's RP ID. The start URL is operational configuration, not origin evidence. If the approved browser-control interface allows later arbitrary navigation, documentation and the approval prompt state that explicitly; optional network policy may narrow destinations but does not create RP action scope.
+
+Direct profile filesystem access is denied. Optional network and egress restrictions may reduce exfiltration, but the first release does not claim they create RP-side revocation or business-action scope.
+
+### Tests
+
+- Wrong UID, process, namespace, cgroup, capability, profile, and expired-session rejection.
+- Capability absence from command lines, environment, logs, audit, crash output, and proc inspection.
+- In-principal attempts to open `/dev/uhid`, human and foreign hidraw nodes, admin socket, stores, audit, and profile paths.
+- Browser startup failure, crash, hang, principal exit, daemon restart, revoke, and expiry cleanup.
+- Monotonic expiry under wall-clock jumps.
+- Symlink, mount replacement, path reuse, and cleanup-race tests.
+- Daemon restart recovery that kills only a PID with matching process-start and scope identity, never a recycled PID.
+- Resource exhaustion that cannot starve the human authenticator.
+
+### Exit gate
+
+The principal sees exactly one intended agent endpoint and no protected path. Missing kernel controls cause launch failure, not same-user fallback. Browser leases terminate and clean up deterministically under normal and fault-injected paths.
+
+## Phase 4: Credential isolation and delegated views
+
+### Objective
+
+Implement storage boundaries before connecting agent requests to key use.
+
+### Human storage ownership
+
+- Add an `AuthenticatorService` constructor accepting the existing `Arc<Mutex<S>>` storage owner while retaining `with_pin_storage()` for current callers; update human construction only where shared ownership is required.
+- Keep one adapter instance for each human backend.
+- Serialize reads, signature-counter updates, writes, deletion, iteration, and cache cleanup.
+- Do not create another local, pass, or TPM adapter over the same human root.
+
+### Delegated credential view
+
+- Add a non-cloneable, capability-scoped callback access filter bound to grant ID, endpoint ID, RP ID, and credential reference; it is not a second `CredentialStorage` adapter.
+- Permit exact credential read and required post-assertion state update only.
+- Reject iteration, RP enumeration, registration, create, overwrite, delete, and credential management.
+- Recheck active grant state and policy immediately before read and update.
+- Hold a per-credential operation lock across the complete read-sign-update sequence and use backend-atomic record replacement; reject conflicting or failed updates before returning an assertion.
+- Invalidate the view before endpoint destruction on every terminal result.
+- Return mismatch errors without searching for another credential.
+
+### Isolated storage
+
+- Define an agent storage port that requires profile identity on every operation.
+- Implement local, pass, and TPM adapters under distinct roots using existing backend formats where safe.
+- Keep profile-specific PIN and UV retry state separate.
+- Store ownership, RP ID, credential reference, creation time, policy digest, and revocation metadata in a versioned integrity-protected envelope if existing records cannot safely carry them.
+- Quarantine corrupt, unknown-version, wrong-owner, and unauthenticated records.
+- Expose no cross-profile iterator.
+
+### Tests
+
+- Shared backend conformance for local, pass, and TPM.
+- Human, isolated, and delegated enumeration boundaries.
+- Exact delegated read/update and every prohibited method.
+- Concurrent human/delegated counter update and rollback failures.
+- Cross-profile, wrong-RP, wrong-credential, expired-grant, and revoked-credential denial.
+- Corruption, truncation, wrong integrity key, symlink, and unknown version.
+- Existing human storage fixtures remain byte-for-byte compatible.
+- Crash and conflict injection between credential read, signature generation, and counter persistence, with behavior compared to the existing signature-counter policy.
+
+### Exit gate
+
+No API or test can use a human credential through an agent endpoint without one live exact delegated view. Isolated credentials cannot appear through human or other profile paths. Concurrent state updates are serialized and durable.
+
+## Phase 5: Policy, intents, and delegation grants
+
+### Objective
+
+Implement daemon-owned authorization independently from browser and credential callbacks.
+
+### Policy engine
+
+- Parse validated profile policy from the main configuration.
+- Assign an in-memory generation and deterministic digest.
+- Reload only through the administrative channel in the first release.
+- Evaluate profile, mode, principal identity, RP ID, action, credential, registration budget, UV requirement, and requested lifetime.
+- Notify endpoint and authorization registries after an atomic successful reload.
+- Cancel work affected by disablement, narrowing, credential revocation, or expiry.
+
+### Isolated intents
+
+- Implement one-shot registration and authentication intent states.
+- Bind registration to one namespace and budget.
+- Bind authentication to one exact credential.
+- Enforce one unbound and one active intent per endpoint.
+- Support idempotent creation only when the complete payload matches.
+
+### Delegated grants
+
+- Accept a principal request for one configured RP and credential as untrusted input and store it as a pending request with no key-use authority.
+- Bind the pending request to an exact CTAP operation before presenting one trusted prompt; prompt approval atomically creates the one-shot grant and supplies UP for that operation.
+- Bind grant ID, profile, principal session, endpoint, RP ID, credential, policy generation, login deadline, and requested session TTL.
+- Clamp grant and session TTLs to configured maxima.
+- Do not start the browser lease until assertion completion.
+- Consume the grant on every terminal assertion result.
+- Never reactivate credential access during `browser_lease_active`.
+
+### Races and time
+
+- Use monotonic deadlines for decisions and wall time for display and audit.
+- Re-evaluate policy at creation, request binding, prompt display, and immediately before credential use.
+- Make cancellation idempotent.
+- Ensure timeout, cancellation, policy reload, principal exit, endpoint destruction, and credential revocation have one deterministic winning terminal transition.
+- Lose all intents and grants on daemon restart.
+
+### Tests
+
+- State-machine model and property tests.
+- Replay, duplicate ID, changed idempotency payload, double binding, and double completion.
+- Wrong endpoint, principal, RP, credential, action, and mode.
+- Expiry at every boundary using a controllable monotonic clock.
+- Policy reload and revocation races before prompt and before key use.
+- Session TTL clamping and principal extension attempts.
+- Registration requests rejected in delegated mode.
+
+### Exit gate
+
+No authorization can bind twice, cross an endpoint or principal, outlive policy, or authorize more than its exact operation. A browser lease contains no live credential capability.
+
+## Phase 6: Protected audit
+
+### Objective
+
+Create an audit subsystem that gates key use and is unavailable to principals.
 
 ### Event model
 
 Events cover:
 
-- Principal session start and end.
-- Policy load, change, denial, expiry, and revocation.
-- Intent creation, binding, rejection, cancellation, expiry, and consumption.
-- Browser connection, protocol mismatch, request, cancellation, and failure.
-- Human prompt display, approval, denial, timeout, and verification result.
-- Machine credential reservation, creation, use, revocation, quarantine, and deletion.
-- Ceremony completion and failure.
-- Audit rotation, checkpoint, degradation, recovery, and administrative acknowledgement.
+- Daemon and agent subsystem start, stop, and degraded state.
+- Principal and endpoint lifecycle.
+- Policy load, reload, denial, expiry, and revocation.
+- Intent and grant creation, approval, binding, cancellation, consumption, and timeout.
+- Prompt display, approval, denial, timeout, and UV result.
+- Isolated credential reservation, creation, use, revocation, quarantine, and deletion.
+- Delegated credential reservation, use, and state-update result.
+- Browser lease start, expiry, revocation, exit, cleanup, quarantine, and recovery.
+- Audit rotation, verification, checkpoint, degradation, and acknowledgement.
 
-### Durability
+### Durability and secrecy
 
-- Open the active file with owner-only permissions and append semantics.
-- Serialize one complete JSON object per line.
-- Assign a sequence number before append.
-- Compute the event hash over canonical event bytes and the previous hash.
-- Use `fdatasync` after the pre-execution authorization-reservation record.
-- Append and synchronize terminal credential events.
-- Rotate only between records and chain the first new record to the previous file's final hash.
-- Retain rotated files for the configured retention period.
-
-Audit storage is global to the daemon and independent from credential backends. The default active path is `$XDG_STATE_HOME/passless/audit/machine.jsonl`, rotation size is 50 MiB, and retention is 180 days. Configuration lives under `[agents.audit]`. Secure profiles reject `best-effort` assurance and refuse startup if protected-local ownership and permissions cannot be established.
-
-### Failure behavior
-
-- Failure before key use returns `audit_unavailable`; no credential operation occurs.
-- Failure after an irreversible RP response sets persistent `audit_degraded` state.
-- Degraded state blocks new agent intents and ceremonies.
-- Recovery requires an administrator to repair storage, run verification, and acknowledge the discontinuity.
-- Human UHID operations are not blocked by agent-audit degradation.
+- Use owner-only append-oriented files under a non-principal path.
+- Serialize one versioned canonical event per record.
+- Include sequence, previous hash, event hash, wall timestamp, and monotonic duration fields where useful.
+- Synchronize the authorization reservation before credential creation or use.
+- Synchronize terminal credential events.
+- Chain rotations and optionally publish TPM or remote checkpoints.
+- Scan every event type for prohibited secret fields.
+- Enter persistent degraded state if an irreversible result cannot be recorded.
+- Keep human operations independent from agent audit degradation.
 
 ### Tests
 
-- Write, sync, rotation, restart, and chain verification.
-- Read-only path, disk-full, short-write, interrupted-write, and corrupt-tail behavior.
-- Pre-write failure proving the credential callback is never invoked.
+- Append, sync, rotation, restart, retention, and chain verification.
+- Disk full, read-only path, short write, interrupted write, corrupt tail, and missing rotation file.
+- Pre-write failure proving no credential callback runs.
 - Terminal-write failure proving later agent operations are denied.
-- Principal filesystem tests proving audit files cannot be opened or modified.
-- Secret-scanning property tests over every event variant.
+- Principal filesystem denial and symlink replacement.
+- Secret-scanning property tests over every event and error variant.
 
 ### Exit gate
 
-The audit writer can block credential callbacks, survives restart, detects chain corruption, and remains inaccessible from a principal sandbox. Performance measurements document the synchronous-write cost.
+Audit can block key use, detect corruption, survive restart, and remain inaccessible to the principal. Recovery is explicit and cannot silently discard a discontinuity.
 
-## Phase 4: Trusted launcher and principal isolation
+## Phase 7: Agent ceremony services
 
 ### Objective
 
-Implement the secure local principal profile and separate daemon channels.
+Connect native CTAP requests to endpoint identity, authorization, policy, audit, prompt, and the correct credential view.
 
-### Launcher design
+### Service construction
 
-- Linux-only in v1.
-- Create an ephemeral runtime directory owned by the daemon user.
-- Generate a 256-bit random session capability.
-- Pass the capability through an inherited pipe or socket file descriptor.
-- Place the process tree and browser in a dedicated cgroup and namespace or supported container.
-- Run the principal under a distinct Unix identity or equivalent container identity.
-- Remove UHID, admin socket, storage, audit, personal home, and unrelated runtime paths from the namespace.
-- Mount only required agent files and a dedicated Chromium profile.
-- Apply `no_new_privs`, a reviewed seccomp profile, resource limits, and process-count limits.
-- Terminate the browser and process tree when either exits unexpectedly or the daemon invalidates the session.
+- Keep the existing human `AuthenticatorService` construction compatible.
+- Create an independent agent service per endpoint with its own callbacks and CTAPHID state.
+- Inject mode-specific authorization and storage capabilities.
+- Parameterize authenticator AAGUID and options where isolated mode requires a distinct model.
+- Compare delegated assertion credential IDs and authenticator-data flags with the human flow for the same credential and verification result; AAGUID is registration attestation data and is not used to characterize delegated assertions.
+- Never share callback-local iterators, pending prompts, PIN state, or ceremony state between services.
 
-`passless agent run` requests a session through the local administrative launcher path, creates the sandbox, starts the native host and managed browser, and then starts the requested command with inherited stdin, stdout, stderr, and exit status. Browser startup failure terminates the command. Command exit terminates the browser and invalidates the principal session. Signals are forwarded to the command process group before the configured forced-shutdown timeout.
+### Trusted prompt
 
-### Session capability
+- Add an `AgentPrompt` interface outside the principal boundary.
+- Use a fixed template with distinct trusted and untrusted fields.
+- Show profile, mode, exact RP ID, action, credential label, and delegated browser-session maximum.
+- Label account names, page URL, page title, and agent reason as untrusted.
+- Deliver approval directly to the daemon, never through the principal socket.
+- Require explicit distinguishable approve and deny actions.
+- Fail closed on unsupported notification servers, timeout, disconnect, rendering failure, or ambiguous action support.
+- Keep automatic approval debug-only and impossible in release builds.
+- Implement `AgentPrompt` separately from `show_verification_notification`; detect notification servers requiring the current single-action fallback and reject agent prompts on them.
+- Use one bound delegated-ceremony template showing trusted RP ID, credential label, grant TTL, session TTL, and clearly labeled untrusted reason. Its distinct affirmative action both creates the one-shot grant and supplies UP for that CTAP operation after a configured minimum review period.
 
-The daemon generates 32 random bytes with the operating-system CSPRNG for each session. It passes the raw capability through an inherited `SOCK_SEQPACKET` socket pair created before entering the sandbox. The capability is session-scoped, is consumed by an authenticated handshake, and is then bound to that connection; it is not sent on every request. The daemon additionally checks peer UID, PID, and cgroup or namespace membership, so possession outside the launched boundary is insufficient. Capability memory is zeroized when the session ends.
+### Isolated registration flow
 
-The exact sandbox implementation is selected during Phase 0 and documented as a supported dependency. If the required kernel boundary is unavailable, `passless agent run` refuses secure mode rather than degrading to a capability file.
+1. The authenticated principal creates an intent under current policy.
+2. The browser starts native `navigator.credentials.create()` through the isolated endpoint.
+3. The endpoint service matches action and RP ID and binds the intent.
+4. Policy and registration budget are re-evaluated and reserved.
+5. Audit reservation is synchronized.
+6. The trusted prompt collects fresh UP and configured UV.
+7. The isolated service creates the credential in the profile store.
+8. Terminal audit is recorded and the response returns to the browser.
+9. The intent is consumed on all terminal paths.
 
-### Daemon channels
+### Isolated authentication flow
 
-- Administrative socket: daemon user only; never mounted in the principal.
-- Agent socket: one authenticated principal session; intent and metadata operations only.
-- Browser socket: native host only; browser protocol operations only.
-- Human UHID loop: unchanged and unaware of agent sockets.
+1. The principal creates an intent naming one exact isolated credential.
+2. The browser starts native `navigator.credentials.get()` through the isolated endpoint.
+3. The service matches RP ID and exact credential and binds the intent.
+4. Policy is re-evaluated and audit reservation is synchronized.
+5. The trusted prompt collects fresh UP and configured UV.
+6. The isolated view returns only the intended credential.
+7. Terminal audit is recorded and the assertion returns.
+8. The intent is consumed on all terminal paths.
 
-The admin socket is created at daemon startup as `$XDG_RUNTIME_DIR/passless/admin.sock` with mode `0600`. Per-session agent and browser sockets live under `$XDG_RUNTIME_DIR/passless/agent/<session-id>/`, in a daemon-owned `0700` directory selectively mounted or passed into the sandbox. Failure to create the admin socket disables agent support but does not stop the human UHID path. Failure to create a session socket aborts that launch. Shutdown closes and removes all sockets and session directories.
+### Delegated authentication flow
 
-The existing instance lock continues to protect the configured human backend. Agent support adds one daemon-wide lock covering agent policy, machine roots, audit state, and sockets. Multiple principal sessions share that daemon; no second daemon may open the same machine root or audit path.
-
-Human UHID work and agent ceremonies execute on separate workers. Agent storage or prompt waits cannot hold the UHID service mutex. Human requests receive scheduling priority when shared backend resources are contended.
-
-Authentication combines socket peer credentials, capability proof, principal-session ID, and cgroup or namespace membership. A capability copied to a process outside the principal boundary is insufficient.
+1. The principal creates a pending delegation request for one configured RP, credential, and session maximum.
+2. Policy permits creation of the temporary browser and endpoint but no key use.
+3. The launcher creates the principal browser and temporary delegated endpoint.
+4. The stock browser starts `navigator.credentials.get()`.
+5. The endpoint service rejects every command except the expected authentication operation.
+6. The service exactly matches RP ID, credential, principal, endpoint, policy generation, and login deadline, then binds the pending request.
+7. Policy is re-evaluated and audit reservation is synchronized.
+8. One trusted prompt creates the grant and collects fresh UP and required UV for the bound operation.
+9. The delegated view reads only the exact user credential and serializes its state update.
+10. Terminal audit is recorded and the assertion returns to the browser.
+11. The grant and delegated view are consumed, then the endpoint drains and is destroyed.
+12. The local browser lease starts at the clamped monotonic deadline.
+13. Expiry, revocation, browser exit, principal exit, or daemon shutdown terminates the browser and cleans the profile.
 
 ### Tests
 
-- Agent and browser can connect only to their intended sockets.
-- Another UID, PID namespace, cgroup, session, or expired capability is rejected.
-- Principal cannot stat or open UHID, admin socket, human store, machine store, audit path, or another browser profile.
-- Capability never appears in `/proc/<pid>/cmdline`, environment, logs, crash output, or audit.
-- Session termination cancels intents and kills browser descendants.
-- Resource limits prevent intent or process flooding from affecting the human authenticator.
+- Controlled-RP isolated registration and authentication.
+- Controlled-RP delegated authentication with an existing credential.
+- RP-side verification of RP hash, signature, counter, UP, and UV.
+- Denial, timeout, UV failure, and prompt failure produce no assertion.
+- Wrong RP, credential, endpoint, profile, principal, policy generation, action, and mode.
+- Delegated registration, second assertion, enumeration, deletion, and management denial.
+- Cancellation and policy/revocation races before and during prompt.
+- Endpoint draining and destruction only after successful transport submission and the Phase 0-proven drain procedure.
+- Packet-level flag fixtures for every prompt and verification result.
+- Human and agent requests for the same credential under contention.
 
 ### Exit gate
 
-A documented adversarial test from inside the principal fails to reach every protected resource. Sandbox setup failure is terminal. The human daemon remains functional after principal termination.
+Packet and RP evidence prove truthful UP/UV and exact route selection. Every missing precondition fails terminally without searching another store or endpoint. Existing human E2E tests pass unchanged.
 
-## Phase 5: Browser extension and native host
-
-### Objective
-
-Build the smallest reviewable browser TCB that forwards proxy requests without making policy decisions.
-
-### Extension
-
-- Manifest V3 with only required permissions.
-- Plain JavaScript with no runtime third-party dependencies.
-- No content scripts and no page-controlled messaging channel.
-- Attach `webAuthenticationProxy` before launcher signals readiness.
-- Accept one request at a time.
-- Collect trusted tab and document context through approved extension APIs.
-- Forward the complete request to the native host.
-- Resolve or reject only the matching opaque browser request ID.
-- Reject all requests after native-host disconnect or protocol error.
-
-### Native host
-
-- Rust binary in `cmd/passless-native-host`.
-- Strict length-prefixed native messaging parser with bounded message size.
-- Authenticate to the browser daemon socket using the inherited launcher channel.
-- Validate extension identity and protocol version.
-- Bind each extension request to one browser session and request ID.
-- Never access storage, policy files, private keys, audit files, or the admin socket.
-- Never construct assertions or modify WebAuthn options.
-
-`cmd/passless-native-host` is a new workspace binary with `passless-protocol`, `serde`, `serde_json`, `zeroize`, and Unix socket dependencies. It has no default features and must use the same package version as the daemon. Release builds produce a separate signed artifact and native-messaging manifest whose allowed extension ID is generated from the pinned extension package.
-
-### Packaging
-
-- Pin the extension identifier in managed Chromium policy.
-- Install the native-host manifest into a launcher-controlled location.
-- Record compatible daemon, native-host, extension, and protocol versions.
-- Refuse mixed incompatible versions.
-- Generate release checksums and sign release artifacts through the existing release process.
-
-The extension has no bundler and no production JavaScript dependencies. Packaging is a deterministic archive of reviewed source files and `manifest.json`. Tests load the unpacked directory; release packaging generates a pinned extension identity and enterprise-policy fixture. Updates require the same signing identity and compatibility tests before the supported-version manifest changes.
-
-### Tests
-
-- Rust parser unit and fuzz tests.
-- JavaScript/Rust protocol fixture tests.
-- Oversized, duplicated, reordered, canceled, stale, and malformed request tests.
-- Service-worker suspension and restart tests.
-- Native-host crash, daemon disconnect, and protocol mismatch tests.
-- Extension-ID and unmanaged-profile rejection tests.
-- Browser integration tests against the controlled RP.
-
-### Exit gate
-
-The extension contains no policy, credential, or fallback logic. Every proxy and host failure rejects the browser request. Packaging pins the expected extension and native-host identity.
-
-## Phase 6: Interactive ceremony engine
+## Phase 8: CLI, documentation, and operations
 
 ### Objective
 
-Connect authenticated browser requests to policy, intent, audit, trusted prompts, and machine credential callbacks.
-
-### Agent authenticator architecture
-
-Create a separate `AgentAuthenticatorService` wrapping an independent `soft_fido2::Authenticator`. It does not reuse the human service instance, callback object, credential store, iterator state, or PIN state. It uses:
-
-- The stable machine AAGUID `50c0c5fa-3b7a-4eee-b906-1b3dd4aed297`.
-- `AgentAuthenticatorCallbacks`, which require an already authorized bound ceremony context.
-- `MachineCredentialStorage`, which exposes only exact-principal and exact-credential operations.
-- Agent-specific PIN/UV state under the machine root if CTAP PIN state is required by `soft-fido2`.
-- A shared pure conversion layer for WebAuthn and CTAP types where reuse does not cross policy or storage boundaries.
-
-The service receives no generic human `CredentialStorage` reference. The human and agent services may share immutable cryptographic and serialization code, but never mutable credential, enumeration, prompt, or PIN state.
-
-### Trusted prompt design
-
-V1 uses a dedicated `AgentPrompt` interface implemented outside the principal boundary. The initial Linux implementation may use `notify-rust` only with notification daemons that provide explicit, distinguishable Accept and Deny actions. The existing single-default-action compatibility fallback is prohibited for agent prompts.
-
-The prompt uses a fixed template, escapes all external text, and labels fields as either trusted (`Principal`, `Origin`, `RP ID`, `Action`, `Credential`) or untrusted (`RP account text`, `Agent reason`). Acceptance is delivered directly from the prompt implementation to the daemon and cannot arrive through agent or browser sockets. The principal runs under a separate identity and cannot access the human desktop notification bus used by the daemon. Unsupported daemons, missing action support, disconnect, timeout, and rendering failure deny the ceremony.
-
-Phase 0 must confirm that this mechanism preserves the current Passless assurance baseline. If it cannot distinguish actions and trust labels reliably, Phase 6 requires a small dedicated native dialog helper and a focused security review before proceeding.
-
-### Registration flow
-
-1. The authenticated principal creates an interactive registration intent.
-2. The daemon validates exact origin, RP ID, namespace, budget, expiry, and browser session against current policy.
-3. The browser begins `navigator.credentials.create()`.
-4. The extension and native host submit the authenticated browser request.
-5. The daemon validates the complete request, recomputes its digest, and binds the intent.
-6. The daemon re-evaluates policy and reserves the registration budget.
-7. The daemon durably audits authorization and reservation.
-8. A trusted prompt displays principal, origin, RP ID, RP-provided account details, and untrusted reason.
-9. Human denial, timeout, cancellation, or policy change releases the reservation and consumes the intent.
-10. Human approval supplies UP; actual configured verification supplies UV if performed.
-11. The agent authenticator creates the credential directly in the machine store.
-12. The daemon records the terminal event and returns the browser response.
-
-Registration never overwrites a credential and never occurs without a prompt. The RP user handle and display data are stored only as required by WebAuthn and are treated as RP-provided values.
-
-### Authentication flow
-
-1. The authenticated principal creates an intent naming one exact credential.
-2. The daemon validates exact origin, RP ID, credential ownership, browser session, and current policy.
-3. The browser begins `navigator.credentials.get()`.
-4. The daemon validates and binds the browser request.
-5. The requested `allowCredentials` must permit the exact intended credential; any account ambiguity is rejected.
-6. The daemon re-evaluates policy and durably audits authorization and reservation.
-7. The trusted prompt shows exact principal, origin, RP ID, credential label, and untrusted reason.
-8. Human approval supplies UP; actual local verification supplies UV if performed.
-9. The machine store returns only the exact credential to the authenticator callback.
-10. The daemon records the terminal event and returns the assertion.
-
-### Prompt implementation
-
-The prompt is outside the principal sandbox and cannot be accepted through the agent socket. It must distinguish trusted fields from RP- and agent-provided text. Unknown notification daemons or action models fail closed. Automated acceptance remains available only in debug E2E builds and cannot be enabled in release builds.
-
-### Daemon restart behavior
-
-Daemon restart closes all session sockets, loses all in-memory intents, rejects pending browser requests, and causes launchers to terminate their managed browsers and process trees. Native hosts do not reconnect an old browser session. After restart, the user must launch a new principal session and the agent must create a new intent. The daemon writes best-effort cancellation records during graceful shutdown; abrupt termination is represented by the next audit startup event and sequence recovery.
-
-### Tests
-
-- Registration and authentication success against the controlled RP.
-- UP false on denial and no assertion returned.
-- UV set only after the configured verification path succeeds.
-- RP requiring UV behaves according to existing Passless configuration without fabricating UV.
-- Wrong origin, RP ID, credential, browser, principal, options digest, request ID, or policy version fails.
-- Empty or ambiguous `allowCredentials` cannot select another account credential in v1.
-- Cancellation and policy/revocation races before and during prompt fail closed.
-- No machine credential is visible through existing human client commands or UHID tests.
-- No human credential is visible through agent metadata commands.
-
-### Exit gate
-
-Packet-level fixtures prove the authenticator flags match the actual prompt and verification outcome. Negative tests cover every missing precondition. Existing human E2E tests pass unchanged.
-
-## Phase 7: CLI, configuration, and documentation
-
-### Objective
-
-Provide stable human-administrative and agent-safe workflows without exposing security-sensitive primitives.
+Provide safe administration and principal workflows without exposing credential or session primitives.
 
 ### Administrative commands
 
 ```text
-passless agent-admin profile create|show|list|revoke
+passless agent-admin profile check|show|list|enable|disable
 passless agent-admin policy check|reload|show
 passless agent-admin credential list|show|revoke|delete
+passless agent-admin delegation show|list|revoke
+passless agent-admin session show|list|revoke
 passless agent-admin audit status|verify|export|recover
 ```
 
-Administrative commands use only the admin channel. Destructive or authority-changing operations require a trusted human confirmation and cannot be invoked from a principal session.
+Authority-changing and destructive commands use only the administrative channel and require trusted human confirmation where applicable.
 
-### Agent commands
+### Principal commands
 
 ```text
 passless agent doctor
 passless agent capabilities
 passless agent instructions
 passless agent intent create|show|wait|cancel
+passless agent delegation request|show|wait|cancel
 passless agent credential list|show
 passless agent run --profile <profile> -- <command...>
 ```
 
-Agent commands:
+Principal commands:
 
-- Default to versioned JSON when called inside a principal.
-- Never read PINs or confirmations from stdin.
-- Never grant policy or mutate credential authority.
-- Never return private material, assertions, capabilities, cookies, or tokens.
-- Return stable error codes and one safe next action.
-- Report only `interactive` mode in capabilities.
+- Default to versioned JSON inside a principal.
+- Never read PINs or confirmation from stdin.
+- Never approve policy or delegation.
+- Never accept a raw credential ID not already represented by an allowed non-secret reference.
+- Never return private material, assertions, cookies, tokens, capabilities, or browser profile paths.
+- Return stable errors and one safe recommended action.
 
 ### Documentation
 
-Create:
+Documentation must explain:
 
-```text
-docs/agents/README.md
-docs/agents/security-model.md
-docs/agents/installation.md
-docs/agents/principal-setup.md
-docs/agents/interactive-registration.md
-docs/agents/interactive-authentication.md
-docs/agents/browser-integration.md
-docs/agents/audit.md
-docs/agents/errors.md
-docs/agents/troubleshooting.md
-docs/agents/alternatives-for-autonomous-access.md
-```
+- The distinction between isolated credentials and delegated sessions.
+- Why every actual WebAuthn operation requires fresh UP and actual UV.
+- That the browser enforces origin and Passless sees only RP ID at CTAP.
+- That delegated mode presents the same user credential to the RP.
+- That local browser expiry is not RP-side revocation.
+- That the agent has the full authority of the RP browser session during the lease.
+- How principal and device isolation work and how to test them.
+- How to provision, approve, launch, audit, revoke, recover, and uninstall.
+- Why RP-supported OAuth, service accounts, applications, and workload identity remain preferable for unattended use.
 
-`passless agent instructions` embeds version-matched concise instructions generated from these contracts. Documentation prominently states that login grants the RP browser session, Passless does not constrain post-login actions, all processes in a principal share authority, and scoped RP-supported credentials are preferable for unattended work.
+### Operational work
+
+- Generate shell completions through the existing build path.
+- Add configuration-reference generation for agent fields.
+- Add systemd and udev examples without applying them automatically.
+- Add startup diagnostics for device isolation, principal identity, stores, audit, and stale profiles.
+- Define browser and kernel support ranges from Phase 0 evidence.
+- Define cleanup and revocation runbooks.
+- Add `Agent` and `AgentAdmin` variants to `passless_core::config::Commands`, module declarations in `cmd/passless/src/commands/mod.rs`, and dispatch arms in `cmd/passless/src/main.rs`.
 
 ### Tests
 
-- CLI JSON snapshots and shell completion generation.
-- Agent commands rejected outside an authenticated principal where required.
-- Admin commands inaccessible inside a principal.
-- Documentation link and embedded-instruction consistency checks.
-- Error code and recommended-action exhaustiveness.
-- Release binary contains no delegated-mode command, capability, or documentation claim.
+- CLI JSON and error snapshots.
+- Admin commands unavailable inside a principal.
+- Principal commands unavailable or limited outside a principal.
+- Completion and generated-config documentation tests.
+- Documentation links and command examples.
+- Release binary has no autonomous mode or automatic WebAuthn approval option.
 
 ### Exit gate
 
-An operator can configure, launch, inspect, revoke, audit, and troubleshoot one principal using only documented commands. An agent can perform only health, instruction, intent, and non-secret metadata operations.
+An operator can configure, validate, launch, inspect, revoke, audit, recover, and uninstall both modes using documented commands. Principal-facing output contains no authority-changing operation or secret.
 
-## Phase 8: System validation and independent security review
+## Phase 9: System validation, independent review, and controlled release
 
 ### Objective
 
-Validate the complete boundary under realistic failures before enabling the feature.
+Validate the complete boundary before enabling opt-in production use.
 
 ### Test environments
 
-- Minimum supported Linux distribution and Chromium version.
-- Latest supported Linux distribution and Chromium stable.
+- Minimum and current supported Linux kernels and distributions.
+- Stock browser versions selected by Phase 0.
 - Local, pass, and TPM storage backends.
-- Existing human UHID flow running concurrently with one principal session.
-- Low disk, process pressure, daemon restart, browser crash, and extension restart.
+- Human endpoint alone, isolated mode, delegated mode, and concurrent human/agent operation.
+- Low disk, file-descriptor pressure, process pressure, clock changes, daemon restart, browser crash, and forced cleanup failure.
 
-### Required validation suites
+### Required suites
 
 | Suite | Coverage |
 |---|---|
-| Human regression | Existing registration, authentication, PIN, credential management, storage, and instance-lock tests |
-| Browser protocol | Origin, document, options, cancellation, timeout, malformed message, downgrade, and proxy failure |
-| Principal isolation | UID, namespace, cgroup, filesystem, socket, UHID, profile, and capability attacks |
-| Policy and intent | Default deny, exact match, reload, expiry, idempotency, reuse, race, cancellation, and revocation |
-| Credential isolation | Backend conformance, cross-principal denial, human/machine separation, corruption, and quarantine |
-| Ceremony semantics | Trusted prompt, UP, UV, account selection, registration budget, and RP verification |
-| Audit | Pre-write gate, terminal failure, degradation, recovery, rotation, chain verification, and secret absence |
-| Resource abuse | Request flooding, process flooding, large messages, audit growth, and browser churn |
-| Supply and update | Artifact signatures, extension pinning, native-host identity, and incompatible versions |
-| Autonomous-mode absence | Unknown mode rejection and no code path setting UP without prompt evidence |
+| Human regression | Existing WebAuthn, client, PIN, storage, credential-management, and instance-lock behavior |
+| Endpoint isolation | Unique identity, node discovery, permissions, wrong-browser access, lifecycle, and no fallback |
+| Principal isolation | UID, namespace, cgroup, filesystem, socket, device, profile, capability, and resource attacks |
+| Policy and authorization | Default deny, exact match, TTL, reload, replay, idempotency, race, cancellation, and revocation |
+| Credential isolation | Human/isolated/delegated boundaries, backend conformance, counter serialization, corruption, and quarantine |
+| Ceremony semantics | Prompt integrity, RP matching, credential selection, UP, UV, and RP verification |
+| Browser lease | Start, clamp, expiry, revoke, crash, principal exit, cleanup, quarantine, and restart |
+| Audit | Pre-write gate, terminal failure, degradation, recovery, rotation, verification, and secret absence |
+| Resource abuse | Endpoint, request, process, audit, profile, and cleanup flooding |
+| Autonomous absence | Unknown mode rejection, no cached approval, and no repeated assertion under one lease |
 
-### Independent review
+### Independent security review
 
 Reviewers receive:
 
-- Current threat model and ADRs.
-- TCB inventory and component versions.
-- Protocol schemas and canonicalization vectors.
-- Sandbox design and adversarial test scripts.
-- Storage envelope and key-lifetime analysis.
-- Audit durability and failure analysis.
-- Coverage report for every requirement ID.
-- Known limitations and residual risks.
+- ADRs, threat model, and requirement traceability.
+- Endpoint and kernel device-routing design.
+- Shared human-storage synchronization analysis.
+- Principal, browser-control, and profile-lifecycle design.
+- Policy and authorization state machines.
+- Prompt and UP/UV evidence.
+- Storage and secret-lifetime analysis.
+- Audit durability and fault-injection evidence.
+- Known limitations, especially RP session authority and local-expiry limits.
 
-Critical and high findings block release. Medium findings require a documented disposition and owner.
-
-### Exit gate
-
-Every requirement has passing evidence, the independent review is complete, and no unresolved release blocker remains.
-
-## Phase 9: Controlled release
-
-### Objective
-
-Enable the feature without changing defaults for existing users.
+Critical and high findings block release. Medium findings require a documented owner and disposition.
 
 ### Rollout
 
-1. Ship as an opt-in build feature or experimental runtime flag with secure-profile checks mandatory.
-2. Support only the documented Chromium and Linux combinations.
-3. Require explicit operator creation of each principal and exact policy grant.
-4. Emit startup diagnostics for proxy, sandbox, socket, storage, and audit health.
-5. Refuse to start the agent path if any mandatory control is unavailable.
-6. Leave human UHID startup independent from agent-component failure.
-7. Collect user-reported compatibility and failure data without telemetry containing RP, user, credential, or browser-session identifiers.
-8. Remove the experimental label only after at least one release cycle without a boundary-breaking issue.
+1. Ship agent support behind an opt-in compile or experimental runtime feature.
+2. Keep `[agents].enabled = false` by default.
+3. Require explicit administrator creation of every profile and exact RP policy.
+4. Refuse profile startup if any mandatory device, principal, storage, prompt, audit, or cleanup control is unavailable.
+5. Leave human startup independent from agent-component failure.
+6. Support only documented kernel, distribution, browser, and backend combinations.
+7. Remove the experimental label only after at least one stable release without a boundary-breaking issue.
 
 ### Rollback
 
-- Disable agent listener startup and managed-profile launch.
-- Revoke affected machine credentials locally and at each RP.
-- Preserve audit and machine metadata for investigation.
-- Leave human credential storage untouched.
-- Uninstall the managed extension and native-host manifest.
-- Document RP-side credential removal because local revocation cannot remove a public credential registered at the RP.
+- Disable profile launch and destroy active agent endpoints.
+- Revoke active grants, intents, and browser leases.
+- Terminate managed ephemeral browsers and quarantine profiles that fail cleanup.
+- Revoke isolated credentials locally and instruct operators to remove them at each RP.
+- Preserve non-secret metadata and audit for investigation.
+- Leave human credentials and configuration untouched.
+- For delegated mode, instruct users to revoke RP sessions through RP controls when compromise or session copying is suspected.
 
 ### Exit gate
 
-The feature can be disabled or removed without migrating or rewriting human credentials, config, or UHID behavior.
+Every requirement has passing evidence, independent review has no unresolved release blocker, installation and rollback are reproducible, and the feature can be disabled without rewriting human credentials or configuration.
 
 ## Security test matrix
 
 | Threat | Primary controls | Required evidence |
 |---|---|---|
-| Prompt injection changes destination | Exact origin/RP/credential intent and trusted prompt | Negative E2E for every mismatched field |
-| Prompt injection acts after login | Documented limitation and low-privilege account guidance | Documentation review; no false authorization claim |
-| Same-user process impersonates agent | Separate identity, peer credentials, capability, sandbox membership | Cross-process and stolen-capability tests |
-| Agent reaches personal passkey | Namespace, device, profile, and transport isolation | In-sandbox UHID and profile access tests |
-| Proxy detaches and browser falls back | Proxy attached before navigation; terminate on failure | Kill tests at every ceremony state |
-| Extension/native host mutates request | Authenticated envelope, canonical digest, strict schema | Cross-language vectors and mutation fuzzing |
-| Intent replay or race | One-shot state machine and one active request | Concurrency and replay tests |
-| Policy changes during prompt | Re-evaluate before key use and cancel affected intent | Deterministic race test |
-| Credential crosses principals | Exact ownership in storage API and envelope | Backend cross-principal conformance test |
-| Corrupt metadata becomes human credential | Separate roots/interfaces and quarantine | Corruption corpus test |
-| Agent suppresses audit | Audit outside sandbox and durable pre-write | Filesystem denial and write-failure tests |
-| Audit terminal write fails | Persistent degraded state | Fault injection and recovery test |
-| False UP or UV | Prompt evidence gates flags | Packet-level flag tests and code-path review |
-| Autonomous mode is added accidentally | Interactive-only enum/capabilities/policy and unknown-mode rejection | API, config, CLI, and fixture tests |
+| Another browser consumes an agent authorization | Dedicated UHID node and kernel device policy | Cross-identity hidraw denial and race tests |
+| Agent reaches human credentials | Separate endpoint plus exact delegated view or isolated store | Storage and device-boundary tests |
+| Delegated mode selects another account | Exact credential reference and no fallback search | Wrong-credential and ambiguous-discoverable tests |
+| Agent obtains repeated passkey use during lease | One-shot grant, consumed view, endpoint destruction | Second-assertion and endpoint-lifecycle E2E |
+| False UP or UV | Trusted prompt and actual verification gate flags | Packet-level and RP-level flag tests |
+| Prompt injection changes RP | Exact CTAP RP match and trusted RP display | Wrong-RP E2E and prompt snapshot review |
+| Principal extends local session | Daemon monotonic deadline and kill-on-expiry | Clock jump, extension attempt, and expiry tests |
+| Agent retains RP authority after local expiry | Honest limitation, ephemeral profile, restricted control/egress where configured | Documentation review and cleanup tests; no revocation claim |
+| Human and agent corrupt credential state | One storage owner and serialized mutation | Concurrent counter/update fault tests |
+| Agent changes policy or approval | Admin channel absent from principal | IPC and filesystem adversarial tests |
+| Agent suppresses audit | Audit outside principal and durable pre-write | Access-denial and write-failure tests |
+| Cleanup leaves reusable profile | Quarantine and no reuse | Fault-injected cleanup and restart tests |
+| Autonomous behavior is introduced | Closed modes and fresh-prompt invariant | Config, API, CLI, code-path, and E2E review |
 
 ## Requirement traceability
 
-| Requirement | Implemented in | Verified in |
+| Requirements | Implemented in | Verified in |
 |---|---|---|
-| AUTH-01, AUTH-02 | Phase 6 ceremony engine | Phase 6 flag tests; Phase 8 review |
-| AUTH-03, AUTO-01 | Phase 1 types and Phase 7 CLI | Unknown-mode and autonomous-absence suites |
-| SEP-01, SEP-03 | Phases 0, 4, 5 | No-fallback and sandbox E2E |
-| SEP-02 | Phase 2 storage | Backend and human-regression suites |
-| PRIN-01 through PRIN-03 | Phase 4 launcher and sockets | Principal-isolation suite |
-| BIND-01 through BIND-05 | Phases 1, 5, 6 | Protocol fixtures, fuzzing, and E2E |
-| POL-01 through POL-03 | Phase 2 policy | Policy, race, and revocation suites |
-| INT-01 through INT-03 | Phase 2 intent registry | State-machine and concurrency tests |
-| STORE-01 through STORE-04 | Phase 2 storage and Phase 6 callbacks | Backend, zeroization, corruption, and revocation tests |
-| SECRET-01 | Phases 1, 3, 5, 6, and 7 | Protocol, CLI, log, error, audit, and failure-output secret-scanning suite |
-| AUDIT-01 through AUDIT-04 | Phase 3 audit | Audit fault-injection suite |
-| PROTO-01 through PROTO-03 | Phases 1 and 5 | Contract, downgrade, malformed-input, and snapshot tests |
-| OPS-01 | Phase 5 packaging and Phase 9 release | Artifact and version compatibility checks |
-| OPS-02 | All phases | Existing CI and human E2E suite |
-| AUTO-02 | Phase 7 documentation | Documentation review |
+| MODE-01 through MODE-03 | Phases 1, 5, and 7 | Config, policy, and delegated negative suites |
+| ROUTE-01 through ROUTE-04 | Phases 0, 2, and 3 | Endpoint and principal-isolation suites |
+| AUTH-01 through AUTH-03 | Phase 7 | Packet and RP flag tests |
+| RP-01 through RP-03 | Phases 1, 5, and 7 | RP validation, mismatch, and documentation review |
+| PRIN-01 through PRIN-03 | Phase 3 | Principal-isolation suite |
+| ISO-01 through ISO-03 | Phases 4, 5, and 7 | Isolated storage and ceremony suites |
+| DEL-01 through DEL-05 | Phases 4, 5, and 7 | Delegated state, storage, and E2E suites |
+| SESS-01 through SESS-04 | Phases 3, 5, 7, and 8 | Lease lifecycle and documentation suites |
+| POL-01 through POL-03 | Phase 5 | Policy and race suites |
+| INT-01 through INT-03 | Phase 5 | State-machine and concurrency suites |
+| STORE-01 through STORE-03 | Phase 4 | Backend, compatibility, and corruption suites |
+| SECRET-01 | All phases | Secret scans over protocol, CLI, logs, audit, and failures |
+| AUDIT-01 through AUDIT-03 | Phase 6 | Audit fault-injection suite |
+| PROTO-01 and PROTO-02 | Phases 1 and 3 | Contract and malformed-input suites |
+| OPS-01 and OPS-02 | All phases | Human regression, rollback, and release suites |
+| AUTO-01 | Phases 1, 5, 7, and 8 | Closed-mode and autonomous-absence suites |
 
 ## CI and quality gates
 
-Every implementation PR must run:
+Every implementation change runs:
 
 ```bash
 cargo fmt --check
@@ -769,131 +810,109 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Agent component PRs additionally run:
+Agent changes additionally run:
 
-- Protocol fixture tests in Rust and JavaScript.
-- Browser extension lint with no production dependency installation at runtime.
-- Native-host parser fuzz corpus.
-- Agent unit and integration suites.
+- Domain and protocol property tests.
+- Agent unit and integration tests.
 - Existing human E2E tests.
-- Controlled-RP browser E2E tests on supported Chromium versions.
-- Secret scanning over protocol, logs, audit fixtures, and failure output.
-- Documentation link and generated-instruction checks.
+- Controlled-RP native-browser E2E tests where the environment supports UHID.
+- Principal and device isolation tests in a privileged CI job.
+- Local, pass, and TPM backend conformance where available.
+- Secret scanning over protocol fixtures, CLI snapshots, logs, errors, and audit.
+- Documentation link and generated configuration checks.
 
-Security-critical unsafe code, new process execution, filesystem access, socket authorization, and cryptographic key handling require focused reviewer ownership.
+New unsafe code, process execution, namespace or device configuration, peer authorization, filesystem access, and credential handling require focused security ownership.
 
 ## Configuration migration
 
-Agent configuration is additive under `[agents]`. Existing configuration files remain valid and preserve current defaults.
+Agent configuration is additive under `[agents]`.
 
-Rules:
-
-- No agent sockets or browser components start without an enabled secure profile.
-- Unknown agent fields fail configuration validation rather than being ignored when security-relevant.
-- Unknown modes fail validation. `delegated`, `autonomous`, and equivalent values are not accepted aliases.
-- Human backend paths remain unchanged.
-- Machine backend roots must not overlap human roots.
-- Existing human credential files are never auto-migrated.
-- Removing agent configuration disables the agent path without modifying machine records.
+- Existing configuration remains valid and agent support remains disabled.
+- Existing human backend paths, records, and instance-lock identity remain valid.
+- Human records are never automatically migrated, copied, or relabeled.
+- Enabling delegated mode creates references to existing credentials, not duplicate records.
+- Removing or disabling a profile prevents new sessions without deleting credentials automatically.
+- Unknown security-sensitive fields and modes fail validation.
+- Isolated roots cannot overlap human or other profile roots.
+- Downgrading to a binary without agent support leaves human operation intact and ignores no active agent process; operators must terminate agent sessions before downgrade.
 
 ## Operational lifecycle
 
-### Provisioning
+### Provisioning isolated mode
 
-1. Install matching daemon, native host, extension, and supported Chromium.
-2. Verify release signatures and component versions.
-3. Create the separate principal identity and sandbox resources.
-4. Create dedicated browser profile and machine storage root.
-5. Verify protected audit storage.
-6. Add exact registration policy with short expiry and budget one.
-7. Launch the principal and perform interactive registration.
-8. Replace or disable registration policy and add exact credential authentication policy.
+1. Install and verify a release supporting agent mode.
+2. Create the principal identity and device-isolation policy.
+3. Configure a separate credential and PIN root.
+4. Configure exact RP policy and registration budget.
+5. Run `agent doctor` and the endpoint visibility checks.
+6. Launch the profile and perform human-approved native registration.
+7. Remove or exhaust registration authority and retain authentication policy.
 
-### Routine use
+### Provisioning delegated-session mode
 
-1. Launcher authenticates the principal session.
-2. Agent checks capabilities and health.
-3. Agent creates one exact intent.
-4. Browser starts one ceremony.
-5. Human reviews and approves or denies the trusted prompt.
-6. Agent uses the RP browser session under RP controls.
+1. Create the principal identity and device-isolation policy.
+2. Select an existing credential by non-secret administrative reference.
+3. Configure exact RP ID, maximum grant TTL, maximum browser-session TTL, and required UV.
+4. Run `agent doctor` and verify the ephemeral browser contains no personal state.
+5. Keep policy disabled until the operator is ready to approve individual grants.
+
+### Delegated use
+
+1. The principal requests one RP and credential under current policy.
+2. Passless validates policy and launches the ephemeral browser and temporary endpoint without granting key use.
+3. The browser starts native WebAuthn and binds the pending request.
+4. Passless verifies the exact RP and credential, durably reserves the operation, and presents one prompt for the one-shot grant and current UP/UV.
+5. Human approval creates the grant and authorizes that bound assertion.
+6. The browser receives one assertion and the credential route is destroyed.
+7. The agent uses the RP browser session until local expiry or earlier termination.
+8. Passless terminates the browser and cleans or quarantines the profile.
 
 ### Revocation
 
-1. Revoke the policy or principal session immediately.
-2. Cancel active intents.
-3. Mark the machine credential revoked locally.
-4. Review and verify audit history.
-5. Remove the credential from the RP through its account controls.
-6. Delete local private material only after investigation and retention requirements are satisfied.
-
-Local revocation prevents future Passless use but cannot invalidate an RP session already issued or delete the RP's registered public key.
+- Disable policy or the profile.
+- Cancel pending intents and grants.
+- Destroy active agent endpoints.
+- Terminate browser leases.
+- Revoke isolated credentials locally and at the RP.
+- For delegated sessions, use RP account controls to revoke server-side sessions when required.
+- Verify audit history and cleanup state.
 
 ### Recovery
 
-- Lost machine store: register a new machine credential interactively and remove the old RP credential.
-- Lost envelope integrity key: quarantine unreadable records; do not bypass verification.
-- Audit corruption: block agent operations, preserve files, verify from the last checkpoint, and require administrative recovery acknowledgement.
-- Compromised principal: terminate session, revoke policy and credentials, remove RP sessions and credentials, rotate profile data, and create a new principal identity.
-- Compromised extension/native host: disable all agent profiles until signed replacements and a security review are available.
-
-## Documentation acceptance checklist
-
-Before release, documentation must answer:
-
-- What a principal is and why a model name is not identity.
-- Which components are trusted and what compromise means.
-- Why every ceremony requires a human gesture.
-- Why agent credentials are separate from personal credentials.
-- What exact origin, RP ID, and credential binding do and do not protect.
-- Why Passless cannot constrain actions after login.
-- How to install, verify, configure, launch, audit, revoke, recover, and uninstall.
-- Which errors are safe to retry and why every retry needs a new intent.
-- Why the agent must never bypass the managed browser or request weaker behavior.
-- Why OAuth, service accounts, workload identity, and RP-specific credentials are preferable for unattended access when available.
-- Why autonomous WebAuthn and delegated UP are not supported.
+- Lost isolated store: register a new isolated credential and remove the old RP credential.
+- Corrupt human credential: follow existing human recovery; do not bypass delegated filtering.
+- Audit corruption: block agent operations, preserve files, verify from the last checkpoint, and require administrative acknowledgement.
+- Failed profile cleanup: quarantine the profile, revoke the RP session if possible, and remove it only through the recovery command.
+- Compromised principal: terminate, revoke policy and leases, remove isolated RP credentials, revoke delegated RP sessions, and rebuild the principal identity.
+- Device-policy failure: disable all agent profiles until routing isolation is restored and independently verified.
 
 ## Risk register
 
 | Risk | Impact | Treatment | Release disposition |
 |---|---|---|---|
-| Chromium API lacks trustworthy document context | Cannot bind ceremony safely | Phase 0 prototype | Blocks implementation |
-| Browser can fall back after proxy failure | Personal credential exposure | Managed policy, UHID denial, kill-on-detach | Blocks release |
-| Sandbox unavailable on target system | Principal can reach protected resources | Refuse secure profile startup | Supported limitation |
-| Notification prompt can be spoofed or auto-accepted | False presence | Trusted prompt review and release-build guard | Blocks release if unresolved |
-| Larger TCB increases maintenance burden | Boundary compromise | Minimal components, version pinning, independent review | Accepted with controls |
-| Synchronous audit writes add latency | Poor UX or timeout | Measure in Phase 3; optimize storage, not semantics | Must meet documented budget |
-| RP session has broad authority | Agent can act beyond login intent | Prominent limitation and low-privilege account guidance | Accepted residual risk |
-| RP account selection is ambiguous | Wrong account authenticated | Exact credential and `allowCredentials` requirement | Blocks release |
-| Chromium update changes proxy behavior | Security or availability regression | Version compatibility tests and pinned support range | Blocks affected version |
-| Local backend stores keys without encryption | Host user can read local credential files | Existing backend disclosure; recommend pass or TPM for high value | Accepted baseline limitation |
-
-## Future autonomous-authentication track
-
-Autonomous work begins only through a new ADR satisfying ADR 0003. It is separate from this plan and cannot reuse the interactive UP flag.
-
-A research phase may evaluate:
-
-- Interactive WebAuthn bootstrap into RP-supported OAuth authorization.
-- Token exchange with explicit subject and actor identity.
-- DPoP- or mTLS-bound, short-lived, audience-restricted tokens.
-- TPM-protected agent proof-of-possession keys.
-- SPIFFE workload identity for operator-controlled services.
-- Cooperating-RP protocols that bind immutable transaction context.
-
-Research artifacts must identify an RP that supports the protocol, show actor visibility and scope enforcement at the RP, and demonstrate independent revocation. A browser-only RP accepting ordinary WebAuthn assertions is not sufficient evidence.
+| UHID nodes cannot be isolated deterministically | Wrong browser reaches credential route | Phase 0 identity and kernel-policy proof | Blocks implementation |
+| Shared human storage update races | Counter or credential corruption | One owner, serialization, fault tests | Blocks release |
+| Agent prompt can be spoofed or auto-accepted | False UP/UV | Trusted prompt boundary and release guard | Blocks release |
+| Browser control exposes session material | Session may survive local lease if copied | Honest scope, restricted profile/control/egress, short TTL | Accepted residual risk if documented |
+| RP session outlives local lease | Continued server authority | Kill browser, clean profile, RP revocation guidance | Accepted residual risk if documented |
+| Fresh profile requires federated or cross-site login | Broader practical session authority or incompatibility | Supported-RP testing and explicit limitations | Block unsupported RP/profile combination |
+| Sandbox unavailable | Principal reaches protected resources | Refuse secure profile startup | Supported limitation |
+| Synchronous audit adds latency | Ceremony timeout or poor UX | Measure and optimize storage, never weaken pre-write | Must meet documented budget |
+| Local backend lacks encryption at rest | Host user can read files | Existing disclosure; recommend pass or TPM | Accepted baseline limitation |
+| Multi-endpoint runtime affects human service | Human availability or regression | Independent workers, priority, full regression suite | Blocks release |
 
 ## Definition of done
 
 The project is done only when:
 
-- All ten phase gates pass.
-- Every requirement in the traceability table has reviewable evidence.
-- The independent security review has no unresolved critical or high finding.
-- Existing human Passless behavior and data remain compatible.
-- Supported installation and rollback are reproducible from documentation.
-- The managed browser cannot reach personal authenticators under any tested failure.
-- Packet-level tests prove truthful UP and UV.
-- No autonomous or delegated-machine mode is exposed by config, protocol, CLI, documentation, or runtime.
-- Operators can revoke local authority and are instructed to revoke RP-side credentials and sessions.
-- The feature remains opt-in until one stable release validates the operating model.
+- All phase gates pass in order.
+- Every requirement has reviewable passing evidence.
+- Independent review has no unresolved critical or high finding.
+- Existing human behavior, configuration, and data remain compatible.
+- Device and principal isolation are reproducible from documentation.
+- Packet-level and RP-level tests prove truthful UP and UV.
+- Delegated mode cannot register, enumerate, delete, manage, or perform a second assertion.
+- Browser lease expiry and cleanup are tested without claiming RP-side revocation.
+- No autonomous or automatic-approval mode exists in config, protocol, CLI, documentation, or runtime.
+- Installation, revocation, recovery, rollback, and uninstall are documented and verified.
+- Agent support remains opt-in until at least one stable release validates the operating model.
