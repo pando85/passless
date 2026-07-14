@@ -49,7 +49,7 @@ Intel's pivot away from SGX on consumer processors was driven by:
 **Status**: ❌ Not viable for post-2021 Intel Core processors
 
 **Details**:
-- Gramine is actively maintained (latest meeting notes: July 2026)
+- Gramine is actively maintained
 - Requires Intel SGX hardware support
 - **Cannot run on 11th gen+ Intel Core processors**
 - Still viable for:
@@ -171,36 +171,6 @@ Given the hardware limitations, consider these alternatives:
 - Available on all modern systems
 - No special hardware requirements beyond standard TPM
 - Works with post-2021 Intel Core processors
-
-### 3. Hybrid Approach: TPM + Optional TEE
-
-**Strategy**:
-- Keep TPM as primary security mechanism (works everywhere)
-- Add optional TEE backend for users with compatible hardware
-- Detect hardware capabilities at runtime
-- Gracefully fall back to TPM-only mode
-
-**Implementation**:
-```rust
-enum SecurityBackend {
-    Tpm,                    // Default, works everywhere
-    Tdx,                    // Intel TDX (cloud/server)
-    Sev,                    // AMD SEV (server)
-    Sgx,                    // Legacy SGX (pre-2021 hardware)
-}
-
-fn detect_best_backend() -> SecurityBackend {
-    if has_intel_tdx() {
-        SecurityBackend::Tdx
-    } else if has_amd_sev() {
-        SecurityBackend::Sev
-    } else if has_intel_sgx() {
-        SecurityBackend::Sgx
-    } else {
-        SecurityBackend::Tpm
-    }
-}
-```
 
 ## Recommendations for Passless
 
