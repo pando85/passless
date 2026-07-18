@@ -12,6 +12,8 @@ use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 
 pub const AUDIT_SCHEMA_VERSION: u32 = 1;
 
+// The closed-schema tests apply these deny lists to every constructible event.
+#[cfg(test)]
 const FORBIDDEN_FIELD_NAMES: &[&str] = &[
     "message",
     "msg",
@@ -39,6 +41,7 @@ const FORBIDDEN_FIELD_NAMES: &[&str] = &[
     "arbitrary",
 ];
 
+#[cfg(test)]
 const FORBIDDEN_KEY_SUBSTRINGS: &[&str] = &["secret", "password", "token", "pin", "private_key"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

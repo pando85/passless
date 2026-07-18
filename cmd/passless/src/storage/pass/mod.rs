@@ -104,6 +104,7 @@ impl PassStorageAdapter {
         gpg_backend: GpgBackend,
         allow_create_without_prompt: bool,
     ) -> Result<Self> {
+        let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
         info!("Using pass (password-store) backend");
         info!("Store path: {}", store_path.display());
         info!("Path: {}", path.display());

@@ -27,12 +27,11 @@ RestartSec=5s
 # Filesystem
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent
+ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent /var/run/passless-browser
 PrivateTmp=true
 # Note: /var/run/passless-browser/<profile> directories are created per-profile
-# and owned by the configured browser_user. The daemon creates them at startup
-# with correct ownership. Do not add /var/run/passless-browser to ReadWritePaths
-# as the daemon does not write directly to browser profile state.
+# and owned by the configured browser_user. The daemon creates and cleans these
+# directories, so the parent must remain writable under ProtectSystem=strict.
 
 # Process
 NoNewPrivileges=false
@@ -40,9 +39,11 @@ NoNewPrivileges=false
 # launch principal and browser processes under separate Unix identities.
 
 # Namespaces
-PrivateDevices=true
-# /dev/uhid is accessed before namespace setup; agent hidraw nodes are created
-# dynamically and exposed only to the correct principal/browser UID via udev.
+PrivateDevices=false
+# PrivateDevices cannot be enabled: Chromium enumerates dynamically created host
+# hidraw nodes after service startup, so static bind mounts are insufficient.
+# The daemon requires /dev/uhid; exact udev identity rules restrict each hidraw
+# node. Never grant /dev/uhid to principals or browser users.
 
 # Logging
 StandardOutput=journal

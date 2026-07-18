@@ -781,11 +781,6 @@ mod tests {
             let mut t = self.now.lock().unwrap();
             *t = MonotonicTime::from_millis(t.as_millis() + ms);
         }
-
-        fn set(&self, ms: u64) {
-            let mut t = self.now.lock().unwrap();
-            *t = MonotonicTime::from_millis(ms);
-        }
     }
 
     impl MonotonicClock for FakeClock {

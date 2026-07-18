@@ -60,14 +60,14 @@ test-e2e:	## run E2E tests (automatically manages authenticator)
 
 .PHONY: test-e2e-local
 test-e2e-local:	## run E2E tests for local backend only
-	cargo test --all-features --test e2e_webauthn local -- --test-threads=1 --ignored
+	cargo test --all-features --test e2e_webauthn test_local_ -- --test-threads=1 --ignored
 
 .PHONY: test-e2e-pass
 test-e2e-pass:	## run E2E tests for password-store backend only
-	cargo test --all-features --test e2e_webauthn pass -- --test-threads=1 --ignored
+	cargo test --all-features --test e2e_webauthn test_pass_ -- --test-threads=1 --ignored
 .PHONY: test-e2e-tpm
 test-e2e-tpm:	## run E2E tests for TPM backend only (requires swtpm)
-	cargo test --test e2e_webauthn tpm -- --test-threads=1 --ignored
+	cargo test --all-features --test e2e_webauthn test_tpm_ -- --test-threads=1 --ignored
 
 .PHONY: update-changelog
 update-changelog:	## automatically update changelog based on commits

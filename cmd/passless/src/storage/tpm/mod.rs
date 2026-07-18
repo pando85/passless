@@ -70,6 +70,7 @@ impl TpmStorageAdapter {
         tcti: Option<String>,
         allow_create_without_prompt: bool,
     ) -> Result<Self> {
+        let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
         info!("Using TPM 2.0 backend");
         info!("Storage path: {}", storage_dir.display());
 

@@ -671,6 +671,10 @@ impl HardenedChildSetup {
         Ok(())
     }
 
+    /// # Safety
+    ///
+    /// Must be called in the forked child before `exec`. `preserved_fds` must
+    /// contain only descriptors intentionally transferred to the principal.
     pub unsafe fn apply(&self, preserved_fds: &[RawFd]) -> Result<(), io::Error> {
         unsafe { close_range_preserving(preserved_fds)? };
 

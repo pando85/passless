@@ -14,6 +14,7 @@ use log::info;
 pub struct GpgKeySelected {
     pub(super) store_path: PathBuf,
     pub(super) fingerprint: String,
+    pub(super) allow_create_without_prompt: bool,
 }
 
 impl GpgKeySelected {
@@ -31,6 +32,7 @@ impl GpgKeySelected {
         Ok(StoreInitialized {
             store_path: self.store_path,
             fingerprint: self.fingerprint,
+            allow_create_without_prompt: self.allow_create_without_prompt,
         })
     }
 }

@@ -28,6 +28,7 @@ pub enum CeremonyAction {
 
 struct ActiveCeremony {
     action: CeremonyAction,
+    rp_id: String,
     generation: u64,
 }
 
@@ -51,10 +52,15 @@ impl CeremonyScope {
         }
     }
 
-    pub fn activate(
+    fn activate(
         &self,
         action: CeremonyAction,
+        rp_id: &str,
     ) -> std::result::Result<Option<CeremonyGuard>, ScopeActivationError> {
+        let rp_id = normalize_rp_id(rp_id);
+        if rp_id.is_empty() {
+            return Err(ScopeActivationError::EmptyRpId);
+        }
         match &action {
             CeremonyAction::Authenticate(cred_ref) => {
                 if cred_ref.as_bytes().iter().all(|&b| b == 0) {
@@ -64,24 +70,45 @@ impl CeremonyScope {
             CeremonyAction::Register => {}
         }
         let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.inner.active.lock().unwrap() = Some(ActiveCeremony { action, generation });
+        *self.inner.active.lock().unwrap() = Some(ActiveCeremony {
+            action,
+            rp_id,
+            generation,
+        });
         Ok(Some(CeremonyGuard {
             scope: self.clone(),
             generation,
         }))
     }
 
+    pub fn activate_register_for_rp(
+        &self,
+        rp_id: &str,
+    ) -> std::result::Result<Option<CeremonyGuard>, ScopeActivationError> {
+        self.activate(CeremonyAction::Register, rp_id)
+    }
+
+    pub fn activate_authenticate_for_rp(
+        &self,
+        cred_ref: CredentialRef,
+        rp_id: &str,
+    ) -> std::result::Result<Option<CeremonyGuard>, ScopeActivationError> {
+        self.activate(CeremonyAction::Authenticate(cred_ref), rp_id)
+    }
+
+    #[cfg(test)]
     pub fn activate_register(
         &self,
     ) -> std::result::Result<Option<CeremonyGuard>, ScopeActivationError> {
-        self.activate(CeremonyAction::Register)
+        self.activate_register_for_rp("example.com")
     }
 
+    #[cfg(test)]
     pub fn activate_authenticate(
         &self,
         cred_ref: CredentialRef,
     ) -> std::result::Result<Option<CeremonyGuard>, ScopeActivationError> {
-        self.activate(CeremonyAction::Authenticate(cred_ref))
+        self.activate_authenticate_for_rp(cred_ref, "example.com")
     }
 
     pub fn active_action(&self) -> Option<CeremonyAction> {
@@ -104,17 +131,28 @@ impl CeremonyScope {
                 CeremonyAction::Register => None,
             })
     }
+
+    pub fn active_rp_id(&self) -> Option<String> {
+        self.inner
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.rp_id.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeActivationError {
     EmptyCredentialRef,
+    EmptyRpId,
 }
 
 impl std::fmt::Display for ScopeActivationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyCredentialRef => write!(f, "empty credential ref"),
+            Self::EmptyRpId => write!(f, "empty RP ID"),
         }
     }
 }
@@ -284,8 +322,17 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
         if !self.cred_ref_to_raw_id.contains_key(&cred_ref) {
             self.build_index()?;
         }
+        let raw_id = self.resolve_raw_id(&cred_ref)?;
+        let rp_id = self
+            .human
+            .lock()
+            .map_err(|e| DelegatedError::Internal(format!("human lock poisoned: {}", e)))?
+            .read(&raw_id)
+            .map_err(|e| DelegatedError::Internal(format!("credential read failed: {}", e)))?
+            .rp
+            .id;
         self.scope
-            .activate_authenticate(cred_ref)
+            .activate_authenticate_for_rp(cred_ref, &rp_id)
             .map_err(|_| DelegatedError::WriteDenied)
     }
 
@@ -316,6 +363,13 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
     ) -> std::result::Result<(), soft_fido2::Error> {
         match self.scope.active_cred_ref() {
             Some(ref active) if *active == *cred_ref => Ok(()),
+            _ => Err(soft_fido2::Error::DoesNotExist),
+        }
+    }
+
+    fn require_ceremony_rp(&self, rp_id: &str) -> std::result::Result<(), soft_fido2::Error> {
+        match self.scope.active_rp_id() {
+            Some(active) if active == normalize_rp_id(rp_id) => Ok(()),
             _ => Err(soft_fido2::Error::DoesNotExist),
         }
     }
@@ -402,7 +456,7 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
 
         match &filter {
             CredentialFilter::ByRp(rp_id) => {
-                if !self.is_rp_allowed(rp_id) {
+                if !self.is_rp_allowed(rp_id) || self.require_ceremony_rp(rp_id).is_err() {
                     return Err(soft_fido2::Error::DoesNotExist);
                 }
                 let raw_id = self
@@ -410,7 +464,9 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
                     .map_err(|_| soft_fido2::Error::DoesNotExist)?;
                 let mut human = self.human.lock().map_err(|_| soft_fido2::Error::Other)?;
                 let cred = human.read(&raw_id)?;
-                if !self.is_rp_allowed(&cred.rp.id) {
+                if !self.is_rp_allowed(&cred.rp.id)
+                    || self.require_ceremony_rp(&cred.rp.id).is_err()
+                {
                     return Err(soft_fido2::Error::DoesNotExist);
                 }
                 Ok(cred)
@@ -426,7 +482,9 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
                     .map_err(|_| soft_fido2::Error::DoesNotExist)?;
                 let mut human = self.human.lock().map_err(|_| soft_fido2::Error::Other)?;
                 let cred = human.read(&raw_id)?;
-                if !self.is_rp_allowed(&cred.rp.id) {
+                if !self.is_rp_allowed(&cred.rp.id)
+                    || self.require_ceremony_rp(&cred.rp.id).is_err()
+                {
                     return Err(soft_fido2::Error::DoesNotExist);
                 }
                 Ok(cred)
@@ -437,7 +495,9 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
                     .map_err(|_| soft_fido2::Error::DoesNotExist)?;
                 let mut human = self.human.lock().map_err(|_| soft_fido2::Error::Other)?;
                 let cred = human.read(&raw_id)?;
-                if !self.is_rp_allowed(&cred.rp.id) {
+                if !self.is_rp_allowed(&cred.rp.id)
+                    || self.require_ceremony_rp(&cred.rp.id).is_err()
+                {
                     return Err(soft_fido2::Error::DoesNotExist);
                 }
                 Ok(cred)
@@ -463,7 +523,7 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
             .map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let mut human = self.human.lock().map_err(|_| soft_fido2::Error::Other)?;
         let cred = human.read(&raw_id)?;
-        if !self.is_rp_allowed(&cred.rp.id) {
+        if !self.is_rp_allowed(&cred.rp.id) || self.require_ceremony_rp(&cred.rp.id).is_err() {
             return Err(soft_fido2::Error::DoesNotExist);
         }
         Ok(cred)
@@ -474,6 +534,10 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
         self.require_active_ceremony()?;
         let href = cred_ref_from_id(&cred_id);
         self.require_ceremony_cred(&href)?;
+        let active_rp_id = self
+            .scope
+            .active_rp_id()
+            .ok_or(DelegatedError::WriteDenied)?;
         if !self.allowed_cred_refs.contains(&href) {
             return Err(DelegatedError::WriteDenied.into());
         }
@@ -486,7 +550,7 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
 
         let latest = human.read(&raw_id)?;
 
-        if !self.is_rp_allowed(&latest.rp.id) {
+        if !self.is_rp_allowed(&latest.rp.id) || normalize_rp_id(&latest.rp.id) != active_rp_id {
             return Err(DelegatedError::RpIdNotAllowed(normalize_rp_id(&latest.rp.id)).into());
         }
 
@@ -511,7 +575,11 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
         }
     }
 
-    fn cleanup_expired_cache(&mut self) {}
+    fn cleanup_expired_cache(&mut self) {
+        if let Ok(mut human) = self.human.lock() {
+            human.cleanup_expired_cache();
+        }
+    }
 }
 
 pub struct ForwardingStorageHandle {
@@ -641,6 +709,13 @@ impl<S: CredentialStorage> IsolatedScopedStorage<S> {
         }
     }
 
+    fn require_ceremony_rp(&self, rp_id: &str) -> std::result::Result<(), soft_fido2::Error> {
+        match self.scope.active_rp_id() {
+            Some(active) if active == normalize_rp_id(rp_id) => Ok(()),
+            _ => Err(soft_fido2::Error::DoesNotExist),
+        }
+    }
+
     fn verify_immutable_fields(
         &self,
         old: &soft_fido2::Credential,
@@ -706,7 +781,7 @@ impl<S: CredentialStorage> CredentialStorage for IsolatedScopedStorage<S> {
 
         match &filter {
             CredentialFilter::ByRp(rp_id) => {
-                if !self.is_rp_allowed(rp_id) {
+                if !self.is_rp_allowed(rp_id) || self.require_ceremony_rp(rp_id).is_err() {
                     return Err(soft_fido2::Error::DoesNotExist);
                 }
             }
@@ -724,7 +799,7 @@ impl<S: CredentialStorage> CredentialStorage for IsolatedScopedStorage<S> {
             .resolve_raw_id(&auth_ref)
             .map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let cred = self.backend.read(&raw_id)?;
-        if !self.is_rp_allowed(&cred.rp.id) {
+        if !self.is_rp_allowed(&cred.rp.id) || self.require_ceremony_rp(&cred.rp.id).is_err() {
             return Err(soft_fido2::Error::DoesNotExist);
         }
         Ok(cred)
@@ -745,7 +820,7 @@ impl<S: CredentialStorage> CredentialStorage for IsolatedScopedStorage<S> {
             .resolve_raw_id(&auth_ref)
             .map_err(|_| soft_fido2::Error::DoesNotExist)?;
         let cred = self.backend.read(&raw_id)?;
-        if !self.is_rp_allowed(&cred.rp.id) {
+        if !self.is_rp_allowed(&cred.rp.id) || self.require_ceremony_rp(&cred.rp.id).is_err() {
             return Err(soft_fido2::Error::DoesNotExist);
         }
         Ok(cred)
@@ -754,10 +829,16 @@ impl<S: CredentialStorage> CredentialStorage for IsolatedScopedStorage<S> {
     fn write(&mut self, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
         match self.scope.active_action() {
             Some(CeremonyAction::Register) => {
+                let active_rp_id = self
+                    .scope
+                    .active_rp_id()
+                    .ok_or(DelegatedError::WriteDenied)?;
                 if !self.registration_allowed {
                     return Err(DelegatedError::RegistrationDenied.into());
                 }
-                if !self.is_rp_allowed(cred_ref.rp_id) {
+                if !self.is_rp_allowed(cred_ref.rp_id)
+                    || normalize_rp_id(cred_ref.rp_id) != active_rp_id
+                {
                     return Err(
                         DelegatedError::RpIdNotAllowed(normalize_rp_id(cred_ref.rp_id)).into(),
                     );
@@ -766,6 +847,10 @@ impl<S: CredentialStorage> CredentialStorage for IsolatedScopedStorage<S> {
                 Ok(())
             }
             Some(CeremonyAction::Authenticate(ref active_ref)) => {
+                let active_rp_id = self
+                    .scope
+                    .active_rp_id()
+                    .ok_or(DelegatedError::WriteDenied)?;
                 let href = cred_ref_from_id(cred_ref.id);
                 if href != *active_ref {
                     return Err(DelegatedError::WriteDenied.into());
@@ -774,7 +859,9 @@ impl<S: CredentialStorage> CredentialStorage for IsolatedScopedStorage<S> {
                     .resolve_raw_id(active_ref)
                     .map_err(|_| DelegatedError::WriteDenied)?;
                 let latest = self.backend.read(&raw_id)?;
-                if !self.is_rp_allowed(&latest.rp.id) {
+                if !self.is_rp_allowed(&latest.rp.id)
+                    || normalize_rp_id(&latest.rp.id) != active_rp_id
+                {
                     return Err(
                         DelegatedError::RpIdNotAllowed(normalize_rp_id(&latest.rp.id)).into(),
                     );
@@ -849,6 +936,7 @@ mod tests {
         writes: Arc<Mutex<Vec<soft_fido2::Credential>>>,
         deletes: Arc<Mutex<Vec<Vec<u8>>>>,
         iterator_calls: Arc<Mutex<usize>>,
+        cleanup_calls: Arc<Mutex<usize>>,
     }
 
     impl MockStorage {
@@ -859,6 +947,7 @@ mod tests {
                 writes: Arc::new(Mutex::new(Vec::new())),
                 deletes: Arc::new(Mutex::new(Vec::new())),
                 iterator_calls: Arc::new(Mutex::new(0)),
+                cleanup_calls: Arc::new(Mutex::new(0)),
             }
         }
     }
@@ -940,6 +1029,10 @@ mod tests {
 
         fn count_credentials(&self) -> usize {
             self.creds.lock().unwrap().len()
+        }
+
+        fn cleanup_expired_cache(&mut self) {
+            *self.cleanup_calls.lock().unwrap() += 1;
         }
     }
 
@@ -1528,7 +1621,9 @@ mod tests {
 
         assert!(scope.active_cred_ref().is_none());
 
-        let _guard = scope.activate_authenticate(cred_ref_for(b"cred1")).unwrap();
+        let _guard = scope
+            .activate_authenticate_for_rp(cred_ref_for(b"cred1"), "example.com")
+            .unwrap();
         assert_eq!(scope.active_cred_ref(), Some(cred_ref_for(b"cred1")));
         assert_eq!(scope_clone.active_cred_ref(), Some(cred_ref_for(b"cred1")));
 
@@ -1541,10 +1636,14 @@ mod tests {
     fn test_ceremony_generation_monotonic() {
         let scope = CeremonyScope::new();
 
-        let guard1 = scope.activate_authenticate(cred_ref_for(b"cred1")).unwrap();
+        let guard1 = scope
+            .activate_authenticate_for_rp(cred_ref_for(b"cred1"), "example.com")
+            .unwrap();
         assert_eq!(scope.active_cred_ref(), Some(cred_ref_for(b"cred1")));
 
-        let guard2 = scope.activate_authenticate(cred_ref_for(b"cred2")).unwrap();
+        let guard2 = scope
+            .activate_authenticate_for_rp(cred_ref_for(b"cred2"), "example.com")
+            .unwrap();
         assert_eq!(scope.active_cred_ref(), Some(cred_ref_for(b"cred2")));
 
         drop(guard1);
@@ -1578,6 +1677,55 @@ mod tests {
                 .unwrap(),
             &b"raw-secret-id-1".to_vec()
         );
+    }
+
+    #[test]
+    fn test_delegated_scope_rejects_other_allowed_rp() {
+        let credential = make_test_cred(b"cred1", "example.com", b"user1", 5);
+        let human = make_shared_mock(vec![credential.clone()]);
+        let mut delegated = SharedDelegatedStorage::new(
+            human,
+            vec!["example.com".to_string(), "other.example".to_string()],
+            vec![cred_ref_for(b"cred1")],
+        );
+        delegated.build_index().unwrap();
+
+        let _guard = delegated
+            .scope
+            .activate_authenticate_for_rp(cred_ref_for(b"cred1"), "other.example")
+            .unwrap();
+
+        assert!(delegated.read(b"cred1").is_err());
+
+        let mut updated = credential;
+        updated.sign_count = 6;
+        let credential_ref = soft_fido2::CredentialRef {
+            id: &updated.id,
+            rp_id: &updated.rp.id,
+            rp_name: updated.rp.name.as_deref(),
+            user_id: &updated.user.id,
+            user_name: updated.user.name.as_deref(),
+            user_display_name: updated.user.display_name.as_deref(),
+            sign_count: &updated.sign_count,
+            alg: &updated.alg,
+            private_key: &updated.private_key,
+            created: &updated.created,
+            discoverable: &updated.discoverable,
+            cred_protect: updated.extensions.cred_protect.as_ref(),
+            cred_random: None,
+        };
+        assert!(delegated.write(credential_ref).is_err());
+    }
+
+    #[test]
+    fn test_delegated_cleanup_reaches_human_storage() {
+        let human = make_shared_mock(vec![]);
+        let cleanup_calls = human.lock().unwrap().cleanup_calls.clone();
+        let mut delegated = SharedDelegatedStorage::new(human, vec![], vec![]);
+
+        delegated.cleanup_expired_cache();
+
+        assert_eq!(*cleanup_calls.lock().unwrap(), 1);
     }
 
     #[test]
@@ -1746,6 +1894,24 @@ mod tests {
             let cred_ref = cred_ref_to_soft_fido2(&new_cred);
             let result = isolated.write(cred_ref);
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_isolated_register_scope_binds_exact_rp() {
+            let (mut isolated, scope) = make_isolated(
+                vec![],
+                vec!["example.com".to_string(), "other.example".to_string()],
+                true,
+            );
+            let _guard = scope.activate_register_for_rp("example.com").unwrap();
+
+            let other_credential = make_test_cred(b"other-cred", "other.example", b"user1", 0);
+
+            assert!(
+                isolated
+                    .write(cred_ref_to_soft_fido2(&other_credential))
+                    .is_err()
+            );
         }
 
         #[test]

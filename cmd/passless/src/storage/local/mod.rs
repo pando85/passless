@@ -16,7 +16,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 /// Local file system storage adapter
@@ -35,13 +35,14 @@ impl LocalStorageAdapter {
     /// Create a new local storage adapter
     #[cfg(test)]
     pub fn new(storage_dir: PathBuf) -> Result<Self> {
-        Self::new_with_options(storage_dir, false)
+        Self::new_with_options(storage_dir, true)
     }
 
     pub fn new_with_options(
         storage_dir: PathBuf,
         allow_create_without_prompt: bool,
     ) -> Result<Self> {
+        let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
         info!("Using local file system backend");
         info!("Storage path: {}", storage_dir.display());
 
@@ -97,7 +98,14 @@ impl LocalStorageAdapter {
 
         // Ensure the RP directory exists with secure permissions
         let parent = path.parent().ok_or(soft_fido2::Error::Other)?;
-        create_secure_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
+        create_secure_dir_all(parent).map_err(|e| {
+            error!(
+                "Failed to create credential directory {}: {}",
+                parent.display(),
+                e
+            );
+            soft_fido2::Error::Other
+        })?;
 
         // Use Zeroizing to ensure credential bytes are cleared from memory after use
         let bytes = Zeroizing::new(our_cred.to_bytes()?);
@@ -106,7 +114,10 @@ impl LocalStorageAdapter {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or(soft_fido2::Error::Other)?;
-        atomic_write_in_dir(parent, filename, &bytes).map_err(|_| soft_fido2::Error::Other)?;
+        atomic_write_in_dir(parent, filename, &bytes).map_err(|e| {
+            error!("Failed to persist credential {}: {}", path.display(), e);
+            soft_fido2::Error::Other
+        })?;
 
         // bytes is automatically zeroed when it goes out of scope
 

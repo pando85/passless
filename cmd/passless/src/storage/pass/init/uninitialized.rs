@@ -78,6 +78,7 @@ impl Uninitialized {
         Ok(DirectoryCreated {
             store_path: self.store_path,
             gpg_backend: self.gpg_backend,
+            allow_create_without_prompt,
         })
     }
 }

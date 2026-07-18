@@ -1113,9 +1113,10 @@ mod tests {
         assert!(result_no_ceremony.is_err());
 
         let _guard = scope
-            .activate_authenticate(passless_core::agent::CredentialRef::with_default_domain(
-                b"cred1",
-            ))
+            .activate_authenticate_for_rp(
+                passless_core::agent::CredentialRef::with_default_domain(b"cred1"),
+                "example.com",
+            )
             .unwrap();
 
         let result_with_ceremony =
@@ -1173,9 +1174,10 @@ mod tests {
         .unwrap();
 
         let _guard = scope
-            .activate_authenticate(passless_core::agent::CredentialRef::with_default_domain(
-                b"cred1",
-            ))
+            .activate_authenticate_for_rp(
+                passless_core::agent::CredentialRef::with_default_domain(b"cred1"),
+                "example.com",
+            )
             .unwrap();
 
         let _ = delegated.read(b"cred1").unwrap();

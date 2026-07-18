@@ -837,33 +837,33 @@ Each requirement maps to specific source modules and test files:
 | PRIN-03 | `cmd/passless/src/agent/launcher.rs`, `contrib/udev/70-passless-agent.rules` | Pending principal-isolation suite |
 | ISO-01 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/storage_factory.rs` | `cmd/passless/src/agent/storage.rs` (unit tests) |
 | ISO-02 | `cmd/passless/src/agent/intent.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
-| ISO-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending isolated storage suite |
+| ISO-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/ceremony.rs` | Isolated storage scope, exact RP, registration, counter, and denial tests |
 | DEL-01 | `cmd/passless/src/agent/grant.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/grant.rs` (unit tests) |
-| DEL-02 | `cmd/passless/src/agent/storage.rs` | Pending delegated storage suite |
-| DEL-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/authenticator.rs` | Pending concurrent counter tests |
+| DEL-02 | `cmd/passless/src/agent/storage.rs` | Delegated exact RP/credential, operation-denial, immutable-field, and cleanup tests |
+| DEL-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/authenticator.rs` | Concurrent counter serialization and shared operation-lock tests |
 | DEL-04 | `cmd/passless/src/agent/grant.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/grant.rs` (unit tests) |
-| DEL-05 | `cmd/passless/src/agent/endpoint_manager.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending endpoint lifecycle tests |
+| DEL-05 | `cmd/passless/src/agent/endpoint_manager.rs`, `cmd/passless/src/agent/ceremony.rs`, `cmd/passless/src/agent/runtime.rs` | Drain-before-destroy, timeout, stale-event, fresh-endpoint, and concurrent lifecycle tests |
 | SESS-01 | `cmd/passless/src/agent/browser.rs` | `cmd/passless/src/agent/browser.rs` (unit tests) |
 | SESS-02 | `cmd/passless/src/agent/browser.rs` | `cmd/passless/src/agent/browser.rs` (unit tests) |
 | SESS-03 | `cmd/passless/src/agent/browser.rs` | `cmd/passless/src/agent/browser.rs` (unit tests) |
 | SESS-04 | Documentation | Documentation review |
 | POL-01 | `passless-core/src/agent/policy.rs`, `cmd/passless/src/agent/policy_engine.rs` | `passless-core/src/agent/policy.rs` (unit tests) |
 | POL-02 | `cmd/passless/src/agent/policy_engine.rs` | `cmd/passless/src/agent/policy_engine.rs` (unit tests) |
-| POL-03 | `cmd/passless/src/agent/policy_engine.rs` | Pending policy race suite |
+| POL-03 | `cmd/passless/src/agent/policy_engine.rs`, `cmd/passless/src/agent/intent.rs`, `cmd/passless/src/agent/grant.rs` | Concurrent claim, cancellation/approval, reload invalidation, revocation, and exact-tuple tests |
 | INT-01 | `cmd/passless/src/agent/intent.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
 | INT-02 | `cmd/passless/src/agent/intent.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
 | INT-03 | `cmd/passless/src/agent/intent.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
 | STORE-01 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/authenticator.rs` | Existing human storage tests |
 | STORE-02 | `cmd/passless/src/authenticator.rs`, `cmd/passless/src/storage/` | Existing human storage tests |
 | STORE-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/storage_factory.rs` | `cmd/passless/src/agent/storage.rs` (unit tests) |
-| SECRET-01 | All agent modules | Pending secret scans over protocol, CLI, logs, audit |
+| SECRET-01 | All agent modules | Audit-taxonomy, protocol, CLI-envelope, capability, and redacted-debug secret-absence tests; full captured-log scan remains pending |
 | AUDIT-01 | `cmd/passless/src/agent/audit.rs`, `cmd/passless/src/agent/audit_events.rs` | `cmd/passless/src/agent/audit.rs` (unit tests) |
 | AUDIT-02 | `cmd/passless/src/agent/audit.rs` | `cmd/passless/src/agent/audit.rs` (unit tests) |
-| AUDIT-03 | `cmd/passless/src/agent/audit.rs` | Pending audit fault-injection suite |
+| AUDIT-03 | `cmd/passless/src/agent/audit.rs` | Fsync, ENOSPC, partial-write, recovery, corruption, rotation, and circuit-breaker fault tests |
 | PROTO-01 | `passless-core/src/agent/protocol.rs` | `passless-core/src/agent/protocol.rs` (unit tests) |
 | PROTO-02 | `passless-core/src/agent/protocol.rs` | `passless-core/src/agent/protocol.rs` (unit tests) |
 | OPS-01 | `cmd/passless/src/agent/runtime.rs`, `cmd/passless/src/worker.rs` | Existing human E2E tests |
-| OPS-02 | `cmd/passless/src/agent/runtime.rs` | Pending rollback suite |
+| OPS-02 | `cmd/passless/src/agent/runtime.rs`, `cmd/passless/src/agent/browser.rs`, `cmd/passless/src/agent/endpoint_manager.rs` | Profile disable, endpoint cancellation, browser cleanup/quarantine, and restart recovery tests; privileged uninstall rehearsal remains pending |
 | AUTO-01 | `passless-core/src/agent/config.rs`, `cmd/passless/src/agent/ceremony.rs` | `passless-core/src/agent/config.rs` (unit tests) |
 
 ### Phase 0 evidence status
@@ -905,7 +905,14 @@ Phase 0 feasibility evidence is documented in `tools/agent-uhid-feasibility/evid
 
 ### Phase 9 validation status
 
-Phase 9 (system validation, independent review, and controlled release) is **not yet executed**.
+Phase 9 (system validation, independent review, and controlled release) is **partially executed**.
+
+**Executed and passed (unprivileged):**
+
+- All-feature passless-rs suite: 1,139 unit tests plus configuration, CLI, policy, protocol, and storage integration suites.
+- Local WebAuthn E2E suite: 11 tests with fresh secure storage and debug-only automatic UP/UV.
+- Fresh pass-store initialization and representative WebAuthn registration/authentication without interactive storage or GPG-key prompts.
+- All-feature Clippy with warnings denied, Rustfmt, documentation links, and commit hooks.
 
 **Pending:**
 

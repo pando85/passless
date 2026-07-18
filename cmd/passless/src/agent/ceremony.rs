@@ -654,14 +654,14 @@ fn has_duplicate_keys(data: &[u8]) -> Result<bool, CeremonyError> {
             }
             u16::from_be_bytes([data[1], data[2]]) as usize
         }
-        _ => return Ok(false),
+        _ => return Err(CeremonyError::InvalidCbor),
     };
 
     let mut pos = match info {
         0..=23 => 1,
         24 => 2,
         25 => 3,
-        _ => unreachable!(),
+        _ => return Err(CeremonyError::InvalidCbor),
     };
 
     let mut seen = std::collections::HashSet::new();
@@ -1476,12 +1476,14 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
         }
 
         let scope_guard = match &intent_action {
-            IntentAction::Register => {
-                self.ctx.ceremony_scope.activate_register().map_err(|_| {
+            IntentAction::Register => self
+                .ctx
+                .ceremony_scope
+                .activate_register_for_rp(&rp_id)
+                .map_err(|_| {
                     self.clear_preparation(generation);
                     AgentCeremonyError::ScopeActivationFailed
-                })?
-            }
+                })?,
             IntentAction::Authenticate => {
                 let cred_ref = effective_cred_ref.ok_or_else(|| {
                     self.clear_preparation(generation);
@@ -1489,7 +1491,7 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
                 })?;
                 self.ctx
                     .ceremony_scope
-                    .activate_authenticate(cred_ref)
+                    .activate_authenticate_for_rp(cred_ref, &rp_id)
                     .map_err(|_| {
                         self.clear_preparation(generation);
                         AgentCeremonyError::ScopeActivationFailed
@@ -2853,6 +2855,14 @@ mod tests {
     #[test]
     fn test_has_duplicate_keys_empty_input() {
         assert!(!has_duplicate_keys(&[]).unwrap());
+    }
+
+    #[test]
+    fn test_has_duplicate_keys_rejects_indefinite_map() {
+        assert_eq!(
+            has_duplicate_keys(&[0xbf, 0xff]),
+            Err(CeremonyError::InvalidCbor)
+        );
     }
 
     #[test]

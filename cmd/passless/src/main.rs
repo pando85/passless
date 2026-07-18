@@ -1,5 +1,5 @@
 #[cfg(feature = "agent")]
-mod agent;
+pub mod agent;
 mod authenticator;
 mod commands;
 mod instance_lock;

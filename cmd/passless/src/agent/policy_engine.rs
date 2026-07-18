@@ -590,7 +590,6 @@ pub struct PolicyRuntime {
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
-    monotonic_clock: Arc<dyn MonotonicClock>,
 }
 
 impl PolicyRuntime {
@@ -626,7 +625,6 @@ impl PolicyRuntime {
             pending: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashMap::new()),
             clock,
-            monotonic_clock,
         })
     }
 
@@ -1235,7 +1233,19 @@ impl PolicyRuntime {
         {
             let pending = self.pending.lock().unwrap();
             match pending.get(&ceremony_key) {
-                Some(pa) if !pa.invalidated => {}
+                Some(pa)
+                    if !pa.invalidated
+                        && pa.grant_id == handle.grant_id
+                        && pa.intent_id == handle.intent_id
+                        && pa.profile_id == handle.profile_id
+                        && pa.session_id == handle.session_id
+                        && pa.endpoint_id == handle.endpoint_id
+                        && pa.process_digest == handle.process_digest
+                        && pa.policy_generation == handle.policy_generation
+                        && pa.policy_digest == handle.policy_digest
+                        && pa.action == handle.action
+                        && pa.rp_id == handle.rp_id
+                        && pa.credential_ref == handle.credential_ref => {}
                 Some(_) => return Err(ReasonCode::CeremonyInvalidated),
                 None => return Err(ReasonCode::CeremonyInvalidated),
             }
@@ -3263,11 +3273,18 @@ mod tests {
 
         let (d1, h1) = runtime.authorize(&request);
         assert!(d1.is_allowed());
-        let handle = h1.unwrap();
+        let mut handle = h1.unwrap();
 
         let (d2, h2) = runtime.authorize(&request);
         assert_eq!(d2.outcome, Outcome::Deny);
         assert!(h2.is_none());
+
+        handle.rp_id = "other.example".to_string();
+        assert_eq!(
+            runtime.consume_authorization(&handle),
+            Err(ReasonCode::CeremonyInvalidated)
+        );
+        handle.rp_id = "example.com".to_string();
 
         let result = runtime.consume_authorization(&handle);
         assert!(result.is_ok());
