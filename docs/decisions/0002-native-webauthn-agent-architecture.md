@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-13
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Planned
+- **Implementation status:** Implemented, validation pending
 - **Depends on:** [ADR 0001](0001-agent-authentication-security-model.md)
 - **Implementation plan:** [Agent authentication implementation plan](../plans/agent-passkey-implementation.md)
 
@@ -309,7 +309,7 @@ Audit storage is outside the principal boundary, owner-only, append-oriented, ha
 
 The daemon exposes separate local interfaces:
 
-- Administrative interface: profile, policy, launch, credential revocation, browser-lease revocation, audit, and recovery.
+- Administrative interface: profile, policy, launch, credential revocation, browser-lease revocation, and audit.
 - Principal interface: health, capabilities, instructions, intent or grant request status, cancellation, and non-secret isolated credential metadata.
 - UHID endpoints: native CTAP traffic only.
 
@@ -414,6 +414,48 @@ Separate decisions are required for:
 - Cross-host browser sessions.
 - Mandatory remote or TPM-backed audit checkpoints.
 - Autonomous OAuth, workload-identity, or cooperating-RP features.
+
+## Alternatives considered
+
+### Separate daemon process for agent endpoints
+
+Rejected. Running agent endpoints in a separate process would require inter-process credential access, duplicating the storage TCB and creating synchronization hazards for shared human credential state. One daemon with isolated workers preserves single-owner storage and serialized mutation.
+
+### Browser extension or native messaging host for agent WebAuthn
+
+Rejected. Adding a browser extension or native messaging host introduces a browser integration TCB, bypasses the stock browser's origin validation, and requires per-browser maintenance. Stock browser WebAuthn over a dedicated UHID endpoint reuses existing origin enforcement without browser modification.
+
+### Per-request classification on a shared endpoint
+
+Rejected. CTAP requests do not carry caller identity. A shared endpoint cannot distinguish human from agent traffic, making policy enforcement reliant on timing or caller-provided labels that an adversary can race or forge.
+
+### Copy user credentials into agent-isolated storage
+
+Rejected. Copying credentials breaks coordinated signature-counter state, exports high-value key material across trust boundaries, and removes the ability to serialize human and delegated access through one storage owner.
+
+## Rollout
+
+The architecture rolls out through the phased approach in the [implementation plan](../plans/agent-passkey-implementation.md):
+
+1. Phase 0 proves deterministic device identity, mutual endpoint invisibility, and stock browser WebAuthn compatibility.
+2. Phases 1-7 build domain types, multi-endpoint runtime, principal launcher, credential isolation, policy, audit, and ceremony services.
+3. Phase 8 provides CLI, documentation, and operations tooling.
+4. Phase 9 validates the complete boundary through system testing and independent security review.
+
+Agent support remains opt-in and experimental until Phase 9 passes. The human authenticator remains fully operational with agent support compiled but disabled. See the [implementation plan](../plans/agent-passkey-implementation.md) for complete phase gates and exit criteria.
+
+## Rollback
+
+The architecture supports rollback without affecting human credentials or configuration:
+
+1. Disable all agent profiles and revoke active grants, intents, and browser leases.
+2. Destroy active agent endpoints and terminate managed ephemeral browsers.
+3. Quarantine profiles that fail cleanup.
+4. Set `[agents].enabled = false` or stop the daemon.
+5. Revoke isolated credentials locally and instruct operators to remove them at each RP.
+6. Preserve audit records for investigation.
+
+The human UHID endpoint, human credential store, and human configuration remain untouched. Endpoint workers are independent; agent-worker failure leaves the human worker operational. See [operations: rollback](../agents/operations.md#rollback) for detailed steps.
 
 ## References
 

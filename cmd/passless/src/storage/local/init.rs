@@ -16,7 +16,7 @@ use log::{info, warn};
 ///
 /// If the directory doesn't exist, prompts the user via desktop notification
 /// to confirm creation.
-pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
+pub fn ensure_initialized(storage_path: &Path, allow_create_without_prompt: bool) -> Result<()> {
     if storage_path.exists() {
         return Ok(());
     }
@@ -26,30 +26,32 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
         storage_path
     );
 
-    match show_yes_no_notification(
-        "Local Storage Not Initialized",
-        &format!(
-            "The local storage directory does not exist at:\n{}\n\nWould you like to create it now?",
-            storage_path.display()
-        ),
-    ) {
-        Ok(YesNoResult::Accepted) => {
-            info!("User agreed to create local storage directory");
-        }
-        Ok(YesNoResult::Denied) => {
-            warn!("Local storage initialization cancelled by user");
-            let _ = show_info_notification(
-                "Initialization Cancelled",
-                "Local storage initialization cancelled by user",
-            );
-            return Err(Error::Config("Initialization cancelled".to_string()));
-        }
-        Err(e) => {
-            warn!("Failed to show initialization prompt: {}", e);
-            return Err(Error::Config(format!(
-                "Failed to show initialization prompt: {}",
-                e
-            )));
+    if !allow_create_without_prompt {
+        match show_yes_no_notification(
+            "Local Storage Not Initialized",
+            &format!(
+                "The local storage directory does not exist at:\n{}\n\nWould you like to create it now?",
+                storage_path.display()
+            ),
+        ) {
+            Ok(YesNoResult::Accepted) => {
+                info!("User agreed to create local storage directory");
+            }
+            Ok(YesNoResult::Denied) => {
+                warn!("Local storage initialization cancelled by user");
+                let _ = show_info_notification(
+                    "Initialization Cancelled",
+                    "Local storage initialization cancelled by user",
+                );
+                return Err(Error::Config("Initialization cancelled".to_string()));
+            }
+            Err(e) => {
+                warn!("Failed to show initialization prompt: {}", e);
+                return Err(Error::Config(format!(
+                    "Failed to show initialization prompt: {}",
+                    e
+                )));
+            }
         }
     }
 
@@ -61,13 +63,15 @@ pub fn ensure_initialized(storage_path: &Path) -> Result<()> {
 
     info!("Created local storage directory at {:?}", storage_path);
 
-    let _ = show_info_notification(
-        "✅ Local Storage Initialized",
-        &format!(
-            "Successfully created local storage directory at:\n{}",
-            storage_path.display()
-        ),
-    );
+    if !allow_create_without_prompt {
+        let _ = show_info_notification(
+            "✅ Local Storage Initialized",
+            &format!(
+                "Successfully created local storage directory at:\n{}",
+                storage_path.display()
+            ),
+        );
+    }
 
     Ok(())
 }

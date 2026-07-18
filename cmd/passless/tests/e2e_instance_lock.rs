@@ -37,6 +37,7 @@ fn test_duplicate_daemon_same_backend_is_rejected() {
             "-v",
         ])
         .env("PASSLESS_E2E_AUTO_ACCEPT_UV", "1")
+        .env("PASSLESS_E2E_AUTO_ACCEPT_STORAGE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

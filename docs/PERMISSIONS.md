@@ -445,3 +445,95 @@ This requires PIN authentication and restores UV retries to the configured maxim
 | `optional` | `true` | Built-in UV denied; PIN required |
 | `optional` | `false` | Falls back to notification-based UV |
 | `never` | any | Falls back to notification-based UV |
+
+## Agent Mode Permissions
+
+Agent mode extends Passless with multiple UHID endpoints, principal sessions, and browser leases.
+It requires additional permissions and a different security model than the human authenticator.
+
+### Daemon runs as root
+
+The agent daemon **must run as root** to:
+
+- Create UHID endpoints with deterministic device identity.
+- Enforce principal isolation (separate UIDs, namespaces, device policy).
+- Manage browser leases and ephemeral profiles.
+- Write audit events to owner-only paths.
+
+**Do not** add `User=` or `Group=` directives to the agent systemd service.
+
+### Principal and browser users
+
+Each agent profile requires:
+
+- **Principal user:** A separate Unix user that owns the principal session (configured as `principal_user`).
+- **Browser user:** A separate Unix user for the ephemeral browser (configured as `browser_user`, delegated-session only). Must differ from `principal_user`.
+
+Create these users as system users with no login shell:
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin passless-<profile>
+sudo useradd -r -s /usr/sbin/nologin passless-browser-<profile>
+```
+
+### Device permissions
+
+Agent hidraw nodes require per-profile udev rules to grant access **only** to the configured browser user.
+
+**Install the agent udev rule:**
+
+```bash
+sudo cp contrib/udev/70-passless-agent.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+**Important:** The example rule contains placeholders. Replace `ATTRS{phys}` and `OWNER`/`GROUP` with your profile's device identity and browser user. See `contrib/udev/70-passless-agent.rules` for instructions.
+
+**Do not** grant human users or principals access to `/dev/uhid`. The daemon accesses `/dev/uhid` as root.
+
+### Storage and audit paths
+
+Agent storage and audit paths must be:
+
+- Owned by root with mode `0700`.
+- Non-overlapping with each other, with the human backend, and with browser runtime roots.
+- Outside every principal boundary.
+
+```bash
+sudo mkdir -p /var/lib/passless-agent/<profile>
+sudo chown root:root /var/lib/passless-agent/<profile>
+sudo chmod 0700 /var/lib/passless-agent/<profile>
+
+sudo mkdir -p /var/lib/passless-agent/audit
+sudo chown root:root /var/lib/passless-agent/audit
+sudo chmod 0700 /var/lib/passless-agent/audit
+```
+
+### Browser runtime root
+
+The browser runtime root (delegated-session only) must be:
+
+- Owned by the configured `browser_user` with mode `0700`.
+- Absolute and contain no NUL bytes.
+- Non-overlapping with other paths.
+
+```bash
+sudo mkdir -p /var/run/passless-browser/<profile>
+sudo chown passless-browser-<profile>:passless-browser-<profile> /var/run/passless-browser/<profile>
+sudo chmod 0700 /var/run/passless-browser/<profile>
+```
+
+### Systemd service
+
+Use the provided `contrib/systemd/passless-agent.service` as a starting point. Key directives:
+
+- `NoNewPrivileges=false` — required because the daemon uses setuid to launch principal and browser processes.
+- `ProtectSystem=strict` — read-only system mounts.
+- `ProtectHome=read-only` — prevent writes to home directories.
+- `ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent` — daemon-owned storage and runtime.
+- `LimitMEMLOCK=64M` — sufficient memory locking for agent operations.
+
+### Troubleshooting
+
+See [docs/agents/troubleshooting.md](agents/troubleshooting.md) for common agent mode issues.

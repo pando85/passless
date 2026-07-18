@@ -82,3 +82,37 @@ pub trait CredentialStorage: Send + Sync {
         // Default: no-op for backends that don't cache
     }
 }
+
+impl CredentialStorage for Box<dyn CredentialStorage> {
+    fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential> {
+        (**self).read_first(filter)
+    }
+
+    fn read_next(&mut self) -> Result<soft_fido2::Credential> {
+        (**self).read_next()
+    }
+
+    fn read(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
+        (**self).read(id)
+    }
+
+    fn write(&mut self, cred: soft_fido2::CredentialRef) -> Result<()> {
+        (**self).write(cred)
+    }
+
+    fn delete(&mut self, id: &[u8]) -> Result<()> {
+        (**self).delete(id)
+    }
+
+    fn count_credentials(&self) -> usize {
+        (**self).count_credentials()
+    }
+
+    fn disable_user_verification(&self) -> bool {
+        (**self).disable_user_verification()
+    }
+
+    fn cleanup_expired_cache(&mut self) {
+        (**self).cleanup_expired_cache()
+    }
+}

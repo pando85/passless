@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-13
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Planned
+- **Implementation status:** Implemented, validation pending
 - **Related decision:** [ADR 0002](0002-native-webauthn-agent-architecture.md)
 - **Implementation plan:** [Agent authentication implementation plan](../plans/agent-passkey-implementation.md)
 - **Supersedes:** the earlier agent authentication proposals in this pull request and the workflow proposed in pull request #308
@@ -221,26 +221,48 @@ Illustrative configuration:
 ```toml
 [agents]
 enabled = true
-default = "deny"
+audit_path = "/var/lib/passless-agent/audit/events.jsonl"
 
 [agents.profiles.opencode]
 mode = "delegated-session"
 principal_user = "passless-opencode"
 rp_ids = ["github.com"]
-credential_refs = ["user-github"]
-max_grant_ttl = "2m"
-max_session_ttl = "15m"
+credential_refs = ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]
+max_grant_ttl = 120
+max_session_ttl = 900
+browser_command = ["firefox", "--kiosk"]
+start_url = "https://github.com/dashboard"
+browser_user = "passless-browser-opencode"
+browser_runtime_root = "/var/run/passless-browser/opencode"
 require_uv = true
+
+[agents.profiles.opencode.device]
+name = "passless-agent-opencode"
+phys = "opencode-phys"
+uniq = "opencode-uniq"
+vendor_id = 4660
+product_id = 22136
 
 [agents.profiles.release-bot]
 mode = "isolated"
 principal_user = "passless-release"
 rp_ids = ["github.com"]
-credential_store = "release-bot"
+registration_allowed = true
 require_uv = true
+
+[agents.profiles.release-bot.storage.local]
+path = "/var/lib/passless-agent/release-bot/credentials"
+pin_path = "/var/lib/passless-agent/release-bot/pin"
+
+[agents.profiles.release-bot.device]
+name = "passless-agent-release"
+phys = "release-phys"
+uniq = "release-uniq"
+vendor_id = 4660
+product_id = 22137
 ```
 
-Exact field names and migration behavior are finalized by the implementation plan. Security-sensitive unknown fields and values are rejected.
+Credential references are non-secret hex SHA-256 digests over credential IDs. TTLs are integer seconds. Unknown fields and invalid modes are rejected at load time. See [configuration reference](../agents/configuration.md) for complete field definitions.
 
 ## Honest security claims
 
@@ -296,6 +318,34 @@ Not selected as the only mode. It provides the strongest revocation boundary but
 ### Browser proxy, extension, or patched browser
 
 Rejected for this design. Stock browser WebAuthn and UHID provide the required RP validation without adding a browser integration TCB.
+
+## Rollout
+
+Agent support is opt-in and disabled by default. The rollout follows the phased approach in the [implementation plan](../plans/agent-passkey-implementation.md):
+
+1. Ship agent support behind an opt-in compile or experimental runtime feature.
+2. Keep `[agents].enabled = false` by default.
+3. Require explicit administrator creation of every profile and exact RP policy.
+4. Refuse profile startup if any mandatory device, principal, storage, prompt, audit, or cleanup control is unavailable.
+5. Leave human startup independent from agent-component failure.
+6. Support only documented kernel, distribution, browser, and backend combinations.
+7. Remove the experimental label only after at least one stable release without a boundary-breaking issue.
+
+Phase 0 feasibility evidence must pass before runtime implementation begins. Phase 9 system validation and independent security review must pass before production release. See the [implementation plan](../plans/agent-passkey-implementation.md) for complete phase gates and exit criteria.
+
+## Rollback
+
+Agent mode can be disabled without affecting human credentials or configuration:
+
+1. Disable every profile: `passless agent-admin profile disable <profile>`.
+2. Revoke all active sessions and delegations.
+3. Terminate managed browsers and quarantine profiles that fail cleanup.
+4. Set `enabled = false` in configuration or stop the daemon.
+5. Revoke isolated credentials locally and instruct operators to remove them at each RP.
+6. For delegated mode, instruct users to revoke RP sessions through RP controls when compromise or session copying is suspected.
+7. Preserve non-secret metadata and audit for investigation.
+
+Human credentials, configuration, and the human UHID endpoint remain untouched. See [operations: rollback](../agents/operations.md#rollback) for detailed steps.
 
 ## References
 

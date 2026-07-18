@@ -87,6 +87,10 @@ impl BackendSetup for LocalBackend {
     fn setup(&mut self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let mut env = HashMap::new();
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+        env.insert(
+            "PASSLESS_E2E_AUTO_ACCEPT_STORAGE".to_string(),
+            "1".to_string(),
+        );
 
         if let Some(vendor_id) = self.vendor_id {
             env.insert(
@@ -234,6 +238,10 @@ impl BackendSetup for PassBackend {
         let mut env = HashMap::new();
         env.insert("GNUPGHOME".to_string(), self.gpg_home.display().to_string());
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+        env.insert(
+            "PASSLESS_E2E_AUTO_ACCEPT_STORAGE".to_string(),
+            "1".to_string(),
+        );
 
         if let Some(vendor_id) = self.vendor_id {
             env.insert(
@@ -345,6 +353,10 @@ impl BackendSetup for TpmBackend {
             "swtpm:host=localhost,port=2321".to_string(),
         );
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+        env.insert(
+            "PASSLESS_E2E_AUTO_ACCEPT_STORAGE".to_string(),
+            "1".to_string(),
+        );
 
         if let Some(vendor_id) = self.vendor_id {
             env.insert(

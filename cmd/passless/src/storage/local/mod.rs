@@ -8,12 +8,12 @@ use crate::storage::index::{
     update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
-use crate::util::{create_secure_dir_all, create_secure_file};
+use crate::util::{atomic_write_in_dir, create_secure_dir_all};
 
 use soft_fido2::Result;
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use log::{debug, info, warn};
@@ -33,7 +33,15 @@ pub struct LocalStorageAdapter {
 
 impl LocalStorageAdapter {
     /// Create a new local storage adapter
+    #[cfg(test)]
     pub fn new(storage_dir: PathBuf) -> Result<Self> {
+        Self::new_with_options(storage_dir, false)
+    }
+
+    pub fn new_with_options(
+        storage_dir: PathBuf,
+        allow_create_without_prompt: bool,
+    ) -> Result<Self> {
         info!("Using local file system backend");
         info!("Storage path: {}", storage_dir.display());
 
@@ -46,7 +54,8 @@ impl LocalStorageAdapter {
 
         // Ensure the storage directory is initialized
         // This will prompt the user via notifications if not initialized
-        self::init::ensure_initialized(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
+        self::init::ensure_initialized(&storage_dir, allow_create_without_prompt)
+            .map_err(|_| soft_fido2::Error::Other)?;
 
         // Load indexes from directory structure (no credential loading needed)
         let indexes =
@@ -87,16 +96,17 @@ impl LocalStorageAdapter {
         let path = path_info.to_path(&self.storage_dir);
 
         // Ensure the RP directory exists with secure permissions
-        if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
-        }
+        let parent = path.parent().ok_or(soft_fido2::Error::Other)?;
+        create_secure_dir_all(parent).map_err(|_| soft_fido2::Error::Other)?;
 
         // Use Zeroizing to ensure credential bytes are cleared from memory after use
         let bytes = Zeroizing::new(our_cred.to_bytes()?);
 
-        let mut file = create_secure_file(&path).map_err(|_| soft_fido2::Error::Other)?;
-        file.write_all(&bytes)
-            .map_err(|_| soft_fido2::Error::Other)?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(soft_fido2::Error::Other)?;
+        atomic_write_in_dir(parent, filename, &bytes).map_err(|_| soft_fido2::Error::Other)?;
 
         // bytes is automatically zeroed when it goes out of scope
 

@@ -629,13 +629,23 @@ passless agent-admin policy check|reload|show
 passless agent-admin credential list|show|revoke|delete
 passless agent-admin delegation show|list|revoke
 passless agent-admin session show|list|revoke
-passless agent-admin audit status|verify|export|recover
+passless agent-admin audit status|verify|export
 passless agent-admin install [auto|opencode|claude|pi] [--scope user|project] [--force]
 ```
 
 Authority-changing and destructive commands use only the administrative channel and require trusted human confirmation where applicable.
 
 The skill installer writes the bundled `passless-agent` Agent Skill to the selected tool's native user or project directory. `auto` installs only for detected tools, existing different skills require `--force`, and installation does not enable an agent profile or grant authentication authority.
+
+**Native skill paths by target:**
+
+| Target | User scope | Project scope |
+|---|---|---|
+| `opencode` | `~/.config/opencode/skills/passless-agent/SKILL.md` | `.opencode/skills/passless-agent/SKILL.md` |
+| `claude` | `~/.claude/skills/passless-agent/SKILL.md` | `.claude/skills/passless-agent/SKILL.md` |
+| `pi` | `~/.pi/agent/skills/passless-agent/SKILL.md` | `.pi/skills/passless-agent/SKILL.md` |
+
+Pi paths follow the [official Pi skills documentation](https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/skills.md). Detection uses the user config directory (`~/.config/opencode`, `~/.claude`, `~/.pi/agent`), the project directory (`.opencode`, `.claude`, `.pi`), or the presence of the agent command (`opencode`, `claude`, `pi`) in `PATH`.
 
 ### Principal commands
 
@@ -669,7 +679,7 @@ Documentation must explain:
 - That local browser expiry is not RP-side revocation.
 - That the agent has the full authority of the RP browser session during the lease.
 - How principal and device isolation work and how to test them.
-- How to provision, approve, launch, audit, revoke, recover, and uninstall.
+- How to provision, approve, launch, audit, revoke, and uninstall.
 - Why RP-supported OAuth, service accounts, applications, and workload identity remain preferable for unattended use.
 
 ### Operational work
@@ -693,7 +703,7 @@ Documentation must explain:
 
 ### Exit gate
 
-An operator can configure, validate, launch, inspect, revoke, audit, recover, and uninstall both modes using documented commands. Principal-facing output contains no authority-changing operation or secret.
+An operator can configure, validate, launch, inspect, revoke, audit, and uninstall both modes using documented commands. Principal-facing output contains no authority-changing operation or secret.
 
 ## Phase 9: System validation, independent review, and controlled release
 
@@ -802,6 +812,131 @@ Every requirement has passing evidence, independent review has no unresolved rel
 | PROTO-01 and PROTO-02 | Phases 1 and 3 | Contract and malformed-input suites |
 | OPS-01 and OPS-02 | All phases | Human regression, rollback, and release suites |
 | AUTO-01 | Phases 1, 5, 7, and 8 | Closed-mode and autonomous-absence suites |
+
+### Requirement-to-source and test mapping
+
+Each requirement maps to specific source modules and test files:
+
+| Requirement | Source modules | Test files |
+|---|---|---|
+| MODE-01 | `passless-core/src/agent/config.rs`, `passless-core/src/agent/policy.rs` | `passless-core/src/agent/config.rs` (unit tests), `cmd/passless/src/agent/policy_engine.rs` (unit tests) |
+| MODE-02 | `passless-core/src/agent/config.rs` | `passless-core/src/agent/config.rs` (unit tests) |
+| MODE-03 | `cmd/passless/src/agent/ceremony.rs`, `cmd/passless/src/agent/grant.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
+| ROUTE-01 | `cmd/passless/src/agent/device.rs`, `cmd/passless/src/agent/endpoint_manager.rs` | `tools/agent-uhid-feasibility/` (Phase 0 evidence) |
+| ROUTE-02 | `cmd/passless/src/agent/endpoint_manager.rs`, `cmd/passless/src/agent/runtime.rs` | `cmd/passless/src/agent/endpoint_manager.rs` (unit tests) |
+| ROUTE-03 | `contrib/udev/70-passless-agent.rules`, `tools/agent-uhid-feasibility/` | Phase 0 evidence (pending privileged checks) |
+| ROUTE-04 | `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
+| AUTH-01 | `cmd/passless/src/agent/prompt.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending packet-level and RP-level tests |
+| AUTH-02 | `cmd/passless/src/agent/prompt.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending packet-level and RP-level tests |
+| AUTH-03 | `passless-core/src/agent/policy.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
+| RP-01 | `cmd/passless/src/agent/ceremony.rs` | Documentation review |
+| RP-02 | `cmd/passless/src/agent/ceremony.rs`, `cmd/passless/src/agent/policy_engine.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
+| RP-03 | Documentation | Documentation review |
+| PRIN-01 | `cmd/passless/src/agent/launcher.rs`, `cmd/passless/src/agent/ipc.rs` | Pending principal-isolation suite |
+| PRIN-02 | `cmd/passless/src/agent/launcher.rs` | Pending principal-isolation suite |
+| PRIN-03 | `cmd/passless/src/agent/launcher.rs`, `contrib/udev/70-passless-agent.rules` | Pending principal-isolation suite |
+| ISO-01 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/storage_factory.rs` | `cmd/passless/src/agent/storage.rs` (unit tests) |
+| ISO-02 | `cmd/passless/src/agent/intent.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
+| ISO-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending isolated storage suite |
+| DEL-01 | `cmd/passless/src/agent/grant.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/grant.rs` (unit tests) |
+| DEL-02 | `cmd/passless/src/agent/storage.rs` | Pending delegated storage suite |
+| DEL-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/authenticator.rs` | Pending concurrent counter tests |
+| DEL-04 | `cmd/passless/src/agent/grant.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/grant.rs` (unit tests) |
+| DEL-05 | `cmd/passless/src/agent/endpoint_manager.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending endpoint lifecycle tests |
+| SESS-01 | `cmd/passless/src/agent/browser.rs` | `cmd/passless/src/agent/browser.rs` (unit tests) |
+| SESS-02 | `cmd/passless/src/agent/browser.rs` | `cmd/passless/src/agent/browser.rs` (unit tests) |
+| SESS-03 | `cmd/passless/src/agent/browser.rs` | `cmd/passless/src/agent/browser.rs` (unit tests) |
+| SESS-04 | Documentation | Documentation review |
+| POL-01 | `passless-core/src/agent/policy.rs`, `cmd/passless/src/agent/policy_engine.rs` | `passless-core/src/agent/policy.rs` (unit tests) |
+| POL-02 | `cmd/passless/src/agent/policy_engine.rs` | `cmd/passless/src/agent/policy_engine.rs` (unit tests) |
+| POL-03 | `cmd/passless/src/agent/policy_engine.rs` | Pending policy race suite |
+| INT-01 | `cmd/passless/src/agent/intent.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
+| INT-02 | `cmd/passless/src/agent/intent.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
+| INT-03 | `cmd/passless/src/agent/intent.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
+| STORE-01 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/authenticator.rs` | Existing human storage tests |
+| STORE-02 | `cmd/passless/src/authenticator.rs`, `cmd/passless/src/storage/` | Existing human storage tests |
+| STORE-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/storage_factory.rs` | `cmd/passless/src/agent/storage.rs` (unit tests) |
+| SECRET-01 | All agent modules | Pending secret scans over protocol, CLI, logs, audit |
+| AUDIT-01 | `cmd/passless/src/agent/audit.rs`, `cmd/passless/src/agent/audit_events.rs` | `cmd/passless/src/agent/audit.rs` (unit tests) |
+| AUDIT-02 | `cmd/passless/src/agent/audit.rs` | `cmd/passless/src/agent/audit.rs` (unit tests) |
+| AUDIT-03 | `cmd/passless/src/agent/audit.rs` | Pending audit fault-injection suite |
+| PROTO-01 | `passless-core/src/agent/protocol.rs` | `passless-core/src/agent/protocol.rs` (unit tests) |
+| PROTO-02 | `passless-core/src/agent/protocol.rs` | `passless-core/src/agent/protocol.rs` (unit tests) |
+| OPS-01 | `cmd/passless/src/agent/runtime.rs`, `cmd/passless/src/worker.rs` | Existing human E2E tests |
+| OPS-02 | `cmd/passless/src/agent/runtime.rs` | Pending rollback suite |
+| AUTO-01 | `passless-core/src/agent/config.rs`, `cmd/passless/src/agent/ceremony.rs` | `passless-core/src/agent/config.rs` (unit tests) |
+
+### Phase 0 evidence status
+
+Phase 0 feasibility evidence is documented in `tools/agent-uhid-feasibility/evidence.md`.
+
+**Executed and passed (rootless):**
+
+- UHID module presence and `/dev/uhid` access.
+- Deterministic device identity (name, phys, uniq, vendor, product) via CREATE2.
+- 1000-cycle create/destroy lifecycle with no leftover devices.
+- Concurrent 3-device lifecycle.
+- Sysfs-based HID device discovery and hidraw mapping.
+- Stock Chromium/Playwright WebAuthn registration and authentication against local Passless UHID endpoint (debug auto-accept UV mode).
+- Policy validation (dry-run) for three-tier identity model (uhid-daemon, fido, fido-agent-probe).
+- Probe unit tests (15 passed).
+
+**Pending (privileged checks):**
+
+- udev rule installation, reload, and trigger.
+- `/dev/uhid` permission enforcement via udev.
+- Probe device tagging via udev `ENV{FEASIBILITY_PROBE}`.
+- hidraw node permission override for probe devices.
+- Module unload safety check.
+- Leftover device cleanup via sysfs write.
+
+**Pending (browser/agent pipeline):**
+
+- Agent-mediated UHID device creation from browser.
+- Cross-origin isolation headers (COOP/COEP).
+- hidraw node access from agent context.
+- Privileged cross-identity separation.
+- Production UV prompt approval flow (debug auto-accept is not evidence of production prompt).
+
+**Browser and kernel support ranges:**
+
+- Kernel: Linux 7.1.3-1-MANJARO tested. Minimum supported kernel is the oldest distribution kernel providing UHID, hidraw, pidfd/close_range, SOCK_SEQPACKET, namespaces, and cgroups.
+- Browser: Stock Chromium (via Playwright) tested with debug auto-accept. Production prompt approval pending.
+
+### Phase 9 validation status
+
+Phase 9 (system validation, independent review, and controlled release) is **not yet executed**.
+
+**Pending:**
+
+- Full test environment matrix (minimum and current supported Linux kernels and distributions).
+- Stock browser versions selected by Phase 0 (production UV flow).
+- Local, pass, and TPM storage backend conformance for agent mode.
+- Human regression suite with agent support compiled but disabled.
+- Endpoint isolation suite (unique identity, node discovery, permissions, wrong-browser access, lifecycle, no fallback).
+- Principal isolation suite (UID, namespace, cgroup, filesystem, socket, device, profile, capability, resource attacks).
+- Policy and authorization suite (default deny, exact match, TTL, reload, replay, idempotency, race, cancellation, revocation).
+- Credential isolation suite (human/isolated/delegated boundaries, backend conformance, counter serialization, corruption, quarantine).
+- Ceremony semantics suite (prompt integrity, RP matching, credential selection, UP, UV, RP verification).
+- Browser lease suite (start, clamp, expiry, revoke, crash, principal exit, cleanup, quarantine, restart).
+- Audit suite (pre-write gate, terminal failure, degradation, recovery, rotation, verification, secret absence).
+- Resource abuse suite (endpoint, request, process, audit, profile, cleanup flooding).
+- Autonomous absence suite (unknown mode rejection, no cached approval, no repeated assertion under one lease).
+- Independent security review of ADRs, threat model, endpoint and kernel device-routing design, shared human-storage synchronization, principal and browser-control design, policy and authorization state machines, prompt and UP/UV evidence, storage and secret-lifetime analysis, audit durability and fault-injection evidence, and known limitations.
+
+**Release gates:**
+
+- All phase gates pass in order.
+- Every requirement has reviewable passing evidence.
+- Independent review has no unresolved critical or high finding.
+- Existing human behavior, configuration, and data remain compatible.
+- Device and principal isolation are reproducible from documentation.
+- Packet-level and RP-level tests prove truthful UP and UV.
+- Delegated mode cannot register, enumerate, delete, manage, or perform a second assertion.
+- Browser lease expiry and cleanup are tested without claiming RP-side revocation.
+- No autonomous or automatic-approval mode exists in config, protocol, CLI, documentation, or runtime.
+- Installation, revocation, recovery, rollback, and uninstall are documented and verified.
+- Agent support remains opt-in until at least one stable release validates the operating model.
 
 ## CI and quality gates
 

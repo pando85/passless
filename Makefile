@@ -180,3 +180,7 @@ uninstall: uninstall-systemd uninstall-udev uninstall-sysusers uninstall-binary 
 	@echo "    Note: The 'fido' group still exists. To remove it:"
 	@echo "      sudo groupdel fido"
 	@echo ""
+
+.PHONY: check-doc-links
+check-doc-links: ## check internal markdown links in docs/
+	@tools/check-doc-links.sh

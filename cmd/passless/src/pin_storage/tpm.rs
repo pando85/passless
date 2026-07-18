@@ -1,9 +1,11 @@
 //! TPM 2.0 PIN storage
 
 use crate::pin_storage::{PinStorage, SerializablePinState};
+use crate::util::{create_secure_dir_all, create_secure_file};
 
 use soft_fido2::{PinState, StatusCode};
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use log::{debug, info, warn};
@@ -77,13 +79,18 @@ impl PinStorage for TpmPinStorage {
         let sealed_data = self.seal(&json_bytes)?;
 
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_secure_dir_all(parent).map_err(|e| {
                 warn!("Failed to create directory: {}", e);
                 StatusCode::Other
             })?;
         }
 
-        std::fs::write(&self.path, &sealed_data).map_err(|e| {
+        let mut file = create_secure_file(&self.path).map_err(|e| {
+            warn!("Failed to create sealed PIN state file: {}", e);
+            StatusCode::Other
+        })?;
+
+        file.write_all(&sealed_data).map_err(|e| {
             warn!("Failed to write sealed PIN state: {}", e);
             StatusCode::Other
         })?;
