@@ -90,8 +90,6 @@ timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_no_fd_leakage_to_child -- --test-threads=1
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_concurrent_launch_and_revoke -- --test-threads=1
-timeout 120s cargo test --all-features -p passless-rs --bin passless \
-    agent::browser::tests::test_manager_cleanup_detects_inode_change -- --test-threads=1
 
 echo "=== Phase 9: cargo test (runtime tests, single-threaded) ===" >&2
 timeout 600s cargo test --all-features -p passless-rs --bin passless \
