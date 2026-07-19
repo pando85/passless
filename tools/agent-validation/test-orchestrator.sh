@@ -56,7 +56,7 @@ run_test() {
     log_test "$test_name"
 
     local actual_exit=0
-    ("${command[@]}" 2>/dev/null) || actual_exit=$?
+    (timeout 10s "${command[@]}" 2>/dev/null) || actual_exit=$?
 
     if [[ $actual_exit -eq $expected_exit ]]; then
         log_pass "Expected exit code $expected_exit, got $actual_exit"
@@ -378,7 +378,7 @@ test_cleanup_preserves_evidence() {
         > "$test_base/$valid_run_id/state.json"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
         log_pass "Cleanup succeeded"
@@ -406,7 +406,7 @@ test_cleanup_marks_state() {
         '{run_id: $run_id, temp_root: $temp_root, resources: [], resource_count: 0, finalized: true, cleanup_completed: false}' \
         > "$test_base/$valid_run_id/state.json"
 
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>/dev/null || true
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>/dev/null || true
 
     local cleanup_completed
     cleanup_completed=$(jq -r '.cleanup_completed // false' "$test_base/$valid_run_id/state.json" 2>/dev/null || echo "false")
@@ -426,7 +426,7 @@ test_delete_evidence_requires_confirmation() {
     local valid_run_id="agent-validation-delete-test"
     mkdir -p "$test_base/$valid_run_id"
 
-    echo "wrong" | EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --delete-evidence "$valid_run_id" 2>/dev/null || true
+    echo "wrong" | timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --delete-evidence "$valid_run_id" 2>/dev/null || true
 
     if [[ -d "$test_base/$valid_run_id" ]]; then
         log_pass "Evidence preserved with wrong confirmation"
@@ -443,7 +443,7 @@ test_delete_evidence_with_correct_confirmation() {
     local valid_run_id="agent-validation-delete-ok-test"
     mkdir -p "$test_base/$valid_run_id"
 
-    echo "DELETE" | EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --delete-evidence "$valid_run_id" 2>/dev/null || true
+    echo "DELETE" | timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --delete-evidence "$valid_run_id" 2>/dev/null || true
 
     if [[ ! -d "$test_base/$valid_run_id" ]]; then
         log_pass "Evidence deleted with correct DELETE confirmation"
@@ -460,7 +460,7 @@ test_cleanup_path_traversal() {
     mkdir -p "$test_base"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "../../../etc" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "../../../etc" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         log_pass "Path traversal rejected (exit=$exit_code)"
@@ -477,7 +477,7 @@ test_cleanup_sibling_prefix() {
     mkdir -p "$test_base/agent-validation-run1"
     mkdir -p "$test_base/agent-validation-run1-evil"
 
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "agent-validation-run1-evil" 2>/dev/null || true
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "agent-validation-run1-evil" 2>/dev/null || true
 
     if [[ -d "$test_base/agent-validation-run1" ]]; then
         log_pass "Legitimate sibling directory preserved"
@@ -494,7 +494,7 @@ test_cleanup_base_directory() {
     mkdir -p "$test_base"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$(basename "$test_base")" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$(basename "$test_base")" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         log_pass "Base directory cleanup rejected (exit=$exit_code)"
@@ -522,7 +522,7 @@ test_cleanup_symlink() {
     ln -sf "$protected_dir" "$test_base/symlink-run"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "symlink-run" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "symlink-run" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         log_pass "Symlink cleanup rejected (exit=$exit_code)"
@@ -546,7 +546,7 @@ test_cleanup_absolute_path() {
     mkdir -p "$test_base"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "/etc/passwd" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "/etc/passwd" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         log_pass "Absolute path rejected (exit=$exit_code)"
@@ -568,7 +568,7 @@ test_cleanup_valid_id() {
         > "$test_base/$valid_run_id/state.json"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
         log_pass "Valid run-id cleanup succeeded"
@@ -770,7 +770,7 @@ test_cleanup_invalid_chars() {
     mkdir -p "$test_base"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "run/with/slashes" 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "run/with/slashes" 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         log_pass "Invalid characters rejected (exit=$exit_code)"
@@ -787,7 +787,7 @@ test_cleanup_dotdot_id() {
     mkdir -p "$test_base"
 
     local exit_code=0
-    EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup ".." 2>/dev/null || exit_code=$?
+    timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup ".." 2>/dev/null || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         log_pass "Dotdot rejected (exit=$exit_code)"
@@ -860,7 +860,7 @@ test_zero_resources_reported() {
         > "$test_base/$valid_run_id/state.json"
 
     local output
-    output=$(EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>&1) || true
+    output=$(timeout 10s env EVIDENCE_BASE_DIR="$test_base" bash "$ORCHESTRATOR_SCRIPT" --cleanup "$valid_run_id" 2>&1) || true
 
     if [[ "$output" == *"0 resource"* ]]; then
         log_pass "Zero resources accurately reported"

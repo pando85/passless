@@ -26,7 +26,11 @@ log_pass() { echo -e "${GREEN}[PASS]${NC} $*" >&2; ((PASS_COUNT++)) || true; ((T
 log_fail() { echo -e "${RED}[FAIL]${NC} $*" >&2; ((FAIL_COUNT++)) || true; ((TEST_COUNT++)) || true; }
 log_test() { echo -e "${BLUE}[TEST]${NC} $*" >&2; }
 
-cleanup() { rm -rf "$TEST_TMP_DIR" 2>/dev/null || true; }
+cleanup() {
+    pkill -P $$ 'sleep' 2>/dev/null || true
+    pkill -f 'mock-cdp-server' 2>/dev/null || true
+    rm -rf "$TEST_TMP_DIR" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 mkdir -p "$TEST_TMP_DIR"
@@ -137,7 +141,7 @@ test_cdp_client_against_mock() {
 
     # Test health check
     local health_result
-    if health_result=$(AV_CDP_PORT="$mock_port" node "${BROWSER_DIR}/cdp-client.js" health 2>&1); then
+    if health_result=$(timeout 15s env AV_CDP_PORT="$mock_port" node "${BROWSER_DIR}/cdp-client.js" health 2>&1); then
         if echo "$health_result" | jq -e '.connected == true' &>/dev/null; then
             log_pass "CDP client health check against mock succeeded"
         else
@@ -149,7 +153,7 @@ test_cdp_client_against_mock() {
 
     # Test evaluate
     local eval_result
-    if eval_result=$(AV_CDP_PORT="$mock_port" node "${BROWSER_DIR}/cdp-client.js" evaluate "true" 2>&1); then
+    if eval_result=$(timeout 15s env AV_CDP_PORT="$mock_port" node "${BROWSER_DIR}/cdp-client.js" evaluate "true" 2>&1); then
         if echo "$eval_result" | jq -e '.value == true' &>/dev/null; then
             log_pass "CDP client evaluate against mock succeeded"
         else

@@ -46,7 +46,7 @@ av_run_fault_rust_category() {
         fi
 
         local test_log="${log_file}.one"
-        timeout "${timeout_secs}s" cargo test --all-features -p "$crate" \
+        timeout --kill-after=15s "${timeout_secs}s" cargo test --all-features -p "$crate" \
             --bin passless "$full_name" -- --exact --test-threads=1 \
             > "$test_log" 2>&1 || exit_code=$?
         cat "$test_log" >> "$log_file"

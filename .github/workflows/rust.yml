@@ -54,6 +54,7 @@ jobs:
   agent-validation:
     name: Agent validation (deterministic)
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7

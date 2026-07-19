@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+set -x
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT_DIR"
@@ -21,6 +22,7 @@ for required_tool in dbus-daemon gpg jq node pass shellcheck swtpm; do
     fi
 done
 
+echo "=== Phase 1: shellcheck ===" >&2
 shellcheck -S warning \
     tools/agent-validation/run.sh \
     tools/agent-validation/validate \
@@ -43,31 +45,47 @@ shell_tests=(
     tools/agent-validation/tests/test-secret-scanning.sh
 )
 
+echo "=== Phase 2: shell tests ===" >&2
 for test_script in "${shell_tests[@]}"; do
-    bash "$test_script"
+    echo "--- Running: $test_script ---" >&2
+    timeout 300s bash "$test_script"
 done
 
-cargo test --all-features -- \
+echo "=== Phase 3: cargo test (parallel) ===" >&2
+timeout 600s cargo test --all-features -- \
     --skip agent::prompt::dbus_tests \
     --skip ceremony_observer \
     --skip agent::storage_factory::tests::composition_conformance \
     --skip agent::browser::tests::test_cdp_pipes_drop_closes_fds \
     --skip agent::browser::tests::test_child_in_separate_process_group \
-    --skip agent::browser::tests::test_no_fd_leakage_to_child
-cargo test -p agent-principal-probe
-cargo test --all-features -p passless-rs --bin passless \
+    --skip agent::browser::tests::test_no_fd_leakage_to_child \
+    --skip agent::browser::tests::test_concurrent_launch_and_revoke
+
+echo "=== Phase 4: cargo test (agent-principal-probe) ===" >&2
+timeout 300s cargo test -p agent-principal-probe
+
+echo "=== Phase 5: cargo test (dbus, single-threaded) ===" >&2
+timeout 300s cargo test --all-features -p passless-rs --bin passless \
     agent::prompt::dbus_tests -- --test-threads=1
-cargo test --all-features -p passless-rs --bin passless \
+
+echo "=== Phase 6: cargo test (ceremony_observer, single-threaded) ===" >&2
+timeout 300s cargo test --all-features -p passless-rs --bin passless \
     ceremony_observer -- --test-threads=1
-cargo test --all-features -p passless-rs --bin passless \
+
+echo "=== Phase 7: cargo test (composition_conformance, single-threaded) ===" >&2
+timeout 600s cargo test --all-features -p passless-rs --bin passless \
     agent::storage_factory::tests::composition_conformance -- \
     --include-ignored --test-threads=1
-cargo test --all-features -p passless-rs --bin passless \
+
+echo "=== Phase 8: cargo test (browser FD tests, single-threaded) ===" >&2
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_cdp_pipes_drop_closes_fds -- --test-threads=1
-cargo test --all-features -p passless-rs --bin passless \
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_child_in_separate_process_group -- --test-threads=1
-cargo test --all-features -p passless-rs --bin passless \
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_no_fd_leakage_to_child -- --test-threads=1
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
+    agent::browser::tests::test_concurrent_launch_and_revoke -- --test-threads=1
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/passless-agent-validation.XXXXXX")
 trap 'rm -rf -- "$tmp_dir"' EXIT
@@ -88,5 +106,10 @@ source tools/agent-validation/lib/secret-scanning.sh
 # shellcheck source=tools/agent-validation/stages/secret-scanning.sh
 source tools/agent-validation/stages/secret-scanning.sh
 
+echo "=== Phase 9: fault injection ===" >&2
 stage_fault_injection
+
+echo "=== Phase 10: secret scanning ===" >&2
 stage_secret_scanning
+
+echo "=== All phases completed ===" >&2

@@ -139,7 +139,7 @@ stage_secret_scanning() {
             local crate="${spec%%|*}"
             local test_path="${spec#*|}"
             local one_log="${temp_root}/redaction-test.log"
-            timeout 180s cargo test --all-features -p "$crate" --bin passless \
+            timeout --kill-after=15s 180s cargo test --all-features -p "$crate" --bin passless \
                 "$test_path" -- --exact --test-threads=1 > "$one_log" 2>&1 || redaction_rc=$?
             cat "$one_log" >> "$redaction_log"
             if [[ $redaction_rc -ne 0 ]] \

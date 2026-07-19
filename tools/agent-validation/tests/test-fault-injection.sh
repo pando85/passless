@@ -24,7 +24,10 @@ log_pass() { echo -e "${GREEN}[PASS]${NC} $*" >&2; ((PASS_COUNT++)) || true; ((T
 log_fail() { echo -e "${RED}[FAIL]${NC} $*" >&2; ((FAIL_COUNT++)) || true; ((TEST_COUNT++)) || true; }
 log_test() { echo -e "${BLUE}[TEST]${NC} $*" >&2; }
 
-cleanup() { rm -rf "$TEST_TMP_DIR" 2>/dev/null || true; }
+cleanup() {
+    pkill -P $$ 'sleep' 2>/dev/null || true
+    rm -rf "$TEST_TMP_DIR" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 mkdir -p "$TEST_TMP_DIR"
