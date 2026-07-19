@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 
 const RP_ID: &str = "example.com";
 const ORIGIN: &str = "https://example.com";
+const CMD_PASSLESS_RESET_UV_RETRIES: u8 = 0x42;
+const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
 
 /// Helper to connect to the first available authenticator
 fn connect_to_authenticator() -> Result<soft_fido2::Transport, Box<dyn std::error::Error>> {
@@ -166,6 +168,38 @@ fn test_client_info() {
                 assert!(!versions.is_empty(), "No versions");
             }
         }
+
+        let mut saw_options = false;
+        for (k, v) in &map {
+            if let Value::Integer(key) = k
+                && *key == 4.into()
+                && let Value::Map(options) = v
+            {
+                saw_options = true;
+
+                let option_bool = |option_name: &str| {
+                    options.iter().find_map(|(option_key, option_value)| {
+                        if let Value::Text(name) = option_key
+                            && name == option_name
+                            && let Value::Bool(value) = option_value
+                        {
+                            return Some(*value);
+                        }
+
+                        None
+                    })
+                };
+
+                assert_eq!(option_bool("rk"), Some(true));
+                assert_eq!(option_bool("up"), Some(true));
+                assert_eq!(option_bool("plat"), Some(true));
+                assert_eq!(option_bool("uv"), Some(true));
+                assert_eq!(option_bool("clientPin"), Some(false));
+                assert_eq!(option_bool("alwaysUv"), Some(true));
+            }
+        }
+
+        assert!(saw_options, "getInfo response should include options");
     } else {
         panic!("Expected CBOR map");
     }
@@ -787,6 +821,94 @@ fn get_uv_token_with_pin(
         None,
     )?;
     Ok(token)
+}
+
+fn get_uv_retries(transport: &mut soft_fido2::Transport) -> Result<u8, Box<dyn std::error::Error>> {
+    use soft_fido2_ctap::cbor::MapBuilder;
+
+    let params = MapBuilder::new().insert(0x02, 0x07u8)?.build()?;
+    let response = transport.send_ctap_command(0x06, &params, 30000)?;
+
+    if response.is_empty() {
+        return Err("getUvRetries returned empty response".into());
+    }
+
+    use ciborium::Value;
+    let cbor_value: Value = if response[0] == 0x00 {
+        ciborium::from_reader(&response[1..])?
+    } else {
+        ciborium::from_reader(&response[..])?
+    };
+
+    if let Value::Map(map) = cbor_value {
+        for (key, value) in map {
+            if key == Value::Integer(0x05.into())
+                && let Value::Integer(retries) = value
+            {
+                return u8::try_from(i128::from(retries)).map_err(|_| "invalid uvRetries".into());
+            }
+        }
+    }
+
+    Err("uvRetries missing from response".into())
+}
+
+fn build_authenticated_uv_reset_payload(
+    transport: &mut soft_fido2::Transport,
+    pin: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use soft_fido2_ctap::cbor::MapBuilder;
+
+    let mut encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(transport, soft_fido2::PinProtocol::V2)?;
+    let token = encapsulation.get_pin_uv_auth_token_using_pin_with_permissions(
+        transport, pin, 0x04, // credentialManagement
+        None,
+    )?;
+    let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
+    let pin_uv_auth_param = encapsulation.authenticate(&auth_data, &token)?;
+
+    Ok(MapBuilder::new()
+        .insert(0x01, RESET_UV_RETRIES_SUBCOMMAND)?
+        .insert(0x03, 0x02u8)?
+        .insert_bytes(0x04, &pin_uv_auth_param)?
+        .build()?)
+}
+
+#[test]
+#[ignore]
+fn test_authenticated_uv_retry_reset_command() {
+    println!("\n═══════════════════════════════════════");
+    println!("  TEST: Authenticated UV Retry Reset");
+    println!("═══════════════════════════════════════\n");
+
+    let mut harness = AuthenticatorHarness::with_local().expect("Failed to create harness");
+    harness.start().expect("Failed to start authenticator");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut transport = connect_to_authenticator().expect("Failed to connect");
+    set_pin(&mut transport, "1234").expect("Failed to set PIN");
+
+    let unauthenticated = transport.send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &[], 30000);
+    if let Ok(response) = unauthenticated {
+        assert_ne!(response, vec![0x00, 0xa0]);
+    }
+
+    let payload = build_authenticated_uv_reset_payload(&mut transport, "1234")
+        .expect("Failed to build authenticated reset payload");
+    let authenticated = transport
+        .send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &payload, 30000)
+        .expect("Failed to send authenticated reset command");
+    assert_eq!(authenticated, vec![0xa1, 0x01, 0x08]);
+    // NOTE: soft-fido2 hardcodes MAX_UV_RETRIES=3 internally, ignoring the configured
+    // max_uv_retries=8. The reset command reports 8 in the response, but the actual
+    // counter is reset to 3. See: https://github.com/pando85/soft-fido2/issues/121
+    assert_eq!(
+        get_uv_retries(&mut transport).expect("Failed to get UV retries"),
+        3
+    );
+
+    harness.stop();
 }
 
 #[test]

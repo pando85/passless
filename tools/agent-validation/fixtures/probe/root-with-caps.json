@@ -1,0 +1,22 @@
+{
+    "pid": 99999,
+    "ppid": 1,
+    "start_time": "999",
+    "uid": 0,
+    "gid": 0,
+    "supplementary_gids": [0],
+    "namespaces": {
+        "pid": 4026531836,
+        "mnt": 4026531840
+    },
+    "cgroup_v2_path": "/",
+    "no_new_privs": false,
+    "cap_env_names": ["PASSLESS_CAP_ADMIN", "PASSLESS_PRIVILEGED_DAEMON"],
+    "fd3": {
+        "present": true,
+        "fd_type": "socket",
+        "peer_uid": 0,
+        "peer_gid": 0
+    },
+    "resources": []
+}

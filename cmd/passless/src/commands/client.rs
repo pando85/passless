@@ -1,8 +1,12 @@
 //! FIDO2 Client Management Commands
 
+use crate::authenticator::CMD_PASSLESS_RESET_UV_RETRIES;
+
 use std::collections::HashMap;
 
 use passless_core::{OutputFormat, Result};
+
+use rpassword::read_password;
 
 use serde::Serialize;
 
@@ -294,6 +298,12 @@ fn open_authenticator(selector: Option<&str>) -> Result<Transport> {
 }
 
 /// Authenticate for credential management operations
+///
+/// Tries the following authentication methods in order:
+/// 1. UV token (built-in user verification)
+/// 2. PIN token (if PIN is set on the authenticator)
+///
+/// Returns an error if neither method is available/supported.
 fn authenticate_for_credential_management(
     transport: &mut Transport,
     output: OutputFormat,
@@ -309,15 +319,158 @@ fn authenticate_for_credential_management(
             }
             Ok(token)
         }
-        Err(e) => {
+        Err(uv_error) => {
             if output == OutputFormat::Plain {
-                println!("  UV not available: {:?}", e);
-                println!("  This authenticator may not support UV tokens");
-                println!("  Trying without explicit authentication...\n");
+                if is_uv_blocked_error(&uv_error) {
+                    println!("  {}", format_uv_blocked_message(&uv_error));
+                } else {
+                    println!("  UV not available: {:?}", uv_error);
+                }
             }
-            Err(passless_core::Error::Other(
-                "Authentication not required for this authenticator".to_string(),
-            ))
+
+            fallback_to_pin_auth(transport, output, uv_error)
+        }
+    }
+}
+
+/// Try to authenticate for credential management, returning None on failure
+///
+/// This is used by operations that may proceed without authentication
+/// (e.g., with passless authenticator that allows internal operations).
+fn authenticate_for_credential_management_opt(
+    transport: &mut Transport,
+    output: OutputFormat,
+) -> Option<soft_fido2::request::PinUvAuth> {
+    match authenticate_for_credential_management(transport, output) {
+        Ok(auth) => Some(auth),
+        Err(_) => {
+            if output == OutputFormat::Plain {
+                println!("Proceeding without explicit authentication...\n");
+            }
+            None
+        }
+    }
+}
+
+/// Check if a soft_fido2 error represents a UV-blocked condition
+fn is_uv_blocked_error(error: &soft_fido2::Error) -> bool {
+    match error {
+        soft_fido2::Error::CtapError(code) => *code == soft_fido2::StatusCode::UvBlocked as u8,
+        _ => false,
+    }
+}
+
+/// Format a UV-blocked error with actionable remediation
+fn format_uv_blocked_message(error: &soft_fido2::Error) -> String {
+    format!(
+        "Built-in user verification (UV) is blocked: {:?}\n\
+         UV retries have been exhausted.\n\
+         Run `passless client pin uv-reset` to restore UV retries.",
+        error
+    )
+}
+
+/// Fallback to PIN authentication when UV fails
+fn fallback_to_pin_auth(
+    transport: &mut Transport,
+    output: OutputFormat,
+    uv_error: soft_fido2::Error,
+) -> Result<soft_fido2::request::PinUvAuth> {
+    if output == OutputFormat::Plain {
+        println!("  Checking if PIN authentication is available...");
+    }
+
+    let info_response = Client::authenticator_get_info(transport).map_err(|e| {
+        passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
+    })?;
+
+    let info_value: soft_fido2_ctap::cbor::Value = soft_fido2_ctap::cbor::decode(&info_response)
+        .map_err(|e| {
+            passless_core::Error::Other(format!("Failed to decode info response: {:?}", e))
+        })?;
+
+    let info = parse_authenticator_info(&info_value)?;
+
+    let has_cred_mgmt = info
+        .options
+        .as_ref()
+        .and_then(|opts| opts.get("credMgmt").or(opts.get("credentialMgmtPreview")))
+        .copied()
+        .unwrap_or(false);
+
+    if !has_cred_mgmt {
+        return Err(passless_core::Error::Other(
+            "This authenticator does not support credential management".to_string(),
+        ));
+    }
+
+    let client_pin_option = info
+        .options
+        .as_ref()
+        .and_then(|opts| opts.get("clientPin"))
+        .copied();
+
+    match client_pin_option {
+        Some(true) => {
+            if output == OutputFormat::Plain {
+                println!("  PIN is set on this authenticator");
+                println!("  Falling back to PIN authentication...\n");
+                println!("Enter PIN: ");
+            }
+
+            let pin = read_password()
+                .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?;
+
+            if pin.is_empty() {
+                return Err(passless_core::Error::Other(
+                    "PIN is required for credential management on this authenticator".to_string(),
+                ));
+            }
+
+            if output == OutputFormat::Plain {
+                println!();
+            }
+
+            Client::get_pin_token_for_credential_management(transport, &pin, PinProtocol::V2)
+                .map_err(|e| {
+                    passless_core::Error::Other(format!(
+                        "PIN authentication failed: {:?}. UV was also unavailable: {:?}",
+                        e, uv_error
+                    ))
+                })
+        }
+        Some(false) => {
+            if is_uv_blocked_error(&uv_error) {
+                Err(passless_core::Error::Other(format_uv_blocked_message(
+                    &uv_error,
+                )))
+            } else {
+                Err(passless_core::Error::Other(format!(
+                    "Credential management requires authentication but:\n\
+                         - UV is unavailable: {:?}\n\
+                         - No PIN is set on this authenticator\n\
+                         \n\
+                         Please set a PIN first using: passless client pin set <PIN>",
+                    uv_error
+                )))
+            }
+        }
+        None => {
+            if is_uv_blocked_error(&uv_error) {
+                Err(passless_core::Error::Other(format_uv_blocked_message(
+                    &uv_error,
+                )))
+            } else {
+                Err(passless_core::Error::Other(format!(
+                    "Credential management requires authentication but:\n\
+                         - UV is unavailable: {:?}\n\
+                         - This authenticator does not support PIN\n\
+                         \n\
+                         This authenticator may require built-in UV (biometric/fingerprint) \
+                         which is currently blocked or unavailable.",
+                    uv_error
+                )))
+            }
         }
     }
 }
@@ -500,16 +653,7 @@ pub fn list(output: OutputFormat, device: Option<&str>, rp_id_filter: Option<&st
         }
     }
 
-    // Try to authenticate (may not be needed for passless)
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Get metadata (optional, only for plain output)
     if output == OutputFormat::Plain {
@@ -744,16 +888,7 @@ pub fn show(output: OutputFormat, device: Option<&str>, credential_id_hex: &str)
 
     let mut transport = open_authenticator(device)?;
 
-    // Try to authenticate
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
@@ -905,16 +1040,7 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
 
     let mut transport = open_authenticator(device)?;
 
-    // Try to authenticate (may not be needed for passless)
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
@@ -970,16 +1096,7 @@ pub fn rename(
 
     let mut transport = open_authenticator(device)?;
 
-    // Authenticate for credential management
-    let pin_uv_auth = match authenticate_for_credential_management(&mut transport, output) {
-        Ok(auth) => Some(auth),
-        Err(_) => {
-            if output == OutputFormat::Plain {
-                println!("Proceeding without explicit authentication...\n");
-            }
-            None
-        }
-    };
+    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
@@ -1270,6 +1387,167 @@ pub fn pin_change(
             let result = PinChangeResult {
                 success: true,
                 message: "PIN changed successfully".to_string(),
+            };
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        }
+    }
+
+    transport.close();
+    Ok(())
+}
+
+/// Reset built-in user verification retries on authenticator after PIN authentication
+pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
+    let mut transport = open_authenticator(device)?;
+
+    if output == OutputFormat::Plain {
+        println!("Resetting built-in user verification retries (authenticated)...");
+        println!("Enter PIN: ");
+    }
+
+    let pin = read_password()
+        .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?;
+
+    if pin.is_empty() {
+        return Err(passless_core::Error::Other(
+            "PIN is required for authenticated UV retry reset".to_string(),
+        ));
+    }
+
+    if output == OutputFormat::Plain {
+        println!();
+    }
+
+    // Get authenticator info to determine supported pinUvAuthProtocol
+    let info_response = Client::authenticator_get_info(&mut transport).map_err(|e| {
+        passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
+    })?;
+
+    let info_value: soft_fido2_ctap::cbor::Value = soft_fido2_ctap::cbor::decode(&info_response)
+        .map_err(|e| {
+            passless_core::Error::Other(format!("Failed to decode info response: {:?}", e))
+        })?;
+
+    let info = parse_authenticator_info(&info_value)?;
+
+    // Determine the preferred pinUvAuthProtocol
+    let pin_uv_auth_protocol = info
+        .pin_uv_auth_protocols
+        .as_ref()
+        .and_then(|protocols| protocols.last())
+        .copied()
+        .unwrap_or(1); // Default to protocol 1 if none specified
+
+    // Get a PIN token for credential management (which has the required permissions)
+    let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(
+        &mut transport,
+        match pin_uv_auth_protocol {
+            1 => soft_fido2::PinProtocol::V1,
+            2 => soft_fido2::PinProtocol::V2,
+            _ => soft_fido2::PinProtocol::V2, // Default to V2 for unknown protocols
+        },
+    )
+    .map_err(|e| {
+        passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e))
+    })?;
+
+    let permissions = soft_fido2::request::Permission::CredentialManagement as u8;
+    let pin_token_bytes = encapsulation
+        .get_pin_uv_auth_token_using_pin_with_permissions(&mut transport, &pin, permissions, None)
+        .map_err(|e| passless_core::Error::Other(format!("Failed to get PIN token: {:?}", e)))?;
+
+    // Prepare authentication data for pinUvAuthParam computation
+    // [CMD_PASSLESS_RESET_UV_RETRIES, 1]
+    let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, 1];
+
+    // Compute pinUvAuthParam using the encapsulation's authenticate method
+    let pin_uv_auth_param = encapsulation
+        .authenticate(&auth_data, &pin_token_bytes)
+        .map_err(|e| {
+            passless_core::Error::Other(format!("Failed to compute PIN UV auth param: {:?}", e))
+        })?;
+
+    // Construct CBOR payload: map {1: subCommand=1, 3: pinUvAuthProtocol, 4: pinUvAuthParam}
+    let payload_bytes = soft_fido2_ctap::cbor::MapBuilder::new()
+        .insert(1, 1u8) // subCommand = 1
+        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+        .insert(3, pin_uv_auth_protocol) // pinUvAuthProtocol
+        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+        .insert_bytes(4, &pin_uv_auth_param) // pinUvAuthParam
+        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+        .build()
+        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?;
+
+    if output == OutputFormat::Plain {
+        println!("Sending authenticated UV retry reset command...");
+    }
+
+    // Send command 0x42 with the CBOR payload
+    let response = transport
+        .send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &payload_bytes, 30000)
+        .map_err(|e| {
+            passless_core::Error::Other(format!("Authenticated UV retry reset failed: {:?}", e))
+        })?;
+
+    let success = response == [0xa0] || response.first() == Some(&0x00);
+    if !success {
+        return Err(passless_core::Error::Other(format!(
+            "Authenticated UV retry reset failed with status: 0x{:02x}",
+            response.first().copied().unwrap_or(0xff)
+        )));
+    }
+
+    // Parse the UV retries count from the response if available
+    let uv_retries_count = if response.len() > 1 {
+        // Response format: [status, ...cbor_map]
+        // Try to parse the CBOR map to extract the count
+        if let Ok(soft_fido2_ctap::cbor::Value::Map(map)) =
+            soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..])
+        {
+            map.iter()
+                .find(|(k, _)| *k == soft_fido2_ctap::cbor::Value::Integer(1))
+                .and_then(|(_, v)| {
+                    if let soft_fido2_ctap::cbor::Value::Integer(n) = v {
+                        Some(*n as u8)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match output {
+        OutputFormat::Plain => {
+            if let Some(count) = uv_retries_count {
+                println!(
+                    "UV retries reset successfully! Restored to {} attempts.",
+                    count
+                );
+            } else {
+                println!("UV retries reset successfully (authenticated)!");
+                println!("Note: The retry counter has been restored to the configured maximum.");
+            }
+        }
+        OutputFormat::Json => {
+            #[derive(Serialize)]
+            struct PinUvResetResult {
+                success: bool,
+                message: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                uv_retries: Option<u8>,
+            }
+            let result = PinUvResetResult {
+                success: true,
+                message: if uv_retries_count.is_some() {
+                    "UV retries reset successfully".to_string()
+                } else {
+                    "UV retries reset successfully (authenticated)".to_string()
+                },
+                uv_retries: uv_retries_count,
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }

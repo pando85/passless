@@ -12,7 +12,8 @@ jobs:
       - name: Checkout repository
         with:
           token: ${{ secrets.PAT }}
-        uses: actions/checkout@v6
+          fetch-depth: 0
+        uses: actions/checkout@v7
 
       - name: Get last changelog version
         id: changelog_reader

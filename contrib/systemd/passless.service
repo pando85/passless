@@ -6,6 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:%h/.cargo/bin:%h/.local/bin
 ExecStart=passless
 Restart=on-failure
 RestartSec=5s

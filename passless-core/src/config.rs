@@ -5,11 +5,11 @@
 //! 2. Configuration file (medium priority)
 //! 3. Default values (lowest priority)
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_serde_derive::ClapSerde;
 use libc::{PR_SET_DUMPABLE, prctl};
 use libc::{mlock, munlock};
@@ -17,6 +17,11 @@ use log::debug;
 use nix::sys::resource::{Resource, setrlimit};
 use passless_config_doc::ConfigDoc;
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "agent")]
+use crate::agent::AgentConfig;
+
+use crate::error::Error;
 
 /// Compute default local storage path
 pub fn local_path() -> String {
@@ -271,6 +276,20 @@ pub struct PinConfig {
     #[default(8)]
     pub max_retries: u8,
 
+    /// Maximum user verification retry attempts before UV is blocked (default: 8)
+    ///
+    /// This controls how many consecutive UV failures are allowed before UV is blocked.
+    /// Use `passless client pin uv-reset` to restore the retry counter after authentication.
+    /// Higher values improve usability but may reduce security against brute-force attacks.
+    #[arg(
+        long = "pin-max-uv-retries",
+        env = "PASSLESS_PIN_MAX_UV_RETRIES",
+        value_name = "RETRIES"
+    )]
+    #[serde(default)]
+    #[default(8)]
+    pub max_uv_retries: u8,
+
     /// Auto-lock timeout in seconds after max failed attempts (0 = disabled)
     /// After lockout, authenticator must be reset to use PIN again
     #[arg(
@@ -281,6 +300,29 @@ pub struct PinConfig {
     #[serde(default)]
     #[default(0)]
     pub auto_lock_timeout: u32,
+}
+
+impl PinConfig {
+    /// Validate PIN configuration values
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.min_length < 4 || self.min_length > 63 {
+            return Err(crate::error::Error::Config(format!(
+                "pin.min_length must be between 4 and 63, got {}",
+                self.min_length
+            )));
+        }
+        if self.max_retries == 0 {
+            return Err(crate::error::Error::Config(
+                "pin.max_retries must be greater than 0".to_string(),
+            ));
+        }
+        if self.max_uv_retries == 0 {
+            return Err(crate::error::Error::Config(
+                "pin.max_uv_retries must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl SecurityConfig {
@@ -384,6 +426,11 @@ pub struct AppConfig {
     #[serde(default)]
     #[command(flatten)]
     pub pin: PinConfig,
+
+    /// Agent configuration (only available with the `agent` feature)
+    #[cfg(feature = "agent")]
+    #[arg(skip)]
+    pub agents: AgentConfig,
 }
 
 /// Backend-specific configuration
@@ -404,10 +451,76 @@ pub enum BackendConfig {
     },
 }
 
+impl BackendConfig {
+    /// Canonicalize a path, resolving symlinks for existing parents.
+    ///
+    /// If the full path does not exist, canonicalize the longest existing
+    /// prefix and append the remaining components lexically.
+    pub fn canonicalize_path(path: &Path) -> PathBuf {
+        match fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => {
+                let mut current = path.to_path_buf();
+                let mut suffix = Vec::new();
+                loop {
+                    match fs::canonicalize(&current) {
+                        Ok(base) => {
+                            let mut result = base;
+                            for component in suffix.iter().rev() {
+                                result.push(component);
+                            }
+                            return result;
+                        }
+                        Err(_) => {
+                            if let Some(file_name) = current.file_name() {
+                                suffix.push(file_name.to_os_string());
+                                current = current
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_default();
+                            } else {
+                                return path.to_path_buf();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the canonical state path for this backend.
+    ///
+    /// This is used as the identity for the instance lock: two daemons with the
+    /// same canonical state path will contend for the same lock.
+    pub fn state_path(&self) -> PathBuf {
+        match self {
+            BackendConfig::Local { path } => Self::canonicalize_path(Path::new(path)),
+            BackendConfig::Pass {
+                store_path, path, ..
+            } => Self::canonicalize_path(&Path::new(store_path).join(path)),
+            #[cfg(feature = "tpm")]
+            BackendConfig::Tpm { path, .. } => Self::canonicalize_path(Path::new(path)),
+        }
+    }
+
+    /// Return a human-readable display string for the backend state path.
+    pub fn state_display(&self) -> String {
+        match self {
+            BackendConfig::Local { path } => path.clone(),
+            BackendConfig::Pass {
+                store_path, path, ..
+            } => {
+                format!("{}/{}", store_path, path)
+            }
+            #[cfg(feature = "tpm")]
+            BackendConfig::Tpm { path, .. } => path.clone(),
+        }
+    }
+}
+
 impl AppConfig {
     /// Load configuration with precedence: CLI > config file > defaults
-    pub fn load(args: &mut Args) -> Self {
-        // Try to load config file
+    pub fn load(args: &mut Args) -> crate::error::Result<Self> {
         let default_config_path = dirs::config_dir().map(|p| p.join("passless/config.toml"));
 
         let config_file_path = args
@@ -421,17 +534,58 @@ impl AppConfig {
         {
             log::info!("Loading configuration from: {}", path.display());
             let content = std::io::read_to_string(BufReader::new(f)).unwrap_or_default();
+
+            #[cfg(feature = "agent")]
+            let agent_config = {
+                match toml::from_str::<toml::Table>(&content) {
+                    Ok(table) => match table.get("agents") {
+                        Some(agents_value) => serde::Deserialize::deserialize(agents_value.clone())
+                            .map_err(|e| {
+                                Error::Config(format!(
+                                    "failed to parse [agents] section in {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?,
+                        None => AgentConfig::default(),
+                    },
+                    Err(e) => {
+                        return Err(Error::Config(format!(
+                            "failed to parse config file {} as TOML: {}",
+                            path.display(),
+                            e
+                        )));
+                    }
+                }
+            };
+
             match toml::from_str::<<AppConfig as ClapSerde>::Opt>(&content) {
                 Ok(file_config) => {
-                    // Deserialize into Opt, then convert with defaults and merge CLI args
-                    return AppConfig::from(file_config).merge(&mut args.config);
+                    #[allow(unused_mut)]
+                    let mut config = AppConfig::from(file_config).merge(&mut args.config);
+                    #[cfg(feature = "agent")]
+                    {
+                        config.agents = agent_config;
+                    }
+                    return Ok(config);
                 }
-                Err(e) => log::warn!("Failed to parse config file {}: {}", path.display(), e),
+                Err(e) => {
+                    return Err(Error::Config(format!(
+                        "failed to parse config file {}: {}",
+                        path.display(),
+                        e
+                    )));
+                }
             }
         }
 
-        // No config file or parse failed - use CLI args + defaults
-        AppConfig::from(&mut args.config)
+        #[allow(unused_mut)]
+        let mut config = AppConfig::from(&mut args.config);
+        #[cfg(feature = "agent")]
+        {
+            config.agents = AgentConfig::default();
+        }
+        Ok(config)
     }
 
     /// Get the backend configuration based on the backend_type
@@ -470,6 +624,17 @@ impl AppConfig {
     /// Get PIN configuration
     pub fn pin_config(&self) -> PinConfig {
         self.pin.clone()
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> crate::error::Result<()> {
+        self.pin.validate()?;
+        #[cfg(feature = "agent")]
+        {
+            let human_path = self.backend().ok().map(|b| b.state_path());
+            self.agents.validate(human_path.as_deref())?;
+        }
+        Ok(())
     }
 }
 
@@ -554,6 +719,42 @@ pub enum Commands {
         #[command(subcommand)]
         action: ClientAction,
     },
+    /// Agent administration commands
+    #[cfg(feature = "agent")]
+    AgentAdmin {
+        /// Output format: json (default) or plain
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FORMAT",
+            default_value = "json",
+            global = true
+        )]
+        output: OutputFormat,
+
+        #[command(subcommand)]
+        action: AgentAdminAction,
+    },
+    /// Agent principal and session commands
+    #[cfg(feature = "agent")]
+    Agent {
+        /// Profile to use for principal commands
+        #[arg(long, value_name = "PROFILE", global = true)]
+        profile: Option<String>,
+
+        /// Output format: json (default) or plain
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FORMAT",
+            default_value = "json",
+            global = true
+        )]
+        output: OutputFormat,
+
+        #[command(subcommand)]
+        action: crate::AgentCommand,
+    },
 }
 
 /// Configuration actions
@@ -561,6 +762,249 @@ pub enum Commands {
 pub enum ConfigAction {
     /// Print the default configuration in TOML format
     Print,
+}
+
+/// Agent administration actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentAdminAction {
+    /// Install the Passless skill for a supported coding agent
+    Install {
+        /// Agent to install for; auto installs to every detected agent
+        #[arg(value_enum, default_value_t = AgentSkillTarget::Auto)]
+        target: AgentSkillTarget,
+
+        /// Install for the current user or the current Git worktree
+        #[arg(long, value_enum, default_value_t = AgentSkillScope::User)]
+        scope: AgentSkillScope,
+
+        /// Replace a different existing file at the skill target
+        #[arg(long)]
+        force: bool,
+    },
+    /// Profile management
+    Profile {
+        #[command(subcommand)]
+        action: AdminProfileAction,
+    },
+    /// Policy management
+    Policy {
+        #[command(subcommand)]
+        action: AdminPolicyAction,
+    },
+    /// Credential management
+    Credential {
+        #[command(subcommand)]
+        action: AdminCredentialAction,
+    },
+    /// Delegation management
+    Delegation {
+        #[command(subcommand)]
+        action: AdminDelegationAction,
+    },
+    /// Session management
+    Session {
+        #[command(subcommand)]
+        action: AdminSessionAction,
+    },
+    /// Audit log management
+    Audit {
+        #[command(subcommand)]
+        action: AdminAuditAction,
+    },
+    /// Shut down the running daemon
+    #[command(hide = true)]
+    Shutdown {
+        /// Confirm the shutdown
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Admin profile actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminProfileAction {
+    /// Check if a profile exists and is valid
+    Check {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// Show profile details
+    Show {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// List all configured profiles
+    List,
+    /// Enable a profile
+    Enable {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// Disable a profile
+    Disable {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+}
+
+/// Admin policy actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminPolicyAction {
+    /// Check policy validity for a profile
+    Check {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// Reload policy for a profile
+    Reload {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// Show current policy for a profile
+    Show {
+        /// Profile identifier
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+}
+
+/// Admin credential actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminCredentialAction {
+    /// List credentials
+    List {
+        /// Filter by relying party ID
+        #[arg(short = 'd', long = "domain", value_name = "DOMAIN")]
+        rp_id: Option<String>,
+    },
+    /// Show credential details
+    Show {
+        /// Credential reference (hex)
+        #[arg(value_name = "CREDENTIAL_REF")]
+        credential_ref: String,
+    },
+    /// Revoke a credential
+    Revoke {
+        /// Credential reference (hex)
+        #[arg(value_name = "CREDENTIAL_REF")]
+        credential_ref: String,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Delete a credential
+    Delete {
+        /// Credential reference (hex)
+        #[arg(value_name = "CREDENTIAL_REF")]
+        credential_ref: String,
+        /// Confirm the deletion
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Admin delegation actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminDelegationAction {
+    /// Show delegation details
+    Show {
+        /// Grant identifier (hex)
+        #[arg(value_name = "GRANT_ID")]
+        grant_id: String,
+    },
+    /// List all delegations
+    List {
+        /// Filter by profile
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Revoke a delegation
+    Revoke {
+        /// Grant identifier (hex)
+        #[arg(value_name = "GRANT_ID")]
+        grant_id: String,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Admin session actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminSessionAction {
+    /// Show session details
+    Show {
+        /// Session identifier (hex)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+    },
+    /// List all sessions
+    List {
+        /// Filter by profile
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Revoke a session
+    Revoke {
+        /// Session identifier (hex)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Admin audit actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminAuditAction {
+    /// Show audit subsystem status
+    Status,
+    /// Verify audit log integrity
+    Verify,
+    /// Export audit log entries
+    Export {
+        /// Export format
+        #[arg(long, value_enum, default_value_t = AdminAuditExportFormat::Json)]
+        format: AdminAuditExportFormat,
+    },
+}
+
+/// Audit export format for CLI
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuditExportFormat {
+    Json,
+    Csv,
+}
+
+/// Supported coding-agent skill targets
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSkillTarget {
+    Auto,
+    Opencode,
+    Claude,
+    Pi,
+}
+
+/// Skill installation scope
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSkillScope {
+    User,
+    Project,
 }
 
 /// Client actions for FIDO2 authenticator management
@@ -631,4 +1075,662 @@ pub enum PinAction {
         #[arg(value_name = "NEW_PIN")]
         new_pin: String,
     },
+    /// Reset built-in user verification retries without deleting credentials
+    UvReset,
+}
+
+/// Agent principal and session commands
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentCommand {
+    /// Run health diagnostics
+    Doctor,
+    /// Show principal capabilities
+    Capabilities,
+    /// Show principal instructions
+    Instructions,
+    /// Intent management
+    Intent {
+        #[command(subcommand)]
+        action: AgentIntentAction,
+    },
+    /// Delegation management
+    Delegation {
+        #[command(subcommand)]
+        action: AgentDelegationAction,
+    },
+    /// Credential queries
+    Credential {
+        #[command(subcommand)]
+        action: AgentCredentialAction,
+    },
+    /// Show browser bridge status
+    BrowserStatus,
+    /// Show endpoint status
+    EndpointStatus,
+    /// Send a CDP command to the managed browser session
+    ///
+    /// WARNING: This is the full browser-session authority interface.
+    /// CDP commands can access cookies, DOM, network state, and session data.
+    /// Output may contain CDP response data — do not mix with credential/admin output.
+    BrowserControl {
+        /// CDP request as JSON (e.g. '{"id":1,"method":"Page.navigate","params":{"url":"https://example.com"}}')
+        #[arg(long, value_name = "JSON", conflicts_with = "request_file")]
+        request: Option<String>,
+        /// Path to file containing CDP request JSON (owner/symlink/size checked)
+        #[arg(long, value_name = "PATH", conflicts_with = "request")]
+        request_file: Option<std::path::PathBuf>,
+        /// Timeout in milliseconds (default: 5000, max: 30000)
+        #[arg(long, value_name = "MS", default_value = "5000")]
+        timeout_ms: u32,
+    },
+    /// Launch a detached principal session
+    Run {
+        /// Profile to launch
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Absolute command path and arguments
+        #[arg(last = true, required = true)]
+        command: Vec<std::path::PathBuf>,
+    },
+}
+
+/// Agent intent actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentIntentAction {
+    /// Create a new intent
+    Create {
+        /// Action type
+        #[arg(value_enum)]
+        action: AgentIntentActionType,
+        /// Relying party ID
+        #[arg(long, value_name = "RP_ID")]
+        rp: String,
+        /// Credential reference (hex)
+        #[arg(long, value_name = "CREDENTIAL_REF")]
+        credential: Option<String>,
+        /// Reason for the intent
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
+    /// Show intent status
+    Show {
+        /// Request identifier (hex)
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: String,
+    },
+    /// Wait for intent to reach terminal state
+    Wait {
+        /// Request identifier (hex)
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: String,
+        /// Timeout in seconds
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+        /// Poll interval in milliseconds
+        #[arg(long, value_name = "MS")]
+        poll_interval: Option<u64>,
+    },
+    /// Cancel a pending intent
+    Cancel {
+        /// Request identifier (hex)
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: String,
+    },
+}
+
+/// Intent action type for CLI
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentIntentActionType {
+    Register,
+    Authenticate,
+}
+
+/// Agent delegation actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentDelegationAction {
+    /// Request a new delegation
+    Request {
+        /// Relying party ID
+        #[arg(long, value_name = "RP_ID")]
+        rp: String,
+        /// Credential reference (hex)
+        #[arg(long, value_name = "CREDENTIAL_REF")]
+        credential: String,
+        /// Session TTL in seconds
+        #[arg(long, value_name = "SECONDS")]
+        session_ttl: u64,
+        /// Reason for the delegation
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
+    /// Show delegation status
+    Show {
+        /// Request identifier (hex)
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: String,
+    },
+    /// Wait for delegation to reach terminal state
+    Wait {
+        /// Request identifier (hex)
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: String,
+        /// Timeout in seconds
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+        /// Poll interval in milliseconds
+        #[arg(long, value_name = "MS")]
+        poll_interval: Option<u64>,
+    },
+    /// Cancel a pending delegation
+    Cancel {
+        /// Request identifier (hex)
+        #[arg(value_name = "REQUEST_ID")]
+        request_id: String,
+    },
+}
+
+/// Agent credential actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentCredentialAction {
+    /// List credentials for the profile
+    List,
+    /// Show credential details
+    Show {
+        /// Credential reference (hex)
+        #[arg(value_name = "CREDENTIAL_REF")]
+        credential_ref: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_install_defaults() {
+        let args = Args::try_parse_from(["passless", "agent-admin", "install"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Install {
+                    target: AgentSkillTarget::Auto,
+                    scope: AgentSkillScope::User,
+                    force: false,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_install_explicit_options() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "install",
+            "claude",
+            "--scope",
+            "project",
+            "--force",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Install {
+                    target: AgentSkillTarget::Claude,
+                    scope: AgentSkillScope::Project,
+                    force: true,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_pin_config_default_max_uv_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        assert_eq!(config.max_uv_retries, 8);
+    }
+
+    #[test]
+    fn test_pin_config_validate_success() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pin_config_validate_zero_max_uv_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 8,
+            max_uv_retries: 0,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_uv_retries"));
+    }
+
+    #[test]
+    fn test_pin_config_validate_zero_max_retries() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 4,
+            max_retries: 0,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_retries"));
+    }
+
+    #[test]
+    fn test_pin_config_validate_invalid_min_length() {
+        let config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            min_length: 3,
+            max_retries: 8,
+            max_uv_retries: 8,
+            auto_lock_timeout: 0,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min_length"));
+    }
+
+    #[test]
+    fn test_canonicalize_path_existing() {
+        let dir = std::env::temp_dir();
+        let canonical = BackendConfig::canonicalize_path(&dir);
+        assert!(canonical.is_absolute());
+        assert!(canonical.exists());
+    }
+
+    #[test]
+    fn test_canonicalize_path_nonexistent() {
+        let base = std::env::temp_dir();
+        let nonexistent = base.join("passless_test_nonexistent_dir_12345/sub");
+        let canonical = BackendConfig::canonicalize_path(&nonexistent);
+        assert!(canonical.is_absolute());
+        assert!(canonical.starts_with(BackendConfig::canonicalize_path(&base)));
+    }
+
+    #[test]
+    fn test_canonicalize_path_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let canonical_real = BackendConfig::canonicalize_path(&real);
+        let canonical_link = BackendConfig::canonicalize_path(&link);
+        assert_eq!(canonical_real, canonical_link);
+    }
+
+    #[test]
+    fn test_local_state_path_relative_and_absolute() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let abs_path = std::fs::canonicalize(dir.path()).unwrap();
+        let rel_path = dir.path().to_path_buf();
+
+        let backend_abs = BackendConfig::Local {
+            path: abs_path.display().to_string(),
+        };
+        let backend_rel = BackendConfig::Local {
+            path: rel_path.display().to_string(),
+        };
+        assert_eq!(backend_abs.state_path(), backend_rel.state_path());
+    }
+
+    #[test]
+    fn test_pass_state_path_different_subpaths() {
+        let store = "/tmp/passless_test_store";
+        let backend_a = BackendConfig::Pass {
+            store_path: store.to_string(),
+            path: "fido2".to_string(),
+            gpg_backend: "gnupg-bin".to_string(),
+        };
+        let backend_b = BackendConfig::Pass {
+            store_path: store.to_string(),
+            path: "fido2-other".to_string(),
+            gpg_backend: "gnupg-bin".to_string(),
+        };
+        assert_ne!(backend_a.state_path(), backend_b.state_path());
+    }
+
+    #[test]
+    fn test_different_local_paths_produce_different_identities() {
+        let backend_a = BackendConfig::Local {
+            path: "/tmp/passless_a".to_string(),
+        };
+        let backend_b = BackendConfig::Local {
+            path: "/tmp/passless_b".to_string(),
+        };
+        assert_ne!(backend_a.state_path(), backend_b.state_path());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_profile_list() {
+        let args = Args::try_parse_from(["passless", "agent-admin", "profile", "list"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Profile {
+                    action: AdminProfileAction::List,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_credential_delete_without_confirm() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "credential",
+            "delete",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Credential {
+                    action: AdminCredentialAction::Delete { confirm: false, .. },
+                },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_credential_delete_with_confirm() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "credential",
+            "delete",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "--confirm",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Credential {
+                    action: AdminCredentialAction::Delete { confirm: true, .. },
+                },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_shutdown_hidden() {
+        let args =
+            Args::try_parse_from(["passless", "agent-admin", "shutdown", "--confirm"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Shutdown { confirm: true },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_output_default_json() {
+        let args = Args::try_parse_from(["passless", "agent-admin", "profile", "list"]).unwrap();
+        match args.command {
+            Some(Commands::AgentAdmin { output, .. }) => {
+                assert_eq!(output, OutputFormat::Json);
+            }
+            _ => panic!("expected AgentAdmin command"),
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_output_plain() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "--output",
+            "plain",
+            "profile",
+            "list",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Commands::AgentAdmin { output, .. }) => {
+                assert_eq!(output, OutputFormat::Plain);
+            }
+            _ => panic!("expected AgentAdmin command"),
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_doctor_parses() {
+        let args = Args::try_parse_from(["passless", "agent", "doctor"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Doctor,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_run_with_command() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "run",
+            "--profile",
+            "myprofile",
+            "--",
+            "/usr/bin/test",
+            "arg1",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Commands::Agent {
+                action: AgentCommand::Run { profile, command },
+                ..
+            }) => {
+                assert_eq!(profile, "myprofile");
+                assert_eq!(command.len(), 2);
+            }
+            _ => panic!("expected Agent Run command"),
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_intent_create_parses() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "intent",
+            "create",
+            "register",
+            "--rp",
+            "example.com",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Intent {
+                    action: AgentIntentAction::Create {
+                        action: AgentIntentActionType::Register,
+                        ..
+                    },
+                },
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_output_default_json() {
+        let args = Args::try_parse_from(["passless", "agent", "doctor"]).unwrap();
+        match args.command {
+            Some(Commands::Agent { output, .. }) => {
+                assert_eq!(output, OutputFormat::Json);
+            }
+            _ => panic!("expected Agent command"),
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_shell_completions_contain_agent_commands() {
+        use clap::CommandFactory;
+
+        let cmd = Args::command();
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut cmd.clone(),
+            "passless",
+            &mut buf,
+        );
+        let completion = String::from_utf8(buf).unwrap();
+
+        for expected in [
+            "agent-admin",
+            "agent",
+            "install",
+            "browser-control",
+            "intent",
+            "delegation",
+            "doctor",
+            "capabilities",
+            "instructions",
+        ] {
+            assert!(
+                completion.contains(expected),
+                "bash completion missing '{}'",
+                expected
+            );
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_shell_completions_zsh_contain_agent_commands() {
+        use clap::CommandFactory;
+
+        let cmd = Args::command();
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Zsh,
+            &mut cmd.clone(),
+            "passless",
+            &mut buf,
+        );
+        let completion = String::from_utf8(buf).unwrap();
+
+        for expected in ["agent-admin", "agent", "install", "browser-control"] {
+            assert!(
+                completion.contains(expected),
+                "zsh completion missing '{}'",
+                expected
+            );
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_config_print_includes_agent_fields() {
+        let mut default_args = Args::parse_from(["passless"]);
+        let config = AppConfig::from(&mut default_args.config);
+        let toml_output = config.to_toml_with_comments();
+
+        assert!(
+            toml_output.contains("backend_type"),
+            "config print missing backend_type"
+        );
+        assert!(
+            toml_output.contains("[security]"),
+            "config print missing [security] section"
+        );
+        assert!(
+            toml_output.contains("[pin]"),
+            "config print missing [pin] section"
+        );
+        assert!(
+            toml_output.contains("always_uv"),
+            "config print missing always_uv"
+        );
+        assert!(
+            toml_output.contains("notification_timeout"),
+            "config print missing notification_timeout"
+        );
+    }
+
+    #[test]
+    fn test_config_print_contains_passless_header() {
+        let mut default_args = Args::parse_from(["passless"]);
+        let config = AppConfig::from(&mut default_args.config);
+        let toml_output = config.to_toml_with_comments();
+
+        assert!(toml_output.contains("Passless Configuration File"));
+        assert!(toml_output.contains("~/.config/passless/config.toml"));
+    }
+
+    #[test]
+    fn test_config_print_contains_local_backend_section() {
+        let mut default_args = Args::parse_from(["passless"]);
+        let config = AppConfig::from(&mut default_args.config);
+        let toml_output = config.to_toml_with_comments();
+
+        assert!(toml_output.contains("[local]"));
+        assert!(toml_output.contains("path"));
+    }
+
+    #[test]
+    fn test_config_print_contains_pass_backend_section() {
+        let mut default_args = Args::parse_from(["passless"]);
+        let config = AppConfig::from(&mut default_args.config);
+        let toml_output = config.to_toml_with_comments();
+
+        assert!(toml_output.contains("[pass]"));
+        assert!(toml_output.contains("store_path"));
+        assert!(toml_output.contains("gpg_backend"));
+    }
 }

@@ -38,10 +38,12 @@ accounts or stricter threat models.
 Users should choose the solution that best fits their own security and practicality requirements.
 
 - [Features](#features)
+- [Android](#android)
 - [Configuration](#configuration)
 - [Installation](#installation)
   - [Cargo](#cargo)
   - [Arch Linux](#arch-linux)
+- [Permissions and Hardening](#permissions-and-hardening)
 - [Acknowledgements](#acknowledgements)
 
 ## Features
@@ -56,6 +58,14 @@ Users should choose the solution that best fits their own security and practical
   - Local filesystem (testing only)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
+
+## Android
+
+For passkey support on Android, use
+[Password Store (Passkey Edition)](https://github.com/pando85/Android-Password-Store). It is a
+`pass`-compatible manager that also registers as an Android WebAuthn/passkey Credential Provider,
+and reads from the same git-synced `pass` store used by passless — giving you a unified,
+cross-platform passkey setup.
 
 ## PIN Support
 
@@ -104,8 +114,12 @@ enforcement = "optional"
 # Minimum PIN length (4-63 characters)
 min_length = 4
 
-# Maximum retry attempts before lockout
+# Maximum PIN retry attempts before lockout
 max_retries = 8
+
+# Maximum user verification retry attempts before UV is blocked
+# Use `passless client pin uv-reset` to restore after authentication
+max_uv_retries = 8
 ```
 
 Note: For enhanced security with hardware-backed protection, consider using the TPM backend
@@ -159,6 +173,23 @@ or the binary from AUR:
 ```bash
 yay -S passless-bin
 ```
+
+## Permissions and Hardening
+
+Passless runs as an unprivileged user and requires only regular-user read/write access to
+`/dev/uhid`. Root is neither required nor recommended.
+
+For detailed setup instructions, backend-specific permissions, hardened systemd service examples,
+and troubleshooting, see [docs/PERMISSIONS.md](docs/PERMISSIONS.md).
+
+## Single-Instance Enforcement
+
+Only one Passless daemon may own a given backend state directory at a time. Starting a second
+daemon against the same backend fails immediately with a clear error. Multiple daemons are
+supported only when each uses a different backend state path.
+
+Client commands (`passless client ...`, `passless config print`) do not acquire the daemon lock
+and work normally while the authenticator is running.
 
 ## Acknowledgements
 

@@ -98,8 +98,13 @@ impl Display for GpgBackend {
 }
 
 impl PassStorageAdapter {
-    /// Create a new pass storage adapter
-    pub fn new(store_path: PathBuf, path: PathBuf, gpg_backend: GpgBackend) -> Result<Self> {
+    pub fn new_with_options(
+        store_path: PathBuf,
+        path: PathBuf,
+        gpg_backend: GpgBackend,
+        allow_create_without_prompt: bool,
+    ) -> Result<Self> {
+        let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
         info!("Using pass (password-store) backend");
         info!("Store path: {}", store_path.display());
         info!("Path: {}", path.display());
@@ -109,7 +114,7 @@ impl PassStorageAdapter {
 
         // Ensure the password store is initialized
         // This will prompt the user via notifications if not initialized
-        self::init::ensure_initialized(&store_path, gpg_backend)?;
+        self::init::ensure_initialized(&store_path, gpg_backend, allow_create_without_prompt)?;
 
         if !store_path.exists() {
             return Err(Error::Storage(format!(
@@ -491,63 +496,7 @@ impl CredentialStorage for PassStorageAdapter {
 
         debug!("read_first called with filter: {:?}", filter);
 
-        // Initialize iteration using the appropriate index
-        // Convert path info to actual paths
-        self.iteration_entries = match &filter {
-            CredentialFilter::None => {
-                // No filter: iterate all credentials
-                self.indexes
-                    .id
-                    .values()
-                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
-                    .collect()
-            }
-            CredentialFilter::ById(id) => {
-                // ById: direct lookup in index_by_id
-                if let Some(path_info) = self.indexes.id.get(id.as_slice()) {
-                    vec![path_info.to_path(&self.get_fido2_path())]
-                } else {
-                    Vec::new()
-                }
-            }
-            CredentialFilter::ByRp(rp_id) => {
-                // ByRp: lookup in index_by_rp
-                self.indexes
-                    .rp
-                    .get(rp_id.as_str())
-                    .map(|cred_ids| {
-                        cred_ids
-                            .iter()
-                            .filter_map(|cred_id| {
-                                self.indexes
-                                    .id
-                                    .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-            CredentialFilter::ByHash(hash) => {
-                // ByHash: lookup in index_by_rp_hash
-                self.indexes
-                    .rp_hash
-                    .get(hash)
-                    .map(|cred_ids| {
-                        cred_ids
-                            .iter()
-                            .filter_map(|cred_id| {
-                                self.indexes
-                                    .id
-                                    .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.get_fido2_path()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-        };
-
+        self.iteration_entries = self.indexes.resolve_filter(&filter, &self.get_fido2_path());
         self.iteration_index = 0;
 
         debug!(

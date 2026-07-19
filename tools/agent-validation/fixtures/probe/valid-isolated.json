@@ -1,0 +1,41 @@
+{
+    "pid": 12345,
+    "ppid": 12344,
+    "start_time": "1234567",
+    "uid": 1001,
+    "gid": 1001,
+    "supplementary_gids": [100, 200],
+    "namespaces": {
+        "cgroup": 4026531835,
+        "ipc": 4026531839,
+        "mnt": 4026531840,
+        "net": 4026531992,
+        "pid": 4026531836,
+        "pid_for_children": 4026531836,
+        "time": 4026531834,
+        "time_for_children": 4026531834,
+        "user": 4026531837,
+        "uts": 4026531838
+    },
+    "cgroup_v2_path": "/user.slice/user-1001.slice/session-42.scope",
+    "no_new_privs": true,
+    "cap_env_names": [],
+    "fd3": {
+        "present": true,
+        "fd_type": "socket",
+        "peer_uid": 1000,
+        "peer_gid": 1000
+    },
+    "resources": [
+        {
+            "path": "/tmp/probe-readable-file",
+            "outcome": "open_ok",
+            "errno": null
+        },
+        {
+            "path": "/var/run/passless-agent/socket",
+            "outcome": "connect_ok",
+            "errno": null
+        }
+    ]
+}

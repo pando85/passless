@@ -1,9 +1,11 @@
 //! TPM 2.0 PIN storage
 
 use crate::pin_storage::{PinStorage, SerializablePinState};
+use crate::util::{create_secure_dir_all, create_secure_file};
 
 use soft_fido2::{PinState, StatusCode};
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use log::{debug, info, warn};
@@ -31,15 +33,17 @@ impl TpmPinStorage {
 
 impl PinStorage for TpmPinStorage {
     fn load_pin_state(&self) -> Result<PinState, StatusCode> {
+        if !self.path.exists() {
+            debug!(
+                "PIN state file does not exist, returning default state (no TPM operation needed)"
+            );
+            return Ok(PinState::new());
+        }
+
         debug!(
             "Loading PIN state from TPM storage: {}",
             self.path.display()
         );
-
-        if !self.path.exists() {
-            debug!("PIN state file does not exist, returning default state");
-            return Ok(PinState::new());
-        }
 
         let sealed_data = std::fs::read(&self.path).map_err(|e| {
             warn!("Failed to read sealed PIN state: {}", e);
@@ -63,7 +67,8 @@ impl PinStorage for TpmPinStorage {
                 state.retries
             );
         } else {
-            info!("Saving PIN state (no PIN set)");
+            info!("Skipping PIN state save (no PIN set, no changes needed)");
+            return Ok(());
         }
 
         debug!("Saving PIN state to TPM storage: {}", self.path.display());
@@ -74,13 +79,18 @@ impl PinStorage for TpmPinStorage {
         let sealed_data = self.seal(&json_bytes)?;
 
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_secure_dir_all(parent).map_err(|e| {
                 warn!("Failed to create directory: {}", e);
                 StatusCode::Other
             })?;
         }
 
-        std::fs::write(&self.path, &sealed_data).map_err(|e| {
+        let mut file = create_secure_file(&self.path).map_err(|e| {
+            warn!("Failed to create sealed PIN state file: {}", e);
+            StatusCode::Other
+        })?;
+
+        file.write_all(&sealed_data).map_err(|e| {
             warn!("Failed to write sealed PIN state: {}", e);
             StatusCode::Other
         })?;
@@ -98,8 +108,9 @@ impl TpmPinStorage {
 
             use aes_gcm::Aes256Gcm;
             use aes_gcm::Nonce;
-            use aes_gcm::aead::{Aead, KeyInit, OsRng};
+            use aes_gcm::aead::{Aead, KeyInit};
             use rand::RngCore;
+            use rand::rngs::OsRng;
             use tss_esapi::attributes::ObjectAttributesBuilder;
             use tss_esapi::constants::SessionType;
             use tss_esapi::interface_types::algorithm::PublicAlgorithm;
@@ -224,14 +235,14 @@ impl TpmPinStorage {
 
             let mut nonce_bytes = [0u8; 12];
             OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::from_slice(&nonce_bytes);
+            let nonce = Nonce::try_from(&nonce_bytes[..]).expect("valid nonce length");
 
             let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
                 warn!("Failed to create AES cipher: {:?}", e);
                 StatusCode::Other
             })?;
 
-            let encrypted_data = cipher.encrypt(nonce, data).map_err(|e| {
+            let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
                 warn!("Failed to encrypt data with AES-GCM: {:?}", e);
                 StatusCode::Other
             })?;
@@ -477,14 +488,14 @@ impl TpmPinStorage {
                 return Err(StatusCode::Other);
             }
 
-            let nonce = Nonce::from_slice(&sealed_blob.nonce);
+            let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
             let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
                 warn!("Failed to create AES cipher: {:?}", e);
                 StatusCode::Other
             })?;
 
             let decrypted_data = cipher
-                .decrypt(nonce, sealed_blob.encrypted_data.as_ref())
+                .decrypt(&nonce, sealed_blob.encrypted_data.as_ref())
                 .map_err(|e| {
                     warn!("Failed to decrypt data with AES-GCM: {:?}", e);
                     StatusCode::Other

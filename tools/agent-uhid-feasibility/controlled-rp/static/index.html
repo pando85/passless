@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Passless Controlled RP</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; max-width: 720px; margin: 0 auto; }
+  h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.4rem; }
+  .subtitle { color: #8b949e; margin-bottom: 2rem; font-size: 0.85rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1.2rem; margin-bottom: 1rem; }
+  .card h2 { color: #58a6ff; font-size: 1rem; margin-bottom: 0.8rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.6rem; flex-wrap: wrap; }
+  label { color: #8b949e; font-size: 0.85rem; min-width: 80px; }
+  input[type="text"] { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 0.4rem 0.6rem; border-radius: 4px; font-family: inherit; font-size: 0.85rem; flex: 1; min-width: 150px; }
+  button { background: #238636; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; font-family: inherit; }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+  button.secondary { background: #30363d; }
+  button.secondary:hover { background: #484f58; }
+  #log { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 0.8rem; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.78rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
+  .log-ok { color: #3fb950; }
+  .log-err { color: #f85149; }
+  .log-info { color: #8b949e; }
+  .log-warn { color: #d29922; }
+  .status-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; padding: 0.5rem 0.8rem; background: #161b22; border: 1px solid #30363d; border-radius: 4px; font-size: 0.8rem; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .status-dot.ok { background: #3fb950; }
+  .status-dot.err { background: #f85149; }
+  .status-dot.unknown { background: #d29922; }
+</style>
+</head>
+<body>
+
+<h1>Passless Controlled RP</h1>
+<p class="subtitle">WebAuthn RP &mdash; Full Standards Verification &mdash; Stock Browser</p>
+
+<div class="status-bar">
+  <span><span class="status-dot unknown" id="statusDot"></span><span id="statusText">Checking...</span></span>
+  <span id="originDisplay"></span>
+</div>
+
+<div class="card">
+  <h2>Register</h2>
+  <div class="row">
+    <label for="regUserName">Username</label>
+    <input type="text" id="regUserName" value="testuser" />
+  </div>
+  <div class="row">
+    <label for="regUserId">User ID</label>
+    <input type="text" id="regUserId" value="default-user" />
+  </div>
+  <div class="row">
+    <button id="btnRegister">Register Passkey</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Authenticate</h2>
+  <div class="row">
+    <label for="authUserId">User ID</label>
+    <input type="text" id="authUserId" value="default-user" placeholder="(empty = conditional/any)" />
+  </div>
+  <div class="row">
+    <button id="btnAuthenticate" class="secondary">Authenticate</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+const logEl = document.getElementById('log');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const originDisplay = document.getElementById('originDisplay');
+
+function log(msg, cls = 'log-info') {
+  const ts = new Date().toISOString().slice(11, 23);
+  const line = document.createElement('div');
+  line.className = cls;
+  line.textContent = `[${ts}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function b64urlEncode(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(str) {
+  let s = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const binary = atob(s);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function apiPost(path, data) {
+  const resp = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return resp.json();
+}
+
+async function checkStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    statusDot.className = 'status-dot ok';
+    statusText.textContent = `RP OK | ${d.credentials_registered} cred(s)`;
+    originDisplay.textContent = location.origin;
+    log(`Connected to RP: ${d.rp_id} (${d.credentials_registered} credentials)`, 'log-ok');
+  } catch (e) {
+    statusDot.className = 'status-dot err';
+    statusText.textContent = 'RP unreachable';
+    log(`Status check failed: ${e.message}`, 'log-err');
+  }
+}
+
+async function register() {
+  const btn = document.getElementById('btnRegister');
+  btn.disabled = true;
+  try {
+    const userName = document.getElementById('regUserName').value || 'testuser';
+    const userId = document.getElementById('regUserId').value || 'default-user';
+
+    log(`Requesting registration options for user "${userName}"...`);
+    const options = await apiPost('/api/register/begin', { userName, userId });
+    log(`Got challenge: ${options.challenge.slice(0, 16)}...`);
+
+    const publicKeyOptions = {
+      rp: options.rp,
+      user: {
+        id: b64urlDecode(options.user.id),
+        name: options.user.name,
+        displayName: options.user.displayName,
+      },
+      challenge: b64urlDecode(options.challenge),
+      pubKeyCredParams: options.pubKeyCredParams,
+      timeout: options.timeout,
+      attestation: options.attestation,
+      authenticatorSelection: options.authenticatorSelection,
+    };
+
+    if (options.excludeCredentials) {
+      publicKeyOptions.excludeCredentials = options.excludeCredentials.map(c => ({
+        type: c.type,
+        id: b64urlDecode(c.id),
+        transports: c.transports,
+      }));
+    }
+
+    log('Calling navigator.credentials.create()...', 'log-warn');
+    const credential = await navigator.credentials.create({ publicKey: publicKeyOptions });
+
+    if (!credential) {
+      log('Credential creation returned null (cancelled or no authenticator)', 'log-err');
+      return;
+    }
+
+    log('Credential created, sending for verification...', 'log-ok');
+
+    const attestationResponse = credential.response;
+    const finishData = {
+      session_id: options.session_id,
+      id: credential.id,
+      rawId: b64urlEncode(credential.rawId),
+      type: credential.type,
+      response: {
+        clientDataJSON: b64urlEncode(attestationResponse.clientDataJSON),
+        attestationObject: b64urlEncode(attestationResponse.attestationObject),
+      },
+      clientExtensionResults: credential.getClientExtensionResults(),
+    };
+
+    if (attestationResponse.getTransports) {
+      finishData.response.transports = attestationResponse.getTransports();
+    }
+
+    const result = await apiPost('/api/register/finish', finishData);
+
+    if (result.ok) {
+      log(`REGISTER OK: ${result.message}`, 'log-ok');
+      log(`  credentialId: ${result.credentialId}`, 'log-ok');
+      log(`  details: ${JSON.stringify(result.details)}`, 'log-info');
+      await checkStatus();
+    } else {
+      log(`REGISTER FAIL: ${result.error}`, 'log-err');
+    }
+  } catch (e) {
+    log(`Registration error: ${e.name}: ${e.message}`, 'log-err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function authenticate() {
+  const btn = document.getElementById('btnAuthenticate');
+  btn.disabled = true;
+  try {
+    const userId = document.getElementById('authUserId').value || undefined;
+
+    log(`Requesting authentication options${userId ? ` for user "${userId}"` : ' (discoverable)'}...`);
+    const options = await apiPost('/api/authenticate/begin', { userId });
+    log(`Got challenge: ${options.challenge.slice(0, 16)}...`);
+
+    const publicKeyOptions = {
+      challenge: b64urlDecode(options.challenge),
+      timeout: options.timeout,
+      rpId: options.rpId,
+      userVerification: options.userVerification,
+    };
+
+    if (options.allowCredentials) {
+      publicKeyOptions.allowCredentials = options.allowCredentials.map(c => ({
+        type: c.type,
+        id: b64urlDecode(c.id),
+        transports: c.transports,
+      }));
+    }
+
+    log('Calling navigator.credentials.get()...', 'log-warn');
+    const assertion = await navigator.credentials.get({ publicKey: publicKeyOptions });
+
+    if (!assertion) {
+      log('Assertion returned null (cancelled or no credential)', 'log-err');
+      return;
+    }
+
+    log(`Assertion received for credential: ${assertion.id.slice(0, 20)}...`, 'log-ok');
+
+    const finishData = {
+      session_id: options.session_id,
+      id: assertion.id,
+      rawId: b64urlEncode(assertion.rawId),
+      type: assertion.type,
+      response: {
+        clientDataJSON: b64urlEncode(assertion.response.clientDataJSON),
+        authenticatorData: b64urlEncode(assertion.response.authenticatorData),
+        signature: b64urlEncode(assertion.response.signature),
+      },
+      clientExtensionResults: assertion.getClientExtensionResults(),
+    };
+
+    if (assertion.response.userHandle) {
+      finishData.response.userHandle = b64urlEncode(assertion.response.userHandle);
+    }
+
+    const result = await apiPost('/api/authenticate/finish', finishData);
+
+    if (result.ok) {
+      log(`AUTH OK: ${result.message}`, 'log-ok');
+      log(`  credentialId: ${result.credentialId}`, 'log-ok');
+      log(`  details: ${JSON.stringify(result.details)}`, 'log-info');
+    } else {
+      log(`AUTH FAIL: ${result.error}`, 'log-err');
+    }
+  } catch (e) {
+    log(`Authentication error: ${e.name}: ${e.message}`, 'log-err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('btnRegister').addEventListener('click', register);
+document.getElementById('btnAuthenticate').addEventListener('click', authenticate);
+
+if (!window.isSecureContext) {
+  log('WARNING: Not a secure context. WebAuthn requires HTTPS or localhost.', 'log-err');
+  statusDot.className = 'status-dot err';
+  statusText.textContent = 'Insecure context';
+} else {
+  log('Secure context confirmed.', 'log-ok');
+}
+
+checkStatus();
+</script>
+
+</body>
+</html>

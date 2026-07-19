@@ -22,7 +22,7 @@ jobs:
             pkgbuild: PKGBUILD-bin
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Extract crate information
         shell: bash
@@ -44,7 +44,7 @@ jobs:
           .ci/generate-pkgbuild.rh ${{ matrix.package.pkgbuild }}
 
       - name: Publish AUR package
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.2
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: ${{ matrix.package.name }}
           pkgbuild: ./${{ matrix.package.pkgbuild }}

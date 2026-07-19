@@ -1,3 +1,5 @@
+#[cfg(feature = "agent")]
+use crate::agent::interaction::{AgentInteractionManager, action_from_info};
 use crate::notification::show_verification_notification;
 use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
@@ -7,7 +9,8 @@ use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
-    CredentialRef, CtapCommand, PinState, Result, UpResult, UvResult,
+    CredentialRef, CtapCommand, Error as SoftFido2Error, PinState, Result, StatusCode, UpResult,
+    UvResult,
 };
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -23,18 +26,128 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
     (major << 16) | (minor << 8) | patch
 });
 
+/// Passless vendor command for resetting built-in UV retries without deleting credentials.
+pub const CMD_PASSLESS_RESET_UV_RETRIES: u8 = 0x42;
+
+const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
+
+fn error_status_byte(error: SoftFido2Error) -> u8 {
+    match error {
+        SoftFido2Error::CtapError(code) => code,
+        error => StatusCode::from(error) as u8,
+    }
+}
+
+/// Classification of UV retry count transitions for diagnostic logging
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UvRetryTransition {
+    Initialized,
+    NoChange,
+    NormalChange,
+    Low,
+    Exhausted,
+    Recovered,
+}
+
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
-struct PinStorageWrapper<P: PinStorage>(Arc<Mutex<P>>);
+///
+/// This wrapper intercepts PIN state load/save operations to enforce the configured
+/// max_uv_retries limit. Since soft-fido2 hardcodes MAX_UV_RETRIES=3 internally,
+/// we clamp the uv_retries value to the configured maximum during persistence.
+///
+/// It also tracks UV retry transitions to emit actionable warnings when retries
+/// approach or reach exhaustion, independent of the storage backend.
+struct PinStorageWrapper<P: PinStorage> {
+    storage: Arc<Mutex<P>>,
+    max_uv_retries: u8,
+    last_uv_retries: Mutex<Option<u8>>,
+}
+
+impl<P: PinStorage> PinStorageWrapper<P> {
+    fn clamp_uv_retries(&self, state: &mut PinState) {
+        if state.uv_retries > self.max_uv_retries {
+            state.uv_retries = self.max_uv_retries;
+        }
+    }
+
+    fn classify_uv_transition(old: Option<u8>, new: u8) -> UvRetryTransition {
+        match old {
+            None => UvRetryTransition::Initialized,
+            Some(prev) if prev == new => UvRetryTransition::NoChange,
+            Some(prev) if new == 0 && prev > 0 => UvRetryTransition::Exhausted,
+            Some(prev) if new == 1 && prev > 1 => UvRetryTransition::Low,
+            Some(prev) if new > prev && prev == 0 => UvRetryTransition::Recovered,
+            Some(_) => UvRetryTransition::NormalChange,
+        }
+    }
+
+    fn log_uv_retry_transition(&self, old: Option<u8>, new: u8) {
+        match Self::classify_uv_transition(old, new) {
+            UvRetryTransition::Initialized => {
+                debug!("UV retries initialized: {} remaining", new);
+            }
+            UvRetryTransition::NoChange => {}
+            UvRetryTransition::Exhausted => {
+                error!(
+                    "UV retries exhausted; built-in user verification is blocked. \
+                     Run `passless client pin uv-reset` to restore UV retries"
+                );
+            }
+            UvRetryTransition::Low => {
+                warn!(
+                    "UV retry limit is almost exhausted: 1 attempt remaining. \
+                     Run `passless client pin uv-reset` to restore UV retries"
+                );
+            }
+            UvRetryTransition::Recovered => {
+                info!("UV retries restored from 0 to {} (reset/recovery)", new);
+            }
+            UvRetryTransition::NormalChange => {
+                debug!(
+                    "UV retries changed: {} -> {} remaining",
+                    old.unwrap_or(0),
+                    new
+                );
+            }
+        }
+    }
+}
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
-        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
-        storage.load_pin_state()
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        let mut state = storage.load_pin_state()?;
+        self.clamp_uv_retries(&mut state);
+        let mut last = self
+            .last_uv_retries
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        *last = Some(state.uv_retries);
+        Ok(state)
     }
 
     fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
-        let storage = self.0.lock().map_err(|_| soft_fido2::StatusCode::Other)?;
-        storage.save_pin_state(state)
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        let mut clamped_state = state.clone();
+        self.clamp_uv_retries(&mut clamped_state);
+        storage.save_pin_state(&clamped_state)?;
+        let old = {
+            let mut last = self
+                .last_uv_retries
+                .lock()
+                .map_err(|_| soft_fido2::StatusCode::Other)?;
+            let old = *last;
+            *last = Some(clamped_state.uv_retries);
+            old
+        };
+        self.log_uv_retry_transition(old, clamped_state.uv_retries);
+        Ok(())
     }
 }
 
@@ -44,6 +157,8 @@ pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     pin_storage: Option<Arc<Mutex<P>>>,
     security_config: SecurityConfig,
     pin_config: PinConfig,
+    #[cfg(feature = "agent")]
+    interaction_manager: Option<Arc<AgentInteractionManager>>,
 }
 
 impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
@@ -58,12 +173,54 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             pin_storage,
             security_config,
             pin_config,
+            #[cfg(feature = "agent")]
+            interaction_manager: None,
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    pub fn with_interaction_manager(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Self {
+        Self {
+            storage,
+            pin_storage,
+            security_config,
+            pin_config,
+            interaction_manager: Some(interaction_manager),
         }
     }
 }
 
 impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
     fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
+        #[cfg(feature = "agent")]
+        {
+            if let Some(ref manager) = self.interaction_manager {
+                let action = action_from_info(info);
+                let generation = 0;
+                match manager.try_consume_up(rp, action, generation) {
+                    Some(result) => {
+                        debug!("Agent interaction override for UP: {:?}", result);
+                        return Ok(result);
+                    }
+                    None => {
+                        if manager.has_active_token() {
+                            warn!(
+                                "Agent interaction token mismatch/expired for UP on rp={}",
+                                rp
+                            );
+                            return Ok(UpResult::Denied);
+                        }
+                    }
+                }
+            }
+        }
+
         // Check for E2E test mode (only available in debug builds)
         #[cfg(debug_assertions)]
         {
@@ -124,7 +281,29 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     }
 
     fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
-        // Check for E2E test mode (only available in debug builds)
+        #[cfg(feature = "agent")]
+        {
+            if let Some(ref manager) = self.interaction_manager {
+                let action = action_from_info(info);
+                let generation = 0;
+                match manager.try_consume_uv(rp, action, generation) {
+                    Some(result) => {
+                        debug!("Agent interaction override for UV: {:?}", result);
+                        return Ok(result);
+                    }
+                    None => {
+                        if manager.has_active_token() {
+                            warn!(
+                                "Agent interaction token mismatch/expired for UV on rp={}",
+                                rp
+                            );
+                            return Ok(UvResult::Denied);
+                        }
+                    }
+                }
+            }
+        }
+
         #[cfg(debug_assertions)]
         {
             if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
@@ -133,12 +312,43 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        // Check if PIN is set and apply enforcement policy
-        if let Some(pin_storage) = &self.pin_storage
-            && let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?
-            && let Ok(state) = storage.load_pin_state()
-            && state.is_pin_set()
-        {
+        let pin_set;
+        let uv_retries;
+
+        if let Some(pin_storage) = &self.pin_storage {
+            let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?;
+            match storage.load_pin_state() {
+                Ok(state) => {
+                    pin_set = state.is_pin_set();
+                    uv_retries = Some(state.uv_retries);
+                }
+                Err(e) => {
+                    debug!("Failed to load PIN state for UV request: {:?}", e);
+                    pin_set = false;
+                    uv_retries = None;
+                }
+            }
+        } else {
+            pin_set = false;
+            uv_retries = None;
+        }
+
+        if let Some(retries) = uv_retries {
+            debug!(
+                "UV request: pin_set={}, uv_retries={}, enforcement={}, always_uv={}",
+                pin_set, retries, self.pin_config.enforcement, self.security_config.always_uv,
+            );
+            if retries == 0 {
+                warn!(
+                    "Built-in UV is blocked (0 retries remaining); \
+                     falling back to notification-based verification because \
+                     pin.enforcement={}",
+                    self.pin_config.enforcement,
+                );
+            }
+        }
+
+        if pin_set {
             match self.pin_config.enforcement {
                 PinEnforcement::Required => {
                     info!("PIN is set and enforcement=required, denying built-in UV to force PIN");
@@ -161,8 +371,6 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        // No PIN set or enforcement allows notification fallback
-        // Return AcceptedWithUp since notification-based UV also captures user presence
         match show_verification_notification(
             info,
             Some(rp),
@@ -248,8 +456,11 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         let mut storage = match self.storage.lock() {
             Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while listing credentials");
+            Err(e) => {
+                error!(
+                    "Failed to acquire storage lock while listing credentials: {}",
+                    e
+                );
                 return Err(soft_fido2::Error::Other);
             }
         };
@@ -273,7 +484,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                 }
             }
             Err(e) => {
-                info!("No credentials found for RP {}: {:?}", rp_id, e);
+                debug!("No credentials found for RP {}: {:?}", rp_id, e);
             }
         }
 
@@ -387,39 +598,145 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
     pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
+    /// Maximum UV retries (configured value, not soft-fido2's hardcoded 3)
+    max_uv_retries: u8,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
     /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
     pub fn new(storage: S, security_config: SecurityConfig, pin_config: PinConfig) -> Result<Self> {
-        Self::with_pin_storage(storage, None, security_config, pin_config)
+        Self::with_shared_storage(
+            Arc::new(Mutex::new(storage)),
+            None,
+            security_config,
+            pin_config,
+        )
     }
 }
 
 impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorService<S, P> {
-    /// Create a new authenticator service with optional PIN storage
-    pub fn with_pin_storage(
-        storage: S,
+    fn build_authenticator(
+        storage: Arc<Mutex<S>>,
         pin_storage: Option<Arc<Mutex<P>>>,
         security_config: SecurityConfig,
         pin_config: PinConfig,
-    ) -> Result<Self> {
-        // Hardcoded authenticator options (FIDO2 spec compliant)
-        // These are platform authenticator defaults and shouldn't need configuration
-        let options = AuthenticatorOptions {
-            rk: true,                      // Resident keys (passkeys)
-            up: true,                      // User presence
-            uv: Some(true),                // Built-in UV capability (notification-based)
-            plat: true,                    // Platform authenticator
-            client_pin: Some(true),        // Client PIN capability
-            pin_uv_auth_token: Some(true), // PIN/UV auth token support
-            cred_mgmt: Some(true),         // Credential management
-            bio_enroll: None,              // No biometric enrollment
-            large_blobs: None,             // No large blob storage
-            ep: None,                      // Enterprise attestation not enabled
-            always_uv: Some(security_config.always_uv),
-            make_cred_uv_not_required: Some(true),
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
+        #[cfg(feature = "agent")]
+        {
+            Self::build_authenticator_with_interaction(
+                storage,
+                pin_storage,
+                security_config,
+                pin_config,
+                None,
+            )
+        }
+        #[cfg(not(feature = "agent"))]
+        {
+            let options = AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: true,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            };
+
+            let config = AuthenticatorConfig::builder()
+                .aaguid([
+                    0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73,
+                    0x2E, 0x72, 0x73,
+                ])
+                .options(options)
+                .commands(vec![
+                    CtapCommand::MakeCredential,
+                    CtapCommand::GetAssertion,
+                    CtapCommand::GetInfo,
+                    CtapCommand::ClientPin,
+                    CtapCommand::GetNextAssertion,
+                    CtapCommand::Selection,
+                ])
+                .max_credentials(100)
+                .extensions(vec!["credProtect".to_string()])
+                .firmware_version(*VERSION)
+                .constant_sign_count(security_config.constant_signature_counter)
+                .algorithms(vec![-7])
+                .max_pin_retries(pin_config.max_retries)
+                .auto_lock_timeout(pin_config.auto_lock_timeout)
+                .build();
+
+            let callbacks = PasslessCallbacks::new(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+            );
+
+            let authenticator = if let Some(ps) = pin_storage {
+                Authenticator::with_config_and_pin_storage(
+                    callbacks,
+                    config,
+                    PinStorageWrapper {
+                        storage: ps,
+                        max_uv_retries: pin_config.max_uv_retries,
+                        last_uv_retries: Mutex::new(None),
+                    },
+                )
+            } else {
+                Authenticator::with_config(callbacks, config)
+            }?;
+
+            Ok(authenticator)
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    fn build_authenticator_with_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Option<Arc<AgentInteractionManager>>,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
+        let is_agent = interaction_manager.is_some();
+
+        let options = if is_agent {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(false),
+                plat: true,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(true),
+                make_cred_uv_not_required: Some(false),
+            }
+        } else {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: true,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            }
         };
 
         let config = AuthenticatorConfig::builder()
@@ -446,30 +763,201 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             .auto_lock_timeout(pin_config.auto_lock_timeout)
             .build();
 
-        let storage = Arc::new(Mutex::new(storage));
-        let callbacks = PasslessCallbacks::new(
-            storage.clone(),
-            pin_storage.clone(),
-            security_config,
-            pin_config,
-        );
+        let callbacks = match interaction_manager {
+            Some(ref mgr) => PasslessCallbacks::with_interaction_manager(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                mgr.clone(),
+            ),
+            None => PasslessCallbacks::new(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+            ),
+        };
 
         let authenticator = if let Some(ps) = pin_storage {
-            Authenticator::with_config_and_pin_storage(callbacks, config, PinStorageWrapper(ps))
+            Authenticator::with_config_and_pin_storage(
+                callbacks,
+                config,
+                PinStorageWrapper {
+                    storage: ps,
+                    max_uv_retries: pin_config.max_uv_retries,
+                    last_uv_retries: Mutex::new(None),
+                },
+            )?
         } else {
-            Authenticator::with_config(callbacks, config)
-        }?;
+            Authenticator::with_config(callbacks, config)?
+        };
+
+        Ok(authenticator)
+    }
+
+    /// Create a new authenticator service with optional PIN storage
+    pub fn with_pin_storage(
+        storage: S,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+    ) -> Result<Self> {
+        let storage = Arc::new(Mutex::new(storage));
+        Self::with_shared_storage(storage, pin_storage, security_config, pin_config)
+    }
+
+    /// Create a new authenticator service with shared (Arc-wrapped) storage
+    ///
+    /// This constructor accepts pre-wrapped `Arc<Mutex<S>>` and `Option<Arc<Mutex<P>>>`,
+    /// allowing callers (such as `AgentStorageBundle`) to share ownership of the storage
+    /// without moving it. Each call creates an independent `AuthenticatorService` that
+    /// references the same underlying storage.
+    pub fn with_shared_storage(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+    ) -> Result<Self> {
+        let authenticator = Self::build_authenticator(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+        )?;
 
         Ok(Self {
             authenticator,
             storage,
+            max_uv_retries: pin_config.max_uv_retries,
         })
+    }
+
+    /// Create a new authenticator service with shared storage and an agent interaction manager
+    ///
+    /// The interaction manager allows agent ceremony code to install a one-shot token
+    /// that overrides UP/UV prompts. When a matching token is present, callbacks consume
+    /// it once and return the pre-decided result. Without a token, the human notification
+    /// path is used. Token bytes are never serialized or logged.
+    #[cfg(feature = "agent")]
+    #[allow(dead_code)]
+    pub fn with_shared_storage_and_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Result<Self> {
+        let authenticator = Self::build_authenticator_with_interaction(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            Some(interaction_manager),
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
+            max_uv_retries: pin_config.max_uv_retries,
+        })
+    }
+
+    fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
+        // Use the high-level reset API from soft-fido2
+        self.authenticator
+            .reset_uv_retries()
+            .map_err(|_| StatusCode::Other)?;
+
+        Ok(())
     }
 
     /// Process a CTAP request and generate a response
     /// Ok(()) on success or an error
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
-        self.authenticator.handle(request, response_buffer)?;
+        if request.first() == Some(&CMD_PASSLESS_RESET_UV_RETRIES) {
+            response_buffer.clear();
+
+            let payload = &request[1..];
+            let parser = match soft_fido2_ctap::cbor::MapParser::from_bytes(payload) {
+                Ok(parser) => parser,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            let sub_command: u8 = match parser.get(1) {
+                Ok(sub_command) => sub_command,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            if sub_command != RESET_UV_RETRIES_SUBCOMMAND {
+                response_buffer.push(StatusCode::InvalidParameter as u8);
+                return Ok(());
+            }
+
+            let pin_uv_auth_protocol: u8 = match parser.get(3) {
+                Ok(protocol) => protocol,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            let pin_uv_auth_param: Vec<u8> = match parser.get_bytes(4) {
+                Ok(param) => param,
+                Err(status) => {
+                    response_buffer.push(status as u8);
+                    return Ok(());
+                }
+            };
+
+            let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
+            if let Err(error) = self.authenticator.verify_credential_management_pin_uv_auth(
+                pin_uv_auth_protocol,
+                &pin_uv_auth_param,
+                &auth_data,
+            ) {
+                response_buffer.push(error_status_byte(error));
+                return Ok(());
+            }
+
+            match self.reset_uv_retries() {
+                Ok(()) => {
+                    response_buffer.push(0x00);
+                    // Include the restored UV retries count in the response
+                    // Response format: CBOR map { 1: uv_retries_count }
+                    // Use configured max_uv_retries, not soft-fido2's hardcoded value
+                    if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
+                        .insert(1, self.max_uv_retries)
+                        .and_then(|b| b.build())
+                    {
+                        response_buffer.extend_from_slice(&cbor_data);
+                    } else {
+                        response_buffer.push(0xa0);
+                    }
+                }
+                Err(status) => response_buffer.push(status as u8),
+            }
+            return Ok(());
+        }
+
+        let result = self.authenticator.handle(request, response_buffer);
+        if let Err(SoftFido2Error::CtapError(code)) = &result
+            && *code == StatusCode::UvBlocked as u8
+        {
+            warn!(
+                "CTAP request returned UV_BLOCKED (0x{:02x}); \
+                 built-in user verification retries are exhausted. \
+                 Run `passless client pin uv-reset` to restore",
+                code
+            );
+        }
+        result?;
         Ok(())
     }
 
@@ -532,6 +1020,276 @@ mod tests {
         assert!(service.is_ok(), "Service creation should succeed");
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_reset_uv_retries_command_requires_authentication() {
+        let temp_dir = std::env::temp_dir().join("test_passless_reset_uv_retries");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let storage =
+            LocalStorageAdapter::new(temp_dir.clone()).expect("Failed to create local storage");
+        let mut service = AuthenticatorService::with_pin_storage(
+            storage,
+            None::<Arc<Mutex<()>>>,
+            SecurityConfig::default(),
+            PinConfig::default(),
+        )
+        .expect("Service creation should succeed");
+
+        let mut response = Vec::new();
+        service
+            .handle(&[CMD_PASSLESS_RESET_UV_RETRIES], &mut response)
+            .expect("UV retry reset command should be handled");
+
+        assert_ne!(response, vec![0x00, 0xa0]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_clamps_on_save() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_pin_wrapper_save");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 5,
+            last_uv_retries: Mutex::new(None),
+        };
+
+        let mut state = PinState::new();
+        state.uv_retries = 10;
+
+        // Save should clamp to max_uv_retries
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+
+        // Load should return clamped value
+        let loaded = wrapper.load_pin_state().expect("Load should succeed");
+        assert_eq!(loaded.uv_retries, 5, "uv_retries should be clamped to max");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_clamps_on_load() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_pin_wrapper_load");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+
+        let wrapper_high = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+        };
+        let mut state = PinState::new();
+        state.uv_retries = 8;
+        wrapper_high
+            .save_pin_state(&state)
+            .expect("Save should succeed");
+
+        let pin_storage2 = LocalPinStorage::new(temp_dir.clone());
+        let wrapper_low = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage2)),
+            max_uv_retries: 3,
+            last_uv_retries: Mutex::new(None),
+        };
+
+        // Load should clamp to the lower max
+        let loaded = wrapper_low.load_pin_state().expect("Load should succeed");
+        assert_eq!(
+            loaded.uv_retries, 3,
+            "uv_retries should be clamped to lower max on load"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_uv_retry_transition_classification() {
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(None, 3),
+            UvRetryTransition::Initialized,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(3), 2),
+            UvRetryTransition::NormalChange,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(2), 1),
+            UvRetryTransition::Low,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(1), 0),
+            UvRetryTransition::Exhausted,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(0), 0),
+            UvRetryTransition::NoChange,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(0), 8),
+            UvRetryTransition::Recovered,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(5), 5),
+            UvRetryTransition::NoChange,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(3), 1),
+            UvRetryTransition::Low,
+        );
+        assert_eq!(
+            PinStorageWrapper::<()>::classify_uv_transition(Some(2), 0),
+            UvRetryTransition::Exhausted,
+        );
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_tracks_uv_retry_transitions() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_uv_transitions");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+        };
+
+        let mut state = PinState::new();
+        state.uv_retries = 3;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(3));
+        }
+
+        state.uv_retries = 2;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(2));
+        }
+
+        state.uv_retries = 1;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(1));
+        }
+
+        state.uv_retries = 0;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(0));
+        }
+
+        state.uv_retries = 0;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(0));
+        }
+
+        state.uv_retries = 8;
+        wrapper.save_pin_state(&state).expect("Save should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, Some(8));
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_pin_storage_wrapper_load_initializes_last_uv_retries() {
+        use crate::pin_storage::local::LocalPinStorage;
+        use soft_fido2::PinStorageCallbacks;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_uv_load_init");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let pin_storage = LocalPinStorage::new(temp_dir.clone());
+        let wrapper = PinStorageWrapper {
+            storage: Arc::new(Mutex::new(pin_storage)),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+        };
+
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert_eq!(*last, None);
+        }
+
+        let _state = wrapper.load_pin_state().expect("Load should succeed");
+        {
+            let last = wrapper.last_uv_retries.lock().unwrap();
+            assert!(last.is_some());
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_delegated_pin_storage_arc_identity() {
+        use crate::pin_storage::local::LocalPinStorage;
+
+        let temp_dir = std::env::temp_dir().join("test_passless_delegated_pin_identity");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        let cred_temp = temp_dir.join("creds");
+        std::fs::create_dir_all(&cred_temp).unwrap();
+        let cred_storage: Arc<Mutex<Box<dyn CredentialStorage>>> = Arc::new(Mutex::new(Box::new(
+            LocalStorageAdapter::new(cred_temp).unwrap(),
+        )));
+
+        let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
+            Arc::new(Mutex::new(Box::new(LocalPinStorage::new(temp_dir.clone()))));
+
+        let human_pin_storage_clone = pin_storage.clone();
+
+        let security_config = SecurityConfig::default();
+        let pin_config = PinConfig::default();
+        let interaction_manager =
+            Arc::new(crate::agent::interaction::AgentInteractionManager::new());
+
+        let service = AuthenticatorService::with_shared_storage_and_interaction(
+            cred_storage,
+            Some(pin_storage.clone()),
+            security_config,
+            pin_config,
+            interaction_manager,
+        )
+        .expect("Service creation should succeed");
+
+        let _ = &service.authenticator;
+
+        assert!(
+            Arc::ptr_eq(&pin_storage, &human_pin_storage_clone),
+            "delegated service must share the same Arc<Mutex<PinStorage>> as human"
+        );
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

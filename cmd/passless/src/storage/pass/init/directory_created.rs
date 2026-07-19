@@ -17,20 +17,22 @@ use prs_lib::crypto::{self, Config, IsContext, Proto};
 pub struct DirectoryCreated {
     pub(super) store_path: PathBuf,
     pub(super) gpg_backend: GpgBackend,
+    pub(super) allow_create_without_prompt: bool,
 }
 
 impl DirectoryCreated {
     pub fn select_gpg_key(self) -> Result<GpgKeySelected> {
-        let fingerprint = select_gpg_key_interactive(self.gpg_backend)?;
+        let fingerprint = select_gpg_key(self.gpg_backend, self.allow_create_without_prompt)?;
 
         Ok(GpgKeySelected {
             store_path: self.store_path,
             fingerprint,
+            allow_create_without_prompt: self.allow_create_without_prompt,
         })
     }
 }
 
-fn select_gpg_key_interactive(_gpg_backend: GpgBackend) -> Result<String> {
+fn select_gpg_key(_gpg_backend: GpgBackend, allow_create_without_prompt: bool) -> Result<String> {
     let config = Config {
         proto: Proto::Gpg,
         gpg_tty: false,
@@ -59,6 +61,12 @@ fn select_gpg_key_interactive(_gpg_backend: GpgBackend) -> Result<String> {
              Then restart passless to complete initialization.",
         );
         return Err(Error::Config("No GPG keys found".to_string()));
+    }
+
+    if allow_create_without_prompt {
+        let fingerprint = private_keys[0].fingerprint(false);
+        info!("E2E test mode: selecting first available GPG key");
+        return Ok(fingerprint);
     }
 
     if private_keys.len() == 1 {

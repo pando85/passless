@@ -635,6 +635,126 @@ fn extract_credential_id(attestation_cbor: &[u8]) -> Result<Vec<u8>> {
     Err(soft_fido2::Error::Other)
 }
 
+fn extract_assertion_user_id(assertion_cbor: &[u8]) -> Result<Vec<u8>> {
+    let value: ciborium::value::Value =
+        ciborium::from_reader(assertion_cbor).map_err(|_| soft_fido2::Error::Other)?;
+
+    if let ciborium::value::Value::Map(map) = value {
+        for (key, val) in map {
+            if let ciborium::value::Value::Integer(i) = key {
+                let i_val: i128 = i.into();
+                if i_val == 4
+                    && let ciborium::value::Value::Map(user_map) = val
+                {
+                    for (user_key, user_val) in user_map {
+                        if let ciborium::value::Value::Text(name) = user_key
+                            && name == "id"
+                            && let ciborium::value::Value::Bytes(id) = user_val
+                        {
+                            return Ok(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(soft_fido2::Error::Other)
+}
+
+fn extract_assertion_credential_count(assertion_cbor: &[u8]) -> Result<Option<usize>> {
+    let value: ciborium::value::Value =
+        ciborium::from_reader(assertion_cbor).map_err(|_| soft_fido2::Error::Other)?;
+
+    if let ciborium::value::Value::Map(map) = value {
+        for (key, val) in map {
+            if let ciborium::value::Value::Integer(i) = key {
+                let i_val: i128 = i.into();
+                if i_val == 5
+                    && let ciborium::value::Value::Integer(count) = val
+                {
+                    let count_i: i128 = count.into();
+                    return Ok(Some(count_i as usize));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Core test logic for userless authentication with multiple discoverable credentials.
+fn run_userless_multiple_discoverable_credentials_test() -> Result<()> {
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║ E2E Test: Userless Multi-Credential Auth      ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    let mut transport = connect_to_authenticator()?;
+    let rp = RelyingParty {
+        id: RP_ID.to_string(),
+        name: Some("Example Corp".to_string()),
+    };
+
+    let user_a_id = vec![1, 2, 3, 4];
+    let user_b_id = vec![5, 6, 7, 8];
+
+    for (label, user_id, name) in [
+        ("User A", user_a_id.clone(), "user_a@example.com"),
+        ("User B", user_b_id.clone(), "user_b@example.com"),
+    ] {
+        println!("📝 Registering discoverable credential for {label}...");
+        let challenge = generate_challenge();
+        let client_data_hash = generate_client_data_hash_for_registration(&challenge);
+        let user = User {
+            id: user_id,
+            name: Some(name.to_string()),
+            display_name: Some(label.to_string()),
+        };
+
+        let request = MakeCredentialRequest::new(client_data_hash, rp.clone(), user)
+            .with_user_verification(true)
+            .with_resident_key(true)
+            .with_timeout(30000);
+
+        print_operation("Register discoverable credential");
+        let attestation = Client::make_credential(&mut transport, request)?;
+        assert!(!attestation.is_empty());
+    }
+
+    println!("\n🔐 Authenticating without allow list...");
+    let challenge = generate_challenge();
+    let client_data_hash = generate_client_data_hash_for_authentication(&challenge);
+    let request = GetAssertionRequest::new(client_data_hash, RP_ID)
+        .with_user_verification(true)
+        .with_timeout(30000);
+
+    print_operation("Authenticate with multiple discoverable credentials");
+    let first_assertion = Client::get_assertion(&mut transport, request)?;
+    assert_eq!(
+        extract_assertion_credential_count(&first_assertion)?,
+        Some(2),
+        "First assertion should advertise both matching credentials"
+    );
+    let first_user_id = extract_assertion_user_id(&first_assertion)?;
+
+    println!("\n🔁 Requesting next assertion...");
+    let second_assertion = transport.send_ctap_command(0x08, &[], 30000)?;
+    let second_user_id = extract_assertion_user_id(&second_assertion)?;
+
+    assert_ne!(
+        first_user_id, second_user_id,
+        "getNextAssertion should return the other credential"
+    );
+    assert!([user_a_id.as_slice(), user_b_id.as_slice()].contains(&first_user_id.as_slice()));
+    assert!([user_a_id.as_slice(), user_b_id.as_slice()].contains(&second_user_id.as_slice()));
+
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║  ✓ Multi-Credential Userless Test Passed!     ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn test_local_authentication_with_allow_list() -> Result<()> {
@@ -1067,5 +1187,171 @@ fn test_pass_algorithm_preference() -> Result<()> {
 fn test_tpm_algorithm_preference() -> Result<()> {
     with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
         run_algorithm_preference_test()
+    })
+}
+
+/// Core test logic for userless discoverable passkey authentication
+fn run_userless_discoverable_passkey_test() -> Result<()> {
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║ E2E Test: Userless Discoverable Passkey Auth  ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    let mut transport = connect_to_authenticator()?;
+
+    // Register a resident/discoverable credential with minimal user info
+    println!("📝 Registering discoverable credential (userless)...");
+    let challenge = generate_challenge();
+    let client_data = format!(
+        r#"{{"type":"webauthn.create","challenge":"{}","origin":"{}","crossOrigin":false}}"#,
+        base64_url_encode(&challenge),
+        ORIGIN
+    );
+    let hash = Sha256::digest(client_data.as_bytes());
+    let client_data_hash = ClientDataHash::from_slice(&hash)?;
+
+    let rp = RelyingParty {
+        id: RP_ID.to_string(),
+        name: Some("Example Corp".to_string()),
+    };
+
+    let user_id = vec![99, 88, 77, 66];
+
+    // Create a discoverable credential whose user handle can identify the
+    // account when authentication is started without an allow list.
+    let user = User {
+        id: user_id.clone(),
+        name: None,
+        display_name: None,
+    };
+
+    let request = MakeCredentialRequest::new(client_data_hash, rp, user)
+        .with_user_verification(true)
+        .with_resident_key(true)
+        .with_timeout(30000);
+
+    print_operation("Register discoverable credential (userless)");
+
+    let attestation = Client::make_credential(&mut transport, request)?;
+    println!(
+        "   ✓ Discoverable credential created ({} bytes)",
+        attestation.len()
+    );
+    assert!(!attestation.is_empty());
+
+    // Extract credential ID from the attestation for verification
+    let cred_id = extract_credential_id(&attestation)?;
+    println!("   Credential ID: {} bytes", cred_id.len());
+
+    // Now authenticate WITHOUT an allow list (discoverable flow)
+    println!("\n🔐 Authenticating without allow list (discoverable flow)...");
+    let challenge = generate_challenge();
+    let client_data = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}"}}"#,
+        base64_url_encode(&challenge),
+        ORIGIN
+    );
+    let hash = Sha256::digest(client_data.as_bytes());
+    let client_data_hash = ClientDataHash::from_slice(&hash)?;
+
+    // No allow list - this should trigger the discoverable flow
+    let request = GetAssertionRequest::new(client_data_hash, RP_ID)
+        .with_user_verification(true)
+        .with_timeout(30000);
+
+    print_operation("Authenticate using discoverable credential (no allow list)");
+
+    let assertion = Client::get_assertion(&mut transport, request)?;
+    println!("   ✓ Authentication successful ({} bytes)", assertion.len());
+    assert!(!assertion.is_empty());
+
+    // Parse the assertion CBOR to validate user information
+    println!("\n🔍 Parsing assertion CBOR to validate user information...");
+    match ciborium::from_reader::<ciborium::value::Value, _>(&assertion[..]) {
+        Ok(ciborium::value::Value::Map(map)) => {
+            println!("   ✓ Valid CBOR response with {} fields", map.len());
+
+            // Check for required fields
+            let has_auth_data = map.iter().any(|(k, _)| {
+                matches!(k, ciborium::value::Value::Integer(i) if Into::<i128>::into(*i) == 2)
+            });
+            let has_signature = map.iter().any(|(k, _)| {
+                matches!(k, ciborium::value::Value::Integer(i) if Into::<i128>::into(*i) == 3)
+            });
+
+            let mut returned_user_id = None;
+            for (k, v) in &map {
+                if let ciborium::value::Value::Integer(i) = k {
+                    let i_val: i128 = (*i).into();
+                    if i_val == 4 {
+                        if let ciborium::value::Value::Map(user_map) = v {
+                            returned_user_id =
+                                user_map.iter().find_map(|(user_key, user_value)| {
+                                    if let ciborium::value::Value::Text(key) = user_key
+                                        && key == "id"
+                                        && let ciborium::value::Value::Bytes(id) = user_value
+                                    {
+                                        return Some(id.clone());
+                                    }
+
+                                    None
+                                });
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            assert!(has_auth_data, "Response should contain authData");
+            assert!(has_signature, "Response should contain signature");
+            println!("   ✓ Response contains authData and signature");
+
+            assert_eq!(
+                returned_user_id.as_deref(),
+                Some(user_id.as_slice()),
+                "Discoverable authentication should return the registered user handle"
+            );
+            println!("   ✓ User handle matches registered user ID");
+        }
+        Ok(_) => panic!("Response should be a CBOR map"),
+        Err(e) => panic!("Failed to parse CBOR response: {}", e),
+    }
+
+    println!("\n╔════════════════════════════════════════════════╗");
+    println!("║     ✓ Userless Discoverable Passkey Test Passed!    ║");
+    println!("╚════════════════════════════════════════════════╝\n");
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_local_userless_discoverable_passkey() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_userless_discoverable_passkey_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_pass_userless_discoverable_passkey() -> Result<()> {
+    with_backend("password-store", AuthenticatorHarness::with_pass, || {
+        run_userless_discoverable_passkey_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_tpm_userless_discoverable_passkey() -> Result<()> {
+    with_backend("TPM (swtpm)", AuthenticatorHarness::with_tpm, || {
+        run_userless_discoverable_passkey_test()
+    })
+}
+
+#[test]
+#[ignore]
+fn test_local_userless_multiple_discoverable_credentials() -> Result<()> {
+    with_backend("local", AuthenticatorHarness::with_local, || {
+        run_userless_multiple_discoverable_credentials_test()
     })
 }

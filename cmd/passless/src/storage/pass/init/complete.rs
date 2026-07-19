@@ -9,18 +9,21 @@ use std::path::PathBuf;
 pub struct Complete {
     pub(super) store_path: PathBuf,
     pub(super) fingerprint: String,
+    pub(super) allow_create_without_prompt: bool,
 }
 
 impl Complete {
     pub fn finish(self) -> Result<()> {
-        let _ = show_info_notification(
-            "✅ Password Store Initialized",
-            &format!(
-                "Password store successfully initialized at:\n{}\n\nGPG Key: {}",
-                self.store_path.display(),
-                self.fingerprint
-            ),
-        );
+        if !self.allow_create_without_prompt {
+            let _ = show_info_notification(
+                "✅ Password Store Initialized",
+                &format!(
+                    "Password store successfully initialized at:\n{}\n\nGPG Key: {}",
+                    self.store_path.display(),
+                    self.fingerprint
+                ),
+            );
+        }
 
         Ok(())
     }

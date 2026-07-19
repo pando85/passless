@@ -14,6 +14,7 @@
 //!
 //! This allows fast iteration without loading all credentials.
 
+use crate::storage::CredentialFilter;
 use crate::util::bytes_to_hex;
 
 use std::collections::HashMap;
@@ -101,6 +102,53 @@ pub struct CredentialIndexes {
     pub rp: HashMap<String, Vec<Vec<u8>>>,
     /// Map RP ID hash to list of credential IDs
     pub rp_hash: HashMap<[u8; 32], Vec<Vec<u8>>>,
+}
+
+impl CredentialIndexes {
+    pub fn resolve_filter(&self, filter: &CredentialFilter, base_dir: &Path) -> Vec<PathBuf> {
+        match filter {
+            CredentialFilter::None => self
+                .id
+                .values()
+                .map(|path_info| path_info.to_path(base_dir))
+                .collect(),
+            CredentialFilter::ById(id) => {
+                if let Some(path_info) = self.id.get(id) {
+                    vec![path_info.to_path(base_dir)]
+                } else {
+                    Vec::new()
+                }
+            }
+            CredentialFilter::ByRp(rp_id) => self
+                .rp
+                .get(rp_id)
+                .map(|cred_ids| {
+                    cred_ids
+                        .iter()
+                        .filter_map(|cred_id| {
+                            self.id
+                                .get(cred_id)
+                                .map(|path_info| path_info.to_path(base_dir))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            CredentialFilter::ByHash(hash) => self
+                .rp_hash
+                .get(hash)
+                .map(|cred_ids| {
+                    cred_ids
+                        .iter()
+                        .filter_map(|cred_id| {
+                            self.id
+                                .get(cred_id)
+                                .map(|path_info| path_info.to_path(base_dir))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 pub struct CachedCredential {

@@ -19,6 +19,12 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+fn secure_temp_dir() -> Result<TempDir, std::io::Error> {
+    let temp_dir = TempDir::new()?;
+    std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(temp_dir)
+}
+
 /// Backend-specific setup and configuration
 #[allow(dead_code)]
 pub trait BackendSetup: Send {
@@ -45,8 +51,9 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = secure_temp_dir()?;
         Ok(Self {
             temp_dir,
             vendor_id: None,
@@ -72,7 +79,7 @@ impl LocalBackend {
     #[allow(dead_code)]
     pub fn with_path(path: std::path::PathBuf) -> Self {
         Self {
-            temp_dir: TempDir::new().unwrap(),
+            temp_dir: secure_temp_dir().unwrap(),
             vendor_id: None,
             product_id: None,
             pin_enforcement: None,
@@ -86,6 +93,10 @@ impl BackendSetup for LocalBackend {
     fn setup(&mut self) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let mut env = HashMap::new();
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+        env.insert(
+            "PASSLESS_E2E_AUTO_ACCEPT_STORAGE".to_string(),
+            "1".to_string(),
+        );
 
         if let Some(vendor_id) = self.vendor_id {
             env.insert(
@@ -140,8 +151,9 @@ pub struct PassBackend {
 }
 
 impl PassBackend {
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = secure_temp_dir()?;
         let gpg_home = temp_dir.path().join(".gnupg");
 
         Ok(Self {
@@ -188,26 +200,6 @@ Expire-Date: 0
 
         Ok(())
     }
-
-    /// Initialize password store
-    fn init_pass(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let output = Command::new("pass")
-            .env("PASSWORD_STORE_DIR", self.temp_dir.path())
-            .env("GNUPGHOME", &self.gpg_home)
-            .arg("init")
-            .arg("passless-e2e@test.local")
-            .output()?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to initialize password store: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-
-        Ok(())
-    }
 }
 
 impl BackendSetup for PassBackend {
@@ -215,7 +207,6 @@ impl BackendSetup for PassBackend {
         println!("🔧 Setting up password-store backend...");
 
         std::fs::create_dir_all(&self.gpg_home)?;
-        std::fs::create_dir_all(self.temp_dir.path().join("fido2"))?;
 
         // Set restrictive permissions on GPG home
         #[cfg(unix)]
@@ -226,12 +217,15 @@ impl BackendSetup for PassBackend {
         self.init_gpg()?;
         println!("   ✓ GPG key generated");
 
-        self.init_pass()?;
-        println!("   ✓ Password store initialized");
+        println!("   ✓ Password store will be initialized by passless");
 
         let mut env = HashMap::new();
         env.insert("GNUPGHOME".to_string(), self.gpg_home.display().to_string());
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+        env.insert(
+            "PASSLESS_E2E_AUTO_ACCEPT_STORAGE".to_string(),
+            "1".to_string(),
+        );
 
         if let Some(vendor_id) = self.vendor_id {
             env.insert(
@@ -276,8 +270,9 @@ pub struct TpmBackend {
 }
 
 impl TpmBackend {
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
+        let temp_dir = secure_temp_dir()?;
 
         Ok(Self {
             temp_dir,
@@ -342,6 +337,10 @@ impl BackendSetup for TpmBackend {
             "swtpm:host=localhost,port=2321".to_string(),
         );
         env.insert("PASSLESS_E2E_AUTO_ACCEPT_UV".to_string(), "1".to_string());
+        env.insert(
+            "PASSLESS_E2E_AUTO_ACCEPT_STORAGE".to_string(),
+            "1".to_string(),
+        );
 
         if let Some(vendor_id) = self.vendor_id {
             env.insert(
@@ -399,6 +398,7 @@ impl Drop for TpmBackend {
 pub struct AuthenticatorHarness {
     process: Option<Child>,
     backend: Box<dyn BackendSetup>,
+    config_dir: TempDir,
     started_by_harness: bool,
 }
 
@@ -408,11 +408,13 @@ impl AuthenticatorHarness {
         Self {
             process: None,
             backend,
+            config_dir: secure_temp_dir().expect("failed to create temporary config directory"),
             started_by_harness: false,
         }
     }
 
     /// Create a harness with local backend
+    #[allow(dead_code)]
     pub fn with_local() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(LocalBackend::new()?)))
     }
@@ -424,11 +426,13 @@ impl AuthenticatorHarness {
     }
 
     /// Create a harness with password-store backend
+    #[allow(dead_code)]
     pub fn with_pass() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(PassBackend::new()?)))
     }
 
     /// Create a harness with TPM backend
+    #[allow(dead_code)]
     pub fn with_tpm() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self::new(Box::new(TpmBackend::new()?)))
     }
@@ -479,11 +483,14 @@ impl AuthenticatorHarness {
         let env_vars = self.backend.setup()?;
         let args = self.backend.args();
 
-        // Build the cargo command
-        let mut cmd = Command::new("cargo");
-        cmd.arg("run")
-            .arg("--")
-            .args(&args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_passless"));
+        cmd.args(&args)
+            .env(
+                "PASSLESS_CONFIG",
+                self.config_dir.path().join("config.toml"),
+            )
+            .env("PASSLESS_E2E_AUTO_ACCEPT_UV", "1")
+            .env("PASSLESS_E2E_AUTO_ACCEPT_STORAGE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

@@ -8,21 +8,22 @@ use crate::storage::index::{
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
-use crate::util::{bytes_to_hex, create_secure_dir_all, create_secure_file};
+use crate::util::{atomic_write_in_dir, bytes_to_hex, create_secure_dir_all};
 
 use soft_fido2::Result;
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use log::{debug, info};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use tss_esapi::constants::SessionType;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
@@ -64,14 +65,19 @@ struct SealedBlob {
 }
 
 impl TpmStorageAdapter {
-    /// Create a new TPM storage adapter
-    pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
+    pub fn new_with_options(
+        storage_dir: PathBuf,
+        tcti: Option<String>,
+        allow_create_without_prompt: bool,
+    ) -> Result<Self> {
+        let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
         info!("Using TPM 2.0 backend");
         info!("Storage path: {}", storage_dir.display());
 
         // Ensure the storage directory is initialized
         // This will prompt the user via notifications if not initialized
-        self::init::ensure_initialized(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
+        self::init::ensure_initialized(&storage_dir, allow_create_without_prompt)
+            .map_err(|_| soft_fido2::Error::Other)?;
 
         // Initialize TPM context
         let tcti_conf = if let Some(ref tcti_str) = tcti {
@@ -244,7 +250,7 @@ impl TpmStorageAdapter {
         // Generate a random 96-bit nonce for AES-GCM
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..]).expect("valid nonce length");
 
         // Encrypt the credential data with AES-GCM
         let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
@@ -252,7 +258,7 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        let encrypted_data = cipher.encrypt(nonce, data).map_err(|e| {
+        let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
             log::error!("Failed to encrypt data with AES-GCM: {}", e);
             soft_fido2::Error::Other
         })?;
@@ -423,14 +429,14 @@ impl TpmStorageAdapter {
         }
 
         // Decrypt the data with AES-GCM
-        let nonce = Nonce::from_slice(&sealed_blob.nonce);
+        let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
         let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
             log::error!("Failed to create AES cipher: {}", e);
             soft_fido2::Error::Other
         })?;
 
         let decrypted_data = cipher
-            .decrypt(nonce, sealed_blob.encrypted_data.as_ref())
+            .decrypt(&nonce, sealed_blob.encrypted_data.as_ref())
             .map_err(|e| {
                 log::error!("Failed to decrypt data with AES-GCM: {}", e);
                 soft_fido2::Error::Other
@@ -553,12 +559,11 @@ impl TpmStorageAdapter {
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists with secure permissions
-        if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent).map_err(|e| {
-                debug!("Failed to create directory: {}", e);
-                soft_fido2::Error::Other
-            })?;
-        }
+        let parent = path.parent().ok_or(soft_fido2::Error::Other)?;
+        create_secure_dir_all(parent).map_err(|e| {
+            debug!("Failed to create directory: {}", e);
+            soft_fido2::Error::Other
+        })?;
 
         // Convert to our format for controlled serialization
         let our_cred = Credential::from_soft_fido2(cred);
@@ -568,12 +573,11 @@ impl TpmStorageAdapter {
         // Seal the data using TPM
         let sealed_data = self.seal_data(&bytes)?;
 
-        let mut file = create_secure_file(&path).map_err(|e| {
-            log::error!("Failed to create credential file {}: {}", path.display(), e);
-            soft_fido2::Error::Other
-        })?;
-
-        file.write_all(&sealed_data).map_err(|e| {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(soft_fido2::Error::Other)?;
+        atomic_write_in_dir(parent, filename, &sealed_data).map_err(|e| {
             log::error!("Failed to write credential file {}: {}", path.display(), e);
             soft_fido2::Error::Other
         })?;
@@ -633,62 +637,7 @@ impl CredentialStorage for TpmStorageAdapter {
 
         debug!("read_first called with filter: {:?}", filter);
 
-        // Initialize iteration using the appropriate index
-        self.iteration_entries = match &filter {
-            CredentialFilter::None => {
-                // No filter: iterate all credentials
-                self.indexes
-                    .id
-                    .values()
-                    .map(|path_info| path_info.to_path(&self.storage_dir))
-                    .collect()
-            }
-            CredentialFilter::ById(id) => {
-                // ById: direct lookup in index
-                if let Some(path_info) = self.indexes.id.get(id.as_slice()) {
-                    vec![path_info.to_path(&self.storage_dir)]
-                } else {
-                    Vec::new()
-                }
-            }
-            CredentialFilter::ByRp(rp_id) => {
-                // ByRp: lookup in index
-                self.indexes
-                    .rp
-                    .get(rp_id.as_str())
-                    .map(|cred_ids| {
-                        cred_ids
-                            .iter()
-                            .filter_map(|cred_id| {
-                                self.indexes
-                                    .id
-                                    .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.storage_dir))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-            CredentialFilter::ByHash(hash) => {
-                // ByHash: lookup in index
-                self.indexes
-                    .rp_hash
-                    .get(hash)
-                    .map(|cred_ids| {
-                        cred_ids
-                            .iter()
-                            .filter_map(|cred_id| {
-                                self.indexes
-                                    .id
-                                    .get(cred_id)
-                                    .map(|path_info| path_info.to_path(&self.storage_dir))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-        };
-
+        self.iteration_entries = self.indexes.resolve_filter(&filter, &self.storage_dir);
         self.iteration_index = 0;
 
         debug!(
