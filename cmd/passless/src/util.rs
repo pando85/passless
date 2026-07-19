@@ -257,6 +257,74 @@ pub fn create_secure_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
+pub fn create_secure_subdir_at(root_fd: i32, subdir_name: &str) -> io::Result<()> {
+    let c_name = CString::new(subdir_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid subdir name"))?;
+
+    let ret = unsafe { libc::mkdirat(root_fd, c_name.as_ptr(), 0o700) };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let flags = libc::AT_SYMLINK_NOFOLLOW;
+            if unsafe { libc::fstatat(root_fd, c_name.as_ptr(), &mut stat, flags) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "symlink detected at subdir",
+                ));
+            }
+            if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "subdir is not a directory",
+                ));
+            }
+            let uid = current_uid();
+            if stat.st_uid != uid && stat.st_uid != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "subdir owned by unexpected user",
+                ));
+            }
+            return Ok(());
+        }
+        return Err(err);
+    }
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::fstatat(root_fd, c_name.as_ptr(), &mut stat, flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "created path is not a directory",
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn validate_path_beneath_root(canonical_path: &Path, canonical_root: &Path) -> io::Result<()> {
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "path {} is not beneath root {}",
+                canonical_path.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

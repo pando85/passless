@@ -331,6 +331,12 @@ fn run() -> Result<()> {
         e
     })?;
 
+    // Validate backend configuration for security
+    backend.validate().map_err(|e| {
+        error!("Backend configuration validation failed: {}", e);
+        e
+    })?;
+
     #[cfg(feature = "agent")]
     let agent_enabled = config.agents.enabled;
     #[cfg(not(feature = "agent"))]

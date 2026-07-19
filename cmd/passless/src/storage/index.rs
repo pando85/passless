@@ -1,61 +1,26 @@
-//! Shared indexing and caching for credential storage backends
-//!
-//! This module provides:
-//! - Efficient credential indexing from file system paths
-//! - Time-limited credential caching for performance
-//! - Memory-safe zeroization of cached credentials
-//!
-//! # Architecture
-//!
-//! The index system uses a three-level lookup structure:
-//! 1. **By ID**: Direct lookup by credential ID (O(1))
-//! 2. **By RP ID**: Filter credentials by relying party (O(1))
-//! 3. **By RP Hash**: Filter by credential ID hash (O(1))
-//!
-//! This allows fast iteration without loading all credentials.
-
 use crate::storage::CredentialFilter;
+use crate::storage::rp_id::ValidatedRpId;
 use crate::util::bytes_to_hex;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use log::debug;
+use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
-/// 30s TTL: short enough to minimize exposure, long enough for single auth flow
 pub const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(30);
 pub const MAX_CACHE_SIZE: usize = 10;
 
-/// Represents the structured path of a credential file
-///
-/// Path structure: {base_dir}/{rp_id}/{cred_id_hex}.{extension}
-///
-/// This structure allows efficient metadata extraction without loading the file:
-/// - RP ID is in the directory name (parent of file)
-/// - Credential ID is decoded from the filename
-/// - Extension determines storage type (bin, gpg, tpm)
-///
-/// # Example
-///
-/// For path `{store_dir}/example.com/a1b2c3d4.gpg`:
-/// - RP ID: "example.com"
-/// - Credential ID: [0xa1, 0xb2, 0xc3, 0xd4]
-/// - Extension: "gpg"
 #[derive(Debug, Clone)]
 pub struct CredentialPathInfo {
-    /// Relying Party ID (extracted from directory name)
-    pub rp_id: String,
-    /// Credential ID (decoded from filename)
+    pub rp_id: ValidatedRpId,
     pub cred_id: Vec<u8>,
-    /// File extension (e.g., "bin", "gpg", "tpm")
     pub extension: String,
 }
 
 impl CredentialPathInfo {
-    /// Create from path components
-    pub fn new(rp_id: String, cred_id: Vec<u8>, extension: String) -> Self {
+    pub fn new(rp_id: ValidatedRpId, cred_id: Vec<u8>, extension: String) -> Self {
         Self {
             rp_id,
             cred_id,
@@ -63,16 +28,24 @@ impl CredentialPathInfo {
         }
     }
 
-    /// Parse from a file path
-    /// Expects structure: {base_dir}/{rp_id}/{cred_id_hex}.{extension}
     pub fn from_path(path: &Path, extension: &str) -> Option<Self> {
-        // Get filename and parse cred_id
         let filename = path.file_name()?.to_str()?;
         let cred_id = parse_cred_id_from_filename(filename, extension)?;
 
-        // Get rp_id from parent directory name
         let parent = path.parent()?;
-        let rp_id = parent.file_name()?.to_str()?.to_string();
+        let rp_id_str = parent.file_name()?.to_str()?;
+
+        let rp_id = match ValidatedRpId::try_from(rp_id_str) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(
+                    "Skipping credential at {}: invalid RP ID directory name: {}",
+                    path.display(),
+                    e
+                );
+                return None;
+            }
+        };
 
         Some(Self {
             rp_id,
@@ -81,12 +54,10 @@ impl CredentialPathInfo {
         })
     }
 
-    /// Reconstruct the full path for this credential
     pub fn to_path(&self, base_dir: &Path) -> PathBuf {
         get_credential_path(base_dir, &self.rp_id, &self.cred_id, &self.extension)
     }
 
-    /// Get the RP ID hash for this credential
     pub fn rp_id_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.rp_id.as_bytes());
@@ -96,11 +67,8 @@ impl CredentialPathInfo {
 
 #[derive(Default)]
 pub struct CredentialIndexes {
-    /// Map credential ID to path info
     pub id: HashMap<Vec<u8>, CredentialPathInfo>,
-    /// Map RP ID to list of credential IDs
     pub rp: HashMap<String, Vec<Vec<u8>>>,
-    /// Map RP ID hash to list of credential IDs
     pub rp_hash: HashMap<[u8; 32], Vec<Vec<u8>>>,
 }
 
@@ -184,7 +152,6 @@ impl CredentialCache {
     }
 
     pub fn remove(&mut self, path: &Path) {
-        // Explicitly drop the credential to ensure SecVec is zeroized immediately
         if let Some(cached) = self.cache.remove(path) {
             drop(cached.credential);
         }
@@ -193,7 +160,6 @@ impl CredentialCache {
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
 
-        // Collect expired entries to explicitly drop their credentials
         let expired: Vec<PathBuf> = self
             .cache
             .iter()
@@ -201,7 +167,6 @@ impl CredentialCache {
             .map(|(path, _)| path.clone())
             .collect();
 
-        // Explicitly drop credentials before removing from cache
         for path in expired {
             debug!("Evicting expired cache entry: {:?}", path);
             if let Some(cached) = self.cache.remove(&path) {
@@ -222,7 +187,6 @@ impl CredentialCache {
             && let Some(oldest) = self.find_oldest()
         {
             debug!("Cache full - evicting oldest entry: {:?}", oldest);
-            // Explicitly drop the credential before removing from cache
             if let Some(cached) = self.cache.remove(&oldest) {
                 drop(cached.credential);
             }
@@ -256,51 +220,15 @@ pub fn parse_cred_id_from_filename(filename: &str, extension: &str) -> Option<Ve
 
 pub fn get_credential_path(
     storage_dir: &Path,
-    rp_id: &str,
+    rp_id: &ValidatedRpId,
     cred_id: &[u8],
     extension: &str,
 ) -> PathBuf {
     storage_dir
-        .join(rp_id)
+        .join(rp_id.as_str())
         .join(get_filename(cred_id, extension))
 }
 
-/// Build indexes from directory structure - no credential loading needed!
-///
-/// This function efficiently extracts credential metadata from the file system
-/// without loading or decrypting any credentials. It builds indexes that allow
-/// fast lookups by credential ID, RP ID, and RP ID hash.
-///
-/// # Performance
-///
-/// O(n) complexity where n = total credentials (single directory traversal)
-///
-/// Uses lazy evaluation with path parsing rather than loading file contents.
-///
-/// # Arguments
-///
-/// * `storage_dir` - The root directory containing credential files
-/// * `extension` - Expected file extension (e.g., "bin", "gpg", "tpm")
-///
-/// # Returns
-///
-/// A `CredentialIndexes` structure containing:
-/// - `id`: Map of credential ID to path information
-/// - `rp`: Map of RP ID to list of credential IDs
-/// - `rp_hash`: Map of RP ID hash to list of credential IDs
-///
-/// # Error Handling
-///
-/// Returns default indexes if directory is inaccessible or empty.
-/// Errors are logged at debug level and don't affect the calling code.
-///
-/// # Examples
-///
-/// ```
-/// let indexes = load_credential_paths(&Path::new("/path/to/store"), "gpg")?;
-/// assert_eq!(indexes.id.len(), 10); // 10 credentials indexed
-/// assert!(indexes.rp.contains_key("example.com"));
-/// ```
 pub fn load_credential_paths(
     storage_dir: &Path,
     extension: &str,
@@ -327,6 +255,16 @@ pub fn load_credential_paths(
             {
                 return None;
             }
+
+            let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if ValidatedRpId::try_from(dir_name).is_err() {
+                warn!(
+                    "Skipping directory with invalid RP ID name: {}",
+                    path.display()
+                );
+                return None;
+            }
+
             Some(path)
         })
         .collect();
@@ -352,19 +290,17 @@ pub fn load_credential_paths(
         };
 
         for cred_path in cred_files {
-            // Parse path info from the file path structure
             if let Some(path_info) = CredentialPathInfo::from_path(&cred_path, extension) {
                 let cred_id = path_info.cred_id.clone();
                 let rp_id = path_info.rp_id.clone();
                 let rp_hash = path_info.rp_id_hash();
 
-                // Index by credential ID
                 indexes.id.insert(cred_id.clone(), path_info);
-
-                // Index by RP ID
-                indexes.rp.entry(rp_id).or_default().push(cred_id.clone());
-
-                // Index by RP ID hash
+                indexes
+                    .rp
+                    .entry(rp_id.to_string())
+                    .or_default()
+                    .push(cred_id.clone());
                 indexes.rp_hash.entry(rp_hash).or_default().push(cred_id);
             }
         }
@@ -381,34 +317,30 @@ pub fn update_indexes_on_write(indexes: &mut CredentialIndexes, path_info: Crede
 
     let is_new = !indexes.id.contains_key(&cred_id);
 
-    // Index by credential ID
     indexes.id.insert(cred_id.clone(), path_info);
 
-    // Only update RP indexes for new credentials to avoid duplicates
     if is_new {
-        // Index by RP ID
-        indexes.rp.entry(rp_id).or_default().push(cred_id.clone());
-
-        // Index by RP ID hash
+        indexes
+            .rp
+            .entry(rp_id.to_string())
+            .or_default()
+            .push(cred_id.clone());
         indexes.rp_hash.entry(rp_hash).or_default().push(cred_id);
     }
 }
 
 pub fn update_indexes_on_delete(indexes: &mut CredentialIndexes, cred_id: &[u8]) {
-    // Get the path info to extract RP ID
     if let Some(path_info) = indexes.id.remove(cred_id) {
-        let rp_id = &path_info.rp_id;
+        let rp_id_str = path_info.rp_id.to_string();
         let rp_hash = path_info.rp_id_hash();
 
-        // Remove from RP index
-        if let Some(cred_ids) = indexes.rp.get_mut(rp_id) {
+        if let Some(cred_ids) = indexes.rp.get_mut(&rp_id_str) {
             cred_ids.retain(|id| id != cred_id);
             if cred_ids.is_empty() {
-                indexes.rp.remove(rp_id);
+                indexes.rp.remove(&rp_id_str);
             }
         }
 
-        // Remove from RP hash index
         if let Some(cred_ids) = indexes.rp_hash.get_mut(&rp_hash) {
             cred_ids.retain(|id| id != cred_id);
             if cred_ids.is_empty() {

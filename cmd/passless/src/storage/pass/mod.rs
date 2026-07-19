@@ -7,6 +7,7 @@ use crate::storage::index::{
     CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
+use crate::storage::rp_id::ValidatedRpId;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{bytes_to_hex, create_secure_dir_all};
 use passless_core::error::{Error, Result};
@@ -374,7 +375,16 @@ impl PassStorageAdapter {
     ) -> Result<()> {
         self.cache.evict_expired();
 
-        let path = get_credential_path(&self.get_fido2_path(), &cred.rp.id, &cred.id, "gpg");
+        let rp_id = ValidatedRpId::try_from(cred.rp.id.as_str()).map_err(|e| {
+            log::error!(
+                "Rejected credential with invalid RP ID '{}': {}",
+                cred.rp.id,
+                e
+            );
+            Error::Storage(format!("Invalid RP ID: {}", e))
+        })?;
+
+        let path = get_credential_path(&self.get_fido2_path(), &rp_id, &cred.id, "gpg");
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists with secure permissions
@@ -407,8 +417,7 @@ impl PassStorageAdapter {
         self.cache.remove(&path);
 
         // Update all indexes using shared function
-        let path_info =
-            CredentialPathInfo::new(cred.rp.id.clone(), cred.id.to_vec(), "gpg".to_string());
+        let path_info = CredentialPathInfo::new(rp_id, cred.id.to_vec(), "gpg".to_string());
         update_indexes_on_write(&mut self.indexes, path_info);
 
         // Commit and push changes to git remote if configured

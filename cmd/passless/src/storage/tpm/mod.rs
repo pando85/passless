@@ -7,6 +7,7 @@ use crate::storage::index::{
     CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
+use crate::storage::rp_id::ValidatedRpId;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{atomic_write_in_dir, bytes_to_hex, create_secure_dir_all};
 
@@ -555,7 +556,16 @@ impl TpmStorageAdapter {
     fn write_credential(&mut self, cred: &soft_fido2::Credential) -> Result<()> {
         self.cache.evict_expired();
 
-        let path = get_credential_path(&self.storage_dir, &cred.rp.id, &cred.id, "tpm");
+        let rp_id = ValidatedRpId::try_from(cred.rp.id.as_str()).map_err(|e| {
+            log::error!(
+                "Rejected credential with invalid RP ID '{}': {}",
+                cred.rp.id,
+                e
+            );
+            soft_fido2::Error::Other
+        })?;
+
+        let path = get_credential_path(&self.storage_dir, &rp_id, &cred.id, "tpm");
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists with secure permissions
@@ -588,8 +598,7 @@ impl TpmStorageAdapter {
         self.cache.remove(&path);
 
         // Update all indexes using shared function
-        let path_info =
-            CredentialPathInfo::new(cred.rp.id.clone(), cred.id.to_vec(), "tpm".to_string());
+        let path_info = CredentialPathInfo::new(rp_id, cred.id.to_vec(), "tpm".to_string());
         update_indexes_on_write(&mut self.indexes, path_info);
 
         Ok(())

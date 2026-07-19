@@ -516,6 +516,64 @@ impl BackendConfig {
             BackendConfig::Tpm { path, .. } => path.clone(),
         }
     }
+
+    /// Validate backend configuration for security and correctness.
+    ///
+    /// This checks that paths are well-formed and don't escape their intended roots.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        match self {
+            BackendConfig::Local { path } => {
+                let p = Path::new(path);
+                if !p.is_absolute() && !p.starts_with("~") {
+                    debug!("Local backend path is relative: {}, canonicalizing", path);
+                }
+                Ok(())
+            }
+            BackendConfig::Pass {
+                store_path, path, ..
+            } => {
+                let p = Path::new(path);
+                if p.is_absolute() {
+                    return Err(Error::Config(format!(
+                        "Pass backend 'path' must be relative, got absolute path: {}",
+                        path
+                    )));
+                }
+                if path.contains("..") {
+                    return Err(Error::Config(format!(
+                        "Pass backend 'path' must not contain '..': {}",
+                        path
+                    )));
+                }
+                if path.starts_with('/') || path.starts_with('\\') {
+                    return Err(Error::Config(format!(
+                        "Pass backend 'path' must not start with path separator: {}",
+                        path
+                    )));
+                }
+                // Verify the combined path doesn't escape the store
+                let combined = Path::new(store_path).join(path);
+                let canonical_store = Self::canonicalize_path(Path::new(store_path));
+                let canonical_combined = Self::canonicalize_path(&combined);
+                if !canonical_combined.starts_with(&canonical_store) {
+                    return Err(Error::Config(format!(
+                        "Pass backend 'path' escapes store_path: {} not beneath {}",
+                        canonical_combined.display(),
+                        canonical_store.display()
+                    )));
+                }
+                Ok(())
+            }
+            #[cfg(feature = "tpm")]
+            BackendConfig::Tpm { path, .. } => {
+                let p = Path::new(path);
+                if !p.is_absolute() && !p.starts_with("~") {
+                    debug!("TPM backend path is relative: {}, canonicalizing", path);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl AppConfig {
