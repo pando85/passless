@@ -59,7 +59,9 @@ timeout 600s cargo test --all-features -- \
     --skip agent::browser::tests::test_cdp_pipes_drop_closes_fds \
     --skip agent::browser::tests::test_child_in_separate_process_group \
     --skip agent::browser::tests::test_no_fd_leakage_to_child \
-    --skip agent::browser::tests::test_concurrent_launch_and_revoke
+    --skip agent::browser::tests::test_concurrent_launch_and_revoke \
+    --skip agent::runtime::tests \
+    --skip agent::launcher::tests::test_spawn_principal_non_root_fails_closed
 
 echo "=== Phase 4: cargo test (agent-principal-probe) ===" >&2
 timeout 300s cargo test -p agent-principal-probe
@@ -87,6 +89,14 @@ timeout 120s cargo test --all-features -p passless-rs --bin passless \
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_concurrent_launch_and_revoke -- --test-threads=1
 
+echo "=== Phase 9: cargo test (runtime tests, single-threaded) ===" >&2
+timeout 600s cargo test --all-features -p passless-rs --bin passless \
+    agent::runtime::tests -- --test-threads=1
+
+echo "=== Phase 10: cargo test (launcher tests, single-threaded) ===" >&2
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
+    agent::launcher::tests::test_spawn_principal_non_root_fails_closed -- --test-threads=1
+
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/passless-agent-validation.XXXXXX")
 trap 'rm -rf -- "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/tmp"
@@ -106,10 +116,10 @@ source tools/agent-validation/lib/secret-scanning.sh
 # shellcheck source=tools/agent-validation/stages/secret-scanning.sh
 source tools/agent-validation/stages/secret-scanning.sh
 
-echo "=== Phase 9: fault injection ===" >&2
+echo "=== Phase 11: fault injection ===" >&2
 stage_fault_injection
 
-echo "=== Phase 10: secret scanning ===" >&2
+echo "=== Phase 12: secret scanning ===" >&2
 stage_secret_scanning
 
 echo "=== All phases completed ===" >&2
