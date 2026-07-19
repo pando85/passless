@@ -43,7 +43,7 @@ Each registration or authentication policy contains:
 
 ```text
 authorization: deny | confirm | allow
-user_presence: human | policy
+user_presence: human | policy | none
 user_verification: human | policy | none
 ```
 
@@ -54,6 +54,7 @@ The meanings are:
 - `allow`: resolve the operation from current administrator policy without a notification.
 - `user_presence = human`: set UP only after the bound trusted confirmation.
 - `user_presence = policy`: set UP from the exact current policy rule and record that source.
+- `user_presence = none`: do not require or assert UP.
 - `user_verification = human`: set UV only after the production PIN/platform-verification path.
 - `user_verification = policy`: set UV from the exact current policy rule and record that source.
 - `user_verification = none`: do not require or assert UV unless the CTAP request independently
@@ -61,6 +62,11 @@ The meanings are:
 
 Invalid combinations fail configuration. In particular, `authorization = allow` cannot use
 `user_presence = human`, and `authorization = deny` cannot assert UP or UV.
+
+A fully unattended isolated profile may use `authorization = allow` with policy UP/UV for both
+registration and authentication. This is machine authorization, not human interaction. It removes
+the notification but retains exact-RP policy, one-shot operation binding, isolated storage, audit
+gating, and terminal consumption.
 
 Missing profiles, rules, actions, evidence settings, storage targets, or policy generations deny.
 There is no permissive default.

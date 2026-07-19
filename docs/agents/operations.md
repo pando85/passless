@@ -18,6 +18,22 @@ passless agent-admin audit export --format csv
   an administrator repairs and acknowledges it.
 - Human operations remain available during agent audit degradation.
 
+### Reviewing unattended profiles
+
+For profiles with `authorization = "allow"`, review audit records for policy-authorized UP/UV,
+credential creation and use, denials, policy generation changes, and unexpected RP IDs. Verify the
+hash chain regularly and after every policy or registration change:
+
+```bash
+passless agent-admin audit verify
+passless agent-admin profile show <profile>
+passless agent-admin policy show <profile>
+```
+
+Audit records distinguish `policy` evidence from `human` evidence and exclude credential private
+keys and other secret material. The first release does not externally anchor the local hash chain;
+a host root capable of replacing daemon state can also rewrite local audit history.
+
 ## Disable and revoke
 
 Disable a profile without deleting credentials:
@@ -52,6 +68,10 @@ To disable all agent functionality:
 4. Set `enabled = false` in configuration or stop the daemon.
 
 Human credentials and configuration are not affected.
+
+For an unattended isolated profile, changing registration to an all-`none` `deny` rule and
+restarting the daemon closes enrollment without deleting existing isolated credentials. Disabling
+the profile is the immediate stop mechanism for both registration and authentication.
 
 ## Uninstall
 

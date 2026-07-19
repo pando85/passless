@@ -66,6 +66,10 @@ denied action must use `none` for both evidence sources.
 
 Isolated mode must not set `browser_user` or `browser_runtime_root`.
 
+For fully unattended isolated operation, an exact action may use `authorization = "allow"` with
+policy UP/UV. After enrollment, change registration to an all-`none` `deny` rule unless unattended
+credential creation must remain available. See the [fully unattended isolated workflow](isolated.md#fully-unattended-workflow).
+
 ### Storage backends
 
 ```toml
@@ -122,10 +126,35 @@ product_id = 22136
   supervised migration form. They cannot be mixed with explicit `rules`.
 - Unknown fields in any section cause load failure.
 
+## Migrating legacy profiles
+
+The experimental legacy fields describe one supervised policy for every listed RP:
+
+```toml
+rp_ids = ["github.com"]
+registration_allowed = true
+require_uv = true
+```
+
+Replace them with an explicit rule before enabling autonomous behavior:
+
+```toml
+[[agents.profiles.<id>.rules]]
+rp_id = "github.com"
+register = { authorization = "confirm", user_presence = "human", user_verification = "human" }
+authenticate = { authorization = "confirm", user_presence = "human", user_verification = "human" }
+```
+
+Create one rule per legacy RP ID. Set `register` to an all-`none` `deny` rule when
+`registration_allowed` was false, and set `user_verification = "none"` when `require_uv` was false.
+Do not keep legacy fields alongside `rules`; mixed forms fail configuration. Change `confirm` to
+`allow` and select policy evidence only after reviewing the [security model](security.md#authorization-and-upuv).
+
 ## Policy reload behavior
 
 The `agent-admin policy reload` command recompiles policy from the daemon's in-memory
-configuration snapshot, not from disk. To apply configuration file changes:
+configuration snapshot, not from disk. It cannot apply an edited TOML file. To apply configuration
+file changes:
 
 1. Edit the TOML configuration file.
 2. Restart the daemon (`systemctl restart passless-agent` or equivalent).

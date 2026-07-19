@@ -13,7 +13,7 @@ evidence is available in `tools/agent-uhid-feasibility/evidence.md`. Full produc
 ## Documentation
 
 - [Configuration reference](configuration.md) — complete field definitions and validation rules
-- [Isolated mode](isolated.md) — agent-only credentials with independent storage
+- [Isolated mode](isolated.md) — agent-only credentials, including fully unattended operation
 - [Delegated-session mode](delegated-session.md) — temporary reuse of one human credential
 - [Security model](security.md) — threat model, UP/UV semantics, browser-control authority
 - [Operations](operations.md) — audit, revocation, rollback, recovery

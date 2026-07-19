@@ -26,6 +26,18 @@ authentication. It also selects the source of UP and UV evidence.
 - If the notification server cannot provide distinguishable approve and deny actions,
   agent mode fails closed.
 
+### Unattended operation semantics
+
+An exact action using `authorization = "allow"` and policy UP/UV is fully unattended: current
+administrator policy resolves the one-shot operation without displaying a notification. Policy UP
+and UV are machine authorization claims, not evidence that a human was present or locally verified.
+
+The RP receives ordinary WebAuthn UP/UV flags and generally cannot distinguish human evidence from
+policy evidence. Passless records the selected authorization and evidence sources in its audit log,
+so operators must treat the rule itself as authority to make those claims. One-shot binding,
+policy re-evaluation, credential scope, audit reservation, and terminal consumption are unchanged.
+For a complete setup, see the [fully unattended isolated workflow](isolated.md#fully-unattended-workflow).
+
 ## Origin vs RP ID
 
 The stock browser validates that the calling origin may use the requested RP ID. Passless
@@ -82,6 +94,10 @@ Mitigations:
 - Delegated access is a filtered view over one exact human credential.
 - Human and delegated access serialize all mutable credential state.
 - Private keys remain in daemon-owned storage and never cross local protocols.
+
+For isolated profiles, `allow` changes ceremony authorization only. It does not grant access to
+human credentials, another profile's credentials, daemon-owned storage, policy administration, or
+the admin socket.
 
 ## Preferred alternatives
 
