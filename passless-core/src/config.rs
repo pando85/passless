@@ -545,12 +545,6 @@ impl BackendConfig {
                         path
                     )));
                 }
-                if path.starts_with('/') || path.starts_with('\\') {
-                    return Err(Error::Config(format!(
-                        "Pass backend 'path' must not start with path separator: {}",
-                        path
-                    )));
-                }
                 // Verify the combined path doesn't escape the store
                 let combined = Path::new(store_path).join(path);
                 let canonical_store = Self::canonicalize_path(Path::new(store_path));

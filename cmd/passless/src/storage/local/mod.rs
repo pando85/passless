@@ -7,7 +7,7 @@ use crate::storage::index::{
     CredentialIndexes, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
     update_indexes_on_write,
 };
-use crate::storage::rp_id::ValidatedRpId;
+use crate::storage::rp_id::validate_rp_id_for_storage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{atomic_write_in_dir, create_secure_dir_all};
 
@@ -76,13 +76,8 @@ impl LocalStorageAdapter {
     fn save_credential(&mut self, cred: &soft_fido2::Credential) -> Result<()> {
         let our_cred = Credential::from_soft_fido2(cred);
 
-        let rp_id = ValidatedRpId::try_from(cred.rp.id.as_str()).map_err(|e| {
-            error!(
-                "Rejected credential with invalid RP ID '{}': {}",
-                cred.rp.id, e
-            );
-            soft_fido2::Error::Other
-        })?;
+        let rp_id = validate_rp_id_for_storage(cred.rp.id.as_str())
+            .map_err(|_| soft_fido2::Error::Other)?;
 
         let path_info = CredentialPathInfo::new(rp_id, cred.id.clone(), "bin".to_string());
 

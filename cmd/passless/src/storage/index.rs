@@ -256,15 +256,6 @@ pub fn load_credential_paths(
                 return None;
             }
 
-            let dir_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if ValidatedRpId::try_from(dir_name).is_err() {
-                warn!(
-                    "Skipping directory with invalid RP ID name: {}",
-                    path.display()
-                );
-                return None;
-            }
-
             Some(path)
         })
         .collect();

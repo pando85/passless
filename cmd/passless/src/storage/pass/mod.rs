@@ -7,7 +7,7 @@ use crate::storage::index::{
     CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
-use crate::storage::rp_id::ValidatedRpId;
+use crate::storage::rp_id::validate_rp_id_for_storage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::{bytes_to_hex, create_secure_dir_all};
 use passless_core::error::{Error, Result};
@@ -375,14 +375,8 @@ impl PassStorageAdapter {
     ) -> Result<()> {
         self.cache.evict_expired();
 
-        let rp_id = ValidatedRpId::try_from(cred.rp.id.as_str()).map_err(|e| {
-            log::error!(
-                "Rejected credential with invalid RP ID '{}': {}",
-                cred.rp.id,
-                e
-            );
-            Error::Storage(format!("Invalid RP ID: {}", e))
-        })?;
+        let rp_id = validate_rp_id_for_storage(cred.rp.id.as_str())
+            .map_err(|e| Error::Storage(format!("Invalid RP ID: {}", e)))?;
 
         let path = get_credential_path(&self.get_fido2_path(), &rp_id, &cred.id, "gpg");
         debug!("Writing credential to: {:?}", path);

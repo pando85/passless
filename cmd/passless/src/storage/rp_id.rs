@@ -2,7 +2,19 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Component, Path};
 
+use log::error;
+
 const MAX_RP_ID_LENGTH: usize = 255;
+
+pub fn validate_rp_id_for_storage(raw: &str) -> Result<ValidatedRpId, RpIdValidationError> {
+    match ValidatedRpId::try_from(raw) {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            error!("Rejected credential with invalid RP ID '{}': {}", raw, e);
+            Err(e)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValidatedRpId(String);
