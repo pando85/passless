@@ -60,8 +60,10 @@ timeout 600s cargo test --all-features -- \
     --skip agent::browser::tests::test_child_in_separate_process_group \
     --skip agent::browser::tests::test_no_fd_leakage_to_child \
     --skip agent::browser::tests::test_concurrent_launch_and_revoke \
+    --skip agent::browser::tests::test_manager_cleanup_detects_inode_change \
     --skip agent::runtime::tests \
-    --skip agent::launcher::tests::test_spawn_principal_non_root_fails_closed
+    --skip agent::launcher::tests::test_spawn_principal_non_root_fails_closed \
+    --skip commands::agent_admin::tests::auto_fails_when_no_agent_detected
 
 echo "=== Phase 4: cargo test (agent-principal-probe) ===" >&2
 timeout 300s cargo test -p agent-principal-probe
@@ -88,6 +90,8 @@ timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_no_fd_leakage_to_child -- --test-threads=1
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_concurrent_launch_and_revoke -- --test-threads=1
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
+    agent::browser::tests::test_manager_cleanup_detects_inode_change -- --test-threads=1
 
 echo "=== Phase 9: cargo test (runtime tests, single-threaded) ===" >&2
 timeout 600s cargo test --all-features -p passless-rs --bin passless \
@@ -96,6 +100,10 @@ timeout 600s cargo test --all-features -p passless-rs --bin passless \
 echo "=== Phase 10: cargo test (launcher tests, single-threaded) ===" >&2
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::launcher::tests::test_spawn_principal_non_root_fails_closed -- --test-threads=1
+
+echo "=== Phase 10b: cargo test (agent_admin tests, single-threaded) ===" >&2
+timeout 120s cargo test --all-features -p passless-rs --bin passless \
+    commands::agent_admin::tests::auto_fails_when_no_agent_detected -- --test-threads=1
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/passless-agent-validation.XXXXXX")
 trap 'rm -rf -- "$tmp_dir"' EXIT
