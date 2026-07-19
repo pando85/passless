@@ -25,6 +25,7 @@ The first implementation will extend the trusted Passless daemon to own:
 - Human credential storage as the sole owner of existing user credentials.
 - Separate isolated credential stores for isolated profiles.
 - A filtered delegated credential view that exposes one exact human credential to one temporary agent service without copying key material.
+- An exact-RP delegated registration scope when policy explicitly selects the human store.
 - A trusted launcher, browser-lease manager, policy engine, prompt implementation, and protected audit writer.
 
 The daemon creates each agent endpoint with a unique kernel-visible identity. Linux device permissions and the principal sandbox make that endpoint visible only to its associated browser. The agent browser cannot access the human endpoint, and ordinary human browser processes cannot access agent endpoints.
@@ -130,11 +131,12 @@ profile_id
 enabled
 mode
 principal_identity
-allowed_rp_ids
+exact_rp_rules: register and authenticate -> deny | confirm | allow
+up_source: human | policy
+uv_source: human | policy | none
 allowed_credential_refs (delegated-session only)
 isolated_store (isolated only)
-registration_allowed (isolated only)
-require_uv
+delegated_registration_storage (delegated-session registration only)
 max_intent_ttl
 max_grant_ttl
 max_session_ttl
@@ -146,8 +148,9 @@ Rules are exact:
 
 - RP IDs are normalized DNS names with no scheme, port, path, wildcard, or trailing dot.
 - Public suffix RP IDs are rejected.
-- Registration and authentication are separate isolated-mode actions.
-- Delegated-session policy permits authentication only.
+- Registration and authentication are separate actions in both modes.
+- Each exact RP/action rule independently denies, confirms, or allows the ceremony.
+- Policy-authorized UP and UV require explicit evidence-source configuration.
 - A delegated policy names explicit credential references.
 - The principal cannot create, broaden, reload, or revoke policy.
 - Security-relevant unknown fields and enum values are rejected.
@@ -246,7 +249,7 @@ The view rejects:
 
 - Iteration beyond the exact credential.
 - RP enumeration.
-- Registration and writes of new credentials.
+- Registration and writes of new credentials unless the active exact rule selects the human registration target.
 - Credential deletion or management.
 - Access after the grant is consumed, expired, revoked, or detached from its endpoint.
 - Any credential or RP mismatch.
@@ -255,7 +258,7 @@ The implementation must not instantiate a second independent storage adapter ove
 
 ## User presence and verification
 
-Configuration, policy, intent creation, delegation approval, and launcher authentication do not set authenticator flags.
+Authenticator flags come only from the exact action rule's configured evidence source.
 
 Immediately before an isolated or delegated key operation, the daemon presents a trusted prompt outside the principal boundary. The prompt shows:
 
@@ -267,9 +270,9 @@ Immediately before an isolated or delegated key operation, the daemon presents a
 - Agent reason or requested URL as untrusted data.
 - For delegated mode, the maximum local browser-session lifetime and the warning that the RP sees the user.
 
-Approval is tied to the active endpoint and CTAP operation. Denial, timeout, prompt failure, cancellation, policy change, or revocation rejects the operation.
+For `confirm`, approval is tied to the active endpoint and CTAP operation. For `allow`, current policy resolves the same one-shot operation without a prompt. Denial, timeout, prompt failure, cancellation, policy change, or revocation rejects affected work.
 
-UP is set only after approval for that operation. UV is set only after actual configured local verification succeeds. If the configured prompt mechanism cannot provide distinguishable approval and denial actions, agent mode fails closed rather than accepting the existing single-action notification compatibility path.
+UP and UV use the evidence sources selected by the exact action rule. Human UP requires the bound confirmation and human UV requires actual local verification. Policy UP/UV is recorded as administrator-authorized machine evidence and must not be described as human interaction. If a required prompt mechanism cannot provide distinguishable approval and denial actions, the `confirm` operation fails closed.
 
 ## Browser lease and profile lifecycle
 
@@ -410,7 +413,6 @@ Separate decisions are required for:
 - RP-integrated session revocation.
 - Durable or transferable delegation grants.
 - Multiple assertions under one grant.
-- Delegated registration.
 - Cross-host browser sessions.
 - Mandatory remote or TPM-backed audit checkpoints.
 - Autonomous OAuth, workload-identity, or cooperating-RP features.

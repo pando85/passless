@@ -28,8 +28,8 @@ evidence is available in `tools/agent-uhid-feasibility/evidence.md`. Full produc
 
 ## Key principles
 
-1. **No autonomous mode.** Every WebAuthn ceremony requires fresh user presence (UP) and actual
-   user verification (UV). Policy, capabilities, and authorization windows never produce UP or UV.
+1. **Autonomy is explicit.** Each exact RP/action rule denies, confirms, or allows the ceremony and
+   selects human or policy UP/UV evidence. Missing rules deny.
 2. **Stock browser only.** No browser modification, extension, native messaging host, or WebAuthn
    proxy. Origin validation remains in the stock browser.
 3. **Exact RP ID matching.** Passless matches the CTAP RP ID exactly against policy. It does not

@@ -46,7 +46,7 @@ The work is complete when one orchestrated release-lab run proves the supported 
 
 | Pain point | Decision |
 |---|---|
-| Existing browser tests use debug auto-accept | Exercise `DesktopPromptHandle` without debug bypasses through two automated production-compatible notification paths |
+| Existing browser tests use debug auto-accept | Exercise explicit `allow` rules and `DesktopPromptHandle` confirmation without debug bypasses |
 | UP and UV are mostly verified by unit fixtures | Assert flags at the UHID transport boundary and independently at the controlled RP |
 | Device permissions have only dry-run evidence | Run real udev and cross-identity open probes in the release lab |
 | Principal isolation is mostly unit-tested | Launch real principals and test UID, namespace, cgroup, socket, filesystem, device, and capability boundaries |
@@ -199,7 +199,7 @@ Required scenarios:
 | Premature approval | Terminal denial |
 | Stale or replayed approval | Terminal denial |
 | Wrong RP, endpoint, credential, or policy generation | Terminal denial |
-| Policy approval without interaction evidence | Cannot set UP or UV |
+| Explicit policy evidence | Success only when the exact action rule selects policy UP/UV; audit records the source |
 
 Actual UV must use the production CTAP PIN/UV path. A notification action alone must never be accepted as UV evidence.
 
@@ -220,7 +220,8 @@ Extend the controlled RP and browser harness to run the complete daemon-to-brows
 - Start with one existing human credential.
 - Select one exact RP and credential through the trusted flow.
 - Complete exactly one assertion through the delegated endpoint.
-- Prove registration, enumeration, deletion, credential management, and a second assertion are denied.
+- Prove delegated registration follows its exact rule and storage target; enumeration, deletion,
+  credential management, wrong targets, and lease-only authority are denied.
 - Prove a different allowed RP or different human credential is still denied.
 - Race two assertions and prove only one terminal result can consume the grant.
 - Prove the shared credential counter is not lost during concurrent human and delegated attempts.
@@ -301,7 +302,7 @@ Required bounded scenarios:
 - Wall-clock changes do not extend monotonic intent, grant, or browser deadlines.
 - Daemon restart loses in-memory authority and recovers durable state safely.
 - Concurrent cancellation, policy reload, approval, and grant claim produce one deterministic winner and no later key use.
-- Unknown modes fail configuration, policy alone cannot provide UP or UV, approvals are not cached across operations, and one browser lease cannot authorize repeated assertions.
+- Unknown modes fail configuration, missing rules deny, policy evidence requires an exact rule, and one browser lease cannot authorize later assertions without a new rule evaluation.
 
 Every scenario must declare its resource ceiling, timeout, expected terminal state, and cleanup invariant. A test that hangs or exceeds its ceiling fails.
 
@@ -361,7 +362,7 @@ Stages 8 through 11 require explicit confirmation. A skipped required stage make
 |---|---|
 | Production prompt | Both notification layers pass approve, deny, timeout, close, early-action, and service-failure cases without debug auto-accept |
 | Truthful UP/UV | Prompt binding, transport-boundary bits, and controlled-RP verification agree; UV comes from CTAP PIN/UV |
-| Agent browser pipeline | Isolated registration/assertion and one-shot delegated assertion pass through dedicated agent endpoints in Chromium |
+| Agent browser pipeline | Isolated and delegated registration/assertion policies pass through dedicated agent endpoints in Chromium |
 | Delegated restrictions | Registration, discovery, management, wrong tuple, replay, and second assertion fail in real ceremonies |
 | Device isolation | Cross-identity open matrix proves each browser can access only its own hidraw endpoint and no browser can access `/dev/uhid` |
 | Principal isolation | Real UID, namespace, cgroup, socket, filesystem, process, device, profile, and capability probes pass |
@@ -371,7 +372,7 @@ Stages 8 through 11 require explicit confirmation. A skipped required stage make
 | Lease cleanup | Expiry, revoke, crash, principal exit, daemon shutdown, cleanup, quarantine, and non-reuse pass |
 | Audit and faults | Pre-write gate, terminal failure, recovery, rotation, restart, pressure, and bounded cleanup scenarios pass |
 | Secret absence | Full captured-run scan finds no sentinels, forbidden fields, raw payloads, or process-metadata leaks |
-| Autonomous absence | Unknown modes fail, policy cannot substitute for interaction, approvals cannot be cached, and a lease cannot authorize repeated assertions |
+| Autonomous scope | Exact `allow` rules skip prompts while retaining one-shot binding; unmatched actions, replay, and lease-only authority fail |
 | Operations | Install, disable, rollback, uninstall, final inventory, and human continuity pass |
 
 ## Completion and claims

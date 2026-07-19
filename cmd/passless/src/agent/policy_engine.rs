@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use passless_core::agent::protocol::IntentAction;
 use passless_core::agent::{
-    AgentConfig, AgentMode, AgentProfileConfig, CredentialRef, EndpointId, GrantId, IntentId,
-    PendingRequestId, Policy, PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId,
-    ProfileId,
+    AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
+    AgentRpRule, CredentialRef, EndpointId, GrantId, IntentId, PendingRequestId, Policy,
+    PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId,
 };
 
 use super::browser::Clock;
@@ -181,6 +181,8 @@ pub struct PolicySnapshot {
     pub require_uv: bool,
     pub registration_allowed: bool,
     pub allowed_actions: BTreeSet<String>,
+    pub rules: Vec<AgentRpRule>,
+    pub delegated_registration_storage: String,
 }
 
 impl PolicySnapshot {
@@ -213,6 +215,21 @@ impl PolicySnapshot {
             IntentAction::Authenticate => "authenticate",
         };
         self.allowed_actions.contains(action_str)
+    }
+
+    pub fn ceremony_policy(
+        &self,
+        rp_id: &str,
+        action: &IntentAction,
+    ) -> Option<&AgentCeremonyPolicy> {
+        let normalized = rp_id.trim().to_ascii_lowercase();
+        self.rules
+            .iter()
+            .find(|rule| rule.rp_id.trim().to_ascii_lowercase() == normalized)
+            .map(|rule| match action {
+                IntentAction::Register => &rule.register,
+                IntentAction::Authenticate => &rule.authenticate,
+            })
     }
 }
 
@@ -671,10 +688,11 @@ impl PolicyRuntime {
         profile_id: &ProfileId,
         config: &AgentProfileConfig,
     ) -> Result<PolicySnapshot, PolicyRuntimeError> {
-        let mut normalized_rp_ids: Vec<String> = config
-            .rp_ids
+        let mut rules = config.effective_rules();
+        rules.sort_by_key(|rule| rule.rp_id.trim().to_ascii_lowercase());
+        let mut normalized_rp_ids: Vec<String> = rules
             .iter()
-            .map(|rp| rp.trim().to_ascii_lowercase())
+            .map(|rule| rule.rp_id.trim().to_ascii_lowercase())
             .collect();
         normalized_rp_ids.sort();
         normalized_rp_ids.dedup();
@@ -682,9 +700,16 @@ impl PolicyRuntime {
         let credential_refs = config.credential_refs.clone().unwrap_or_default();
 
         let mut allowed_actions = BTreeSet::new();
-        allowed_actions.insert("authenticate".to_string());
-
-        if config.registration_allowed {
+        if rules
+            .iter()
+            .any(|rule| rule.authenticate.authorization != AgentAuthorization::Deny)
+        {
+            allowed_actions.insert("authenticate".to_string());
+        }
+        if rules
+            .iter()
+            .any(|rule| rule.register.authorization != AgentAuthorization::Deny)
+        {
             allowed_actions.insert("register".to_string());
         }
 
@@ -730,6 +755,11 @@ impl PolicyRuntime {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            rules: rules.clone(),
+            delegated_registration_storage: config
+                .delegated_registration_storage
+                .map(|target| target.to_string())
+                .unwrap_or_default(),
         };
 
         let policy = Policy::from_params(params)
@@ -750,11 +780,34 @@ impl PolicyRuntime {
             require_uv: config.require_uv,
             registration_allowed: config.registration_allowed,
             allowed_actions,
+            rules,
+            delegated_registration_storage: config
+                .delegated_registration_storage
+                .map(|target| target.to_string())
+                .unwrap_or_default(),
         })
     }
 
     pub fn current_generation(&self) -> Arc<PolicyGenerationSnapshot> {
         self.current.read().unwrap().clone()
+    }
+
+    pub fn ceremony_policy(
+        &self,
+        profile_id: &ProfileId,
+        generation_id: &PolicyGenerationId,
+        generation_digest: &PolicyDigest,
+        rp_id: &str,
+        action: &IntentAction,
+    ) -> Option<AgentCeremonyPolicy> {
+        let generation = self.current.read().unwrap();
+        if generation.generation_id != *generation_id || generation.digest != *generation_digest {
+            return None;
+        }
+        generation
+            .find_snapshot(profile_id)
+            .and_then(|snapshot| snapshot.ceremony_policy(rp_id, action))
+            .cloned()
     }
 
     pub fn digest(&self) -> PolicyDigest {
@@ -942,6 +995,22 @@ impl PolicyRuntime {
             );
         }
 
+        let ceremony_policy = match snapshot.ceremony_policy(&request.rp_id, &request.action) {
+            Some(policy) => policy,
+            None => {
+                return (
+                    Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
+                    None,
+                );
+            }
+        };
+        if ceremony_policy.authorization == AgentAuthorization::Deny {
+            return (
+                Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
+                None,
+            );
+        }
+
         if let Some(ref cred_ref) = request.credential_ref
             && !snapshot.credential_refs.is_empty()
             && !snapshot.credential_ref_set().contains(cred_ref)
@@ -954,6 +1023,7 @@ impl PolicyRuntime {
 
         if snapshot.credential_refs.is_empty()
             && matches!(snapshot.mode, AgentMode::DelegatedSession)
+            && request.action == IntentAction::Authenticate
         {
             return (
                 Decision::deny(
@@ -966,7 +1036,9 @@ impl PolicyRuntime {
 
         match snapshot.mode {
             AgentMode::DelegatedSession => {
-                if request.action == IntentAction::Register {
+                if request.action == IntentAction::Register
+                    && snapshot.delegated_registration_storage.is_empty()
+                {
                     return (
                         Decision::deny(
                             ReasonCode::DelegatedRegistrationDenied,
@@ -982,8 +1054,11 @@ impl PolicyRuntime {
                         None,
                     );
                 }
-
-                self.authorize_delegated(snapshot, request, &generation)
+                if request.action == IntentAction::Register {
+                    self.authorize_isolated(snapshot, request, &generation)
+                } else {
+                    self.authorize_delegated(snapshot, request, &generation)
+                }
             }
             AgentMode::Isolated => {
                 if !snapshot.action_allowed(&request.action) {
@@ -2181,8 +2256,9 @@ impl MonotonicClock for ArcMonotonicClockAdapter {
 mod tests {
     use super::*;
     use passless_core::agent::{
-        AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration,
-        CredentialRef, DeviceIdentity, ProfileId,
+        AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
+        AgentRpRule, AgentStorageConfig, BoundedDuration, CredentialRef, DeviceIdentity, ProfileId,
+        UserPresenceSource, UserVerificationSource,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -2272,6 +2348,8 @@ mod tests {
                     pin_path: PathBuf::from(format!("/tmp/test-{}/pin", profile_name)),
                 }),
                 registration_allowed,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: test_device(profile_name, 0x1234, 0x5678),
                 start_url: None,
                 browser_command: None,
@@ -2305,6 +2383,8 @@ mod tests {
                 max_session_ttl: Some(BoundedDuration::new(900).unwrap()),
                 storage: None,
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: test_device(profile_name, 0x1234, 0x5679),
                 start_url: None,
                 browser_command: Some(vec!["firefox".to_string()]),
@@ -2391,7 +2471,41 @@ mod tests {
     }
 
     #[test]
-    fn test_delegated_registration_always_denied() {
+    fn test_compile_explicit_allow_and_deny_rules() {
+        let mut config = make_isolated_config("rules", vec![], false);
+        let profile = config.profiles.get_mut("rules").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::Policy,
+                user_verification: UserVerificationSource::Policy,
+            },
+        }];
+
+        let generation = PolicyRuntime::compile_generation(&config, 0).unwrap();
+        let snapshot = &generation.snapshots[0];
+        assert_eq!(
+            snapshot
+                .ceremony_policy("example.com", &IntentAction::Authenticate)
+                .unwrap()
+                .authorization,
+            AgentAuthorization::Allow
+        );
+        assert_eq!(
+            snapshot
+                .ceremony_policy("example.com", &IntentAction::Register)
+                .unwrap()
+                .authorization,
+            AgentAuthorization::Deny
+        );
+        assert!(snapshot.action_allowed(&IntentAction::Authenticate));
+        assert!(!snapshot.action_allowed(&IntentAction::Register));
+    }
+
+    #[test]
+    fn test_delegated_registration_denied_without_explicit_rule() {
         let cr = test_cred_ref(b"c1");
         let config = make_delegated_config("delreg", vec!["example.com"], vec![cr], true);
         let (runtime, _clock) = make_runtime(&config);
@@ -2408,7 +2522,7 @@ mod tests {
 
         let (decision, handle) = runtime.authorize(&request);
         assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::DelegatedRegistrationDenied);
+        assert_eq!(decision.reason, ReasonCode::ActionNotAllowed);
         assert!(handle.is_none());
     }
 

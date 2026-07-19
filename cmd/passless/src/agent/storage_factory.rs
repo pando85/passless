@@ -316,8 +316,25 @@ pub fn create_shared_delegated_storage<S: CredentialStorage + 'static>(
     credential_refs: Vec<CredentialRef>,
     constant_counter: bool,
 ) -> Result<(SharedDelegatedStorage<S>, CeremonyScope)> {
+    create_shared_delegated_storage_with_registration(
+        human,
+        rp_ids,
+        credential_refs,
+        constant_counter,
+        false,
+    )
+}
+
+pub fn create_shared_delegated_storage_with_registration<S: CredentialStorage + 'static>(
+    human: Arc<Mutex<S>>,
+    rp_ids: Vec<String>,
+    credential_refs: Vec<CredentialRef>,
+    constant_counter: bool,
+    registration_allowed: bool,
+) -> Result<(SharedDelegatedStorage<S>, CeremonyScope)> {
     let mut delegated = SharedDelegatedStorage::new(human, rp_ids, credential_refs)
-        .with_constant_counter_mode(constant_counter);
+        .with_constant_counter_mode(constant_counter)
+        .with_registration_allowed(registration_allowed);
     delegated
         .build_index()
         .map_err(|e| Error::Storage(format!("failed to build delegated index: {}", e)))?;
@@ -556,6 +573,8 @@ mod tests {
                 pin_path: PathBuf::from("/tmp/test/pin"),
             }),
             registration_allowed: false,
+            rules: vec![],
+            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "test".to_string(),
                 phys: "test".to_string(),
@@ -594,6 +613,8 @@ mod tests {
             max_session_ttl: None,
             storage: None,
             registration_allowed: false,
+            rules: vec![],
+            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "test".to_string(),
                 phys: "test".to_string(),

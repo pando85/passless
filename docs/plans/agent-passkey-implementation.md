@@ -26,7 +26,7 @@ The implementation is complete when:
 3. Kernel-enforced device permissions prevent human and agent browsers from seeing the wrong endpoint.
 4. Isolated credentials cannot cross human or agent-profile boundaries.
 5. Delegated mode exposes one exact existing credential for one exact RP assertion without copying key material.
-6. Every WebAuthn operation receives fresh, truthful UP and actual UV when required.
+6. Every WebAuthn operation uses the exact configured human, policy, or absent evidence source and records it truthfully.
 7. A delegation grant is consumed by one terminal assertion result and cannot authorize later WebAuthn calls.
 8. A delegated browser is terminated at its local monotonic deadline or earlier revocation.
 9. Policy, authorization, credential use, browser leases, denial, and cleanup are protected by durable audit.
@@ -36,7 +36,7 @@ The implementation is complete when:
 
 This work does not deliver:
 
-- Autonomous WebAuthn or automatic UP/UV during an authorization window.
+- Implicit autonomous authority not expressed by an exact administrator-owned RP/action rule.
 - A new RP-visible agent identity in delegated-session mode.
 - Business-action authorization after login.
 - Guaranteed invalidation of an RP session when the local browser lease ends.
@@ -120,14 +120,14 @@ Requirement IDs are stable across implementation, tests, and review evidence.
 |---|---|
 | MODE-01 | Agent support is disabled by default and unknown modes fail validation. |
 | MODE-02 | Support only `isolated` and `delegated-session` profiles. |
-| MODE-03 | Delegated mode permits one authentication assertion and no registration or credential management. |
+| MODE-03 | Delegated registration requires an explicit exact-RP rule and storage target; credential management remains denied. |
 | ROUTE-01 | Human and agent requests use distinct UHID endpoints. |
 | ROUTE-02 | Every agent endpoint is bound to one authenticated principal, profile, and mode. |
 | ROUTE-03 | Human and agent browser identities cannot open each other's hidraw nodes. |
 | ROUTE-04 | Endpoint failure never falls back to another Passless credential path. |
-| AUTH-01 | Set UP only after a fresh gesture for the exact active CTAP operation. |
-| AUTH-02 | Set UV only after actual local user verification for that operation. |
-| AUTH-03 | Policy, capabilities, grants, leases, and earlier gestures never produce UP or UV. |
+| AUTH-01 | Set UP only from the exact action rule's configured human or policy source. |
+| AUTH-02 | Set UV only from the exact action rule's configured human, policy, or absent source. |
+| AUTH-03 | Audit distinguishes human and policy evidence; no principal request broadens the configured source. |
 | RP-01 | The stock browser remains responsible for origin-to-RP validation and client-data construction. |
 | RP-02 | Passless exactly matches the CTAP RP ID against policy and active authorization. |
 | RP-03 | Passless never claims independent visibility of the exact web origin. |
@@ -163,7 +163,7 @@ Requirement IDs are stable across implementation, tests, and review evidence.
 | PROTO-02 | Validate message sizes, fields, state transitions, and peer authorization before use. |
 | OPS-01 | Agent failure does not stop or weaken the existing human authenticator. |
 | OPS-02 | Agent configuration and data can be disabled or removed without migrating human credentials. |
-| AUTO-01 | No autonomous mode, delegated UP, cached UV, or repeated passkey use under one browser lease is exposed. |
+| AUTO-01 | Autonomous authority requires an exact `allow` rule; every operation remains one-shot and re-evaluated. |
 
 ## Delivery strategy
 
@@ -203,7 +203,7 @@ The Phase 0 tools are not linked into production and contain no production crede
 6. Launch a stock browser with a fresh profile and complete isolated registration and authentication through only the agent node.
 7. Complete delegated authentication with one existing human credential through an exact filtered view while the human endpoint remains responsive.
 8. Race simultaneous human and delegated assertions for the same credential and verify serialized counter/state updates without lost writes.
-9. Attempt delegated registration, resident enumeration, credential management, deletion, another RP, another credential, and a second assertion; verify terminal rejection.
+9. Exercise delegated registration with and without an exact rule and storage target; reject resident enumeration, credential management, deletion, another RP, another credential, and lease-only authority.
 10. Deny and approve prompts and inspect authenticator flags at packet and RP levels.
 11. After successfully submitting the CTAP response, reject later requests before callback dispatch, exercise the transport's kernel acknowledgment or bounded drain procedure, and verify safe endpoint destruction without truncating the browser result.
 12. Kill the browser, agent, worker, daemon, and audit path at each state and verify cleanup and fail-closed behavior.
@@ -699,7 +699,7 @@ Documentation must explain:
 - Principal commands unavailable or limited outside a principal.
 - Completion and generated-config documentation tests.
 - Documentation links and command examples.
-- Release binary has no autonomous mode or automatic WebAuthn approval option.
+- Release binary permits automatic approval only through explicit exact-RP `allow` rules.
 
 ### Exit gate
 
@@ -790,7 +790,7 @@ Every requirement has passing evidence, independent review has no unresolved rel
 | Agent changes policy or approval | Admin channel absent from principal | IPC and filesystem adversarial tests |
 | Agent suppresses audit | Audit outside principal and durable pre-write | Access-denial and write-failure tests |
 | Cleanup leaves reusable profile | Quarantine and no reuse | Fault-injected cleanup and restart tests |
-| Autonomous behavior is introduced | Closed modes and fresh-prompt invariant | Config, API, CLI, code-path, and E2E review |
+| Autonomous behavior exceeds policy | Exact rules, one-shot binding, and policy re-evaluation | Config, API, CLI, code-path, and E2E review |
 
 ## Requirement traceability
 
@@ -946,7 +946,7 @@ The agreed work to close the remaining engineering evidence is defined in the [A
 - Packet-level and RP-level tests prove truthful UP and UV.
 - Delegated mode cannot register, enumerate, delete, manage, or perform a second assertion.
 - Browser lease expiry and cleanup are tested without claiming RP-side revocation.
-- No autonomous or automatic-approval mode exists in config, protocol, CLI, documentation, or runtime.
+- Autonomous ceremonies occur only under exact `allow` rules and retain audit, scope, and one-shot consumption.
 - Installation, revocation, recovery, rollback, and uninstall are documented and verified.
 - Agent support remains opt-in until at least one stable release validates the operating model.
 
@@ -1063,6 +1063,6 @@ The project is done only when:
 - Packet-level and RP-level tests prove truthful UP and UV.
 - Delegated mode cannot register, enumerate, delete, manage, or perform a second assertion.
 - Browser lease expiry and cleanup are tested without claiming RP-side revocation.
-- No autonomous or automatic-approval mode exists in config, protocol, CLI, documentation, or runtime.
+- Automatic approval requires an explicit exact-RP `allow` rule and remains one-shot.
 - Installation, revocation, recovery, rollback, and uninstall are documented and verified.
 - Agent support remains opt-in until at least one stable release validates the operating model.

@@ -10,7 +10,7 @@ use passless_core::agent::{
 use super::grant::{CeremonyId, GrantRequestId};
 use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 1;
+pub const AUDIT_SCHEMA_VERSION: u32 = 2;
 
 // The closed-schema tests apply these deny lists to every constructible event.
 #[cfg(test)]
@@ -656,6 +656,9 @@ pub struct PolicyAllowMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    authorization: String,
+    user_presence: String,
+    user_verification: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1543,6 +1546,9 @@ pub struct PolicyAllowBuilder {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    authorization: String,
+    user_presence: String,
+    user_verification: String,
 }
 
 impl PolicyAllowBuilder {
@@ -1551,7 +1557,22 @@ impl PolicyAllowBuilder {
             profile_id,
             action,
             rp_id: rp_id.to_string(),
+            authorization: "confirm".to_string(),
+            user_presence: "human".to_string(),
+            user_verification: "none".to_string(),
         }
+    }
+
+    pub fn evidence_sources(
+        mut self,
+        authorization: &str,
+        user_presence: &str,
+        user_verification: &str,
+    ) -> Self {
+        self.authorization = authorization.to_string();
+        self.user_presence = user_presence.to_string();
+        self.user_verification = user_verification.to_string();
+        self
     }
 
     pub fn build(self) -> AuditEvent {
@@ -1559,6 +1580,9 @@ impl PolicyAllowBuilder {
             profile_id: self.profile_id,
             action: self.action,
             rp_id: self.rp_id,
+            authorization: self.authorization,
+            user_presence: self.user_presence,
+            user_verification: self.user_verification,
         }))
     }
 }

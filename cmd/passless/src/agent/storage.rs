@@ -243,6 +243,7 @@ pub struct SharedDelegatedStorage<S: CredentialStorage> {
     cred_ref_to_raw_id: HashMap<CredentialRef, Vec<u8>>,
     scope: CeremonyScope,
     constant_counter_mode: bool,
+    registration_allowed: bool,
 }
 
 impl<S: CredentialStorage> SharedDelegatedStorage<S> {
@@ -258,11 +259,17 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
             cred_ref_to_raw_id: HashMap::new(),
             scope: CeremonyScope::new(),
             constant_counter_mode: false,
+            registration_allowed: false,
         }
     }
 
     pub fn with_constant_counter_mode(mut self, enabled: bool) -> Self {
         self.constant_counter_mode = enabled;
+        self
+    }
+
+    pub fn with_registration_allowed(mut self, allowed: bool) -> Self {
+        self.registration_allowed = allowed;
         self
     }
 
@@ -353,6 +360,7 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
     fn require_active_ceremony(&self) -> std::result::Result<(), soft_fido2::Error> {
         match self.scope.active_action() {
             Some(CeremonyAction::Authenticate(_)) => Ok(()),
+            Some(CeremonyAction::Register) if self.registration_allowed => Ok(()),
             _ => Err(soft_fido2::Error::DoesNotExist),
         }
     }
@@ -452,7 +460,10 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
 impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
     fn read_first(&mut self, filter: CredentialFilter) -> Result<soft_fido2::Credential> {
         self.require_active_ceremony()?;
-        let active_ref = self.scope.active_cred_ref().unwrap();
+        let active_ref = self
+            .scope
+            .active_cred_ref()
+            .ok_or(soft_fido2::Error::DoesNotExist)?;
 
         match &filter {
             CredentialFilter::ByRp(rp_id) => {
@@ -532,12 +543,26 @@ impl<S: CredentialStorage> CredentialStorage for SharedDelegatedStorage<S> {
     fn write(&mut self, cred_ref: soft_fido2::CredentialRef) -> Result<()> {
         let cred_id = cred_ref.id.to_vec();
         self.require_active_ceremony()?;
-        let href = cred_ref_from_id(&cred_id);
-        self.require_ceremony_cred(&href)?;
         let active_rp_id = self
             .scope
             .active_rp_id()
             .ok_or(DelegatedError::WriteDenied)?;
+
+        if matches!(self.scope.active_action(), Some(CeremonyAction::Register)) {
+            let credential_rp = normalize_rp_id(cred_ref.rp_id);
+            if !self.registration_allowed
+                || !self.is_rp_allowed(&credential_rp)
+                || credential_rp != active_rp_id
+            {
+                return Err(DelegatedError::WriteDenied.into());
+            }
+            let mut human = self.human.lock().map_err(|_| soft_fido2::Error::Other)?;
+            human.write(cred_ref)?;
+            return Ok(());
+        }
+
+        let href = cred_ref_from_id(&cred_id);
+        self.require_ceremony_cred(&href)?;
         if !self.allowed_cred_refs.contains(&href) {
             return Err(DelegatedError::WriteDenied.into());
         }
@@ -1038,6 +1063,65 @@ mod tests {
 
     fn cred_ref_for(id: &[u8]) -> CredentialRef {
         CredentialRef::with_default_domain(id)
+    }
+
+    fn borrowed_credential_ref(cred: &soft_fido2::Credential) -> soft_fido2::CredentialRef<'_> {
+        soft_fido2::CredentialRef {
+            id: &cred.id,
+            rp_id: &cred.rp.id,
+            rp_name: cred.rp.name.as_deref(),
+            user_id: &cred.user.id,
+            user_name: cred.user.name.as_deref(),
+            user_display_name: cred.user.display_name.as_deref(),
+            sign_count: &cred.sign_count,
+            alg: &cred.alg,
+            private_key: &cred.private_key,
+            created: &cred.created,
+            discoverable: &cred.discoverable,
+            cred_protect: cred.extensions.cred_protect.as_ref(),
+            cred_random: None,
+        }
+    }
+
+    #[test]
+    fn test_delegated_registration_requires_explicit_scope_and_target() {
+        let human = make_shared_mock(vec![]);
+        let mut delegated =
+            SharedDelegatedStorage::new(human.clone(), vec!["example.com".to_string()], vec![])
+                .with_registration_allowed(true);
+        delegated.build_index().unwrap();
+        let scope = delegated.scope();
+        let credential = make_test_cred(b"new", "example.com", b"agent", 0);
+
+        assert!(
+            delegated
+                .write(borrowed_credential_ref(&credential))
+                .is_err()
+        );
+        let _guard = scope.activate_register_for_rp("example.com").unwrap();
+        delegated
+            .write(borrowed_credential_ref(&credential))
+            .unwrap();
+        assert_eq!(human.lock().unwrap().count_credentials(), 1);
+        assert!(delegated.delete(&credential.id).is_err());
+    }
+
+    #[test]
+    fn test_delegated_registration_rejects_wrong_rp() {
+        let human = make_shared_mock(vec![]);
+        let mut delegated =
+            SharedDelegatedStorage::new(human.clone(), vec!["example.com".to_string()], vec![])
+                .with_registration_allowed(true);
+        let scope = delegated.scope();
+        let _guard = scope.activate_register_for_rp("example.com").unwrap();
+        let credential = make_test_cred(b"new", "evil.com", b"agent", 0);
+
+        assert!(
+            delegated
+                .write(borrowed_credential_ref(&credential))
+                .is_err()
+        );
+        assert_eq!(human.lock().unwrap().count_credentials(), 0);
     }
 
     fn make_shared_mock(creds: Vec<soft_fido2::Credential>) -> Arc<Mutex<MockStorage>> {

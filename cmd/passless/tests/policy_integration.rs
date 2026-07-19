@@ -27,6 +27,8 @@ fn base_params() -> PolicyParams {
         storage_path: "/tmp/test".into(),
         browser_user: "browseruser".into(),
         browser_runtime_root: "/tmp/browser".into(),
+        rules: vec![],
+        delegated_registration_storage: String::new(),
     }
 }
 
@@ -34,7 +36,7 @@ fn base_params() -> PolicyParams {
 fn policy_from_params_round_trip() {
     let params = base_params();
     let policy = Policy::from_params(params.clone()).unwrap();
-    assert_eq!(policy.version, 2);
+    assert_eq!(policy.version, 3);
     assert_eq!(policy.profile_id, "testprofile");
     assert_eq!(policy.mode, "isolated");
     assert_eq!(policy.normalized_rp_ids, vec!["example.com"]);

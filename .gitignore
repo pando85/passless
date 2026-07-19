@@ -21,3 +21,11 @@ passless-completions-*.tar.gz
 /PKGBUILD
 /PKGBUILD-bin
 completions-tmp
+
+# Controlled RP test harness
+tools/agent-uhid-feasibility/controlled-rp/certs/*.pem
+tools/agent-uhid-feasibility/controlled-rp/node_modules/
+
+# Phase 0 evidence JSON (host-specific, machine-readable)
+tools/agent-uhid-feasibility/evidence/*.json
+.playwright-mcp

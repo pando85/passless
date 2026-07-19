@@ -22,9 +22,12 @@ Each profile is a named entry under `[agents.profiles.<id>]`.
 [agents.profiles.<profile-id>]
 mode = "isolated" | "delegated-session"
 principal_user = "<unix-user>"
-rp_ids = ["<exact-dns-name>"]
-require_uv = true | false
 device = { name, phys, uniq, vendor_id, product_id }
+
+[[agents.profiles.<profile-id>.rules]]
+rp_id = "<exact-dns-name>"
+register = { authorization = "deny", user_presence = "none", user_verification = "none" }
+authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
 ```
 
 ### Fields common to both modes
@@ -33,10 +36,14 @@ device = { name, phys, uniq, vendor_id, product_id }
 |---|---|---|
 | `mode` | yes | `isolated` or `delegated-session` |
 | `principal_user` | yes | Separate Unix user that owns the principal session |
-| `rp_ids` | no | Exact DNS names; no scheme, port, path, wildcard, trailing dot, IP, or public suffix |
-| `require_uv` | yes for delegated | Must be `true` for `delegated-session` |
+| `rules` | no | Exact RP registration and authentication policies; missing rules deny |
 | `device` | yes | Unique UHID identity; must not collide with human endpoint or other profiles |
-| `start_url` | delegated only | HTTPS URL whose host matches exactly one `rp_ids` entry |
+| `start_url` | delegated only | HTTPS URL whose host matches exactly one rule |
+
+Each action sets `authorization = "deny" | "confirm" | "allow"`,
+`user_presence = "human" | "policy" | "none"`, and
+`user_verification = "human" | "policy" | "none"`. `allow` cannot require human UP, and a
+denied action must use `none` for both evidence sources.
 
 ### Delegated-session fields
 
@@ -48,13 +55,14 @@ device = { name, phys, uniq, vendor_id, product_id }
 | `browser_command` | yes | Stock browser executable and arguments |
 | `browser_user` | yes | Separate Unix user for the ephemeral browser; must differ from `principal_user` |
 | `browser_runtime_root` | yes | Absolute path for ephemeral browser profile state; owned by `browser_user` with mode 0700 |
+| `delegated_registration_storage` | for registration | Must be `"human"`; omission denies delegated registration |
 
 ### Isolated fields
 
 | Field | Required | Description |
 |---|---|---|
 | `storage` | yes | Backend configuration with non-overlapping root paths |
-| `registration_allowed` | no | Whether the profile may create new credentials |
+| `rules[].register` | no | Exact-RP registration decision and evidence sources |
 
 Isolated mode must not set `browser_user` or `browser_runtime_root`.
 
@@ -103,13 +111,15 @@ product_id = 22136
 ## Validation rules
 
 - `enabled = true` requires `audit_path`.
-- `delegated-session` requires `require_uv = true`, non-empty `credential_refs`,
-  positive `max_grant_ttl` and `max_session_ttl`, `browser_command`, `browser_user`,
-  and `browser_runtime_root`.
+- `delegated-session` requires non-empty `credential_refs` for authentication, positive
+  `max_grant_ttl` and `max_session_ttl`, `browser_command`, `browser_user`, and
+  `browser_runtime_root`.
 - `isolated` requires `storage` and must not set `browser_user` or `browser_runtime_root`.
 - `browser_user` must differ from `principal_user`.
 - `browser_runtime_root` must be absolute and contain no NUL bytes.
-- `start_url` must use HTTPS and its host must match exactly one `rp_ids` entry.
+- `start_url` must use HTTPS and its host must match exactly one rule.
+- The legacy experimental `rp_ids`, `registration_allowed`, and `require_uv` fields remain a
+  supervised migration form. They cannot be mixed with explicit `rules`.
 - Unknown fields in any section cause load failure.
 
 ## Policy reload behavior

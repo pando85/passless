@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use passless_core::agent::protocol::IntentAction;
 use passless_core::agent::{
-    CredentialRef, EndpointId, PolicyDigest, PolicyGenerationId, PrincipalSessionId, ProfileId,
+    AgentAuthorization, CredentialRef, EndpointId, PolicyDigest, PolicyGenerationId,
+    PrincipalSessionId, ProfileId, UserPresenceSource, UserVerificationSource,
 };
 
 use serde_cbor as cbor;
@@ -1361,7 +1362,24 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
             }
         };
 
-        let effective_uv = require_uv || self.ctx.require_uv;
+        let ceremony_policy = self
+            .ctx
+            .policy_runtime
+            .ceremony_policy(
+                &self.ctx.profile_id,
+                preparation.policy_generation(),
+                preparation.policy_digest(),
+                &rp_id,
+                &intent_action,
+            )
+            .ok_or_else(|| {
+                self.clear_preparation(generation);
+                AgentCeremonyError::PolicyDenied(ReasonCode::GenerationStale)
+            })?;
+
+        let effective_uv = require_uv
+            || ceremony_policy.user_verification != UserVerificationSource::None
+            || self.ctx.require_uv;
 
         if let Some(expected) = preparation.credential_ref() {
             match &parsed {
@@ -1379,11 +1397,6 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
             }
         }
 
-        let prompt_action = match action {
-            AuditAction::Register => PromptAction::Register,
-            AuditAction::Authenticate => PromptAction::Authenticate,
-        };
-
         let effective_cred_ref = request_cred_ref
             .clone()
             .or_else(|| preparation.credential_ref().cloned());
@@ -1400,57 +1413,71 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
             credential_ref: effective_cred_ref.clone(),
         };
 
-        let mut prompt_builder = PromptRequest::builder()
-            .profile_id(self.ctx.profile_id.clone())
-            .mode(self.ctx.mode)
-            .action(prompt_action)
-            .rp_id(&rp_id)
-            .credential_ref_opt(preparation.credential_ref().cloned())
-            .grant_ttl_secs(preparation.clamped_grant_ttl_secs())
-            .session_ttl_secs(preparation.clamped_session_ttl_secs());
-
-        if let Some(label) = preparation.trusted_credential_label() {
-            prompt_builder = prompt_builder.credential_label(label);
-        }
-
-        if let Some(reason) = preparation.untrusted_metadata().principal_reason() {
-            prompt_builder = prompt_builder.untrusted_reason(reason);
-        }
-
-        let prompt_request = prompt_builder.build().map_err(|_| {
-            self.clear_preparation(generation);
-            AgentCeremonyError::PromptBuildFailed
-        })?;
-
-        self.audit_prompt_display(&prompt_request, effective_cred_ref.as_ref())?;
-
-        let prompt_result = self.ctx.prompt_handle.prompt(&prompt_request);
-
-        match prompt_result.decision {
-            super::prompt::PromptDecision::Approved => {
-                self.audit_prompt_approve(&prompt_request, prompt_result.latency_ms)?;
-            }
-            super::prompt::PromptDecision::Denied => {
-                self.audit_prompt_deny(&prompt_request, prompt_result.latency_ms)?;
+        match ceremony_policy.authorization {
+            AgentAuthorization::Deny => {
+                self.audit_policy_deny(&rp_id, action, PolicyDenyReason::ActionNotAllowed)?;
                 let _ = self.ctx.policy_runtime.ceremony_deny_pending(&tuple);
                 self.clear_preparation(generation);
-                return Err(AgentCeremonyError::PromptDenied);
+                return Err(AgentCeremonyError::PolicyDenied(
+                    ReasonCode::ActionNotAllowed,
+                ));
             }
-            super::prompt::PromptDecision::Timeout => {
-                self.audit_prompt_timeout(&prompt_request)?;
-                let _ = self.ctx.policy_runtime.ceremony_deny_pending(&tuple);
-                self.clear_preparation(generation);
-                return Err(AgentCeremonyError::PromptTimeout);
+            AgentAuthorization::Confirm => {
+                let prompt_action = match action {
+                    AuditAction::Register => PromptAction::Register,
+                    AuditAction::Authenticate => PromptAction::Authenticate,
+                };
+                let mut prompt_builder = PromptRequest::builder()
+                    .profile_id(self.ctx.profile_id.clone())
+                    .mode(self.ctx.mode)
+                    .action(prompt_action)
+                    .rp_id(&rp_id)
+                    .credential_ref_opt(preparation.credential_ref().cloned())
+                    .grant_ttl_secs(preparation.clamped_grant_ttl_secs())
+                    .session_ttl_secs(preparation.clamped_session_ttl_secs());
+
+                if let Some(label) = preparation.trusted_credential_label() {
+                    prompt_builder = prompt_builder.credential_label(label);
+                }
+                if let Some(reason) = preparation.untrusted_metadata().principal_reason() {
+                    prompt_builder = prompt_builder.untrusted_reason(reason);
+                }
+
+                let prompt_request = prompt_builder.build().map_err(|_| {
+                    self.clear_preparation(generation);
+                    AgentCeremonyError::PromptBuildFailed
+                })?;
+                self.audit_prompt_display(&prompt_request, effective_cred_ref.as_ref())?;
+                let prompt_result = self.ctx.prompt_handle.prompt(&prompt_request);
+
+                match prompt_result.decision {
+                    super::prompt::PromptDecision::Approved => {
+                        self.audit_prompt_approve(&prompt_request, prompt_result.latency_ms)?;
+                    }
+                    super::prompt::PromptDecision::Denied => {
+                        self.audit_prompt_deny(&prompt_request, prompt_result.latency_ms)?;
+                        let _ = self.ctx.policy_runtime.ceremony_deny_pending(&tuple);
+                        self.clear_preparation(generation);
+                        return Err(AgentCeremonyError::PromptDenied);
+                    }
+                    super::prompt::PromptDecision::Timeout => {
+                        self.audit_prompt_timeout(&prompt_request)?;
+                        let _ = self.ctx.policy_runtime.ceremony_deny_pending(&tuple);
+                        self.clear_preparation(generation);
+                        return Err(AgentCeremonyError::PromptTimeout);
+                    }
+                    super::prompt::PromptDecision::Error => {
+                        let error_kind = prompt_result
+                            .error_kind
+                            .unwrap_or(super::prompt::PromptErrorKind::InternalError);
+                        self.audit_prompt_error(&prompt_request, error_kind)?;
+                        let _ = self.ctx.policy_runtime.ceremony_deny_pending(&tuple);
+                        self.clear_preparation(generation);
+                        return Err(AgentCeremonyError::PromptError);
+                    }
+                }
             }
-            super::prompt::PromptDecision::Error => {
-                let error_kind = prompt_result
-                    .error_kind
-                    .unwrap_or(super::prompt::PromptErrorKind::InternalError);
-                self.audit_prompt_error(&prompt_request, error_kind)?;
-                let _ = self.ctx.policy_runtime.ceremony_deny_pending(&tuple);
-                self.clear_preparation(generation);
-                return Err(AgentCeremonyError::PromptError);
-            }
+            AgentAuthorization::Allow => {}
         }
 
         let approval = TrustedApproval::new();
@@ -1493,7 +1520,7 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
             AgentCeremonyError::BoundAuthorizeFailed
         })?;
 
-        self.audit_policy_allow(&rp_id, action)?;
+        self.audit_policy_allow(&rp_id, action, &ceremony_policy)?;
 
         let ceremony_id = handle.ceremony_id().clone();
         let grant_id = handle.grant_id().cloned();
@@ -1550,8 +1577,8 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
                 rp_id.clone(),
                 intent_action.clone(),
                 interaction_gen,
-                true,
-                false,
+                ceremony_policy.user_presence != UserPresenceSource::None,
+                ceremony_policy.user_verification == UserVerificationSource::Policy,
                 Duration::from_secs(60),
             );
             Some(InteractionTokenGuard::new(manager.clone()))
@@ -1609,8 +1636,15 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
         &self,
         rp_id: &str,
         action: AuditAction,
+        policy: &passless_core::agent::AgentCeremonyPolicy,
     ) -> Result<(), AgentCeremonyError> {
-        let event = PolicyAllowBuilder::new(self.ctx.profile_id.clone(), action, rp_id).build();
+        let event = PolicyAllowBuilder::new(self.ctx.profile_id.clone(), action, rp_id)
+            .evidence_sources(
+                &policy.authorization.to_string(),
+                &policy.user_presence.to_string(),
+                &policy.user_verification.to_string(),
+            )
+            .build();
         self.ctx
             .audit_gate
             .record(event)
@@ -4030,6 +4064,8 @@ mod tests {
                         pin_path: PathBuf::from("/tmp/test-handler/pin"),
                     }),
                     registration_allowed,
+                    rules: vec![],
+                    delegated_registration_storage: None,
                     device: test_device(),
                     start_url: None,
                     browser_command: None,
@@ -4847,8 +4883,9 @@ mod tests {
             use crate::agent::policy_engine::PolicyRuntime;
             use crate::agent::storage::CeremonyScope;
             use passless_core::agent::{
-                AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, DeviceIdentity,
-                EndpointId, PrincipalSessionId, ProfileId,
+                AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode,
+                AgentProfileConfig, AgentRpRule, AgentStorageConfig, DeviceIdentity, EndpointId,
+                PrincipalSessionId, ProfileId, UserPresenceSource, UserVerificationSource,
             };
             use std::collections::BTreeMap;
             use std::path::PathBuf;
@@ -4972,6 +5009,8 @@ mod tests {
                             pin_path: PathBuf::from("/tmp/test-audit-fault/pin"),
                         }),
                         registration_allowed: true,
+                        rules: vec![],
+                        delegated_registration_storage: None,
                         device: test_device(),
                         start_url: None,
                         browser_command: None,
@@ -4984,6 +5023,23 @@ mod tests {
                     profiles,
                     audit_path: Some(PathBuf::from("/tmp/test-audit-fault-audit")),
                 }
+            }
+
+            fn make_allow_config() -> AgentConfig {
+                let mut config = make_isolated_config();
+                let profile = config.profiles.get_mut("test").unwrap();
+                profile.rp_ids.clear();
+                profile.registration_allowed = false;
+                profile.rules = vec![AgentRpRule {
+                    rp_id: "example.com".to_string(),
+                    register: AgentCeremonyPolicy {
+                        authorization: AgentAuthorization::Allow,
+                        user_presence: UserPresenceSource::Policy,
+                        user_verification: UserVerificationSource::Policy,
+                    },
+                    authenticate: AgentCeremonyPolicy::deny(),
+                }];
+                config
             }
 
             fn make_runtime_with_faulty_audit(
@@ -5368,6 +5424,97 @@ mod tests {
             }
 
             #[test]
+            fn test_policy_allow_skips_denied_prompt_and_dispatches() {
+                use crate::agent::prompt::{MockPromptHandle, PromptDecision};
+
+                let audit_dir = format!(
+                    "/tmp/test-policy-allow-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                std::fs::create_dir_all(&audit_dir).unwrap();
+                std::fs::set_permissions(
+                    &audit_dir,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                )
+                .unwrap();
+                let audit = Arc::new(AuditGate::open(&audit_dir).unwrap());
+                let config = make_allow_config();
+                let clock = Arc::new(MockClock::new());
+                let runtime =
+                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let generation = runtime.current_generation();
+                let profile_id = ProfileId::new("test").unwrap();
+                let session_id = PrincipalSessionId::new();
+                let endpoint_id = EndpointId::new();
+                let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
+
+                runtime
+                    .principal_create_pending_intent(crate::agent::intent::CreateIntentParams {
+                        profile_id: profile_id.clone(),
+                        session_id: session_id.clone(),
+                        endpoint_id: endpoint_id.clone(),
+                        process_digest: process_digest.clone(),
+                        action: IntentAction::Register,
+                        rp_id: "example.com".to_string(),
+                        credential_ref: None,
+                        policy_generation: generation.generation_id.clone(),
+                        policy_digest: generation.digest.clone(),
+                        require_uv: true,
+                        ttl_ms: Some(60_000),
+                    })
+                    .unwrap();
+
+                let slot = Arc::new(CeremonyPreparationSlot::new());
+                let guard = slot
+                    .install(CeremonyPreparationInput {
+                        session_id,
+                        process_digest,
+                        policy_generation: generation.generation_id.clone(),
+                        policy_digest: generation.digest.clone(),
+                        credential_ref: None,
+                        untrusted_metadata: BoundedUntrustedMetadata::new(
+                            "example.com".to_string(),
+                            IntentAction::Register,
+                            true,
+                        ),
+                        clamped_grant_ttl_secs: 300,
+                        clamped_session_ttl_secs: 3600,
+                        trusted_credential_label: None,
+                    })
+                    .unwrap();
+                guard.disarm();
+
+                let scope = CeremonyScope::new();
+                let ctx = StaticCeremonyContext::new(StaticCeremonyContextConfig {
+                    profile_id,
+                    endpoint_id,
+                    mode: PromptMode::Isolated,
+                    policy_runtime: runtime,
+                    audit_gate: audit,
+                    ceremony_scope: scope,
+                    require_uv: false,
+                    prompt_handle: Arc::new(MockPromptHandle::new(PromptDecision::Denied, 0)),
+                    preparation_slot: slot,
+                });
+                let (inner, calls) = CountingHandler::new(make_mc_response_bytes());
+                let mut handler = AgentCeremonyHandler::new(inner, ctx);
+
+                let result = handler
+                    .handle_command(
+                        soft_fido2_transport::Cmd::Cbor,
+                        &make_mc_request("example.com"),
+                    )
+                    .unwrap();
+
+                assert_eq!(result, make_mc_response_bytes());
+                assert_eq!(*calls.lock().unwrap(), 1);
+                let _ = std::fs::remove_dir_all(&audit_dir);
+            }
+
+            #[test]
             fn test_missing_pending_request_fails_closed() {
                 let audit_dir = format!(
                     "/tmp/test-no-pending-{}",
@@ -5513,6 +5660,8 @@ mod tests {
                             pin_path: PathBuf::from("/tmp/test-rp-mismatch/pin"),
                         }),
                         registration_allowed: true,
+                        rules: vec![],
+                        delegated_registration_storage: None,
                         device: test_device(),
                         start_url: None,
                         browser_command: None,

@@ -58,6 +58,133 @@ impl std::str::FromStr for AgentMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentAuthorization {
+    Deny,
+    Confirm,
+    Allow,
+}
+
+impl fmt::Display for AgentAuthorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deny => f.write_str("deny"),
+            Self::Confirm => f.write_str("confirm"),
+            Self::Allow => f.write_str("allow"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserPresenceSource {
+    Human,
+    Policy,
+    None,
+}
+
+impl fmt::Display for UserPresenceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Human => f.write_str("human"),
+            Self::Policy => f.write_str("policy"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserVerificationSource {
+    Human,
+    Policy,
+    None,
+}
+
+impl fmt::Display for UserVerificationSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Human => f.write_str("human"),
+            Self::Policy => f.write_str("policy"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCeremonyPolicy {
+    pub authorization: AgentAuthorization,
+    pub user_presence: UserPresenceSource,
+    pub user_verification: UserVerificationSource,
+}
+
+impl AgentCeremonyPolicy {
+    pub fn validate(&self, profile_id: &ProfileId, rp_id: &str, action: &str) -> Result<()> {
+        if self.authorization == AgentAuthorization::Deny
+            && (self.user_presence != UserPresenceSource::None
+                || self.user_verification != UserVerificationSource::None)
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': {} policy for '{}' must use no UP or UV evidence when authorization is deny",
+                profile_id, action, rp_id,
+            )));
+        }
+        if self.authorization == AgentAuthorization::Allow
+            && self.user_presence == UserPresenceSource::Human
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': {} policy for '{}' cannot require human UP when authorization is allow",
+                profile_id, action, rp_id,
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn legacy_confirm(require_uv: bool) -> Self {
+        Self {
+            authorization: AgentAuthorization::Confirm,
+            user_presence: UserPresenceSource::Human,
+            user_verification: if require_uv {
+                UserVerificationSource::Human
+            } else {
+                UserVerificationSource::None
+            },
+        }
+    }
+
+    pub fn deny() -> Self {
+        Self {
+            authorization: AgentAuthorization::Deny,
+            user_presence: UserPresenceSource::None,
+            user_verification: UserVerificationSource::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRpRule {
+    pub rp_id: String,
+    pub register: AgentCeremonyPolicy,
+    pub authenticate: AgentCeremonyPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DelegatedRegistrationStorage {
+    Human,
+}
+
+impl fmt::Display for DelegatedRegistrationStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Human => f.write_str("human"),
+        }
+    }
+}
+
 fn default_gpg_backend() -> String {
     "gnupg-bin".to_string()
 }
@@ -341,6 +468,11 @@ pub struct AgentProfileConfig {
     #[serde(default)]
     pub registration_allowed: bool,
 
+    #[serde(default)]
+    pub rules: Vec<AgentRpRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_registration_storage: Option<DelegatedRegistrationStorage>,
+
     pub device: DeviceIdentity,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +486,62 @@ pub struct AgentProfileConfig {
 }
 
 impl AgentProfileConfig {
+    pub fn effective_rules(&self) -> Vec<AgentRpRule> {
+        if !self.rules.is_empty() {
+            return self.rules.clone();
+        }
+
+        self.rp_ids
+            .iter()
+            .map(|rp_id| AgentRpRule {
+                rp_id: rp_id.clone(),
+                register: if self.registration_allowed && self.mode == AgentMode::Isolated {
+                    AgentCeremonyPolicy::legacy_confirm(self.require_uv)
+                } else {
+                    AgentCeremonyPolicy::deny()
+                },
+                authenticate: AgentCeremonyPolicy::legacy_confirm(self.require_uv),
+            })
+            .collect()
+    }
+
+    pub fn allowed_rp_ids(&self) -> Vec<String> {
+        self.effective_rules()
+            .into_iter()
+            .filter(|rule| {
+                rule.register.authorization != AgentAuthorization::Deny
+                    || rule.authenticate.authorization != AgentAuthorization::Deny
+            })
+            .map(|rule| rule.rp_id)
+            .collect()
+    }
+
+    pub fn rule_for_rp(&self, rp_id: &str) -> Option<AgentRpRule> {
+        let normalized = rp_id.trim().to_ascii_lowercase();
+        self.effective_rules()
+            .into_iter()
+            .find(|rule| rule.rp_id.trim().to_ascii_lowercase() == normalized)
+    }
+
+    pub fn allows_registration(&self) -> bool {
+        self.effective_rules()
+            .iter()
+            .any(|rule| rule.register.authorization != AgentAuthorization::Deny)
+    }
+
+    pub fn allows_authentication(&self) -> bool {
+        self.effective_rules()
+            .iter()
+            .any(|rule| rule.authenticate.authorization != AgentAuthorization::Deny)
+    }
+
+    pub fn requires_human_uv(&self) -> bool {
+        self.effective_rules().iter().any(|rule| {
+            rule.register.user_verification == UserVerificationSource::Human
+                || rule.authenticate.user_verification == UserVerificationSource::Human
+        })
+    }
+
     pub fn validate(&self, profile_id: &ProfileId) -> Result<()> {
         if self.principal_user.is_empty() {
             return Err(Error::Config(format!(
@@ -362,8 +550,30 @@ impl AgentProfileConfig {
             )));
         }
 
-        for rp_id in &self.rp_ids {
-            validate_rp_id(rp_id)?;
+        if !self.rules.is_empty()
+            && (!self.rp_ids.is_empty() || self.registration_allowed || self.require_uv)
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': explicit rules cannot be combined with legacy rp_ids, registration_allowed, or require_uv",
+                profile_id,
+            )));
+        }
+
+        let effective_rules = self.effective_rules();
+        let mut normalized_rules = std::collections::BTreeSet::new();
+        for rule in &effective_rules {
+            validate_rp_id(&rule.rp_id)?;
+            let normalized = rule.rp_id.trim().to_ascii_lowercase();
+            if !normalized_rules.insert(normalized) {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': duplicate RP rule for '{}'",
+                    profile_id, rule.rp_id,
+                )));
+            }
+            rule.register
+                .validate(profile_id, &rule.rp_id, "registration")?;
+            rule.authenticate
+                .validate(profile_id, &rule.rp_id, "authentication")?;
         }
 
         self.device.validate(profile_id)?;
@@ -387,7 +597,7 @@ impl AgentProfileConfig {
 
         match self.mode {
             AgentMode::DelegatedSession => {
-                if !self.require_uv {
+                if self.rules.is_empty() && !self.require_uv {
                     return Err(Error::Config(format!(
                         "agent profile '{}': delegated-session requires require_uv = true",
                         profile_id
@@ -400,17 +610,25 @@ impl AgentProfileConfig {
                         profile_id
                     )));
                 }
-                let refs = self.credential_refs.as_ref().ok_or_else(|| {
-                    Error::Config(format!(
-                        "agent profile '{}': delegated-session requires credential_refs",
-                        profile_id
-                    ))
-                })?;
-                if refs.is_empty() {
+                if self.allows_registration() && self.delegated_registration_storage.is_none() {
                     return Err(Error::Config(format!(
-                        "agent profile '{}': credential_refs must not be empty",
-                        profile_id
+                        "agent profile '{}': delegated registration requires delegated_registration_storage",
+                        profile_id,
                     )));
+                }
+                if self.allows_authentication() {
+                    let refs = self.credential_refs.as_ref().ok_or_else(|| {
+                        Error::Config(format!(
+                            "agent profile '{}': delegated authentication requires credential_refs",
+                            profile_id
+                        ))
+                    })?;
+                    if refs.is_empty() {
+                        return Err(Error::Config(format!(
+                            "agent profile '{}': credential_refs must not be empty",
+                            profile_id
+                        )));
+                    }
                 }
                 if self.max_grant_ttl.is_none() {
                     return Err(Error::Config(format!(
@@ -465,10 +683,16 @@ impl AgentProfileConfig {
                 validate_browser_runtime_root(browser_runtime_root, profile_id)?;
 
                 if let Some(ref url) = self.start_url {
-                    validate_start_url(url, &self.rp_ids, profile_id)?;
+                    validate_start_url(url, &self.allowed_rp_ids(), profile_id)?;
                 }
             }
             AgentMode::Isolated => {
+                if self.delegated_registration_storage.is_some() {
+                    return Err(Error::Config(format!(
+                        "agent profile '{}': isolated mode must not specify delegated_registration_storage",
+                        profile_id,
+                    )));
+                }
                 if self.storage.is_none() {
                     return Err(Error::Config(format!(
                         "agent profile '{}': isolated mode requires storage backend configuration",
@@ -1003,6 +1227,8 @@ mod tests {
             max_session_ttl: Some(BoundedDuration::new(900).unwrap()),
             storage: None,
             registration_allowed: false,
+            rules: vec![],
+            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "passless-agent-test".to_string(),
                 phys: "test-phys".to_string(),
@@ -1031,6 +1257,8 @@ mod tests {
                 pin_path: PathBuf::from("/tmp/test-agent/pin"),
             }),
             registration_allowed: true,
+            rules: vec![],
+            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "passless-agent-iso".to_string(),
                 phys: "iso-phys".to_string(),
@@ -1102,6 +1330,168 @@ mod tests {
         let profile = make_isolated_profile();
         let pid = ProfileId::new("test").unwrap();
         assert!(profile.validate(&pid).is_ok());
+    }
+
+    fn policy(
+        authorization: AgentAuthorization,
+        user_presence: UserPresenceSource,
+        user_verification: UserVerificationSource,
+    ) -> AgentCeremonyPolicy {
+        AgentCeremonyPolicy {
+            authorization,
+            user_presence,
+            user_verification,
+        }
+    }
+
+    #[test]
+    fn test_explicit_policy_allow_validates() {
+        let mut profile = make_isolated_profile();
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: policy(
+                AgentAuthorization::Allow,
+                UserPresenceSource::Policy,
+                UserVerificationSource::Policy,
+            ),
+            authenticate: policy(
+                AgentAuthorization::Confirm,
+                UserPresenceSource::Human,
+                UserVerificationSource::Human,
+            ),
+        }];
+
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+        assert_eq!(profile.allowed_rp_ids(), vec!["example.com"]);
+        assert!(profile.allows_registration());
+        assert!(profile.requires_human_uv());
+    }
+
+    #[test]
+    fn test_explicit_policy_rejects_legacy_fields() {
+        let mut profile = make_isolated_profile();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_allow_rejects_human_up() {
+        let err = policy(
+            AgentAuthorization::Allow,
+            UserPresenceSource::Human,
+            UserVerificationSource::None,
+        )
+        .validate(
+            &ProfileId::new("test").unwrap(),
+            "example.com",
+            "authentication",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot require human UP"));
+    }
+
+    #[test]
+    fn test_deny_rejects_evidence() {
+        let err = policy(
+            AgentAuthorization::Deny,
+            UserPresenceSource::Policy,
+            UserVerificationSource::None,
+        )
+        .validate(
+            &ProfileId::new("test").unwrap(),
+            "example.com",
+            "registration",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must use no UP or UV evidence"));
+    }
+
+    #[test]
+    fn test_duplicate_explicit_rp_rule_rejected() {
+        let mut profile = make_isolated_profile();
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        let rule = AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: policy(
+                AgentAuthorization::Allow,
+                UserPresenceSource::Policy,
+                UserVerificationSource::None,
+            ),
+        };
+        profile.rules = vec![rule.clone(), rule];
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate RP rule"));
+    }
+
+    #[test]
+    fn test_delegated_registration_requires_explicit_storage_target() {
+        let mut profile = make_delegated_profile();
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: policy(
+                AgentAuthorization::Allow,
+                UserPresenceSource::Policy,
+                UserVerificationSource::Policy,
+            ),
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+        profile.credential_refs = None;
+
+        let profile_id = ProfileId::new("test").unwrap();
+        let err = profile.validate(&profile_id).unwrap_err();
+        assert!(err.to_string().contains("delegated_registration_storage"));
+
+        profile.delegated_registration_storage = Some(DelegatedRegistrationStorage::Human);
+        assert!(profile.validate(&profile_id).is_ok());
+    }
+
+    #[test]
+    fn test_explicit_rules_toml_roundtrip() {
+        let input = r#"
+mode = "isolated"
+principal_user = "agent"
+
+[[rules]]
+rp_id = "example.com"
+register = { authorization = "deny", user_presence = "none", user_verification = "none" }
+authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+
+[storage.local]
+path = "/tmp/rules/credentials"
+pin_path = "/tmp/rules/pin"
+
+[device]
+name = "rules"
+phys = "rules-phys"
+uniq = "rules-uniq"
+vendor_id = 4660
+product_id = 22136
+"#;
+        let profile: AgentProfileConfig = toml::from_str(input).unwrap();
+        assert_eq!(profile.rules.len(), 1);
+        assert_eq!(
+            profile.rules[0].authenticate.authorization,
+            AgentAuthorization::Allow
+        );
+        assert!(profile.validate(&ProfileId::new("rules").unwrap()).is_ok());
     }
 
     #[test]
@@ -1251,6 +1641,8 @@ verbose = false
                     pin_path: PathBuf::from("/tmp/a/pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: device.clone(),
                 start_url: None,
                 browser_command: None,
@@ -1273,6 +1665,8 @@ verbose = false
                     pin_path: PathBuf::from("/tmp/b/pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device,
                 start_url: None,
                 browser_command: None,
@@ -1307,6 +1701,8 @@ verbose = false
                     pin_path: PathBuf::from("/tmp/agent/data/sub"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -1351,6 +1747,8 @@ verbose = false
                     pin_path: dir.path().join("pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -1654,6 +2052,8 @@ product_id = 2
                     pin_path: PathBuf::from("/tmp/overlap/data/sub"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "overlap-test".to_string(),
                     phys: "p".to_string(),
@@ -1696,6 +2096,8 @@ product_id = 2
                         pin_path: PathBuf::from(format!("/tmp/{}-pin", name)),
                     }),
                     registration_allowed: false,
+                    rules: vec![],
+                    delegated_registration_storage: None,
                     device: DeviceIdentity {
                         name: format!("dev-{}", name),
                         phys: format!("phys-{}", name),
@@ -1823,6 +2225,8 @@ backend_type = "local"
                     pin_path: symlink_dir.clone(),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -1877,6 +2281,8 @@ backend_type = "local"
                     pin_path: dir.path().join("pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -1923,6 +2329,8 @@ backend_type = "local"
                     pin_path: dir.path().join("pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2297,6 +2705,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     pin_path: shared_pin.clone(),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2325,6 +2735,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     pin_path: shared_pin,
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "b".to_string(),
                     phys: "b".to_string(),
@@ -2396,6 +2808,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     pin_path: PathBuf::from("/tmp/a/pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2424,6 +2838,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     pin_path: PathBuf::from("/tmp/b/pin"),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "b".to_string(),
                     phys: "b".to_string(),
@@ -2466,6 +2882,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     pin_path: audit.clone(),
                 }),
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),

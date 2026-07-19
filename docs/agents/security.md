@@ -11,14 +11,16 @@ and browser leases. The security boundary relies on:
 - Hash-chained audit that gates credential use.
 - Deny-by-default policy administered outside every principal.
 
-## Trusted prompt and UP/UV
+## Authorization and UP/UV
 
-Every WebAuthn ceremony requires fresh user presence (UP) and actual user verification
-(UV) for that exact operation.
+Every exact RP rule selects `deny`, `confirm`, or `allow` independently for registration and
+authentication. It also selects the source of UP and UV evidence.
 
-- UP is set only after a human approves the trusted prompt for the bound CTAP operation.
-- UV is set only after Passless performs actual local verification (PIN or platform UV).
-- Policy, capabilities, prior gestures, and authorization windows never produce UP or UV.
+- Human UP is set only after a trusted prompt approves the bound CTAP operation.
+- Human UV is set only after Passless performs actual local verification.
+- Policy UP/UV requires an explicit operator-owned rule and is audited as machine authorization,
+  not human interaction or verification.
+- Missing rules deny, and browser leases never authorize another ceremony by themselves.
 - The prompt shows trusted fields (profile, mode, exact RP ID, action, credential label)
   and clearly labels untrusted fields (account name, page URL, page title, agent reason).
 - If the notification server cannot provide distinguishable approve and deny actions,

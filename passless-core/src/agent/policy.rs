@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::config::AgentRpRule;
 use super::ids::{CredentialRef, ProfileId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +33,7 @@ impl fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-pub const CURRENT_POLICY_VERSION: u8 = 2;
+pub const CURRENT_POLICY_VERSION: u8 = 3;
 const MAX_TTL: u64 = 86400 * 365;
 const MAX_CONCURRENT_GRANTS_LIMIT: u64 = 1000;
 
@@ -60,6 +61,8 @@ pub struct PolicyParams {
     pub storage_path: String,
     pub browser_user: String,
     pub browser_runtime_root: String,
+    pub rules: Vec<AgentRpRule>,
+    pub delegated_registration_storage: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +90,8 @@ pub struct Policy {
     pub storage_path: String,
     pub browser_user: String,
     pub browser_runtime_root: String,
+    pub rules: Vec<AgentRpRule>,
+    pub delegated_registration_storage: String,
 }
 
 impl Policy {
@@ -103,6 +108,9 @@ impl Policy {
         let mut sorted_actions = params.allowed_actions;
         sorted_actions.sort();
         sorted_actions.dedup();
+
+        let mut sorted_rules = params.rules;
+        sorted_rules.sort_by_key(|rule| rule.rp_id.trim().to_ascii_lowercase());
 
         let policy = Self {
             version: CURRENT_POLICY_VERSION,
@@ -128,6 +136,8 @@ impl Policy {
             storage_path: params.storage_path,
             browser_user: params.browser_user,
             browser_runtime_root: params.browser_runtime_root,
+            rules: sorted_rules,
+            delegated_registration_storage: params.delegated_registration_storage,
         };
         policy.validate()?;
         Ok(policy)
@@ -163,6 +173,8 @@ impl Policy {
             storage_path: String::new(),
             browser_user: String::new(),
             browser_runtime_root: String::new(),
+            rules: vec![],
+            delegated_registration_storage: String::new(),
         })
     }
 
@@ -283,6 +295,8 @@ impl AsRef<[u8]> for PolicyDigest {
 
 pub mod cbor {
     use super::Policy;
+
+    use crate::agent::{AgentCeremonyPolicy, AgentRpRule};
 
     pub fn encode_uint(value: u64) -> Vec<u8> {
         encode_type_and_length(0, value)
@@ -459,8 +473,53 @@ pub mod cbor {
                 "browser_runtime_root".to_string(),
                 encode_text(&policy.browser_runtime_root),
             ),
+            ("rules".to_string(), encode_rules(&policy.rules)),
+            (
+                "delegated_registration_storage".to_string(),
+                encode_text(&policy.delegated_registration_storage),
+            ),
         ];
         encode_map_sorted(&entries)
+    }
+
+    fn encode_ceremony_policy(policy: &AgentCeremonyPolicy) -> Vec<u8> {
+        encode_map_sorted(&[
+            (
+                "authorization".to_string(),
+                encode_text(&policy.authorization.to_string()),
+            ),
+            (
+                "user_presence".to_string(),
+                encode_text(&policy.user_presence.to_string()),
+            ),
+            (
+                "user_verification".to_string(),
+                encode_text(&policy.user_verification.to_string()),
+            ),
+        ])
+    }
+
+    fn encode_rules(rules: &[AgentRpRule]) -> Vec<u8> {
+        let encoded = rules
+            .iter()
+            .map(|rule| {
+                encode_map_sorted(&[
+                    (
+                        "rp_id".to_string(),
+                        encode_text(&rule.rp_id.trim().to_ascii_lowercase()),
+                    ),
+                    (
+                        "register".to_string(),
+                        encode_ceremony_policy(&rule.register),
+                    ),
+                    (
+                        "authenticate".to_string(),
+                        encode_ceremony_policy(&rule.authenticate),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        encode_array(&encoded)
     }
 
     pub fn encode_generation_digest(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
@@ -502,6 +561,8 @@ pub mod cbor {
             "storage_path",
             "browser_user",
             "browser_runtime_root",
+            "rules",
+            "delegated_registration_storage",
         ];
         keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         keys
@@ -512,6 +573,10 @@ pub mod cbor {
 mod tests {
     use super::cbor;
     use super::*;
+
+    use crate::agent::{
+        AgentAuthorization, AgentCeremonyPolicy, UserPresenceSource, UserVerificationSource,
+    };
 
     fn test_profile_id() -> ProfileId {
         ProfileId::new("test-agent").unwrap()
@@ -641,7 +706,7 @@ mod tests {
     fn test_encode_map_sorted_order() {
         let keys = cbor::sorted_keys_for_policy();
         assert_eq!(keys[0], "mode");
-        assert_eq!(keys[1], "version");
+        assert_eq!(keys[1], "rules");
 
         for i in 1..keys.len() {
             assert!(keys[i - 1].len() <= keys[i].len());
@@ -732,7 +797,8 @@ mod tests {
         let policy = test_policy();
         let cbor = policy.to_deterministic_cbor();
         assert_eq!(cbor[0] & 0xe0, 0xa0);
-        assert_eq!(cbor[0] & 0x1f, 23);
+        assert_eq!(cbor[0] & 0x1f, 24);
+        assert_eq!(cbor[1], 25);
     }
 
     #[test]
@@ -857,6 +923,8 @@ mod tests {
             storage_path: String::new(),
             browser_user: "alice".to_string(),
             browser_runtime_root: String::new(),
+            rules: vec![],
+            delegated_registration_storage: String::new(),
         })
         .unwrap();
         let p2 = Policy::from_params(PolicyParams {
@@ -882,6 +950,8 @@ mod tests {
             storage_path: String::new(),
             browser_user: "bob".to_string(),
             browser_runtime_root: String::new(),
+            rules: vec![],
+            delegated_registration_storage: String::new(),
         })
         .unwrap();
         assert_ne!(p1.digest(), p2.digest());
@@ -913,6 +983,8 @@ mod tests {
             storage_path: String::new(),
             browser_user: String::new(),
             browser_runtime_root: "/run/browser-a".to_string(),
+            rules: vec![],
+            delegated_registration_storage: String::new(),
         })
         .unwrap();
         let p2 = Policy::from_params(PolicyParams {
@@ -938,9 +1010,33 @@ mod tests {
             storage_path: String::new(),
             browser_user: String::new(),
             browser_runtime_root: "/run/browser-b".to_string(),
+            rules: vec![],
+            delegated_registration_storage: String::new(),
         })
         .unwrap();
         assert_ne!(p1.digest(), p2.digest());
+    }
+
+    #[test]
+    fn test_rule_decision_changes_policy_digest() {
+        let mut confirm = test_policy();
+        confirm.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Confirm,
+                user_presence: UserPresenceSource::Human,
+                user_verification: UserVerificationSource::Human,
+            },
+        }];
+        let mut allow = confirm.clone();
+        allow.rules[0].authenticate = AgentCeremonyPolicy {
+            authorization: AgentAuthorization::Allow,
+            user_presence: UserPresenceSource::Policy,
+            user_verification: UserVerificationSource::Policy,
+        };
+
+        assert_ne!(confirm.digest(), allow.digest());
     }
 
     #[test]
@@ -1014,7 +1110,8 @@ mod tests {
         let cbor_bytes = policy.to_deterministic_cbor();
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
-        assert_eq!(cbor_bytes[0] & 0x1f, 23);
+        assert_eq!(cbor_bytes[0] & 0x1f, 24);
+        assert_eq!(cbor_bytes[1], 25);
         assert!(!cbor_bytes.is_empty());
         assert_ne!(cbor_bytes[0], 0xbf);
     }
@@ -1043,7 +1140,8 @@ mod tests {
         let cbor_bytes = policy.to_deterministic_cbor();
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
-        assert_eq!(cbor_bytes[0] & 0x1f, 23);
+        assert_eq!(cbor_bytes[0] & 0x1f, 24);
+        assert_eq!(cbor_bytes[1], 25);
         assert!(!cbor_bytes.is_empty());
     }
 
@@ -1070,7 +1168,8 @@ mod tests {
         let cbor_bytes = policy.to_deterministic_cbor();
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
-        assert_eq!(cbor_bytes[0] & 0x1f, 23);
+        assert_eq!(cbor_bytes[0] & 0x1f, 24);
+        assert_eq!(cbor_bytes[1], 25);
     }
 
     #[test]
@@ -1165,7 +1264,7 @@ mod tests {
     #[test]
     fn test_sorted_keys_complete() {
         let keys = cbor::sorted_keys_for_policy();
-        assert_eq!(keys.len(), 23);
+        assert_eq!(keys.len(), 25);
         assert!(keys.contains(&"version"));
         assert!(keys.contains(&"profile_id"));
         assert!(keys.contains(&"mode"));
@@ -1189,6 +1288,8 @@ mod tests {
         assert!(keys.contains(&"storage_path"));
         assert!(keys.contains(&"browser_user"));
         assert!(keys.contains(&"browser_runtime_root"));
+        assert!(keys.contains(&"rules"));
+        assert!(keys.contains(&"delegated_registration_storage"));
     }
 
     #[test]
@@ -1205,6 +1306,7 @@ mod tests {
             keys,
             vec![
                 "mode",
+                "rules",
                 "version",
                 "start_url",
                 "profile_id",
@@ -1227,13 +1329,14 @@ mod tests {
                 "browser_runtime_root",
                 "registration_allowed",
                 "max_concurrent_grants",
+                "delegated_registration_storage",
             ]
         );
     }
 
     #[test]
     fn test_policy_version_constant() {
-        assert_eq!(CURRENT_POLICY_VERSION, 2);
+        assert_eq!(CURRENT_POLICY_VERSION, 3);
     }
 
     #[test]

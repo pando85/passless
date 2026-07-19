@@ -44,7 +44,9 @@ use super::launcher::{
 use super::policy_engine::PolicyRuntime;
 use super::prompt::{DesktopPromptHandle, PromptHandle, PromptMode};
 use super::storage::{CeremonyScope, ForwardingStorageHandle, IsolatedScopedStorage};
-use super::storage_factory::{create_shared_delegated_storage, create_storage_bundle_with_options};
+use super::storage_factory::{
+    create_shared_delegated_storage_with_registration, create_storage_bundle_with_options,
+};
 
 use crate::authenticator::AuthenticatorService;
 use crate::storage::CredentialStorage;
@@ -991,7 +993,7 @@ impl AgentRuntime {
 
                     let ceremony_scope = CeremonyScope::new();
 
-                    let effective_pin_config = if profile.require_uv {
+                    let effective_pin_config = if profile.requires_human_uv() {
                         let mut cfg = pin_config.clone();
                         cfg.enforcement = passless_core::config::PinEnforcement::Required;
                         cfg
@@ -1026,16 +1028,11 @@ impl AgentRuntime {
                     Ok((spec, ceremony_scope, bundle.credential_storage))
                 }
                 AgentMode::DelegatedSession => {
-                    let cred_refs = profile.credential_refs.as_ref().ok_or_else(|| {
-                        RuntimeError::Config(format!(
-                            "profile '{}': delegated-session requires credential_refs",
-                            name
-                        ))
-                    })?;
+                    let cred_refs = profile.credential_refs.clone().unwrap_or_default();
 
                     let ceremony_scope = CeremonyScope::new();
 
-                    let effective_pin_config = if profile.require_uv {
+                    let effective_pin_config = if profile.requires_human_uv() {
                         let mut cfg = pin_config.clone();
                         cfg.enforcement = passless_core::config::PinEnforcement::Required;
                         cfg
@@ -1064,7 +1061,7 @@ impl AgentRuntime {
                             human_storage: human_storage.clone(),
                             human_pin_storage: human_pin_storage.clone(),
                             human_operation_lock: human_operation_lock.clone(),
-                            credential_refs: cred_refs.clone(),
+                            credential_refs: cred_refs,
                         }),
                     };
 
@@ -1212,7 +1209,7 @@ impl AgentRuntime {
             .as_ref()
             .map(|d| d.as_secs())
             .unwrap_or(300);
-        let require_uv = spec.profile_config.require_uv;
+        let require_uv = spec.profile_config.rules.is_empty() && spec.profile_config.require_uv;
 
         let binding = EndpointBinding {
             profile_id: profile_id.clone(),
@@ -1257,8 +1254,8 @@ impl AgentRuntime {
                     ))
                 })?;
 
-                let rp_ids = spec.profile_config.rp_ids.clone();
-                let registration_allowed = spec.profile_config.registration_allowed;
+                let rp_ids = spec.profile_config.allowed_rp_ids();
+                let registration_allowed = spec.profile_config.allows_registration();
 
                 let mut scoped_storage = IsolatedScopedStorage::new(
                     ForwardingStorageHandle::new(deps.credential_storage.clone()),
@@ -1378,11 +1375,12 @@ impl AgentRuntime {
                             name, e
                         ))
                     })?;
-                    create_shared_delegated_storage(
+                    create_shared_delegated_storage_with_registration(
                         deps.human_storage.clone(),
-                        spec.profile_config.rp_ids.clone(),
+                        spec.profile_config.allowed_rp_ids(),
                         deps.credential_refs.clone(),
                         spec.security_config.constant_signature_counter,
+                        spec.profile_config.delegated_registration_storage.is_some(),
                     )
                     .map_err(|e| {
                         RuntimeError::Storage(format!(
@@ -1518,7 +1516,7 @@ impl AgentRuntime {
             .as_ref()
             .map(|d| d.as_secs())
             .unwrap_or(300);
-        let require_uv = spec.profile_config.require_uv;
+        let require_uv = spec.profile_config.rules.is_empty() && spec.profile_config.require_uv;
 
         let binding = super::device::EndpointBinding {
             profile_id: profile_id.clone(),
@@ -1558,11 +1556,12 @@ impl AgentRuntime {
                             name, e
                         ))
                     })?;
-                    super::storage_factory::create_shared_delegated_storage(
+                    super::storage_factory::create_shared_delegated_storage_with_registration(
                         deps.human_storage.clone(),
-                        spec.profile_config.rp_ids.clone(),
+                        spec.profile_config.allowed_rp_ids(),
                         deps.credential_refs.clone(),
                         spec.security_config.constant_signature_counter,
+                        spec.profile_config.delegated_registration_storage.is_some(),
                     )
                     .map_err(|e| {
                         RuntimeError::Storage(format!(
@@ -1675,8 +1674,8 @@ impl AgentRuntime {
                     ))
                 })?;
 
-                let rp_ids = spec.profile_config.rp_ids.clone();
-                let registration_allowed = spec.profile_config.registration_allowed;
+                let rp_ids = spec.profile_config.allowed_rp_ids();
+                let registration_allowed = spec.profile_config.allows_registration();
 
                 let mut scoped_storage = super::storage::IsolatedScopedStorage::new(
                     super::storage::ForwardingStorageHandle::new(deps.credential_storage.clone()),
@@ -2310,6 +2309,10 @@ impl AgentRuntime {
                             let mut current = profile.current_pending.lock().unwrap();
                             *current = None;
                         }
+                        if profile.mode == AgentMode::DelegatedSession && browser_lease_id.is_none()
+                        {
+                            let _ = self.destroy_delegated_endpoint(profile);
+                        }
                     }
                     super::policy_engine::PendingState::Waiting => {}
                     super::policy_engine::PendingState::Denied
@@ -2924,10 +2927,16 @@ impl AgentRuntime {
         } = params;
         use passless_core::agent::protocol::IntentAction;
 
-        if profile.mode != AgentMode::Isolated {
+        let delegated_registration = profile.mode == AgentMode::DelegatedSession
+            && *action == IntentAction::Register
+            && profile
+                .profile_config
+                .delegated_registration_storage
+                .is_some();
+        if profile.mode != AgentMode::Isolated && !delegated_registration {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                "CreateIntent is only allowed for isolated profiles",
+                "CreateIntent is allowed only for isolated profiles or explicitly configured delegated registration",
                 RecommendedAction::FixRequest,
             ));
         }
@@ -2935,11 +2944,13 @@ impl AgentRuntime {
         let normalized_rp = rp_id.trim().to_ascii_lowercase();
         let config = &profile.profile_config;
 
-        if !config
-            .rp_ids
-            .iter()
-            .any(|id| id.trim().to_ascii_lowercase() == normalized_rp)
-        {
+        let ceremony_policy = config.rule_for_rp(&normalized_rp).map(|rule| match action {
+            IntentAction::Register => rule.register,
+            IntentAction::Authenticate => rule.authenticate,
+        });
+        if ceremony_policy.as_ref().is_none_or(|policy| {
+            policy.authorization == passless_core::agent::AgentAuthorization::Deny
+        }) {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "RP ID does not exactly match configured RP IDs",
@@ -2949,13 +2960,6 @@ impl AgentRuntime {
 
         match action {
             IntentAction::Register => {
-                if !config.registration_allowed {
-                    return Err(ProtocolError::new(
-                        ErrorCode::Forbidden,
-                        "registration is not allowed for this profile",
-                        RecommendedAction::FixRequest,
-                    ));
-                }
                 if credential_ref.is_some() {
                     return Err(ProtocolError::new(
                         ErrorCode::Forbidden,
@@ -3033,7 +3037,9 @@ impl AgentRuntime {
             credential_ref: credential_ref.cloned(),
             policy_generation: generation.generation_id.clone(),
             policy_digest: generation.digest.clone(),
-            require_uv: config.require_uv,
+            require_uv: ceremony_policy.as_ref().is_some_and(|policy| {
+                policy.user_verification != passless_core::agent::UserVerificationSource::None
+            }),
             ttl_ms: Some(300_000),
         };
 
@@ -3072,7 +3078,9 @@ impl AgentRuntime {
             untrusted_metadata: super::ceremony::BoundedUntrustedMetadata::new(
                 normalized_rp,
                 intent_action,
-                config.require_uv,
+                ceremony_policy.as_ref().is_some_and(|policy| {
+                    policy.user_verification != passless_core::agent::UserVerificationSource::None
+                }),
             )
             .with_principal_reason(principal_reason),
             clamped_grant_ttl_secs: clamped_grant_ttl,
@@ -3263,7 +3271,7 @@ impl AgentRuntime {
         let config = &profile.profile_config;
 
         if !config
-            .rp_ids
+            .allowed_rp_ids()
             .iter()
             .any(|id| id.trim().to_ascii_lowercase() == normalized_rp)
         {
@@ -3289,13 +3297,17 @@ impl AgentRuntime {
             ));
         }
 
-        if !config.require_uv {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "delegated authentication requires UV",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        let ceremony_policy = config
+            .rule_for_rp(&normalized_rp)
+            .map(|rule| rule.authenticate)
+            .filter(|policy| policy.authorization != passless_core::agent::AgentAuthorization::Deny)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "delegated authentication is denied for this RP",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
 
         if max_session_ttl == 0 {
             return Err(ProtocolError::new(
@@ -3347,7 +3359,8 @@ impl AgentRuntime {
             credential_ref: Some(credential_ref.clone()),
             policy_generation: generation.generation_id.clone(),
             policy_digest: generation.digest.clone(),
-            require_uv: true,
+            require_uv: ceremony_policy.user_verification
+                != passless_core::agent::UserVerificationSource::None,
             ttl_ms: Some(300_000),
         };
 
@@ -3509,7 +3522,7 @@ impl AgentRuntime {
                     .unwrap_or_else(|| std::path::PathBuf::from("/var/run/passless-browser")),
                 ttl: session_ttl,
                 login_timeout,
-                rp_ids: config.rp_ids.clone(),
+                rp_ids: config.allowed_rp_ids(),
                 target_uid: browser_user,
                 target_gid: browser_gid,
                 daemon_uid: self.daemon_uid,
@@ -3699,7 +3712,7 @@ impl AgentRuntime {
             .map(
                 |cred_ref| passless_core::agent::PrincipalCredentialSummary {
                     credential_ref: cred_ref.clone(),
-                    rp_id: config.rp_ids.first().cloned().unwrap_or_default(),
+                    rp_id: config.allowed_rp_ids().first().cloned().unwrap_or_default(),
                     user_name: String::new(),
                     display_name: String::new(),
                 },
@@ -4078,7 +4091,7 @@ impl AgentRuntime {
             }
         };
 
-        let require_uv = profile.profile_config.require_uv;
+        let require_uv = profile.profile_config.requires_human_uv();
 
         super::doctor::build_profile_diagnostic_report(super::doctor::ProfileDiagnosticParams {
             profile_id,
@@ -4415,9 +4428,13 @@ impl AgentRuntime {
                 let rp_match = if let Some(rp) = rp_id {
                     cred.rp.id.trim().eq_ignore_ascii_case(rp.trim())
                 } else {
-                    profile.profile_config.rp_ids.iter().any(|configured_rp| {
-                        configured_rp.trim().eq_ignore_ascii_case(cred.rp.id.trim())
-                    })
+                    profile
+                        .profile_config
+                        .allowed_rp_ids()
+                        .iter()
+                        .any(|configured_rp| {
+                            configured_rp.trim().eq_ignore_ascii_case(cred.rp.id.trim())
+                        })
                 };
 
                 if rp_match {
@@ -5359,8 +5376,8 @@ impl PrincipalHandler for AgentRuntime {
                 Ok(PrincipalResponse::Capabilities(PrincipalCapabilities {
                     profile_id: profile_id.to_string(),
                     mode: mode_str,
-                    allowed_rp_ids: profile.profile_config.rp_ids.clone(),
-                    registration_allowed: profile.profile_config.registration_allowed,
+                    allowed_rp_ids: profile.profile_config.allowed_rp_ids(),
+                    registration_allowed: profile.profile_config.allows_registration(),
                 }))
             }
             PrincipalRequest::Instructions => {
@@ -5387,6 +5404,30 @@ impl PrincipalHandler for AgentRuntime {
                 grant_ttl_secs,
                 session_ttl_secs,
             } => {
+                if profile.mode == AgentMode::DelegatedSession
+                    && *action == passless_core::agent::protocol::IntentAction::Register
+                    && profile
+                        .profile_config
+                        .delegated_registration_storage
+                        .is_some()
+                {
+                    let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+                    let mut eid_guard = profile.endpoint_id.lock().unwrap();
+                    if eid_guard.is_none() {
+                        *eid_guard = Some(self.create_profile_endpoint(&profile.endpoint_spec).map_err(
+                            |e| {
+                                ProtocolError::new(
+                                    ErrorCode::Internal,
+                                    format!(
+                                        "failed to create endpoint for delegated registration: {}",
+                                        e
+                                    ),
+                                    RecommendedAction::Retry,
+                                )
+                            },
+                        )?);
+                    }
+                }
                 let eid = profile.endpoint_id.lock().unwrap().clone();
                 match eid {
                     Some(ref eid) => self.handle_create_intent(CreateIntentParams {
@@ -5849,6 +5890,8 @@ mod tests {
                 max_session_ttl: None,
                 storage: None,
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: passless_core::agent::DeviceIdentity {
                     name: "test".to_string(),
                     phys: "test".to_string(),
@@ -6169,6 +6212,8 @@ mod tests {
                 max_session_ttl: Some(passless_core::agent::BoundedDuration::new(900).unwrap()),
                 storage: None,
                 registration_allowed: false,
+                rules: vec![],
+                delegated_registration_storage: None,
                 device: passless_core::agent::DeviceIdentity {
                     name: "test-device".to_string(),
                     phys: "test-phys".to_string(),
@@ -6883,6 +6928,8 @@ mod tests {
             max_session_ttl: Some(passless_core::agent::BoundedDuration::new(900).unwrap()),
             storage: None,
             registration_allowed: false,
+            rules: vec![],
+            delegated_registration_storage: None,
             device: passless_core::agent::DeviceIdentity {
                 name: "test-device".to_string(),
                 phys: "test-phys".to_string(),
@@ -7162,6 +7209,8 @@ mod tests {
                         pin_path: temp_dir.path().join("pin"),
                     }),
                     registration_allowed: false,
+                    rules: vec![],
+                    delegated_registration_storage: None,
                     device: passless_core::agent::DeviceIdentity {
                         name: "test-iso-device".to_string(),
                         phys: "test-iso-phys".to_string(),

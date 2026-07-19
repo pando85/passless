@@ -1,8 +1,8 @@
 # Delegated-session mode
 
-Delegated-session mode permits exactly one authentication assertion using one configured
-existing human credential for one exact RP ID. The RP sees the same user and credential
-as a normal login by the human.
+Delegated-session mode permits exact-policy authentication using configured human credentials and,
+when explicitly selected, registration into the human store. The RP sees the same account context
+as ordinary use by the human.
 
 ## Semantics
 
@@ -19,15 +19,19 @@ as a normal login by the human.
 [agents.profiles.opencode]
 mode = "delegated-session"
 principal_user = "passless-opencode"
-rp_ids = ["github.com"]
-require_uv = true
 credential_refs = ["<credential-ref-hex>"]
+delegated_registration_storage = "human"
 max_grant_ttl = 120
 max_session_ttl = 900
 browser_command = ["firefox", "--profile", "<daemon-managed>"]
 start_url = "https://github.com/dashboard"
 browser_user = "passless-browser"
 browser_runtime_root = "/var/run/passless-browser"
+
+[[agents.profiles.opencode.rules]]
+rp_id = "github.com"
+register = { authorization = "confirm", user_presence = "human", user_verification = "human" }
+authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
 
 [agents.profiles.opencode.device]
 name = "passless-agent-opencode"
@@ -62,9 +66,9 @@ product_id = 22136
      --rp github.com --credential <credential-ref-hex> \
      --session-ttl 900 --reason "CI deploy"
    ```
-4. The daemon launches an ephemeral browser, presents a trusted prompt, and collects
-   fresh UP and required UV from the human.
-5. On approval, the grant is created and the one permitted assertion completes.
+4. The daemon launches an ephemeral browser and evaluates the exact authentication rule.
+5. A `confirm` rule presents the trusted prompt; an `allow` rule resolves the one-shot operation
+   without a notification. The configured UP/UV sources are recorded in audit.
 6. The local browser lease starts at the clamped monotonic deadline.
 7. The grant and delegated credential view are consumed after the assertion.
 

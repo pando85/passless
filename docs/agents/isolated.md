@@ -13,9 +13,11 @@ endpoint and to other profiles.
 [agents.profiles.release-bot]
 mode = "isolated"
 principal_user = "passless-release"
-rp_ids = ["github.com"]
-require_uv = true
-registration_allowed = true
+
+[[agents.profiles.release-bot.rules]]
+rp_id = "github.com"
+register = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
 
 [agents.profiles.release-bot.storage.local]
 path = "/var/lib/passless-agent/release-bot/credentials"
@@ -40,9 +42,9 @@ passless agent --profile release-bot intent create register \
   --rp github.com --reason "CI release signing"
 ```
 
-The intent binds to the first matching CTAP `makeCredential` request. A human-approved
-trusted prompt collects fresh UP and configured UV. The credential is stored in the
-profile's isolated store. The intent is consumed on every terminal result.
+The intent binds to the first matching CTAP `makeCredential` request. A `confirm` rule displays
+the trusted prompt; an `allow` rule resolves it from policy without a notification. The credential
+is stored in the profile's isolated store. The intent is consumed on every terminal result.
 
 ### Authentication
 
@@ -51,8 +53,8 @@ passless agent --profile release-bot intent create authenticate \
   --rp github.com --credential <credential-ref-hex> --reason "release push"
 ```
 
-The intent binds to the exact credential and RP ID. A fresh prompt supplies UP and UV.
-The intent is consumed on every terminal result.
+The intent binds to the exact credential and RP ID. UP and UV use the sources configured in the
+exact action rule. The intent is consumed on every terminal result.
 
 ## Launch and workflow
 
@@ -91,12 +93,12 @@ Revocation is local. Remove the credential at each RP separately.
 
 ## Registration budget
 
-Set `registration_allowed = true` only during initial enrollment. Disable it afterward
-by setting `registration_allowed = false` in the configuration file and restarting the
-daemon:
+Use `register.authorization = "allow"` only where unattended enrollment is intended. Change it to
+`"confirm"` for supervised enrollment or replace the registration policy with an all-`none`
+`"deny"` rule after enrollment, then restart the daemon:
 
 ```bash
-# Edit the TOML configuration file to set registration_allowed = false
+# Edit the exact RP registration rule
 sudo systemctl restart passless-agent
 ```
 
