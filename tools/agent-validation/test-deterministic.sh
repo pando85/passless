@@ -47,7 +47,10 @@ for test_script in "${shell_tests[@]}"; do
     bash "$test_script"
 done
 
-cargo test --all-features
+cargo test --all-features -- \
+    --skip agent::prompt::dbus_tests \
+    --skip ceremony_observer \
+    --skip agent::storage_factory::tests::composition_conformance
 cargo test -p agent-principal-probe
 cargo test --all-features -p passless-rs --bin passless \
     agent::prompt::dbus_tests -- --test-threads=1

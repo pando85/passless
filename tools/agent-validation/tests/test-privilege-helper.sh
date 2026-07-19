@@ -118,13 +118,26 @@ test_install_test_udev_validates_path() {
         log_pass "av_install_test_udev_rule rejects invalid path"
     fi
 
-    # Test with valid path (will fail due to no sudo, but validates path first)
+    # Test with valid path - mock sudo to avoid actual execution
+    local mock_dir="${TEST_TMP_DIR}/mock-bin-$$"
+    mkdir -p "$mock_dir"
+    cat > "$mock_dir/sudo" << 'SUDO_EOF'
+#!/bin/bash
+exit 0
+SUDO_EOF
+    chmod +x "$mock_dir/sudo"
+
+    local old_path="$PATH"
+    export PATH="$mock_dir:$PATH"
+
     if av_install_test_udev_rule "$src_file" "/etc/udev/rules.d/99-test.rules" 2>&1 | grep -q "Invalid destination"; then
         log_fail "av_install_test_udev_rule rejected valid path pattern"
-        return 1
     else
         log_pass "av_install_test_udev_rule accepts valid path pattern"
     fi
+
+    export PATH="$old_path"
+    rm -rf "$mock_dir"
 }
 
 test_remove_test_udev_validates_path() {
