@@ -63,8 +63,10 @@ cargo test --all-features -p passless-rs --bin passless \
     agent::storage_factory::tests::composition_conformance -- \
     --include-ignored --test-threads=1
 cargo test --all-features -p passless-rs --bin passless \
-    agent::browser::tests::test_cdp_pipes_drop_closes_fds \
-    agent::browser::tests::test_child_in_separate_process_group \
+    agent::browser::tests::test_cdp_pipes_drop_closes_fds -- --test-threads=1
+cargo test --all-features -p passless-rs --bin passless \
+    agent::browser::tests::test_child_in_separate_process_group -- --test-threads=1
+cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_no_fd_leakage_to_child -- --test-threads=1
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/passless-agent-validation.XXXXXX")
