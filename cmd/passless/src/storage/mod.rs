@@ -6,6 +6,7 @@ pub mod credential;
 pub mod index;
 pub mod local;
 pub mod pass;
+pub mod rp_id;
 #[cfg(feature = "tpm")]
 pub mod tpm;
 
@@ -14,6 +15,7 @@ pub mod tpm;
 pub(crate) use credential::Credential;
 pub use local::LocalStorageAdapter;
 pub use pass::PassStorageAdapter;
+pub use rp_id::ValidatedRpId;
 #[cfg(feature = "tpm")]
 pub use tpm::TpmStorageAdapter;
 

@@ -452,6 +452,14 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     }
 
     fn list_credentials(&self, rp_id: &str, _user_id: Option<&[u8]>) -> Result<Vec<Credential>> {
+        if let Err(e) = crate::storage::ValidatedRpId::try_from(rp_id) {
+            warn!(
+                "Rejected list_credentials for invalid RP ID '{}': {}",
+                rp_id, e
+            );
+            return Err(soft_fido2::Error::Other);
+        }
+
         info!("Listing credentials for RP: {}", rp_id);
 
         let mut storage = match self.storage.lock() {
