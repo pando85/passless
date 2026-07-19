@@ -398,6 +398,7 @@ impl Drop for TpmBackend {
 pub struct AuthenticatorHarness {
     process: Option<Child>,
     backend: Box<dyn BackendSetup>,
+    config_dir: TempDir,
     started_by_harness: bool,
 }
 
@@ -407,6 +408,7 @@ impl AuthenticatorHarness {
         Self {
             process: None,
             backend,
+            config_dir: secure_temp_dir().expect("failed to create temporary config directory"),
             started_by_harness: false,
         }
     }
@@ -481,11 +483,12 @@ impl AuthenticatorHarness {
         let env_vars = self.backend.setup()?;
         let args = self.backend.args();
 
-        // Build the cargo command
-        let mut cmd = Command::new("cargo");
-        cmd.arg("run")
-            .arg("--")
-            .args(&args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_passless"));
+        cmd.args(&args)
+            .env(
+                "PASSLESS_CONFIG",
+                self.config_dir.path().join("config.toml"),
+            )
             .env("PASSLESS_E2E_AUTO_ACCEPT_UV", "1")
             .env("PASSLESS_E2E_AUTO_ACCEPT_STORAGE", "1")
             .stdout(Stdio::piped())

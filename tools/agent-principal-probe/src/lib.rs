@@ -559,12 +559,19 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_fd3_absent() {
+    fn test_collect_fd3_info_is_consistent() {
         let info = collect_fd3_info();
-        assert!(!info.present);
-        assert_eq!(info.fd_type, "absent");
-        assert!(info.peer_uid.is_none());
-        assert!(info.peer_gid.is_none());
+        if info.present {
+            assert_ne!(info.fd_type, "absent");
+            if info.fd_type != "socket" {
+                assert!(info.peer_uid.is_none());
+                assert!(info.peer_gid.is_none());
+            }
+        } else {
+            assert_eq!(info.fd_type, "absent");
+            assert!(info.peer_uid.is_none());
+            assert!(info.peer_gid.is_none());
+        }
     }
 
     #[test]

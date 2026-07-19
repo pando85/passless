@@ -160,7 +160,7 @@ fn path_to_cstring(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))
 }
 
-fn validate_existing_dir(path: &Path) -> io::Result<()> {
+fn validate_existing_dir(path: &Path, require_private: bool) -> io::Result<()> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     let c_path = path_to_cstring(path)?;
     if unsafe { libc::lstat(c_path.as_ptr(), &mut stat) } != 0 {
@@ -191,11 +191,12 @@ fn validate_existing_dir(path: &Path) -> io::Result<()> {
         ));
     }
     let mode = stat.st_mode & 0o7777;
-    if uid == stat.st_uid && mode & 0o077 != 0 {
+    let disallowed_mode = if require_private { 0o077 } else { 0o022 };
+    if uid == stat.st_uid && mode & disallowed_mode != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "path component {} has insecure permissions {:o}; expected 0o700 or stricter",
+                "path component {} has insecure permissions {:o}",
                 path.display(),
                 mode
             ),
@@ -204,26 +205,28 @@ fn validate_existing_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn create_single_dir(path: &Path) -> io::Result<()> {
+fn create_single_dir(path: &Path, require_private: bool) -> io::Result<()> {
     let c_path = path_to_cstring(path)?;
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
     if ret != 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::AlreadyExists {
-            validate_existing_dir(path)?;
+            validate_existing_dir(path, require_private)?;
             return Ok(());
         }
         return Err(err);
     }
-    validate_existing_dir(path)
+    validate_existing_dir(path, require_private)
 }
 
 pub fn create_secure_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref();
     let mut current = PathBuf::new();
 
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         current.push(component);
+        let require_private = components.peek().is_none();
 
         if current == Path::new("/") {
             continue;
@@ -243,10 +246,10 @@ pub fn create_secure_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
                         format!("path component {} is not a directory", current.display()),
                     ));
                 }
-                validate_existing_dir(&current)?;
+                validate_existing_dir(&current, require_private)?;
             }
             Err(_) => {
-                create_single_dir(&current)?;
+                create_single_dir(&current, require_private)?;
             }
         }
     }
@@ -333,6 +336,23 @@ mod tests {
             .expect("Failed to set permissions");
 
         create_secure_dir_all(&path).expect("Should succeed for secure existing dir");
+    }
+
+    #[test]
+    fn test_create_secure_dir_all_accepts_non_writable_ancestor() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let ancestor = dir.path().join("ancestor");
+        let target = ancestor.join("passless");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_secure_dir_all(&target).expect("non-writable ancestors should be accepted");
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

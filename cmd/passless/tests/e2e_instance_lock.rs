@@ -26,20 +26,19 @@ fn test_duplicate_daemon_same_backend_is_rejected() {
         AuthenticatorHarness::new(Box::new(LocalBackend::with_path(backend_path.clone())));
     harness1.start().expect("First daemon should start");
 
-    let mut cmd = Command::new("cargo");
-    cmd.arg("run")
-        .arg("--")
-        .args([
-            "--backend-type",
-            "local",
-            "--local-path",
-            &backend_path.display().to_string(),
-            "-v",
-        ])
-        .env("PASSLESS_E2E_AUTO_ACCEPT_UV", "1")
-        .env("PASSLESS_E2E_AUTO_ACCEPT_STORAGE", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_passless"));
+    cmd.args([
+        "--backend-type",
+        "local",
+        "--local-path",
+        &backend_path.display().to_string(),
+        "-v",
+    ])
+    .env("PASSLESS_CONFIG", temp_dir.path().join("config.toml"))
+    .env("PASSLESS_E2E_AUTO_ACCEPT_UV", "1")
+    .env("PASSLESS_E2E_AUTO_ACCEPT_STORAGE", "1")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().expect("Failed to spawn second daemon");
 

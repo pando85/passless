@@ -9,6 +9,7 @@ license-file.workspace = true
 homepage.workspace = true
 repository.workspace = true
 version.workspace = true
+default-run = "passless"
 
 [[bin]]
 name = "passless"
