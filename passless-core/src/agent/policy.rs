@@ -188,6 +188,9 @@ impl Policy {
         if self.max_grant_ttl == 0 || self.max_grant_ttl > MAX_TTL {
             return Err(PolicyError::InvalidTtl(self.max_grant_ttl));
         }
+        if self.max_session_ttl > MAX_TTL {
+            return Err(PolicyError::InvalidTtl(self.max_session_ttl));
+        }
         if self.max_concurrent_grants == 0
             || self.max_concurrent_grants > MAX_CONCURRENT_GRANTS_LIMIT
         {
@@ -782,6 +785,14 @@ mod tests {
             MAX_TTL + 1,
         );
         assert!(matches!(result, Err(PolicyError::InvalidTtl(_))));
+    }
+
+    #[test]
+    fn test_policy_validation_excessive_session_ttl() {
+        let mut policy = test_policy();
+        policy.max_session_ttl = MAX_TTL + 1;
+
+        assert!(matches!(policy.validate(), Err(PolicyError::InvalidTtl(_))));
     }
 
     #[test]

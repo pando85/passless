@@ -3197,6 +3197,7 @@ impl AgentRuntime {
         request_id: &PendingRequestId,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
+        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
         let status = self
             .policy_runtime
             .principal_pending_status(request_id, session_id)
@@ -3387,10 +3388,6 @@ impl AgentRuntime {
 
         let config = &profile.profile_config;
         let max_grant_ttl = config.max_grant_ttl.map(|d| d.as_secs()).unwrap_or(300);
-        let max_session_ttl = config.max_session_ttl.map(|d| d.as_secs()).unwrap_or(900);
-
-        let requested_session_ttl = max_session_ttl.min(max_session_ttl);
-        let clamped_session_ttl = requested_session_ttl.min(max_session_ttl).max(60);
         let requested_grant_ttl = max_grant_ttl;
         let clamped_grant_ttl = requested_grant_ttl.min(max_grant_ttl).max(5);
 
@@ -3414,7 +3411,7 @@ impl AgentRuntime {
             )
             .with_principal_reason(principal_reason),
             clamped_grant_ttl_secs: clamped_grant_ttl,
-            clamped_session_ttl_secs: clamped_session_ttl,
+            clamped_session_ttl_secs: clamped_ttl,
             trusted_credential_label,
         };
 
@@ -3635,6 +3632,7 @@ impl AgentRuntime {
         request_id: &PendingRequestId,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
+        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
         let status = self
             .policy_runtime
             .principal_pending_status(request_id, session_id)
@@ -3679,8 +3677,10 @@ impl AgentRuntime {
             current.as_ref().and_then(|p| p.browser_lease_id.clone())
         } {
             let mut browser_mgr = self.browser_manager.lock().unwrap();
+            let _ = browser_mgr.revoke(lease_id);
             let _ = browser_mgr.terminate(lease_id);
-            let _ = browser_mgr.remove(lease_id);
+            let _ = browser_mgr.cleanup(lease_id);
+            browser_mgr.remove(lease_id);
         }
 
         {
@@ -6482,6 +6482,16 @@ mod tests {
                 let pending = pending.as_ref().unwrap();
                 assert_eq!(pending.request_id, request_id);
                 assert_eq!(pending.session_id, harness.session_id);
+                assert_eq!(pending.clamped_session_ttl_secs, 300);
+                assert_eq!(
+                    harness
+                        .profile()
+                        .preparation_slot
+                        .snapshot()
+                        .unwrap()
+                        .clamped_session_ttl_secs(),
+                    300
+                );
                 assert!(
                     pending.browser_lease_id.is_some(),
                     "browser lease should be set"
@@ -6489,6 +6499,60 @@ mod tests {
             }
             _ => panic!("expected DelegationRequested response"),
         }
+    }
+
+    #[test]
+    fn cancel_delegation_cleans_up_browser_lease() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+        let response = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 120,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+        let request_id = match response {
+            PrincipalResponse::DelegationRequested { request_id } => request_id,
+            _ => panic!("expected DelegationRequested response"),
+        };
+        let lease_id = harness
+            .profile()
+            .current_pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|pending| pending.browser_lease_id.clone())
+            .unwrap();
+        let runtime_root = harness._temp_dir.path().join("browser-runtime");
+        assert!(std::fs::read_dir(&runtime_root).unwrap().next().is_some());
+
+        let result = harness.runtime.handle_cancel_delegation(
+            &harness.profile_id,
+            &harness.session_id,
+            &request_id,
+            harness.profile(),
+        );
+
+        assert!(matches!(result, Ok(PrincipalResponse::DelegationCancelled)));
+        assert!(
+            harness
+                .runtime
+                .browser_manager
+                .lock()
+                .unwrap()
+                .snapshot(&lease_id)
+                .is_none()
+        );
+        assert!(std::fs::read_dir(runtime_root).unwrap().next().is_none());
+        assert!(harness.profile().current_pending.lock().unwrap().is_none());
     }
 
     #[test]

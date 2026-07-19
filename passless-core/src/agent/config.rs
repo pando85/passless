@@ -917,7 +917,12 @@ impl AgentConfig {
         let normalized = normalize_rp_id(rp_id);
         self.profiles
             .iter()
-            .filter(|(_, p)| p.rp_ids.iter().any(|id| normalize_rp_id(id) == normalized))
+            .filter(|(_, profile)| {
+                profile
+                    .effective_rules()
+                    .iter()
+                    .any(|rule| normalize_rp_id(&rule.rp_id) == normalized)
+            })
             .collect()
     }
 }
@@ -1601,6 +1606,39 @@ pin_path = "/var/lib/passless-agent/release/pin"
         let profile = config.profiles.get("release-bot").unwrap();
         assert_eq!(profile.mode, AgentMode::Isolated);
         assert!(profile.registration_allowed);
+    }
+
+    #[test]
+    fn test_profiles_for_rp_id_matches_explicit_rules() {
+        let toml_str = r#"
+enabled = true
+
+[profiles.release-bot]
+mode = "isolated"
+principal_user = "passless-release"
+
+[[profiles.release-bot.rules]]
+rp_id = "github.com"
+register = { authorization = "deny", user_presence = "none", user_verification = "none" }
+authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+
+[profiles.release-bot.device]
+name = "passless-agent-release"
+phys = "release-phys"
+uniq = "release-uniq"
+vendor_id = 4660
+product_id = 22137
+
+[profiles.release-bot.storage.local]
+path = "/var/lib/passless-agent/release/credentials"
+pin_path = "/var/lib/passless-agent/release/pin"
+"#;
+        let config: AgentConfig = toml::from_str(toml_str).unwrap();
+
+        let matches = config.profiles_for_rp_id("GITHUB.COM");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "release-bot");
     }
 
     #[test]
