@@ -1,0 +1,17 @@
+[package]
+name = "agent-uhid-feasibility"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+passless-uhid.workspace = true
+libc.workspace = true
+
+[lib]
+name = "agent_uhid_feasibility"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uhid-feasibility"
+path = "src/main.rs"

@@ -41,26 +41,28 @@ impl Uninitialized {
         Ok(self)
     }
 
-    pub fn prompt_user(self) -> Result<DirectoryCreated> {
-        match show_yes_no_notification(
-            "Password Store Not Initialized",
-            &format!(
-                "The password store directory does not exist at:\n{}\n\nWould you like to initialize it now?",
-                self.store_path.display()
-            ),
-        ) {
-            Ok(YesNoResult::Accepted) => info!("User agreed to initialize"),
-            Ok(YesNoResult::Denied) => {
-                warn!("Initialization cancelled by user");
-                let _ = show_info_notification(
-                    "Initialization Cancelled",
-                    "Password store initialization cancelled by user",
-                );
-                return Err(Error::Config("Initialization cancelled".to_string()));
-            }
-            Err(e) => {
-                warn!("Failed to show initialization prompt: {}", e);
-                return Err(Error::Config(format!("Failed to prompt: {}", e)));
+    pub fn prompt_user(self, allow_create_without_prompt: bool) -> Result<DirectoryCreated> {
+        if !allow_create_without_prompt {
+            match show_yes_no_notification(
+                "Password Store Not Initialized",
+                &format!(
+                    "The password store directory does not exist at:\n{}\n\nWould you like to initialize it now?",
+                    self.store_path.display()
+                ),
+            ) {
+                Ok(YesNoResult::Accepted) => info!("User agreed to initialize"),
+                Ok(YesNoResult::Denied) => {
+                    warn!("Initialization cancelled by user");
+                    let _ = show_info_notification(
+                        "Initialization Cancelled",
+                        "Password store initialization cancelled by user",
+                    );
+                    return Err(Error::Config("Initialization cancelled".to_string()));
+                }
+                Err(e) => {
+                    warn!("Failed to show initialization prompt: {}", e);
+                    return Err(Error::Config(format!("Failed to prompt: {}", e)));
+                }
             }
         }
 
@@ -76,6 +78,7 @@ impl Uninitialized {
         Ok(DirectoryCreated {
             store_path: self.store_path,
             gpg_backend: self.gpg_backend,
+            allow_create_without_prompt,
         })
     }
 }

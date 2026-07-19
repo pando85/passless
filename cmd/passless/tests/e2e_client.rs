@@ -195,7 +195,7 @@ fn test_client_info() {
                 assert_eq!(option_bool("plat"), Some(true));
                 assert_eq!(option_bool("uv"), Some(true));
                 assert_eq!(option_bool("clientPin"), Some(false));
-                assert_eq!(option_bool("alwaysUv"), Some(false));
+                assert_eq!(option_bool("alwaysUv"), Some(true));
             }
         }
 
@@ -899,7 +899,10 @@ fn test_authenticated_uv_retry_reset_command() {
     let authenticated = transport
         .send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &payload, 30000)
         .expect("Failed to send authenticated reset command");
-    assert!(authenticated == vec![0x00, 0xa0] || authenticated == vec![0xa0]);
+    assert_eq!(authenticated, vec![0xa1, 0x01, 0x08]);
+    // NOTE: soft-fido2 hardcodes MAX_UV_RETRIES=3 internally, ignoring the configured
+    // max_uv_retries=8. The reset command reports 8 in the response, but the actual
+    // counter is reset to 3. See: https://github.com/pando85/soft-fido2/issues/121
     assert_eq!(
         get_uv_retries(&mut transport).expect("Failed to get UV retries"),
         3

@@ -8,12 +8,12 @@ use crate::storage::index::{
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::{CredentialFilter, CredentialStorage};
-use crate::util::{bytes_to_hex, create_secure_dir_all, create_secure_file};
+use crate::util::{atomic_write_in_dir, bytes_to_hex, create_secure_dir_all};
 
 use soft_fido2::Result;
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -65,14 +65,19 @@ struct SealedBlob {
 }
 
 impl TpmStorageAdapter {
-    /// Create a new TPM storage adapter
-    pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
+    pub fn new_with_options(
+        storage_dir: PathBuf,
+        tcti: Option<String>,
+        allow_create_without_prompt: bool,
+    ) -> Result<Self> {
+        let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
         info!("Using TPM 2.0 backend");
         info!("Storage path: {}", storage_dir.display());
 
         // Ensure the storage directory is initialized
         // This will prompt the user via notifications if not initialized
-        self::init::ensure_initialized(&storage_dir).map_err(|_| soft_fido2::Error::Other)?;
+        self::init::ensure_initialized(&storage_dir, allow_create_without_prompt)
+            .map_err(|_| soft_fido2::Error::Other)?;
 
         // Initialize TPM context
         let tcti_conf = if let Some(ref tcti_str) = tcti {
@@ -554,12 +559,11 @@ impl TpmStorageAdapter {
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists with secure permissions
-        if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent).map_err(|e| {
-                debug!("Failed to create directory: {}", e);
-                soft_fido2::Error::Other
-            })?;
-        }
+        let parent = path.parent().ok_or(soft_fido2::Error::Other)?;
+        create_secure_dir_all(parent).map_err(|e| {
+            debug!("Failed to create directory: {}", e);
+            soft_fido2::Error::Other
+        })?;
 
         // Convert to our format for controlled serialization
         let our_cred = Credential::from_soft_fido2(cred);
@@ -569,12 +573,11 @@ impl TpmStorageAdapter {
         // Seal the data using TPM
         let sealed_data = self.seal_data(&bytes)?;
 
-        let mut file = create_secure_file(&path).map_err(|e| {
-            log::error!("Failed to create credential file {}: {}", path.display(), e);
-            soft_fido2::Error::Other
-        })?;
-
-        file.write_all(&sealed_data).map_err(|e| {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(soft_fido2::Error::Other)?;
+        atomic_write_in_dir(parent, filename, &sealed_data).map_err(|e| {
             log::error!("Failed to write credential file {}: {}", path.display(), e);
             soft_fido2::Error::Other
         })?;

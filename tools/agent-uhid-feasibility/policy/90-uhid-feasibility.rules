@@ -1,0 +1,32 @@
+# 90-uhid-feasibility.rules
+# Deterministic udev rules for UHID feasibility probe isolation.
+#
+# Identity model (PRIN-03, ROUTE-03 compliant):
+#
+#   Group              Purpose                              Members
+#   ─────────────────  ───────────────────────────────────  ──────────────────
+#   uhid-daemon        Daemon-only /dev/uhid R/W            passless-daemon
+#   fido               Human operator hidraw (real hw)      human operators
+#   fido-agent-probe   Per-agent-profile probe hidraw R/W   agent processes
+#
+# Invariants enforced:
+#   PRIN-03  Principals (human operators) MUST NOT share a group with the
+#            daemon for /dev/uhid access.  The daemon uses uhid-daemon;
+#            humans use fido.  These groups are disjoint.
+#   ROUTE-03 Principals MUST NOT receive /dev/uhid.  Only the daemon user
+#            (member of uhid-daemon) can open /dev/uhid.
+#   ISOL-01  Probe hidraw nodes are accessible ONLY to the per-agent-profile
+#            group (fido-agent-probe), not to the general fido group.
+#
+# /dev/uhid: daemon-only access (PRIN-03, ROUTE-03)
+# Human operators in 'fido' group do NOT get /dev/uhid.
+KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0660", GROUP="uhid-daemon"
+
+# Tag feasibility probe devices by deterministic vendor/product identity.
+# Probe product 0xF1D0 is reserved for feasibility probes ONLY.
+# This MUST NOT match the human passless endpoint (15d9:0a37).
+SUBSYSTEM=="hid", ATTRS{idVendor}=="15d9", ATTRS{idProduct}=="f1d0", ENV{FEASIBILITY_PROBE}="1"
+
+# Probe hidraw nodes: per-agent-profile group only (ISOL-01).
+# Humans in 'fido' do NOT get probe hidraw access.
+SUBSYSTEM=="hidraw", ENV{FEASIBILITY_PROBE}=="1", MODE="0660", GROUP="fido-agent-probe"

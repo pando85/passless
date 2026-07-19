@@ -273,3 +273,13 @@ impl PinStorage for () {
         Ok(())
     }
 }
+
+impl PinStorage for Box<dyn PinStorage> {
+    fn load_pin_state(&self) -> Result<PinState, StatusCode> {
+        (**self).load_pin_state()
+    }
+
+    fn save_pin_state(&self, state: &PinState) -> Result<(), StatusCode> {
+        (**self).save_pin_state(state)
+    }
+}

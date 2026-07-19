@@ -1,5 +1,12 @@
 [workspace]
-members = ["cmd/passless", "passless-config-doc", "passless-core"]
+members = [
+    "cmd/passless",
+    "passless-config-doc",
+    "passless-core",
+    "passless-uhid",
+    "tools/agent-principal-probe",
+    "tools/agent-uhid-feasibility",
+]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +20,7 @@ repository = "https://github.com/pando85/passless"
 # Workspace crates
 passless-core = { path = "./passless-core", version = "0.13.0" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.13.0" }
+passless-uhid = { path = "./passless-uhid", version = "0.13.0" }
 
 soft-fido2 = "0.13.1"
 soft-fido2-ctap = "0.13.1"
@@ -32,7 +40,7 @@ dirs = "6.0"
 prs-lib = "0.5"
 serde_json = "1.0"
 libc = "0.2"
-nix = { version = "0.31", features = ["resource", "fs"] }
+nix = { version = "0.31", features = ["resource", "fs", "signal", "process", "dir"] }
 notify-rust = "4.11"
 aes-gcm = "0.11"
 rand = "0.8"
@@ -40,6 +48,8 @@ ctrlc = "3.4"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
 shadow-rs = "2.0"
+psl = "2"
+zbus = "5.14"
 
 # Proc macro dependencies
 syn = { version = "3.0", features = ["full", "extra-traits"] }

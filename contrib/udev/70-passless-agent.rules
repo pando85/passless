@@ -1,0 +1,29 @@
+# Passless agent hidraw device rules
+#
+# These rules set ownership and permissions for agent UHID hidraw nodes.
+# They do NOT grant human users or principals access to /dev/uhid.
+# They do NOT apply to human hidraw nodes (only agent-created UHID endpoints).
+#
+# The daemon creates agent UHID endpoints with deterministic device identity.
+# Each profile's hidraw node must be visible ONLY to the configured browser UID.
+#
+# IMPORTANT: Replace the placeholder ATTRS values with the exact device identity
+# from your agent profile configuration. Wildcard matches are intentionally
+# avoided to prevent cross-profile or human/agent visibility.
+#
+# Example for a single profile with:
+#   device.name = "passless-agent-opencode"
+#   device.phys = "opencode-phys"
+#   device.uniq = "opencode-uniq"
+#   browser_user = "passless-browser-opencode"
+#
+# Match by exact phys (unique per profile):
+# ATTRS{phys}=="opencode-phys", SUBSYSTEM=="hidraw", KERNEL=="hidraw*", \
+#   OWNER="passless-browser-opencode", GROUP="passless-browser-opencode", MODE="0600"
+#
+# For additional profiles, add one rule per profile with the matching phys value
+# and the correct browser UID. Do not use group-based access for human users.
+# Do not match KERNEL=="uhid" or human hidraw nodes.
+#
+# After installing, reload udev rules:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger

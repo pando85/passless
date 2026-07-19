@@ -1,0 +1,18 @@
+[package]
+name = "agent-principal-probe"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[lib]
+name = "agent_principal_probe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-principal-probe"
+path = "src/main.rs"

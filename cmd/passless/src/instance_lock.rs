@@ -13,6 +13,30 @@ pub struct InstanceLock {
     lock_path: PathBuf,
 }
 
+/// Lock ordering (acquired in this order, released in reverse):
+///
+/// 1. Daemon-wide agent-state lock (`agent-state.lock`)
+///    - Single lock per daemon process; guards agent registry mutations.
+/// 2. Backend locks (one per `BackendConfig`, sorted by canonical state path)
+///    - Deterministic lexicographic order on the canonical state path ensures
+///      that any two processes acquiring overlapping sets of backend locks
+///      will always attempt them in the same order, preventing deadlocks.
+///
+/// On partial failure (any lock acquisition fails), all previously acquired
+/// locks in the set are released before returning the error.
+#[derive(Debug)]
+#[cfg(any(feature = "agent", test))]
+pub struct MultiLock {
+    __agent_state_lock: Option<InstanceLock>,
+    backend_locks: Vec<InstanceLock>,
+}
+
+#[derive(Debug)]
+#[cfg(any(feature = "agent", test))]
+pub struct DaemonLocks {
+    _inner: MultiLock,
+}
+
 impl InstanceLock {
     pub fn acquire(backend: &BackendConfig) -> passless_core::Result<Self> {
         Self::acquire_with_runtime_dir(backend, None)
@@ -175,6 +199,72 @@ impl InstanceLock {
     }
 }
 
+#[cfg(any(feature = "agent", test))]
+impl MultiLock {
+    pub fn acquire_agent_state(runtime_dir: &Path) -> passless_core::Result<Self> {
+        let agent_backend = Self::agent_state_backend();
+        let lock = InstanceLock::acquire_with_runtime_dir(&agent_backend, Some(runtime_dir))?;
+        Ok(Self {
+            __agent_state_lock: Some(lock),
+            backend_locks: Vec::new(),
+        })
+    }
+
+    pub fn then_backends(
+        mut self,
+        backends: &[BackendConfig],
+        runtime_dir: &Path,
+    ) -> passless_core::Result<Self> {
+        let mut sorted: Vec<(PathBuf, &BackendConfig)> =
+            backends.iter().map(|b| (b.state_path(), b)).collect();
+        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let mut acquired: Vec<InstanceLock> = Vec::with_capacity(sorted.len());
+        for (canonical, backend) in &sorted {
+            match InstanceLock::acquire_with_runtime_dir(backend, Some(runtime_dir)) {
+                Ok(lock) => acquired.push(lock),
+                Err(e) => {
+                    return Err(passless_core::Error::Other(format!(
+                        "failed to acquire backend lock for {}: {}",
+                        canonical.display(),
+                        e
+                    )));
+                }
+            }
+        }
+
+        self.backend_locks = acquired;
+        Ok(self)
+    }
+
+    fn agent_state_backend() -> BackendConfig {
+        BackendConfig::Local {
+            path: "__passless_daemon_agent_state__".to_string(),
+        }
+    }
+}
+
+#[cfg(any(feature = "agent", test))]
+impl DaemonLocks {
+    pub fn acquire(
+        human_backend: &BackendConfig,
+        agent_backends: &[BackendConfig],
+        runtime_dir: &Path,
+    ) -> passless_core::Result<Self> {
+        let multi = MultiLock::acquire_agent_state(runtime_dir)?;
+
+        let mut all_backends: Vec<BackendConfig> = Vec::new();
+        all_backends.push(human_backend.clone());
+        for b in agent_backends {
+            all_backends.push(b.clone());
+        }
+
+        let multi = multi.then_backends(&all_backends, runtime_dir)?;
+
+        Ok(Self { _inner: multi })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +406,251 @@ mod tests {
         let lock2 = InstanceLock::acquire_with_runtime_dir(&backend, Some(&runtime_dir))
             .expect("should acquire despite stale file");
         drop(lock2);
+    }
+
+    #[test]
+    fn test_multi_lock_sorted_backend_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let state_c = dir.path().join("state_c");
+        let state_a = dir.path().join("state_a");
+        let state_b = dir.path().join("state_b");
+        fs::create_dir_all(&state_c).unwrap();
+        fs::create_dir_all(&state_a).unwrap();
+        fs::create_dir_all(&state_b).unwrap();
+
+        let backends = vec![
+            test_backend(&state_c.display().to_string()),
+            test_backend(&state_a.display().to_string()),
+            test_backend(&state_b.display().to_string()),
+        ];
+
+        let multi =
+            MultiLock::acquire_agent_state(&runtime_dir).expect("agent state should succeed");
+        let multi = multi
+            .then_backends(&backends, &runtime_dir)
+            .expect("backends should succeed");
+
+        assert_eq!(multi.backend_locks.len(), 3);
+
+        let mut sorted_backends = backends.clone();
+        sorted_backends.sort_by_key(|a| a.state_path());
+
+        for (lock, backend) in multi.backend_locks.iter().zip(sorted_backends.iter()) {
+            let expected_filename = InstanceLock::lock_filename(backend);
+            assert!(
+                lock.lock_path().file_name().unwrap().to_str().unwrap() == expected_filename,
+                "lock {:?} should correspond to backend {:?}",
+                lock.lock_path(),
+                backend.state_path()
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_lock_partial_failure_releases_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let state_a = dir.path().join("state_a");
+        let state_b = dir.path().join("state_b");
+        fs::create_dir_all(&state_a).unwrap();
+        fs::create_dir_all(&state_b).unwrap();
+
+        let backend_a = test_backend(&state_a.display().to_string());
+        let backend_b = test_backend(&state_b.display().to_string());
+
+        let _holder = InstanceLock::acquire_with_runtime_dir(&backend_a, Some(&runtime_dir))
+            .expect("holder should succeed");
+
+        let multi =
+            MultiLock::acquire_agent_state(&runtime_dir).expect("agent state should succeed");
+        let result = multi.then_backends(&[backend_a, backend_b], &runtime_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_lock_with_agent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let state_a = dir.path().join("state_a");
+        fs::create_dir_all(&state_a).unwrap();
+
+        let backends = vec![test_backend(&state_a.display().to_string())];
+        let multi =
+            MultiLock::acquire_agent_state(&runtime_dir).expect("agent state should succeed");
+        let multi = multi
+            .then_backends(&backends, &runtime_dir)
+            .expect("backends should succeed");
+
+        assert!(multi.__agent_state_lock.is_some());
+        assert_eq!(multi.backend_locks.len(), 1);
+    }
+
+    #[test]
+    fn test_multi_lock_agent_state_failure_releases_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let agent_backend = MultiLock::agent_state_backend();
+        let _agent_holder =
+            InstanceLock::acquire_with_runtime_dir(&agent_backend, Some(&runtime_dir))
+                .expect("agent holder should succeed");
+
+        let result = MultiLock::acquire_agent_state(&runtime_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_daemon_locks_acquire_and_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let human_state = dir.path().join("human");
+        let agent_state = dir.path().join("agent");
+        fs::create_dir_all(&human_state).unwrap();
+        fs::create_dir_all(&agent_state).unwrap();
+
+        let human = test_backend(&human_state.display().to_string());
+        let agent = test_backend(&agent_state.display().to_string());
+
+        let locks = DaemonLocks::acquire(&human, std::slice::from_ref(&agent), &runtime_dir)
+            .expect("daemon locks should succeed");
+        assert_eq!(locks._inner.backend_locks.len(), 2);
+        assert!(locks._inner.__agent_state_lock.is_some());
+
+        drop(locks);
+
+        let locks2 = DaemonLocks::acquire(&human, &[agent], &runtime_dir)
+            .expect("should reacquire after drop");
+        drop(locks2);
+    }
+
+    #[test]
+    fn test_daemon_locks_contention_on_human_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let human_state = dir.path().join("human");
+        let agent_state = dir.path().join("agent");
+        fs::create_dir_all(&human_state).unwrap();
+        fs::create_dir_all(&agent_state).unwrap();
+
+        let human = test_backend(&human_state.display().to_string());
+        let agent = test_backend(&agent_state.display().to_string());
+
+        let _locks1 = DaemonLocks::acquire(&human, std::slice::from_ref(&agent), &runtime_dir)
+            .expect("first daemon locks should succeed");
+
+        let result = DaemonLocks::acquire(&human, &[agent], &runtime_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_lock_empty_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let backends: Vec<BackendConfig> = vec![];
+        let multi =
+            MultiLock::acquire_agent_state(&runtime_dir).expect("agent state should succeed");
+        let multi = multi
+            .then_backends(&backends, &runtime_dir)
+            .expect("empty backends should succeed");
+        assert_eq!(multi.backend_locks.len(), 0);
+    }
+
+    #[test]
+    fn test_multi_lock_duplicate_backends_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let state_a = dir.path().join("state_a");
+        let state_b = dir.path().join("state_b");
+        fs::create_dir_all(&state_a).unwrap();
+        fs::create_dir_all(&state_b).unwrap();
+
+        let backends = vec![
+            test_backend(&state_b.display().to_string()),
+            test_backend(&state_a.display().to_string()),
+            test_backend(&state_b.display().to_string()),
+        ];
+
+        let multi =
+            MultiLock::acquire_agent_state(&runtime_dir).expect("agent state should succeed");
+        let result = multi.then_backends(&backends, &runtime_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_concurrent_multi_lock_different_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let state_a = dir.path().join("state_a");
+        let state_b = dir.path().join("state_b");
+        let state_c = dir.path().join("state_c");
+        fs::create_dir_all(&state_a).unwrap();
+        fs::create_dir_all(&state_b).unwrap();
+        fs::create_dir_all(&state_c).unwrap();
+
+        let backends_1 = vec![
+            test_backend(&state_a.display().to_string()),
+            test_backend(&state_b.display().to_string()),
+        ];
+        let backends_2 = vec![test_backend(&state_c.display().to_string())];
+
+        let multi1 = MultiLock {
+            __agent_state_lock: None,
+            backend_locks: Vec::new(),
+        };
+        let _multi1 = multi1
+            .then_backends(&backends_1, &runtime_dir)
+            .expect("first set should succeed");
+
+        let multi2 = MultiLock {
+            __agent_state_lock: None,
+            backend_locks: Vec::new(),
+        };
+        let _multi2 = multi2
+            .then_backends(&backends_2, &runtime_dir)
+            .expect("non-overlapping set should succeed");
+    }
+
+    #[test]
+    fn test_daemon_lock_ordering_agent_state_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let human_state = dir.path().join("human");
+        let agent_state_dir = dir.path().join("agent");
+        fs::create_dir_all(&human_state).unwrap();
+        fs::create_dir_all(&agent_state_dir).unwrap();
+
+        let human = test_backend(&human_state.display().to_string());
+        let agent = test_backend(&agent_state_dir.display().to_string());
+
+        let agent_backend = MultiLock::agent_state_backend();
+        let _agent_holder =
+            InstanceLock::acquire_with_runtime_dir(&agent_backend, Some(&runtime_dir))
+                .expect("agent holder should succeed");
+
+        let result = DaemonLocks::acquire(&human, &[agent], &runtime_dir);
+        assert!(
+            result.is_err(),
+            "daemon locks should fail because agent-state lock is held"
+        );
     }
 }

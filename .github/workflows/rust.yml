@@ -51,6 +51,32 @@ jobs:
         with:
           args: --all-features -- --deny warnings
 
+  agent-validation:
+    name: Agent validation (deterministic)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run deterministic agent validation
+        run: make test-agent-validation
+
   build:
     strategy:
       fail-fast: false

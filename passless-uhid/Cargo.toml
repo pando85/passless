@@ -1,0 +1,11 @@
+[package]
+name = "passless-uhid"
+description = "Raw UHID device abstraction with deterministic identity for Passless"
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+version.workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true

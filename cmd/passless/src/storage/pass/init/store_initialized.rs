@@ -15,20 +15,22 @@ use log::{info, warn};
 pub struct StoreInitialized {
     pub(super) store_path: PathBuf,
     pub(super) fingerprint: String,
+    pub(super) allow_create_without_prompt: bool,
 }
 
 impl StoreInitialized {
     pub fn setup_git(self) -> Result<Complete> {
         info!("Setting up git");
-        initialize_git_repo(&self.store_path)?;
+        initialize_git_repo(&self.store_path, self.allow_create_without_prompt)?;
         Ok(Complete {
             store_path: self.store_path,
             fingerprint: self.fingerprint,
+            allow_create_without_prompt: self.allow_create_without_prompt,
         })
     }
 }
 
-fn initialize_git_repo(store_path: &PathBuf) -> Result<()> {
+fn initialize_git_repo(store_path: &PathBuf, allow_create_without_prompt: bool) -> Result<()> {
     let output = Command::new("git")
         .arg("init")
         .current_dir(store_path)
@@ -65,17 +67,19 @@ fn initialize_git_repo(store_path: &PathBuf) -> Result<()> {
         .current_dir(store_path)
         .output();
 
-    let _ = show_info_notification(
-        "Git Initialized",
-        &format!(
-            "Git repository initialized in password store.\n\n\
-             To add a remote repository, run:\n\
-             cd {}\n\
-             git remote add origin <your-git-url>\n\
-             git push -u origin master",
-            store_path.display()
-        ),
-    );
+    if !allow_create_without_prompt {
+        let _ = show_info_notification(
+            "Git Initialized",
+            &format!(
+                "Git repository initialized in password store.\n\n\
+                 To add a remote repository, run:\n\
+                 cd {}\n\
+                 git remote add origin <your-git-url>\n\
+                 git push -u origin master",
+                store_path.display()
+            ),
+        );
+    }
 
     Ok(())
 }

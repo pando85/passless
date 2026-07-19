@@ -4,6 +4,7 @@ use crate::pin_storage::{
     PinStorage, SerializablePinConfig, SerializablePinRetries, SerializablePinState,
 };
 use crate::storage::pass::GpgBackend;
+use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
 
@@ -247,7 +248,7 @@ impl PassPinStorage {
         let path = self.get_config_path();
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_secure_dir_all(parent).map_err(|e| {
                 warn!("Failed to create directory: {}", e);
                 soft_fido2::StatusCode::Other
             })?;
@@ -300,7 +301,7 @@ impl PassPinStorage {
         let path = self.get_retries_path();
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            create_secure_dir_all(parent).map_err(|e| {
                 warn!("Failed to create directory: {}", e);
                 soft_fido2::StatusCode::Other
             })?;

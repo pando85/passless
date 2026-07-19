@@ -48,6 +48,7 @@ make test-e2e
 
 The E2E tests use environment variables:
 - `PASSLESS_E2E_AUTO_ACCEPT_UV=1` - Auto-accept user verification (debug builds only)
+- `PASSLESS_E2E_AUTO_ACCEPT_STORAGE=1` - Create test storage without initialization prompts (debug builds only)
 - `PASSLESS_LOCAL_PATH=/tmp/passless/fido2` - Use temporary storage
 
 ### Linting and Formatting

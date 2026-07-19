@@ -17,12 +17,16 @@ use passless_core::error::Result;
 use std::path::Path;
 
 /// Initialize password store, prompting user via desktop notifications if needed
-pub fn ensure_initialized(store_path: &Path, gpg_backend: GpgBackend) -> Result<()> {
+pub fn ensure_initialized(
+    store_path: &Path,
+    gpg_backend: GpgBackend,
+    allow_create_without_prompt: bool,
+) -> Result<()> {
     let init = Uninitialized::new(store_path.to_path_buf(), gpg_backend);
 
     match init.check_if_initialized() {
         Ok(init) => init
-            .prompt_user()?
+            .prompt_user(allow_create_without_prompt)?
             .select_gpg_key()?
             .write_gpg_id()?
             .setup_git()?
