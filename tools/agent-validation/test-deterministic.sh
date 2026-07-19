@@ -50,7 +50,8 @@ done
 cargo test --all-features -- \
     --skip agent::prompt::dbus_tests \
     --skip ceremony_observer \
-    --skip agent::storage_factory::tests::composition_conformance
+    --skip agent::storage_factory::tests::composition_conformance \
+    --skip agent::browser::tests::test_cdp_pipes_drop_closes_fds
 cargo test -p agent-principal-probe
 cargo test --all-features -p passless-rs --bin passless \
     agent::prompt::dbus_tests -- --test-threads=1
@@ -59,6 +60,8 @@ cargo test --all-features -p passless-rs --bin passless \
 cargo test --all-features -p passless-rs --bin passless \
     agent::storage_factory::tests::composition_conformance -- \
     --include-ignored --test-threads=1
+cargo test --all-features -p passless-rs --bin passless \
+    agent::browser::tests::test_cdp_pipes_drop_closes_fds -- --test-threads=1
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/passless-agent-validation.XXXXXX")
 trap 'rm -rf -- "$tmp_dir"' EXIT
