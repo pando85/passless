@@ -130,6 +130,13 @@ impl MockClock {
 }
 
 #[cfg(test)]
+impl Default for MockClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl Clock for MockClock {
     fn now(&self) -> Instant {
         let inner = self.inner.lock().unwrap();

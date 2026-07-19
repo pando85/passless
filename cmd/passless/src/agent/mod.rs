@@ -2,6 +2,8 @@ pub mod audit;
 pub mod audit_events;
 pub mod browser;
 pub mod ceremony;
+#[cfg(test)]
+pub mod ceremony_observer;
 pub mod client;
 pub mod device;
 pub mod doctor;

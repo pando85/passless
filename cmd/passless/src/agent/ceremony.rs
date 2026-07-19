@@ -24,6 +24,8 @@ use super::policy_engine::{
 use super::prompt::{PromptAction, PromptMode, PromptRequest};
 use super::storage::CeremonyScope;
 
+#[cfg(test)]
+use crate::agent::ceremony_observer::{CeremonyObservation, TerminalResult, TestObserver};
 use crate::agent::grant::CeremonyId;
 use crate::agent::prompt::PromptHandle;
 
@@ -1182,6 +1184,8 @@ pub struct StaticCeremonyContext {
     preparation_slot: Arc<CeremonyPreparationSlot>,
     require_uv: bool,
     operation_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    test_observer: Option<TestObserver>,
 }
 
 pub struct StaticCeremonyContextConfig {
@@ -1210,6 +1214,8 @@ impl StaticCeremonyContext {
             interaction_manager: None,
             preparation_slot: config.preparation_slot,
             operation_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            test_observer: None,
         }
     }
 
@@ -1221,6 +1227,40 @@ impl StaticCeremonyContext {
     pub fn with_operation_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
         self.operation_lock = lock;
         self
+    }
+
+    #[cfg(test)]
+    pub fn with_test_observer(mut self, observer: TestObserver) -> Self {
+        self.test_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    fn emit_observation(
+        &self,
+        command_class: CommandClass,
+        terminal_result: TerminalResult,
+        up: bool,
+        uv: bool,
+        correlation_id: u64,
+    ) {
+        if let Some(ref observer) = self.test_observer {
+            observer.record(CeremonyObservation {
+                command_class,
+                terminal_result,
+                up,
+                uv,
+                correlation_id,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn mint_correlation_id(&self) -> u64 {
+        self.test_observer
+            .as_ref()
+            .map(|o| o.mint_correlation_id())
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -1750,16 +1790,54 @@ impl<H: CommandHandler> CommandHandler for AgentCeremonyHandler<H> {
         let cmd_byte = data[0];
         let cmd_class = classify_command(cmd_byte);
 
+        #[cfg(test)]
+        let correlation_id = self.ctx.mint_correlation_id();
+
         match cmd_class {
             CommandClass::Denied => {
+                #[cfg(test)]
+                self.ctx.emit_observation(
+                    cmd_class,
+                    TerminalResult::CommandClassDenied,
+                    false,
+                    false,
+                    correlation_id,
+                );
                 return Ok(operation_denied_response());
             }
             CommandClass::SafeNonCeremony => {
-                return self.inner.handle_command(Cmd::Cbor, data).map_err(|_| {
+                let result = self.inner.handle_command(Cmd::Cbor, data).map_err(|_| {
+                    #[cfg(test)]
+                    self.ctx.emit_observation(
+                        cmd_class,
+                        TerminalResult::InnerHandlerError,
+                        false,
+                        false,
+                        correlation_id,
+                    );
                     soft_fido2_transport::Error::Other("inner handler failed".into())
                 });
+                #[cfg(test)]
+                if result.is_ok() {
+                    self.ctx.emit_observation(
+                        cmd_class,
+                        TerminalResult::Success,
+                        false,
+                        false,
+                        correlation_id,
+                    );
+                }
+                return result;
             }
             CommandClass::Unknown => {
+                #[cfg(test)]
+                self.ctx.emit_observation(
+                    cmd_class,
+                    TerminalResult::CommandClassDenied,
+                    false,
+                    false,
+                    correlation_id,
+                );
                 return Ok(operation_denied_response());
             }
             CommandClass::Ceremony => {}
@@ -1771,14 +1849,90 @@ impl<H: CommandHandler> CommandHandler for AgentCeremonyHandler<H> {
             .map_err(|_| soft_fido2_transport::Error::Other("operation lock poisoned".into()))?;
 
         match self.handle_ceremony_command(data, cmd_byte) {
-            Ok(response) => Ok(response),
-            Err(_) => Ok(operation_denied_response()),
+            Ok(response) => {
+                #[cfg(test)]
+                {
+                    let (up, uv) = extract_up_uv_from_response(cmd_byte, &response);
+                    self.ctx.emit_observation(
+                        cmd_class,
+                        TerminalResult::Success,
+                        up,
+                        uv,
+                        correlation_id,
+                    );
+                }
+                Ok(response)
+            }
+            Err(e) => {
+                #[cfg(test)]
+                {
+                    let terminal = map_ceremony_error_to_terminal(&e);
+                    self.ctx
+                        .emit_observation(cmd_class, terminal, false, false, correlation_id);
+                }
+                let _ = e;
+                Ok(operation_denied_response())
+            }
         }
     }
 }
 
 fn operation_denied_response() -> Vec<u8> {
     vec![CTAP_ERR_OPERATION_DENIED]
+}
+
+#[cfg(test)]
+pub(crate) fn extract_up_uv_from_response(cmd_byte: u8, response: &[u8]) -> (bool, bool) {
+    if response.is_empty() || response[0] != CTAP_OK {
+        return (false, false);
+    }
+    let cbor_bytes = &response[1..];
+    let value: cbor::Value = match cbor::from_slice(cbor_bytes) {
+        Ok(v) => v,
+        Err(_) => return (false, false),
+    };
+    let map = match &value {
+        cbor::Value::Map(m) => m,
+        _ => return (false, false),
+    };
+    let auth_data = match map
+        .iter()
+        .find(|(k, _)| **k == cbor::Value::Integer(RESP_KEY_AUTH_DATA as i128))
+    {
+        Some((_, cbor::Value::Bytes(b))) if b.len() >= AUTH_DATA_MIN_LEN => b,
+        _ => return (false, false),
+    };
+    let flags = auth_data[AUTH_DATA_FLAGS_OFFSET];
+    let up = flags & FLAG_UP != 0;
+    let uv = flags & FLAG_UV != 0;
+    let _ = cmd_byte;
+    (up, uv)
+}
+
+#[cfg(test)]
+pub(crate) fn map_ceremony_error_to_terminal(e: &AgentCeremonyError) -> TerminalResult {
+    match e {
+        AgentCeremonyError::ConsumeFailed(_) => TerminalResult::ConsumeFailed,
+        AgentCeremonyError::AuditFailed => TerminalResult::AuditFailed,
+        AgentCeremonyError::ResponseParseFailed(CeremonyError::NonZeroStatus) => {
+            TerminalResult::NonZeroStatus
+        }
+        AgentCeremonyError::ResponseParseFailed(_) => TerminalResult::ResponseParseError,
+        AgentCeremonyError::InnerHandlerFailed => TerminalResult::InnerHandlerError,
+        AgentCeremonyError::ScopeActivationFailed => TerminalResult::ScopeActivationFailed,
+        AgentCeremonyError::CredentialMismatch => TerminalResult::CredentialMismatch,
+        AgentCeremonyError::PromptDenied => TerminalResult::PromptDenied,
+        AgentCeremonyError::PromptTimeout => TerminalResult::PromptTimeout,
+        AgentCeremonyError::PromptError => TerminalResult::PromptError,
+        AgentCeremonyError::PendingResolveFailed => TerminalResult::ResponseParseError,
+        AgentCeremonyError::PromptBuildFailed => TerminalResult::PromptError,
+        AgentCeremonyError::BoundAuthorizeFailed => TerminalResult::BoundAuthorizeFailed,
+        AgentCeremonyError::NoPreparation => TerminalResult::NoPreparation,
+        AgentCeremonyError::PreparationStale => TerminalResult::PreparationStale,
+        AgentCeremonyError::CommandClassDenied => TerminalResult::CommandClassDenied,
+        AgentCeremonyError::GetNextAssertionDenied => TerminalResult::GetNextAssertionDenied,
+        AgentCeremonyError::PolicyDenied(_) => TerminalResult::DeniedByPolicy,
+    }
 }
 
 fn reason_code_to_policy_deny_reason(reason: ReasonCode) -> PolicyDenyReason {

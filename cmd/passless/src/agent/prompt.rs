@@ -913,10 +913,10 @@ mod tests {
     fn test_untrusted_fields_clearly_separated() {
         let req = build_test_request();
         let snapshot = req.snapshot();
-        assert!(snapshot.untrusted_reason.starts_with(""));
-        assert!(snapshot.untrusted_page_title.starts_with(""));
-        assert!(snapshot.untrusted_page_url.starts_with(""));
-        assert!(snapshot.untrusted_account_label.starts_with(""));
+        assert_eq!(snapshot.untrusted_reason, "Login to example.com");
+        assert_eq!(snapshot.untrusted_page_title, "Example Login");
+        assert_eq!(snapshot.untrusted_page_url, "https://example.com/login");
+        assert_eq!(snapshot.untrusted_account_label, "user@example.com");
 
         let json = serde_json::to_value(&snapshot).unwrap();
         let obj = json.as_object().unwrap();
@@ -927,6 +927,9 @@ mod tests {
             4,
             "expected 4 untrusted_ prefixed keys"
         );
+        assert!(obj.contains_key("profile_id"));
+        assert!(obj.contains_key("rp_id"));
+        assert!(!obj["rp_id"].as_str().unwrap().contains("untrusted"));
     }
 
     #[test]
@@ -1328,5 +1331,594 @@ mod tests {
         let body = build_security_body(&req);
         assert!(!body.contains("Credential label"));
         assert!(!body.contains("Credential ref"));
+    }
+}
+
+#[cfg(all(test, feature = "agent"))]
+mod dbus_tests {
+    use std::collections::HashMap;
+    use std::env;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
+    use zbus::connection::Builder;
+    use zbus::interface;
+
+    use super::*;
+    use passless_core::agent::{CredentialRef, ProfileId};
+
+    const TEST_TIMEOUT_SECS: u64 = 10;
+    const NOTIFY_WAIT_TIMEOUT_MS: u64 = 5000;
+
+    static DBUS_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    #[derive(Debug, Clone)]
+    struct CapturedNotification {
+        app_name: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        expire_timeout: i32,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ServerKind {
+        FullActions,
+        DefaultActionOnly,
+        Unknown,
+    }
+
+    struct SharedState {
+        next_id: u32,
+        captured: Option<CapturedNotification>,
+    }
+
+    struct TestNotificationService {
+        state: Arc<Mutex<SharedState>>,
+        notify_ready: Arc<Notify>,
+        server_kind: ServerKind,
+    }
+
+    impl TestNotificationService {
+        fn new(server_kind: ServerKind) -> (Self, Arc<Mutex<SharedState>>, Arc<Notify>) {
+            let state = Arc::new(Mutex::new(SharedState {
+                next_id: 1,
+                captured: None,
+            }));
+            let notify_ready = Arc::new(Notify::new());
+            let svc = Self {
+                state: Arc::clone(&state),
+                notify_ready: Arc::clone(&notify_ready),
+                server_kind,
+            };
+            (svc, state, notify_ready)
+        }
+    }
+
+    #[interface(name = "org.freedesktop.Notifications")]
+    impl TestNotificationService {
+        async fn get_capabilities(&self) -> Vec<String> {
+            match self.server_kind {
+                ServerKind::FullActions => {
+                    vec![
+                        "actions".to_string(),
+                        "body".to_string(),
+                        "body-markup".to_string(),
+                    ]
+                }
+                ServerKind::DefaultActionOnly => {
+                    vec!["body".to_string()]
+                }
+                ServerKind::Unknown => {
+                    vec![]
+                }
+            }
+        }
+
+        // The freedesktop Notifications D-Bus method has this fixed external signature.
+        #[allow(clippy::too_many_arguments)]
+        async fn notify(
+            &self,
+            app_name: &str,
+            replaces_id: u32,
+            _app_icon: &str,
+            summary: &str,
+            body: &str,
+            actions: Vec<String>,
+            _hints: HashMap<String, zbus::zvariant::Value<'_>>,
+            expire_timeout: i32,
+        ) -> zbus::fdo::Result<u32> {
+            let mut state = self.state.lock().unwrap();
+            let id = if replaces_id == 0 {
+                let id = state.next_id;
+                state.next_id += 1;
+                id
+            } else {
+                replaces_id
+            };
+
+            state.captured = Some(CapturedNotification {
+                app_name: app_name.to_string(),
+                summary: summary.to_string(),
+                body: body.to_string(),
+                actions,
+                expire_timeout,
+            });
+
+            self.notify_ready.notify_one();
+            Ok(id)
+        }
+
+        async fn close_notification(&self, id: u32) -> zbus::fdo::Result<()> {
+            let _ = id;
+            Ok(())
+        }
+
+        async fn get_server_information(
+            &self,
+        ) -> zbus::fdo::Result<(String, String, String, String)> {
+            match self.server_kind {
+                ServerKind::FullActions => Ok((
+                    "TestNotificationServer".to_string(),
+                    "1.0".to_string(),
+                    "1.0".to_string(),
+                    "1.2".to_string(),
+                )),
+                ServerKind::DefaultActionOnly => Ok((
+                    "notify-osd".to_string(),
+                    "1.0".to_string(),
+                    "1.0".to_string(),
+                    "1.2".to_string(),
+                )),
+                ServerKind::Unknown => Err(zbus::fdo::Error::Failed(
+                    "no notification server".to_string(),
+                )),
+            }
+        }
+    }
+
+    async fn emit_action_invoked(conn: &zbus::Connection, id: u32, action: &str) {
+        let _ = conn
+            .emit_signal(
+                None::<zbus::names::BusName<'_>>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "ActionInvoked",
+                &(id, action),
+            )
+            .await;
+    }
+
+    async fn emit_notification_closed(conn: &zbus::Connection, id: u32, reason: u32) {
+        let _ = conn
+            .emit_signal(
+                None::<zbus::names::BusName<'_>>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "NotificationClosed",
+                &(id, reason),
+            )
+            .await;
+    }
+
+    struct PrivateDBus {
+        pid: u32,
+        address: String,
+    }
+
+    impl PrivateDBus {
+        fn start() -> Self {
+            let output = Command::new("dbus-daemon")
+                .args(["--print-address=1", "--print-pid=2", "--fork", "--session"])
+                .output()
+                .expect("failed to start dbus-daemon");
+
+            let address = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let pid_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+            assert!(!address.is_empty(), "dbus-daemon did not print address");
+            assert!(!pid_str.is_empty(), "dbus-daemon did not print pid");
+
+            let pid: u32 = pid_str.parse().expect("invalid pid from dbus-daemon");
+
+            Self { pid, address }
+        }
+
+        fn address(&self) -> &str {
+            &self.address
+        }
+    }
+
+    impl Drop for PrivateDBus {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        unsafe fn set(key: &'static str, value: &str) -> Self {
+            let prev = env::var(key).ok();
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(ref val) = self.prev {
+                    env::set_var(self.key, val);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn test_profile_id() -> ProfileId {
+        ProfileId::new("test-profile").unwrap()
+    }
+
+    fn test_cred() -> CredentialRef {
+        CredentialRef::with_default_domain(b"test-credential-id")
+    }
+
+    fn build_test_request() -> PromptRequest {
+        PromptRequest::builder()
+            .profile_id(test_profile_id())
+            .mode(PromptMode::Isolated)
+            .action(PromptAction::Authenticate)
+            .rp_id("example.com")
+            .credential_label("my-key")
+            .credential_ref(test_cred())
+            .grant_ttl_secs(300)
+            .session_ttl_secs(3600)
+            .untrusted_reason("Login to example.com")
+            .untrusted_page_title("Example Login")
+            .untrusted_page_url("https://example.com/login")
+            .untrusted_account_label("user@example.com")
+            .build()
+            .unwrap()
+    }
+
+    async fn run_prompt_test<F, Fut>(
+        server_kind: ServerKind,
+        _timeout_secs: u64,
+        _min_review_delay_ms: u64,
+        test_fn: F,
+    ) -> PromptResult
+    where
+        F: FnOnce(Arc<Mutex<SharedState>>, Arc<zbus::Connection>, Arc<Notify>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = PromptResult> + Send,
+    {
+        let _lock = DBUS_ENV_LOCK.lock().await;
+
+        let dbus = PrivateDBus::start();
+        let _env_guard = unsafe { EnvGuard::set("DBUS_SESSION_BUS_ADDRESS", dbus.address()) };
+
+        let timeout_result = tokio::time::timeout(Duration::from_secs(TEST_TIMEOUT_SECS), async {
+            let (service, state, notify_ready) = TestNotificationService::new(server_kind);
+
+            let conn = Builder::session()
+                .unwrap()
+                .name("org.freedesktop.Notifications")
+                .unwrap()
+                .serve_at("/org/freedesktop/Notifications", service)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+
+            let conn = Arc::new(conn);
+
+            let result = test_fn(state, Arc::clone(&conn), notify_ready).await;
+
+            let _ = (*conn).clone().close().await;
+            result
+        })
+        .await;
+
+        match timeout_result {
+            Ok(result) => result,
+            Err(_) => panic!("Test timed out after {}s", TEST_TIMEOUT_SECS),
+        }
+    }
+
+    #[test]
+    fn test_desktop_prompt_trusted_content() {
+        let request = build_test_request();
+        let title = build_security_title(request.action());
+        let body = build_security_body(&request);
+
+        assert!(title.contains("Authentication"));
+        assert!(body.contains("Profile (trusted): test-profile"));
+        assert!(body.contains("Mode (trusted): isolated"));
+        assert!(body.contains("Exact relying party (trusted): example.com"));
+        assert!(body.contains("Action (trusted): authenticate"));
+        assert!(body.contains("Agent-supplied reason (untrusted): Login to example.com"));
+        assert!(body.contains("Page title (untrusted): Example Login"));
+        assert!(body.contains("Page URL (untrusted): https://example.com/login"));
+    }
+
+    #[test]
+    fn test_desktop_prompt_timeout_with_private_dbus() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::FullActions,
+                5,
+                10,
+                |state, conn, notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 10));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
+                        notify_ready.notified(),
+                    )
+                    .await;
+                    assert!(wait_result.is_ok(), "Notify() was not called");
+
+                    let captured = state
+                        .lock()
+                        .unwrap()
+                        .captured
+                        .clone()
+                        .expect("notification not captured");
+                    assert!(!captured.app_name.is_empty());
+                    assert!(captured.summary.contains("Authentication"));
+                    assert!(captured.body.contains("example.com"));
+                    assert!(captured.actions.contains(&"approve".to_string()));
+                    assert!(captured.actions.contains(&"deny".to_string()));
+                    assert_eq!(captured.expire_timeout, 5000);
+
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    emit_notification_closed(&conn, 1, 1).await;
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Timeout);
+    }
+
+    #[test]
+    fn test_desktop_prompt_delayed_approve() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::FullActions,
+                5,
+                100,
+                |_state, conn, notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
+                        notify_ready.notified(),
+                    )
+                    .await;
+                    assert!(wait_result.is_ok(), "Notify() was not called");
+
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    emit_action_invoked(&conn, 1, "approve").await;
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Approved);
+    }
+
+    #[test]
+    fn test_desktop_prompt_premature_approve_denied() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::FullActions,
+                5,
+                1000,
+                |_state, conn, notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 1000));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
+                        notify_ready.notified(),
+                    )
+                    .await;
+                    assert!(wait_result.is_ok(), "Notify() was not called");
+
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    emit_action_invoked(&conn, 1, "approve").await;
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Denied);
+    }
+
+    #[test]
+    fn test_desktop_prompt_explicit_deny() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::FullActions,
+                5,
+                100,
+                |state, conn, notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
+                        notify_ready.notified(),
+                    )
+                    .await;
+                    assert!(wait_result.is_ok(), "Notify() was not called");
+
+                    let captured = state
+                        .lock()
+                        .unwrap()
+                        .captured
+                        .clone()
+                        .expect("notification not captured");
+                    assert!(captured.summary.contains("Authentication"));
+                    assert!(captured.body.contains("test-profile"));
+
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    emit_action_invoked(&conn, 1, "deny").await;
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Denied);
+    }
+
+    #[test]
+    fn test_desktop_prompt_close_signal() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::FullActions,
+                5,
+                100,
+                |_state, conn, notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    let wait_result = tokio::time::timeout(
+                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
+                        notify_ready.notified(),
+                    )
+                    .await;
+                    assert!(wait_result.is_ok(), "Notify() was not called");
+
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    emit_notification_closed(&conn, 1, 2).await;
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Timeout);
+    }
+
+    #[test]
+    fn test_desktop_prompt_capability_default_action_only_rejected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::DefaultActionOnly,
+                5,
+                100,
+                |_state, _conn, _notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Error);
+        assert_eq!(
+            result.error_kind,
+            Some(PromptErrorKind::ServerCapabilityRejected)
+        );
+    }
+
+    #[test]
+    fn test_desktop_prompt_capability_unknown_rejected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_prompt_test(
+                ServerKind::Unknown,
+                5,
+                100,
+                |_state, _conn, _notify_ready| async move {
+                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
+                    let request = build_test_request();
+
+                    let prompt_task = tokio::task::spawn_blocking({
+                        let handle = Arc::clone(&handle);
+                        let request = request.clone();
+                        move || handle.prompt(&request)
+                    });
+
+                    prompt_task.await.unwrap()
+                },
+            )
+            .await
+        });
+
+        assert_eq!(result.decision, PromptDecision::Error);
+        assert_eq!(
+            result.error_kind,
+            Some(PromptErrorKind::NotificationUnsupported)
+        );
     }
 }

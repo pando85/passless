@@ -1242,4 +1242,888 @@ mod tests {
         let result = delegated.write(advanced_ref);
         assert!(result.is_ok());
     }
+
+    mod composition_conformance {
+        use super::*;
+        use crate::storage::CredentialFilter;
+        use std::collections::VecDeque;
+
+        fn secure_temp_dir() -> tempfile::TempDir {
+            let dir = tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        }
+
+        fn comp_test_credential(
+            id: &[u8],
+            rp_id: &str,
+            user_id: &[u8],
+            sign_count: u32,
+        ) -> soft_fido2::Credential {
+            make_test_credential(id, rp_id, user_id, sign_count)
+        }
+
+        fn comp_cred_to_ref(cred: &soft_fido2::Credential) -> soft_fido2::CredentialRef<'_> {
+            soft_fido2::CredentialRef {
+                id: &cred.id,
+                rp_id: &cred.rp.id,
+                rp_name: cred.rp.name.as_deref(),
+                user_id: &cred.user.id,
+                user_name: cred.user.name.as_deref(),
+                user_display_name: cred.user.display_name.as_deref(),
+                sign_count: &cred.sign_count,
+                alg: &cred.alg,
+                private_key: &cred.private_key,
+                created: &cred.created,
+                discoverable: &cred.discoverable,
+                cred_protect: cred.extensions.cred_protect.as_ref(),
+                cred_random: None,
+            }
+        }
+
+        fn comp_cred_ref_for(id: &[u8]) -> CredentialRef {
+            CredentialRef::with_default_domain(id)
+        }
+
+        fn comp_write_seed(
+            human: &Arc<Mutex<Box<dyn CredentialStorage>>>,
+            cred: &soft_fido2::Credential,
+        ) {
+            let mut h = human.lock().unwrap();
+            let cr = comp_cred_to_ref(cred);
+            h.write(cr).unwrap();
+        }
+
+        fn run_composition_conformance(
+            human: Arc<Mutex<Box<dyn CredentialStorage>>>,
+            rp_id: &str,
+            cred_id: &[u8],
+            initial_counter: u32,
+        ) {
+            let seed = comp_test_credential(cred_id, rp_id, b"user1", initial_counter);
+            comp_write_seed(&human, &seed);
+
+            {
+                let h = human.lock().unwrap();
+                assert_eq!(h.count_credentials(), 1);
+            }
+
+            let agent_cred_ref = comp_cred_ref_for(cred_id);
+            let (mut delegated, scope) = create_shared_delegated_storage(
+                human.clone(),
+                vec![rp_id.to_string()],
+                vec![agent_cred_ref.clone()],
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(delegated.count_credentials(), 0);
+
+            let no_ceremony = delegated.read_first(CredentialFilter::ByRp(rp_id.into()));
+            assert!(no_ceremony.is_err());
+
+            let guard = scope
+                .activate_authenticate_for_rp(agent_cred_ref.clone(), rp_id)
+                .unwrap();
+
+            let found = delegated
+                .read_first(CredentialFilter::ByRp(rp_id.into()))
+                .unwrap();
+            assert_eq!(found.id, cred_id);
+            assert_eq!(found.rp.id, rp_id);
+            assert_eq!(found.sign_count, initial_counter);
+
+            assert!(
+                delegated
+                    .read_first(CredentialFilter::ByRp("evil.com".into()))
+                    .is_err()
+            );
+
+            let direct = delegated.read(cred_id).unwrap();
+            assert_eq!(direct.id, cred_id);
+
+            let mut advanced = seed.clone();
+            advanced.sign_count = initial_counter + 1;
+            let adv_ref = comp_cred_to_ref(&advanced);
+            delegated.write(adv_ref).unwrap();
+
+            let after_write = delegated.read(cred_id).unwrap();
+            assert_eq!(after_write.sign_count, initial_counter + 1);
+
+            drop(guard);
+
+            assert!(delegated.read(cred_id).is_err());
+            assert_eq!(delegated.count_credentials(), 0);
+
+            let mut h = human.lock().unwrap();
+            let persisted = h.read(cred_id).unwrap();
+            assert_eq!(persisted.sign_count, initial_counter + 1);
+            assert_eq!(h.count_credentials(), 1);
+
+            h.cleanup_expired_cache();
+        }
+
+        fn run_cleanup_propagation(human: Arc<Mutex<Box<dyn CredentialStorage>>>) {
+            let (mut delegated, _scope) =
+                create_shared_delegated_storage(human.clone(), vec![], vec![], false).unwrap();
+            delegated.cleanup_expired_cache();
+        }
+
+        fn run_no_second_adapter_check(human: &Arc<Mutex<Box<dyn CredentialStorage>>>) {
+            let seed = comp_test_credential(b"cred1", "example.com", b"user1", 0);
+            comp_write_seed(human, &seed);
+            let agent_cred_ref = comp_cred_ref_for(b"cred1");
+
+            let (mut delegated_a, scope_a) = create_shared_delegated_storage(
+                human.clone(),
+                vec!["example.com".to_string()],
+                vec![agent_cred_ref.clone()],
+                false,
+            )
+            .unwrap();
+
+            let (mut delegated_b, scope_b) = create_shared_delegated_storage(
+                human.clone(),
+                vec!["example.com".to_string()],
+                vec![agent_cred_ref.clone()],
+                false,
+            )
+            .unwrap();
+
+            let _guard_a = scope_a
+                .activate_authenticate_for_rp(agent_cred_ref.clone(), "example.com")
+                .unwrap();
+            let _guard_b = scope_b
+                .activate_authenticate_for_rp(agent_cred_ref, "example.com")
+                .unwrap();
+
+            let mut advanced = seed.clone();
+            advanced.sign_count = 1;
+            delegated_a.write(comp_cred_to_ref(&advanced)).unwrap();
+            assert_eq!(delegated_b.read(b"cred1").unwrap().sign_count, 1);
+
+            advanced.sign_count = 2;
+            delegated_b.write(comp_cred_to_ref(&advanced)).unwrap();
+            assert_eq!(delegated_a.read(b"cred1").unwrap().sign_count, 2);
+        }
+
+        struct ProcessEnvGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl ProcessEnvGuard {
+            unsafe fn set(key: &'static str, value: &Path) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for ProcessEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    if let Some(value) = &self.previous {
+                        std::env::set_var(self.key, value);
+                    } else {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+
+        fn binary_available(name: &str) -> bool {
+            std::process::Command::new("which")
+                .arg(name)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+
+        #[test]
+        fn local_composition_full_flow() {
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("local_comp_creds");
+            let pin_dir = base.path().join("local_comp_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+
+            run_composition_conformance(
+                bundle.credential_storage.clone(),
+                "example.com",
+                b"local-cred-01",
+                0,
+            );
+        }
+
+        #[test]
+        fn local_cleanup_propagation() {
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("local_cleanup_creds");
+            let pin_dir = base.path().join("local_cleanup_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+
+            run_cleanup_propagation(bundle.credential_storage.clone());
+        }
+
+        #[test]
+        fn local_no_second_adapter() {
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("local_no2nd_creds");
+            let pin_dir = base.path().join("local_no2nd_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+
+            run_no_second_adapter_check(&bundle.credential_storage);
+        }
+
+        #[test]
+        fn local_counter_persistence_across_sessions() {
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("local_persist_creds");
+            let pin_dir = base.path().join("local_persist_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+            let human = bundle.credential_storage.clone();
+
+            let seed = comp_test_credential(b"persist-cred", "example.com", b"user1", 10);
+            comp_write_seed(&human, &seed);
+
+            let agent_cred_ref = comp_cred_ref_for(b"persist-cred");
+
+            for expected_counter in 11..15 {
+                let (mut delegated, scope) = create_shared_delegated_storage(
+                    human.clone(),
+                    vec!["example.com".to_string()],
+                    vec![agent_cred_ref.clone()],
+                    false,
+                )
+                .unwrap();
+
+                let _guard = scope
+                    .activate_authenticate_for_rp(agent_cred_ref.clone(), "example.com")
+                    .unwrap();
+
+                let cred = delegated.read(b"persist-cred").unwrap();
+                assert_eq!(cred.sign_count, expected_counter - 1);
+
+                let mut advanced = seed.clone();
+                advanced.sign_count = expected_counter;
+                delegated.write(comp_cred_to_ref(&advanced)).unwrap();
+            }
+
+            let mut h = human.lock().unwrap();
+            let final_cred = h.read(b"persist-cred").unwrap();
+            assert_eq!(final_cred.sign_count, 14);
+        }
+
+        #[test]
+        fn local_concurrent_delegated_sessions_same_human() {
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("local_conc_creds");
+            let pin_dir = base.path().join("local_conc_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+            let human = bundle.credential_storage.clone();
+
+            let c1 = comp_test_credential(b"conc-cred-1", "example.com", b"user1", 0);
+            let c2 = comp_test_credential(b"conc-cred-2", "example.com", b"user2", 0);
+            comp_write_seed(&human, &c1);
+            comp_write_seed(&human, &c2);
+
+            let ref1 = comp_cred_ref_for(b"conc-cred-1");
+            let ref2 = comp_cred_ref_for(b"conc-cred-2");
+
+            let (mut del1, scope1) = create_shared_delegated_storage(
+                human.clone(),
+                vec!["example.com".to_string()],
+                vec![ref1.clone()],
+                false,
+            )
+            .unwrap();
+
+            let (mut del2, scope2) = create_shared_delegated_storage(
+                human.clone(),
+                vec!["example.com".to_string()],
+                vec![ref2.clone()],
+                false,
+            )
+            .unwrap();
+
+            let g1 = scope1
+                .activate_authenticate_for_rp(ref1, "example.com")
+                .unwrap();
+            let g2 = scope2
+                .activate_authenticate_for_rp(ref2, "example.com")
+                .unwrap();
+
+            let r1 = del1.read(b"conc-cred-1").unwrap();
+            assert_eq!(r1.id, b"conc-cred-1");
+
+            let r2 = del2.read(b"conc-cred-2").unwrap();
+            assert_eq!(r2.id, b"conc-cred-2");
+
+            assert!(del1.read(b"conc-cred-2").is_err());
+            assert!(del2.read(b"conc-cred-1").is_err());
+
+            drop(g1);
+            drop(g2);
+
+            let h = human.lock().unwrap();
+            assert_eq!(h.count_credentials(), 2);
+        }
+
+        #[derive(Clone)]
+        struct DeterministicStorage {
+            creds: Arc<Mutex<Vec<soft_fido2::Credential>>>,
+            iteration: Arc<Mutex<VecDeque<usize>>>,
+            cleanup_calls: Arc<Mutex<usize>>,
+        }
+
+        impl DeterministicStorage {
+            fn new(creds: Vec<soft_fido2::Credential>) -> Self {
+                Self {
+                    creds: Arc::new(Mutex::new(creds)),
+                    iteration: Arc::new(Mutex::new(VecDeque::new())),
+                    cleanup_calls: Arc::new(Mutex::new(0)),
+                }
+            }
+        }
+
+        impl CredentialStorage for DeterministicStorage {
+            fn read_first(
+                &mut self,
+                filter: CredentialFilter,
+            ) -> soft_fido2::Result<soft_fido2::Credential> {
+                let creds = self.creds.lock().unwrap();
+                let mut iter = self.iteration.lock().unwrap();
+                iter.clear();
+
+                let matching: Vec<usize> = match &filter {
+                    CredentialFilter::None => (0..creds.len()).collect(),
+                    CredentialFilter::ByRp(rp) => creds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.rp.id == *rp)
+                        .map(|(i, _)| i)
+                        .collect(),
+                    CredentialFilter::ById(id) => creds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.id == *id)
+                        .map(|(i, _)| i)
+                        .collect(),
+                    CredentialFilter::ByHash(_) => vec![],
+                };
+
+                if matching.is_empty() {
+                    return Err(soft_fido2::Error::DoesNotExist);
+                }
+
+                for &idx in &matching[1..] {
+                    iter.push_back(idx);
+                }
+
+                Ok(creds[matching[0]].clone())
+            }
+
+            fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+                let creds = self.creds.lock().unwrap();
+                let mut iter = self.iteration.lock().unwrap();
+                match iter.pop_front() {
+                    Some(idx) => Ok(creds[idx].clone()),
+                    None => Err(soft_fido2::Error::DoesNotExist),
+                }
+            }
+
+            fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+                let creds = self.creds.lock().unwrap();
+                creds
+                    .iter()
+                    .find(|c| c.id == id)
+                    .cloned()
+                    .ok_or(soft_fido2::Error::DoesNotExist)
+            }
+
+            fn write(&mut self, cred_ref: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+                let cred = cred_ref.to_owned();
+                let mut creds = self.creds.lock().unwrap();
+                if let Some(existing) = creds.iter_mut().find(|c| c.id == cred.id) {
+                    *existing = cred;
+                } else {
+                    creds.push(cred);
+                }
+                Ok(())
+            }
+
+            fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
+                let mut creds = self.creds.lock().unwrap();
+                creds.retain(|c| c.id != id);
+                Ok(())
+            }
+
+            fn count_credentials(&self) -> usize {
+                self.creds.lock().unwrap().len()
+            }
+
+            fn cleanup_expired_cache(&mut self) {
+                *self.cleanup_calls.lock().unwrap() += 1;
+            }
+        }
+
+        #[test]
+        fn deterministic_composition_full_flow() {
+            let adapter = DeterministicStorage::new(vec![]);
+            let human: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                Arc::new(Mutex::new(Box::new(adapter)));
+
+            run_composition_conformance(human, "example.com", b"det-cred-01", 5);
+        }
+
+        #[test]
+        fn deterministic_cleanup_propagation() {
+            let adapter = DeterministicStorage::new(vec![]);
+            let cleanup_calls = adapter.cleanup_calls.clone();
+            let human: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                Arc::new(Mutex::new(Box::new(adapter)));
+
+            run_cleanup_propagation(human);
+
+            assert_eq!(*cleanup_calls.lock().unwrap(), 1);
+        }
+
+        #[test]
+        fn deterministic_no_second_adapter() {
+            let adapter = DeterministicStorage::new(vec![]);
+            let human: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                Arc::new(Mutex::new(Box::new(adapter)));
+
+            run_no_second_adapter_check(&human);
+        }
+
+        #[test]
+        fn deterministic_counter_persistence_multiple_sessions() {
+            let adapter = DeterministicStorage::new(vec![]);
+            let human: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                Arc::new(Mutex::new(Box::new(adapter)));
+
+            let seed = comp_test_credential(b"det-persist", "example.com", b"user1", 0);
+            comp_write_seed(&human, &seed);
+
+            let agent_cred_ref = comp_cred_ref_for(b"det-persist");
+
+            for expected in 1..6 {
+                let (mut delegated, scope) = create_shared_delegated_storage(
+                    human.clone(),
+                    vec!["example.com".to_string()],
+                    vec![agent_cred_ref.clone()],
+                    false,
+                )
+                .unwrap();
+
+                let _guard = scope
+                    .activate_authenticate_for_rp(agent_cred_ref.clone(), "example.com")
+                    .unwrap();
+
+                let mut advanced = seed.clone();
+                advanced.sign_count = expected;
+                delegated.write(comp_cred_to_ref(&advanced)).unwrap();
+            }
+
+            let mut h = human.lock().unwrap();
+            let final_cred = h.read(b"det-persist").unwrap();
+            assert_eq!(final_cred.sign_count, 5);
+        }
+
+        #[test]
+        fn deterministic_isolated_rp_view_through_shared_human() {
+            let adapter = DeterministicStorage::new(vec![]);
+            let human: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                Arc::new(Mutex::new(Box::new(adapter)));
+
+            let c1 = comp_test_credential(b"rp-cred-1", "allowed.com", b"user1", 0);
+            let c2 = comp_test_credential(b"rp-cred-2", "forbidden.com", b"user2", 0);
+            comp_write_seed(&human, &c1);
+            comp_write_seed(&human, &c2);
+
+            let agent_cred_ref = comp_cred_ref_for(b"rp-cred-1");
+            let (mut delegated, scope) = create_shared_delegated_storage(
+                human.clone(),
+                vec!["allowed.com".to_string()],
+                vec![agent_cred_ref.clone()],
+                false,
+            )
+            .unwrap();
+
+            let _guard = scope
+                .activate_authenticate_for_rp(agent_cred_ref, "allowed.com")
+                .unwrap();
+
+            let found = delegated
+                .read_first(CredentialFilter::ByRp("allowed.com".into()))
+                .unwrap();
+            assert_eq!(found.id, b"rp-cred-1");
+
+            assert!(
+                delegated
+                    .read_first(CredentialFilter::ByRp("forbidden.com".into()))
+                    .is_err()
+            );
+
+            let h = human.lock().unwrap();
+            assert_eq!(h.count_credentials(), 2);
+        }
+
+        #[test]
+        fn human_regression_getinfo_with_agent_compiled() {
+            use crate::authenticator::AuthenticatorService;
+            use passless_core::config::{PinConfig, SecurityConfig};
+
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("human_reg_creds");
+            let pin_dir = base.path().join("human_reg_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+
+            let mut service = AuthenticatorService::with_shared_storage(
+                bundle.credential_storage.clone(),
+                Some(bundle.pin_storage.clone()),
+                SecurityConfig::default(),
+                PinConfig::default(),
+            )
+            .expect("service creation should succeed");
+
+            let mut response = Vec::new();
+            service
+                .handle(&[0x04], &mut response)
+                .expect("GetInfo should succeed without agent interaction");
+
+            assert!(!response.is_empty());
+            assert_eq!(response[0], 0x00, "GetInfo should return success status");
+        }
+
+        #[test]
+        fn human_regression_seed_and_readback_without_ceremony() {
+            use crate::authenticator::AuthenticatorService;
+            use passless_core::config::{PinConfig, SecurityConfig};
+
+            let base = secure_temp_dir();
+            let cred_dir = base.path().join("human_ops_creds");
+            let pin_dir = base.path().join("human_ops_pin");
+
+            let config = AgentStorageConfig::Local {
+                path: cred_dir,
+                pin_path: pin_dir,
+            };
+            let bundle = create_storage_bundle(config).unwrap();
+            let human = bundle.credential_storage.clone();
+
+            let seed = comp_test_credential(b"human-cred", "example.com", b"user1", 0);
+            {
+                let mut h = human.lock().unwrap();
+                let cr = comp_cred_to_ref(&seed);
+                h.write(cr).unwrap();
+                assert_eq!(h.count_credentials(), 1);
+            }
+
+            let mut service = AuthenticatorService::with_shared_storage(
+                human.clone(),
+                Some(bundle.pin_storage.clone()),
+                SecurityConfig::default(),
+                PinConfig::default(),
+            )
+            .unwrap();
+
+            let mut response = Vec::new();
+            service.handle(&[0x04], &mut response).unwrap();
+            assert_eq!(response[0], 0x00);
+
+            {
+                let mut h = human.lock().unwrap();
+                let cred = h.read(b"human-cred").unwrap();
+                assert_eq!(cred.sign_count, 0);
+                assert_eq!(cred.rp.id, "example.com");
+            }
+        }
+
+        #[test]
+        #[ignore]
+        fn pass_composition_full_flow() {
+            assert!(
+                binary_available("gpg") && binary_available("pass"),
+                "explicit pass composition validation requires gpg and pass"
+            );
+
+            let base = secure_temp_dir();
+            let gpg_home = base.path().join(".gnupg");
+            fs::create_dir_all(&gpg_home).unwrap();
+            fs::set_permissions(&gpg_home, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let batch_file = base.path().join("gpg-batch");
+            fs::write(
+                &batch_file,
+                "Key-Type: RSA\nKey-Length: 2048\nName-Real: Passless Comp Test\n\
+                 Name-Email: passless-comp@test.local\nExpire-Date: 0\n%no-protection\n%commit\n",
+            )
+            .unwrap();
+
+            let output = std::process::Command::new("gpg")
+                .arg("--homedir")
+                .arg(&gpg_home)
+                .arg("--batch")
+                .arg("--gen-key")
+                .arg(&batch_file)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "GPG key generation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let store_path = base.path().join("store");
+            fs::create_dir_all(&store_path).unwrap();
+            fs::set_permissions(&store_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let gpg_id_output = std::process::Command::new("gpg")
+                .arg("--homedir")
+                .arg(&gpg_home)
+                .arg("--list-keys")
+                .arg("--with-colons")
+                .output()
+                .unwrap();
+            let gpg_id = String::from_utf8_lossy(&gpg_id_output.stdout)
+                .lines()
+                .find(|l| l.starts_with("uid:"))
+                .map(|l| {
+                    l.split(':')
+                        .nth(9)
+                        .unwrap_or("passless-comp@test.local")
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "passless-comp@test.local".to_string());
+
+            let init_output = std::process::Command::new("pass")
+                .arg("init")
+                .arg(&gpg_id)
+                .env("PASSWORD_STORE_DIR", &store_path)
+                .env("GNUPGHOME", &gpg_home)
+                .output()
+                .unwrap();
+
+            assert!(init_output.status.success(), "pass init failed");
+
+            let config = AgentStorageConfig::Pass {
+                store_path: store_path.clone(),
+                path: "fido2".to_string(),
+                gpg_backend: "gnupg-bin".to_string(),
+                pin_path: PathBuf::from("pin"),
+            };
+
+            let _gpg_home_guard = unsafe { ProcessEnvGuard::set("GNUPGHOME", &gpg_home) };
+            let _store_guard = unsafe { ProcessEnvGuard::set("PASSWORD_STORE_DIR", &store_path) };
+
+            let bundle = create_storage_bundle(config).expect("pass bundle creation failed");
+
+            run_composition_conformance(
+                bundle.credential_storage.clone(),
+                "example.com",
+                b"pass-cred-01",
+                0,
+            );
+        }
+
+        #[cfg(feature = "tpm")]
+        mod tpm_composition {
+            use super::*;
+            use std::process::{Child, Command, Stdio};
+
+            struct SwtpmHandle {
+                child: Child,
+                _state_dir: tempfile::TempDir,
+                server_port: u16,
+            }
+
+            impl SwtpmHandle {
+                fn start() -> Option<Self> {
+                    if !binary_available("swtpm") {
+                        return None;
+                    }
+
+                    let state_dir = secure_temp_dir();
+                    let (server_port, ctrl_port) = reserve_tcp_ports()?;
+
+                    let child = Command::new("swtpm")
+                        .arg("socket")
+                        .arg("--tpm2")
+                        .arg("--tpmstate")
+                        .arg(format!("dir={}", state_dir.path().display()))
+                        .arg("--server")
+                        .arg(format!("type=tcp,port={server_port}"))
+                        .arg("--ctrl")
+                        .arg(format!("type=tcp,port={ctrl_port}"))
+                        .arg("--flags")
+                        .arg("not-need-init,startup-clear")
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .ok()?;
+
+                    let start = std::time::Instant::now();
+                    while std::net::TcpStream::connect(("127.0.0.1", server_port)).is_err() {
+                        if start.elapsed() > std::time::Duration::from_secs(5) {
+                            let mut c = child;
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+
+                    Some(Self {
+                        child,
+                        _state_dir: state_dir,
+                        server_port,
+                    })
+                }
+
+                fn tcti(&self) -> String {
+                    format!("swtpm:host=127.0.0.1,port={}", self.server_port)
+                }
+            }
+
+            fn reserve_tcp_ports() -> Option<(u16, u16)> {
+                for _ in 0..32 {
+                    let server = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+                    let server_port = server.local_addr().ok()?.port();
+                    let control_port = server_port.checked_add(1)?;
+                    if let Ok(control) = std::net::TcpListener::bind(("127.0.0.1", control_port)) {
+                        drop(control);
+                        drop(server);
+                        return Some((server_port, control_port));
+                    }
+                }
+                None
+            }
+
+            impl Drop for SwtpmHandle {
+                fn drop(&mut self) {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                }
+            }
+
+            #[test]
+            #[ignore]
+            fn tpm_composition_full_flow() {
+                let swtpm = SwtpmHandle::start()
+                    .expect("explicit TPM composition validation requires a usable swtpm");
+
+                let base = secure_temp_dir();
+                let cred_dir = base.path().join("tpm_comp_creds");
+                let pin_dir = base.path().join("tpm_comp_pin");
+
+                let config = AgentStorageConfig::Tpm {
+                    path: cred_dir,
+                    tcti: swtpm.tcti(),
+                    pin_path: pin_dir,
+                };
+
+                let bundle = create_storage_bundle(config).expect("TPM bundle creation failed");
+
+                run_composition_conformance(
+                    bundle.credential_storage.clone(),
+                    "example.com",
+                    b"tpm-cred-01",
+                    0,
+                );
+
+                drop(swtpm);
+            }
+
+            #[test]
+            #[ignore]
+            fn tpm_profile_isolation() {
+                let swtpm = SwtpmHandle::start()
+                    .expect("explicit TPM profile validation requires a usable swtpm");
+
+                let base = secure_temp_dir();
+                let cred_a = base.path().join("tpm_a").join("creds");
+                let pin_a = base.path().join("tpm_a").join("pin");
+                let cred_b = base.path().join("tpm_b").join("creds");
+                let pin_b = base.path().join("tpm_b").join("pin");
+
+                let config_a = AgentStorageConfig::Tpm {
+                    path: cred_a,
+                    tcti: swtpm.tcti(),
+                    pin_path: pin_a,
+                };
+                let config_b = AgentStorageConfig::Tpm {
+                    path: cred_b,
+                    tcti: swtpm.tcti(),
+                    pin_path: pin_b,
+                };
+
+                let bundle_a = create_storage_bundle(config_a).expect("TPM bundle A failed");
+                let bundle_b = create_storage_bundle(config_b).expect("TPM bundle B failed");
+
+                assert_ne!(bundle_a.credential_dir(), bundle_b.credential_dir());
+                assert_ne!(
+                    Arc::as_ptr(&bundle_a.credential_storage),
+                    Arc::as_ptr(&bundle_b.credential_storage),
+                );
+
+                drop(swtpm);
+            }
+
+            #[test]
+            #[ignore]
+            fn tpm_cleanup_propagation() {
+                let swtpm = SwtpmHandle::start()
+                    .expect("explicit TPM cleanup validation requires a usable swtpm");
+
+                let base = secure_temp_dir();
+                let cred_dir = base.path().join("tpm_cleanup_creds");
+                let pin_dir = base.path().join("tpm_cleanup_pin");
+
+                let config = AgentStorageConfig::Tpm {
+                    path: cred_dir,
+                    tcti: swtpm.tcti(),
+                    pin_path: pin_dir,
+                };
+
+                let bundle = create_storage_bundle(config).expect("TPM bundle failed");
+
+                run_cleanup_propagation(bundle.credential_storage.clone());
+
+                drop(swtpm);
+            }
+        }
+    }
 }

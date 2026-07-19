@@ -4,6 +4,7 @@ members = [
     "passless-config-doc",
     "passless-core",
     "passless-uhid",
+    "tools/agent-principal-probe",
     "tools/agent-uhid-feasibility",
 ]
 resolver = "2"
@@ -48,6 +49,7 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
 shadow-rs = "2.0"
 psl = "2"
+zbus = "5.14"
 
 # Proc macro dependencies
 syn = { version = "2.0", features = ["full", "extra-traits"] }

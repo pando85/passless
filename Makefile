@@ -8,7 +8,7 @@ PROJECT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | he
 help:	## Show this help menu.
 	@echo "Usage: make [TARGET ...]"
 	@echo ""
-	@@egrep -h "#[#]" $(MAKEFILE_LIST) | sed -e 's/\\$$//' | awk 'BEGIN {FS = "[:=].*?#[#] "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -Eh "#[#]" $(MAKEFILE_LIST) | sed -e 's/\\$$//' | awk 'BEGIN {FS = "[:=].*?#[#] "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 
 .PHONY: build
@@ -68,6 +68,10 @@ test-e2e-pass:	## run E2E tests for password-store backend only
 .PHONY: test-e2e-tpm
 test-e2e-tpm:	## run E2E tests for TPM backend only (requires swtpm)
 	cargo test --all-features --test e2e_webauthn test_tpm_ -- --test-threads=1 --ignored
+
+.PHONY: test-agent-validation
+test-agent-validation:	## run deterministic agent validation (no privileged or live browser changes)
+	tools/agent-validation/test-deterministic.sh
 
 .PHONY: update-changelog
 update-changelog:	## automatically update changelog based on commits

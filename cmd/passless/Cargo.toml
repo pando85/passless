@@ -14,10 +14,16 @@ version.workspace = true
 name = "passless"
 path = "src/main.rs"
 
+[[bin]]
+name = "agent-prompt-probe"
+path = "src/bin/agent-prompt-probe.rs"
+required-features = ["agent-validation"]
+
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi"]
 agent = ["passless-core/agent", "passless-uhid"]
+agent-validation = ["agent"]
 
 [dependencies]
 passless-core.workspace = true
@@ -59,6 +65,8 @@ toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 passless-config-doc.workspace = true
+zbus = { workspace = true, features = ["tokio"] }
+tokio = { version = "1.0", features = ["rt", "macros", "time", "sync"] }
 
 [build-dependencies]
 passless-core.workspace = true

@@ -3293,28 +3293,22 @@ mod tests {
         assert!(result2.is_err());
     }
 
-    fn make_ceremony_tuple(
-        runtime: &PolicyRuntime,
-        profile_id: ProfileId,
-        session_id: PrincipalSessionId,
-        endpoint_id: EndpointId,
-        process_digest: ProcessIdentityDigest,
-        action: IntentAction,
-        rp_id: &str,
-        credential_ref: Option<CredentialRef>,
-    ) -> CeremonyTuple {
-        let generation = runtime.current_generation();
-        CeremonyTuple {
-            profile_id,
-            session_id,
-            endpoint_id,
-            process_digest,
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action,
-            rp_id: rp_id.to_string(),
-            credential_ref,
-        }
+    macro_rules! make_ceremony_tuple {
+        ($runtime:expr, $profile_id:expr, $session_id:expr, $endpoint_id:expr,
+         $process_digest:expr, $action:expr, $rp_id:expr, $credential_ref:expr $(,)?) => {{
+            let generation = $runtime.current_generation();
+            CeremonyTuple {
+                profile_id: $profile_id,
+                session_id: $session_id,
+                endpoint_id: $endpoint_id,
+                process_digest: $process_digest,
+                policy_generation: generation.generation_id.clone(),
+                policy_digest: generation.digest.clone(),
+                action: $action,
+                rp_id: $rp_id.to_string(),
+                credential_ref: $credential_ref,
+            }
+        }};
     }
 
     #[test]
@@ -3378,7 +3372,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid.clone(),
             session.clone(),
@@ -3429,7 +3423,7 @@ mod tests {
             })
             .unwrap();
 
-        let wrong_tuple = make_ceremony_tuple(
+        let wrong_tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -3471,7 +3465,7 @@ mod tests {
             })
             .unwrap();
 
-        let wrong_tuple = make_ceremony_tuple(
+        let wrong_tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -3514,7 +3508,7 @@ mod tests {
             })
             .unwrap();
 
-        let wrong_tuple = make_ceremony_tuple(
+        let wrong_tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             wrong_session,
@@ -3556,7 +3550,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -3602,7 +3596,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -3711,7 +3705,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session.clone(),
@@ -3789,7 +3783,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid.clone(),
             session.clone(),
@@ -3850,7 +3844,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid.clone(),
             session.clone(),
@@ -3907,7 +3901,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid.clone(),
             session.clone(),
@@ -3970,7 +3964,7 @@ mod tests {
             .principal_cancel_pending(&pending_id, &session)
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -4047,7 +4041,7 @@ mod tests {
             .unwrap();
 
         let wrong_cr = test_cred_ref(b"cred-b");
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -4090,7 +4084,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,
@@ -4133,7 +4127,7 @@ mod tests {
             })
             .unwrap();
 
-        let tuple = make_ceremony_tuple(
+        let tuple = make_ceremony_tuple!(
             &runtime,
             pid,
             session,

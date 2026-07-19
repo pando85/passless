@@ -1,0 +1,55 @@
+{
+    "identity_model": {
+        "description": "Expected cross-identity device access matrix",
+        "invariants": {
+            "PRIN-03": "Human operators (fido group) MUST NOT share group with daemon for /dev/uhid",
+            "ROUTE-03": "Human operators MUST NOT receive /dev/uhid access",
+            "ISOL-01": "Probe hidraw nodes accessible ONLY to fido-agent-probe group"
+        },
+        "groups": {
+            "uhid-daemon": {
+                "purpose": "Daemon-only /dev/uhid R/W",
+                "members": ["passless-daemon"],
+                "access": {
+                    "/dev/uhid": "rw",
+                    "human_hidraw": "none",
+                    "probe_hidraw": "none"
+                }
+            },
+            "fido": {
+                "purpose": "Human operator hidraw (real hardware)",
+                "members": ["human operators"],
+                "access": {
+                    "/dev/uhid": "none",
+                    "human_hidraw": "rw",
+                    "probe_hidraw": "none"
+                }
+            },
+            "fido-agent-probe": {
+                "purpose": "Per-agent-profile probe hidraw R/W",
+                "members": ["agent processes"],
+                "access": {
+                    "/dev/uhid": "none",
+                    "human_hidraw": "none",
+                    "probe_hidraw": "rw"
+                }
+            }
+        }
+    },
+    "expected_matrix": {
+        "/dev/uhid": {
+            "group": "uhid-daemon",
+            "mode": "0660",
+            "human_access": false,
+            "daemon_access": true,
+            "probe_access": false
+        },
+        "probe_hidraw": {
+            "group": "fido-agent-probe",
+            "mode": "0660",
+            "human_access": false,
+            "daemon_access": false,
+            "probe_access": true
+        }
+    }
+}

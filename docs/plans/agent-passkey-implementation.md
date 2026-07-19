@@ -826,15 +826,15 @@ Each requirement maps to specific source modules and test files:
 | ROUTE-02 | `cmd/passless/src/agent/endpoint_manager.rs`, `cmd/passless/src/agent/runtime.rs` | `cmd/passless/src/agent/endpoint_manager.rs` (unit tests) |
 | ROUTE-03 | `contrib/udev/70-passless-agent.rules`, `tools/agent-uhid-feasibility/` | Phase 0 evidence (pending privileged checks) |
 | ROUTE-04 | `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
-| AUTH-01 | `cmd/passless/src/agent/prompt.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending packet-level and RP-level tests |
-| AUTH-02 | `cmd/passless/src/agent/prompt.rs`, `cmd/passless/src/agent/ceremony.rs` | Pending packet-level and RP-level tests |
+| AUTH-01 | `cmd/passless/src/agent/prompt.rs`, `cmd/passless/src/agent/ceremony.rs` | Private-D-Bus prompt and test-only transport-observer tests; live controlled-RP correlation pending |
+| AUTH-02 | `cmd/passless/src/agent/prompt.rs`, `cmd/passless/src/agent/ceremony.rs` | Private-D-Bus prompt and test-only transport-observer tests; live CTAP PIN/UV and RP correlation pending |
 | AUTH-03 | `passless-core/src/agent/policy.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
 | RP-01 | `cmd/passless/src/agent/ceremony.rs` | Documentation review |
 | RP-02 | `cmd/passless/src/agent/ceremony.rs`, `cmd/passless/src/agent/policy_engine.rs` | `cmd/passless/src/agent/ceremony.rs` (unit tests) |
 | RP-03 | Documentation | Documentation review |
-| PRIN-01 | `cmd/passless/src/agent/launcher.rs`, `cmd/passless/src/agent/ipc.rs` | Pending principal-isolation suite |
-| PRIN-02 | `cmd/passless/src/agent/launcher.rs` | Pending principal-isolation suite |
-| PRIN-03 | `cmd/passless/src/agent/launcher.rs`, `contrib/udev/70-passless-agent.rules` | Pending principal-isolation suite |
+| PRIN-01 | `cmd/passless/src/agent/launcher.rs`, `cmd/passless/src/agent/ipc.rs` | Principal-probe unit and validation-harness tests; privileged live run pending |
+| PRIN-02 | `cmd/passless/src/agent/launcher.rs` | Principal-probe unit and validation-harness tests; privileged live run pending |
+| PRIN-03 | `cmd/passless/src/agent/launcher.rs`, `contrib/udev/70-passless-agent.rules` | Device-matrix and principal-probe harness tests; privileged live run pending |
 | ISO-01 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/storage_factory.rs` | `cmd/passless/src/agent/storage.rs` (unit tests) |
 | ISO-02 | `cmd/passless/src/agent/intent.rs`, `cmd/passless/src/agent/ceremony.rs` | `cmd/passless/src/agent/intent.rs` (unit tests) |
 | ISO-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/ceremony.rs` | Isolated storage scope, exact RP, registration, counter, and denial tests |
@@ -856,14 +856,14 @@ Each requirement maps to specific source modules and test files:
 | STORE-01 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/authenticator.rs` | Existing human storage tests |
 | STORE-02 | `cmd/passless/src/authenticator.rs`, `cmd/passless/src/storage/` | Existing human storage tests |
 | STORE-03 | `cmd/passless/src/agent/storage.rs`, `cmd/passless/src/agent/storage_factory.rs` | `cmd/passless/src/agent/storage.rs` (unit tests) |
-| SECRET-01 | All agent modules | Audit-taxonomy, protocol, CLI-envelope, capability, and redacted-debug secret-absence tests; full captured-log scan remains pending |
+| SECRET-01 | All agent modules | Audit-taxonomy, protocol, CLI-envelope, capability, redacted-debug, sentinel, and evidence-scan tests; complete release-run scan pending |
 | AUDIT-01 | `cmd/passless/src/agent/audit.rs`, `cmd/passless/src/agent/audit_events.rs` | `cmd/passless/src/agent/audit.rs` (unit tests) |
 | AUDIT-02 | `cmd/passless/src/agent/audit.rs` | `cmd/passless/src/agent/audit.rs` (unit tests) |
 | AUDIT-03 | `cmd/passless/src/agent/audit.rs` | Fsync, ENOSPC, partial-write, recovery, corruption, rotation, and circuit-breaker fault tests |
 | PROTO-01 | `passless-core/src/agent/protocol.rs` | `passless-core/src/agent/protocol.rs` (unit tests) |
 | PROTO-02 | `passless-core/src/agent/protocol.rs` | `passless-core/src/agent/protocol.rs` (unit tests) |
 | OPS-01 | `cmd/passless/src/agent/runtime.rs`, `cmd/passless/src/worker.rs` | Existing human E2E tests |
-| OPS-02 | `cmd/passless/src/agent/runtime.rs`, `cmd/passless/src/agent/browser.rs`, `cmd/passless/src/agent/endpoint_manager.rs` | Profile disable, endpoint cancellation, browser cleanup/quarantine, and restart recovery tests; privileged uninstall rehearsal remains pending |
+| OPS-02 | `cmd/passless/src/agent/runtime.rs`, `cmd/passless/src/agent/browser.rs`, `cmd/passless/src/agent/endpoint_manager.rs` | Profile disable, endpoint cancellation, browser cleanup/quarantine, restart recovery, and uninstall-harness tests; privileged live rehearsal pending |
 | AUTO-01 | `passless-core/src/agent/config.rs`, `cmd/passless/src/agent/ceremony.rs` | `passless-core/src/agent/config.rs` (unit tests) |
 
 ### Phase 0 evidence status
@@ -907,28 +907,33 @@ Phase 0 feasibility evidence is documented in `tools/agent-uhid-feasibility/evid
 
 Phase 9 (system validation, independent review, and controlled release) is **partially executed**.
 
+The agreed work to close the remaining engineering evidence is defined in the [Agent ADR validation closure plan](agent-adr-validation-closure.md).
+
 **Executed and passed (unprivileged):**
 
-- All-feature passless-rs suite: 1,139 unit tests plus configuration, CLI, policy, protocol, and storage integration suites.
+- All-feature workspace suite: 1,190 passless-rs unit tests plus configuration, CLI, policy, protocol, storage, workspace, and documentation suites.
 - Local WebAuthn E2E suite: 11 tests with fresh secure storage and debug-only automatic UP/UV.
 - Fresh pass-store initialization and representative WebAuthn registration/authentication without interactive storage or GPG-key prompts.
 - All-feature Clippy with warnings denied, Rustfmt, documentation links, and commit hooks.
+- Eight production-path prompt tests against a private D-Bus notification service, including delayed approval, premature approval, denial, closure, timeout, content, and capability rejection.
+- Test-only transport observer tests that expose only command class, terminal result, UP, UV, and numeric correlation metadata.
+- Local and pass agent-composition tests, human-disabled regression tests, and shared-adapter/counter/cleanup tests. swtpm composition is wired but requires a provisioned runner.
+- Principal probe and shell validation tests for identity, namespaces, cgroups, `NoNewPrivileges`, fd3, resource outcomes, device matrices, and fail-closed missing prerequisites.
+- Fourteen bounded fault categories and eight sentinel/redaction/evidence-scan checks.
+- Fail-closed release orchestrator, cleanup state, real-notification probe, Chromium/CDP harness, uninstall harness, and deterministic CI target.
 
 **Pending:**
 
 - Full test environment matrix (minimum and current supported Linux kernels and distributions).
 - Stock browser versions selected by Phase 0 (production UV flow).
-- Local, pass, and TPM storage backend conformance for agent mode.
-- Human regression suite with agent support compiled but disabled.
+- swtpm agent-composition execution on a provisioned runner.
+- Full human WebAuthn regression with agent support compiled but disabled at runtime.
 - Endpoint isolation suite (unique identity, node discovery, permissions, wrong-browser access, lifecycle, no fallback).
 - Principal isolation suite (UID, namespace, cgroup, filesystem, socket, device, profile, capability, resource attacks).
-- Policy and authorization suite (default deny, exact match, TTL, reload, replay, idempotency, race, cancellation, revocation).
-- Credential isolation suite (human/isolated/delegated boundaries, backend conformance, counter serialization, corruption, quarantine).
-- Ceremony semantics suite (prompt integrity, RP matching, credential selection, UP, UV, RP verification).
-- Browser lease suite (start, clamp, expiry, revoke, crash, principal exit, cleanup, quarantine, restart).
-- Audit suite (pre-write gate, terminal failure, degradation, recovery, rotation, verification, secret absence).
-- Resource abuse suite (endpoint, request, process, audit, profile, cleanup flooding).
-- Autonomous absence suite (unknown mode rejection, no cached approval, no repeated assertion under one lease).
+- Live ceremony correlation across trusted prompt, transport UP/UV observation, CTAP PIN/UV, and controlled-RP verification.
+- Live isolated/delegated Chromium ceremonies and lease/process cleanup on the release-lab identities.
+- Privileged execution of the endpoint/device/principal isolation, install, rollback, uninstall, final inventory, and human-continuity stages.
+- One complete fail-closed release-orchestrator run on the recorded x86_64 Linux environment.
 - Independent security review of ADRs, threat model, endpoint and kernel device-routing design, shared human-storage synchronization, principal and browser-control design, policy and authorization state machines, prompt and UP/UV evidence, storage and secret-lifetime analysis, audit durability and fault-injection evidence, and known limitations.
 
 **Release gates:**
