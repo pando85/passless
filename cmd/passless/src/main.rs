@@ -36,6 +36,7 @@ use worker::{UhidEndpoint, WorkerConfig, WorkerOutcome};
 
 shadow!(build);
 
+#[cfg(debug_assertions)]
 const E2E_AUTO_ACCEPT_STORAGE_ENV: &str = "PASSLESS_E2E_AUTO_ACCEPT_STORAGE";
 
 fn allow_e2e_storage_creation() -> bool {
