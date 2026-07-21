@@ -695,7 +695,23 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.10.7",
- "fiat-crypto",
+ "fiat-crypto 0.2.9",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "curve25519-dalek-derive",
+ "digest 0.11.2",
+ "fiat-crypto 0.3.0",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -868,15 +884,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
+dependencies = [
+ "signature 3.0.0",
+]
+
+[[package]]
 name = "ed25519-dalek"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
- "curve25519-dalek",
- "ed25519",
+ "curve25519-dalek 4.1.3",
+ "ed25519 2.2.3",
  "serde",
  "sha2 0.10.9",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
+dependencies = [
+ "curve25519-dalek 5.0.0",
+ "ed25519 3.0.0",
+ "sha2 0.11.0",
  "subtle",
  "zeroize",
 ]
@@ -1011,6 +1049,12 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "fiat-crypto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1832,8 +1876,8 @@ dependencies = [
  "sha2 0.11.0",
  "shadow-rs",
  "soft-fido2",
- "soft-fido2-ctap",
- "soft-fido2-transport",
+ "soft-fido2-ctap 0.13.1",
+ "soft-fido2-transport 0.13.1",
  "tempfile",
  "tokio",
  "toml",
@@ -2527,9 +2571,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea2ddbcdbb7f4b1cdae552de6007b0b28c5719794c2e8c678881186ee453d768"
+checksum = "33120664f41abafe64189b23d990599d95545bda8295f38f0201464ae7943731"
 dependencies = [
  "aes",
  "cbc",
@@ -2544,9 +2588,9 @@ dependencies = [
  "serde_bytes",
  "sha2 0.11.0",
  "smallvec",
- "soft-fido2-crypto",
- "soft-fido2-ctap",
- "soft-fido2-transport",
+ "soft-fido2-crypto 0.14.0",
+ "soft-fido2-ctap 0.14.0",
+ "soft-fido2-transport 0.14.0",
  "spin",
  "zeroize",
 ]
@@ -2559,7 +2603,26 @@ checksum = "f9d3122142f801deb504ab1aed5428eead247ad15c60d9614ba8838385420f0f"
 dependencies = [
  "aes",
  "cbc",
- "ed25519-dalek",
+ "ed25519-dalek 2.2.0",
+ "hkdf",
+ "hmac",
+ "p256",
+ "rand",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "soft-fido2-crypto"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76812960ba194c30739db32d4cbfa3e4777725d70c8102d50225e5776294b7b2"
+dependencies = [
+ "aes",
+ "cbc",
+ "ed25519-dalek 3.0.0",
  "hkdf",
  "hmac",
  "p256",
@@ -2583,7 +2646,26 @@ dependencies = [
  "serde_bytes",
  "sha2 0.11.0",
  "smallvec",
- "soft-fido2-crypto",
+ "soft-fido2-crypto 0.13.1",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "soft-fido2-ctap"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "551e806dc71d51a99b129fda18ec8b7650d55ffa63e8f8352d297cbeb0d05114"
+dependencies = [
+ "cbor4ii",
+ "rand",
+ "secstr",
+ "serde",
+ "serde_bytes",
+ "sha2 0.11.0",
+ "smallvec",
+ "soft-fido2-crypto 0.14.0",
  "subtle",
  "thiserror",
  "zeroize",
@@ -2594,6 +2676,18 @@ name = "soft-fido2-transport"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c52e1068683ef2cc65a3b711f145290c621c7c39db639121a9fdda629e0c1ad"
+dependencies = [
+ "hex",
+ "lazy_static",
+ "nix 0.31.3",
+ "smallvec",
+]
+
+[[package]]
+name = "soft-fido2-transport"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d5a0afa31668553c360d8df86d8e990786faecf8e47ddb01510dbe7b93943c2"
 dependencies = [
  "hex",
  "hidapi",
@@ -2718,7 +2812,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

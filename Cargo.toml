@@ -22,7 +22,7 @@ passless-core = { path = "./passless-core", version = "0.13.0" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.13.0" }
 passless-uhid = { path = "./passless-uhid", version = "0.13.0" }
 
-soft-fido2 = "0.13.1"
+soft-fido2 = "0.14.0"
 soft-fido2-ctap = "0.13.1"
 soft-fido2-transport = "0.13.1"
 
