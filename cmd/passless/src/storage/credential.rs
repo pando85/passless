@@ -465,16 +465,9 @@ mod tests {
             },
         };
 
-        // Convert to our format (zero-copy)
         let our_cred = Credential::from_soft_fido2(&soft_cred);
 
-        // Serialize
-        let _bytes = our_cred.to_bytes().expect("Serialization should succeed");
-
-        // Test migration: read soft-fido2 bytes using auto deserializer
-        // Note: soft-fido2 0.14.0+ changed the serialization format significantly,
-        // so we test roundtrip through our format instead
-        let our_bytes = our_cred.to_bytes().expect("Should serialize our format");
+        let our_bytes = our_cred.to_bytes().expect("Serialization should succeed");
         let deserialized =
             Credential::from_bytes(&our_bytes).expect("Should deserialize our format");
 
@@ -489,8 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compatibility() {
-        // Create a credential in our stable format
+    fn test_minimal_credential_roundtrip() {
         let our_cred = Credential {
             id: std::borrow::Cow::Owned(vec![1, 2, 3, 4]),
             rp: RelyingParty {
@@ -510,10 +502,7 @@ mod tests {
             extensions: Extensions::default(),
         };
 
-        // Serialize in our stable format
         let our_bytes = our_cred.to_bytes().expect("Should serialize our format");
-
-        // Deserialize using our format
         let deserialized =
             Credential::from_bytes(&our_bytes).expect("Should deserialize our format");
 

@@ -939,7 +939,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
                     response_buffer.push(0x00);
                     // Include the restored UV retries count in the response
                     // Response format: CBOR map { 1: uv_retries_count }
-                    // soft-fido2 0.14.0+ uses the configured max_pin_retries for reset
+                    // soft-fido2 0.14.0+ resets UV retries to the configured max_pin_retries value
                     if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
                         .insert(1, self.max_uv_retries)
                         .and_then(|b| b.build())
