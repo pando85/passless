@@ -52,8 +52,8 @@ enum UvRetryTransition {
 /// Wrapper to adapt passless PinStorage to soft-fido2 PinStorageCallbacks
 ///
 /// This wrapper intercepts PIN state load/save operations to enforce the configured
-/// max_uv_retries limit. Since soft-fido2 hardcodes MAX_UV_RETRIES=3 internally,
-/// we clamp the uv_retries value to the configured maximum during persistence.
+/// max_uv_retries limit. We clamp the uv_retries value to the configured maximum during
+/// persistence as a safety measure to ensure the configured limit is always respected.
 ///
 /// It also tracks UV retry transitions to emit actionable warnings when retries
 /// approach or reach exhaustion, independent of the storage backend.
@@ -606,7 +606,7 @@ pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
     pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
-    /// Maximum UV retries (configured value, not soft-fido2's hardcoded 3)
+    /// Maximum UV retries (configured value)
     max_uv_retries: u8,
 }
 
@@ -939,7 +939,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
                     response_buffer.push(0x00);
                     // Include the restored UV retries count in the response
                     // Response format: CBOR map { 1: uv_retries_count }
-                    // Use configured max_uv_retries, not soft-fido2's hardcoded value
+                    // soft-fido2 0.14.0+ uses the configured max_pin_retries for reset
                     if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
                         .insert(1, self.max_uv_retries)
                         .and_then(|b| b.build())
