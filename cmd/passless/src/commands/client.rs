@@ -1159,7 +1159,7 @@ pub fn rename(
 
     // Build updated user with the same user.id but potentially new name/display_name
     // Special handling: "-" means delete/clear the field (kubectl-style syntax)
-    let updated_user = soft_fido2_ctap::User {
+    let updated_user = soft_fido2::User {
         id: credential.user.id.clone(),
         name: match user_name {
             Some("-") => None,                    // Clear the field
