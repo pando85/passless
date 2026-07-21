@@ -1054,6 +1054,10 @@ mod tests {
         };
         let mut client = AdminClient::connect_raw(client_fd);
 
+        client.seq = 0;
+        let frame = RequestFrame::Admin(AdminRequestFrame::new(1, AdminRequest::Ping));
+        SeqpacketCodec::send_msg(client.fd.as_raw_fd(), &frame).unwrap();
+
         let resp = std::thread::spawn(move || {
             let big = "x".repeat(passless_core::agent::MAX_MESSAGE_SIZE + 100);
             let oversized = ResponseFrame::Admin(AdminResponseFrame::error(
@@ -1067,10 +1071,6 @@ mod tests {
             let encode_result = SeqpacketCodec::send_msg(server_fd.as_raw_fd(), &oversized);
             assert!(encode_result.is_err());
         });
-
-        client.seq = 0;
-        let frame = RequestFrame::Admin(AdminRequestFrame::new(1, AdminRequest::Ping));
-        SeqpacketCodec::send_msg(client.fd.as_raw_fd(), &frame).unwrap();
 
         let result = client.request(AdminRequest::Ping);
         assert!(result.is_err());
