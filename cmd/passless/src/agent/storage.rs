@@ -417,7 +417,7 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
                 "discoverable".into(),
             ));
         }
-        if old.private_key.as_slice() != new_cred.private_key.as_slice() {
+        if old.key.material.as_slice() != new_cred.key.material.as_slice() {
             return Err(DelegatedError::ImmutableFieldViolation(
                 "private_key".into(),
             ));
@@ -776,7 +776,7 @@ impl<S: CredentialStorage> IsolatedScopedStorage<S> {
                 "discoverable".into(),
             ));
         }
-        if old.private_key.as_slice() != new_cred.private_key.as_slice() {
+        if old.key.material.as_slice() != new_cred.key.material.as_slice() {
             return Err(DelegatedError::ImmutableFieldViolation(
                 "private_key".into(),
             ));
@@ -947,7 +947,7 @@ mod tests {
             },
             sign_count,
             alg: -7,
-            private_key: SecBytes::new(vec![0xAA; 32]),
+            key: soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0xAA; 32])),
             created: 1000,
             discoverable: true,
             extensions: soft_fido2::Extensions::default(),
@@ -1075,7 +1075,7 @@ mod tests {
             user_display_name: cred.user.display_name.as_deref(),
             sign_count: &cred.sign_count,
             alg: &cred.alg,
-            private_key: &cred.private_key,
+            key: &cred.key,
             created: &cred.created,
             discoverable: &cred.discoverable,
             cred_protect: cred.extensions.cred_protect.as_ref(),
@@ -1290,7 +1290,7 @@ mod tests {
             user_display_name: new_cred.user.display_name.as_deref(),
             sign_count: &new_cred.sign_count,
             alg: &new_cred.alg,
-            private_key: &new_cred.private_key,
+            key: &new_cred.key,
             created: &new_cred.created,
             discoverable: &new_cred.discoverable,
             cred_protect: new_cred.extensions.cred_protect.as_ref(),
@@ -1345,7 +1345,7 @@ mod tests {
             user_display_name: updated.user.display_name.as_deref(),
             sign_count: &updated.sign_count,
             alg: &updated.alg,
-            private_key: &updated.private_key,
+            key: &updated.key,
             created: &updated.created,
             discoverable: &updated.discoverable,
             cred_protect: updated.extensions.cred_protect.as_ref(),
@@ -1383,7 +1383,7 @@ mod tests {
             user_display_name: regressed.user.display_name.as_deref(),
             sign_count: &regressed.sign_count,
             alg: &regressed.alg,
-            private_key: &regressed.private_key,
+            key: &regressed.key,
             created: &regressed.created,
             discoverable: &regressed.discoverable,
             cred_protect: regressed.extensions.cred_protect.as_ref(),
@@ -1422,7 +1422,7 @@ mod tests {
             user_display_name: same_counter.user.display_name.as_deref(),
             sign_count: &same_counter.sign_count,
             alg: &same_counter.alg,
-            private_key: &same_counter.private_key,
+            key: &same_counter.key,
             created: &same_counter.created,
             discoverable: &same_counter.discoverable,
             cred_protect: same_counter.extensions.cred_protect.as_ref(),
@@ -1552,7 +1552,7 @@ mod tests {
                     user_display_name: cred.user.display_name.as_deref(),
                     sign_count: &new_count,
                     alg: &cred.alg,
-                    private_key: &cred.private_key,
+                    key: &cred.key,
                     created: &cred.created,
                     discoverable: &cred.discoverable,
                     cred_protect: cred.extensions.cred_protect.as_ref(),
@@ -1598,7 +1598,7 @@ mod tests {
                 user_display_name: updated.user.display_name.as_deref(),
                 sign_count: &updated.sign_count,
                 alg: &updated.alg,
-                private_key: &updated.private_key,
+                key: &updated.key,
                 created: &updated.created,
                 discoverable: &updated.discoverable,
                 cred_protect: updated.extensions.cred_protect.as_ref(),
@@ -1792,7 +1792,7 @@ mod tests {
             user_display_name: updated.user.display_name.as_deref(),
             sign_count: &updated.sign_count,
             alg: &updated.alg,
-            private_key: &updated.private_key,
+            key: &updated.key,
             created: &updated.created,
             discoverable: &updated.discoverable,
             cred_protect: updated.extensions.cred_protect.as_ref(),
@@ -1840,7 +1840,7 @@ mod tests {
             user_display_name: tampered.user.display_name.as_deref(),
             sign_count: &tampered.sign_count,
             alg: &tampered.alg,
-            private_key: &tampered.private_key,
+            key: &tampered.key,
             created: &tampered.created,
             discoverable: &tampered.discoverable,
             cred_protect: tampered.extensions.cred_protect.as_ref(),
@@ -1867,7 +1867,7 @@ mod tests {
         let _ = delegated.read(b"cred1").unwrap();
 
         let mut tampered = c1.clone();
-        tampered.private_key = SecBytes::new(vec![0xBB; 32]);
+        tampered.key = soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0xBB; 32]));
         tampered.sign_count = 6;
 
         let cred_ref = soft_fido2::CredentialRef {
@@ -1879,7 +1879,7 @@ mod tests {
             user_display_name: tampered.user.display_name.as_deref(),
             sign_count: &tampered.sign_count,
             alg: &tampered.alg,
-            private_key: &tampered.private_key,
+            key: &tampered.key,
             created: &tampered.created,
             discoverable: &tampered.discoverable,
             cred_protect: tampered.extensions.cred_protect.as_ref(),
@@ -1917,7 +1917,7 @@ mod tests {
                 user_display_name: cred.user.display_name.as_deref(),
                 sign_count: &cred.sign_count,
                 alg: &cred.alg,
-                private_key: &cred.private_key,
+                key: &cred.key,
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
