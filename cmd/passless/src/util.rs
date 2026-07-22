@@ -68,6 +68,17 @@ pub fn open_dir_fd<P: AsRef<Path>>(path: P) -> io::Result<i32> {
     let path = path.as_ref();
     let c_path = path_to_cstring(path)?;
 
+    let mut lstat_buf: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::lstat(c_path.as_ptr(), &mut lstat_buf) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (lstat_buf.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is a symbolic link",
+        ));
+    }
+
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if fd < 0 {
