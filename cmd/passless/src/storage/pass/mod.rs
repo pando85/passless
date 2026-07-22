@@ -437,7 +437,7 @@ impl PassStorageAdapter {
 
         let mut entries = Vec::new();
 
-        for (_id, path_info) in &indexes.id {
+        for path_info in indexes.id.values() {
             let path = path_info.to_path(&fido2_path);
             if !path.exists() {
                 continue;
@@ -595,17 +595,17 @@ fn extract_gpg_key_ids(path: &Path) -> Result<Vec<String>> {
     let mut key_ids: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
-        if line.contains("pubkey enc packet") {
-            if let Some(after_keyid) = line.split("keyid ").nth(1) {
-                let kid = after_keyid
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !kid.is_empty() && !key_ids.contains(&kid) {
-                    key_ids.push(kid);
-                }
+        if line.contains("pubkey enc packet")
+            && let Some(after_keyid) = line.split("keyid ").nth(1)
+        {
+            let kid = after_keyid
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !kid.is_empty() && !key_ids.contains(&kid) {
+                key_ids.push(kid);
             }
         }
     }
