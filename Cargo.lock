@@ -910,7 +910,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1363,7 +1363,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1737,10 +1737,12 @@ dependencies = [
 name = "passless-rs"
 version = "0.13.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "atty",
  "base64",
  "ciborium",
+ "cipher",
  "clap",
  "clap_complete",
  "ctrlc",
@@ -1748,11 +1750,13 @@ dependencies = [
  "env_logger",
  "git2 0.21.0",
  "hex",
+ "hkdf",
  "hmac",
  "libc",
  "log",
  "nix 0.31.3",
  "notify-rust",
+ "p256",
  "passless-config-doc",
  "passless-core",
  "passless-uhid",
@@ -2200,7 +2204,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2431,9 +2435,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33120664f41abafe64189b23d990599d95545bda8295f38f0201464ae7943731"
+checksum = "c335fb59502a3e70096fc0415042302a3b723169aafedc23c2186bfc6e53a874"
 dependencies = [
  "aes",
  "cbc",
@@ -2457,9 +2461,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-crypto"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76812960ba194c30739db32d4cbfa3e4777725d70c8102d50225e5776294b7b2"
+checksum = "d5a498d3e634cf14c47f68f19bbea3c69e549edc2ca7ac85fe367dbdf2d3dc18"
 dependencies = [
  "aes",
  "cbc",
@@ -2476,9 +2480,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "551e806dc71d51a99b129fda18ec8b7650d55ffa63e8f8352d297cbeb0d05114"
+checksum = "051bb98ecd8e825efa43adaea189fc0d80199ade4d8c8610959ce467c3c0d036"
 dependencies = [
  "cbor4ii",
  "rand",
@@ -2495,9 +2499,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-transport"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5a0afa31668553c360d8df86d8e990786faecf8e47ddb01510dbe7b93943c2"
+checksum = "0a5ad0561a252bf233b92abf999344b0feb82842431054da0207d487818f346a"
 dependencies = [
  "hex",
  "hidapi",
@@ -2615,7 +2619,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3041,7 +3045,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

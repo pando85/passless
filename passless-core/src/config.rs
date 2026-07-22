@@ -123,6 +123,12 @@ pub struct TpmBackendConfig {
     #[serde(default)]
     #[default("device:/dev/tpmrm0".to_string())]
     pub tcti: String,
+
+    /// Use portable TPM backend with TPM-resident credential keys
+    #[arg(long = "tpm-portable", env = "PASSLESS_TPM_PORTABLE")]
+    #[serde(default)]
+    #[default(false)]
+    pub portable: bool,
 }
 
 /// Security configuration
@@ -448,6 +454,7 @@ pub enum BackendConfig {
     Tpm {
         path: String,
         tcti: String,
+        portable: bool,
     },
 }
 
@@ -655,6 +662,7 @@ impl AppConfig {
             "tpm" => Ok(BackendConfig::Tpm {
                 path: self.tpm.path.clone(),
                 tcti: self.tpm.tcti.clone(),
+                portable: self.tpm.portable,
             }),
             _ => Err(crate::error::Error::Config(format!(
                 "Invalid backend_type '{}'. Must be one of: local, pass, tpm",
@@ -806,6 +814,54 @@ pub enum Commands {
 
         #[command(subcommand)]
         action: crate::AgentCommand,
+    },
+    /// TPM portable parent management
+    #[cfg(feature = "tpm")]
+    Tpm {
+        #[command(subcommand)]
+        action: TpmAction,
+    },
+}
+
+/// TPM portable parent actions
+#[cfg(feature = "tpm")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum TpmAction {
+    /// Provision the portable TPM parent from a recovery seed
+    Provision {
+        /// Generate a new random 32-byte recovery seed and print it
+        #[arg(long)]
+        generate: bool,
+        /// Read the recovery seed (hex) from this file descriptor instead of prompting
+        #[arg(long)]
+        seed_fd: Option<i32>,
+        /// TPM storage directory
+        #[arg(long = "tpm-path", env = "PASSLESS_TPM_PATH")]
+        path: Option<String>,
+        /// TPM TCTI configuration
+        #[arg(long = "tpm-tcti", env = "PASSLESS_TPM_TCTI")]
+        tcti: Option<String>,
+    },
+    /// Show provisioning status
+    Status {
+        /// TPM storage directory
+        #[arg(long = "tpm-path", env = "PASSLESS_TPM_PATH")]
+        path: Option<String>,
+        /// TPM TCTI configuration
+        #[arg(long = "tpm-tcti", env = "PASSLESS_TPM_TCTI")]
+        tcti: Option<String>,
+    },
+    /// Remove the provisioned portable parent
+    Remove {
+        /// Confirm the removal
+        #[arg(long)]
+        confirm: bool,
+        /// TPM storage directory
+        #[arg(long = "tpm-path", env = "PASSLESS_TPM_PATH")]
+        path: Option<String>,
+        /// TPM TCTI configuration
+        #[arg(long = "tpm-tcti", env = "PASSLESS_TPM_TCTI")]
+        tcti: Option<String>,
     },
 }
 

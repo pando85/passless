@@ -263,6 +263,7 @@ impl AgentStorageConfig {
             Self::Tpm { path, tcti, .. } => crate::config::BackendConfig::Tpm {
                 path: path.display().to_string(),
                 tcti: tcti.clone(),
+                portable: false,
             },
         }
     }

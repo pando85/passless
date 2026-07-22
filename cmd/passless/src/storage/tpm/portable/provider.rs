@@ -2,39 +2,34 @@
 //!
 //! Implements the `CredentialKeyProvider` trait for TPM-resident credential keys.
 
-use super::parent::{FORMAT_VERSION, PROVIDER_ID, PortableParent};
+use super::parent::{self, PortableParent};
 
 use soft_fido2::Result;
+use soft_fido2_ctap::SecBytes;
 use soft_fido2_ctap::key_provider::{
     CredentialKey, CredentialKeyError, CredentialKeyProvider, CredentialKeyProviderId,
     GeneratedCredentialKey,
 };
-use soft_fido2_ctap::SecBytes;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use log::{debug, error, info};
-use tss_esapi::attributes::ObjectAttributesBuilder;
-use tss_esapi::handles::ObjectHandle;
-use tss_esapi::interface_types::algorithm::PublicAlgorithm;
-use tss_esapi::interface_types::key_bits::EccKeyBits;
-use tss_esapi::interface_types::{algorithm::HashingAlgorithm, resource_handles::Hierarchy};
-use tss_esapi::structures::{
-    EccPoint, EccScheme, Public, PublicBuilder, PublicEccParametersBuilder,
-    SymmetricDefinitionObject,
-};
-use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
+use log::{debug, error};
 use tss_esapi::Context;
-use zeroize::Zeroizing;
+use tss_esapi::attributes::ObjectAttributesBuilder;
+use tss_esapi::interface_types::algorithm::HashingAlgorithm;
+use tss_esapi::interface_types::algorithm::PublicAlgorithm;
+use tss_esapi::interface_types::ecc::EccCurve;
+use tss_esapi::structures::{
+    EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, Public, PublicBuilder,
+    PublicEccParametersBuilder, SignatureScheme, SymmetricDefinitionObject,
+};
+use tss_esapi::traits::{Marshall, UnMarshall};
 
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256)
 const COSE_ALG_ES256: i32 = -7;
 
 /// TPM credential key provider
-///
-/// Generates and uses TPM-resident credential signing keys that can be
-/// synchronized across multiple TPMs provisioned from the same recovery seed.
 pub struct TpmCredentialKeyProvider {
     /// Portable parent manager
     parent: PortableParent,
@@ -43,24 +38,21 @@ pub struct TpmCredentialKeyProvider {
 }
 
 /// Opaque material format for TPM credential keys
-///
-/// Contains the TPM2B_PUBLIC and TPM2B_PRIVATE blobs for the credential signing key.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TpmKeyMaterial {
-    /// TPM public area (TPM2B_PUBLIC serialized)
+    /// TPMT_PUBLIC marshalled (no size prefix)
     public_blob: Vec<u8>,
-    /// TPM private area (TPM2B_PRIVATE serialized)
+    /// TPM2B_PRIVATE inner content (no outer size prefix)
     private_blob: Vec<u8>,
-    /// COSE-encoded public key (for quick access without loading)
+    /// Uncompressed public key (0x04 || x || y)
     cose_public_key: Vec<u8>,
 }
 
 impl TpmCredentialKeyProvider {
     /// Create a new TPM credential key provider
     pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
-        let parent = PortableParent::new(storage_dir, tcti)?;
+        let parent = PortableParent::new(storage_dir.clone(), tcti.clone())?;
 
-        // Get a fresh context for key operations
         let tcti_conf = if let Some(ref tcti_str) = tcti {
             std::str::FromStr::from_str(tcti_str).map_err(|e| {
                 error!("Failed to parse TCTI configuration: {}", e);
@@ -90,10 +82,7 @@ impl TpmCredentialKeyProvider {
     fn generate_es256_key(&self) -> Result<GeneratedCredentialKey> {
         debug!("Generating ES256 credential key in TPM");
 
-        // Load parent metadata
         let metadata = self.parent.load_metadata()?;
-
-        // Verify parent is still valid
         self.parent.verify_parent(&metadata)?;
 
         let mut context = self.context.lock().map_err(|e| {
@@ -101,13 +90,19 @@ impl TpmCredentialKeyProvider {
             soft_fido2::Error::Other
         })?;
 
-        // Get the persistent parent handle
-        let parent_handle = ObjectHandle::from(metadata.persistent_handle);
+        let parent_tpm_handle =
+            tss_esapi::handles::PersistentTpmHandle::new(metadata.persistent_handle)
+                .map_err(|_| soft_fido2::Error::Other)?;
+        let parent_obj = context
+            .tr_from_tpm_public(parent_tpm_handle.into())
+            .map_err(|e| {
+                error!("Failed to register parent handle: {}", e);
+                soft_fido2::Error::Other
+            })?;
+        let parent_handle = tss_esapi::handles::KeyHandle::from(parent_obj);
 
-        // Build the public template for the credential signing key
-        let key_public = self.build_signing_key_public()?;
+        let key_public = build_signing_key_public()?;
 
-        // Create the signing key under the portable parent
         let create_result = context
             .execute_with_nullauth_session(|ctx| {
                 ctx.create(parent_handle, key_public, None, None, None, None)
@@ -117,27 +112,18 @@ impl TpmCredentialKeyProvider {
                 soft_fido2::Error::Other
             })?;
 
-        // Extract the public and private blobs
-        let private_tpm: TPM2B_PRIVATE = create_result.out_private.into();
-        let private_bytes = private_tpm.buffer[..private_tpm.size as usize].to_vec();
-
-        let public_tpm: TPM2B_PUBLIC = create_result.out_public.try_into().map_err(|e| {
-            error!("Failed to convert public to TPM2B: {:?}", e);
+        let public_blob = create_result.out_public.marshall().map_err(|e| {
+            error!("Failed to marshall signing key public: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        let public_bytes = unsafe {
-            let ptr = &public_tpm as *const TPM2B_PUBLIC as *const u8;
-            std::slice::from_raw_parts(ptr, std::mem::size_of::<TPM2B_PUBLIC>()).to_vec()
-        };
+        let private_blob = create_result.out_private.value().to_vec();
 
-        // Extract the public key point for COSE encoding
-        let cose_public_key = self.extract_cose_public_key(&create_result.out_public)?;
+        let cose_public_key = extract_cose_public_key(&create_result.out_public)?;
 
-        // Build the opaque material
         let material = TpmKeyMaterial {
-            public_blob: public_bytes,
-            private_blob: private_bytes,
+            public_blob,
+            private_blob,
             cose_public_key: cose_public_key.clone(),
         };
 
@@ -147,12 +133,12 @@ impl TpmCredentialKeyProvider {
         })?;
 
         let key = CredentialKey::new(
-            CredentialKeyProviderId::new(PROVIDER_ID),
-            FORMAT_VERSION,
+            CredentialKeyProviderId::new(parent::PROVIDER_ID),
+            parent::FORMAT_VERSION,
             SecBytes::from_slice(&material_bytes),
         );
 
-        info!("Generated ES256 credential key in TPM");
+        debug!("Generated ES256 credential key in TPM");
 
         Ok(GeneratedCredentialKey {
             key,
@@ -160,237 +146,114 @@ impl TpmCredentialKeyProvider {
         })
     }
 
-    /// Build the public template for a credential signing key
-    fn build_signing_key_public(&self) -> Result<Public> {
-        // Signing key attributes: sensitiveDataOrigin | sign | userWithAuth
-        // fixedTPM and fixedParent should be set to prevent re-parenting
-        let object_attributes = ObjectAttributesBuilder::new()
-            .with_fixed_tpm(true)
-            .with_fixed_parent(true)
-            .with_sensitive_data_origin(true)
-            .with_user_with_auth(true)
-            .with_sign_encrypt(true)
-            .with_restricted(false)
-            .build()
-            .map_err(|e| {
-                error!("Failed to build signing key attributes: {}", e);
-                soft_fido2::Error::Other
-            })?;
-
-        let ecc_params = PublicEccParametersBuilder::new()
-            .with_symmetric(SymmetricDefinitionObject::Null)
-            .with_scheme(EccScheme::EcDsa(
-                tss_esapi::structures::SignatureScheme::Sha256,
-            ))
-            .with_curve(tss_esapi::interface_types::ecc::EccCurve::NistP256)
-            .with_is_signing_key(true)
-            .with_is_decryption_key(false)
-            .with_restricted(false)
-            .build()
-            .map_err(|e| {
-                error!("Failed to build signing key ECC parameters: {}", e);
-                soft_fido2::Error::Other
-            })?;
-
-        PublicBuilder::new()
-            .with_public_algorithm(PublicAlgorithm::Ecc)
-            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-            .with_object_attributes(object_attributes)
-            .with_ecc_parameters(ecc_params)
-            .with_ecc_unique_identifier(EccPoint::default())
-            .build()
-            .map_err(|e| {
-                error!("Failed to build signing key public: {}", e);
-                soft_fido2::Error::Other
-            })
-    }
-
-    /// Extract the COSE-encoded public key from a TPM public area
-    fn extract_cose_public_key(&self, public: &Public) -> Result<Vec<u8>> {
-        // Extract the ECC point from the public area
-        // This is a simplified implementation - needs proper COSE_Key encoding
-        match public {
-            Public::Ecc {
-                parameters: _,
-                unique,
-            } => {
-                // COSE_Key for ECDSA P-256:
-                // 1: 2 (kty: EC2)
-                // -1: 1 (crv: P-256)
-                // -2: x-coordinate
-                // -3: y-coordinate
-                let mut cose_key = Vec::new();
-
-                // This is a placeholder - proper COSE encoding needed
-                // For now, return uncompressed point format (0x04 || x || y)
-                let mut uncompressed = vec![0x04];
-                uncompressed.extend_from_slice(&unique.x.buffer[..unique.x.size as usize]);
-                uncompressed.extend_from_slice(&unique.y.buffer[..unique.y.size as usize]);
-
-                Ok(uncompressed)
-            }
-            _ => {
-                error!("Expected ECC public key");
-                Err(soft_fido2::Error::Other)
-            }
-        }
-    }
-
     /// Sign a message with a TPM credential key
     fn sign_with_tpm_key(
         &self,
         key_material: &[u8],
         message: &[u8],
-    ) -> Result<Vec<u8>, CredentialKeyError> {
+    ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
         debug!("Signing message with TPM credential key");
 
-        // Deserialize the key material
         let material: TpmKeyMaterial = serde_json::from_slice(key_material).map_err(|e| {
             error!("Failed to deserialize key material: {}", e);
             CredentialKeyError::InvalidKeyMaterial
         })?;
+
+        let public = Public::unmarshall(&material.public_blob).map_err(|e| {
+            error!("Failed to unmarshall public: {}", e);
+            CredentialKeyError::InvalidKeyMaterial
+        })?;
+
+        validate_signing_template(&public)?;
 
         let mut context = self.context.lock().map_err(|e| {
             error!("Failed to lock TPM context: {}", e);
             CredentialKeyError::TransientFailure("Failed to lock TPM context".to_string())
         })?;
 
-        // Load parent metadata
         let metadata = self.parent.load_metadata().map_err(|e| {
             error!("Failed to load parent metadata: {}", e);
             CredentialKeyError::TransientFailure("Failed to load parent".to_string())
         })?;
 
-        // Get the persistent parent handle
-        let parent_handle = ObjectHandle::from(metadata.persistent_handle);
+        let parent_tpm_handle = tss_esapi::handles::PersistentTpmHandle::new(
+            metadata.persistent_handle,
+        )
+        .map_err(|_| CredentialKeyError::TransientFailure("Invalid parent handle".to_string()))?;
+        let parent_obj = context
+            .tr_from_tpm_public(parent_tpm_handle.into())
+            .map_err(|e| {
+                error!("Failed to register parent handle: {}", e);
+                CredentialKeyError::TransientFailure("Failed to register parent handle".to_string())
+            })?;
+        let parent_handle = tss_esapi::handles::KeyHandle::from(parent_obj);
 
-        // Deserialize the private and public blobs
-        let private_blob = TPM2B_PRIVATE {
-            size: material.private_blob.len() as u16,
-            buffer: {
-                let mut buf = [0u8; 256];
-                buf[..material.private_blob.len()].copy_from_slice(&material.private_blob);
-                buf
-            },
-        };
+        let private = tss_esapi::structures::Private::try_from(material.private_blob.clone())
+            .map_err(|e| {
+                error!("Failed to create Private: {}", e);
+                CredentialKeyError::InvalidKeyMaterial
+            })?;
 
-        let public_blob: TPM2B_PUBLIC =
-            unsafe { std::ptr::read(material.public_blob.as_ptr() as *const TPM2B_PUBLIC) };
-
-        // Load the signing key under the portable parent
         let loaded_key = context
-            .execute_with_nullauth_session(|ctx| {
-                ctx.load(parent_handle, private_blob.into(), public_blob.into())
-            })
+            .execute_with_nullauth_session(|ctx| ctx.load(parent_handle, private, public.clone()))
             .map_err(|e| {
                 error!("Failed to load signing key: {}", e);
                 CredentialKeyError::InvalidKeyMaterial
             })?;
 
-        // Sign the message, ensuring we flush the key even on failure
-        let signature = match context.execute_with_nullauth_session(|ctx| {
-            ctx.sign(
-                loaded_key.into(),
-                message,
-                tss_esapi::structures::SignatureScheme::EcDsa(
-                    tss_esapi::structures::HashScheme::Sha256,
-                ),
-                tss_esapi::structures::HashValue::from_sha256(&{
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(message);
-                    hasher.finalize().to_vec()
-                }),
-            )
-        }) {
-            Ok(sig) => sig,
-            Err(e) => {
-                // Flush the key before returning error
-                let _ = context.flush_context(loaded_key.into());
-                error!("Failed to sign with TPM: {}", e);
-                return Err(CredentialKeyError::TransientFailure(
-                    "TPM signing failed".to_string(),
-                ));
-            }
-        };
+        let result = (|| -> std::result::Result<Vec<u8>, CredentialKeyError> {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(message);
 
-        // Convert TPM signature to DER-encoded ECDSA signature
-        let der_signature = self.tpm_signature_to_der(&signature)?;
+            let digest_tpm =
+                tss_esapi::structures::Digest::try_from(digest.as_slice()).map_err(|e| {
+                    error!("Failed to create Digest: {}", e);
+                    CredentialKeyError::TransientFailure("Failed to create digest".to_string())
+                })?;
 
-        Ok(der_signature)
-    }
+            let null_ticket = create_null_hashcheck_ticket().map_err(|e| {
+                error!("Failed to create null ticket: {}", e);
+                CredentialKeyError::TransientFailure("Failed to create ticket".to_string())
+            })?;
 
-    /// Convert a TPM signature to DER-encoded ECDSA signature
-    fn tpm_signature_to_der(
-        &self,
-        signature: &tss_esapi::structures::Signature,
-    ) -> Result<Vec<u8>, CredentialKeyError> {
-        match signature {
-            tss_esapi::structures::Signature::EcDsa(ecdsa_sig) => {
-                // Extract r and s values
-                let r = &ecdsa_sig.signature_r.buffer[..ecdsa_sig.signature_r.size as usize];
-                let s = &ecdsa_sig.signature_s.buffer[..ecdsa_sig.signature_s.size as usize];
+            let signature = context
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.sign(
+                        loaded_key,
+                        digest_tpm,
+                        SignatureScheme::EcDsa {
+                            hash_scheme: HashScheme::new(HashingAlgorithm::Sha256),
+                        },
+                        null_ticket,
+                    )
+                })
+                .map_err(|e| {
+                    error!("Failed to sign with TPM: {}", e);
+                    CredentialKeyError::TransientFailure("TPM signing failed".to_string())
+                })?;
 
-                // DER encode: SEQUENCE { INTEGER r, INTEGER s }
-                let mut der = Vec::new();
+            signature_to_der(&signature)
+        })();
 
-                // Encode r
-                let r_der = Self::encode_der_integer(r);
-                // Encode s
-                let s_der = Self::encode_der_integer(s);
+        let _ = context.flush_context(loaded_key.into());
 
-                // SEQUENCE header
-                let seq_len = r_der.len() + s_der.len();
-                der.push(0x30); // SEQUENCE tag
-                der.push(seq_len as u8);
-                der.extend_from_slice(&r_der);
-                der.extend_from_slice(&s_der);
-
-                Ok(der)
-            }
-            _ => {
-                error!("Expected ECDSA signature");
-                Err(CredentialKeyError::TransientFailure(
-                    "Invalid signature type".to_string(),
-                ))
-            }
-        }
-    }
-
-    /// Encode an integer as DER INTEGER
-    fn encode_der_integer(value: &[u8]) -> Vec<u8> {
-        let mut der = Vec::new();
-        der.push(0x02); // INTEGER tag
-
-        // Remove leading zeros but keep one if high bit is set
-        let mut start = 0;
-        while start < value.len() - 1 && value[start] == 0 {
-            start += 1;
-        }
-
-        let needs_padding = value[start] & 0x80 != 0;
-        let len = value.len() - start + if needs_padding { 1 } else { 0 };
-
-        der.push(len as u8);
-        if needs_padding {
-            der.push(0x00);
-        }
-        der.extend_from_slice(&value[start..]);
-
-        der
+        result
     }
 }
 
 impl CredentialKeyProvider for TpmCredentialKeyProvider {
     fn provider_id(&self) -> CredentialKeyProviderId {
-        CredentialKeyProviderId::new(PROVIDER_ID)
+        CredentialKeyProviderId::new(parent::PROVIDER_ID)
     }
 
     fn supports_algorithm(&self, algorithm: i32) -> bool {
         algorithm == COSE_ALG_ES256
     }
 
-    fn generate(&self, algorithm: i32) -> Result<GeneratedCredentialKey, CredentialKeyError> {
+    fn generate(
+        &self,
+        algorithm: i32,
+    ) -> core::result::Result<GeneratedCredentialKey, CredentialKeyError> {
         if !self.supports_algorithm(algorithm) {
             return Err(CredentialKeyError::UnsupportedAlgorithm);
         }
@@ -416,12 +279,12 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
         key: &CredentialKey,
         algorithm: i32,
         message: &[u8],
-    ) -> Result<Vec<u8>, CredentialKeyError> {
-        if key.provider.as_bytes() != PROVIDER_ID {
+    ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
+        if key.provider.as_bytes() != parent::PROVIDER_ID {
             return Err(CredentialKeyError::UnsupportedProvider);
         }
 
-        if key.format_version != FORMAT_VERSION {
+        if key.format_version != parent::FORMAT_VERSION {
             return Err(CredentialKeyError::UnsupportedFormatVersion);
         }
 
@@ -439,9 +302,194 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
         self.sign_with_tpm_key(key.material.as_slice(), message)
     }
 
-    fn delete(&self, _key: &CredentialKey) -> Result<(), CredentialKeyError> {
-        // TPM keys are deleted when the credential file is deleted
-        // No separate cleanup needed
+    fn delete(&self, _key: &CredentialKey) -> core::result::Result<(), CredentialKeyError> {
         Ok(())
     }
+}
+
+/// Build the public template for a credential signing key
+fn build_signing_key_public() -> Result<Public> {
+    let object_attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(false)
+        .with_fixed_parent(false)
+        .with_sensitive_data_origin(true)
+        .with_user_with_auth(true)
+        .with_sign_encrypt(true)
+        .with_restricted(false)
+        .build()
+        .map_err(|e| {
+            error!("Failed to build signing key attributes: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+    let ecc_params = PublicEccParametersBuilder::new()
+        .with_symmetric(SymmetricDefinitionObject::Null)
+        .with_ecc_scheme(EccScheme::EcDsa(HashScheme::new(HashingAlgorithm::Sha256)))
+        .with_curve(EccCurve::NistP256)
+        .with_is_signing_key(true)
+        .with_is_decryption_key(false)
+        .with_restricted(false)
+        .with_key_derivation_function_scheme(KeyDerivationFunctionScheme::Null)
+        .build()
+        .map_err(|e| {
+            error!("Failed to build signing key ECC parameters: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::Ecc)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(object_attributes)
+        .with_ecc_parameters(ecc_params)
+        .with_ecc_unique_identifier(EccPoint::default())
+        .build()
+        .map_err(|e| {
+            error!("Failed to build signing key public: {}", e);
+            soft_fido2::Error::Other
+        })
+}
+
+/// Extract the COSE-encoded public key from a TPM public area
+fn extract_cose_public_key(public: &Public) -> Result<Vec<u8>> {
+    match public {
+        Public::Ecc { unique, .. } => {
+            let mut uncompressed = vec![0x04];
+            let x = unique.x().value();
+            let y = unique.y().value();
+
+            let mut x_padded = vec![0u8; 32];
+            let x_start = 32 - x.len();
+            x_padded[x_start..].copy_from_slice(x);
+
+            let mut y_padded = vec![0u8; 32];
+            let y_start = 32 - y.len();
+            y_padded[y_start..].copy_from_slice(y);
+
+            uncompressed.extend_from_slice(&x_padded);
+            uncompressed.extend_from_slice(&y_padded);
+
+            Ok(uncompressed)
+        }
+        _ => {
+            error!("Expected ECC public key");
+            Err(soft_fido2::Error::Other)
+        }
+    }
+}
+
+/// Validate that a public template is suitable for signing
+fn validate_signing_template(public: &Public) -> core::result::Result<(), CredentialKeyError> {
+    match public {
+        Public::Ecc { parameters, .. } => {
+            if public.name_hashing_algorithm() != HashingAlgorithm::Sha256 {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            let attrs = public.object_attributes();
+            if !attrs.sign_encrypt() {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if attrs.restricted() {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if attrs.fixed_tpm() {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if attrs.fixed_parent() {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if !attrs.sensitive_data_origin() {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if !attrs.user_with_auth() {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if parameters.ecc_curve() != EccCurve::NistP256 {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            match parameters.ecc_scheme() {
+                EccScheme::EcDsa(hash_scheme) => {
+                    if hash_scheme.hashing_algorithm() != HashingAlgorithm::Sha256 {
+                        return Err(CredentialKeyError::InvalidKeyMaterial);
+                    }
+                }
+                _ => return Err(CredentialKeyError::InvalidKeyMaterial),
+            }
+            if parameters.symmetric_definition_object() != SymmetricDefinitionObject::Null {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            if parameters.key_derivation_function_scheme() != KeyDerivationFunctionScheme::Null {
+                return Err(CredentialKeyError::InvalidKeyMaterial);
+            }
+            Ok(())
+        }
+        _ => Err(CredentialKeyError::InvalidKeyMaterial),
+    }
+}
+
+/// Create a NULL HashcheckTicket
+fn create_null_hashcheck_ticket() -> Result<tss_esapi::structures::HashcheckTicket> {
+    use tss_esapi::constants::tss::{TPM2_RH_NULL, TPM2_ST_HASHCHECK};
+    use tss_esapi::tss2_esys::TPMT_TK_HASHCHECK;
+
+    let ticket = TPMT_TK_HASHCHECK {
+        tag: TPM2_ST_HASHCHECK,
+        hierarchy: TPM2_RH_NULL,
+        digest: Default::default(),
+    };
+    tss_esapi::structures::HashcheckTicket::try_from(ticket).map_err(|e| {
+        error!("Failed to create null hashcheck ticket: {}", e);
+        soft_fido2::Error::Other
+    })
+}
+
+/// Convert a TPM ECDSA signature to DER format
+fn signature_to_der(
+    signature: &tss_esapi::structures::Signature,
+) -> std::result::Result<Vec<u8>, CredentialKeyError> {
+    match signature {
+        tss_esapi::structures::Signature::EcDsa(ecdsa_sig) => {
+            let r = ecdsa_sig.signature_r().value();
+            let s = ecdsa_sig.signature_s().value();
+
+            let r_der = encode_der_integer(r);
+            let s_der = encode_der_integer(s);
+
+            let mut der = Vec::new();
+            let seq_len = r_der.len() + s_der.len();
+            der.push(0x30);
+            der.push(seq_len as u8);
+            der.extend_from_slice(&r_der);
+            der.extend_from_slice(&s_der);
+
+            Ok(der)
+        }
+        _ => {
+            error!("Expected ECDSA signature");
+            Err(CredentialKeyError::TransientFailure(
+                "Invalid signature type".to_string(),
+            ))
+        }
+    }
+}
+
+/// Encode an integer as DER INTEGER
+fn encode_der_integer(value: &[u8]) -> Vec<u8> {
+    let mut der = Vec::new();
+    der.push(0x02);
+
+    let mut start = 0;
+    while start < value.len() - 1 && value[start] == 0 {
+        start += 1;
+    }
+
+    let needs_padding = value[start] & 0x80 != 0;
+    let len = value.len() - start + if needs_padding { 1 } else { 0 };
+
+    der.push(len as u8);
+    if needs_padding {
+        der.push(0x00);
+    }
+    der.extend_from_slice(&value[start..]);
+
+    der
 }

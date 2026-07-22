@@ -246,7 +246,7 @@ pub fn create_storage_bundle_with_options(
             ref gpg_backend,
             ref pin_path,
         } => {
-            let gpg = GpgBackend::from_str(gpg_backend).map_err(|e| {
+            let gpg = gpg_backend.parse::<GpgBackend>().map_err(|e| {
                 Error::Storage(format!("invalid GPG backend '{}': {}", gpg_backend, e))
             })?;
 

@@ -1,6 +1,7 @@
 //! TPM (Trusted Platform Module) storage adapter
 
 pub mod init;
+pub mod portable;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
@@ -34,6 +35,7 @@ use tss_esapi::structures::{KeyedHashScheme, Public, PublicBuilder, PublicKeyedH
 use tss_esapi::structures::{
     PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme, SymmetricDefinitionObject,
 };
+use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
 use tss_esapi::{Context, Tcti};
 use zeroize::Zeroizing;
@@ -50,6 +52,7 @@ pub struct TpmStorageAdapter {
     iteration_index: usize,
     iteration_entries: Vec<PathBuf>,
     context: Mutex<Context>,
+    portable: bool,
 }
 
 /// Represents a sealed credential blob stored on disk
@@ -146,8 +149,36 @@ impl TpmStorageAdapter {
             iteration_index: 0,
             iteration_entries: Vec::new(),
             context: Mutex::new(context),
+            portable: false,
         };
 
+        Ok(adapter)
+    }
+
+    /// Create a new TPM storage adapter in portable mode.
+    ///
+    /// In portable mode, the metadata AES key is sealed under the portable
+    /// parent (persistent ECC P-256 storage key at handle 0x81000001),
+    /// making sealed records loadable on any TPM provisioned from the same
+    /// recovery seed.
+    pub fn new_portable(
+        storage_dir: PathBuf,
+        tcti: Option<String>,
+        allow_create_without_prompt: bool,
+    ) -> Result<Self> {
+        let metadata_path = storage_dir.join("portable_parent.json");
+        if !metadata_path.exists() {
+            log::error!(
+                "TPM portable parent is not provisioned at {}",
+                storage_dir.display()
+            );
+            log::error!("Run: passless tpm provision");
+            return Err(soft_fido2::Error::Other);
+        }
+
+        let mut adapter = Self::new_with_options(storage_dir, tcti, allow_create_without_prompt)?;
+        adapter.portable = true;
+        info!("TPM storage adapter initialized in portable mode");
         Ok(adapter)
     }
 
@@ -207,12 +238,66 @@ impl TpmStorageAdapter {
         Ok(primary_key_result.key_handle)
     }
 
+    /// Get the parent key handle for sealing operations.
+    ///
+    /// In portable mode, returns the persistent portable parent handle.
+    /// In legacy mode, creates and returns a transient primary key.
+    fn sealing_parent_handle(
+        &self,
+        context: &mut Context,
+    ) -> Result<tss_esapi::handles::KeyHandle> {
+        if self.portable {
+            let metadata_path = self.storage_dir.join("portable_parent.json");
+            let metadata_bytes = std::fs::read(&metadata_path).map_err(|e| {
+                log::error!("Failed to read portable parent metadata: {}", e);
+                soft_fido2::Error::Other
+            })?;
+            let metadata: portable::parent::PortableParentMetadata =
+                serde_json::from_slice(&metadata_bytes).map_err(|e| {
+                    log::error!("Failed to parse portable parent metadata: {}", e);
+                    soft_fido2::Error::Other
+                })?;
+
+            let persistent_tpm_handle = tss_esapi::handles::PersistentTpmHandle::new(
+                metadata.persistent_handle,
+            )
+            .map_err(|e| {
+                log::error!("Failed to create persistent TPM handle: {}", e);
+                soft_fido2::Error::Other
+            })?;
+
+            // Clear sessions before registering the persistent handle
+            // The HMAC session we use for encryption interferes with tr_from_tpm_public
+            let saved_sessions = context.sessions();
+            context.set_sessions((None, None, None));
+
+            let persistent_handle = context
+                .tr_from_tpm_public(persistent_tpm_handle.into())
+                .map_err(|e| {
+                    log::error!(
+                        "Failed to register persistent handle in ESYS context: {}",
+                        e
+                    );
+                    soft_fido2::Error::Other
+                })?;
+
+            // Restore sessions
+            context.set_sessions(saved_sessions);
+
+            Ok(tss_esapi::handles::KeyHandle::from(persistent_handle))
+        } else {
+            self.create_primary_key(context)
+        }
+    }
+
     /// Create a keyed hash object public structure for sealing data
     fn create_sealing_public(&self) -> Result<Public> {
-        // For a sealing object, we need minimal attributes
+        let fixed_tpm = !self.portable;
+        let fixed_parent = !self.portable;
+
         let object_attributes = tss_esapi::attributes::ObjectAttributesBuilder::new()
-            .with_fixed_tpm(true)
-            .with_fixed_parent(true)
+            .with_fixed_tpm(fixed_tpm)
+            .with_fixed_parent(fixed_parent)
             .with_user_with_auth(true)
             .build()
             .map_err(|e| {
@@ -241,7 +326,7 @@ impl TpmStorageAdapter {
     ///
     /// Uses AES-256-GCM to encrypt the data, then seals only the encryption key with TPM.
     /// This avoids TPM size limits on sealed data (typically 128 bytes).
-    fn seal_data(&self, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn seal_data(&self, data: &[u8]) -> Result<Vec<u8>> {
         debug!("Sealing {} bytes with TPM (hybrid encryption)", data.len());
 
         // Generate a random 256-bit AES key
@@ -276,8 +361,8 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        // Create primary key
-        let primary_key = self.create_primary_key(&mut context)?;
+        // Get the sealing parent handle
+        let parent_key = self.sealing_parent_handle(&mut context)?;
 
         // Create sealing object public
         let sealing_pub = self.create_sealing_public()?;
@@ -291,7 +376,7 @@ impl TpmStorageAdapter {
 
         let create_result = context
             .create(
-                primary_key,
+                parent_key,
                 sealing_pub,
                 None,
                 Some(sensitive_data),
@@ -303,27 +388,40 @@ impl TpmStorageAdapter {
                 soft_fido2::Error::Other
             })?;
 
-        // Flush the primary key (we'll recreate it when unsealing)
-        context.flush_context(primary_key.into()).map_err(|e| {
-            log::error!("Failed to flush primary key: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        // Flush the parent key handle
+        // For legacy (transient primary): releases the key from TPM memory
+        // For portable (persistent): persistent handles cannot be flushed;
+        // the ESYS_TR reference is automatically cleaned up when the context is dropped
+        if !self.portable {
+            context.flush_context(parent_key.into()).map_err(|e| {
+                log::error!("Failed to flush parent key: {}", e);
+                soft_fido2::Error::Other
+            })?;
+        }
 
         let private_tpm: TPM2B_PRIVATE = create_result.out_private.into();
         // Store just the actual data, not the whole buffer
         let private_bytes = private_tpm.buffer[..private_tpm.size as usize].to_vec();
 
-        #[allow(clippy::unnecessary_fallible_conversions)]
-        let public_tpm: TPM2B_PUBLIC = create_result.out_public.try_into().map_err(|e| {
-            log::error!("Failed to convert public to TPM2B: {:?}", e);
-            soft_fido2::Error::Other
-        })?;
+        // Store the public area
+        let public_bytes = if self.portable {
+            // Portable mode: use proper marshaling (no unsafe)
+            create_result.out_public.marshall().map_err(|e| {
+                log::error!("Failed to marshall public area: {}", e);
+                soft_fido2::Error::Other
+            })?
+        } else {
+            // Legacy mode: use the existing unsafe raw dump for backward compatibility
+            #[allow(clippy::unnecessary_fallible_conversions)]
+            let public_tpm: TPM2B_PUBLIC = create_result.out_public.try_into().map_err(|e| {
+                log::error!("Failed to convert public to TPM2B: {:?}", e);
+                soft_fido2::Error::Other
+            })?;
 
-        // For Public, we need to store the entire TPM2B_PUBLIC structure as bytes
-        // because it has a complex nested structure
-        let public_bytes = unsafe {
-            let ptr = &public_tpm as *const TPM2B_PUBLIC as *const u8;
-            std::slice::from_raw_parts(ptr, std::mem::size_of::<TPM2B_PUBLIC>()).to_vec()
+            unsafe {
+                let ptr = &public_tpm as *const TPM2B_PUBLIC as *const u8;
+                std::slice::from_raw_parts(ptr, std::mem::size_of::<TPM2B_PUBLIC>()).to_vec()
+            }
         };
 
         let sealed_blob = SealedBlob {
@@ -346,7 +444,7 @@ impl TpmStorageAdapter {
     /// Unseal data using TPM with hybrid decryption
     ///
     /// Unseals the AES key from TPM, then decrypts the data with AES-GCM.
-    fn unseal_data(&self, sealed_data: &[u8]) -> Result<Vec<u8>> {
+    pub fn unseal_data(&self, sealed_data: &[u8]) -> Result<Vec<u8>> {
         debug!("Unsealing data with TPM (hybrid decryption)");
 
         let mut context = self.context.lock().map_err(|e| {
@@ -359,7 +457,7 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        let primary_key = self.create_primary_key(&mut context)?;
+        let parent_key = self.sealing_parent_handle(&mut context)?;
 
         let mut private_tpm = TPM2B_PRIVATE {
             size: sealed_blob.tpm_private.len() as u16,
@@ -368,33 +466,41 @@ impl TpmStorageAdapter {
         private_tpm.buffer[..sealed_blob.tpm_private.len()]
             .copy_from_slice(&sealed_blob.tpm_private);
 
-        let public_tpm: TPM2B_PUBLIC = unsafe {
-            let mut public_struct: TPM2B_PUBLIC = std::mem::zeroed();
-            let ptr = &mut public_struct as *mut TPM2B_PUBLIC as *mut u8;
-            std::ptr::copy_nonoverlapping(
-                sealed_blob.tpm_public.as_ptr(),
-                ptr,
-                std::cmp::min(
-                    sealed_blob.tpm_public.len(),
-                    std::mem::size_of::<TPM2B_PUBLIC>(),
-                ),
-            );
-            public_struct
-        };
-
-        // Convert to tss-esapi types
         let private = tss_esapi::structures::Private::try_from(private_tpm).map_err(|e| {
             log::error!("Failed to convert TPM2B_PRIVATE to Private: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        let public = tss_esapi::structures::Public::try_from(public_tpm).map_err(|e| {
-            log::error!("Failed to convert TPM2B_PUBLIC to Public: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let public = if self.portable {
+            // Portable mode: use proper unmarshaling (no unsafe)
+            Public::unmarshall(&sealed_blob.tpm_public).map_err(|e| {
+                log::error!("Failed to unmarshall public area: {}", e);
+                soft_fido2::Error::Other
+            })?
+        } else {
+            // Legacy mode: use the existing unsafe reconstruction for backward compatibility
+            let public_tpm: TPM2B_PUBLIC = unsafe {
+                let mut public_struct: TPM2B_PUBLIC = std::mem::zeroed();
+                let ptr = &mut public_struct as *mut TPM2B_PUBLIC as *mut u8;
+                std::ptr::copy_nonoverlapping(
+                    sealed_blob.tpm_public.as_ptr(),
+                    ptr,
+                    std::cmp::min(
+                        sealed_blob.tpm_public.len(),
+                        std::mem::size_of::<TPM2B_PUBLIC>(),
+                    ),
+                );
+                public_struct
+            };
+
+            tss_esapi::structures::Public::try_from(public_tpm).map_err(|e| {
+                log::error!("Failed to convert TPM2B_PUBLIC to Public: {}", e);
+                soft_fido2::Error::Other
+            })?
+        };
 
         // Load the sealed object
-        let sealed_handle = context.load(primary_key, private, public).map_err(|e| {
+        let sealed_handle = context.load(parent_key, private, public).map_err(|e| {
             log::error!("Failed to load sealed object: {}", e);
             soft_fido2::Error::Other
         })?;
@@ -411,10 +517,13 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        context.flush_context(primary_key.into()).map_err(|e| {
-            log::error!("Failed to flush primary key: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        // Flush parent key (only for legacy transient primary)
+        if !self.portable {
+            context.flush_context(parent_key.into()).map_err(|e| {
+                log::error!("Failed to flush parent key: {}", e);
+                soft_fido2::Error::Other
+            })?;
+        }
 
         // Drop the mutex before AES decryption
         drop(context);
