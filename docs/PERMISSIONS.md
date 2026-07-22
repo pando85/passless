@@ -410,10 +410,9 @@ Error: another Passless instance is already using backend state:
 Passless enforces single-instance ownership per backend state directory. A second daemon targeting
 the same state is rejected immediately to prevent concurrent read/modify/write corruption.
 
-### Built-in UV stopped working (retry exhaustion)
+### Multiple instances or stale lock files
 
-If authentication silently fails with a notification timeout instead of prompting for UV,
-built-in UV retries may be exhausted.
+If you see errors about another instance running or the service fails to start:
 
 **Diagnosis:**
 
