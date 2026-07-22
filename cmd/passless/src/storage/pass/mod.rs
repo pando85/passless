@@ -292,6 +292,7 @@ impl PassStorageAdapter {
     }
 
     /// Parse GPG key IDs from .gpg-id file content.
+    #[allow(dead_code)]
     fn parse_gpg_id_content(
         &self,
         content: &str,
@@ -428,6 +429,7 @@ impl PassStorageAdapter {
     /// differ from the effective `.gpg-id` policy.
     ///
     /// Requires the `gpg` binary for packet inspection.
+    #[allow(dead_code)]
     pub fn audit_passkey_recipients(&self) -> Result<Vec<AuditEntry>> {
         let fido2_path = self.get_fido2_path();
         let indexes = load_credential_paths(&fido2_path, "gpg")
@@ -492,6 +494,7 @@ impl PassStorageAdapter {
     /// 3. Re-encrypts to a temporary file.
     /// 4. Atomically renames the temporary over the original.
     /// 5. Commits the change via the password-store Git integration.
+    #[allow(dead_code)]
     pub fn reencrypt_passkey_file(&mut self, path: &Path) -> Result<()> {
         if !path.exists() {
             return Err(Error::Storage(format!(
@@ -565,6 +568,7 @@ impl PassStorageAdapter {
 
 /// Extract GPG public-key-encrypted session key IDs from an OpenPGP file by
 /// running `gpg --list-packets --verbose`.
+#[allow(dead_code)]
 fn extract_gpg_key_ids(path: &Path) -> Result<Vec<String>> {
     let output = std::process::Command::new("gpg")
         .args(["--batch", "--no-tty", "--list-packets", "--verbose"])
@@ -610,6 +614,7 @@ fn extract_gpg_key_ids(path: &Path) -> Result<Vec<String>> {
 }
 
 /// Result of comparing expected vs actual recipients for a single credential file.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecipientMatch {
     /// The credential's OpenPGP recipients match the .gpg-id policy.
@@ -623,6 +628,7 @@ pub enum RecipientMatch {
 }
 
 /// An audit entry describing the recipient match status for one credential file.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     /// Path to the credential file.
@@ -761,7 +767,10 @@ mod tests {
         let content = "DEADBEEF\n";
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
         assert!(result.is_err(), "short 8-char key ID should be rejected");
-        let err = result.unwrap_err().to_string();
+        let err = match result {
+            Err(e) => e.to_string(),
+            _ => unreachable!(),
+        };
         assert!(
             err.contains("8-character"),
             "error should mention 8-char: {}",
@@ -856,8 +865,8 @@ mod tests {
         let target = fido2_dir.join("example.com/cred.gpg");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
 
-        write_gpg_id(&root, "ROOT00000000000000000000000000000000001\n");
-        write_gpg_id(&fido2_dir, "FIDO20000000000000000000000000000000002\n");
+        write_gpg_id(&root, "0000000000000000000000000000000000000001\n");
+        write_gpg_id(&fido2_dir, "0000000000000000000000000000000000000002\n");
 
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
@@ -877,9 +886,9 @@ mod tests {
         let target = rp_dir.join("cred.gpg");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
 
-        write_gpg_id(&root, "ROOT00000000000000000000000000000000001\n");
-        write_gpg_id(&fido2_dir, "FIDO20000000000000000000000000000000002\n");
-        write_gpg_id(&rp_dir, "RP000000000000000000000000000000000003\n");
+        write_gpg_id(&root, "0000000000000000000000000000000000000001\n");
+        write_gpg_id(&fido2_dir, "0000000000000000000000000000000000000002\n");
+        write_gpg_id(&rp_dir, "0000000000000000000000000000000000000003\n");
 
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
@@ -900,12 +909,11 @@ mod tests {
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&outside);
         assert!(result.is_err(), "target outside store should fail");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not within store root")
-        );
+        let err = match result {
+            Err(e) => e.to_string(),
+            _ => unreachable!(),
+        };
+        assert!(err.contains("not within store root"));
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub fn parse_gpg_id_content(content: &str, gpg_id_path: &Path) -> Result<prs_lib
 /// Parse GPG key ID strings from `.gpg-id` file content.
 /// Returns the last 16 hex chars (long key ID) for each entry, sorted and
 /// deduplicated, for comparison with `gpg --list-packets` output.
+#[allow(dead_code)]
 pub fn parse_raw_key_ids(content: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for line in content.lines() {
