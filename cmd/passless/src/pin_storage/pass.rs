@@ -4,6 +4,7 @@ use crate::pin_storage::{
     PinStorage, SerializablePinConfig, SerializablePinRetries, SerializablePinState,
 };
 use crate::storage::pass::GpgBackend;
+use crate::storage::pass::gpg_id;
 use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
@@ -84,108 +85,7 @@ impl PassPinStorage {
     }
 
     fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
-        if !target.starts_with(&self.store_path) {
-            return Err(Error::Storage(format!(
-                "Target path '{}' is not within store root '{}'",
-                target.display(),
-                self.store_path.display()
-            )));
-        }
-
-        let parent = target.parent().ok_or_else(|| {
-            Error::Storage(format!(
-                "Target path '{}' has no parent directory",
-                target.display()
-            ))
-        })?;
-
-        let start_dir = if parent.exists() {
-            parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
-        } else {
-            parent.to_path_buf()
-        };
-
-        let root = if self.store_path.exists() {
-            self.store_path.canonicalize().unwrap_or_else(|_| self.store_path.clone())
-        } else {
-            self.store_path.clone()
-        };
-
-        if !start_dir.starts_with(&root) {
-            return Err(Error::Storage(format!(
-                "Resolved target path '{}' is not within store root '{}'",
-                start_dir.display(),
-                root.display()
-            )));
-        }
-
-        let mut current = start_dir;
-
-        loop {
-            let gpg_id_path = current.join(".gpg-id");
-
-            match std::fs::read_to_string(&gpg_id_path) {
-                Ok(content) => {
-                    let keys: Vec<prs_lib::Key> = content
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                        .filter_map(|key_id| {
-                            let cleaned = key_id.strip_suffix('!').unwrap_or(key_id);
-                            let hex_part = cleaned
-                                .strip_prefix("0x")
-                                .or_else(|| cleaned.strip_prefix("0X"))
-                                .unwrap_or(cleaned);
-                            if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                                warn!("Non-hex char in key ID '{}', skipping", key_id);
-                                None
-                            } else if hex_part.len() == 8 {
-                                warn!("Short 8-char key ID '{}' rejected", key_id);
-                                None
-                            } else {
-                                Some(prs_lib::Key::Gpg(prs_lib::crypto::proto::gpg::Key {
-                                    fingerprint: cleaned.to_string(),
-                                    user_ids: vec![],
-                                }))
-                            }
-                        })
-                        .collect();
-
-                    if keys.is_empty() {
-                        return Err(Error::Storage(format!(
-                            "No valid GPG key IDs found in {:?}",
-                            gpg_id_path
-                        )));
-                    }
-
-                    return Ok(prs_lib::Recipients::from(keys));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(Error::Storage(format!(
-                        "Failed to read {:?}: {}",
-                        gpg_id_path, e
-                    )));
-                }
-            }
-
-            if current == root {
-                break;
-            }
-
-            match current.parent() {
-                Some(parent) => {
-                    current = parent.to_path_buf();
-                }
-                None => break,
-            }
-        }
-
-        Err(Error::Storage(format!(
-            "No .gpg-id found in any parent of '{}' up to store root '{}'",
-            target.display(),
-            self.store_path.display()
-        )))
+        gpg_id::resolve_recipients_for_target(&self.store_path, target)
     }
 
     fn sync_prepare(&self) -> Result<()> {

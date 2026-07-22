@@ -1,5 +1,6 @@
 //! Pass (password-store) storage adapter
 
+pub mod gpg_id;
 pub mod init;
 
 use crate::storage::credential::Credential;
@@ -216,36 +217,6 @@ impl PassStorageAdapter {
         })
     }
 
-    /// Read a credential from a specific file path WITHOUT caching
-    /// Used for operations that need &self (select_users, get_relying_parties, etc.)
-    #[allow(dead_code)]
-    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<soft_fido2::Credential> {
-        debug!("Reading credential (no cache) from path: {:?}", path);
-
-        // Read the encrypted GPG file
-        let encrypted_data = std::fs::read(path).map_err(|e| {
-            debug!("Failed to read encrypted file: {}", e);
-            Error::Storage(format!("Failed to read file: {}", e))
-        })?;
-
-        // Create crypto context
-        let mut context = self.create_crypto_context()?;
-
-        // Decrypt the data
-        let ciphertext = Ciphertext::from(encrypted_data);
-        let plaintext = context.decrypt(ciphertext).map_err(|e| {
-            error!("Failed to decrypt credential: {:?}", e);
-            Error::Storage(format!("Failed to decrypt credential: {:?}", e))
-        })?;
-
-        debug!("Successfully decrypted credential");
-
-        // Parse credential from decrypted bytes using auto format
-        Credential::from_bytes(plaintext.unsecure_ref())
-            .map(|cred| cred.to_soft_fido2())
-            .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))
-    }
-
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant GPG decryption
     fn read_credential_from_path(&mut self, path: &Path) -> Result<soft_fido2::Credential> {
@@ -312,159 +283,21 @@ impl PassStorageAdapter {
     /// Find the nearest `.gpg-id` file by walking from `target`'s parent
     /// directory up to `store_root`. Returns the path and raw content.
     fn find_nearest_gpg_id(&self, target: &Path) -> Result<(PathBuf, String)> {
-        if !target.starts_with(&self.store_path) {
-            return Err(Error::Storage(format!(
-                "Target path '{}' is not within store root '{}'",
-                target.display(),
-                self.store_path.display()
-            )));
-        }
-
-        let parent = target.parent().ok_or_else(|| {
-            Error::Storage(format!(
-                "Target path '{}' has no parent directory",
-                target.display()
-            ))
-        })?;
-
-        let start_dir = if parent.exists() {
-            parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
-        } else {
-            parent.to_path_buf()
-        };
-
-        let root = if self.store_path.exists() {
-            self.store_path
-                .canonicalize()
-                .unwrap_or_else(|_| self.store_path.clone())
-        } else {
-            self.store_path.clone()
-        };
-
-        if !start_dir.starts_with(&root) {
-            return Err(Error::Storage(format!(
-                "Resolved target path '{}' is not within store root '{}'",
-                start_dir.display(),
-                root.display()
-            )));
-        }
-
-        let mut current = start_dir;
-
-        loop {
-            let gpg_id_path = current.join(".gpg-id");
-            debug!("Looking for .gpg-id at: {:?}", gpg_id_path);
-
-            match std::fs::read_to_string(&gpg_id_path) {
-                Ok(content) => {
-                    debug!("Found .gpg-id at: {:?}", gpg_id_path);
-                    return Ok((gpg_id_path, content));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(Error::Storage(format!(
-                        "Failed to read .gpg-id at {}: {}",
-                        gpg_id_path.display(),
-                        e
-                    )));
-                }
-            }
-
-            if current == root {
-                break;
-            }
-
-            match current.parent() {
-                Some(parent) => {
-                    current = parent.to_path_buf();
-                }
-                None => break,
-            }
-        }
-
-        Err(Error::Storage(format!(
-            "No .gpg-id file found in any parent directory of '{}' up to store root '{}'. \
-             Make sure the password store is initialized with: pass init <gpg-key-id>",
-            target.display(),
-            self.store_path.display()
-        )))
+        gpg_id::find_nearest_gpg_id(&self.store_path, target)
     }
 
     /// Resolve GPG recipients for a target file using hierarchical .gpg-id lookup.
-    ///
-    /// Walks from `target`'s parent directory up to `store_path` and uses the
-    /// nearest `.gpg-id` file found. This enforces pass-compatible recipient
-    /// resolution semantics: a closer `.gpg-id` (e.g. `fido2/.gpg-id`) overrides
-    /// the root `.gpg-id`.
     fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
-        let (gpg_id_path, content) = self.find_nearest_gpg_id(target)?;
-        self.parse_gpg_id_content(&content, &gpg_id_path)
+        gpg_id::resolve_recipients_for_target(&self.store_path, target)
     }
 
     /// Parse GPG key IDs from .gpg-id file content.
-    ///
-    /// Security properties:
-    /// - Strips blank lines, comments (lines starting with `#`) and optional GPG
-    ///   subkey `!` markers.
-    /// - Rejects short 8-character key IDs (insecure).
-    /// - Fails when the file contains no usable key IDs.
     fn parse_gpg_id_content(
         &self,
         content: &str,
         gpg_id_path: &Path,
     ) -> Result<prs_lib::Recipients> {
-        let mut keys: Vec<prs_lib::Key> = Vec::new();
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let key_id = trimmed.strip_suffix('!').unwrap_or(trimmed);
-
-            let hex_part = key_id
-                .strip_prefix("0x")
-                .or_else(|| key_id.strip_prefix("0X"))
-                .unwrap_or(key_id);
-
-            if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                warn!(
-                    "Non-hex character in GPG key ID '{}' from {:?}, skipping",
-                    trimmed, gpg_id_path
-                );
-                continue;
-            }
-
-            if hex_part.len() == 8 {
-                return Err(Error::Storage(format!(
-                    "Short 8-character GPG key ID '{}' rejected from .gpg-id at '{}'. \
-                     Use a long key ID (16 hex chars) or full fingerprint (40 hex chars).",
-                    trimmed,
-                    gpg_id_path.display()
-                )));
-            }
-
-            debug!("Found GPG key ID: {}", trimmed);
-            keys.push(prs_lib::Key::Gpg(prs_lib::crypto::proto::gpg::Key {
-                fingerprint: key_id.to_string(),
-                user_ids: vec![],
-            }));
-        }
-
-        if keys.is_empty() {
-            return Err(Error::Storage(format!(
-                "No valid GPG key IDs found in .gpg-id file at {:?}",
-                gpg_id_path
-            )));
-        }
-
-        debug!(
-            "Loaded {} GPG recipient(s) from {:?}",
-            keys.len(),
-            gpg_id_path
-        );
-        Ok(prs_lib::Recipients::from(keys))
+        gpg_id::parse_gpg_id_content(content, gpg_id_path)
     }
 
     /// Write a credential to the store
@@ -622,7 +455,7 @@ impl PassStorageAdapter {
             };
 
             let expected = match self.find_nearest_gpg_id(&path) {
-                Ok((_, content)) => parse_raw_key_ids(&content),
+                Ok((_, content)) => gpg_id::parse_raw_key_ids(&content),
                 Err(e) => {
                     entries.push(AuditEntry {
                         path,
@@ -684,9 +517,9 @@ impl PassStorageAdapter {
 
         let recipients = self.resolve_recipients_for_target(path)?;
 
-        let parent = path.parent().ok_or_else(|| {
-            Error::Storage(format!("No parent directory for {}", path.display()))
-        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Storage(format!("No parent directory for {}", path.display())))?;
 
         let tmp_name = format!(
             ".reencrypt.{}.{}",
@@ -774,37 +607,6 @@ fn extract_gpg_key_ids(path: &Path) -> Result<Vec<String>> {
     }
 
     Ok(key_ids)
-}
-
-/// Parse GPG key ID strings from `.gpg-id` file content.
-/// Returns the last 16 hex chars (long key ID) for each entry, sorted and
-/// deduplicated, for comparison with `gpg --list-packets` output.
-fn parse_raw_key_ids(content: &str) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let key_id = trimmed.strip_suffix('!').unwrap_or(trimmed);
-        let hex_part = key_id
-            .strip_prefix("0x")
-            .or_else(|| key_id.strip_prefix("0X"))
-            .unwrap_or(key_id);
-        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) || hex_part.len() < 16 {
-            continue;
-        }
-        let long_id = if hex_part.len() > 16 {
-            hex_part[hex_part.len() - 16..].to_uppercase()
-        } else {
-            hex_part.to_uppercase()
-        };
-        if !ids.contains(&long_id) {
-            ids.push(long_id);
-        }
-    }
-    ids.sort();
-    ids
 }
 
 /// Result of comparing expected vs actual recipients for a single credential file.
@@ -960,7 +762,11 @@ mod tests {
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
         assert!(result.is_err(), "short 8-char key ID should be rejected");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("8-character"), "error should mention 8-char: {}", err);
+        assert!(
+            err.contains("8-character"),
+            "error should mention 8-char: {}",
+            err
+        );
     }
 
     #[test]
@@ -969,14 +775,18 @@ mod tests {
         let dir = Path::new("/tmp/test");
         let content = "ABCDEF0123456789ABCDEF0123456789ABCDEF01!\n";
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
-        assert!(result.is_ok(), "key ID with ! subkey marker should be accepted");
+        assert!(
+            result.is_ok(),
+            "key ID with ! subkey marker should be accepted"
+        );
     }
 
     #[test]
     fn test_parse_multiple_recipients() {
         let adapter = create_adapter(Path::new("/tmp/test"));
         let dir = Path::new("/tmp/test");
-        let content = "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n1234567890ABCDEF1234567890ABCDEF12345678\n";
+        let content =
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n1234567890ABCDEF1234567890ABCDEF12345678\n";
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
         assert!(result.is_ok());
     }
@@ -1003,7 +813,10 @@ mod tests {
         let dir = Path::new("/tmp/test");
         let content = "NOTHEX!!\nABCDEF0123456789ABCDEF0123456789ABCDEF01\n";
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
-        assert!(result.is_ok(), "non-hex lines should be skipped, valid keys should remain");
+        assert!(
+            result.is_ok(),
+            "non-hex lines should be skipped, valid keys should remain"
+        );
     }
 
     #[test]
@@ -1028,7 +841,11 @@ mod tests {
 
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
-        assert!(result.is_ok(), "should find root .gpg-id: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "should find root .gpg-id: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1044,7 +861,11 @@ mod tests {
 
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
-        assert!(result.is_ok(), "should find fido2/.gpg-id: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "should find fido2/.gpg-id: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1062,7 +883,11 @@ mod tests {
 
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
-        assert!(result.is_ok(), "should find example.com/.gpg-id: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "should find example.com/.gpg-id: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1075,7 +900,12 @@ mod tests {
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&outside);
         assert!(result.is_err(), "target outside store should fail");
-        assert!(result.unwrap_err().to_string().contains("not within store root"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not within store root")
+        );
     }
 
     #[test]
@@ -1115,7 +945,10 @@ mod tests {
 
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
-        assert!(result.is_err(), "short 8-char key ID in .gpg-id should fail");
+        assert!(
+            result.is_err(),
+            "short 8-char key ID in .gpg-id should fail"
+        );
     }
 
     #[test]
