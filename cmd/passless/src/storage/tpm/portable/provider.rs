@@ -3,7 +3,6 @@
 //! Implements the `CredentialKeyProvider` trait for TPM-resident credential keys.
 
 use super::parent::{FORMAT_VERSION, PROVIDER_ID, PortableParent};
-use crate::storage::tpm::portable::parent;
 
 use soft_fido2::Result;
 use soft_fido2_ctap::key_provider::{
@@ -28,6 +27,9 @@ use tss_esapi::structures::{
 use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
 use tss_esapi::Context;
 use zeroize::Zeroizing;
+
+/// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256)
+const COSE_ALG_ES256: i32 = -7;
 
 /// TPM credential key provider
 ///
@@ -285,33 +287,32 @@ impl TpmCredentialKeyProvider {
                 CredentialKeyError::InvalidKeyMaterial
             })?;
 
-        // Sign the message
-        let signature = context
-            .execute_with_nullauth_session(|ctx| {
-                ctx.sign(
-                    loaded_key.into(),
-                    message,
-                    tss_esapi::structures::SignatureScheme::EcDsa(
-                        tss_esapi::structures::HashScheme::Sha256,
-                    ),
-                    tss_esapi::structures::HashValue::from_sha256(&{
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(message);
-                        hasher.finalize().to_vec()
-                    }),
-                )
-            })
-            .map_err(|e| {
+        // Sign the message, ensuring we flush the key even on failure
+        let signature = match context.execute_with_nullauth_session(|ctx| {
+            ctx.sign(
+                loaded_key.into(),
+                message,
+                tss_esapi::structures::SignatureScheme::EcDsa(
+                    tss_esapi::structures::HashScheme::Sha256,
+                ),
+                tss_esapi::structures::HashValue::from_sha256(&{
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(message);
+                    hasher.finalize().to_vec()
+                }),
+            )
+        }) {
+            Ok(sig) => sig,
+            Err(e) => {
+                // Flush the key before returning error
+                let _ = context.flush_context(loaded_key.into());
                 error!("Failed to sign with TPM: {}", e);
-                CredentialKeyError::TransientFailure("TPM signing failed".to_string())
-            })?;
-
-        // Flush the loaded key
-        context.flush_context(loaded_key.into()).map_err(|e| {
-            error!("Failed to flush loaded key: {}", e);
-            CredentialKeyError::TransientFailure("Failed to flush key".to_string())
-        })?;
+                return Err(CredentialKeyError::TransientFailure(
+                    "TPM signing failed".to_string(),
+                ));
+            }
+        };
 
         // Convert TPM signature to DER-encoded ECDSA signature
         let der_signature = self.tpm_signature_to_der(&signature)?;
@@ -386,8 +387,7 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
     }
 
     fn supports_algorithm(&self, algorithm: i32) -> bool {
-        // ES256 (algorithm -7)
-        algorithm == -7
+        algorithm == COSE_ALG_ES256
     }
 
     fn generate(&self, algorithm: i32) -> Result<GeneratedCredentialKey, CredentialKeyError> {
@@ -403,7 +403,7 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
         }
 
         match algorithm {
-            -7 => self.generate_es256_key().map_err(|e| {
+            COSE_ALG_ES256 => self.generate_es256_key().map_err(|e| {
                 error!("Failed to generate ES256 key: {:?}", e);
                 CredentialKeyError::TransientFailure("Key generation failed".to_string())
             }),

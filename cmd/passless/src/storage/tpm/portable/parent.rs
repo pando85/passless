@@ -366,46 +366,43 @@ impl PortableParent {
 
 /// Derive parent private key from recovery seed using HKDF
 fn derive_parent_private(seed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    // HKDF-Extract
-    let mut mac =
-        HmacSha256::new_from_slice(b"passless-portable-parent-private-v1").map_err(|e| {
-            error!("Failed to create HMAC: {}", e);
-            soft_fido2::Error::Other
-        })?;
-    mac.update(seed);
-    let prk = mac.finalize().into_bytes();
-
-    // HKDF-Expand (simplified - just use first 32 bytes)
-    let mut private = Zeroizing::new(vec![0u8; 32]);
-    private.copy_from_slice(&prk[..32]);
-
-    Ok(private)
+    derive_key_material(seed, b"passless-portable-parent-private-v1")
 }
 
 /// Derive parent seed value from recovery seed using HKDF
 fn derive_parent_seed(seed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    derive_key_material(seed, b"passless-portable-parent-seed-v1")
+}
+
+/// Derive key material from seed using HKDF-SHA256
+///
+/// Implements RFC 5869 HKDF with Extract and Expand phases.
+fn derive_key_material(seed: &[u8], info: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
 
-    // HKDF-Extract with different label
-    let mut mac =
-        HmacSha256::new_from_slice(b"passless-portable-parent-seed-v1").map_err(|e| {
-            error!("Failed to create HMAC: {}", e);
-            soft_fido2::Error::Other
-        })?;
-    mac.update(seed);
-    let prk = mac.finalize().into_bytes();
+    // HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
+    // Using info as salt for domain separation
+    let mut extract_mac = HmacSha256::new_from_slice(info).map_err(|e| {
+        error!("Failed to create HMAC for extraction: {}", e);
+        soft_fido2::Error::Other
+    })?;
+    extract_mac.update(seed);
+    let prk = extract_mac.finalize().into_bytes();
 
-    // HKDF-Expand (simplified - just use first 32 bytes)
-    let mut parent_seed = Zeroizing::new(vec![0u8; 32]);
-    parent_seed.copy_from_slice(&prk[..32]);
+    // HKDF-Expand: OKM = T(1) where T(1) = HMAC-Hash(PRK, info | 0x01)
+    let mut expand_mac = HmacSha256::new_from_slice(&prk).map_err(|e| {
+        error!("Failed to create HMAC for expansion: {}", e);
+        soft_fido2::Error::Other
+    })?;
+    expand_mac.update(info);
+    expand_mac.update(&[0x01]);
+    let okm = expand_mac.finalize().into_bytes();
 
-    Ok(parent_seed)
+    let mut result = Zeroizing::new(vec![0u8; 32]);
+    result.copy_from_slice(&okm[..32]);
+
+    Ok(result)
 }
