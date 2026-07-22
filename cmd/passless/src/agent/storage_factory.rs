@@ -1940,15 +1940,15 @@ mod tests {
                 .unwrap();
             let gpg_id = String::from_utf8_lossy(&gpg_id_output.stdout)
                 .lines()
-                .find(|l| l.starts_with("uid:"))
-                .map(|l| {
-                    l.split(':')
-                        .nth(9)
-                        .unwrap_or("passless-comp@test.local")
-                        .trim()
-                        .to_string()
-                })
-                .unwrap_or_else(|| "passless-comp@test.local".to_string());
+                .find(|l| l.starts_with("fpr:"))
+                .and_then(|l| l.split(':').nth(9).map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Failed to extract GPG key fingerprint from:\n{}",
+                        String::from_utf8_lossy(&gpg_id_output.stdout)
+                    )
+                });
 
             let init_output = std::process::Command::new("pass")
                 .arg("init")
