@@ -77,6 +77,30 @@ ls -l /dev/uhid
 test -r /dev/uhid && test -w /dev/uhid && echo "access ok"
 ```
 
+## Daemon vs Client Access
+
+Passless daemon access to `/dev/uhid` is not the same as client access to the virtual FIDO HID
+device.
+
+```
+Passless requires:         /dev/uhid access (to create virtual authenticator)
+WebAuthn client requires:  access to the generated FIDO HID/hidraw device (to send CTAP2 requests)
+Brokered setup may use:    credentialsd/portal API instead of direct client HID access
+```
+
+- **Passless daemon** opens `/dev/uhid` to register a virtual FIDO2 authenticator with the kernel.
+- **WebAuthn client** (browser, Electron app, etc.) opens the generated `/dev/hidraw*` device to
+  perform CTAP2 operations.
+- **credentialsd** can broker access, allowing confined applications to use Passless without direct
+  HID device access.
+
+If Passless starts successfully but a browser or application cannot complete a WebAuthn ceremony,
+the issue is likely in the client layer (device permissions, WebAuthn implementation, or package
+confinement), not in Passless itself.
+
+See [docs/CLIENT_COMPATIBILITY.md](CLIENT_COMPATIBILITY.md) for application-side troubleshooting,
+compatibility boundaries, and diagnostic procedures.
+
 ## Optional Backend-Specific Access
 
 ### Configuration File

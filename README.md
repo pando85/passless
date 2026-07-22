@@ -17,11 +17,14 @@ It also includes client capabilities for interacting with any FIDO2 authenticato
 
 > [!IMPORTANT]
 >
-> Browsers running in sandboxed environments (for example, installed via the Ubuntu App Center) may
-> not be able to communicate with the authenticator out of the box. To enable this, you can use the
-> `credentialsd` service provided by the
-> ["Credentials for Linux" project](https://github.com/linux-credentials/credentialsd) to allow
-> sandboxed apps — including browsers — to access FIDO2 / WebAuthn credentials on Linux.
+> **Client compatibility:** Sandboxed environments (Flatpak, Snap) and some Electron applications
+> may not be able to communicate with the authenticator out of the box. The
+> [Credentials for Linux](https://github.com/linux-credentials/credentialsd) project is developing
+> a system credential service and browser integrations that may provide a portal-style path for
+> confined applications. Current integrations are experimental and do not automatically enable
+> arbitrary Electron, Flatpak, or Snap applications. See
+> [docs/CLIENT_COMPATIBILITY.md](docs/CLIENT_COMPATIBILITY.md) for details on compatibility
+> boundaries, troubleshooting, and credentialsd integration.
 
 ## ⚠️ Security Warning <!-- omit in toc -->
 
