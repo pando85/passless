@@ -4,11 +4,12 @@ use crate::pin_storage::{
     PinStorage, SerializablePinConfig, SerializablePinRetries, SerializablePinState,
 };
 use crate::storage::pass::GpgBackend;
+use crate::storage::pass::gpg_id;
 use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use log::{debug, info, warn};
@@ -83,37 +84,8 @@ impl PassPinStorage {
         })
     }
 
-    fn load_recipients_from_gpg_id(&self) -> Result<prs_lib::Recipients> {
-        let gpg_id_path = self.store_path.join(".gpg-id");
-        match std::fs::read_to_string(&gpg_id_path) {
-            Ok(content) => {
-                let keys: Vec<prs_lib::Key> = content
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(|key_id| {
-                        let gpg_key = prs_lib::crypto::proto::gpg::Key {
-                            fingerprint: key_id.to_string(),
-                            user_ids: vec![],
-                        };
-                        prs_lib::Key::Gpg(gpg_key)
-                    })
-                    .collect();
-
-                if keys.is_empty() {
-                    return Err(Error::Storage(format!(
-                        "No GPG key IDs found in {:?}",
-                        gpg_id_path
-                    )));
-                }
-
-                Ok(prs_lib::Recipients::from(keys))
-            }
-            Err(e) => Err(Error::Storage(format!(
-                "Failed to read {:?}: {}",
-                gpg_id_path, e
-            ))),
-        }
+    fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
+        gpg_id::resolve_recipients_for_target(&self.store_path, target)
     }
 
     fn sync_prepare(&self) -> Result<()> {
@@ -235,7 +207,8 @@ impl PassPinStorage {
 
         let bytes = config.to_json_bytes()?;
 
-        let recipients = self.load_recipients_from_gpg_id().map_err(|e| {
+        let path = self.get_config_path();
+        let recipients = self.resolve_recipients_for_target(&path).map_err(|e| {
             warn!("Failed to load GPG recipients: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
@@ -244,8 +217,6 @@ impl PassPinStorage {
             warn!("Failed to create crypto context: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
-
-        let path = self.get_config_path();
 
         if let Some(parent) = path.parent() {
             create_secure_dir_all(parent).map_err(|e| {
@@ -288,7 +259,8 @@ impl PassPinStorage {
 
         let bytes = retries.to_json_bytes()?;
 
-        let recipients = self.load_recipients_from_gpg_id().map_err(|e| {
+        let path = self.get_retries_path();
+        let recipients = self.resolve_recipients_for_target(&path).map_err(|e| {
             warn!("Failed to load GPG recipients: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
@@ -297,8 +269,6 @@ impl PassPinStorage {
             warn!("Failed to create crypto context: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
-
-        let path = self.get_retries_path();
 
         if let Some(parent) = path.parent() {
             create_secure_dir_all(parent).map_err(|e| {

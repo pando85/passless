@@ -1,5 +1,6 @@
 //! Pass (password-store) storage adapter
 
+pub mod gpg_id;
 pub mod init;
 
 use crate::storage::credential::Credential;
@@ -216,36 +217,6 @@ impl PassStorageAdapter {
         })
     }
 
-    /// Read a credential from a specific file path WITHOUT caching
-    /// Used for operations that need &self (select_users, get_relying_parties, etc.)
-    #[allow(dead_code)]
-    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<soft_fido2::Credential> {
-        debug!("Reading credential (no cache) from path: {:?}", path);
-
-        // Read the encrypted GPG file
-        let encrypted_data = std::fs::read(path).map_err(|e| {
-            debug!("Failed to read encrypted file: {}", e);
-            Error::Storage(format!("Failed to read file: {}", e))
-        })?;
-
-        // Create crypto context
-        let mut context = self.create_crypto_context()?;
-
-        // Decrypt the data
-        let ciphertext = Ciphertext::from(encrypted_data);
-        let plaintext = context.decrypt(ciphertext).map_err(|e| {
-            error!("Failed to decrypt credential: {:?}", e);
-            Error::Storage(format!("Failed to decrypt credential: {:?}", e))
-        })?;
-
-        debug!("Successfully decrypted credential");
-
-        // Parse credential from decrypted bytes using auto format
-        Credential::from_bytes(plaintext.unsecure_ref())
-            .map(|cred| cred.to_soft_fido2())
-            .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))
-    }
-
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant GPG decryption
     fn read_credential_from_path(&mut self, path: &Path) -> Result<soft_fido2::Credential> {
@@ -309,62 +280,25 @@ impl PassStorageAdapter {
         self.read_credential_from_path(&path)
     }
 
-    /// Load GPG recipients from .gpg-id file
-    /// This bypasses prs-lib's Recipients::load which tries to read .public-keys
-    fn load_recipients_from_gpg_id(&self) -> Result<prs_lib::Recipients> {
-        let gpg_id_path = &self.store_path.join(".gpg-id");
-        debug!("Checking for .gpg-id at: {:?}", gpg_id_path);
-        match std::fs::read_to_string(gpg_id_path) {
-            Ok(content) => {
-                debug!("Found .gpg-id at: {:?}", gpg_id_path);
-                self.parse_gpg_id_content(&content, gpg_id_path)
-            }
-            Err(e) => {
-                debug!("Failed to read .gpg-id at {:?}: {}", gpg_id_path, e);
-                Err(Error::Storage(format!(
-                    "Failed to find .gpg-id file in {:?} or any parent directory. Make sure the password store is initialized with: pass init <gpg-key-id>",
-                    self.store_path
-                )))
-            }
-        }
+    /// Find the nearest `.gpg-id` file by walking from `target`'s parent
+    /// directory up to `store_root`. Returns the path and raw content.
+    fn find_nearest_gpg_id(&self, target: &Path) -> Result<(PathBuf, String)> {
+        gpg_id::find_nearest_gpg_id(&self.store_path, target)
     }
 
-    /// Parse GPG key IDs from .gpg-id file content
+    /// Resolve GPG recipients for a target file using hierarchical .gpg-id lookup.
+    fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
+        gpg_id::resolve_recipients_for_target(&self.store_path, target)
+    }
+
+    /// Parse GPG key IDs from .gpg-id file content.
+    #[allow(dead_code)]
     fn parse_gpg_id_content(
         &self,
         content: &str,
         gpg_id_path: &Path,
     ) -> Result<prs_lib::Recipients> {
-        // Parse key IDs from .gpg-id (one per line, skip empty lines and comments)
-        let keys: Vec<prs_lib::Key> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|key_id| {
-                debug!("Found GPG key ID: {}", key_id);
-                // Create a GPG key with just the fingerprint
-                // prs-lib will handle key validation when encrypting
-                let gpg_key = prs_lib::crypto::proto::gpg::Key {
-                    fingerprint: key_id.to_string(),
-                    user_ids: vec![],
-                };
-                prs_lib::Key::Gpg(gpg_key)
-            })
-            .collect();
-
-        if keys.is_empty() {
-            return Err(Error::Storage(format!(
-                "No GPG key IDs found in .gpg-id file at {:?}",
-                gpg_id_path
-            )));
-        }
-
-        debug!(
-            "Loaded {} GPG recipient(s) from {:?}",
-            keys.len(),
-            gpg_id_path
-        );
-        Ok(prs_lib::Recipients::from(keys))
+        gpg_id::parse_gpg_id_content(content, gpg_id_path)
     }
 
     /// Write a credential to the store
@@ -389,8 +323,8 @@ impl PassStorageAdapter {
             })?;
         }
 
-        // Load recipients from .gpg-id file
-        let recipients = self.load_recipients_from_gpg_id()?;
+        // Resolve recipients by walking up from target to find the nearest .gpg-id
+        let recipients = self.resolve_recipients_for_target(&path)?;
 
         // Create crypto context
         let mut context = self.create_crypto_context()?;
@@ -488,6 +422,223 @@ impl PassStorageAdapter {
 
         self.read_credential_from_path(&path)
     }
+
+    // ── Audit / re-encrypt ──────────────────────────────────────────────────
+
+    /// Scan all passkey files and report those whose OpenPGP packet recipients
+    /// differ from the effective `.gpg-id` policy.
+    ///
+    /// Requires the `gpg` binary for packet inspection.
+    #[allow(dead_code)]
+    pub fn audit_passkey_recipients(&self) -> Result<Vec<AuditEntry>> {
+        let fido2_path = self.get_fido2_path();
+        let indexes = load_credential_paths(&fido2_path, "gpg")
+            .map_err(|e| Error::Storage(format!("Failed to scan credentials: {}", e)))?;
+
+        let mut entries = Vec::new();
+
+        for path_info in indexes.id.values() {
+            let path = path_info.to_path(&fido2_path);
+            if !path.exists() {
+                continue;
+            }
+
+            let actual = match extract_gpg_key_ids(&path) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    entries.push(AuditEntry {
+                        path,
+                        expected_recipients: vec![],
+                        actual_recipients: vec![],
+                        match_result: RecipientMatch::InspectionError(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let expected = match self.find_nearest_gpg_id(&path) {
+                Ok((_, content)) => gpg_id::parse_raw_key_ids(&content),
+                Err(e) => {
+                    entries.push(AuditEntry {
+                        path,
+                        expected_recipients: vec![],
+                        actual_recipients: actual.clone(),
+                        match_result: RecipientMatch::ResolutionError(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let match_result = if actual == expected {
+                RecipientMatch::Match
+            } else {
+                RecipientMatch::Mismatch
+            };
+
+            entries.push(AuditEntry {
+                path,
+                expected_recipients: expected,
+                actual_recipients: actual,
+                match_result,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Re-encrypt a passkey file so its OpenPGP recipients match the current
+    /// `.gpg-id` policy.
+    ///
+    /// 1. Decrypts the file using an available secret key.
+    /// 2. Resolves the effective recipients via `resolve_recipients_for_target`.
+    /// 3. Re-encrypts to a temporary file.
+    /// 4. Atomically renames the temporary over the original.
+    /// 5. Commits the change via the password-store Git integration.
+    #[allow(dead_code)]
+    pub fn reencrypt_passkey_file(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Err(Error::Storage(format!(
+                "File does not exist: {}",
+                path.display()
+            )));
+        }
+
+        let encrypted_data = std::fs::read(path).map_err(|e| {
+            Error::Storage(format!("Failed to read file {}: {}", path.display(), e))
+        })?;
+
+        let mut context = self.create_crypto_context()?;
+
+        let ciphertext = Ciphertext::from(encrypted_data);
+        let plaintext = context.decrypt(ciphertext).map_err(|e| {
+            Error::Storage(format!(
+                "Failed to decrypt {} for re-encryption: {:?}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        let recipients = self.resolve_recipients_for_target(path)?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Storage(format!("No parent directory for {}", path.display())))?;
+
+        let tmp_name = format!(
+            ".reencrypt.{}.{}",
+            std::process::id(),
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("credential.gpg")
+        );
+        let tmp_path = parent.join(&tmp_name);
+
+        context
+            .encrypt_file(&recipients, plaintext, &tmp_path)
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "Failed to re-encrypt credential {}: {:?}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            Error::Storage(format!(
+                "Failed to replace {} with re-encrypted version: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        let relative_path = path
+            .strip_prefix(&self.store_path)
+            .unwrap_or(path)
+            .display();
+        let message = format!(
+            "Re-encrypt {} with current .gpg-id recipient policy.",
+            relative_path
+        );
+        self.sync_finalize(&message)?;
+
+        info!("Re-encrypted {}", path.display());
+        Ok(())
+    }
+}
+
+/// Extract GPG public-key-encrypted session key IDs from an OpenPGP file by
+/// running `gpg --list-packets --verbose`.
+#[allow(dead_code)]
+fn extract_gpg_key_ids(path: &Path) -> Result<Vec<String>> {
+    let output = std::process::Command::new("gpg")
+        .args(["--batch", "--no-tty", "--list-packets", "--verbose"])
+        .arg(path)
+        .output()
+        .map_err(|e| {
+            Error::Storage(format!(
+                "Failed to run gpg --list-packets on {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Storage(format!(
+            "gpg --list-packets failed for {}: {}",
+            path.display(),
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut key_ids: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        if line.contains("pubkey enc packet")
+            && let Some(after_keyid) = line.split("keyid ").nth(1)
+        {
+            let kid = after_keyid
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !kid.is_empty() && !key_ids.contains(&kid) {
+                key_ids.push(kid);
+            }
+        }
+    }
+
+    Ok(key_ids)
+}
+
+/// Result of comparing expected vs actual recipients for a single credential file.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipientMatch {
+    /// The credential's OpenPGP recipients match the .gpg-id policy.
+    Match,
+    /// The credential's recipients differ from the .gpg-id policy.
+    Mismatch,
+    /// The expected recipients could not be resolved.
+    ResolutionError(String),
+    /// The actual recipients could not be inspected.
+    InspectionError(String),
+}
+
+/// An audit entry describing the recipient match status for one credential file.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    /// Path to the credential file.
+    pub path: PathBuf,
+    /// Expected recipient key IDs (16-char uppercase hex).
+    pub expected_recipients: Vec<String>,
+    /// Actual recipient key IDs extracted from the OpenPGP packets.
+    pub actual_recipients: Vec<String>,
+    /// Whether the expected and actual recipients match.
+    pub match_result: RecipientMatch,
 }
 
 impl CredentialStorage for PassStorageAdapter {
@@ -564,5 +715,307 @@ impl CredentialStorage for PassStorageAdapter {
 
     fn cleanup_expired_cache(&mut self) {
         self.cache.evict_expired();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+
+    fn write_gpg_id(dir: &Path, content: &str) {
+        fs::write(dir.join(".gpg-id"), content).unwrap();
+    }
+
+    fn create_adapter(store_root: &Path) -> PassStorageAdapter {
+        PassStorageAdapter {
+            store_path: store_root.to_path_buf(),
+            path: PathBuf::from("fido2"),
+            gpg_backend: GpgBackend::GnupgBin,
+            indexes: CredentialIndexes::default(),
+            cache: CredentialCache::new(),
+            iteration_index: 0,
+            iteration_entries: vec![],
+        }
+    }
+
+    // ── parse_gpg_id_content ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_single_key_id() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content = "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_skips_comments_and_blanks() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content = "# comment\n\nABCDEF0123456789ABCDEF0123456789ABCDEF01\n  \n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_rejects_short_key_id() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content = "DEADBEEF\n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(result.is_err(), "short 8-char key ID should be rejected");
+        let err = match result {
+            Err(e) => e.to_string(),
+            _ => unreachable!(),
+        };
+        assert!(
+            err.contains("8-character"),
+            "error should mention 8-char: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_strips_subkey_marker() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content = "ABCDEF0123456789ABCDEF0123456789ABCDEF01!\n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(
+            result.is_ok(),
+            "key ID with ! subkey marker should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_parse_multiple_recipients() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content =
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n1234567890ABCDEF1234567890ABCDEF12345678\n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_empty_content_fails() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let result = adapter.parse_gpg_id_content("", &dir.join(".gpg-id"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_only_comments_fails() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let result = adapter.parse_gpg_id_content("# only a comment\n", &dir.join(".gpg-id"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_non_hex_chars_skipped() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content = "NOTHEX!!\nABCDEF0123456789ABCDEF0123456789ABCDEF01\n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(
+            result.is_ok(),
+            "non-hex lines should be skipped, valid keys should remain"
+        );
+    }
+
+    #[test]
+    fn test_parse_0x_prefix_stripped() {
+        let adapter = create_adapter(Path::new("/tmp/test"));
+        let dir = Path::new("/tmp/test");
+        let content = "0xABCDEF0123456789ABCDEF0123456789ABCDEF01\n";
+        let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
+        assert!(result.is_ok(), "0x-prefixed key ID should be accepted");
+    }
+
+    // ── resolve_recipients_for_target ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_root_gpg_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let target = root.join("fido2/example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n");
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(
+            result.is_ok(),
+            "should find root .gpg-id: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_resolve_hierarchical_fido2_overrides_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let fido2_dir = root.join("fido2");
+        let target = fido2_dir.join("example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "0000000000000000000000000000000000000001\n");
+        write_gpg_id(&fido2_dir, "0000000000000000000000000000000000000002\n");
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(
+            result.is_ok(),
+            "should find fido2/.gpg-id: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_resolve_hierarchical_rp_dir_overrides_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let fido2_dir = root.join("fido2");
+        let rp_dir = fido2_dir.join("example.com");
+        let target = rp_dir.join("cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "0000000000000000000000000000000000000001\n");
+        write_gpg_id(&fido2_dir, "0000000000000000000000000000000000000002\n");
+        write_gpg_id(&rp_dir, "0000000000000000000000000000000000000003\n");
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(
+            result.is_ok(),
+            "should find example.com/.gpg-id: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_outside_store_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+
+        let outside = dir.path().join("outside/cred.gpg");
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&outside);
+        assert!(result.is_err(), "target outside store should fail");
+        let err = match result {
+            Err(e) => e.to_string(),
+            _ => unreachable!(),
+        };
+        assert!(err.contains("not within store root"));
+    }
+
+    #[test]
+    fn test_resolve_missing_gpg_id_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let target = root.join("fido2/example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(result.is_err(), "missing .gpg-id should fail");
+    }
+
+    #[test]
+    fn test_resolve_empty_gpg_id_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let target = root.join("fido2/example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "# only a comment\n");
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(result.is_err(), "empty .gpg-id (only comments) should fail");
+    }
+
+    #[test]
+    fn test_resolve_short_key_id_in_root_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let target = root.join("fido2/example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "DEADBEEF\n");
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(
+            result.is_err(),
+            "short 8-char key ID in .gpg-id should fail"
+        );
+    }
+
+    #[test]
+    fn test_resolve_with_subkey_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let target = root.join("fido2/example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "ABCDEF0123456789ABCDEF0123456789ABCDEF01!\n");
+
+        let adapter = create_adapter(&root);
+        let result = adapter.resolve_recipients_for_target(&target);
+        assert!(result.is_ok(), "key IDs with ! marker should be accepted");
+    }
+
+    // ── find_nearest_gpg_id ───────────────────────────────────────────────
+
+    #[test]
+    fn test_find_nearest_gpg_id_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let target = root.join("fido2/example.com/cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n");
+
+        let adapter = create_adapter(&root);
+        let (found_path, content) = adapter.find_nearest_gpg_id(&target).unwrap();
+        assert_eq!(found_path, root.join(".gpg-id"));
+        assert!(content.contains("ABCDEF"));
+    }
+
+    #[test]
+    fn test_find_nearest_gpg_id_prefers_closest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let fido2_dir = root.join("fido2");
+        let rp_dir = fido2_dir.join("example.com");
+        let target = rp_dir.join("cred.gpg");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        write_gpg_id(&root, "ROOT00000000000000000000000000000000001\n");
+        write_gpg_id(&rp_dir, "RP000000000000000000000000000000000003\n");
+
+        let adapter = create_adapter(&root);
+        let (found_path, _) = adapter.find_nearest_gpg_id(&target).unwrap();
+        assert_eq!(found_path, rp_dir.join(".gpg-id"));
+    }
+
+    #[test]
+    fn test_find_nearest_gpg_id_outside_store_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+
+        let outside = dir.path().join("outside/cred.gpg");
+        let adapter = create_adapter(&root);
+        let result = adapter.find_nearest_gpg_id(&outside);
+        assert!(result.is_err());
     }
 }
