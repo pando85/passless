@@ -544,6 +544,8 @@ mod tests {
             sign_count: 0,
             alg: -7,
             private_key: SecBytes::new(vec![0u8; 32]),
+            key_provider: None,
+            key_format_version: None,
             created: 0,
             discoverable: true,
             extensions: Extensions::default(),
