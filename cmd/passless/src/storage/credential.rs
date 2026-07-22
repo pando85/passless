@@ -248,13 +248,11 @@ impl<'a> Credential<'a> {
     /// Convert to owned soft_fido2::Credential
     pub fn to_soft_fido2(&self) -> soft_fido2::Credential {
         let key = match (&self.key_provider, self.key_format_version) {
-            (Some(provider_bytes), Some(version)) => {
-                soft_fido2_ctap::CredentialKey::new(
-                    soft_fido2_ctap::CredentialKeyProviderId::new(provider_bytes),
-                    version,
-                    self.private_key.clone(),
-                )
-            }
+            (Some(provider_bytes), Some(version)) => soft_fido2_ctap::CredentialKey::new(
+                soft_fido2_ctap::CredentialKeyProviderId::new(provider_bytes),
+                version,
+                self.private_key.clone(),
+            ),
             _ => soft_fido2_ctap::CredentialKey::software(self.private_key.clone()),
         };
 
