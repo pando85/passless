@@ -1766,8 +1766,8 @@ dependencies = [
  "sha2",
  "shadow-rs",
  "soft-fido2",
- "soft-fido2-ctap 0.14.0",
- "soft-fido2-transport 0.14.0",
+ "soft-fido2-ctap",
+ "soft-fido2-transport",
  "tempfile",
  "tokio",
  "toml",
@@ -2448,29 +2448,10 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto 0.15.0",
- "soft-fido2-ctap 0.15.0",
- "soft-fido2-transport 0.15.0",
+ "soft-fido2-crypto",
+ "soft-fido2-ctap",
+ "soft-fido2-transport",
  "spin",
- "zeroize",
-]
-
-[[package]]
-name = "soft-fido2-crypto"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76812960ba194c30739db32d4cbfa3e4777725d70c8102d50225e5776294b7b2"
-dependencies = [
- "aes",
- "cbc",
- "ed25519-dalek",
- "hkdf",
- "hmac",
- "p256",
- "rand",
- "sha2",
- "subtle",
- "thiserror",
  "zeroize",
 ]
 
@@ -2495,25 +2476,6 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "551e806dc71d51a99b129fda18ec8b7650d55ffa63e8f8352d297cbeb0d05114"
-dependencies = [
- "cbor4ii",
- "rand",
- "secstr",
- "serde",
- "serde_bytes",
- "sha2",
- "smallvec",
- "soft-fido2-crypto 0.14.0",
- "subtle",
- "thiserror",
- "zeroize",
-]
-
-[[package]]
-name = "soft-fido2-ctap"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051bb98ecd8e825efa43adaea189fc0d80199ade4d8c8610959ce467c3c0d036"
@@ -2525,22 +2487,10 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto 0.15.0",
+ "soft-fido2-crypto",
  "subtle",
  "thiserror",
  "zeroize",
-]
-
-[[package]]
-name = "soft-fido2-transport"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d5a0afa31668553c360d8df86d8e990786faecf8e47ddb01510dbe7b93943c2"
-dependencies = [
- "hex",
- "lazy_static",
- "nix 0.31.3",
- "smallvec",
 ]
 
 [[package]]
