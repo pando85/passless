@@ -160,6 +160,12 @@ pub struct Credential<'a> {
     #[serde(with = "sec_bytes_serde")]
     pub private_key: SecBytes,
 
+    #[serde(default)]
+    pub key_provider: Option<Vec<u8>>,
+
+    #[serde(default)]
+    pub key_format_version: Option<u16>,
+
     pub created: i64,
 
     pub discoverable: bool,
@@ -172,6 +178,7 @@ impl<'a> Credential<'a> {
     /// Create a new Credential from a soft_fido2::Credential (zero-copy)
     #[inline]
     pub fn from_soft_fido2(cred: &'a soft_fido2::Credential) -> Self {
+        let is_software = cred.key.provider.is_software();
         Self {
             id: std::borrow::Cow::Borrowed(&cred.id),
             rp: RelyingParty::from_soft_fido2(&cred.rp),
@@ -179,6 +186,16 @@ impl<'a> Credential<'a> {
             sign_count: cred.sign_count,
             alg: cred.alg,
             private_key: cred.key.material.clone(),
+            key_provider: if is_software {
+                None
+            } else {
+                Some(cred.key.provider.as_bytes().to_vec())
+            },
+            key_format_version: if is_software {
+                None
+            } else {
+                Some(cred.key.format_version)
+            },
             created: cred.created,
             discoverable: cred.discoverable,
             extensions: Extensions {
@@ -193,6 +210,7 @@ impl<'a> Credential<'a> {
     #[inline]
     #[allow(dead_code)]
     pub fn from_soft_fido2_ref(cred_ref: soft_fido2::CredentialRef<'a>) -> Self {
+        let is_software = cred_ref.key.provider.is_software();
         Self {
             id: std::borrow::Cow::Borrowed(cred_ref.id),
             rp: RelyingParty {
@@ -207,6 +225,16 @@ impl<'a> Credential<'a> {
             sign_count: *cred_ref.sign_count,
             alg: *cred_ref.alg,
             private_key: cred_ref.key.material.clone(),
+            key_provider: if is_software {
+                None
+            } else {
+                Some(cred_ref.key.provider.as_bytes().to_vec())
+            },
+            key_format_version: if is_software {
+                None
+            } else {
+                Some(cred_ref.key.format_version)
+            },
             created: *cred_ref.created,
             discoverable: *cred_ref.discoverable,
             extensions: Extensions {
@@ -219,13 +247,24 @@ impl<'a> Credential<'a> {
 
     /// Convert to owned soft_fido2::Credential
     pub fn to_soft_fido2(&self) -> soft_fido2::Credential {
+        let key = match (&self.key_provider, self.key_format_version) {
+            (Some(provider_bytes), Some(version)) => {
+                soft_fido2_ctap::CredentialKey::new(
+                    soft_fido2_ctap::CredentialKeyProviderId::new(provider_bytes),
+                    version,
+                    self.private_key.clone(),
+                )
+            }
+            _ => soft_fido2_ctap::CredentialKey::software(self.private_key.clone()),
+        };
+
         soft_fido2::Credential {
             id: self.id.to_vec(),
             rp: self.rp.to_soft_fido2(),
             user: self.user.to_soft_fido2(),
             sign_count: self.sign_count,
             alg: self.alg,
-            key: soft_fido2_ctap::CredentialKey::software(self.private_key.clone()),
+            key,
             created: self.created,
             discoverable: self.discoverable,
             extensions: soft_fido2::Extensions {
@@ -250,6 +289,8 @@ impl<'a> Credential<'a> {
             sign_count: self.sign_count,
             alg: self.alg,
             private_key: self.private_key,
+            key_provider: self.key_provider,
+            key_format_version: self.key_format_version,
             created: self.created,
             discoverable: self.discoverable,
             extensions: self.extensions,
@@ -277,6 +318,10 @@ impl<'a> Credential<'a> {
             alg: i32,
             #[serde(deserialize_with = "flexible_bytes::deserialize")]
             private_key: Vec<u8>,
+            #[serde(default)]
+            key_provider: Option<Vec<u8>>,
+            #[serde(default)]
+            key_format_version: Option<u16>,
             created: i64,
             discoverable: bool,
             #[serde(default)]
@@ -314,6 +359,8 @@ impl<'a> Credential<'a> {
             sign_count: owned.sign_count,
             alg: owned.alg,
             private_key: SecBytes::new(owned.private_key),
+            key_provider: owned.key_provider,
+            key_format_version: owned.key_format_version,
             created: owned.created,
             discoverable: owned.discoverable,
             extensions: owned.extensions,
