@@ -180,6 +180,8 @@ fn provision(
     );
     println!("TPM portable parent provisioned successfully.");
     println!("Persistent handle: 0x{:08X}", metadata.persistent_handle);
+    eprintln!("NOTE: Portable keys use an empty TPM authValue (pre-1.0 limitation).");
+    eprintln!("Security relies on seed secrecy and TPM sealing. See docs/TPM_PORTABLE.md.");
 
     Ok(())
 }
