@@ -1112,6 +1112,31 @@ impl<
         })
     }
 
+    #[cfg(all(feature = "tpm", feature = "agent"))]
+    pub fn with_shared_storage_and_key_provider_and_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        key_provider: K,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Result<Self> {
+        let authenticator = Self::build_authenticator_with_interaction_and_key_provider(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            Some(interaction_manager),
+            key_provider,
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
+            max_uv_retries: pin_config.max_uv_retries,
+        })
+    }
+
     fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
         self.authenticator
             .reset_uv_retries()

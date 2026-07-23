@@ -214,6 +214,8 @@ pub enum AgentStorageConfig {
         #[serde(default = "default_tcti")]
         tcti: String,
         pin_path: PathBuf,
+        #[serde(default)]
+        portable: bool,
     },
 }
 
@@ -260,10 +262,15 @@ impl AgentStorageConfig {
                 gpg_backend: gpg_backend.clone(),
             },
             #[cfg(feature = "tpm")]
-            Self::Tpm { path, tcti, .. } => crate::config::BackendConfig::Tpm {
+            Self::Tpm {
+                path,
+                tcti,
+                portable,
+                ..
+            } => crate::config::BackendConfig::Tpm {
                 path: path.display().to_string(),
                 tcti: tcti.clone(),
-                portable: false,
+                portable: *portable,
             },
         }
     }
@@ -2630,6 +2637,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 path,
                 tcti,
                 pin_path,
+                portable,
             }) => {
                 assert_eq!(path, &PathBuf::from("/var/lib/passless-agent/secure/tpm"));
                 assert_eq!(tcti, "swtpm:path=/tmp/swtpm-sock");
@@ -2637,6 +2645,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     pin_path,
                     &PathBuf::from("/var/lib/passless-agent/secure/pin")
                 );
+                assert!(!portable);
             }
             other => panic!("expected Tpm storage, got: {:?}", other),
         }
@@ -3042,5 +3051,99 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         let pid = ProfileId::new("test").unwrap();
         let err = profile.validate(&pid).unwrap_err();
         assert!(err.to_string().contains("browser_runtime_root"));
+    }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn test_storage_backend_config_conversion_tpm_portable_true() {
+        let storage = AgentStorageConfig::Tpm {
+            path: PathBuf::from("/tmp/tpm-creds"),
+            tcti: "swtpm:host=127.0.0.1,port=2321".to_string(),
+            pin_path: PathBuf::from("/tmp/tpm-pin"),
+            portable: true,
+        };
+        let backend = storage.to_backend_config();
+        match backend {
+            crate::config::BackendConfig::Tpm {
+                path,
+                tcti,
+                portable,
+            } => {
+                assert_eq!(path, "/tmp/tpm-creds");
+                assert_eq!(tcti, "swtpm:host=127.0.0.1,port=2321");
+                assert!(portable);
+            }
+            _ => panic!("expected Tpm backend"),
+        }
+    }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn test_storage_backend_config_conversion_tpm_portable_false() {
+        let storage = AgentStorageConfig::Tpm {
+            path: PathBuf::from("/tmp/tpm-creds"),
+            tcti: "device:/dev/tpmrm0".to_string(),
+            pin_path: PathBuf::from("/tmp/tpm-pin"),
+            portable: false,
+        };
+        let backend = storage.to_backend_config();
+        match backend {
+            crate::config::BackendConfig::Tpm {
+                path,
+                tcti,
+                portable,
+            } => {
+                assert_eq!(path, "/tmp/tpm-creds");
+                assert_eq!(tcti, "device:/dev/tpmrm0");
+                assert!(!portable);
+            }
+            _ => panic!("expected Tpm backend"),
+        }
+    }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn test_snapshot_toml_tpm_storage_portable_true() {
+        let toml_str = r#"
+enabled = true
+
+[profiles.secure]
+mode = "isolated"
+principal_user = "secure-user"
+rp_ids = ["secure.example.com"]
+require_uv = true
+
+[profiles.secure.device]
+name = "agent-secure"
+phys = "secure-phys"
+uniq = "secure-uniq"
+vendor_id = 4660
+product_id = 22139
+
+[profiles.secure.storage.tpm]
+path = "/var/lib/passless-agent/secure/tpm"
+tcti = "swtpm:path=/tmp/swtpm-sock"
+pin_path = "/var/lib/passless-agent/secure/pin"
+portable = true
+"#;
+        let config: AgentConfig = toml::from_str(toml_str).unwrap();
+        let profile = config.profiles.get("secure").unwrap();
+        match &profile.storage {
+            Some(AgentStorageConfig::Tpm {
+                path,
+                tcti,
+                pin_path,
+                portable,
+            }) => {
+                assert_eq!(path, &PathBuf::from("/var/lib/passless-agent/secure/tpm"));
+                assert_eq!(tcti, "swtpm:path=/tmp/swtpm-sock");
+                assert_eq!(
+                    pin_path,
+                    &PathBuf::from("/var/lib/passless-agent/secure/pin")
+                );
+                assert!(*portable);
+            }
+            other => panic!("expected Tpm storage, got: {:?}", other),
+        }
     }
 }
