@@ -34,8 +34,11 @@ provisioned with the same seed ends up with an identical parent key at persisten
 # Generate a fresh random seed, print it ONCE, and provision the parent
 passless tpm provision --generate
 
-# Provision with a seed read from file descriptor N (hex-encoded, 64 chars)
-passless tpm provision --seed-fd 3 3<seed.txt
+# Provision with a seed read from a file (hex-encoded, 64 chars)
+passless tpm provision --seed-file seed.hex
+
+# Provision with a seed piped from stdin (e.g. from password-store)
+pass show fido2/seed | passless tpm provision --seed-stdin
 
 # Interactive prompt (seed is not echoed)
 passless tpm provision
@@ -52,13 +55,17 @@ All commands accept `--tpm-path PATH` and `--tpm-tcti TCTI` to target a specific
 ### Seed input
 
 The recovery seed is a 32-byte value encoded as 64 hexadecimal characters. It is accepted through
-exactly three channels — never as a positional or regular CLI argument:
+exactly four channels — never as a positional or regular CLI argument:
 
 1. `--generate` — the authenticator generates 32 random bytes via the OS CSPRNG, prints the hex
    seed to stderr exactly once, and warns that it will not be shown again.
-2. `--seed-fd N` — the hex seed is read from file descriptor `N`. Useful for scripting and for
-   keeping the seed out of the process argument list and shell history.
-3. Interactive prompt via `rpassword` — the seed is read without echo.
+2. `--seed-file PATH` — the hex seed is read from the first line of the file at `PATH`. A warning
+   is printed if the file has group or other permissions set (recommend `chmod 600`).
+3. `--seed-stdin` — the hex seed is read from stdin. Useful for piping from `pass` or other
+   secret stores: `pass show fido2/seed | passless tpm provision --seed-stdin`.
+4. Interactive prompt via `rpassword` — the seed is read without echo.
+
+`--generate`, `--seed-file`, and `--seed-stdin` are mutually exclusive.
 
 ### What provisioning does
 

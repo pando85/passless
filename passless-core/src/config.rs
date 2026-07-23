@@ -828,13 +828,17 @@ pub enum Commands {
 #[derive(Subcommand, Debug, Clone)]
 pub enum TpmAction {
     /// Provision the portable TPM parent from a recovery seed
+    #[command(group(clap::ArgGroup::new("seed-source").args(["generate", "seed_file", "seed_stdin"])))]
     Provision {
         /// Generate a new random 32-byte recovery seed and print it
         #[arg(long)]
         generate: bool,
-        /// Read the recovery seed (hex) from this file descriptor instead of prompting
-        #[arg(long)]
-        seed_fd: Option<i32>,
+        /// Read the recovery seed (hex) from this file instead of prompting
+        #[arg(long = "seed-file", value_name = "PATH")]
+        seed_file: Option<PathBuf>,
+        /// Read the recovery seed (hex) from stdin instead of prompting
+        #[arg(long = "seed-stdin")]
+        seed_stdin: bool,
         /// TPM storage directory
         #[arg(long = "tpm-path", env = "PASSLESS_TPM_PATH")]
         path: Option<String>,
