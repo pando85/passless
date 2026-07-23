@@ -187,7 +187,6 @@ impl TpmCredentialKeyProvider {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn import_existing_es256_key(
         &self,
         private_scalar: &[u8; 32],
@@ -542,7 +541,6 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
     }
 }
 
-#[allow(dead_code)]
 pub fn compute_public_from_scalar(scalar: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
     use p256::elliptic_curve::PrimeField;
     use p256::elliptic_curve::sec1::ToSec1Point;
@@ -563,13 +561,25 @@ pub fn compute_public_from_scalar(scalar: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>
     let affine = public_point.to_affine();
     let point = affine.to_sec1_point(false);
 
-    let pub_x = point.x().unwrap().to_vec();
-    let pub_y = point.y().unwrap().to_vec();
+    let pub_x = point
+        .x()
+        .ok_or_else(|| {
+            error!("Failed to extract x coordinate from public point");
+            soft_fido2::Error::Other
+        })?
+        .to_vec();
+    let pub_y = point
+        .y()
+        .ok_or_else(|| {
+            error!("Failed to extract y coordinate from public point");
+            soft_fido2::Error::Other
+        })?
+        .to_vec();
 
     Ok((pub_x, pub_y))
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Used by integration tests via lib crate, not by the binary target
 pub fn verify_public_key_matches(
     scalar: &[u8; 32],
     cose_public_key: &[u8],
