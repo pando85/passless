@@ -7,6 +7,7 @@ pub(crate) mod context;
 pub mod kdf;
 pub mod parent;
 pub mod provider;
+pub mod provision;
 pub mod session;
 
 pub use parent::PortableParent;
