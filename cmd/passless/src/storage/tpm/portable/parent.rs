@@ -97,8 +97,11 @@ impl PortableParent {
     pub fn load_metadata(&self) -> Result<PortableParentMetadata> {
         let metadata_path = self.storage_dir.join("portable_parent.json");
         let data = std::fs::read(&metadata_path).map_err(|e| {
-            error!("Failed to read parent metadata: {}", e);
-            soft_fido2::Error::Other
+            error!(
+                "TPM portable parent is not provisioned. Run 'passless tpm provision' first. ({})",
+                e
+            );
+            soft_fido2::Error::InitializationFailed
         })?;
 
         serde_json::from_slice(&data).map_err(|e| {
@@ -125,16 +128,19 @@ impl PortableParent {
             .tr_from_tpm_public(persistent_tpm_handle.into())
             .map_err(|e| {
                 error!(
-                    "Failed to register persistent handle in ESYS context: {}",
+                    "TPM portable parent is not provisioned. Run 'passless tpm provision' first. ({})",
                     e
                 );
-                soft_fido2::Error::Other
+                soft_fido2::Error::InitializationFailed
             })?;
         let persistent_key_handle = tss_esapi::handles::KeyHandle::from(persistent_handle);
 
         let (public_area, name, _) = context.read_public(persistent_key_handle).map_err(|e| {
-            error!("Failed to read persistent parent public area: {}", e);
-            soft_fido2::Error::Other
+            error!(
+                "TPM portable parent is not provisioned. Run 'passless tpm provision' first. ({})",
+                e
+            );
+            soft_fido2::Error::InitializationFailed
         })?;
 
         let expected_public = Public::unmarshall(&metadata.public_blob).map_err(|e| {
@@ -143,13 +149,21 @@ impl PortableParent {
         })?;
 
         if public_area != expected_public {
-            error!("Parent public area mismatch");
-            return Err(soft_fido2::Error::Other);
+            error!(
+                "TPM portable parent key does not match the expected key. \
+                 The TPM may have been cleared or this storage was provisioned with a different seed. \
+                 Re-provision with 'passless tpm provision'."
+            );
+            return Err(soft_fido2::Error::CtapError(0x3D));
         }
 
         if name.value() != metadata.parent_name {
-            error!("Parent name mismatch");
-            return Err(soft_fido2::Error::Other);
+            error!(
+                "TPM portable parent name does not match the expected name. \
+                 The TPM may have been cleared or this storage was provisioned with a different seed. \
+                 Re-provision with 'passless tpm provision'."
+            );
+            return Err(soft_fido2::Error::CtapError(0x3D));
         }
 
         debug!("Parent verification successful");
@@ -229,6 +243,34 @@ impl PortableParent {
             error!("Failed to create persistent TPM handle: {}", e);
             soft_fido2::Error::Other
         })?;
+
+        if let Ok(existing_handle) = context.tr_from_tpm_public(persistent_tpm_handle.into()) {
+            let existing_key_handle = tss_esapi::handles::KeyHandle::from(existing_handle);
+            let (existing_public, _, _) =
+                context.read_public(existing_key_handle).map_err(|e| {
+                    error!(
+                        "Failed to read public area at persistent handle 0x{:08X}: {}",
+                        PARENT_PERSISTENT_HANDLE, e
+                    );
+                    soft_fido2::Error::Other
+                })?;
+
+            if existing_public != parent_public {
+                error!(
+                    "Persistent handle 0x{:08X} is occupied by a foreign object. \
+                     Refusing to evict unknown object. \
+                     Clear the handle manually or use a different TPM.",
+                    PARENT_PERSISTENT_HANDLE
+                );
+                return Err(soft_fido2::Error::DoesAlreadyExist);
+            }
+
+            debug!(
+                "Persistent handle 0x{:08X} already holds the expected parent, proceeding",
+                PARENT_PERSISTENT_HANDLE
+            );
+        }
+
         let persistent = Persistent::from(persistent_tpm_handle);
 
         context
