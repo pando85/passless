@@ -4,6 +4,7 @@
 //! that enables credential key portability across TPMs.
 
 use super::kdf;
+use super::session;
 
 use soft_fido2::Result;
 
@@ -211,21 +212,20 @@ impl PortableParent {
         let (duplicate, in_sym_seed) =
             wrap_for_import(&material, &prim_x, &prim_y, &parent_public)?;
 
-        let imported_private = context
-            .execute_with_session(Some(AuthSession::Password), |ctx| {
-                ctx.import(
-                    temp_primary.into(),
-                    None,
-                    parent_public.clone(),
-                    duplicate,
-                    in_sym_seed,
-                    SymmetricDefinitionObject::Null,
-                )
-            })
+        let imported_private = session::execute_with_encrypted_session(&mut context, |ctx| {
+            ctx.import(
+                temp_primary.into(),
+                None,
+                parent_public.clone(),
+                duplicate,
+                in_sym_seed,
+                SymmetricDefinitionObject::Null,
+            )
             .map_err(|e| {
                 error!("Failed to import parent key: {}", e);
                 soft_fido2::Error::Other
-            })?;
+            })
+        })?;
 
         let loaded_handle = context
             .execute_with_nullauth_session(|ctx| {

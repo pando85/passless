@@ -3,6 +3,7 @@
 //! Implements the `CredentialKeyProvider` trait for TPM-resident credential keys.
 
 use super::parent::{self, PortableParent};
+use super::session;
 
 use soft_fido2::Result;
 use soft_fido2_ctap::SecBytes;
@@ -259,21 +260,20 @@ impl TpmCredentialKeyProvider {
             &child_public,
         )?;
 
-        let imported_private = context
-            .execute_with_nullauth_session(|ctx| {
-                ctx.import(
-                    parent_handle.into(),
-                    None,
-                    child_public.clone(),
-                    duplicate,
-                    in_sym_seed,
-                    SymmetricDefinitionObject::Null,
-                )
-            })
+        let imported_private = session::execute_with_encrypted_session(&mut context, |ctx| {
+            ctx.import(
+                parent_handle.into(),
+                None,
+                child_public.clone(),
+                duplicate,
+                in_sym_seed,
+                SymmetricDefinitionObject::Null,
+            )
             .map_err(|e| {
                 error!("Failed to import child key: {}", e);
                 soft_fido2::Error::Other
-            })?;
+            })
+        })?;
 
         let public_blob = child_public.marshall().map_err(|e| {
             error!("Failed to marshall child public: {}", e);
@@ -336,14 +336,13 @@ impl TpmCredentialKeyProvider {
 
         let key_public = build_signing_key_public()?;
 
-        let create_result = context
-            .execute_with_nullauth_session(|ctx| {
-                ctx.create(parent_handle, key_public, None, None, None, None)
-            })
-            .map_err(|e| {
-                error!("Failed to create signing key: {}", e);
-                soft_fido2::Error::Other
-            })?;
+        let create_result = session::execute_with_encrypted_session(&mut context, |ctx| {
+            ctx.create(parent_handle, key_public, None, None, None, None)
+                .map_err(|e| {
+                    error!("Failed to create signing key: {}", e);
+                    soft_fido2::Error::Other
+                })
+        })?;
 
         let public_blob = create_result.out_public.marshall().map_err(|e| {
             error!("Failed to marshall signing key public: {}", e);

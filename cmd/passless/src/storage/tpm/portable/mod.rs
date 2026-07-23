@@ -6,6 +6,7 @@
 pub mod kdf;
 pub mod parent;
 pub mod provider;
+pub mod session;
 
 pub use parent::PortableParent;
 pub use provider::TpmCredentialKeyProvider;
