@@ -19,8 +19,9 @@ use tss_esapi::interface_types::resource_handles::Provision;
 use tss_esapi::interface_types::session_handles::AuthSession;
 use tss_esapi::interface_types::{algorithm::HashingAlgorithm, resource_handles::Hierarchy};
 use tss_esapi::structures::{
-    EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, Public, PublicBuilder,
-    PublicEccParametersBuilder, Sensitive, SensitiveBuffer, SymmetricDefinitionObject,
+    EccParameter, EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, Public,
+    PublicBuilder, PublicEccParametersBuilder, Sensitive, SensitiveBuffer,
+    SymmetricDefinitionObject,
 };
 use tss_esapi::traits::{Marshall, UnMarshall};
 use zeroize::Zeroizing;
@@ -565,6 +566,160 @@ pub fn compute_name(tpmt_public: &[u8]) -> Vec<u8> {
     name.extend_from_slice(&0x000Bu16.to_be_bytes());
     name.extend_from_slice(&sha2::Sha256::digest(tpmt_public));
     name
+}
+
+#[allow(dead_code)]
+pub fn build_import_child_public(pub_x: &[u8], pub_y: &[u8]) -> Result<Public> {
+    let object_attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(false)
+        .with_fixed_parent(false)
+        .with_sensitive_data_origin(false)
+        .with_user_with_auth(true)
+        .with_sign_encrypt(true)
+        .with_restricted(false)
+        .build()
+        .map_err(|e| {
+            error!("Failed to build import child object attributes: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+    let ecc_params = PublicEccParametersBuilder::new()
+        .with_symmetric(SymmetricDefinitionObject::Null)
+        .with_ecc_scheme(EccScheme::EcDsa(HashScheme::new(HashingAlgorithm::Sha256)))
+        .with_curve(EccCurve::NistP256)
+        .with_is_signing_key(true)
+        .with_is_decryption_key(false)
+        .with_restricted(false)
+        .with_key_derivation_function_scheme(KeyDerivationFunctionScheme::Null)
+        .build()
+        .map_err(|e| {
+            error!("Failed to build import child ECC parameters: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+    let x_param = EccParameter::try_from(pub_x.to_vec()).map_err(|e| {
+        error!("Failed to create EccParameter for x: {}", e);
+        soft_fido2::Error::Other
+    })?;
+
+    let y_param = EccParameter::try_from(pub_y.to_vec()).map_err(|e| {
+        error!("Failed to create EccParameter for y: {}", e);
+        soft_fido2::Error::Other
+    })?;
+
+    let unique = EccPoint::new(x_param, y_param);
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::Ecc)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(object_attributes)
+        .with_ecc_parameters(ecc_params)
+        .with_ecc_unique_identifier(unique)
+        .build()
+        .map_err(|e| {
+            error!("Failed to build import child public: {}", e);
+            soft_fido2::Error::Other
+        })
+}
+
+#[allow(dead_code)]
+pub fn wrap_child_for_import(
+    private_scalar: &[u8],
+    seed_value: &[u8],
+    parent_pub_x: &[u8],
+    parent_pub_y: &[u8],
+    child_public: &Public,
+) -> Result<(
+    tss_esapi::structures::Private,
+    tss_esapi::structures::EncryptedSecret,
+)> {
+    use p256::PublicKey;
+    use p256::ecdh::EphemeralSecret;
+    use p256::elliptic_curve::Generate;
+    use p256::elliptic_curve::sec1::ToSec1Point;
+
+    let eph_secret = EphemeralSecret::generate();
+    let eph_public = eph_secret.public_key();
+    let eph_point = eph_public.to_sec1_point(false);
+    let eph_x = eph_point.x().unwrap();
+    let eph_y = eph_point.y().unwrap();
+
+    let parent_pub_key = PublicKey::from_sec1_bytes(&{
+        let mut bytes = vec![0x04];
+        bytes.extend_from_slice(parent_pub_x);
+        bytes.extend_from_slice(parent_pub_y);
+        bytes
+    })
+    .map_err(|e| {
+        error!("Failed to parse parent public key for child import: {}", e);
+        soft_fido2::Error::Other
+    })?;
+
+    let shared_secret = eph_secret.diffie_hellman(&parent_pub_key);
+    let z = shared_secret.raw_secret_bytes();
+
+    let label = b"DUPLICATE\x00";
+    let seed = kdf::kdfe(z, label, eph_x, parent_pub_x, 256);
+
+    let child_tpmt = child_public.marshall().map_err(|e| {
+        error!("Failed to marshall child public: {}", e);
+        soft_fido2::Error::Other
+    })?;
+
+    let name = compute_name(&child_tpmt);
+
+    let sensitive = Sensitive::Ecc {
+        auth_value: tss_esapi::structures::Auth::default(),
+        seed_value: tss_esapi::structures::Digest::try_from(seed_value).map_err(|e| {
+            error!("Failed to create Digest for child seed_value: {}", e);
+            soft_fido2::Error::Other
+        })?,
+        sensitive: EccParameter::try_from(private_scalar.to_vec()).map_err(|e| {
+            error!("Failed to create EccParameter for child scalar: {}", e);
+            soft_fido2::Error::Other
+        })?,
+    };
+
+    let sensb = SensitiveBuffer::try_from(sensitive)
+        .map_err(|e| {
+            error!("Failed to create SensitiveBuffer for child: {}", e);
+            soft_fido2::Error::Other
+        })?
+        .marshall()
+        .map_err(|e| {
+            error!("Failed to marshall child SensitiveBuffer: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+    let outerkey = kdf::kdfa(&seed, b"STORAGE", &name, b"", 128);
+    let dupsens = kdf::aes_128_cfb_encrypt(&outerkey, &sensb);
+
+    let hmackey = kdf::kdfa(&seed, b"INTEGRITY", b"", b"", 256);
+    let hmac_data = kdf::hmac_sha256(&hmackey, &[dupsens.as_slice(), &name].concat());
+
+    let mut duplicate_bytes = Vec::new();
+    duplicate_bytes.extend_from_slice(&(hmac_data.len() as u16).to_be_bytes());
+    duplicate_bytes.extend_from_slice(&hmac_data);
+    duplicate_bytes.extend_from_slice(&dupsens);
+
+    let duplicate = tss_esapi::structures::Private::try_from(duplicate_bytes).map_err(|e| {
+        error!("Failed to create Private from child duplicate: {}", e);
+        soft_fido2::Error::Other
+    })?;
+
+    let mut in_sym_seed_content = Vec::new();
+    in_sym_seed_content.extend_from_slice(&(eph_x.len() as u16).to_be_bytes());
+    in_sym_seed_content.extend_from_slice(eph_x);
+    in_sym_seed_content.extend_from_slice(&(eph_y.len() as u16).to_be_bytes());
+    in_sym_seed_content.extend_from_slice(eph_y);
+
+    let in_sym_seed = tss_esapi::structures::EncryptedSecret::try_from(in_sym_seed_content)
+        .map_err(|e| {
+            error!("Failed to create EncryptedSecret for child: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+    Ok((duplicate, in_sym_seed))
 }
 
 /// Create a temporary primary key for import operations

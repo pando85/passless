@@ -78,6 +78,131 @@ impl TpmCredentialKeyProvider {
         self.parent.is_provisioned()
     }
 
+    #[allow(dead_code)]
+    pub fn import_existing_es256_key(
+        &self,
+        private_scalar: &[u8; 32],
+    ) -> Result<GeneratedCredentialKey> {
+        debug!("Importing existing ES256 key into TPM");
+
+        let (pub_x, pub_y) = compute_public_from_scalar(private_scalar)?;
+
+        let metadata = self.parent.load_metadata()?;
+        self.parent.verify_parent(&metadata)?;
+
+        let mut context = self.context.lock().map_err(|e| {
+            error!("Failed to lock TPM context: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+        let parent_tpm_handle =
+            tss_esapi::handles::PersistentTpmHandle::new(metadata.persistent_handle)
+                .map_err(|_| soft_fido2::Error::Other)?;
+        let parent_obj = context
+            .tr_from_tpm_public(parent_tpm_handle.into())
+            .map_err(|e| {
+                error!("Failed to register parent handle: {}", e);
+                soft_fido2::Error::Other
+            })?;
+        let parent_handle = tss_esapi::handles::KeyHandle::from(parent_obj);
+
+        let (parent_pub, _, _) = context.read_public(parent_handle).map_err(|e| {
+            error!("Failed to read parent public: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+        let (parent_x, parent_y) = match &parent_pub {
+            Public::Ecc { unique, .. } => {
+                let x = unique.x().value().to_vec();
+                let y = unique.y().value().to_vec();
+                let mut x_padded = vec![0u8; 32];
+                let x_start = 32 - x.len();
+                x_padded[x_start..].copy_from_slice(&x);
+                let mut y_padded = vec![0u8; 32];
+                let y_start = 32 - y.len();
+                y_padded[y_start..].copy_from_slice(&y);
+                (x_padded, y_padded)
+            }
+            _ => {
+                error!("Expected ECC parent public key");
+                return Err(soft_fido2::Error::Other);
+            }
+        };
+
+        let child_public = parent::build_import_child_public(&pub_x, &pub_y)?;
+
+        let mut child_seed = zeroize::Zeroizing::new(vec![0u8; 32]);
+        {
+            use hkdf::Hkdf;
+            use sha2::Sha256;
+            let hkdf = Hkdf::<Sha256>::new(Some(b"passless.child-seed"), private_scalar);
+            hkdf.expand(b"child-import-seed", &mut child_seed)
+                .map_err(|e| {
+                    error!("HKDF expand failed for child seed: {}", e);
+                    soft_fido2::Error::Other
+                })?;
+        }
+
+        let (duplicate, in_sym_seed) = parent::wrap_child_for_import(
+            private_scalar,
+            &child_seed,
+            &parent_x,
+            &parent_y,
+            &child_public,
+        )?;
+
+        let imported_private = context
+            .execute_with_nullauth_session(|ctx| {
+                ctx.import(
+                    parent_handle.into(),
+                    None,
+                    child_public.clone(),
+                    duplicate,
+                    in_sym_seed,
+                    SymmetricDefinitionObject::Null,
+                )
+            })
+            .map_err(|e| {
+                error!("Failed to import child key: {}", e);
+                soft_fido2::Error::Other
+            })?;
+
+        let public_blob = child_public.marshall().map_err(|e| {
+            error!("Failed to marshall child public: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+        let private_blob = imported_private.value().to_vec();
+
+        let mut cose_public_key = vec![0x04];
+        cose_public_key.extend_from_slice(&pub_x);
+        cose_public_key.extend_from_slice(&pub_y);
+
+        let material = TpmKeyMaterial {
+            public_blob,
+            private_blob,
+            cose_public_key: cose_public_key.clone(),
+        };
+
+        let material_bytes = serde_json::to_vec(&material).map_err(|e| {
+            error!("Failed to serialize imported key material: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+        let key = CredentialKey::new(
+            CredentialKeyProviderId::new(parent::PROVIDER_ID),
+            parent::FORMAT_VERSION,
+            SecBytes::from_slice(&material_bytes),
+        );
+
+        debug!("Imported existing ES256 key into TPM");
+
+        Ok(GeneratedCredentialKey {
+            key,
+            cose_public_key,
+        })
+    }
+
     /// Generate a new ES256 credential key inside the TPM
     fn generate_es256_key(&self) -> Result<GeneratedCredentialKey> {
         debug!("Generating ES256 credential key in TPM");
@@ -307,7 +432,48 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
     }
 }
 
-/// Build the public template for a credential signing key
+#[allow(dead_code)]
+pub fn compute_public_from_scalar(scalar: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
+    use p256::elliptic_curve::PrimeField;
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use p256::{ProjectivePoint, Scalar};
+
+    let field_bytes = p256::FieldBytes::try_from(scalar.as_slice()).map_err(|_| {
+        error!("Failed to create FieldBytes from scalar");
+        soft_fido2::Error::Other
+    })?;
+    let scalar_val = Scalar::from_repr(field_bytes)
+        .into_option()
+        .ok_or_else(|| {
+            error!("Scalar is not valid for P-256");
+            soft_fido2::Error::Other
+        })?;
+
+    let public_point = ProjectivePoint::GENERATOR * scalar_val;
+    let affine = public_point.to_affine();
+    let point = affine.to_sec1_point(false);
+
+    let pub_x = point.x().unwrap().to_vec();
+    let pub_y = point.y().unwrap().to_vec();
+
+    Ok((pub_x, pub_y))
+}
+
+#[allow(dead_code)]
+pub fn verify_public_key_matches(
+    scalar: &[u8; 32],
+    cose_public_key: &[u8],
+) -> core::result::Result<bool, CredentialKeyError> {
+    let (pub_x, pub_y) =
+        compute_public_from_scalar(scalar).map_err(|_| CredentialKeyError::InvalidKeyMaterial)?;
+
+    let mut expected = vec![0x04];
+    expected.extend_from_slice(&pub_x);
+    expected.extend_from_slice(&pub_y);
+
+    Ok(expected == cose_public_key)
+}
+
 fn build_signing_key_public() -> Result<Public> {
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(false)
@@ -395,9 +561,6 @@ fn validate_signing_template(public: &Public) -> core::result::Result<(), Creden
                 return Err(CredentialKeyError::InvalidKeyMaterial);
             }
             if attrs.fixed_parent() {
-                return Err(CredentialKeyError::InvalidKeyMaterial);
-            }
-            if !attrs.sensitive_data_origin() {
                 return Err(CredentialKeyError::InvalidKeyMaterial);
             }
             if !attrs.user_with_auth() {

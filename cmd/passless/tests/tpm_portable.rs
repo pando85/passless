@@ -215,3 +215,104 @@ fn test_tpm_portable_provision_and_sign() {
     let result = provider_a.sign(&tampered_key, -7, message);
     assert!(result.is_err());
 }
+
+#[test]
+fn test_tpm_portable_import_existing_key() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let swtpm = SwtpmInstance::new((23412, 23411));
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let storage_dir = dir.path().to_path_buf();
+
+    let parent =
+        PortableParent::new(storage_dir.clone(), Some(swtpm.tcti())).expect("create parent");
+
+    let seed = [0x42u8; 32];
+    parent.provision(&seed).expect("provision");
+    assert!(parent.is_provisioned());
+
+    let provider = TpmCredentialKeyProvider::new(storage_dir.clone(), Some(swtpm.tcti()))
+        .expect("create provider");
+
+    let test_scalar: [u8; 32] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32,
+        0x10, 0x0A, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0x60, 0x71, 0x82, 0x93, 0xA4, 0xB5, 0xC6, 0xD7,
+        0xE8, 0xF9,
+    ];
+
+    let (expected_x, expected_y) =
+        passless_rs::storage::tpm::portable::provider::compute_public_from_scalar(&test_scalar)
+            .expect("compute public from scalar");
+
+    let mut expected_cose = vec![0x04];
+    expected_cose.extend_from_slice(&expected_x);
+    expected_cose.extend_from_slice(&expected_y);
+
+    let imported = provider
+        .import_existing_es256_key(&test_scalar)
+        .expect("import existing key");
+
+    assert_eq!(imported.cose_public_key.len(), 65);
+    assert_eq!(imported.cose_public_key[0], 0x04);
+    assert_eq!(imported.cose_public_key, expected_cose);
+
+    let key_material: serde_json::Value =
+        serde_json::from_slice(imported.key.material.as_slice()).expect("parse material");
+    let public_blob: Vec<u8> =
+        serde_json::from_value(key_material["public_blob"].clone()).expect("parse public_blob");
+
+    use tss_esapi::structures::Public;
+    use tss_esapi::traits::UnMarshall;
+    let tpm_public = Public::unmarshall(&public_blob).expect("unmarshall public");
+
+    match &tpm_public {
+        Public::Ecc { unique, .. } => {
+            let tpm_x = unique.x().value();
+            let tpm_y = unique.y().value();
+
+            let mut tpm_x_padded = vec![0u8; 32];
+            let x_start = 32 - tpm_x.len();
+            tpm_x_padded[x_start..].copy_from_slice(tpm_x);
+
+            let mut tpm_y_padded = vec![0u8; 32];
+            let y_start = 32 - tpm_y.len();
+            tpm_y_padded[y_start..].copy_from_slice(tpm_y);
+
+            assert_eq!(
+                tpm_x_padded, expected_x,
+                "TPM public X must match recomputed X"
+            );
+            assert_eq!(
+                tpm_y_padded, expected_y,
+                "TPM public Y must match recomputed Y"
+            );
+        }
+        _ => panic!("Expected ECC public"),
+    }
+
+    let message = b"test import message";
+    let signature = provider
+        .sign(&imported.key, -7, message)
+        .expect("sign with imported key");
+
+    assert!(!signature.is_empty());
+    assert_eq!(signature[0], 0x30);
+
+    use p256::PublicKey;
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+    let public_key =
+        PublicKey::from_sec1_bytes(&imported.cose_public_key).expect("valid public key");
+    let verifying_key = VerifyingKey::from(&public_key);
+    let sig = Signature::from_der(&signature).expect("parse DER signature");
+    verifying_key
+        .verify(message, &sig)
+        .expect("verify signature with imported key");
+
+    let matches = passless_rs::storage::tpm::portable::provider::verify_public_key_matches(
+        &test_scalar,
+        &imported.cose_public_key,
+    )
+    .expect("verify public key match");
+    assert!(matches, "recomputed public must match stored COSE key");
+}
