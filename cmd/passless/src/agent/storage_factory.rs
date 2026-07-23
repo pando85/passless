@@ -2122,7 +2122,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_composition_full_flow() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM composition validation requires a usable swtpm");
@@ -2151,7 +2150,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_profile_isolation() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM profile validation requires a usable swtpm");
@@ -2188,7 +2186,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_cleanup_propagation() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM cleanup validation requires a usable swtpm");
@@ -2212,7 +2209,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_portable_missing_parent_errors() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM portable validation requires a usable swtpm");
@@ -2240,7 +2236,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_portable_provisioned_bundle_has_key_provider() {
                 use crate::storage::tpm::portable::PortableParent;
                 use std::os::unix::fs::PermissionsExt;
