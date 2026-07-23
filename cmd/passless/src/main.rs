@@ -557,29 +557,12 @@ fn run() -> Result<()> {
                     portable,
                 } => {
                     if portable {
-                        use storage::tpm::portable::TpmCredentialKeyProvider;
+                        use storage::tpm::portable::build_portable_bundle;
 
-                        let provider =
-                            TpmCredentialKeyProvider::new(path.clone().into(), Some(tcti.clone()))
-                                .map_err(|e| {
-                                    Error::Other(format!(
-                                        "Failed to create TPM key provider: {:?}",
-                                        e
-                                    ))
-                                })?;
-                        if !provider.is_ready() {
-                            return Err(Error::Other(
-                                "TPM portable parent is not provisioned. Run: passless tpm provision".to_string(),
-                            ));
-                        }
-                        let storage = TpmStorageAdapter::new_portable(
-                            path.clone().into(),
-                            Some(tcti.clone()),
-                            allow_storage_creation,
-                        )?;
+                        let (provider, storage, pin_storage) =
+                            build_portable_bundle(path.into(), Some(tcti), allow_storage_creation)?;
                         let boxed: Box<dyn CredentialStorage> = Box::new(storage);
                         let shared_storage = Arc::new(Mutex::new(boxed));
-                        let pin_storage = TpmPinStorage::new_portable(path.into(), Some(tcti));
                         let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
                             Arc::new(Mutex::new(Box::new(pin_storage)));
                         let service = AuthenticatorService::with_shared_storage_and_key_provider(
@@ -772,25 +755,10 @@ fn run() -> Result<()> {
                 portable,
             } => {
                 if portable {
-                    use storage::tpm::portable::TpmCredentialKeyProvider;
+                    use storage::tpm::portable::build_portable_bundle;
 
-                    let provider =
-                        TpmCredentialKeyProvider::new(path.clone().into(), Some(tcti.clone()))
-                            .map_err(|e| {
-                                Error::Other(format!("Failed to create TPM key provider: {:?}", e))
-                            })?;
-                    if !provider.is_ready() {
-                        return Err(Error::Other(
-                            "TPM portable parent is not provisioned. Run: passless tpm provision"
-                                .to_string(),
-                        ));
-                    }
-                    let storage = TpmStorageAdapter::new_portable(
-                        path.clone().into(),
-                        Some(tcti.clone()),
-                        allow_storage_creation,
-                    )?;
-                    let pin_storage = TpmPinStorage::new_portable(path.into(), Some(tcti));
+                    let (provider, storage, pin_storage) =
+                        build_portable_bundle(path.into(), Some(tcti), allow_storage_creation)?;
                     let pin_storage = Arc::new(Mutex::new(pin_storage));
                     let service = AuthenticatorService::with_pin_storage_and_key_provider(
                         storage,
