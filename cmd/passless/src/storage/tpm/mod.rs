@@ -21,7 +21,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use log::{debug, info};
 use rand::RngCore;
@@ -66,6 +66,106 @@ struct SealedBlob {
     tpm_private: Vec<u8>,
     /// The public part of the TPM-sealed encryption key
     tpm_public: Vec<u8>,
+}
+
+/// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256)
+const COSE_ALG_ES256: i32 = -7;
+
+fn aes_gcm_encrypt_with_aad(
+    key: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| {
+        log::error!("Failed to create AES cipher: {}", e);
+        soft_fido2::Error::Other
+    })?;
+    let nonce = Nonce::try_from(nonce).expect("valid nonce length");
+    cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| {
+            log::error!("Failed to encrypt data with AES-GCM: {}", e);
+            soft_fido2::Error::Other
+        })
+}
+
+fn aes_gcm_decrypt_with_aad(
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| {
+        log::error!("Failed to create AES cipher: {}", e);
+        soft_fido2::Error::Other
+    })?;
+    let nonce = Nonce::try_from(nonce).expect("valid nonce length");
+    cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| {
+            log::error!("Failed to decrypt data with AES-GCM: {}", e);
+            soft_fido2::Error::Other
+        })
+}
+
+fn build_metadata_aad(credential_id: &[u8], rp_id: &str) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+    aad.extend_from_slice(credential_id);
+    aad.extend_from_slice(&(rp_id.len() as u16).to_be_bytes());
+    aad.extend_from_slice(rp_id.as_bytes());
+    aad.extend_from_slice(&COSE_ALG_ES256.to_be_bytes());
+    aad.extend_from_slice(&portable::parent::FORMAT_VERSION.to_be_bytes());
+    aad
+}
+
+fn build_aad_from_path(path: &Path, storage_dir: &Path) -> Result<Vec<u8>> {
+    let rel = path.strip_prefix(storage_dir).map_err(|_| {
+        log::error!("Failed to strip storage_dir prefix from credential path");
+        soft_fido2::Error::Other
+    })?;
+    let components: Vec<_> = rel.components().collect();
+    if components.len() != 2 {
+        log::error!("Unexpected credential path structure: {:?}", path);
+        return Err(soft_fido2::Error::Other);
+    }
+    let rp_id = components[0].as_os_str().to_str().ok_or_else(|| {
+        log::error!("Non-UTF8 RP ID in path");
+        soft_fido2::Error::Other
+    })?;
+    let cred_id_hex = components[1].as_os_str().to_str().ok_or_else(|| {
+        log::error!("Non-UTF8 credential ID in path");
+        soft_fido2::Error::Other
+    })?;
+    let cred_id_hex = cred_id_hex.strip_suffix(".tpm").ok_or_else(|| {
+        log::error!("Missing .tpm extension in path");
+        soft_fido2::Error::Other
+    })?;
+    let cred_id = hex::decode(cred_id_hex).map_err(|e| {
+        log::error!("Failed to decode credential ID hex: {}", e);
+        soft_fido2::Error::Other
+    })?;
+    let mut aad = Vec::new();
+    aad.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());
+    aad.extend_from_slice(&cred_id);
+    aad.extend_from_slice(&(rp_id.len() as u16).to_be_bytes());
+    aad.extend_from_slice(rp_id.as_bytes());
+    aad.extend_from_slice(&COSE_ALG_ES256.to_be_bytes());
+    aad.extend_from_slice(&portable::parent::FORMAT_VERSION.to_be_bytes());
+    Ok(aad)
 }
 
 impl TpmStorageAdapter {
@@ -326,48 +426,28 @@ impl TpmStorageAdapter {
     ///
     /// Uses AES-256-GCM to encrypt the data, then seals only the encryption key with TPM.
     /// This avoids TPM size limits on sealed data (typically 128 bytes).
-    pub fn seal_data(&self, data: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// The `aad` parameter provides additional authenticated data bound into the AES-GCM
+    /// ciphertext. For the portable path, callers pass credential-specific AAD (cred ID,
+    /// RP ID, algorithm, provider version); the TPM public blob is appended internally.
+    /// For the legacy path, pass an empty slice.
+    pub fn seal_data(&self, data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         debug!("Sealing {} bytes with TPM (hybrid encryption)", data.len());
 
-        // Generate a random 256-bit AES key
         let mut aes_key = [0u8; 32];
         OsRng.fill_bytes(&mut aes_key);
 
-        // Generate a random 96-bit nonce for AES-GCM
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::try_from(&nonce_bytes[..]).expect("valid nonce length");
 
-        // Encrypt the credential data with AES-GCM
-        let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
-            log::error!("Failed to create AES cipher: {}", e);
-            soft_fido2::Error::Other
-        })?;
-
-        let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
-            log::error!("Failed to encrypt data with AES-GCM: {}", e);
-            soft_fido2::Error::Other
-        })?;
-
-        debug!(
-            "Encrypted {} bytes to {} bytes, now sealing 32-byte AES key with TPM",
-            data.len(),
-            encrypted_data.len()
-        );
-
-        // Now seal only the AES key (32 bytes) with TPM
         let mut context = self.context.lock().map_err(|e| {
             log::error!("Failed to lock TPM context: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        // Get the sealing parent handle
         let parent_key = self.sealing_parent_handle(&mut context)?;
-
-        // Create sealing object public
         let sealing_pub = self.create_sealing_public()?;
 
-        // Create the sealed object with the AES key
         let sensitive_data = tss_esapi::structures::SensitiveData::try_from(aes_key.to_vec())
             .map_err(|e| {
                 log::error!("Failed to create sensitive data for AES key: {}", e);
@@ -388,10 +468,6 @@ impl TpmStorageAdapter {
                 soft_fido2::Error::Other
             })?;
 
-        // Flush the parent key handle
-        // For legacy (transient primary): releases the key from TPM memory
-        // For portable (persistent): persistent handles cannot be flushed;
-        // the ESYS_TR reference is automatically cleaned up when the context is dropped
         if !self.portable {
             context.flush_context(parent_key.into()).map_err(|e| {
                 log::error!("Failed to flush parent key: {}", e);
@@ -400,18 +476,14 @@ impl TpmStorageAdapter {
         }
 
         let private_tpm: TPM2B_PRIVATE = create_result.out_private.into();
-        // Store just the actual data, not the whole buffer
         let private_bytes = private_tpm.buffer[..private_tpm.size as usize].to_vec();
 
-        // Store the public area
         let public_bytes = if self.portable {
-            // Portable mode: use proper marshaling (no unsafe)
             create_result.out_public.marshall().map_err(|e| {
                 log::error!("Failed to marshall public area: {}", e);
                 soft_fido2::Error::Other
             })?
         } else {
-            // Legacy mode: use the existing unsafe raw dump for backward compatibility
             #[allow(clippy::unnecessary_fallible_conversions)]
             let public_tpm: TPM2B_PUBLIC = create_result.out_public.try_into().map_err(|e| {
                 log::error!("Failed to convert public to TPM2B: {:?}", e);
@@ -424,6 +496,19 @@ impl TpmStorageAdapter {
             }
         };
 
+        let mut full_aad = Vec::with_capacity(aad.len() + public_bytes.len());
+        full_aad.extend_from_slice(aad);
+        full_aad.extend_from_slice(&public_bytes);
+
+        let encrypted_data = aes_gcm_encrypt_with_aad(&aes_key, &nonce_bytes, data, &full_aad)?;
+
+        debug!(
+            "Encrypted {} bytes to {} bytes with AAD ({} bytes)",
+            data.len(),
+            encrypted_data.len(),
+            full_aad.len()
+        );
+
         let sealed_blob = SealedBlob {
             encrypted_data,
             nonce: nonce_bytes.to_vec(),
@@ -431,8 +516,6 @@ impl TpmStorageAdapter {
             tpm_public: public_bytes,
         };
 
-        // Serialize the blob to JSON
-        // Use Zeroizing to ensure the serialization buffer is cleared from memory after use
         let serialized = Zeroizing::new(serde_json::to_vec(&sealed_blob).map_err(|e| {
             log::error!("Failed to serialize sealed blob: {}", e);
             soft_fido2::Error::Other
@@ -444,7 +527,11 @@ impl TpmStorageAdapter {
     /// Unseal data using TPM with hybrid decryption
     ///
     /// Unseals the AES key from TPM, then decrypts the data with AES-GCM.
-    pub fn unseal_data(&self, sealed_data: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// The `aad` parameter must match what was passed to `seal_data`. For the portable
+    /// path, callers pass credential-specific AAD; the TPM public blob from the sealed
+    /// blob is appended internally. For the legacy path, pass an empty slice.
+    pub fn unseal_data(&self, sealed_data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         debug!("Unsealing data with TPM (hybrid decryption)");
 
         let mut context = self.context.lock().map_err(|e| {
@@ -472,13 +559,11 @@ impl TpmStorageAdapter {
         })?;
 
         let public = if self.portable {
-            // Portable mode: use proper unmarshaling (no unsafe)
             Public::unmarshall(&sealed_blob.tpm_public).map_err(|e| {
                 log::error!("Failed to unmarshall public area: {}", e);
                 soft_fido2::Error::Other
             })?
         } else {
-            // Legacy mode: use the existing unsafe reconstruction for backward compatibility
             let public_tpm: TPM2B_PUBLIC = unsafe {
                 let mut public_struct: TPM2B_PUBLIC = std::mem::zeroed();
                 let ptr = &mut public_struct as *mut TPM2B_PUBLIC as *mut u8;
@@ -499,25 +584,21 @@ impl TpmStorageAdapter {
             })?
         };
 
-        // Load the sealed object
         let sealed_handle = context.load(parent_key, private, public).map_err(|e| {
             log::error!("Failed to load sealed object: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        // Unseal the AES key from TPM
         let unsealed_key = context.unseal(sealed_handle.into()).map_err(|e| {
             log::error!("Failed to unseal AES key: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        // Flush handles
         context.flush_context(sealed_handle.into()).map_err(|e| {
             log::error!("Failed to flush sealed handle: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        // Flush parent key (only for legacy transient primary)
         if !self.portable {
             context.flush_context(parent_key.into()).map_err(|e| {
                 log::error!("Failed to flush parent key: {}", e);
@@ -525,10 +606,8 @@ impl TpmStorageAdapter {
             })?;
         }
 
-        // Drop the mutex before AES decryption
         drop(context);
 
-        // Extract the AES key
         let aes_key = unsealed_key.value();
         if aes_key.len() != 32 {
             log::error!(
@@ -538,19 +617,16 @@ impl TpmStorageAdapter {
             return Err(soft_fido2::Error::Other);
         }
 
-        // Decrypt the data with AES-GCM
-        let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
-        let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
-            log::error!("Failed to create AES cipher: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut full_aad = Vec::with_capacity(aad.len() + sealed_blob.tpm_public.len());
+        full_aad.extend_from_slice(aad);
+        full_aad.extend_from_slice(&sealed_blob.tpm_public);
 
-        let decrypted_data = cipher
-            .decrypt(&nonce, sealed_blob.encrypted_data.as_ref())
-            .map_err(|e| {
-                log::error!("Failed to decrypt data with AES-GCM: {}", e);
-                soft_fido2::Error::Other
-            })?;
+        let decrypted_data = aes_gcm_decrypt_with_aad(
+            aes_key,
+            &sealed_blob.nonce,
+            &sealed_blob.encrypted_data,
+            &full_aad,
+        )?;
 
         debug!("Successfully decrypted {} bytes", decrypted_data.len());
 
@@ -574,11 +650,14 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        // Unseal the data using TPM
-        // Use Zeroizing to ensure the unsealed data is cleared from memory after use
-        let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data)?);
+        let aad = if self.portable {
+            build_aad_from_path(path, &self.storage_dir)?
+        } else {
+            Vec::new()
+        };
 
-        // Load using auto format (tries our format, falls back to soft-fido2 format)
+        let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data, &aad)?);
+
         Credential::from_bytes(&unsealed_data).map(|cred| cred.to_soft_fido2())
     }
 
@@ -599,10 +678,7 @@ impl TpmStorageAdapter {
             path
         );
 
-        // Evict expired entries before adding new one
         self.cache.evict_expired();
-
-        // If cache is full, evict oldest entry
         self.cache.evict_oldest_if_full();
 
         let mut file = File::open(path).map_err(|e| {
@@ -616,14 +692,16 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        // Unseal the data using TPM
-        // Use Zeroizing to ensure the unsealed data is cleared from memory after use
-        let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data)?);
+        let aad = if self.portable {
+            build_aad_from_path(path, &self.storage_dir)?
+        } else {
+            Vec::new()
+        };
 
-        // Load using auto format (tries our format, falls back to soft-fido2 format)
+        let unsealed_data = Zeroizing::new(self.unseal_data(&sealed_data, &aad)?);
+
         let credential = Credential::from_bytes(&unsealed_data).map(|cred| cred.to_soft_fido2())?;
 
-        // Cache the unsealed credential with automatic TTL
         self.cache.insert(path.to_path_buf(), credential.clone());
 
         Ok(credential)
@@ -671,20 +749,22 @@ impl TpmStorageAdapter {
         let path = get_credential_path(&self.storage_dir, &rp_id, &cred.id, "tpm");
         debug!("Writing credential to: {:?}", path);
 
-        // Ensure parent directory exists with secure permissions
         let parent = path.parent().ok_or(soft_fido2::Error::Other)?;
         create_secure_dir_all(parent).map_err(|e| {
             debug!("Failed to create directory: {}", e);
             soft_fido2::Error::Other
         })?;
 
-        // Convert to our format for controlled serialization
         let our_cred = Credential::from_soft_fido2(cred);
-        // Use Zeroizing to ensure credential bytes are cleared from memory after use
         let bytes = Zeroizing::new(our_cred.to_bytes()?);
 
-        // Seal the data using TPM
-        let sealed_data = self.seal_data(&bytes)?;
+        let aad = if self.portable {
+            build_metadata_aad(&cred.id, &rp_id)
+        } else {
+            Vec::new()
+        };
+
+        let sealed_data = self.seal_data(&bytes, &aad)?;
 
         let filename = path
             .file_name()
@@ -809,5 +889,64 @@ impl CredentialStorage for TpmStorageAdapter {
 
     fn cleanup_expired_cache(&mut self) {
         self.cache.evict_expired();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aes_gcm_aad_mismatch_fails_decryption() {
+        let key = [0x42u8; 32];
+        let nonce = [0x07u8; 12];
+        let plaintext = b"credential metadata payload";
+        let aad_a = b"aad-for-credential-A";
+        let aad_b = b"aad-for-credential-B";
+
+        let ciphertext =
+            aes_gcm_encrypt_with_aad(&key, &nonce, plaintext, aad_a).expect("encrypt succeeds");
+
+        assert_ne!(plaintext.as_slice(), ciphertext.as_slice());
+
+        let decrypted =
+            aes_gcm_decrypt_with_aad(&key, &nonce, &ciphertext, aad_a).expect("correct AAD works");
+        assert_eq!(decrypted, plaintext);
+
+        let result = aes_gcm_decrypt_with_aad(&key, &nonce, &ciphertext, aad_b);
+        assert!(result.is_err(), "decryption with wrong AAD must fail");
+
+        let result_empty = aes_gcm_decrypt_with_aad(&key, &nonce, &ciphertext, b"");
+        assert!(
+            result_empty.is_err(),
+            "decryption with empty AAD must fail when data was encrypted with non-empty AAD"
+        );
+    }
+
+    #[test]
+    fn aes_gcm_empty_aad_roundtrip() {
+        let key = [0x55u8; 32];
+        let nonce = [0x11u8; 12];
+        let plaintext = b"legacy credential data";
+
+        let ciphertext =
+            aes_gcm_encrypt_with_aad(&key, &nonce, plaintext, b"").expect("encrypt succeeds");
+
+        let decrypted =
+            aes_gcm_decrypt_with_aad(&key, &nonce, &ciphertext, b"").expect("decrypt succeeds");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn build_metadata_aad_deterministic() {
+        let cred_id = vec![0xAA, 0xBB, 0xCC];
+        let rp_id = "example.com";
+
+        let aad1 = build_metadata_aad(&cred_id, rp_id);
+        let aad2 = build_metadata_aad(&cred_id, rp_id);
+        assert_eq!(aad1, aad2);
+
+        let aad_different = build_metadata_aad(&[0xDD, 0xEE], rp_id);
+        assert_ne!(aad1, aad_different);
     }
 }

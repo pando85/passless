@@ -138,7 +138,7 @@ fn test_tpm_portable_metadata_sealing() {
         TpmStorageAdapter::new_portable(storage_dir_a.clone(), Some(swtpm_a.tcti()), true)
             .expect("create portable adapter A");
 
-    let sealed_blob = adapter_a.seal_data(test_data).expect("seal data on A");
+    let sealed_blob = adapter_a.seal_data(test_data, b"").expect("seal data on A");
 
     // TPM B: provision with SAME seed, unseal
     let swtpm_b = SwtpmInstance::new((24423, 24422));
@@ -154,7 +154,7 @@ fn test_tpm_portable_metadata_sealing() {
             .expect("create portable adapter B");
 
     let unsealed = adapter_b
-        .unseal_data(&sealed_blob)
+        .unseal_data(&sealed_blob, b"")
         .expect("unseal data on B");
     assert_eq!(unsealed, test_data);
 
@@ -172,6 +172,6 @@ fn test_tpm_portable_metadata_sealing() {
         TpmStorageAdapter::new_portable(storage_dir_c.clone(), Some(swtpm_c.tcti()), true)
             .expect("create portable adapter C");
 
-    let result = adapter_c.unseal_data(&sealed_blob);
+    let result = adapter_c.unseal_data(&sealed_blob, b"");
     assert!(result.is_err(), "unseal on different-seed TPM must fail");
 }
