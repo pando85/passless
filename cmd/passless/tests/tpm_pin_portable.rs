@@ -5,6 +5,7 @@
 use passless_rs::pin_storage::PinStorage;
 use passless_rs::pin_storage::tpm::TpmPinStorage;
 use passless_rs::storage::tpm::portable::PortableParent;
+use passless_rs::storage::tpm::portable::build_portable_bundle;
 use soft_fido2::PinState;
 
 use std::process::{Child, Command};
@@ -273,5 +274,46 @@ fn test_portable_and_legacy_use_different_files() {
             .pin_hash
             .as_ref()
             .map(|h| h.as_array().to_vec())
+    );
+}
+
+#[test]
+fn portable_bundle_wiring_uses_portable_pin_file() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let swtpm = SwtpmInstance::new((25034, 25033));
+    let dir = make_secure_tempdir();
+    let storage_dir = dir.path().to_path_buf();
+
+    let parent =
+        PortableParent::new(storage_dir.clone(), Some(swtpm.tcti())).expect("create parent");
+    let seed = [0x55u8; 32];
+    parent.provision(&seed).expect("provision");
+
+    let tcti = Some(swtpm.tcti());
+
+    let (_provider, _storage, pin_storage) =
+        build_portable_bundle(storage_dir.clone(), tcti, true).expect("build portable bundle");
+
+    let state = make_pin_state("9876");
+    pin_storage.save_pin_state(&state).expect("save pin state");
+
+    let portable_pin_path = storage_dir.join("pin_state.json.tpm.portable");
+    let legacy_pin_path = storage_dir.join("pin_state.json.tpm");
+
+    assert!(
+        portable_pin_path.exists(),
+        "portable bundle must write pin_state.json.tpm.portable"
+    );
+    assert!(
+        !legacy_pin_path.exists(),
+        "portable bundle must NOT write legacy pin_state.json.tpm"
+    );
+
+    let loaded = pin_storage.load_pin_state().expect("load pin state");
+    assert!(loaded.is_pin_set());
+    assert_eq!(
+        loaded.pin_hash.as_ref().map(|h| h.as_array().to_vec()),
+        state.pin_hash.as_ref().map(|h| h.as_array().to_vec())
     );
 }

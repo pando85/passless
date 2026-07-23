@@ -316,3 +316,66 @@ fn test_tpm_portable_import_existing_key() {
     .expect("verify public key match");
     assert!(matches, "recomputed public must match stored COSE key");
 }
+
+#[test]
+fn portable_keys_are_usable_with_empty_auth() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let swtpm = SwtpmInstance::new((25012, 25011));
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let storage_dir = dir.path().to_path_buf();
+
+    let parent =
+        PortableParent::new(storage_dir.clone(), Some(swtpm.tcti())).expect("create parent");
+
+    let seed = [0x77u8; 32];
+    parent.provision(&seed).expect("provision");
+    assert!(parent.is_provisioned());
+
+    let metadata = parent.load_metadata().expect("load metadata");
+    parent.verify_parent(&metadata).expect("verify parent");
+
+    let provider = TpmCredentialKeyProvider::new(storage_dir.clone(), Some(swtpm.tcti()))
+        .expect("create provider");
+
+    let generated = provider.generate(-7).expect("generate child key");
+
+    let message = b"empty-auth invariant check";
+    let signature = provider
+        .sign(&generated.key, -7, message)
+        .expect("sign with null-auth session");
+
+    assert!(!signature.is_empty());
+    assert_eq!(signature[0], 0x30);
+
+    use p256::PublicKey;
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+    let public_key =
+        PublicKey::from_sec1_bytes(&generated.cose_public_key).expect("valid public key");
+    let verifying_key = VerifyingKey::from(&public_key);
+    let sig = Signature::from_der(&signature).expect("parse DER signature");
+    verifying_key
+        .verify(message, &sig)
+        .expect("signature must verify");
+
+    let swtpm2 = SwtpmInstance::new((25023, 25022));
+    let dir2 = tempfile::tempdir().expect("create temp dir");
+    let storage_dir2 = dir2.path().to_path_buf();
+
+    let parent2 =
+        PortableParent::new(storage_dir2.clone(), Some(swtpm2.tcti())).expect("create parent 2");
+    parent2.provision(&seed).expect("provision 2");
+
+    let provider2 = TpmCredentialKeyProvider::new(storage_dir2.clone(), Some(swtpm2.tcti()))
+        .expect("create provider 2");
+
+    let signature2 = provider2
+        .sign(&generated.key, -7, message)
+        .expect("sign on second TPM with null-auth session");
+
+    let sig2 = Signature::from_der(&signature2).expect("parse DER signature 2");
+    verifying_key
+        .verify(message, &sig2)
+        .expect("cross-TPM signature must verify");
+}
