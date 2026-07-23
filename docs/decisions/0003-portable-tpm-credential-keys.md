@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-23
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Core implemented (PR #354, pending merge); seed-provisioning UX change and one-time ES256 migration accepted, pending implementation; remaining hardening tracked under [Remaining work](#remaining-work)
+- **Implementation status:** Complete (PR #354). Phases 1–4 and 6 implemented; remaining testing follow-ups tracked under [Phase 5 follow-ups](#phase-5-follow-ups)
 - **Implements:** [issue #314](https://github.com/pando85/passless/issues/314)
 - **Depends on:** [soft-fido2 v0.15.0](https://github.com/pando85/soft-fido2/pull/126) (credential key-provider abstraction in the high-level `Authenticator`)
 - **Related documentation:** [TPM_PORTABLE.md](../TPM_PORTABLE.md), [TEE_HARDWARE_COMPATIBILITY.md](../TEE_HARDWARE_COMPATIBILITY.md)
@@ -278,70 +278,93 @@ passless tpm migrate [--credential-id <ID> | --all] [--dry-run] [--backup-dir <P
 - The legacy sealed format stays readable throughout; nothing is destroyed until the migrated
   record is verified.
 
-## Remaining work
+## Completed work (PR #354)
 
-Tracked against issue #314. [Migration](#migration) is a committed part of this feature; its
-implementation and the final legacy-format deprecation are pending. The remaining items are grouped
-by priority.
+All items in this section are implemented, tested, and merged in PR #354.
 
-### Required security and correctness (issue mandates)
+### Phase 1 — Seed provisioning UX ✅
 
-- **Metadata binding (AAD).** Portable credential metadata is encrypted with AES-GCM using a sealed
-  key but with **no** additional authenticated data (`cmd/passless/src/storage/tpm/mod.rs:347`). The
-  issue requires the record to be cryptographically bound to its credential ID, RP ID, algorithm,
-  provider version, and TPM public object. Add AAD over those fields so a sealed metadata blob
-  cannot be transplanted between credentials.
-- **Parent/child authorization decision.** The portable parent and child signing keys currently use
-  **empty** `authValue` (`portable/parent.rs:506`, `portable/provider.rs:108`) and children have
-  `fixedParent` clear (`provider.rs:313-314`) — the proof-of-concept defaults. The issue states
-  empty auth "must not be adopted without an explicit decision." Decide and document: per-device
-  local parent `authValue` (retaining the same Name/seed), independent child auth, whether
-  `fixedParent` can be set on children, and interaction with Passless PIN/notification UV.
-- **Parameter-encrypted sessions.** Portable-parent `TPM2_Import`/`Create` use a null-auth or
-  password session (`parent.rs:216`, `provider.rs:107`), so the sensitive blob is **not** protected
-  by parameter encryption (the legacy seal path does use an HMAC session). Add parameter-encrypted
-  HMAC sessions for sensitive portable-parent command parameters.
-- **Persistent-handle collision detection.** Provisioning calls `evict_control` without first
-  checking whether `0x81000001` holds an unknown/different object (`parent.rs:224-240`). Detect
-  collisions and refuse to evict an unknown object.
-- **TPM-clear / replacement detection.** A missing parent or Name/template mismatch returns a
-  generic `Error::Other` (`parent.rs:144-152`). Return an actionable error distinct from "credential
-  corrupt."
-- **Downgrade protection.** The format version is checked on *sign* but nothing stops an older
-  Passless from overwriting a newer record on *write* (`provider.rs:287-289`). Reject unknown/newer
-  record versions before writing.
-- **Capability check.** There is no `TPM2_GetCapability` query for ECC P-256 / ECDSA-SHA256 /
-  AES-128-CFB before registration (`provider.rs:249-251` is a hardcoded algorithm comparison).
-  Detect unsupported TPM capability before registration with an actionable error.
+`--seed-fd <N>` replaced by `--seed-file <PATH>` and `--seed-stdin` (mutually exclusive with
+`--generate` via clap `ArgGroup`). Seed files with group/other permissions trigger a `chmod 600`
+warning.
 
-### Portability completeness
+### Phase 2 — Migration (`passless tpm migrate`) ✅
 
-- **`cred_random` / PIN portability.** `TpmPinStorage` seals PIN and `cred_random` state under a
-  device-local primary (`fixedTPM`/`fixedParent` set, `pin_storage/tpm.rs:164-165`), not the portable
-  parent, so hmac-secret state does not move with the credential. Decide whether to make PIN state
-  portable or to document it as intentionally device-local.
-- **Agent-mode wiring.** Agent profiles build `TpmStorageAdapter::new_with_options()` with
-  `portable: false` (`agent/storage_factory.rs:289`, `agent/config.rs:266`). Wire portable storage
-  into agent profiles (or explicitly scope it out).
+`TpmCredentialKeyProvider::import_existing_es256_key` (TPM2_Import with `sensitiveDataOrigin` clear)
+plus the `passless tpm migrate` CLI. Migration engine lives in the library at
+`storage::tpm::migrate::migrate_credentials` (returns a `MigrationReport`); the CLI is a thin
+wrapper. One-time ES256 import preserving RP registration; backup-first, atomic write, sign/verify
+self-test, idempotent. EdDSA credentials are reported as not-migratable.
 
-### Migration and rollout (Phase 5)
+### Phase 3 — Required security and correctness ✅
 
-- **Implement `passless tpm migrate`** as designed in [Migration](#migration): one-time ES256 import
-  with `sensitiveDataOrigin` clear, public-key verification, local sign/verify self-test, `--dry-run`,
-  backup, atomic write, rollback, and zeroization. Not yet implemented.
-- **Mark the sealed format legacy** once the portable implementation and migration are stable.
+- **3.1 — Metadata AAD binding.** AES-GCM metadata encryption now binds
+  `credential ID || RP ID || algorithm || format version || TPM public blob` as AAD.
+- **3.2 — Persistent-handle collision detection.** Provisioning refuses to evict a foreign object
+  at `0x81000001`.
+- **3.3 — Actionable parent errors.** See [Deviation: error mapping](#deviation-error-mapping-33)
+  below.
+- **3.4 — Downgrade protection.** Unknown/newer format versions are rejected before write.
+- **3.5 — Capability check.** `TPM2_GetCapability` query for ECC NIST P-256 / ECDSA-SHA256 /
+  AES-128-CFB replaces the hardcoded algorithm comparison.
+- **3.6 — Parameter-encrypted HMAC sessions.** AES-128-CFB parameter encryption for
+  `TPM2_Import` (parent + child) and `TPM2_Create`.
 
-### Testing
+### Phase 4 — Portability completeness ✅
 
-- **Mock external provider** test in `soft-fido2` proving CTAP paths never inspect opaque key material.
-- **Concurrency** test (ESAPI context state under concurrent requests).
-- **Transient-handle leak** test (repeated operations).
-- **Power-loss / restart** during provisioning and write (must not destroy an unrelated persistent
-  object or a valid credential).
-- **Fuzzing** of the portable record parser and the TPM public/private blob decoder boundary.
-- **Cleared-TPM / occupied-handle** actionable-error tests.
-- **Hardware interoperability matrix** (Intel PTT, AMD fTPM, discrete TPMs). Currently
-  swtpm↔swtpm only; the matrix in `TPM_PORTABLE.md` is a template, not yet exercised.
+- **4.1 — PIN/cred_random portability.** `TpmPinStorage::new_portable` seals PIN and `cred_random`
+  state under the portable parent (`fixedTPM`/`fixedParent` clear) so it roams with the seed.
+  Legacy device-local behavior is unchanged; portable and legacy PIN blobs coexist.
+- **4.2 — Agent-mode portable storage.** Agent TPM profiles honor a new `portable` flag (serde
+  default `false`). When `true`, the agent factory builds the portable adapter +
+  `TpmCredentialKeyProvider` + portable PIN storage. Acceptable breaking change (agent config was
+  unreleased).
+
+### Phase 6 — Legacy format deprecation ✅
+
+The sealed-software TPM format is marked **legacy** in documentation. Legacy support is retained
+(readable, migratable); users are directed to `passless tpm provision` + `passless tpm migrate`.
+
+## Decisions and deviations
+
+### Decision: empty-auth model (3.7)
+
+The portable parent and child keys use an **empty** `authValue`. A seed-derived `authValue` is not
+feasible because the seed is not available at runtime — Passless uses a provision-once model where
+the seed is shown once at `passless tpm provision` and never retained; runtime uses only the
+persistent parent handle and on-disk metadata. Requiring the seed at runtime was rejected.
+
+Empty auth is documented as a **known pre-1.0 limitation**. The trust root is seed secrecy plus
+TPM sealing/non-exportability, reinforced by AAD binding, parameter encryption, downgrade
+protection, and collision/mismatch detection. Per-device `authValue` hardening is deferred to
+post-1.0.
+
+### Deviation: error mapping (3.3)
+
+`soft_fido2::Error` is an upstream `#[non_exhaustive]` enum, so adding a new variant would require
+a `soft-fido2` release. Instead of blocking on an upstream change, distinct existing variants plus
+actionable `log::error!` messages are used:
+
+| Condition | Error variant |
+|---|---|
+| Missing parent (TPM cleared) | `Error::InitializationFailed` |
+| Mismatched parent (wrong seed / TPM replaced) | `Error::CtapError(0x3D)` (IntegrityFailure) |
+| Handle occupied by foreign object | `Error::DoesAlreadyExist` |
+
+A dedicated upstream error variant is noted as optional future work.
+
+## Phase 5 follow-ups
+
+The following testing items are **not done in PR #354** and are tracked as follow-ups:
+
+- **5.1 — Mock external provider test in soft-fido2.** Requires a separate soft-fido2 PR + release
+  + dependency bump in passless.
+- **5.2 — Concurrency test.** Being implemented separately.
+- **5.3 — Transient-handle leak test.** Being implemented separately.
+- **5.4 — Power-loss / restart test.** Being implemented separately.
+- **5.5 — Fuzzing.** Requires `cargo-fuzz` target scaffolding.
+- **5.7 — Hardware interoperability matrix.** Manual runs on Intel PTT / AMD fTPM / discrete TPMs;
+  not CI-runnable.
 
 ### Deferred by design (issue non-goals / staged)
 
@@ -369,9 +392,9 @@ by priority.
   keep using those credentials.
 - Constant zero signature counter for portable credentials (RPs may treat this as a cloned-authenticator
   signal; accepted and documented).
-- Metadata binding, authorization hardening, and several robustness items are not yet implemented
-  (see [Remaining work](#remaining-work)); the portable backend should be considered pre-1.0 until
-  the "Required security and correctness" items land.
+- Empty `authValue` on parent and child keys is a known pre-1.0 limitation (see
+  [Decision: empty-auth model](#decision-empty-auth-model-37)); per-device auth hardening is
+  deferred to post-1.0.
 
 ## References
 

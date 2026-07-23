@@ -202,6 +202,11 @@ There is no in-place migration of credential blobs between parents.
 
 ### Legacy TPM credentials
 
+> **Deprecation notice:** The legacy sealed-software TPM format is superseded by the portable
+> format. New deployments should use `passless tpm provision` followed by `passless tpm migrate`
+> to move existing credentials to the portable format. Legacy support is retained — legacy
+> credentials remain readable and migratable — but the legacy format is no longer recommended.
+
 Credentials created with the legacy (non-portable) TPM backend remain fully readable. The legacy
 backend seals each credential under a device-local RSA primary (`fixedTPM=true`, `fixedParent=true`);
 those sealed files are not silently rewritten or migrated.
@@ -258,6 +263,30 @@ passless tpm migrate --all --backup-dir /path/to/backups
 - **Rollback.** Restore the backup file from `.backup/{rp_id}/{cred_id_hex}.tpm` to the
   original path to revert to the legacy record.
 
+### Portable PIN state
+
+In portable mode, PIN state (PIN value, retry counter, lockout) and `cred_random` (hmac-secret
+state) are sealed under the portable parent (`fixedTPM`/`fixedParent` clear), so they roam with
+the seed. PIN state provisioned on one TPM can be unsealed on another TPM provisioned from the
+same seed.
+
+Legacy mode is unchanged — PIN state remains sealed under the device-local hierarchy primary
+(`fixedTPM`/`fixedParent` set) and does not sync across TPMs. Portable and legacy PIN blobs
+coexist on the same TPM.
+
+### Agent-mode portable storage
+
+Agent TPM profiles accept a `portable = true` flag in the agent configuration. When enabled, the
+agent factory builds the portable storage adapter with `TpmCredentialKeyProvider` and portable PIN
+storage. The flag defaults to `false` (legacy device-local behavior). This is an acceptable
+breaking change because the agent configuration was unreleased at the time of introduction.
+
+```toml
+[agent.profiles.my-tpm]
+backend-type = "tpm"
+tpm-portable = true
+```
+
 ### On-disk layout
 
 Both backends use the same directory layout: `{storage_dir}/{rp_id}/{cred_id_hex}.tpm`. The
@@ -288,13 +317,12 @@ any authenticator that can be used on multiple devices, including the portable T
 - **ES256 only.** The TPM key provider supports COSE algorithm `-7` (ECDSA P-256 / SHA-256)
   exclusively. EdDSA (Ed25519, COSE algorithm `-8`) is not implemented — the TPM 2.0 command set
   used here does not expose an EdDSA signing path in the current `tss-esapi` binding.
-- **TpmPinStorage is device-local.** PIN state (PIN value, retry counter, lockout) is sealed
-  under the device's own hierarchy primary, not under the portable parent. PIN state does not
-  sync across TPMs. Each provisioned TPM maintains its own independent PIN state.
-- **Agent-mode portable storage is not wired.** The agent subsystem's storage factory
-  (`cmd/passless/src/agent/storage_factory.rs`) always constructs the legacy (non-portable)
-  `TpmStorageAdapter` for TPM-backed agent profiles. Agent profiles cannot currently use the
-  portable backend; they fall back to device-local TPM storage.
+- **Empty `authValue` on parent and child keys (pre-1.0 limitation).** The portable parent and
+  child signing keys use an empty TPM `authValue`. A seed-derived `authValue` is not feasible
+  because the seed is not available at runtime (provision-once model). Security relies on seed
+  secrecy combined with TPM sealing/non-exportability, reinforced by AAD binding, parameter
+  encryption, downgrade protection, and collision/mismatch detection. Per-device `authValue`
+  hardening is deferred to post-1.0.
 - **Requires TPM 2.0 with ECC P-256 + ECDH.** The portable parent is an ECC P-256 storage key
   imported via `TPM2_Import` using ECDH for seed wrapping. TPMs that lack ECC P-256 or ECDH
   support (some older discrete TPMs, certain firmware TPM configurations) cannot use the

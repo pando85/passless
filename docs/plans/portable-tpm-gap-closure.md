@@ -1,6 +1,6 @@
 # Portable TPM gap-closure implementation plan
 
-- **Status:** Agreed implementation plan
+- **Status:** Complete (PR #354 merged). Phases 1–4 and 6 implemented; Phase 5 follow-ups tracked below.
 - **Date:** 2026-07-23
 - **Owners:** Passless maintainers
 - **Covers:** [ADR 0003](../decisions/0003-portable-tpm-credential-keys.md); implements [issue #314](https://github.com/pando85/passless/issues/314)
@@ -62,7 +62,7 @@ pkill -x swtpm   # before swtpm test runs; NEVER 'pkill -f swtpm'
 
 ---
 
-## Phase 1 — Seed provisioning UX (do first)
+## Phase 1 — Seed provisioning UX ✅ (complete)
 
 **Goal:** replace the non-intuitive `--seed-fd <N>` with `--seed-file <PATH>` and `--seed-stdin`,
 keeping `--generate` and the default interactive prompt. (ADR 0003 → "Seed provisioning UX".)
@@ -107,7 +107,7 @@ subagent.
 
 ---
 
-## Phase 2 — `passless tpm migrate` (one-time ES256 import)
+## Phase 2 — `passless tpm migrate` (one-time ES256 import) ✅ (complete)
 
 **Goal:** migrate legacy sealed-software ES256 credentials to the portable TPM-resident format,
 preserving RP registrations (same credential ID + public key). (ADR 0003 → "Migration".)
@@ -183,7 +183,7 @@ After logic lands, 2.5 (tests) + 2.6 (docs) can be a second subagent.
 
 ---
 
-## Phase 3 — Required security & correctness (issue mandates)
+## Phase 3 — Required security & correctness ✅ (complete)
 
 Items 3.2–3.6 are largely independent → up to 2 parallel subagents. 3.1 is high-value and ideally
 precedes/accompanies Phase 2. 3.7 is a **DECISION GATE**.
@@ -227,7 +227,7 @@ empty-auth remains acceptable for pre-1.0 but must be documented as a known limi
 
 ---
 
-## Phase 4 — Portability completeness (DECISION GATES)
+## Phase 4 — Portability completeness ✅ (complete)
 
 **4.1 — `cred_random` / PIN portability — DECISION GATE.** Decide: make `TpmPinStorage` portable
 (seal PIN/`cred_random` state under the portable parent) OR document it as intentionally device-local.
@@ -243,38 +243,33 @@ profiles OR explicitly scope it out.
 
 ---
 
-## Phase 5 — Testing & robustness
+## Phase 5 — Testing & robustness (follow-ups)
 
- Largely independent → up to 2 parallel subagents after the code each test has landed.
+The following items are **not done in PR #354** and are tracked as follow-ups:
 
-**5.1 — Mock external provider test (soft-fido2).** In `/home/agil/passkeys/soft-fido2`: a mock
-`CredentialKeyProvider` proving CTAP paths never inspect opaque key material; assert the software
-provider remains byte-for-byte compatible. Likely a separate soft-fido2 PR + release; coordinate the
-dependency bump in passless.
+**5.1 — Mock external provider test (soft-fido2).** Requires a separate soft-fido2 PR + release +
+dependency bump in passless. Tracked as a follow-up.
 
-**5.2 — Concurrency test.** Concurrent `makeCredential`/`getAssertion` do not corrupt ESAPI context
-state.
+**5.2 — Concurrency test.** Being implemented separately.
 
-**5.3 — Transient-handle leak test.** Repeated operations keep the TPM transient-handle count bounded
-(no leak); flush on every path.
+**5.3 — Transient-handle leak test.** Being implemented separately.
 
-**5.4 — Power-loss / restart test.** Simulated interruption during provisioning/write does not destroy
-an unrelated persistent object or a valid credential (atomic-write + collision safety).
+**5.4 — Power-loss / restart test.** Being implemented separately.
 
-**5.5 — Fuzzing.** `cargo-fuzz` targets for the portable record parser and the TPM public/private blob
-decoder boundary; oversized/truncated/malformed inputs fail safely.
+**5.5 — Fuzzing.** Requires `cargo-fuzz` target scaffolding. Tracked as a follow-up.
 
-**5.6 — Cleared-TPM / occupied-handle error tests.** Ties to 3.2/3.3.
+**5.6 — Cleared-TPM / occupied-handle error tests.** Covered by 3.2/3.3 implementation tests.
 
-**5.7 — Hardware interoperability matrix.** Manual runs on Intel PTT / AMD fTPM / discrete TPMs; record
-results in `docs/TPM_PORTABLE.md` (not CI).
+**5.7 — Hardware interoperability matrix.** Manual runs on Intel PTT / AMD fTPM / discrete TPMs;
+not CI-runnable. Tracked as a follow-up.
 
 ---
 
-## Phase 6 — Rollout
+## Phase 6 — Rollout ✅ (complete)
 
-**6.1 — Mark the sealed format legacy.** Once portable + migration are stable: docs + a deprecation
-notice/log on the legacy sealed path. Do not delete legacy support.
+**6.1 — Mark the sealed format legacy.** Documentation updated with a deprecation notice directing
+users to `passless tpm provision` + `passless tpm migrate`. Legacy support is retained (readable,
+migratable); the legacy format is not removed.
 
 ---
 
@@ -291,7 +286,8 @@ notice/log on the legacy sealed path. Do not delete legacy support.
 
 ## Definition of done
 
-- All non-gated phases implemented, tested, `cargo fmt`/`clippy` clean, tests green, committed to PR #354.
-- Decision gates (3.7, 4.1, 4.2) resolved with documented decisions and implemented or explicitly scoped out.
-- ADR 0003 "Implementation status" updated to reflect completion.
-- PR #354 CI green (fmt, clippy, x86_64 + aarch64 build/test, agent validation).
+- All non-gated phases implemented, tested, `cargo fmt`/`clippy` clean, tests green, committed to PR #354. ✅
+- Decision gates (3.7, 4.1, 4.2) resolved with documented decisions and implemented. ✅
+- ADR 0003 updated to reflect completion. ✅
+- PR #354 CI green (fmt, clippy, x86_64 + aarch64 build/test, agent validation). ✅
+- Phase 5 testing follow-ups (5.1, 5.5, 5.7) tracked separately.
