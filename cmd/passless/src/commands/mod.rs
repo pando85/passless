@@ -6,3 +6,5 @@ pub mod client;
 pub mod custom;
 #[cfg(feature = "tpm")]
 pub mod tpm;
+#[cfg(feature = "tpm")]
+pub mod tpm_migrate;

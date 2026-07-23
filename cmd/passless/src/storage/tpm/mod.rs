@@ -1,6 +1,7 @@
 //! TPM (Trusted Platform Module) storage adapter
 
 pub mod init;
+pub mod migrate;
 pub mod portable;
 
 use crate::storage::credential::Credential;
@@ -53,6 +54,13 @@ pub struct TpmStorageAdapter {
     iteration_entries: Vec<PathBuf>,
     context: Mutex<Context>,
     portable: bool,
+}
+
+impl TpmStorageAdapter {
+    #[allow(dead_code)]
+    pub fn storage_dir(&self) -> &Path {
+        &self.storage_dir
+    }
 }
 
 /// Represents a sealed credential blob stored on disk
@@ -636,7 +644,10 @@ impl TpmStorageAdapter {
     /// Read a credential from a specific file path WITHOUT caching
     /// Used for operations that need &self
     #[allow(dead_code)]
-    fn read_credential_from_path_no_cache(&self, path: &Path) -> Result<soft_fido2::Credential> {
+    pub fn read_credential_from_path_no_cache(
+        &self,
+        path: &Path,
+    ) -> Result<soft_fido2::Credential> {
         debug!("Reading credential (no cache) from path: {:?}", path);
 
         let mut file = File::open(path).map_err(|e| {
@@ -740,7 +751,8 @@ impl TpmStorageAdapter {
 
     /// Write a credential to storage
     /// Uses new directory structure: {storage_dir}/{rp_id}/{cred_id_hex}.tpm
-    fn write_credential(&mut self, cred: &soft_fido2::Credential) -> Result<()> {
+    #[allow(dead_code)]
+    pub fn write_credential(&mut self, cred: &soft_fido2::Credential) -> Result<()> {
         self.cache.evict_expired();
 
         let rp_id = validate_rp_id_for_storage(cred.rp.id.as_str())

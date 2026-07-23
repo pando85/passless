@@ -216,14 +216,47 @@ The portable backend uses a new on-disk format:
   sealed records are portable.
 - The provider ID is `tpm-portable-v1` with format version `1`.
 
-### Migration path
+### Migrating legacy credentials
 
-There is no automated migration. To move a credential from the legacy backend to the portable
-backend, **re-register** the passkey at the relying party while the authenticator is running in
-portable mode. The relying party will issue a new credential bound to the portable TPM parent.
+Legacy ES256 credentials can be migrated in-place to the portable format without re-registering
+at relying parties. The credential ID and public key are preserved, so existing RP registrations
+continue to work.
 
-Legacy `.tpm` files are not silently rewritten. You can continue to use the legacy backend for
-existing credentials while registering new credentials on the portable backend.
+**Precondition:** A portable parent must be provisioned first (`passless tpm provision`).
+
+```bash
+# Preview what would be migrated (no disk changes)
+passless tpm migrate --all --dry-run
+
+# Migrate all legacy ES256 credentials
+passless tpm migrate --all
+
+# Migrate a single credential by hex ID
+passless tpm migrate --credential-id <HEX_ID>
+
+# Use a custom backup directory (default: {storage_dir}/.backup)
+passless tpm migrate --all --backup-dir /path/to/backups
+```
+
+**Behavior:**
+
+- The legacy record is backed up to `{storage_dir}/.backup/{rp_id}/{cred_id_hex}.tpm` before
+  being replaced with the portable record.
+- Migration is idempotent: running it again on already-migrated credentials reports them as
+  "already portable" and makes no changes.
+- `--dry-run` lists candidates without modifying any files.
+
+**Caveats:**
+
+- **ES256 only.** EdDSA (Ed25519, COSE algorithm `-8`) credentials cannot be migrated and must
+  be re-registered at the relying party.
+- **Signature counter reset.** The migrated portable record uses a constant signature counter
+  (zero). Relying parties that enforce monotonic counters may flag this; enable
+  `--constant-signature-counter` for new credentials to avoid this class of issue.
+- **Prior plaintext exposure.** The legacy software key existed in plaintext on disk before
+  migration. Non-exportability is guaranteed only from migration onward.
+- **Rollback.** Restore the backup file from `.backup/{rp_id}/{cred_id_hex}.tpm` to the
+  original path to revert to the legacy record.
 
 ### On-disk layout
 
@@ -269,8 +302,9 @@ any authenticator that can be used on multiple devices, including the portable T
 - **Persistent handle `0x81000001` is hardcoded.** The portable parent occupies owner-hierarchy
   persistent handle `0x81000001`. If another application already uses this handle on your TPM,
   provisioning will fail. There is currently no way to select an alternate handle.
-- **No automated credential migration.** Moving from the legacy backend to the portable backend
-  requires re-registration at every relying party.
+- **EdDSA credentials require re-registration.** The migration tool (`passless tpm migrate`)
+  handles ES256 credentials only. EdDSA (Ed25519) credentials must be re-registered at the
+  relying party.
 
 ## Interoperability matrix
 

@@ -103,6 +103,21 @@ pub fn dispatch(action: &TpmAction) -> Result<()> {
             path,
             tcti,
         } => remove(*confirm, path.clone(), tcti.clone()),
+        TpmAction::Migrate {
+            credential_id,
+            all,
+            dry_run,
+            backup_dir,
+            path,
+            tcti,
+        } => super::tpm_migrate::migrate(
+            credential_id.clone(),
+            *all,
+            *dry_run,
+            backup_dir.clone(),
+            path.clone(),
+            tcti.clone(),
+        ),
     }
 }
 

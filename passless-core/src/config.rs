@@ -867,6 +867,28 @@ pub enum TpmAction {
         #[arg(long = "tpm-tcti", env = "PASSLESS_TPM_TCTI")]
         tcti: Option<String>,
     },
+    /// Migrate legacy sealed credentials to portable TPM format
+    #[command(group(clap::ArgGroup::new("selection").args(["credential_id", "all"]).required(true)))]
+    Migrate {
+        /// Migrate a specific credential by ID (hex)
+        #[arg(long = "credential-id", value_name = "ID")]
+        credential_id: Option<String>,
+        /// Migrate all migratable legacy credentials
+        #[arg(long)]
+        all: bool,
+        /// Show what would be migrated without making changes
+        #[arg(long)]
+        dry_run: bool,
+        /// Directory to store backups of legacy records
+        #[arg(long = "backup-dir", value_name = "PATH")]
+        backup_dir: Option<String>,
+        /// TPM storage directory
+        #[arg(long = "tpm-path", env = "PASSLESS_TPM_PATH")]
+        path: Option<String>,
+        /// TPM TCTI configuration
+        #[arg(long = "tpm-tcti", env = "PASSLESS_TPM_TCTI")]
+        tcti: Option<String>,
+    },
 }
 
 /// Configuration actions
