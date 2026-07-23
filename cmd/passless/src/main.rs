@@ -579,7 +579,7 @@ fn run() -> Result<()> {
                         )?;
                         let boxed: Box<dyn CredentialStorage> = Box::new(storage);
                         let shared_storage = Arc::new(Mutex::new(boxed));
-                        let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
+                        let pin_storage = TpmPinStorage::new_portable(path.into(), Some(tcti));
                         let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
                             Arc::new(Mutex::new(Box::new(pin_storage)));
                         let service = AuthenticatorService::with_shared_storage_and_key_provider(
@@ -790,7 +790,7 @@ fn run() -> Result<()> {
                         Some(tcti.clone()),
                         allow_storage_creation,
                     )?;
-                    let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
+                    let pin_storage = TpmPinStorage::new_portable(path.into(), Some(tcti));
                     let pin_storage = Arc::new(Mutex::new(pin_storage));
                     let service = AuthenticatorService::with_pin_storage_and_key_provider(
                         storage,
