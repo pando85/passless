@@ -156,15 +156,7 @@ impl TpmPinStorage {
             use tss_esapi::{Context, Tcti};
             use zeroize::Zeroizing;
 
-            #[derive(serde::Serialize, serde::Deserialize)]
-            struct SealedBlob {
-                #[serde(default, skip_serializing_if = "Option::is_none")]
-                mode: Option<String>,
-                encrypted_data: Vec<u8>,
-                nonce: Vec<u8>,
-                tpm_private: Vec<u8>,
-                tpm_public: Vec<u8>,
-            }
+            use crate::storage::tpm::SealedBlob;
 
             let tcti_conf = Tcti::from_str(&self.tcti).map_err(|e| {
                 warn!(
@@ -338,15 +330,7 @@ impl TpmPinStorage {
             use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
             use tss_esapi::{Context, Tcti};
 
-            #[derive(serde::Serialize, serde::Deserialize)]
-            struct SealedBlob {
-                #[serde(default)]
-                mode: Option<String>,
-                encrypted_data: Vec<u8>,
-                nonce: Vec<u8>,
-                tpm_private: Vec<u8>,
-                tpm_public: Vec<u8>,
-            }
+            use crate::storage::tpm::SealedBlob;
 
             let tcti_conf = Tcti::from_str(&self.tcti).map_err(|e| {
                 warn!(
@@ -538,61 +522,11 @@ impl TpmPinStorage {
         &self,
         context: &mut tss_esapi::Context,
     ) -> Result<tss_esapi::handles::KeyHandle, StatusCode> {
-        use tss_esapi::attributes::ObjectAttributesBuilder;
-        use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
-        use tss_esapi::interface_types::key_bits::RsaKeyBits;
         use tss_esapi::interface_types::resource_handles::Hierarchy;
-        use tss_esapi::structures::{
-            PublicBuilder, PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme,
-            SymmetricDefinitionObject,
-        };
 
-        let object_attributes = ObjectAttributesBuilder::new()
-            .with_fixed_tpm(true)
-            .with_fixed_parent(true)
-            .with_sensitive_data_origin(true)
-            .with_user_with_auth(true)
-            .with_decrypt(true)
-            .with_restricted(true)
-            .build()
-            .map_err(|e| {
-                warn!("Failed to build object attributes: {:?}", e);
-                StatusCode::Other
-            })?;
-
-        let rsa_params = PublicRsaParametersBuilder::new()
-            .with_symmetric(SymmetricDefinitionObject::AES_128_CFB)
-            .with_scheme(RsaScheme::Null)
-            .with_key_bits(RsaKeyBits::Rsa2048)
-            .with_exponent(RsaExponent::default())
-            .with_is_signing_key(false)
-            .with_is_decryption_key(true)
-            .with_restricted(true)
-            .build()
-            .map_err(|e| {
-                warn!("Failed to build RSA parameters: {:?}", e);
-                StatusCode::Other
-            })?;
-
-        let primary_pub = PublicBuilder::new()
-            .with_public_algorithm(PublicAlgorithm::Rsa)
-            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-            .with_object_attributes(object_attributes)
-            .with_rsa_parameters(rsa_params)
-            .with_rsa_unique_identifier(PublicKeyRsa::default())
-            .build()
-            .map_err(|e| {
-                warn!("Failed to build primary key public: {:?}", e);
-                StatusCode::Other
-            })?;
-
-        let primary_key_result = context
-            .create_primary(Hierarchy::Owner, primary_pub, None, None, None, None)
-            .map_err(|e| {
-                warn!("Failed to create primary key: {:?}", e);
-                StatusCode::Other
-            })?;
-
-        Ok(primary_key_result.key_handle)
+        crate::storage::tpm::create_rsa_primary(context, Hierarchy::Owner).map_err(|e| {
+            warn!("Failed to create primary key: {:?}", e);
+            StatusCode::Other
+        })
     }
 }

@@ -65,15 +65,18 @@ impl TpmStorageAdapter {
 
 /// Represents a sealed credential blob stored on disk
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SealedBlob {
+pub(crate) struct SealedBlob {
+    /// The sealing mode (e.g. "portable"). Absent for legacy blobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
     /// The encrypted credential data (AES-GCM encrypted)
-    encrypted_data: Vec<u8>,
+    pub(crate) encrypted_data: Vec<u8>,
     /// The nonce used for AES-GCM encryption (96 bits)
-    nonce: Vec<u8>,
+    pub(crate) nonce: Vec<u8>,
     /// The private part of the TPM-sealed encryption key
-    tpm_private: Vec<u8>,
+    pub(crate) tpm_private: Vec<u8>,
     /// The public part of the TPM-sealed encryption key
-    tpm_public: Vec<u8>,
+    pub(crate) tpm_public: Vec<u8>,
 }
 
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256)
@@ -174,6 +177,47 @@ fn build_aad_from_path(path: &Path, storage_dir: &Path) -> Result<Vec<u8>> {
     aad.extend_from_slice(&COSE_ALG_ES256.to_be_bytes());
     aad.extend_from_slice(&portable::parent::FORMAT_VERSION.to_be_bytes());
     Ok(aad)
+}
+
+/// Create an RSA-2048 primary storage key in the given hierarchy.
+///
+/// Shared helper used by both credential sealing and PIN sealing paths.
+/// Returns the raw `tss_esapi::Error` so callers can map to their own error types.
+pub(crate) fn create_rsa_primary(
+    context: &mut Context,
+    hierarchy: Hierarchy,
+) -> std::result::Result<tss_esapi::handles::KeyHandle, tss_esapi::Error> {
+    let object_attributes = tss_esapi::attributes::ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_sensitive_data_origin(true)
+        .with_user_with_auth(true)
+        .with_decrypt(true)
+        .with_restricted(true)
+        .build()?;
+
+    let rsa_params = PublicRsaParametersBuilder::new()
+        .with_symmetric(SymmetricDefinitionObject::AES_128_CFB)
+        .with_scheme(RsaScheme::Null)
+        .with_key_bits(RsaKeyBits::Rsa2048)
+        .with_exponent(RsaExponent::default())
+        .with_is_signing_key(false)
+        .with_is_decryption_key(true)
+        .with_restricted(true)
+        .build()?;
+
+    let primary_pub = PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::Rsa)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(object_attributes)
+        .with_rsa_parameters(rsa_params)
+        .with_rsa_unique_identifier(PublicKeyRsa::default())
+        .build()?;
+
+    let primary_key_result =
+        context.create_primary(hierarchy, primary_pub, None, None, None, None)?;
+
+    Ok(primary_key_result.key_handle)
 }
 
 impl TpmStorageAdapter {
@@ -295,55 +339,10 @@ impl TpmStorageAdapter {
     /// This creates a transient primary key that can be used as a parent for sealing operations.
     /// The key is created with the same parameters each time, so it has the same handle.
     fn create_primary_key(&self, context: &mut Context) -> Result<tss_esapi::handles::KeyHandle> {
-        // Create a primary storage key (RSA 2048, storage parent)
-        let object_attributes = tss_esapi::attributes::ObjectAttributesBuilder::new()
-            .with_fixed_tpm(true)
-            .with_fixed_parent(true)
-            .with_sensitive_data_origin(true)
-            .with_user_with_auth(true)
-            .with_decrypt(true)
-            .with_restricted(true)
-            .build()
-            .map_err(|e| {
-                log::error!("Failed to build object attributes: {}", e);
-                soft_fido2::Error::Other
-            })?;
-
-        // For a storage key, we need to specify the symmetric algorithm used to encrypt child objects
-        let rsa_params = PublicRsaParametersBuilder::new()
-            .with_symmetric(SymmetricDefinitionObject::AES_128_CFB)
-            .with_scheme(RsaScheme::Null)
-            .with_key_bits(RsaKeyBits::Rsa2048)
-            .with_exponent(RsaExponent::default())
-            .with_is_signing_key(false)
-            .with_is_decryption_key(true)
-            .with_restricted(true)
-            .build()
-            .map_err(|e| {
-                log::error!("Failed to build RSA parameters: {}", e);
-                soft_fido2::Error::Other
-            })?;
-
-        let primary_pub = PublicBuilder::new()
-            .with_public_algorithm(PublicAlgorithm::Rsa)
-            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-            .with_object_attributes(object_attributes)
-            .with_rsa_parameters(rsa_params)
-            .with_rsa_unique_identifier(PublicKeyRsa::default())
-            .build()
-            .map_err(|e| {
-                log::error!("Failed to build primary key public: {}", e);
-                soft_fido2::Error::Other
-            })?;
-
-        let primary_key_result = context
-            .create_primary(Hierarchy::Owner, primary_pub, None, None, None, None)
-            .map_err(|e| {
-                log::error!("Failed to create primary key: {}", e);
-                soft_fido2::Error::Other
-            })?;
-
-        Ok(primary_key_result.key_handle)
+        create_rsa_primary(context, Hierarchy::Owner).map_err(|e| {
+            log::error!("Failed to create primary key: {}", e);
+            soft_fido2::Error::Other
+        })
     }
 
     /// Get the parent key handle for sealing operations.
@@ -518,6 +517,7 @@ impl TpmStorageAdapter {
         );
 
         let sealed_blob = SealedBlob {
+            mode: None,
             encrypted_data,
             nonce: nonce_bytes.to_vec(),
             tpm_private: private_bytes,
