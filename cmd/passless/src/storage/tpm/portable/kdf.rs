@@ -4,6 +4,7 @@
 
 use hmac::{KeyInit, Mac};
 use sha2::Sha256;
+use soft_fido2::Error;
 use zeroize::Zeroizing;
 
 /// KDFe - NIST SP800-56A Concat KDF (used for ECDH seed derivation).
@@ -73,18 +74,31 @@ pub fn kdfa(
 ///
 /// Full-block CFB mode: c[0..16] = p[0..16] XOR AES_encrypt(IV);
 /// subsequent blocks XOR AES_encrypt(prev ciphertext block).
-pub fn aes_128_cfb_encrypt(key: &[u8], plaintext: &[u8]) -> Zeroizing<Vec<u8>> {
+pub fn aes_128_cfb_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    aes_128_cfb_encrypt_with_iv(key, &[0u8; 16], plaintext)
+}
+
+fn aes_128_cfb_encrypt_with_iv(
+    key: &[u8],
+    iv: &[u8],
+    plaintext: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Error> {
     use aes::Aes128;
     use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
-    let cipher = Aes128::new_from_slice(key).expect("valid AES-128 key");
+    if key.len() != 16 {
+        return Err(Error::Other);
+    }
+
+    let cipher = Aes128::new_from_slice(key).map_err(|_| Error::Other)?;
     let mut result = Zeroizing::new(vec![0u8; plaintext.len()]);
 
-    let mut iv = [0u8; 16];
+    let mut block_iv = [0u8; 16];
+    block_iv.copy_from_slice(iv);
     let block_size = 16;
 
     for (i, chunk) in plaintext.chunks(block_size).enumerate() {
-        let mut block = iv;
+        let mut block = block_iv;
         cipher.encrypt_block((&mut block).into());
 
         let start = i * block_size;
@@ -93,11 +107,11 @@ pub fn aes_128_cfb_encrypt(key: &[u8], plaintext: &[u8]) -> Zeroizing<Vec<u8>> {
         }
 
         if chunk.len() == block_size {
-            iv.copy_from_slice(&result[start..start + block_size]);
+            block_iv.copy_from_slice(&result[start..start + block_size]);
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// HMAC-SHA256
@@ -225,5 +239,46 @@ mod tests {
 
         let d = hmac_sha256(b"other_key", b"data");
         assert_ne!(a, d);
+    }
+
+    #[test]
+    fn aes_128_cfb_nist_sp800_38a_test_vector() {
+        let key = Vec::from_hex("2b7e151628aed2a6abf7158809cf4f3c").unwrap();
+        let iv = Vec::from_hex("000102030405060708090a0b0c0d0e0f").unwrap();
+        let plaintext = Vec::from_hex("6bc1bee22e409f96e93d7e117393172a").unwrap();
+        let expected = Vec::from_hex("3b3fd92eb72dad20333449f8e83cfb4a").unwrap();
+
+        let result = aes_128_cfb_encrypt_with_iv(&key, &iv, &plaintext).unwrap();
+        assert_eq!(&result[..], &expected[..]);
+    }
+
+    #[test]
+    fn aes_128_cfb_rejects_invalid_key_length() {
+        let short_key = [0u8; 15];
+        let long_key = [0u8; 17];
+        let plaintext = [0u8; 16];
+
+        assert!(aes_128_cfb_encrypt(&short_key, &plaintext).is_err());
+        assert!(aes_128_cfb_encrypt(&long_key, &plaintext).is_err());
+    }
+
+    #[test]
+    fn aes_128_cfb_deterministic_output() {
+        let key = [0x42u8; 16];
+        let plaintext = b"test plaintext!!";
+
+        let a = aes_128_cfb_encrypt(&key, plaintext).unwrap();
+        let b = aes_128_cfb_encrypt(&key, plaintext).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn aes_128_cfb_output_length_matches_input() {
+        let key = [0x42u8; 16];
+        for len in [0, 1, 15, 16, 17, 31, 32, 33, 100] {
+            let plaintext = vec![0xAA; len];
+            let ciphertext = aes_128_cfb_encrypt(&key, &plaintext).unwrap();
+            assert_eq!(ciphertext.len(), len);
+        }
     }
 }

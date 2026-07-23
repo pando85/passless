@@ -578,7 +578,10 @@ fn wrap_sensitive_for_import(
         })?;
 
     let outerkey = kdf::kdfa(&seed, b"STORAGE", &name, b"", 128);
-    let dupsens = kdf::aes_128_cfb_encrypt(&outerkey, &sensb);
+    let dupsens = kdf::aes_128_cfb_encrypt(&outerkey, &sensb).map_err(|e| {
+        error!("AES-128-CFB encryption failed: {:?}", e);
+        soft_fido2::Error::Other
+    })?;
 
     let hmackey = kdf::kdfa(&seed, b"INTEGRITY", b"", b"", 256);
     let hmac_data = kdf::hmac_sha256(&hmackey, &[dupsens.as_slice(), &name].concat());
