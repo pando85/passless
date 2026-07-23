@@ -137,167 +137,7 @@ impl TpmPinStorage {
     fn seal(&self, data: &[u8]) -> Result<Vec<u8>, StatusCode> {
         #[cfg(feature = "tpm")]
         {
-            use aes_gcm::Aes256Gcm;
-            use aes_gcm::Nonce;
-            use aes_gcm::aead::{Aead, KeyInit};
-            use rand::RngCore;
-            use rand::rngs::OsRng;
-            use tss_esapi::attributes::ObjectAttributesBuilder;
-            use tss_esapi::constants::SessionType;
-            use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
-            use tss_esapi::structures::{
-                KeyedHashScheme, PublicBuilder, PublicKeyedHashParameters, SensitiveData,
-                SymmetricDefinitionObject,
-            };
-            use tss_esapi::traits::Marshall;
-            use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
-            use zeroize::Zeroizing;
-
-            use crate::storage::tpm::SealedBlob;
-
-            let mut context =
-                crate::storage::tpm::portable::context::create_tpm_context(Some(&self.tcti))
-                    .map_err(|e| {
-                        warn!("Failed to connect to TPM: {:?}", e);
-                        StatusCode::Other
-                    })?;
-
-            let session = context
-                .start_auth_session(
-                    None,
-                    None,
-                    None,
-                    SessionType::Hmac,
-                    SymmetricDefinitionObject::AES_128_CFB.into(),
-                    HashingAlgorithm::Sha256,
-                )
-                .map_err(|e| {
-                    warn!("Failed to start TPM auth session: {:?}", e);
-                    StatusCode::Other
-                })?
-                .ok_or_else(|| {
-                    warn!("TPM auth session returned None");
-                    StatusCode::Other
-                })?;
-
-            context.set_sessions((Some(session), None, None));
-
-            let (parent_key, is_portable_parent) = if self.mode == TpmPinStorageMode::Portable {
-                (self.load_portable_parent(&mut context)?, true)
-            } else {
-                (self.create_legacy_primary(&mut context)?, false)
-            };
-
-            let fixed_tpm = !is_portable_parent;
-            let fixed_parent = !is_portable_parent;
-
-            let sealing_attributes = ObjectAttributesBuilder::new()
-                .with_fixed_tpm(fixed_tpm)
-                .with_fixed_parent(fixed_parent)
-                .with_user_with_auth(true)
-                .build()
-                .map_err(|e| {
-                    warn!("Failed to build sealing object attributes: {:?}", e);
-                    StatusCode::Other
-                })?;
-
-            let sealing_pub = PublicBuilder::new()
-                .with_public_algorithm(PublicAlgorithm::KeyedHash)
-                .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-                .with_object_attributes(sealing_attributes)
-                .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
-                .with_keyed_hash_unique_identifier(tss_esapi::structures::Digest::default())
-                .build()
-                .map_err(|e| {
-                    warn!("Failed to build sealing object public: {:?}", e);
-                    StatusCode::Other
-                })?;
-
-            let mut aes_key = [0u8; 32];
-            OsRng.fill_bytes(&mut aes_key);
-
-            let mut nonce_bytes = [0u8; 12];
-            OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::try_from(&nonce_bytes[..]).expect("valid nonce length");
-
-            let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
-                warn!("Failed to create AES cipher: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
-                warn!("Failed to encrypt data with AES-GCM: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let sensitive_data = SensitiveData::try_from(aes_key.to_vec()).map_err(|e| {
-                warn!("Failed to create sensitive data for AES key: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let create_result = context
-                .create(
-                    parent_key,
-                    sealing_pub,
-                    None,
-                    Some(sensitive_data),
-                    None,
-                    None,
-                )
-                .map_err(|e| {
-                    warn!("Failed to create sealed object: {:?}", e);
-                    StatusCode::Other
-                })?;
-
-            if !is_portable_parent {
-                context.flush_context(parent_key.into()).map_err(|e| {
-                    warn!("Failed to flush parent key: {:?}", e);
-                    StatusCode::Other
-                })?;
-            }
-
-            let private_tpm: TPM2B_PRIVATE = create_result.out_private.into();
-            let private_bytes = private_tpm.buffer[..private_tpm.size as usize].to_vec();
-
-            let public_bytes = if is_portable_parent {
-                create_result.out_public.marshall().map_err(|e| {
-                    warn!("Failed to marshall public area: {:?}", e);
-                    StatusCode::Other
-                })?
-            } else {
-                #[allow(clippy::unnecessary_fallible_conversions)]
-                let public_tpm: TPM2B_PUBLIC =
-                    create_result.out_public.try_into().map_err(|e| {
-                        warn!("Failed to convert public to TPM2B: {:?}", e);
-                        StatusCode::Other
-                    })?;
-
-                unsafe {
-                    let ptr = &public_tpm as *const TPM2B_PUBLIC as *const u8;
-                    std::slice::from_raw_parts(ptr, std::mem::size_of::<TPM2B_PUBLIC>()).to_vec()
-                }
-            };
-
-            let mode_str = if is_portable_parent {
-                Some("portable".to_string())
-            } else {
-                None
-            };
-
-            let sealed_blob = SealedBlob {
-                mode: mode_str,
-                encrypted_data,
-                nonce: nonce_bytes.to_vec(),
-                tpm_private: private_bytes,
-                tpm_public: public_bytes,
-            };
-
-            let serialized = Zeroizing::new(serde_json::to_vec(&sealed_blob).map_err(|e| {
-                warn!("Failed to serialize sealed blob: {:?}", e);
-                StatusCode::Other
-            })?);
-
-            Ok(serialized.to_vec())
+            self.seal_tpm(data)
         }
 
         #[cfg(not(feature = "tpm"))]
@@ -307,147 +147,362 @@ impl TpmPinStorage {
         }
     }
 
+    #[cfg(feature = "tpm")]
+    fn seal_tpm(&self, data: &[u8]) -> Result<Vec<u8>, StatusCode> {
+        use aes_gcm::Aes256Gcm;
+        use aes_gcm::Nonce;
+        use aes_gcm::aead::{Aead, KeyInit};
+        use rand::RngCore;
+        use rand::rngs::OsRng;
+        use tss_esapi::structures::SensitiveData;
+        use zeroize::Zeroizing;
+
+        use crate::storage::tpm::SealedBlob;
+
+        let mut context = crate::storage::tpm::portable::context::create_tpm_context(Some(
+            &self.tcti,
+        ))
+        .map_err(|e| {
+            warn!("Failed to connect to TPM: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        self.setup_encrypted_session(&mut context)?;
+
+        let (parent_key, is_portable_parent) = self.load_parent_key(&mut context)?;
+        let sealing_pub = self.build_sealing_template(is_portable_parent)?;
+
+        let mut aes_key = [0u8; 32];
+        OsRng.fill_bytes(&mut aes_key);
+
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..]).expect("valid nonce length");
+
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| {
+            warn!("Failed to create AES cipher: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
+            warn!("Failed to encrypt data with AES-GCM: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        let sensitive_data = SensitiveData::try_from(aes_key.to_vec()).map_err(|e| {
+            warn!("Failed to create sensitive data for AES key: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        let create_result = context
+            .create(
+                parent_key,
+                sealing_pub,
+                None,
+                Some(sensitive_data),
+                None,
+                None,
+            )
+            .map_err(|e| {
+                warn!("Failed to create sealed object: {:?}", e);
+                StatusCode::Other
+            })?;
+
+        if !is_portable_parent {
+            context.flush_context(parent_key.into()).map_err(|e| {
+                warn!("Failed to flush parent key: {:?}", e);
+                StatusCode::Other
+            })?;
+        }
+
+        let private_bytes = self.serialize_private(create_result.out_private);
+        let public_bytes = self.serialize_public(create_result.out_public, is_portable_parent)?;
+
+        let sealed_blob = SealedBlob {
+            mode: if is_portable_parent {
+                Some("portable".to_string())
+            } else {
+                None
+            },
+            encrypted_data,
+            nonce: nonce_bytes.to_vec(),
+            tpm_private: private_bytes,
+            tpm_public: public_bytes,
+        };
+
+        let serialized = Zeroizing::new(serde_json::to_vec(&sealed_blob).map_err(|e| {
+            warn!("Failed to serialize sealed blob: {:?}", e);
+            StatusCode::Other
+        })?);
+
+        Ok(serialized.to_vec())
+    }
+
     fn unseal(&self, sealed_data: &[u8]) -> Result<Vec<u8>, StatusCode> {
         #[cfg(feature = "tpm")]
         {
-            use aes_gcm::aead::{Aead, KeyInit};
-            use aes_gcm::{Aes256Gcm, Nonce};
-            use tss_esapi::constants::SessionType;
-            use tss_esapi::interface_types::algorithm::HashingAlgorithm;
-            use tss_esapi::structures::{Private, Public, SymmetricDefinitionObject};
-            use tss_esapi::traits::UnMarshall;
-            use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
-
-            use crate::storage::tpm::SealedBlob;
-
-            let mut context =
-                crate::storage::tpm::portable::context::create_tpm_context(Some(&self.tcti))
-                    .map_err(|e| {
-                        warn!("Failed to connect to TPM: {:?}", e);
-                        StatusCode::Other
-                    })?;
-
-            let session = context
-                .start_auth_session(
-                    None,
-                    None,
-                    None,
-                    SessionType::Hmac,
-                    SymmetricDefinitionObject::AES_128_CFB.into(),
-                    HashingAlgorithm::Sha256,
-                )
-                .map_err(|e| {
-                    warn!("Failed to start TPM auth session: {:?}", e);
-                    StatusCode::Other
-                })?
-                .ok_or_else(|| {
-                    warn!("TPM auth session returned None");
-                    StatusCode::Other
-                })?;
-
-            context.set_sessions((Some(session), None, None));
-
-            let sealed_blob: SealedBlob = serde_json::from_slice(sealed_data).map_err(|e| {
-                warn!("Failed to deserialize sealed blob: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let blob_is_portable = sealed_blob.mode.as_deref() == Some("portable");
-
-            let (parent_key, is_portable_parent) = if blob_is_portable {
-                (self.load_portable_parent(&mut context)?, true)
-            } else {
-                (self.create_legacy_primary(&mut context)?, false)
-            };
-
-            let mut private_tpm = TPM2B_PRIVATE {
-                size: sealed_blob.tpm_private.len() as u16,
-                buffer: [0u8; 1550],
-            };
-            private_tpm.buffer[..sealed_blob.tpm_private.len()]
-                .copy_from_slice(&sealed_blob.tpm_private);
-
-            let private = Private::try_from(private_tpm).map_err(|e| {
-                warn!("Failed to convert TPM2B_PRIVATE to Private: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let public = if is_portable_parent {
-                Public::unmarshall(&sealed_blob.tpm_public).map_err(|e| {
-                    warn!("Failed to unmarshall public area: {:?}", e);
-                    StatusCode::Other
-                })?
-            } else {
-                let public_tpm: TPM2B_PUBLIC = unsafe {
-                    let mut public_struct: TPM2B_PUBLIC = std::mem::zeroed();
-                    let ptr = &mut public_struct as *mut TPM2B_PUBLIC as *mut u8;
-                    std::ptr::copy_nonoverlapping(
-                        sealed_blob.tpm_public.as_ptr(),
-                        ptr,
-                        std::cmp::min(
-                            sealed_blob.tpm_public.len(),
-                            std::mem::size_of::<TPM2B_PUBLIC>(),
-                        ),
-                    );
-                    public_struct
-                };
-
-                Public::try_from(public_tpm).map_err(|e| {
-                    warn!("Failed to convert TPM2B_PUBLIC to Public: {:?}", e);
-                    StatusCode::Other
-                })?
-            };
-
-            let sealed_handle = context.load(parent_key, private, public).map_err(|e| {
-                warn!("Failed to load sealed object: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let unsealed_key = context.unseal(sealed_handle.into()).map_err(|e| {
-                warn!("Failed to unseal AES key: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            context.flush_context(sealed_handle.into()).map_err(|e| {
-                warn!("Failed to flush sealed handle: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            if !is_portable_parent {
-                context.flush_context(parent_key.into()).map_err(|e| {
-                    warn!("Failed to flush parent key: {:?}", e);
-                    StatusCode::Other
-                })?;
-            }
-
-            let aes_key = unsealed_key.value();
-            if aes_key.len() != 32 {
-                warn!(
-                    "Unsealed key has wrong size: {} (expected 32)",
-                    aes_key.len()
-                );
-                return Err(StatusCode::Other);
-            }
-
-            let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
-            let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
-                warn!("Failed to create AES cipher: {:?}", e);
-                StatusCode::Other
-            })?;
-
-            let decrypted_data = cipher
-                .decrypt(&nonce, sealed_blob.encrypted_data.as_ref())
-                .map_err(|e| {
-                    warn!("Failed to decrypt data with AES-GCM: {:?}", e);
-                    StatusCode::Other
-                })?;
-
-            Ok(decrypted_data)
+            self.unseal_tpm(sealed_data)
         }
 
         #[cfg(not(feature = "tpm"))]
         {
             Ok(sealed_data.to_vec())
+        }
+    }
+
+    #[cfg(feature = "tpm")]
+    fn unseal_tpm(&self, sealed_data: &[u8]) -> Result<Vec<u8>, StatusCode> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        use crate::storage::tpm::SealedBlob;
+
+        let mut context = crate::storage::tpm::portable::context::create_tpm_context(Some(
+            &self.tcti,
+        ))
+        .map_err(|e| {
+            warn!("Failed to connect to TPM: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        self.setup_encrypted_session(&mut context)?;
+
+        let sealed_blob: SealedBlob = serde_json::from_slice(sealed_data).map_err(|e| {
+            warn!("Failed to deserialize sealed blob: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        let is_portable_parent = sealed_blob.mode.as_deref() == Some("portable");
+        let (parent_key, _) = self.load_parent_key_for_mode(&mut context, is_portable_parent)?;
+
+        let private = self.deserialize_private(&sealed_blob.tpm_private)?;
+        let public = self.deserialize_public(&sealed_blob.tpm_public, is_portable_parent)?;
+
+        let sealed_handle = context.load(parent_key, private, public).map_err(|e| {
+            warn!("Failed to load sealed object: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        let unsealed_key = context.unseal(sealed_handle.into()).map_err(|e| {
+            warn!("Failed to unseal AES key: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        context.flush_context(sealed_handle.into()).map_err(|e| {
+            warn!("Failed to flush sealed handle: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        if !is_portable_parent {
+            context.flush_context(parent_key.into()).map_err(|e| {
+                warn!("Failed to flush parent key: {:?}", e);
+                StatusCode::Other
+            })?;
+        }
+
+        let aes_key = unsealed_key.value();
+        if aes_key.len() != 32 {
+            warn!(
+                "Unsealed key has wrong size: {} (expected 32)",
+                aes_key.len()
+            );
+            return Err(StatusCode::Other);
+        }
+
+        let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
+        let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
+            warn!("Failed to create AES cipher: {:?}", e);
+            StatusCode::Other
+        })?;
+
+        let decrypted_data = cipher
+            .decrypt(&nonce, sealed_blob.encrypted_data.as_ref())
+            .map_err(|e| {
+                warn!("Failed to decrypt data with AES-GCM: {:?}", e);
+                StatusCode::Other
+            })?;
+
+        Ok(decrypted_data)
+    }
+
+    #[cfg(feature = "tpm")]
+    fn setup_encrypted_session(&self, context: &mut tss_esapi::Context) -> Result<(), StatusCode> {
+        use tss_esapi::constants::SessionType;
+        use tss_esapi::interface_types::algorithm::HashingAlgorithm;
+        use tss_esapi::structures::SymmetricDefinitionObject;
+
+        let session = context
+            .start_auth_session(
+                None,
+                None,
+                None,
+                SessionType::Hmac,
+                SymmetricDefinitionObject::AES_128_CFB.into(),
+                HashingAlgorithm::Sha256,
+            )
+            .map_err(|e| {
+                warn!("Failed to start TPM auth session: {:?}", e);
+                StatusCode::Other
+            })?
+            .ok_or_else(|| {
+                warn!("TPM auth session returned None");
+                StatusCode::Other
+            })?;
+
+        context.set_sessions((Some(session), None, None));
+        Ok(())
+    }
+
+    #[cfg(feature = "tpm")]
+    fn load_parent_key(
+        &self,
+        context: &mut tss_esapi::Context,
+    ) -> Result<(tss_esapi::handles::KeyHandle, bool), StatusCode> {
+        let is_portable = self.mode == TpmPinStorageMode::Portable;
+        let key = if is_portable {
+            self.load_portable_parent(context)?
+        } else {
+            self.create_legacy_primary(context)?
+        };
+        Ok((key, is_portable))
+    }
+
+    #[cfg(feature = "tpm")]
+    fn load_parent_key_for_mode(
+        &self,
+        context: &mut tss_esapi::Context,
+        is_portable: bool,
+    ) -> Result<(tss_esapi::handles::KeyHandle, bool), StatusCode> {
+        let key = if is_portable {
+            self.load_portable_parent(context)?
+        } else {
+            self.create_legacy_primary(context)?
+        };
+        Ok((key, is_portable))
+    }
+
+    #[cfg(feature = "tpm")]
+    fn build_sealing_template(
+        &self,
+        is_portable: bool,
+    ) -> Result<tss_esapi::structures::Public, StatusCode> {
+        use tss_esapi::attributes::ObjectAttributesBuilder;
+        use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
+        use tss_esapi::structures::{KeyedHashScheme, PublicBuilder, PublicKeyedHashParameters};
+
+        let fixed_tpm = !is_portable;
+        let fixed_parent = !is_portable;
+
+        let sealing_attributes = ObjectAttributesBuilder::new()
+            .with_fixed_tpm(fixed_tpm)
+            .with_fixed_parent(fixed_parent)
+            .with_user_with_auth(true)
+            .build()
+            .map_err(|e| {
+                warn!("Failed to build sealing object attributes: {:?}", e);
+                StatusCode::Other
+            })?;
+
+        PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::KeyedHash)
+            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+            .with_object_attributes(sealing_attributes)
+            .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+            .with_keyed_hash_unique_identifier(tss_esapi::structures::Digest::default())
+            .build()
+            .map_err(|e| {
+                warn!("Failed to build sealing object public: {:?}", e);
+                StatusCode::Other
+            })
+    }
+
+    #[cfg(feature = "tpm")]
+    fn serialize_private(&self, out_private: tss_esapi::structures::Private) -> Vec<u8> {
+        use tss_esapi::tss2_esys::TPM2B_PRIVATE;
+
+        let private_tpm: TPM2B_PRIVATE = out_private.into();
+        private_tpm.buffer[..private_tpm.size as usize].to_vec()
+    }
+
+    #[cfg(feature = "tpm")]
+    fn serialize_public(
+        &self,
+        out_public: tss_esapi::structures::Public,
+        is_portable: bool,
+    ) -> Result<Vec<u8>, StatusCode> {
+        use tss_esapi::traits::Marshall;
+        use tss_esapi::tss2_esys::TPM2B_PUBLIC;
+
+        if is_portable {
+            out_public.marshall().map_err(|e| {
+                warn!("Failed to marshall public area: {:?}", e);
+                StatusCode::Other
+            })
+        } else {
+            #[allow(clippy::unnecessary_fallible_conversions)]
+            let public_tpm: TPM2B_PUBLIC = out_public.try_into().map_err(|e| {
+                warn!("Failed to convert public to TPM2B: {:?}", e);
+                StatusCode::Other
+            })?;
+
+            Ok(unsafe {
+                let ptr = &public_tpm as *const TPM2B_PUBLIC as *const u8;
+                std::slice::from_raw_parts(ptr, std::mem::size_of::<TPM2B_PUBLIC>()).to_vec()
+            })
+        }
+    }
+
+    #[cfg(feature = "tpm")]
+    fn deserialize_private(
+        &self,
+        tpm_private: &[u8],
+    ) -> Result<tss_esapi::structures::Private, StatusCode> {
+        use tss_esapi::structures::Private;
+        use tss_esapi::tss2_esys::TPM2B_PRIVATE;
+
+        let mut private_tpm = TPM2B_PRIVATE {
+            size: tpm_private.len() as u16,
+            buffer: [0u8; 1550],
+        };
+        private_tpm.buffer[..tpm_private.len()].copy_from_slice(tpm_private);
+
+        Private::try_from(private_tpm).map_err(|e| {
+            warn!("Failed to convert TPM2B_PRIVATE to Private: {:?}", e);
+            StatusCode::Other
+        })
+    }
+
+    #[cfg(feature = "tpm")]
+    fn deserialize_public(
+        &self,
+        tpm_public: &[u8],
+        is_portable: bool,
+    ) -> Result<tss_esapi::structures::Public, StatusCode> {
+        use tss_esapi::structures::Public;
+        use tss_esapi::traits::UnMarshall;
+        use tss_esapi::tss2_esys::TPM2B_PUBLIC;
+
+        if is_portable {
+            Public::unmarshall(tpm_public).map_err(|e| {
+                warn!("Failed to unmarshall public area: {:?}", e);
+                StatusCode::Other
+            })
+        } else {
+            let public_tpm: TPM2B_PUBLIC = unsafe {
+                let mut public_struct: TPM2B_PUBLIC = std::mem::zeroed();
+                let ptr = &mut public_struct as *mut TPM2B_PUBLIC as *mut u8;
+                std::ptr::copy_nonoverlapping(
+                    tpm_public.as_ptr(),
+                    ptr,
+                    std::cmp::min(tpm_public.len(), std::mem::size_of::<TPM2B_PUBLIC>()),
+                );
+                public_struct
+            };
+
+            Public::try_from(public_tpm).map_err(|e| {
+                warn!("Failed to convert TPM2B_PUBLIC to Public: {:?}", e);
+                StatusCode::Other
+            })
         }
     }
 
