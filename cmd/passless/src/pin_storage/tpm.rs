@@ -137,8 +137,6 @@ impl TpmPinStorage {
     fn seal(&self, data: &[u8]) -> Result<Vec<u8>, StatusCode> {
         #[cfg(feature = "tpm")]
         {
-            use std::str::FromStr;
-
             use aes_gcm::Aes256Gcm;
             use aes_gcm::Nonce;
             use aes_gcm::aead::{Aead, KeyInit};
@@ -153,23 +151,16 @@ impl TpmPinStorage {
             };
             use tss_esapi::traits::Marshall;
             use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
-            use tss_esapi::{Context, Tcti};
             use zeroize::Zeroizing;
 
             use crate::storage::tpm::SealedBlob;
 
-            let tcti_conf = Tcti::from_str(&self.tcti).map_err(|e| {
-                warn!(
-                    "Failed to parse TCTI configuration '{}': {:?}",
-                    self.tcti, e
-                );
-                StatusCode::Other
-            })?;
-
-            let mut context = Context::new(tcti_conf).map_err(|e| {
-                warn!("Failed to connect to TPM: {:?}", e);
-                StatusCode::Other
-            })?;
+            let mut context =
+                crate::storage::tpm::portable::context::create_tpm_context(Some(&self.tcti))
+                    .map_err(|e| {
+                        warn!("Failed to connect to TPM: {:?}", e);
+                        StatusCode::Other
+                    })?;
 
             let session = context
                 .start_auth_session(
@@ -319,8 +310,6 @@ impl TpmPinStorage {
     fn unseal(&self, sealed_data: &[u8]) -> Result<Vec<u8>, StatusCode> {
         #[cfg(feature = "tpm")]
         {
-            use std::str::FromStr;
-
             use aes_gcm::aead::{Aead, KeyInit};
             use aes_gcm::{Aes256Gcm, Nonce};
             use tss_esapi::constants::SessionType;
@@ -328,22 +317,15 @@ impl TpmPinStorage {
             use tss_esapi::structures::{Private, Public, SymmetricDefinitionObject};
             use tss_esapi::traits::UnMarshall;
             use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
-            use tss_esapi::{Context, Tcti};
 
             use crate::storage::tpm::SealedBlob;
 
-            let tcti_conf = Tcti::from_str(&self.tcti).map_err(|e| {
-                warn!(
-                    "Failed to parse TCTI configuration '{}': {:?}",
-                    self.tcti, e
-                );
-                StatusCode::Other
-            })?;
-
-            let mut context = Context::new(tcti_conf).map_err(|e| {
-                warn!("Failed to connect to TPM: {:?}", e);
-                StatusCode::Other
-            })?;
+            let mut context =
+                crate::storage::tpm::portable::context::create_tpm_context(Some(&self.tcti))
+                    .map_err(|e| {
+                        warn!("Failed to connect to TPM: {:?}", e);
+                        StatusCode::Other
+                    })?;
 
             let session = context
                 .start_auth_session(

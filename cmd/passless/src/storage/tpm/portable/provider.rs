@@ -81,16 +81,7 @@ impl TpmCredentialKeyProvider {
     pub fn new(storage_dir: PathBuf, tcti: Option<String>) -> Result<Self> {
         let parent = PortableParent::new(storage_dir.clone(), tcti.clone())?;
 
-        let tcti_conf = if let Some(ref tcti_str) = tcti {
-            std::str::FromStr::from_str(tcti_str).map_err(|e| {
-                error!("Failed to parse TCTI configuration: {}", e);
-                soft_fido2::Error::Other
-            })?
-        } else {
-            tss_esapi::Tcti::Device(Default::default())
-        };
-
-        let context = Context::new(tcti_conf).map_err(|e| {
+        let context = super::context::create_tpm_context(tcti.as_deref()).map_err(|e| {
             error!("Failed to create TPM context: {}", e);
             soft_fido2::Error::Other
         })?;

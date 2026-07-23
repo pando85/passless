@@ -18,7 +18,6 @@ use soft_fido2::Result;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -33,12 +32,12 @@ use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::{algorithm::HashingAlgorithm, resource_handles::Hierarchy};
 use tss_esapi::structures::{KeyedHashScheme, Public, PublicBuilder, PublicKeyedHashParameters};
 
+use tss_esapi::Context;
 use tss_esapi::structures::{
     PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme, SymmetricDefinitionObject,
 };
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::{TPM2B_PRIVATE, TPM2B_PUBLIC};
-use tss_esapi::{Context, Tcti};
 use zeroize::Zeroizing;
 
 /// TPM storage adapter
@@ -236,23 +235,13 @@ impl TpmStorageAdapter {
             .map_err(|_| soft_fido2::Error::Other)?;
 
         // Initialize TPM context
-        let tcti_conf = if let Some(ref tcti_str) = tcti {
+        if let Some(ref tcti_str) = tcti {
             info!("Using TCTI configuration: {}", tcti_str);
-            Tcti::from_str(tcti_str).map_err(|e| {
-                log::error!("Failed to parse TCTI configuration '{}': {}", tcti_str, e);
-                log::error!("TCTI format examples:");
-                log::error!("  - Hardware TPM: device:/dev/tpmrm0");
-                log::error!("  - swtpm socket: swtpm:path=/path/to/socket");
-
-                soft_fido2::Error::Other
-            })?
         } else {
-            // Default TCTI (device or simulator)
             info!("Using default TCTI: device:/dev/tpmrm0");
-            Tcti::Device(Default::default())
-        };
+        }
 
-        let mut context = Context::new(tcti_conf).map_err(|e| {
+        let mut context = portable::context::create_tpm_context(tcti.as_deref()).map_err(|e| {
             log::error!("Failed to create TPM context: {}", e);
             if let Some(ref tcti_str) = tcti {
                 log::error!("TCTI used: {}", tcti_str);
