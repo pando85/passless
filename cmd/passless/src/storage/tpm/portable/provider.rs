@@ -13,10 +13,12 @@ use soft_fido2_ctap::key_provider::{
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use log::{debug, error};
 use tss_esapi::Context;
 use tss_esapi::attributes::ObjectAttributesBuilder;
+use tss_esapi::constants::{AlgorithmIdentifier, CapabilityType, EccCurveIdentifier};
 use tss_esapi::interface_types::algorithm::HashingAlgorithm;
 use tss_esapi::interface_types::algorithm::PublicAlgorithm;
 use tss_esapi::interface_types::ecc::EccCurve;
@@ -29,12 +31,37 @@ use tss_esapi::traits::{Marshall, UnMarshall};
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256)
 const COSE_ALG_ES256: i32 = -7;
 
+/// Validate that a record's format version is compatible with this binary.
+///
+/// Refuses records stamped with a version newer than `FORMAT_VERSION`
+/// (downgrade protection) or version 0 (unknown/invalid).
+pub fn validate_record_version(
+    record_version: u16,
+) -> core::result::Result<(), CredentialKeyError> {
+    if record_version == 0 {
+        error!(
+            "Refusing record with unknown format version 0 (current version: {})",
+            parent::FORMAT_VERSION
+        );
+        return Err(CredentialKeyError::UnsupportedFormatVersion);
+    }
+    if record_version > parent::FORMAT_VERSION {
+        error!(
+            "Refusing record with newer format version {} (current version: {}); \
+             upgrade this binary before accessing this credential",
+            record_version,
+            parent::FORMAT_VERSION
+        );
+        return Err(CredentialKeyError::UnsupportedFormatVersion);
+    }
+    Ok(())
+}
+
 /// TPM credential key provider
 pub struct TpmCredentialKeyProvider {
-    /// Portable parent manager
     parent: PortableParent,
-    /// TPM context for key operations
     context: Mutex<Context>,
+    capabilities_checked: OnceLock<bool>,
 }
 
 /// Opaque material format for TPM credential keys
@@ -70,12 +97,93 @@ impl TpmCredentialKeyProvider {
         Ok(Self {
             parent,
             context: Mutex::new(context),
+            capabilities_checked: OnceLock::new(),
         })
     }
 
     /// Check if the provider is ready (parent is provisioned)
     pub fn is_ready(&self) -> bool {
         self.parent.is_provisioned()
+    }
+
+    fn verify_tpm_capabilities(&self) -> core::result::Result<(), CredentialKeyError> {
+        if self.capabilities_checked.get().is_some() {
+            return Ok(());
+        }
+
+        let mut context = self.context.lock().map_err(|e| {
+            error!("Failed to lock TPM context for capability check: {}", e);
+            CredentialKeyError::TransientFailure("Failed to lock TPM context".to_string())
+        })?;
+
+        let (alg_data, _) = context
+            .get_capability(CapabilityType::Algorithms, 0, 256)
+            .map_err(|e| {
+                error!("TPM2_GetCapability(Algorithms) failed: {}", e);
+                CredentialKeyError::TransientFailure(
+                    "Failed to query TPM algorithm capabilities".to_string(),
+                )
+            })?;
+
+        let alg_list = match alg_data {
+            tss_esapi::structures::CapabilityData::Algorithms(list) => list,
+            _ => {
+                error!("Unexpected capability data type for Algorithms query");
+                return Err(CredentialKeyError::TransientFailure(
+                    "Unexpected TPM capability response".to_string(),
+                ));
+            }
+        };
+
+        let required_algs = [
+            (AlgorithmIdentifier::Ecc, "ECC"),
+            (AlgorithmIdentifier::EcDsa, "ECDSA"),
+            (AlgorithmIdentifier::Aes, "AES"),
+            (AlgorithmIdentifier::Cfb, "AES-CFB"),
+        ];
+
+        for (alg_id, name) in &required_algs {
+            if alg_list.find(*alg_id).is_none() {
+                error!(
+                    "TPM does not support required algorithm {} ({:?})",
+                    name, alg_id
+                );
+                return Err(CredentialKeyError::TransientFailure(format!(
+                    "TPM missing required algorithm: {}",
+                    name
+                )));
+            }
+        }
+
+        let (curve_data, _) = context
+            .get_capability(CapabilityType::EccCurves, 0, 16)
+            .map_err(|e| {
+                error!("TPM2_GetCapability(EccCurves) failed: {}", e);
+                CredentialKeyError::TransientFailure(
+                    "Failed to query TPM ECC curve capabilities".to_string(),
+                )
+            })?;
+
+        let curve_list = match curve_data {
+            tss_esapi::structures::CapabilityData::EccCurves(list) => list,
+            _ => {
+                error!("Unexpected capability data type for EccCurves query");
+                return Err(CredentialKeyError::TransientFailure(
+                    "Unexpected TPM capability response".to_string(),
+                ));
+            }
+        };
+
+        if !curve_list.as_ref().contains(&EccCurveIdentifier::NistP256) {
+            error!("TPM does not support required ECC curve NIST P-256");
+            return Err(CredentialKeyError::TransientFailure(
+                "TPM missing required ECC curve: NIST P-256".to_string(),
+            ));
+        }
+
+        let _ = self.capabilities_checked.set(true);
+        debug!("TPM capability check passed: ES256 (P-256, ECDSA-SHA256, AES-128-CFB) supported");
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -372,7 +480,10 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
     }
 
     fn supports_algorithm(&self, algorithm: i32) -> bool {
-        algorithm == COSE_ALG_ES256
+        if algorithm != COSE_ALG_ES256 {
+            return false;
+        }
+        self.verify_tpm_capabilities().is_ok()
     }
 
     fn generate(
@@ -389,6 +500,8 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
                 "TPM portable parent not provisioned".to_string(),
             ));
         }
+
+        self.verify_tpm_capabilities()?;
 
         match algorithm {
             COSE_ALG_ES256 => self.generate_es256_key().map_err(|e| {
@@ -409,9 +522,7 @@ impl CredentialKeyProvider for TpmCredentialKeyProvider {
             return Err(CredentialKeyError::UnsupportedProvider);
         }
 
-        if key.format_version != parent::FORMAT_VERSION {
-            return Err(CredentialKeyError::UnsupportedFormatVersion);
-        }
+        validate_record_version(key.format_version)?;
 
         if !self.supports_algorithm(algorithm) {
             return Err(CredentialKeyError::UnsupportedAlgorithm);
