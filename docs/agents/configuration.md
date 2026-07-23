@@ -90,6 +90,7 @@ pin_path = "agent/<profile>-pin"
 path = "/var/lib/passless-agent/<profile>/credentials"
 tcti = "device:/dev/tpmrm0"
 pin_path = "/var/lib/passless-agent/<profile>/pin"
+portable = false # true = portable TPM-resident keys; requires prior `passless tpm provision`
 ```
 
 All storage roots must be non-overlapping with each other, with the human backend, and with the

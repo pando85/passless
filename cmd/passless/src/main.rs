@@ -13,6 +13,8 @@ use passless_core::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
 };
 
+use soft_fido2::CredentialKeyProvider;
+use soft_fido2::SoftwareCredentialKeyProvider;
 use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, UhidDevice};
 
 use std::process;
@@ -70,20 +72,26 @@ struct CliArgs {
 /// The operation_lock is held across the entire CTAP service dispatch so that
 /// human and delegated read-sign-update operations serialize. Never hold the
 /// service/storage lock while acquiring the operation_lock.
-pub(crate) struct ServiceHandler<S: CredentialStorage, P: PinStorage> {
-    service: std::sync::Mutex<AuthenticatorService<S, P>>,
+pub(crate) struct ServiceHandler<
+    S: CredentialStorage,
+    P: PinStorage,
+    K: CredentialKeyProvider = SoftwareCredentialKeyProvider,
+> {
+    service: std::sync::Mutex<AuthenticatorService<S, P, K>>,
     operation_lock: Arc<Mutex<()>>,
 }
 
-impl<S: CredentialStorage, P: PinStorage> ServiceHandler<S, P> {
-    pub(crate) fn new(service: AuthenticatorService<S, P>) -> Self {
+impl<S: CredentialStorage, P: PinStorage, K: CredentialKeyProvider + Send + Sync>
+    ServiceHandler<S, P, K>
+{
+    pub(crate) fn new(service: AuthenticatorService<S, P, K>) -> Self {
         Self {
             service: std::sync::Mutex::new(service),
             operation_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    fn with_operation_lock(service: AuthenticatorService<S, P>, lock: Arc<Mutex<()>>) -> Self {
+    fn with_operation_lock(service: AuthenticatorService<S, P, K>, lock: Arc<Mutex<()>>) -> Self {
         Self {
             service: std::sync::Mutex::new(service),
             operation_lock: lock,
@@ -91,8 +99,11 @@ impl<S: CredentialStorage, P: PinStorage> ServiceHandler<S, P> {
     }
 }
 
-impl<S: CredentialStorage + 'static, P: PinStorage + 'static> CommandHandler
-    for ServiceHandler<S, P>
+impl<
+    S: CredentialStorage + 'static,
+    P: PinStorage + 'static,
+    K: CredentialKeyProvider + Send + Sync + 'static,
+> CommandHandler for ServiceHandler<S, P, K>
 {
     fn handle_command(&mut self, cmd: Cmd, data: &[u8]) -> soft_fido2_transport::Result<Vec<u8>> {
         if cmd != Cmd::Cbor {
@@ -122,8 +133,12 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> CommandHandler
 }
 
 /// Helper function to run the main loop with any storage backend
-fn run_with_service<S: CredentialStorage + 'static, P: PinStorage + 'static>(
-    service: AuthenticatorService<S, P>,
+fn run_with_service<
+    S: CredentialStorage + 'static,
+    P: PinStorage + 'static,
+    K: CredentialKeyProvider + Send + Sync + 'static,
+>(
+    service: AuthenticatorService<S, P, K>,
     uhid: UhidDevice,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -131,8 +146,12 @@ fn run_with_service<S: CredentialStorage + 'static, P: PinStorage + 'static>(
 }
 
 #[cfg(feature = "agent")]
-fn run_with_service_and_lock<S: CredentialStorage + 'static, P: PinStorage + 'static>(
-    service: AuthenticatorService<S, P>,
+fn run_with_service_and_lock<
+    S: CredentialStorage + 'static,
+    P: PinStorage + 'static,
+    K: CredentialKeyProvider + Send + Sync + 'static,
+>(
+    service: AuthenticatorService<S, P, K>,
     uhid: UhidDevice,
     shutdown: Arc<AtomicBool>,
     operation_lock: Arc<Mutex<()>>,
@@ -140,8 +159,12 @@ fn run_with_service_and_lock<S: CredentialStorage + 'static, P: PinStorage + 'st
     run_with_service_inner(service, uhid, shutdown, Some(operation_lock))
 }
 
-fn run_with_service_inner<S: CredentialStorage + 'static, P: PinStorage + 'static>(
-    mut service: AuthenticatorService<S, P>,
+fn run_with_service_inner<
+    S: CredentialStorage + 'static,
+    P: PinStorage + 'static,
+    K: CredentialKeyProvider + Send + Sync + 'static,
+>(
+    mut service: AuthenticatorService<S, P, K>,
     uhid: UhidDevice,
     shutdown: Arc<AtomicBool>,
     operation_lock: Option<Arc<Mutex<()>>>,
@@ -286,6 +309,8 @@ fn run() -> Result<()> {
                 output,
                 action,
             } => commands::agent::dispatch(profile.as_deref(), *output, action),
+            #[cfg(feature = "tpm")]
+            Commands::Tpm { action } => commands::tpm::dispatch(action),
         };
     }
 
@@ -477,7 +502,7 @@ fn run() -> Result<()> {
                     path,
                     gpg_backend,
                 } => {
-                    let gpg_backend = storage::pass::GpgBackend::from_str(&gpg_backend)?;
+                    let gpg_backend = gpg_backend.parse::<storage::pass::GpgBackend>()?;
                     let storage = PassStorageAdapter::new_with_options(
                         store_path.clone().into(),
                         path.clone().into(),
@@ -526,50 +551,101 @@ fn run() -> Result<()> {
                     result
                 }
                 #[cfg(feature = "tpm")]
-                BackendConfig::Tpm { path, tcti } => {
-                    let storage = TpmStorageAdapter::new_with_options(
-                        path.clone().into(),
-                        Some(tcti.clone()),
-                        allow_storage_creation,
-                    )?;
-                    let boxed: Box<dyn CredentialStorage> = Box::new(storage);
-                    let shared_storage = Arc::new(Mutex::new(boxed));
-                    let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
-                    let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
-                        Arc::new(Mutex::new(Box::new(pin_storage)));
-                    let service = AuthenticatorService::with_shared_storage(
-                        shared_storage.clone(),
-                        Some(pin_storage.clone()),
-                        security_config.clone(),
-                        pin_config.clone(),
-                    )?;
+                BackendConfig::Tpm {
+                    path,
+                    tcti,
+                    portable,
+                } => {
+                    if portable {
+                        use storage::tpm::portable::build_portable_bundle;
 
-                    let agent_runtime = match agent::runtime::AgentRuntime::start(
-                        shared_storage.clone(),
-                        pin_storage.clone(),
-                        operation_lock.clone(),
-                        &config.agents,
-                        security_config,
-                        pin_config,
-                        shutdown.clone(),
-                    ) {
-                        Ok(rt) => Some(rt),
-                        Err(e) => {
-                            warn!(
-                                "Agent subsystem failed to start: {}; human path remains available",
-                                e
-                            );
-                            None
+                        let (provider, storage, pin_storage) =
+                            build_portable_bundle(path.into(), Some(tcti), allow_storage_creation)?;
+                        let boxed: Box<dyn CredentialStorage> = Box::new(storage);
+                        let shared_storage = Arc::new(Mutex::new(boxed));
+                        let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
+                            Arc::new(Mutex::new(Box::new(pin_storage)));
+                        let service = AuthenticatorService::with_shared_storage_and_key_provider(
+                            shared_storage.clone(),
+                            Some(pin_storage.clone()),
+                            provider,
+                            security_config.clone(),
+                            pin_config.clone(),
+                        )?;
+
+                        let agent_runtime = match agent::runtime::AgentRuntime::start(
+                            shared_storage.clone(),
+                            pin_storage.clone(),
+                            operation_lock.clone(),
+                            &config.agents,
+                            security_config,
+                            pin_config,
+                            shutdown.clone(),
+                        ) {
+                            Ok(rt) => Some(rt),
+                            Err(e) => {
+                                warn!(
+                                    "Agent subsystem failed to start: {}; human path remains available",
+                                    e
+                                );
+                                None
+                            }
+                        };
+
+                        let result =
+                            run_with_service_and_lock(service, uhid, shutdown, operation_lock);
+                        if let Some(rt) = agent_runtime {
+                            rt.shutdown();
                         }
-                    };
+                        endpoint_manager.cancel_all();
+                        let _ = endpoint_manager.shutdown_all(None);
+                        result
+                    } else {
+                        let storage = TpmStorageAdapter::new_with_options(
+                            path.clone().into(),
+                            Some(tcti.clone()),
+                            allow_storage_creation,
+                        )?;
+                        let boxed: Box<dyn CredentialStorage> = Box::new(storage);
+                        let shared_storage = Arc::new(Mutex::new(boxed));
+                        let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
+                        let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
+                            Arc::new(Mutex::new(Box::new(pin_storage)));
+                        let service = AuthenticatorService::with_shared_storage(
+                            shared_storage.clone(),
+                            Some(pin_storage.clone()),
+                            security_config.clone(),
+                            pin_config.clone(),
+                        )?;
 
-                    let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
-                    if let Some(rt) = agent_runtime {
-                        rt.shutdown();
+                        let agent_runtime = match agent::runtime::AgentRuntime::start(
+                            shared_storage.clone(),
+                            pin_storage.clone(),
+                            operation_lock.clone(),
+                            &config.agents,
+                            security_config,
+                            pin_config,
+                            shutdown.clone(),
+                        ) {
+                            Ok(rt) => Some(rt),
+                            Err(e) => {
+                                warn!(
+                                    "Agent subsystem failed to start: {}; human path remains available",
+                                    e
+                                );
+                                None
+                            }
+                        };
+
+                        let result =
+                            run_with_service_and_lock(service, uhid, shutdown, operation_lock);
+                        if let Some(rt) = agent_runtime {
+                            rt.shutdown();
+                        }
+                        endpoint_manager.cancel_all();
+                        let _ = endpoint_manager.shutdown_all(None);
+                        result
                     }
-                    endpoint_manager.cancel_all();
-                    let _ = endpoint_manager.shutdown_all(None);
-                    result
                 }
             }
         }
@@ -655,7 +731,7 @@ fn run() -> Result<()> {
                 path,
                 gpg_backend,
             } => {
-                let gpg_backend = storage::pass::GpgBackend::from_str(&gpg_backend)?;
+                let gpg_backend = gpg_backend.parse::<storage::pass::GpgBackend>()?;
                 let storage = PassStorageAdapter::new_with_options(
                     store_path.clone().into(),
                     path.clone().into(),
@@ -673,21 +749,41 @@ fn run() -> Result<()> {
                 run_with_service(service, uhid, shutdown)
             }
             #[cfg(feature = "tpm")]
-            BackendConfig::Tpm { path, tcti } => {
-                let storage = TpmStorageAdapter::new_with_options(
-                    path.clone().into(),
-                    Some(tcti.clone()),
-                    allow_storage_creation,
-                )?;
-                let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
-                let pin_storage = Arc::new(Mutex::new(pin_storage));
-                let service = AuthenticatorService::with_pin_storage(
-                    storage,
-                    Some(pin_storage),
-                    security_config,
-                    pin_config,
-                )?;
-                run_with_service(service, uhid, shutdown)
+            BackendConfig::Tpm {
+                path,
+                tcti,
+                portable,
+            } => {
+                if portable {
+                    use storage::tpm::portable::build_portable_bundle;
+
+                    let (provider, storage, pin_storage) =
+                        build_portable_bundle(path.into(), Some(tcti), allow_storage_creation)?;
+                    let pin_storage = Arc::new(Mutex::new(pin_storage));
+                    let service = AuthenticatorService::with_pin_storage_and_key_provider(
+                        storage,
+                        Some(pin_storage),
+                        provider,
+                        security_config,
+                        pin_config,
+                    )?;
+                    run_with_service(service, uhid, shutdown)
+                } else {
+                    let storage = TpmStorageAdapter::new_with_options(
+                        path.clone().into(),
+                        Some(tcti.clone()),
+                        allow_storage_creation,
+                    )?;
+                    let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
+                    let pin_storage = Arc::new(Mutex::new(pin_storage));
+                    let service = AuthenticatorService::with_pin_storage(
+                        storage,
+                        Some(pin_storage),
+                        security_config,
+                        pin_config,
+                    )?;
+                    run_with_service(service, uhid, shutdown)
+                }
             }
         }
     }

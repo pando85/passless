@@ -4,3 +4,7 @@ pub mod agent;
 pub mod agent_admin;
 pub mod client;
 pub mod custom;
+#[cfg(feature = "tpm")]
+pub mod tpm;
+#[cfg(feature = "tpm")]
+pub mod tpm_migrate;

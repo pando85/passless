@@ -10,6 +10,8 @@ use crate::storage::CredentialStorage;
 
 use log::debug;
 
+use soft_fido2::CredentialKeyProvider;
+
 /// Command byte for custom credential management (0x41 Yubikey variant)
 pub const CMD_CUSTOM_CREDENTIAL_MGMT: u8 = 0x41;
 
@@ -22,8 +24,12 @@ pub const CMD_CUSTOM_CREDENTIAL_MGMT: u8 = 0x41;
 /// # Arguments
 ///
 /// * `service` - Mutable reference to the authenticator service
-pub fn register_yubikey_credential_mgmt<S: CredentialStorage + 'static, P: PinStorage + 'static>(
-    service: &mut AuthenticatorService<S, P>,
+pub fn register_yubikey_credential_mgmt<
+    S: CredentialStorage + 'static,
+    P: PinStorage + 'static,
+    K: CredentialKeyProvider + Send + Sync + 'static,
+>(
+    service: &mut AuthenticatorService<S, P, K>,
 ) {
     debug!("Registering Yubikey credential management command (0x41)");
 

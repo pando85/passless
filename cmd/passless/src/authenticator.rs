@@ -9,8 +9,8 @@ use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
-    CredentialRef, CtapCommand, Error as SoftFido2Error, PinState, Result, StatusCode, UpResult,
-    UvResult,
+    CredentialKeyProvider, CredentialRef, CtapCommand, Error as SoftFido2Error, PinState, Result,
+    SoftwareCredentialKeyProvider, StatusCode, UpResult, UvResult,
 };
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -601,16 +601,20 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
 /// This service orchestrates the FIDO2 authenticator:
 /// - Storage is injected through the CredentialStorage trait
 /// - Handles CTAP requests and generates responses
-pub struct AuthenticatorService<S: CredentialStorage, P: PinStorage = ()> {
+pub struct AuthenticatorService<
+    S: CredentialStorage,
+    P: PinStorage = (),
+    K: CredentialKeyProvider = SoftwareCredentialKeyProvider,
+> {
     /// The underlying soft_fido2 authenticator
-    pub authenticator: Authenticator<PasslessCallbacks<S, P>>,
+    pub authenticator: Authenticator<PasslessCallbacks<S, P>, K>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
     /// Maximum UV retries (configured value)
     max_uv_retries: u8,
 }
 
-impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
+impl<S: CredentialStorage + 'static> AuthenticatorService<S, (), SoftwareCredentialKeyProvider> {
     /// Create a new authenticator service without PIN storage
     #[allow(dead_code)]
     pub fn new(storage: S, security_config: SecurityConfig, pin_config: PinConfig) -> Result<Self> {
@@ -623,7 +627,9 @@ impl<S: CredentialStorage + 'static> AuthenticatorService<S, ()> {
     }
 }
 
-impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorService<S, P> {
+impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
+    AuthenticatorService<S, P, SoftwareCredentialKeyProvider>
+{
     fn build_authenticator(
         storage: Arc<Mutex<S>>,
         pin_storage: Option<Arc<Mutex<P>>>,
@@ -870,9 +876,268 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             max_uv_retries: pin_config.max_uv_retries,
         })
     }
+}
+
+impl<
+    S: CredentialStorage + 'static,
+    P: PinStorage + 'static,
+    K: CredentialKeyProvider + Send + Sync + 'static,
+> AuthenticatorService<S, P, K>
+{
+    #[cfg(feature = "tpm")]
+    fn build_authenticator_with_key_provider(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        key_provider: K,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>, K>> {
+        #[cfg(feature = "agent")]
+        {
+            Self::build_authenticator_with_interaction_and_key_provider(
+                storage,
+                pin_storage,
+                security_config,
+                pin_config,
+                None,
+                key_provider,
+            )
+        }
+        #[cfg(not(feature = "agent"))]
+        {
+            let options = AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: true,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            };
+
+            let config = AuthenticatorConfig::builder()
+                .aaguid([
+                    0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73,
+                    0x2E, 0x72, 0x73,
+                ])
+                .options(options)
+                .commands(vec![
+                    CtapCommand::MakeCredential,
+                    CtapCommand::GetAssertion,
+                    CtapCommand::GetInfo,
+                    CtapCommand::ClientPin,
+                    CtapCommand::GetNextAssertion,
+                    CtapCommand::Selection,
+                ])
+                .max_credentials(100)
+                .extensions(vec!["credProtect".to_string()])
+                .firmware_version(*VERSION)
+                .constant_sign_count(security_config.constant_signature_counter)
+                .algorithms(vec![-7])
+                .max_pin_retries(pin_config.max_retries)
+                .auto_lock_timeout(pin_config.auto_lock_timeout)
+                .build();
+
+            let callbacks = PasslessCallbacks::new(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+            );
+
+            let authenticator = if let Some(ps) = pin_storage {
+                Authenticator::with_config_and_pin_storage_and_key_provider(
+                    callbacks,
+                    config,
+                    PinStorageWrapper {
+                        storage: ps,
+                        max_uv_retries: pin_config.max_uv_retries,
+                        last_uv_retries: Mutex::new(None),
+                    },
+                    key_provider,
+                )
+            } else {
+                Authenticator::with_config_and_key_provider(callbacks, config, key_provider)
+            }?;
+
+            Ok(authenticator)
+        }
+    }
+
+    #[cfg(all(feature = "tpm", feature = "agent"))]
+    fn build_authenticator_with_interaction_and_key_provider(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Option<Arc<AgentInteractionManager>>,
+        key_provider: K,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>, K>> {
+        let is_agent = interaction_manager.is_some();
+
+        let options = if is_agent {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(false),
+                plat: true,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(true),
+                make_cred_uv_not_required: Some(false),
+            }
+        } else {
+            AuthenticatorOptions {
+                rk: true,
+                up: true,
+                uv: Some(true),
+                plat: true,
+                client_pin: Some(true),
+                pin_uv_auth_token: Some(true),
+                cred_mgmt: Some(true),
+                bio_enroll: None,
+                large_blobs: None,
+                ep: None,
+                always_uv: Some(security_config.always_uv),
+                make_cred_uv_not_required: Some(true),
+            }
+        };
+
+        let config = AuthenticatorConfig::builder()
+            .aaguid([
+                0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73, 0x2E,
+                0x72, 0x73,
+            ])
+            .options(options)
+            .commands(vec![
+                CtapCommand::MakeCredential,
+                CtapCommand::GetAssertion,
+                CtapCommand::GetInfo,
+                CtapCommand::ClientPin,
+                CtapCommand::GetNextAssertion,
+                CtapCommand::Selection,
+            ])
+            .max_credentials(100)
+            .extensions(vec!["credProtect".to_string()])
+            .firmware_version(*VERSION)
+            .constant_sign_count(security_config.constant_signature_counter)
+            .algorithms(vec![-7])
+            .max_pin_retries(pin_config.max_retries)
+            .auto_lock_timeout(pin_config.auto_lock_timeout)
+            .build();
+
+        let callbacks = match interaction_manager {
+            Some(ref mgr) => PasslessCallbacks::with_interaction_manager(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+                mgr.clone(),
+            ),
+            None => PasslessCallbacks::new(
+                storage,
+                pin_storage.clone(),
+                security_config,
+                pin_config.clone(),
+            ),
+        };
+
+        let authenticator = if let Some(ps) = pin_storage {
+            Authenticator::with_config_and_pin_storage_and_key_provider(
+                callbacks,
+                config,
+                PinStorageWrapper {
+                    storage: ps,
+                    max_uv_retries: pin_config.max_uv_retries,
+                    last_uv_retries: Mutex::new(None),
+                },
+                key_provider,
+            )?
+        } else {
+            Authenticator::with_config_and_key_provider(callbacks, config, key_provider)?
+        };
+
+        Ok(authenticator)
+    }
+
+    /// Create a new authenticator service with optional PIN storage and a custom key provider
+    #[cfg(feature = "tpm")]
+    pub fn with_pin_storage_and_key_provider(
+        storage: S,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        key_provider: K,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+    ) -> Result<Self> {
+        let storage = Arc::new(Mutex::new(storage));
+        Self::with_shared_storage_and_key_provider(
+            storage,
+            pin_storage,
+            key_provider,
+            security_config,
+            pin_config,
+        )
+    }
+
+    /// Create a new authenticator service with shared (Arc-wrapped) storage and a custom key provider
+    #[cfg(feature = "tpm")]
+    pub fn with_shared_storage_and_key_provider(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        key_provider: K,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+    ) -> Result<Self> {
+        let authenticator = Self::build_authenticator_with_key_provider(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            key_provider,
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
+            max_uv_retries: pin_config.max_uv_retries,
+        })
+    }
+
+    #[cfg(all(feature = "tpm", feature = "agent"))]
+    pub fn with_shared_storage_and_key_provider_and_interaction(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        key_provider: K,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Result<Self> {
+        let authenticator = Self::build_authenticator_with_interaction_and_key_provider(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            Some(interaction_manager),
+            key_provider,
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
+            max_uv_retries: pin_config.max_uv_retries,
+        })
+    }
 
     fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
-        // Use the high-level reset API from soft-fido2
         self.authenticator
             .reset_uv_retries()
             .map_err(|_| StatusCode::Other)?;
@@ -881,7 +1146,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
     }
 
     /// Process a CTAP request and generate a response
-    /// Ok(()) on success or an error
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         if request.first() == Some(&CMD_PASSLESS_RESET_UV_RETRIES) {
             response_buffer.clear();
@@ -937,9 +1201,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
             match self.reset_uv_retries() {
                 Ok(()) => {
                     response_buffer.push(0x00);
-                    // Include the restored UV retries count in the response
-                    // Response format: CBOR map { 1: uv_retries_count }
-                    // soft-fido2 0.14.0+ resets UV retries to the configured max_pin_retries value
                     if let Ok(cbor_data) = soft_fido2_ctap::cbor::MapBuilder::new()
                         .insert(1, self.max_uv_retries)
                         .and_then(|b| b.build())
@@ -976,14 +1237,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static> AuthenticatorServi
     }
 
     /// Register a custom CTAP command handler
-    ///
-    /// This allows registering vendor-specific commands (0x40-0xFF range).
-    /// Useful for compatibility with different authenticator variants.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - Command byte (0x40-0xFF vendor range)
-    /// * `handler` - Handler function that processes the command
     pub fn register_custom_command<F>(&mut self, command: u8, handler: F)
     where
         F: Fn(&[u8]) -> core::result::Result<Vec<u8>, soft_fido2::StatusCode>

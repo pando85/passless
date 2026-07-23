@@ -20,13 +20,23 @@ pub struct AgentStorageBundle {
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub pin_storage: Arc<Mutex<Box<dyn PinStorage>>>,
     pub config: AgentStorageConfig,
+    #[cfg(feature = "tpm")]
+    pub tpm_key_provider: Option<crate::storage::tpm::portable::TpmCredentialKeyProvider>,
 }
 
 impl core::fmt::Debug for AgentStorageBundle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AgentStorageBundle")
-            .field("config", &self.config)
-            .finish_non_exhaustive()
+        let mut d = f.debug_struct("AgentStorageBundle");
+        d.field("config", &self.config);
+        #[cfg(feature = "tpm")]
+        d.field(
+            "tpm_key_provider",
+            &self
+                .tpm_key_provider
+                .as_ref()
+                .map(|_| "TpmCredentialKeyProvider"),
+        );
+        d.finish_non_exhaustive()
     }
 }
 
@@ -238,6 +248,8 @@ pub fn create_storage_bundle_with_options(
                 credential_storage: Arc::new(Mutex::new(Box::new(cred_storage))),
                 pin_storage: Arc::new(Mutex::new(Box::new(pin_storage))),
                 config,
+                #[cfg(feature = "tpm")]
+                tpm_key_provider: None,
             })
         }
         AgentStorageConfig::Pass {
@@ -246,7 +258,7 @@ pub fn create_storage_bundle_with_options(
             ref gpg_backend,
             ref pin_path,
         } => {
-            let gpg = GpgBackend::from_str(gpg_backend).map_err(|e| {
+            let gpg = gpg_backend.parse::<GpgBackend>().map_err(|e| {
                 Error::Storage(format!("invalid GPG backend '{}': {}", gpg_backend, e))
             })?;
 
@@ -272,6 +284,8 @@ pub fn create_storage_bundle_with_options(
                 credential_storage: Arc::new(Mutex::new(Box::new(cred_storage))),
                 pin_storage: Arc::new(Mutex::new(Box::new(pin_storage))),
                 config,
+                #[cfg(feature = "tpm")]
+                tpm_key_provider: None,
             })
         }
         #[cfg(feature = "tpm")]
@@ -279,6 +293,7 @@ pub fn create_storage_bundle_with_options(
             ref path,
             ref tcti,
             ref pin_path,
+            portable,
         } => {
             let tcti_opt = if tcti.is_empty() {
                 None
@@ -286,26 +301,70 @@ pub fn create_storage_bundle_with_options(
                 Some(tcti.clone())
             };
 
-            let cred_storage = crate::storage::TpmStorageAdapter::new_with_options(
-                path.clone(),
-                tcti_opt.clone(),
-                allow_create_without_prompt,
-            )
-            .map_err(|e| {
-                Error::Storage(format!(
-                    "failed to create TPM credential storage at {}: {:?}",
-                    path.display(),
-                    e
-                ))
-            })?;
+            if portable {
+                use crate::storage::tpm::portable::TpmCredentialKeyProvider;
 
-            let pin_storage = crate::pin_storage::TpmPinStorage::new(pin_path.clone(), tcti_opt);
+                let provider = TpmCredentialKeyProvider::new(path.clone(), tcti_opt.clone())
+                    .map_err(|e| {
+                        Error::Storage(format!(
+                            "failed to create TPM key provider at {}: {:?}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+                if !provider.is_ready() {
+                    return Err(Error::Storage(
+                        "TPM portable parent is not provisioned. Run: passless tpm provision"
+                            .to_string(),
+                    ));
+                }
 
-            Ok(AgentStorageBundle {
-                credential_storage: Arc::new(Mutex::new(Box::new(cred_storage))),
-                pin_storage: Arc::new(Mutex::new(Box::new(pin_storage))),
-                config,
-            })
+                let cred_storage = crate::storage::TpmStorageAdapter::new_portable(
+                    path.clone(),
+                    tcti_opt.clone(),
+                    allow_create_without_prompt,
+                )
+                .map_err(|e| {
+                    Error::Storage(format!(
+                        "failed to create portable TPM credential storage at {}: {:?}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+                let pin_storage =
+                    crate::pin_storage::TpmPinStorage::new_portable(pin_path.clone(), tcti_opt);
+
+                Ok(AgentStorageBundle {
+                    credential_storage: Arc::new(Mutex::new(Box::new(cred_storage))),
+                    pin_storage: Arc::new(Mutex::new(Box::new(pin_storage))),
+                    config,
+                    tpm_key_provider: Some(provider),
+                })
+            } else {
+                let cred_storage = crate::storage::TpmStorageAdapter::new_with_options(
+                    path.clone(),
+                    tcti_opt.clone(),
+                    allow_create_without_prompt,
+                )
+                .map_err(|e| {
+                    Error::Storage(format!(
+                        "failed to create TPM credential storage at {}: {:?}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+                let pin_storage =
+                    crate::pin_storage::TpmPinStorage::new(pin_path.clone(), tcti_opt);
+
+                Ok(AgentStorageBundle {
+                    credential_storage: Arc::new(Mutex::new(Box::new(cred_storage))),
+                    pin_storage: Arc::new(Mutex::new(Box::new(pin_storage))),
+                    config,
+                    tpm_key_provider: None,
+                })
+            }
         }
     }
 }
@@ -815,6 +874,7 @@ mod tests {
             path: cred_dir.clone(),
             tcti: "device:/dev/tpmrm0".to_string(),
             pin_path: pin_dir.clone(),
+            portable: false,
         };
         let pin_path = config.pin_state_path();
         let expected = passless_core::BackendConfig::canonicalize_path(&pin_dir);
@@ -864,6 +924,7 @@ mod tests {
             path: cred_dir,
             tcti: "device:/dev/tpmrm0".to_string(),
             pin_path: pin_dir.clone(),
+            portable: false,
         };
         let bundle = match create_storage_bundle(config) {
             Ok(b) => b,
@@ -2061,7 +2122,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_composition_full_flow() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM composition validation requires a usable swtpm");
@@ -2074,6 +2134,7 @@ mod tests {
                     path: cred_dir,
                     tcti: swtpm.tcti(),
                     pin_path: pin_dir,
+                    portable: false,
                 };
 
                 let bundle = create_storage_bundle(config).expect("TPM bundle creation failed");
@@ -2089,7 +2150,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_profile_isolation() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM profile validation requires a usable swtpm");
@@ -2104,11 +2164,13 @@ mod tests {
                     path: cred_a,
                     tcti: swtpm.tcti(),
                     pin_path: pin_a,
+                    portable: false,
                 };
                 let config_b = AgentStorageConfig::Tpm {
                     path: cred_b,
                     tcti: swtpm.tcti(),
                     pin_path: pin_b,
+                    portable: false,
                 };
 
                 let bundle_a = create_storage_bundle(config_a).expect("TPM bundle A failed");
@@ -2124,7 +2186,6 @@ mod tests {
             }
 
             #[test]
-            #[ignore]
             fn tpm_cleanup_propagation() {
                 let swtpm = SwtpmHandle::start()
                     .expect("explicit TPM cleanup validation requires a usable swtpm");
@@ -2137,11 +2198,81 @@ mod tests {
                     path: cred_dir,
                     tcti: swtpm.tcti(),
                     pin_path: pin_dir,
+                    portable: false,
                 };
 
                 let bundle = create_storage_bundle(config).expect("TPM bundle failed");
 
                 run_cleanup_propagation(bundle.credential_storage.clone());
+
+                drop(swtpm);
+            }
+
+            #[test]
+            fn tpm_portable_missing_parent_errors() {
+                let swtpm = SwtpmHandle::start()
+                    .expect("explicit TPM portable validation requires a usable swtpm");
+
+                let base = secure_temp_dir();
+                let cred_dir = base.path().join("tpm_portable_unprov_creds");
+                let pin_dir = base.path().join("tpm_portable_unprov_pin");
+
+                let config = AgentStorageConfig::Tpm {
+                    path: cred_dir,
+                    tcti: swtpm.tcti(),
+                    pin_path: pin_dir,
+                    portable: true,
+                };
+
+                let err = create_storage_bundle(config)
+                    .expect_err("portable bundle without provisioned parent must fail");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("passless tpm provision"),
+                    "error should mention provisioning command, got: {msg}"
+                );
+
+                drop(swtpm);
+            }
+
+            #[test]
+            fn tpm_portable_provisioned_bundle_has_key_provider() {
+                use crate::storage::tpm::portable::PortableParent;
+                use std::os::unix::fs::PermissionsExt;
+
+                let swtpm = SwtpmHandle::start()
+                    .expect("explicit TPM portable validation requires a usable swtpm");
+
+                let base = secure_temp_dir();
+                let cred_dir = base.path().join("tpm_portable_prov_creds");
+                let pin_dir = base.path().join("tpm_portable_prov_pin");
+
+                std::fs::create_dir_all(&cred_dir).expect("create cred dir");
+                fs::set_permissions(&cred_dir, fs::Permissions::from_mode(0o700))
+                    .expect("set cred dir perms");
+                std::fs::create_dir_all(&pin_dir).expect("create pin dir");
+                fs::set_permissions(&pin_dir, fs::Permissions::from_mode(0o700))
+                    .expect("set pin dir perms");
+
+                let parent = PortableParent::new(cred_dir.clone(), Some(swtpm.tcti()))
+                    .expect("create portable parent");
+                let seed = [0x42u8; 32];
+                parent.provision(&seed).expect("provision portable parent");
+                assert!(parent.is_provisioned());
+
+                let config = AgentStorageConfig::Tpm {
+                    path: cred_dir,
+                    tcti: swtpm.tcti(),
+                    pin_path: pin_dir,
+                    portable: true,
+                };
+
+                let bundle =
+                    create_storage_bundle(config).expect("portable bundle creation failed");
+                assert!(
+                    bundle.tpm_key_provider.is_some(),
+                    "portable bundle must carry a TpmCredentialKeyProvider"
+                );
 
                 drop(swtpm);
             }

@@ -150,6 +150,9 @@ Given the hardware limitations, consider these alternatives:
 - Memory locking (mlockall) prevents swapping
 - Core dump prevention
 - No new privileges flag
+- [Portable TPM backend](TPM_PORTABLE.md) (experimental): TPM-resident, non-exportable
+  signing keys synchronized across devices via a recovery seed. Validated against swtpm;
+  cross-vendor hardware TPM testing is pending (see [interoperability matrix](TPM_PORTABLE.md#interoperability-matrix)).
 
 **Advantages**:
 - Works on all modern hardware
@@ -166,6 +169,10 @@ Given the hardware limitations, consider these alternatives:
 - Implement TPM-based attestation
 - Leverage TPM's RNG for cryptographic operations
 - Platform Configuration Registers (PCRs) for boot integrity
+
+**Already implemented**:
+- [Portable TPM backend](TPM_PORTABLE.md): TPM-resident signing keys portable across devices
+  provisioned from the same recovery seed (experimental, ES256 only).
 
 **Advantages**:
 - Available on all modern systems

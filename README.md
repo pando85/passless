@@ -57,7 +57,8 @@ Users should choose the solution that best fits their own security and practical
 - PIN support with configurable enforcement policies
 - Storage backends:
   - [pass](https://www.passwordstore.org/) (encrypted, git-synced)
-  - TPM 2.0 (Experimental)
+  - TPM 2.0 (Experimental), including a [portable TPM backend](docs/TPM_PORTABLE.md)
+    with TPM-resident non-exportable keys syncable across devices via a recovery seed
   - Local filesystem (testing only)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
@@ -126,7 +127,10 @@ max_uv_retries = 8
 ```
 
 Note: For enhanced security with hardware-backed protection, consider using the TPM backend
-which seals credentials to the TPM hardware.
+which seals credentials to the TPM hardware. The experimental
+[portable TPM backend](docs/TPM_PORTABLE.md) goes further: signing keys are generated inside
+the TPM and never exposed to host memory, and credential blobs can be synchronized across
+multiple TPMs provisioned from the same recovery seed.
 
 ## Configuration
 

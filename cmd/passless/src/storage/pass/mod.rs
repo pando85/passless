@@ -47,9 +47,11 @@ pub enum GpgBackend {
     GnupgBin,
 }
 
-impl GpgBackend {
+impl std::str::FromStr for GpgBackend {
+    type Err = Error;
+
     /// Parse from string
-    pub fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "gpgme" => Ok(Self::Gpgme),
             "gnupg-bin" | "gnupg_bin" | "gnupg" => Ok(Self::GnupgBin),
@@ -59,7 +61,9 @@ impl GpgBackend {
             ))),
         }
     }
+}
 
+impl GpgBackend {
     #[allow(dead_code)]
     pub fn validate(&self) -> Result<()> {
         match self {

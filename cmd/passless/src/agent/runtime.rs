@@ -134,6 +134,9 @@ pub struct IsolatedEndpointDeps {
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
     pub ceremony_scope: CeremonyScope,
+    #[cfg(feature = "tpm")]
+    pub tpm_key_provider:
+        Arc<Mutex<Option<crate::storage::tpm::portable::TpmCredentialKeyProvider>>>,
 }
 
 #[derive(Clone)]
@@ -1021,6 +1024,8 @@ impl AgentRuntime {
                             credential_storage: bundle.credential_storage.clone(),
                             pin_storage: bundle.pin_storage.clone(),
                             ceremony_scope: ceremony_scope.clone(),
+                            #[cfg(feature = "tpm")]
+                            tpm_key_provider: Arc::new(Mutex::new(bundle.tpm_key_provider)),
                         }),
                         delegated_deps: None,
                     };
@@ -1270,6 +1275,121 @@ impl AgentRuntime {
                     ))
                 })?;
 
+                let ceremony_scope_inner = deps.ceremony_scope.clone();
+                let op_lock_for_ctx = spec.operation_lock.clone();
+                let prompt_mode = PromptMode::Isolated;
+
+                let audit_gate_for_before_start = spec.audit_gate.clone();
+                let profile_id_for_before_start = profile_id.clone();
+                let name_for_before_start = name.clone();
+
+                #[cfg(feature = "tpm")]
+                let has_tpm_key_provider = deps.tpm_key_provider.lock().unwrap().is_some();
+                #[cfg(not(feature = "tpm"))]
+                let has_tpm_key_provider = false;
+
+                if has_tpm_key_provider {
+                    #[cfg(feature = "tpm")]
+                    {
+                        let provider = deps.tpm_key_provider.lock().unwrap().take().unwrap();
+                        let service =
+                            AuthenticatorService::with_shared_storage_and_key_provider_and_interaction(
+                                Arc::new(Mutex::new(scoped_storage)),
+                                Some(deps.pin_storage.clone()),
+                                provider,
+                                spec.security_config.clone(),
+                                spec.pin_config.clone(),
+                                spec.interaction_manager.clone(),
+                            )
+                            .map_err(|e| {
+                                RuntimeError::Service(format!(
+                                    "profile '{}': failed to create authenticator service with TPM key provider: {}",
+                                    name, e
+                                ))
+                            })?;
+
+                        let profile_id_for_tpm = profile_id_for_before_start.clone();
+                        let audit_gate_for_tpm = audit_gate_for_before_start.clone();
+                        let name_for_tpm = name_for_before_start.clone();
+                        let name_for_err = name_for_before_start.clone();
+
+                        let endpoint_id = endpoint_manager
+                            .create_and_start_full(
+                                binding,
+                                name.to_string(),
+                                move |generated_endpoint_id: &EndpointId| {
+                                    *generated_endpoint_for_factory.lock().unwrap() =
+                                        Some(generated_endpoint_id.clone());
+                                    let service_handler = ServiceHandler::new(service);
+
+                                    let prompt_handle: Arc<dyn PromptHandle> =
+                                        Arc::new(DesktopPromptHandle::default_config());
+
+                                    let ceremony_context =
+                                        StaticCeremonyContext::new(StaticCeremonyContextConfig {
+                                            profile_id: profile_id_for_tpm.clone(),
+                                            endpoint_id: generated_endpoint_id.clone(),
+                                            mode: prompt_mode,
+                                            policy_runtime: policy_runtime_inner.clone(),
+                                            audit_gate: audit_gate_for_tpm.clone(),
+                                            ceremony_scope: ceremony_scope_inner.clone(),
+                                            require_uv,
+                                            prompt_handle,
+                                            preparation_slot: preparation_slot_inner.clone(),
+                                        })
+                                        .with_interaction_manager(interaction_manager_inner.clone())
+                                        .with_operation_lock(op_lock_for_ctx.clone());
+
+                                    AgentCeremonyHandler::new(service_handler, ceremony_context)
+                                },
+                                device_factory,
+                                WorkerHooks {
+                                    on_response_sent: Some(Box::new(move || {
+                                        if let Some(endpoint_id) =
+                                            generated_endpoint_for_hooks.lock().unwrap().clone()
+                                        {
+                                            let _ =
+                                                event_tx_inner.send(EndpointEvent::ResponseSent {
+                                                    endpoint_id,
+                                                    profile_id: profile_id_for_hooks.clone(),
+                                                });
+                                        }
+                                    })),
+                                },
+                                Some(Box::new(move |eid: &EndpointId| {
+                                    let create_event = EndpointCreateBuilder::new(
+                                        eid.clone(),
+                                        profile_id_for_before_start.clone(),
+                                    )
+                                    .build();
+                                    audit_gate_for_before_start.record(create_event).map_err(
+                                        |e| {
+                                            format!(
+                                                "profile '{}' endpoint create audit failed: {}",
+                                                name_for_tpm, e
+                                            )
+                                        },
+                                    )?;
+                                    Ok(())
+                                })),
+                            )
+                            .map_err(|e| {
+                                RuntimeError::Endpoint(format!("profile '{}': {}", name_for_err, e))
+                            })?;
+
+                        info!(
+                            "Profile '{}' {:?} endpoint created: {}",
+                            name, spec.mode, endpoint_id
+                        );
+
+                        return Ok(endpoint_id);
+                    }
+                    #[cfg(not(feature = "tpm"))]
+                    {
+                        unreachable!()
+                    }
+                }
+
                 let service = AuthenticatorService::with_shared_storage_and_interaction(
                     Arc::new(Mutex::new(scoped_storage)),
                     Some(deps.pin_storage.clone()),
@@ -1283,14 +1403,6 @@ impl AgentRuntime {
                         name, e
                     ))
                 })?;
-
-                let ceremony_scope_inner = deps.ceremony_scope.clone();
-                let op_lock_for_ctx = spec.operation_lock.clone();
-                let prompt_mode = PromptMode::Isolated;
-
-                let audit_gate_for_before_start = spec.audit_gate.clone();
-                let profile_id_for_before_start = profile_id.clone();
-                let name_for_before_start = name.clone();
 
                 let endpoint_id = endpoint_manager
                     .create_and_start_full(
@@ -7334,6 +7446,8 @@ mod tests {
                 credential_storage: cred_storage.clone(),
                 pin_storage: pin_storage.clone(),
                 ceremony_scope: _ceremony_scope.clone(),
+                #[cfg(feature = "tpm")]
+                tpm_key_provider: Arc::new(Mutex::new(None)),
             }),
             delegated_deps: None,
         };
