@@ -61,7 +61,7 @@ aes = { version = "0.9", optional = true }
 cipher = { version = "0.5", optional = true }
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 ciborium = "0.2"
 tempfile = "3.14"
 hex = "0.4"
