@@ -1158,7 +1158,7 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
                 libc::close(child_fd);
             }
 
-            setup.apply(&[CONTROL_FD])
+            setup.apply(&[0, 1, 2, CONTROL_FD])
         });
     }
 
