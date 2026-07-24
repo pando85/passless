@@ -1348,10 +1348,11 @@ impl SeqpacketCodec {
         hdr.msg_iov = &mut iov;
         hdr.msg_iovlen = 1;
 
+        let mut cmsg_buf: Vec<u8> = Vec::new();
         if !fds.is_empty() {
             let fds_len = std::mem::size_of_val(fds);
             let cmsg_space = unsafe { libc::CMSG_SPACE(fds_len as libc::c_uint) } as usize;
-            let mut cmsg_buf = vec![0u8; cmsg_space];
+            cmsg_buf = vec![0u8; cmsg_space];
 
             hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
             hdr.msg_controllen = cmsg_space;
