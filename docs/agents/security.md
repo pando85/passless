@@ -112,3 +112,65 @@ For unattended or narrowly scoped automation, prefer RP-supported mechanisms:
 
 These mechanisms express actor, audience, scope, lifetime, and revocation independently
 from the browser session.
+
+## Port mode threat model
+
+When `browser_cdp_expose = "port"`, the daemon exposes the browser's CDP WebSocket on
+`127.0.0.1` instead of mediating CDP through Unix pipes. The trust boundary shifts from
+the CDP channel to the authenticated session.
+
+### Trust boundary
+
+The trust boundary is the authenticated session (cookies), not the CDP channel. Any
+same-user process with the WebSocket URL can control the browser session. This is an
+accepted risk for single-user workstations where the agent and operator share a trust
+boundary.
+
+### Credential isolation
+
+The credential private key never leaves the daemon. Passless mediates the WebAuthn
+ceremony; the browser only holds the authenticated session (cookies), not the credential
+material. Even if the agent exfiltrates the entire browser session, it cannot extract
+the private key.
+
+### WebSocket UUID as bearer token
+
+The CDP WebSocket URL includes a UUID path component (e.g.,
+`ws://127.0.0.1:9222/devtools/browser/<uuid>`). This UUID acts as a bearer token:
+possession of the URL grants access. The URL is written to `<runtime_dir>/cdp-endpoint`
+with mode 0600, owned by the principal user. The runtime directory has mode 0700.
+
+### Loopback-only binding
+
+Chromium binds to `127.0.0.1` only. The daemon does not pass `--remote-debugging-address`;
+Chromium's default is loopback. This is enforced, not configurable. Remote network access
+to the CDP endpoint is not possible.
+
+### Extra args rejection
+
+The daemon rejects `--remote-debugging-port` and `--remote-debugging-address` in
+`browser_command` extra args. These flags are set by the daemon in port mode. Attempting
+to override them causes configuration load failure.
+
+### Audit trail
+
+Audit records note the exposure mode (`pipe` or `port`) at lease creation. In port mode,
+audit records the delegation grant, lease creation, and lease expiry. Per-command CDP
+audit is not available; the agent has direct CDP access after the ceremony.
+
+### Comparison to pipe mode
+
+| Property | Pipe mode | Port mode |
+|----------|-----------|-----------|
+| CDP transport | Unix pipes | TCP 127.0.0.1 |
+| Daemon mediation | Every command | Ceremony only |
+| External tool attachment | No | Yes |
+| `browser_user` isolation | Required | Optional |
+| CDP command audit | Per-command | Lease-level |
+| CDP command filtering | Yes | No |
+| Credential key exposure | Never | Never |
+| Session cookie exposure | Daemon-gated | Direct |
+| Trust assumption | Agent is untrusted | Agent is trusted |
+
+Use pipe mode for multi-user systems, production environments, or untrusted agents.
+Use port mode only for single-user workstations where the operator fully trusts the agent.

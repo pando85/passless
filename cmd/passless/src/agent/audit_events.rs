@@ -531,6 +531,8 @@ pub struct BrowserLeaseLaunchMeta {
     lease_id: BrowserLeaseId,
     profile_id: ProfileId,
     endpoint_id: EndpointId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cdp_expose: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1161,6 +1163,7 @@ pub struct BrowserLeaseLaunchBuilder {
     lease_id: BrowserLeaseId,
     profile_id: ProfileId,
     endpoint_id: EndpointId,
+    cdp_expose: Option<String>,
 }
 
 impl BrowserLeaseLaunchBuilder {
@@ -1169,7 +1172,13 @@ impl BrowserLeaseLaunchBuilder {
             lease_id,
             profile_id,
             endpoint_id,
+            cdp_expose: None,
         }
+    }
+
+    pub fn with_cdp_expose(mut self, mode: String) -> Self {
+        self.cdp_expose = Some(mode);
+        self
     }
 
     pub fn build(self) -> AuditEvent {
@@ -1177,6 +1186,7 @@ impl BrowserLeaseLaunchBuilder {
             lease_id: self.lease_id,
             profile_id: self.profile_id,
             endpoint_id: self.endpoint_id,
+            cdp_expose: self.cdp_expose,
         }))
     }
 }

@@ -253,6 +253,7 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+#[derive(Clone)]
 struct ResolvedUser {
     uid: u32,
     gid: u32,
@@ -611,9 +612,12 @@ impl AgentRuntime {
                 }
             }
 
+            let cdp_port_mode = profile.browser_cdp_expose
+                == Some(passless_core::agent::config::CdpExposeMode::Port);
+
             let browser_user_resolved = if let Some(ref browser_user) = profile.browser_user {
                 let bu = resolve_user(browser_user)?;
-                if is_root {
+                if is_root && !cdp_port_mode {
                     if bu.uid == user.uid {
                         return Err(RuntimeError::Config(format!(
                             "profile '{}': browser uid {} must differ from principal uid {}",
@@ -637,6 +641,8 @@ impl AgentRuntime {
                     validate_browser_runtime_root_at_startup(runtime_root, bu.uid, name)?;
                 }
                 Some(bu)
+            } else if cdp_port_mode {
+                Some(user.clone())
             } else {
                 None
             };
@@ -3636,6 +3642,8 @@ impl AgentRuntime {
                 target_gid: browser_gid,
                 daemon_uid: self.daemon_uid,
                 daemon_gid: self.daemon_gid,
+                cdp_expose: config.browser_cdp_expose.unwrap_or_default(),
+                cdp_port: config.browser_cdp_port.unwrap_or(0),
             };
 
             let mut browser_mgr = self.browser_manager.lock().unwrap();
@@ -3665,6 +3673,7 @@ impl AgentRuntime {
                 profile_id.clone(),
                 endpoint_id.clone(),
             )
+            .with_cdp_expose(browser_config.cdp_expose.to_string())
             .build();
             if let Err(e) = self.audit_gate.record(lease_audit_event) {
                 let _ = policy_rt.principal_cancel_pending(&pending_id_clone, &session_id_clone);
@@ -3856,10 +3865,12 @@ impl AgentRuntime {
         if let Some(lease_id) = lease_id {
             let browser_mgr = self.browser_manager.lock().unwrap();
             if let Some(snapshot) = browser_mgr.snapshot(&lease_id) {
+                let cdp_endpoint = browser_mgr.lease_cdp_endpoint(&lease_id).flatten();
                 return Ok(PrincipalResponse::BrowserStatus(
                     passless_core::agent::BrowserStatusResponse {
                         running: !snapshot.state.is_terminal(),
                         status: format!("{}", snapshot.state),
+                        cdp_endpoint,
                     },
                 ));
             }
@@ -3869,6 +3880,7 @@ impl AgentRuntime {
             passless_core::agent::BrowserStatusResponse {
                 running: false,
                 status: "no_browser".into(),
+                cdp_endpoint: None,
             },
         ))
     }
@@ -3946,6 +3958,24 @@ impl AgentRuntime {
         };
 
         let cdp_method = extract_cdp_method_for_audit(request_json);
+
+        {
+            let browser_mgr = self.browser_manager.lock().unwrap();
+            if let Some(false) = browser_mgr.lease_has_cdp_pipes(&lease_id) {
+                let endpoint_msg = browser_mgr
+                    .lease_cdp_endpoint(&lease_id)
+                    .flatten()
+                    .unwrap_or_else(|| "<endpoint not yet discovered>".to_string());
+                return Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    format!(
+                        "browser-control is unavailable in port mode; connect directly via CDP: {}",
+                        endpoint_msg
+                    ),
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        }
 
         let pre_audit = self.audit_gate.record(
             super::audit_events::BrowserControlRequestBuilder::new(
@@ -6015,6 +6045,8 @@ mod tests {
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
             security_config: SecurityConfig::default(),
             pin_config: PinConfig::default(),
@@ -6337,6 +6369,8 @@ mod tests {
                 browser_command: Some(vec!["/bin/true".to_string()]),
                 browser_user: Some("browseruser".to_string()),
                 browser_runtime_root: Some(temp_dir.path().join("browser-runtime")),
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             };
 
             let agent_config = {
@@ -7117,6 +7151,8 @@ mod tests {
             browser_command: Some(vec!["/bin/true".to_string()]),
             browser_user: Some("browseruser".to_string()),
             browser_runtime_root: Some(temp_dir.path().join("browser-runtime")),
+            browser_cdp_expose: None,
+            browser_cdp_port: None,
         };
 
         let agent_config = {
@@ -7398,6 +7434,8 @@ mod tests {
                     browser_command: None,
                     browser_user: None,
                     browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
                 },
             );
             config

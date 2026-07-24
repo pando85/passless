@@ -725,6 +725,8 @@ impl ProfileDiagnosticReport {
 pub struct BrowserStatusResponse {
     pub running: bool,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
