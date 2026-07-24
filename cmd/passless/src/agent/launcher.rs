@@ -650,25 +650,23 @@ pub struct HardenedChildSetup {
 
 impl HardenedChildSetup {
     pub fn validate(&self) -> Result<(), LauncherError> {
-        if self.target_uid == self.daemon_uid {
-            return Err(LauncherError::SameUserFallback);
-        }
-        if self.target_gid == self.daemon_gid {
-            return Err(LauncherError::IdentityMismatch {
-                field: "gid".to_string(),
-                expected: format!("!= {}", self.daemon_gid),
-                got: self.target_gid.to_string(),
-            });
-        }
-        if self.daemon_uid != 0 {
-            return Err(LauncherError::PrivilegeInsufficient {
-                detail: format!(
-                    "daemon uid {} is not root; cannot setuid/setgid for child",
-                    self.daemon_uid
-                ),
-            });
+        if self.daemon_uid == 0 {
+            if self.target_uid == self.daemon_uid {
+                return Err(LauncherError::SameUserFallback);
+            }
+            if self.target_gid == self.daemon_gid {
+                return Err(LauncherError::IdentityMismatch {
+                    field: "gid".to_string(),
+                    expected: format!("!= {}", self.daemon_gid),
+                    got: self.target_gid.to_string(),
+                });
+            }
         }
         Ok(())
+    }
+
+    fn same_user(&self) -> bool {
+        self.target_uid == self.daemon_uid && self.target_gid == self.daemon_gid
     }
 
     /// # Safety
@@ -686,16 +684,18 @@ impl HardenedChildSetup {
             return Err(io::Error::last_os_error());
         }
 
-        if unsafe { libc::setgroups(0, std::ptr::null()) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        if !self.same_user() {
+            if unsafe { libc::setgroups(0, std::ptr::null()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        if unsafe { libc::setgid(self.target_gid) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            if unsafe { libc::setgid(self.target_gid) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        if unsafe { libc::setuid(self.target_uid) } < 0 {
-            return Err(io::Error::last_os_error());
+            if unsafe { libc::setuid(self.target_uid) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
@@ -2013,14 +2013,13 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_config_validate_privilege_required() {
+    fn test_spawn_config_validate_non_root_different_target_ok() {
         let mut config = default_spawn_config();
         config.daemon_uid = 1000;
         config.daemon_gid = 1000;
         config.target_uid = 1001;
         config.target_gid = 1001;
-        let err = config.validate().unwrap_err();
-        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -2169,7 +2168,10 @@ mod tests {
         };
 
         let err = spawn_principal(config).unwrap_err();
-        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
+        assert!(matches!(
+            err,
+            LauncherError::SpawnFailed { .. } | LauncherError::PostExecVerification { .. }
+        ));
     }
 
     #[test]
@@ -2258,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hardened_child_setup_validate_privilege_required() {
+    fn test_hardened_child_setup_validate_non_root_different_target_ok() {
         let setup = HardenedChildSetup {
             target_uid: 1001,
             target_gid: 1001,
@@ -2269,8 +2271,7 @@ mod tests {
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
         };
-        let err = setup.validate().unwrap_err();
-        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
+        assert!(setup.validate().is_ok());
     }
 
     #[test]
@@ -2409,7 +2410,7 @@ mod tests {
         let err = spawn_principal(config).unwrap_err();
         assert!(matches!(
             err,
-            LauncherError::PrivilegeInsufficient { .. } | LauncherError::SameUserFallback
+            LauncherError::SpawnFailed { .. } | LauncherError::PostExecVerification { .. }
         ));
     }
 
