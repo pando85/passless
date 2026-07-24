@@ -58,9 +58,10 @@ impl std::str::FromStr for AgentMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CdpExposeMode {
+    #[default]
     Pipe,
     Port,
 }
@@ -86,12 +87,6 @@ impl std::str::FromStr for CdpExposeMode {
                 s
             )),
         }
-    }
-}
-
-impl Default for CdpExposeMode {
-    fn default() -> Self {
-        Self::Pipe
     }
 }
 
