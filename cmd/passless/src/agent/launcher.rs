@@ -1134,6 +1134,7 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
 
     let target_uid = setup.target_uid;
     let target_gid = setup.target_gid;
+    let is_same_user = setup.same_user();
 
     let mut cmd = Command::new(&config.program);
     cmd.args(&config.args);
@@ -1177,7 +1178,12 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
 
     let start_time = read_proc_start_time(child_pid, proc_root).map_err(cleanup_on_failure)?;
     let cgroup_path = read_cgroup_v2_path(child_pid, proc_root).map_err(cleanup_on_failure)?;
-    let ns_inodes = read_namespace_inodes(child_pid, proc_root).map_err(cleanup_on_failure)?;
+    let ns_inodes = match read_namespace_inodes(child_pid, proc_root) {
+        Ok(ns) => ns,
+        Err(_) if is_same_user => read_namespace_inodes(std::process::id() as i32, proc_root)
+            .map_err(cleanup_on_failure)?,
+        Err(e) => return Err(cleanup_on_failure(e)),
+    };
 
     let (actual_uid, actual_gid) =
         read_proc_uid_gid(child_pid, proc_root).map_err(cleanup_on_failure)?;
