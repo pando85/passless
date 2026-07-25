@@ -65,11 +65,30 @@ Users should choose the solution that best fits their own security and practical
 
 ## Android
 
-For passkey support on Android, use
-[Password Store (Passkey Edition)](https://github.com/pando85/Android-Password-Store). It is a
-`pass`-compatible manager that also registers as an Android WebAuthn/passkey Credential Provider,
-and reads from the same git-synced `pass` store used by passless — giving you a unified,
-cross-platform passkey setup.
+[Password Store (Passkey Edition)](https://github.com/pando85/Android-Password-Store) is the
+Android companion application for managing passkeys on mobile devices. It extends the well-known
+[`pass`](https://www.passwordstore.org/) password manager with full FIDO2/WebAuthn credential
+support.
+
+### Credential Provider
+
+Password Store registers as an Android Credential Manager provider, allowing supported applications
+and browsers to request WebAuthn passkey operations directly from the device. This enables
+passwordless authentication on Android using the same credentials managed by Passless on desktop.
+
+### Interoperability
+
+Passkeys created by Passless can be imported and used on Android, and passkeys created on Android
+can be used by Passless on desktop. Both tools share the same encrypted CBOR credential format and
+operate on the same `pass`-compatible directory structure, so credentials synchronize seamlessly
+through the existing git-backed `pass` store.
+
+### Installation
+
+Password Store (Passkey Edition) is available from:
+
+- [GitHub Releases](https://github.com/pando85/Android-Password-Store/releases)
+- [F-Droid](https://f-droid.org/packages/app.passwordstore.pando85/)
 
 ## PIN Support
 
