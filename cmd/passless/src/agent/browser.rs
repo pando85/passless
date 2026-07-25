@@ -1656,7 +1656,7 @@ fn spawn_browser_hardened(
                 return Err(io::Error::last_os_error());
             }
 
-            setup.apply(&[CDP_FD_READ, CDP_FD_WRITE])
+            setup.apply(&[0, 1, 2, CDP_FD_READ, CDP_FD_WRITE])
         });
     }
 
@@ -1756,7 +1756,7 @@ fn spawn_browser_port_mode(
     let mut cmd = build_browser_command(config, profile_dir)?;
 
     unsafe {
-        cmd.pre_exec(move || setup.apply(&[]));
+        cmd.pre_exec(move || setup.apply(&[0, 1, 2]));
     }
 
     cmd.spawn()
