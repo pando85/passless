@@ -615,7 +615,11 @@ impl BrowserProcessManager {
 
         let (cdp_pipes, mut child, cdp_endpoint_url) = if is_port_mode {
             let child = spawn_browser_port_mode(config, &profile_dir)?;
-            let discovered = discover_cdp_endpoint(&profile_dir, Duration::from_secs(10))?;
+            let discovered = if config.cdp_port > 0 {
+                wait_for_cdp_port(config.cdp_port, Duration::from_secs(30))?
+            } else {
+                discover_cdp_endpoint(&profile_dir, Duration::from_secs(30))?
+            };
             write_cdp_endpoint(
                 &runtime_dir,
                 &discovered,
@@ -1788,6 +1792,65 @@ pub(crate) fn discover_cdp_endpoint(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_for_cdp_port(port: u16, timeout: Duration) -> Result<String, LaunchError> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let deadline = Instant::now() + timeout;
+    let addr = format!("127.0.0.1:{}", port);
+    loop {
+        if let Ok(mut stream) =
+            TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+        {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let request = format!(
+                "GET /json/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                addr
+            );
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut response = String::new();
+                let mut buf = [0u8; 4096];
+                let read_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if let Some(ws_url) = extract_web_socket_debugger_url(&response) {
+                                return Ok(ws_url);
+                            }
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            if Instant::now() >= read_deadline {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(LaunchError::CdpDiscoveryTimeout);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn extract_web_socket_debugger_url(http_response: &str) -> Option<String> {
+    let key = "webSocketDebuggerUrl";
+    let key_pos = http_response.find(key)?;
+    let after_key = &http_response[key_pos + key.len()..];
+    let ws_start = after_key.find("ws://")?;
+    let value = &after_key[ws_start..];
+    let end = value.find('"').unwrap_or(value.len());
+    Some(value[..end].to_string())
 }
 
 fn write_cdp_endpoint(
