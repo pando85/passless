@@ -397,8 +397,8 @@ fn dispatch_delegation(
             session_ttl,
             reason,
         } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::RequestDelegation {
+            let mut client = connect_admin()?;
+            let req = passless_core::agent::AdminRequest::RequestDelegation {
                 profile_id: parse_profile_id(profile)?,
                 rp_id: rp.clone(),
                 credential_ref: parse_credential_ref(credential)?,
@@ -407,7 +407,7 @@ fn dispatch_delegation(
             };
             let resp = client.request(req).map_err(client_error_to_result)?;
             match resp {
-                passless_core::agent::PrincipalResponse::DelegationRequested { request_id } => {
+                passless_core::agent::AdminResponse::DelegationRequested { request_id } => {
                     #[derive(Serialize)]
                     struct DelegationRequestedOut {
                         request_id: String,

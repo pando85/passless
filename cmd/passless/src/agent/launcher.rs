@@ -661,6 +661,13 @@ impl HardenedChildSetup {
                     got: self.target_gid.to_string(),
                 });
             }
+        } else if !self.same_user() {
+            return Err(LauncherError::PrivilegeInsufficient {
+                detail: format!(
+                    "non-root daemon (uid={}) cannot spawn as different user (uid={})",
+                    self.daemon_uid, self.target_uid
+                ),
+            });
         }
         Ok(())
     }
@@ -2019,13 +2026,14 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_config_validate_non_root_different_target_ok() {
+    fn test_spawn_config_validate_non_root_different_target_fails() {
         let mut config = default_spawn_config();
         config.daemon_uid = 1000;
         config.daemon_gid = 1000;
         config.target_uid = 1001;
         config.target_gid = 1001;
-        assert!(config.validate().is_ok());
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
     }
 
     #[test]
@@ -2160,8 +2168,8 @@ mod tests {
         let config = SpawnConfig {
             program: PathBuf::from("/bin/true"),
             args: vec![],
-            target_uid: 1001,
-            target_gid: 1001,
+            target_uid: my_uid + 1,
+            target_gid: my_uid + 1,
             daemon_uid: my_uid,
             daemon_gid: my_uid,
             rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
@@ -2174,10 +2182,7 @@ mod tests {
         };
 
         let err = spawn_principal(config).unwrap_err();
-        assert!(matches!(
-            err,
-            LauncherError::SpawnFailed { .. } | LauncherError::PostExecVerification { .. }
-        ));
+        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
     }
 
     #[test]
@@ -2266,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hardened_child_setup_validate_non_root_different_target_ok() {
+    fn test_hardened_child_setup_validate_non_root_different_target_fails() {
         let setup = HardenedChildSetup {
             target_uid: 1001,
             target_gid: 1001,
@@ -2277,7 +2282,8 @@ mod tests {
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
         };
-        assert!(setup.validate().is_ok());
+        let err = setup.validate().unwrap_err();
+        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
     }
 
     #[test]
@@ -2400,8 +2406,8 @@ mod tests {
         let config = SpawnConfig {
             program: PathBuf::from("/bin/true"),
             args: vec![],
-            target_uid: 1001,
-            target_gid: 1001,
+            target_uid: my_uid + 1,
+            target_gid: my_uid + 1,
             daemon_uid: my_uid,
             daemon_gid: my_uid,
             rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
@@ -2414,10 +2420,7 @@ mod tests {
         };
 
         let err = spawn_principal(config).unwrap_err();
-        assert!(matches!(
-            err,
-            LauncherError::SpawnFailed { .. } | LauncherError::PostExecVerification { .. }
-        ));
+        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
     }
 
     #[test]

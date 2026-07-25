@@ -358,6 +358,14 @@ pub enum AdminRequest {
     ProfileCheck {
         profile_id: ProfileId,
     },
+    RequestDelegation {
+        profile_id: ProfileId,
+        rp_id: String,
+        credential_ref: CredentialRef,
+        max_session_ttl: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Shutdown,
 }
 
@@ -395,6 +403,7 @@ pub enum AdminResponse {
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
+    DelegationRequested { request_id: PendingRequestId },
     ShutdownAccepted,
 }
 
@@ -1116,6 +1125,12 @@ impl Validate for AdminRequest {
                 }
             }
             Self::TerminatePrincipal { .. } => {}
+            Self::RequestDelegation { rp_id, reason, .. } => {
+                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+                if let Some(r) = reason {
+                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
+                }
+            }
             Self::WaitPrincipal { timeout_ms, .. } => {
                 if *timeout_ms > 5000 {
                     errors.push(format!(

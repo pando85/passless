@@ -576,6 +576,11 @@ impl BrowserProcessManager {
         endpoint_id: EndpointId,
         profile_id: ProfileId,
     ) -> Result<BrowserLeaseId, LaunchError> {
+        config
+            .hardening()
+            .validate()
+            .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
+
         let lease_id = BrowserLeaseId::new();
         let now = self.clock.now();
         let monotonic_secs = self.clock.monotonic_secs();
@@ -3884,6 +3889,8 @@ mod tests {
         let mut config = test_config(dir.path());
         config.daemon_uid = my_uid;
         config.daemon_gid = my_uid;
+        config.target_uid = my_uid + 1;
+        config.target_gid = my_uid + 1;
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
         assert!(matches!(result, Err(LaunchError::HardeningFailed(_))));
