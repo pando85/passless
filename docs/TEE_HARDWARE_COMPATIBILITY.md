@@ -41,7 +41,7 @@ Intel SGX remains available on:
 
 Intel's pivot away from SGX on consumer processors was driven by:
 
-1. Multiple security vulnerabilities (Foreshadow, Plundervolt, LVI, SGAxe, AEPI leak)
+1. Multiple security vulnerabilities (Foreshadow, Plundervolt, LVI, SGAxe, AEPIC leak)
 2. Limited adoption in consumer applications
 3. Shift to cloud/enterprise focus for confidential computing
 4. Development of newer technologies (Intel TDX)
