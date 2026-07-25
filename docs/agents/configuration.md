@@ -53,9 +53,15 @@ denied action must use `none` for both evidence sources.
 | `max_grant_ttl` | yes | Maximum seconds for the one-shot login grant (1..31536000) |
 | `max_session_ttl` | yes | Maximum seconds for the browser lease after assertion |
 | `browser_command` | yes | Stock browser executable and arguments |
-| `browser_user` | yes | Separate Unix user for the ephemeral browser; must differ from `principal_user` |
-| `browser_runtime_root` | yes | Absolute path for ephemeral browser profile state; owned by `browser_user` with mode 0700 |
+| `browser_user` | pipe mode | Separate Unix user for the ephemeral browser; must differ from `principal_user` |
+| `browser_runtime_root` | yes | Absolute path for ephemeral browser profile state; mode 0700 |
+| `browser_cdp_expose` | no | CDP transport: `"pipe"` (default) or `"port"` |
+| `browser_cdp_port` | no | TCP port for port mode; 0 = ephemeral (default 0) |
 | `delegated_registration_storage` | for registration | Must be `"human"`; omission denies delegated registration |
+
+When `browser_cdp_expose = "port"`, `browser_user` may equal `principal_user` or be omitted
+(defaults to principal). When `browser_cdp_expose = "pipe"` (or unset), `browser_user` must
+differ from `principal_user`. See [delegated-session](delegated-session.md#trusted-port-mode).
 
 ### Isolated fields
 
@@ -117,10 +123,13 @@ product_id = 22136
 
 - `enabled = true` requires `audit_path`.
 - `delegated-session` requires non-empty `credential_refs` for authentication, positive
-  `max_grant_ttl` and `max_session_ttl`, `browser_command`, `browser_user`, and
-  `browser_runtime_root`.
+  `max_grant_ttl` and `max_session_ttl`, `browser_command`, and `browser_runtime_root`.
 - `isolated` requires `storage` and must not set `browser_user` or `browser_runtime_root`.
-- `browser_user` must differ from `principal_user`.
+- `browser_cdp_expose = "pipe"` (or unset): `browser_user` must differ from `principal_user`.
+- `browser_cdp_expose = "port"`: `browser_user` may equal `principal_user` or be omitted.
+- `browser_cdp_port` is only valid with `browser_cdp_expose = "port"`.
+- `browser_command` extra args must not contain `--remote-debugging-port` or
+  `--remote-debugging-address`; these are set by the daemon in port mode.
 - `browser_runtime_root` must be absolute and contain no NUL bytes.
 - `start_url` must use HTTPS and its host must match exactly one rule.
 - The legacy experimental `rp_ids`, `registration_allowed`, and `require_uv` fields remain a

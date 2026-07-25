@@ -40,6 +40,8 @@ fn isolated_profile() -> AgentProfileConfig {
         browser_command: None,
         browser_user: None,
         browser_runtime_root: None,
+        browser_cdp_expose: None,
+        browser_cdp_port: None,
     }
 }
 
@@ -61,6 +63,8 @@ fn delegated_profile() -> AgentProfileConfig {
         browser_command: Some(vec!["/usr/bin/browser".into()]),
         browser_user: Some("browseruser".into()),
         browser_runtime_root: Some(PathBuf::from("/tmp/browser-runtime")),
+        browser_cdp_expose: None,
+        browser_cdp_port: None,
     }
 }
 

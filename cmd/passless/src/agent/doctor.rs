@@ -242,12 +242,9 @@ pub fn run_startup_diagnostics(
             message: if euid_ok {
                 "daemon euid is root".into()
             } else {
-                "daemon euid is not root; cannot manage profiles".into()
+                "daemon euid is not root; relying on group-based UHID access".into()
             },
         });
-        if !euid_ok {
-            fatal.push("daemon euid is not root".into());
-        }
     }
 
     if has_profiles {
@@ -832,13 +829,18 @@ mod tests {
     }
 
     #[test]
-    fn test_not_root_is_fatal_when_profiles() {
+    fn test_not_root_nonfatal_when_uhid_accessible() {
         let probes = MockProbes::not_root();
         let profiles = vec![("test".into(), make_profile_info())];
         let result =
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
-        assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("root")));
+        assert!(result.is_ok());
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|c| c.name == "daemon_euid_root" && !c.passed)
+        );
     }
 
     #[test]

@@ -94,3 +94,90 @@ passless agent-admin delegation list --profile opencode
 passless agent-admin delegation revoke <grant-id> --confirm
 passless agent-admin session revoke <session-id> --confirm
 ```
+
+## Trusted (port) mode
+
+By default, delegated-session mode uses pipe-based CDP transport (`browser_cdp_expose = "pipe"`).
+The daemon mediates every CDP command through Unix pipes, and `browser_user` must differ from
+`principal_user`.
+
+Setting `browser_cdp_expose = "port"` switches to a trusted trust model where the agent connects
+directly to the browser's CDP WebSocket endpoint. This enables external tools like Playwright MCP,
+Puppeteer, and native DevTools clients.
+
+### Configuration
+
+```toml
+[agents.profiles.opencode]
+mode = "delegated-session"
+principal_user = "alice"
+browser_cdp_expose = "port"
+browser_cdp_port = 9222
+credential_refs = ["<credential-ref-hex>"]
+max_grant_ttl = 120
+max_session_ttl = 900
+browser_command = ["chromium", "--user-data-dir", "<daemon-managed>"]
+start_url = "https://github.com/dashboard"
+browser_runtime_root = "/var/run/passless-browser"
+
+[[agents.profiles.opencode.rules]]
+rp_id = "github.com"
+register = { authorization = "deny", user_presence = "none", user_verification = "none" }
+authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+
+[agents.profiles.opencode.device]
+name = "passless-agent-opencode"
+phys = "opencode-phys"
+uniq = "opencode-uniq"
+vendor_id = 4660
+product_id = 22136
+```
+
+- `browser_user` is optional; if omitted, defaults to `principal_user`.
+- `browser_cdp_port` is optional; 0 (default) lets the OS assign an ephemeral port.
+- `browser_command` extra args must not include `--remote-debugging-port` or
+  `--remote-debugging-address`; the daemon sets these automatically.
+
+### Workflow
+
+1. Operator configures the profile with `browser_cdp_expose = "port"`.
+2. Operator launches the principal session:
+   ```bash
+   passless agent run --profile opencode -- /usr/local/bin/agent-command
+   ```
+3. Inside the session, the principal requests delegation:
+   ```bash
+   passless agent --profile opencode delegation request \
+     --rp github.com --credential <credential-ref-hex> \
+     --session-ttl 900 --reason "Playwright automation"
+   ```
+4. The daemon performs the WebAuthn ceremony and launches Chromium with
+   `--remote-debugging-port=<N> --remote-debugging-address=127.0.0.1`.
+5. The daemon reads Chromium's `DevToolsActivePort` file to discover the WebSocket URL.
+6. The daemon writes the full WebSocket URL to `<runtime_dir>/cdp-endpoint`
+   (mode 0600, owned by principal user).
+7. The agent reads the CDP endpoint and connects with Playwright:
+   ```javascript
+   const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222/devtools/browser/<uuid>');
+   ```
+8. The agent has full browser control: snapshots, clicks, typing, navigation.
+9. Lease expiry or revocation kills the browser process.
+
+### What changes in port mode
+
+- `browser-control` returns an error directing the caller to use the CDP endpoint directly.
+- `browser-status` includes a `cdp_endpoint` field with the WebSocket URL.
+- No daemon mediation of CDP commands after the ceremony.
+- Audit records the exposure mode at lease creation.
+- The credential private key never leaves the daemon; only the authenticated session (cookies)
+  is exposed to the agent.
+
+### When to use port mode
+
+- Single-user workstations where the operator fully trusts the agent.
+- Automation that requires rich browser interaction (Playwright MCP, accessibility snapshots,
+  element targeting, auto-waiting).
+- Environments where per-command daemon round-trips are unacceptable.
+
+Do not use port mode for multi-user systems, production environments, or untrusted agents.
+Use pipe mode instead. See [security](security.md#port-mode-threat-model) for the full threat model.

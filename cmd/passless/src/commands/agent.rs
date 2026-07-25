@@ -397,8 +397,8 @@ fn dispatch_delegation(
             session_ttl,
             reason,
         } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::RequestDelegation {
+            let mut client = connect_admin()?;
+            let req = passless_core::agent::AdminRequest::RequestDelegation {
                 profile_id: parse_profile_id(profile)?,
                 rp_id: rp.clone(),
                 credential_ref: parse_credential_ref(credential)?,
@@ -407,7 +407,7 @@ fn dispatch_delegation(
             };
             let resp = client.request(req).map_err(client_error_to_result)?;
             match resp {
-                passless_core::agent::PrincipalResponse::DelegationRequested { request_id } => {
+                passless_core::agent::AdminResponse::DelegationRequested { request_id } => {
                     #[derive(Serialize)]
                     struct DelegationRequestedOut {
                         request_id: String,
@@ -831,7 +831,12 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
                     break;
                 }
 
-                match client.wait_principal(&session_id, 1000) {
+                let mut wait_client = match connect_admin() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+
+                match wait_client.wait_principal(&session_id, 1000) {
                     Ok(AdminResponse::PrincipalWait(wait_resp)) => {
                         if !wait_resp.running {
                             exit_code = wait_resp.exit_code;
@@ -842,7 +847,8 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
                     Ok(_) => break,
                     Err(ClientError::Io(ref e))
                         if e.kind() == std::io::ErrorKind::ConnectionReset
-                            || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                            || e.kind() == std::io::ErrorKind::UnexpectedEof
+                            || e.kind() == std::io::ErrorKind::BrokenPipe =>
                     {
                         break;
                     }

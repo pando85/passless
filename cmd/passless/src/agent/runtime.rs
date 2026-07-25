@@ -253,6 +253,7 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+#[derive(Clone)]
 struct ResolvedUser {
     uid: u32,
     gid: u32,
@@ -353,7 +354,10 @@ fn validate_browser_runtime_root_at_startup(
     Ok(())
 }
 
-fn validate_principal_executable(path_str: &str) -> Result<std::path::PathBuf, ProtocolError> {
+fn validate_principal_executable(
+    path_str: &str,
+    daemon_uid: u32,
+) -> Result<std::path::PathBuf, ProtocolError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let path = std::path::Path::new(path_str);
@@ -390,13 +394,15 @@ fn validate_principal_executable(path_str: &str) -> Result<std::path::PathBuf, P
         ));
     }
 
-    if meta.uid() != 0 {
+    let owner = meta.uid();
+    if owner != 0 && owner != daemon_uid {
         return Err(ProtocolError::new(
             ErrorCode::Forbidden,
             format!(
-                "executable '{}' must be owned by root (uid 0), owned by uid {}",
+                "executable '{}' must be owned by root (uid 0) or daemon uid {}, owned by uid {}",
                 canonical.display(),
-                meta.uid()
+                daemon_uid,
+                owner
             ),
             RecommendedAction::FixRequest,
         ));
@@ -611,9 +617,12 @@ impl AgentRuntime {
                 }
             }
 
+            let cdp_port_mode = profile.browser_cdp_expose
+                == Some(passless_core::agent::config::CdpExposeMode::Port);
+
             let browser_user_resolved = if let Some(ref browser_user) = profile.browser_user {
                 let bu = resolve_user(browser_user)?;
-                if is_root {
+                if is_root && !cdp_port_mode {
                     if bu.uid == user.uid {
                         return Err(RuntimeError::Config(format!(
                             "profile '{}': browser uid {} must differ from principal uid {}",
@@ -637,6 +646,8 @@ impl AgentRuntime {
                     validate_browser_runtime_root_at_startup(runtime_root, bu.uid, name)?;
                 }
                 Some(bu)
+            } else if cdp_port_mode {
+                Some(user.clone())
             } else {
                 None
             };
@@ -2570,7 +2581,7 @@ impl AgentRuntime {
             ));
         }
 
-        let program = validate_principal_executable(&command[0])?;
+        let program = validate_principal_executable(&command[0], self.daemon_uid)?;
         let args = if command.len() > 1 {
             command[1..].to_vec()
         } else {
@@ -3636,6 +3647,8 @@ impl AgentRuntime {
                 target_gid: browser_gid,
                 daemon_uid: self.daemon_uid,
                 daemon_gid: self.daemon_gid,
+                cdp_expose: config.browser_cdp_expose.unwrap_or_default(),
+                cdp_port: config.browser_cdp_port.unwrap_or(0),
             };
 
             let mut browser_mgr = self.browser_manager.lock().unwrap();
@@ -3665,6 +3678,7 @@ impl AgentRuntime {
                 profile_id.clone(),
                 endpoint_id.clone(),
             )
+            .with_cdp_expose(browser_config.cdp_expose.to_string())
             .build();
             if let Err(e) = self.audit_gate.record(lease_audit_event) {
                 let _ = policy_rt.principal_cancel_pending(&pending_id_clone, &session_id_clone);
@@ -3856,10 +3870,12 @@ impl AgentRuntime {
         if let Some(lease_id) = lease_id {
             let browser_mgr = self.browser_manager.lock().unwrap();
             if let Some(snapshot) = browser_mgr.snapshot(&lease_id) {
+                let cdp_endpoint = browser_mgr.lease_cdp_endpoint(&lease_id).flatten();
                 return Ok(PrincipalResponse::BrowserStatus(
                     passless_core::agent::BrowserStatusResponse {
                         running: !snapshot.state.is_terminal(),
                         status: format!("{}", snapshot.state),
+                        cdp_endpoint,
                     },
                 ));
             }
@@ -3869,6 +3885,7 @@ impl AgentRuntime {
             passless_core::agent::BrowserStatusResponse {
                 running: false,
                 status: "no_browser".into(),
+                cdp_endpoint: None,
             },
         ))
     }
@@ -3946,6 +3963,24 @@ impl AgentRuntime {
         };
 
         let cdp_method = extract_cdp_method_for_audit(request_json);
+
+        {
+            let browser_mgr = self.browser_manager.lock().unwrap();
+            if let Some(false) = browser_mgr.lease_has_cdp_pipes(&lease_id) {
+                let endpoint_msg = browser_mgr
+                    .lease_cdp_endpoint(&lease_id)
+                    .flatten()
+                    .unwrap_or_else(|| "<endpoint not yet discovered>".to_string());
+                return Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    format!(
+                        "browser-control is unavailable in port mode; connect directly via CDP: {}",
+                        endpoint_msg
+                    ),
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        }
 
         let pre_audit = self.audit_gate.record(
             super::audit_events::BrowserControlRequestBuilder::new(
@@ -5260,6 +5295,85 @@ impl AgentRuntime {
         ))
     }
 
+    fn handle_admin_request_delegation(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        credential_ref: &passless_core::agent::CredentialRef,
+        max_session_ttl: u64,
+        reason: Option<&str>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        let profile = self.profiles.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                "no session slot for profile",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        let managed_guard = session_slot.lock().unwrap();
+        let managed = managed_guard.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Conflict,
+                "no active principal session for this profile; launch one first with `passless agent run`",
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+        {
+            let eid_guard = profile.endpoint_id.lock().unwrap();
+            if eid_guard.is_none() {
+                drop(eid_guard);
+                match self.create_profile_endpoint(&profile.endpoint_spec) {
+                    Ok(eid) => {
+                        let mut eid_guard = profile.endpoint_id.lock().unwrap();
+                        *eid_guard = Some(eid);
+                    }
+                    Err(e) => {
+                        return Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            format!("failed to create endpoint for delegation: {}", e),
+                            RecommendedAction::Retry,
+                        ));
+                    }
+                }
+            }
+        }
+        let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
+
+        let resp = self.handle_request_delegation(RequestDelegationParams {
+            profile_id,
+            session_id: &managed.session_id,
+            endpoint_id: &eid,
+            rp_id,
+            credential_ref,
+            max_session_ttl,
+            principal_reason: reason.map(|s| s.to_string()),
+            profile,
+            session_digest: &managed.process_digest,
+        })?;
+
+        match resp {
+            PrincipalResponse::DelegationRequested { request_id } => {
+                Ok(AdminResponse::DelegationRequested { request_id })
+            }
+            _ => Err(ProtocolError::new(
+                ErrorCode::Internal,
+                "unexpected response from delegation handler",
+                RecommendedAction::Retry,
+            )),
+        }
+    }
+
     fn handle_shutdown(&self) -> Result<AdminResponse, ProtocolError> {
         let shutdown_event =
             super::audit_events::AdminShutdownRequestBuilder::new(std::process::id()).build();
@@ -5355,6 +5469,19 @@ impl AdminHandler for AgentRuntime {
             AdminRequest::AuditVerify => self.handle_audit_verify(),
             AdminRequest::AuditExport { format } => self.handle_audit_export(format),
             AdminRequest::ProfileCheck { profile_id } => self.handle_profile_check(profile_id),
+            AdminRequest::RequestDelegation {
+                profile_id,
+                rp_id,
+                credential_ref,
+                max_session_ttl,
+                reason,
+            } => self.handle_admin_request_delegation(
+                profile_id,
+                rp_id,
+                credential_ref,
+                *max_session_ttl,
+                reason.as_deref(),
+            ),
             AdminRequest::Shutdown => self.handle_shutdown(),
         }
     }
@@ -5756,20 +5883,20 @@ mod tests {
 
     #[test]
     fn validate_principal_executable_rejects_relative_path() {
-        let err = validate_principal_executable("relative/path").unwrap_err();
+        let err = validate_principal_executable("relative/path", 0).unwrap_err();
         assert!(err.to_string().contains("absolute"));
     }
 
     #[test]
     fn validate_principal_executable_rejects_nonexistent_path() {
-        let err = validate_principal_executable("/nonexistent/binary").unwrap_err();
+        let err = validate_principal_executable("/nonexistent/binary", 0).unwrap_err();
         assert!(err.to_string().contains("cannot be resolved"));
     }
 
     #[test]
     fn validate_principal_executable_rejects_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let err = validate_principal_executable(dir.path().to_str().unwrap()).unwrap_err();
+        let err = validate_principal_executable(dir.path().to_str().unwrap(), 0).unwrap_err();
         assert!(err.to_string().contains("not a regular file"));
     }
 
@@ -5777,7 +5904,7 @@ mod tests {
     fn validate_principal_executable_accepts_root_owned_executable() {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata("/bin/true").unwrap();
-        let result = validate_principal_executable("/bin/true");
+        let result = validate_principal_executable("/bin/true", 0);
         if meta.uid() == 0 {
             assert!(
                 result.is_ok(),
@@ -5789,6 +5916,16 @@ mod tests {
                 "/bin/true is not root-owned, should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn validate_principal_executable_accepts_daemon_uid_owned() {
+        let my_uid = unsafe { libc::getuid() };
+        let result = validate_principal_executable("/bin/true", my_uid);
+        assert!(
+            result.is_ok(),
+            "/bin/true owned by daemon uid should be accepted"
+        );
     }
 
     #[test]
@@ -6015,6 +6152,8 @@ mod tests {
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
             security_config: SecurityConfig::default(),
             pin_config: PinConfig::default(),
@@ -6337,6 +6476,8 @@ mod tests {
                 browser_command: Some(vec!["/bin/true".to_string()]),
                 browser_user: Some("browseruser".to_string()),
                 browser_runtime_root: Some(temp_dir.path().join("browser-runtime")),
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             };
 
             let agent_config = {
@@ -7117,6 +7258,8 @@ mod tests {
             browser_command: Some(vec!["/bin/true".to_string()]),
             browser_user: Some("browseruser".to_string()),
             browser_runtime_root: Some(temp_dir.path().join("browser-runtime")),
+            browser_cdp_expose: None,
+            browser_cdp_port: None,
         };
 
         let agent_config = {
@@ -7398,6 +7541,8 @@ mod tests {
                     browser_command: None,
                     browser_user: None,
                     browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
                 },
             );
             config

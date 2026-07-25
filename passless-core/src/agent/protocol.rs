@@ -358,6 +358,14 @@ pub enum AdminRequest {
     ProfileCheck {
         profile_id: ProfileId,
     },
+    RequestDelegation {
+        profile_id: ProfileId,
+        rp_id: String,
+        credential_ref: CredentialRef,
+        max_session_ttl: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Shutdown,
 }
 
@@ -395,6 +403,7 @@ pub enum AdminResponse {
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
+    DelegationRequested { request_id: PendingRequestId },
     ShutdownAccepted,
 }
 
@@ -725,6 +734,8 @@ impl ProfileDiagnosticReport {
 pub struct BrowserStatusResponse {
     pub running: bool,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1114,6 +1125,12 @@ impl Validate for AdminRequest {
                 }
             }
             Self::TerminatePrincipal { .. } => {}
+            Self::RequestDelegation { rp_id, reason, .. } => {
+                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+                if let Some(r) = reason {
+                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
+                }
+            }
             Self::WaitPrincipal { timeout_ms, .. } => {
                 if *timeout_ms > 5000 {
                     errors.push(format!(
@@ -1346,10 +1363,11 @@ impl SeqpacketCodec {
         hdr.msg_iov = &mut iov;
         hdr.msg_iovlen = 1;
 
+        let mut cmsg_buf: Vec<u8> = Vec::new();
         if !fds.is_empty() {
             let fds_len = std::mem::size_of_val(fds);
             let cmsg_space = unsafe { libc::CMSG_SPACE(fds_len as libc::c_uint) } as usize;
-            let mut cmsg_buf = vec![0u8; cmsg_space];
+            cmsg_buf.resize(cmsg_space, 0);
 
             hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
             hdr.msg_controllen = cmsg_space;
@@ -2587,7 +2605,7 @@ mod tests {
     fn seqpacket_socketpair_peer_cred() {
         let (fd0, fd1) = create_seqpacket_pair();
         let cred = PeerCred::from_fd(fd1).unwrap();
-        assert_eq!(cred.pid, std::process::id() as i32);
+        assert_eq!(cred.pid, unsafe { libc::getpid() });
         assert_eq!(cred.uid, unsafe { libc::getuid() });
         assert_eq!(cred.gid, unsafe { libc::getgid() });
         let _ = fd0;

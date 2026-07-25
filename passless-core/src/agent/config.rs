@@ -58,6 +58,38 @@ impl std::str::FromStr for AgentMode {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CdpExposeMode {
+    #[default]
+    Pipe,
+    Port,
+}
+
+impl fmt::Display for CdpExposeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pipe => f.write_str("pipe"),
+            Self::Port => f.write_str("port"),
+        }
+    }
+}
+
+impl std::str::FromStr for CdpExposeMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pipe" => Ok(CdpExposeMode::Pipe),
+            "port" => Ok(CdpExposeMode::Port),
+            _ => Err(format!(
+                "Invalid CDP expose mode '{}'. Must be: pipe, port",
+                s
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentAuthorization {
@@ -491,6 +523,10 @@ pub struct AgentProfileConfig {
     pub browser_user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_runtime_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_cdp_expose: Option<CdpExposeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_cdp_port: Option<u16>,
 }
 
 impl AgentProfileConfig {
@@ -657,27 +693,32 @@ impl AgentProfileConfig {
                     )));
                 }
 
-                let browser_user = self.browser_user.as_ref().ok_or_else(|| {
-                    Error::Config(format!(
-                        "agent profile '{}': delegated-session requires browser_user",
-                        profile_id
-                    ))
-                })?;
-                if browser_user.is_empty() {
+                let cdp_port_mode = self.browser_cdp_expose == Some(CdpExposeMode::Port);
+
+                if let Some(ref browser_user) = self.browser_user {
+                    if browser_user.is_empty() {
+                        return Err(Error::Config(format!(
+                            "agent profile '{}': browser_user must not be empty",
+                            profile_id
+                        )));
+                    }
+                    if browser_user.contains('\0') {
+                        return Err(Error::Config(format!(
+                            "agent profile '{}': browser_user must not contain NUL bytes",
+                            profile_id
+                        )));
+                    }
+                    if !cdp_port_mode && *browser_user == self.principal_user {
+                        return Err(Error::Config(format!(
+                            "agent profile '{}': browser_user must differ from principal_user \
+                             (unless browser_cdp_expose = \"port\")",
+                            profile_id
+                        )));
+                    }
+                } else if !cdp_port_mode {
                     return Err(Error::Config(format!(
-                        "agent profile '{}': browser_user must not be empty",
-                        profile_id
-                    )));
-                }
-                if browser_user.contains('\0') {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': browser_user must not contain NUL bytes",
-                        profile_id
-                    )));
-                }
-                if *browser_user == self.principal_user {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': browser_user must differ from principal_user",
+                        "agent profile '{}': delegated-session requires browser_user \
+                         (or set browser_cdp_expose = \"port\" to use principal_user)",
                         profile_id
                     )));
                 }
@@ -1253,6 +1294,8 @@ mod tests {
             browser_command: Some(vec!["firefox".to_string()]),
             browser_user: Some("browser-user".to_string()),
             browser_runtime_root: Some(PathBuf::from("/var/run/passless-browser")),
+            browser_cdp_expose: None,
+            browser_cdp_port: None,
         }
     }
 
@@ -1283,6 +1326,8 @@ mod tests {
             browser_command: None,
             browser_user: None,
             browser_runtime_root: None,
+            browser_cdp_expose: None,
+            browser_cdp_port: None,
         }
     }
 
@@ -1694,6 +1739,8 @@ verbose = false
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         profiles.insert(
@@ -1718,6 +1765,8 @@ verbose = false
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -1760,6 +1809,8 @@ verbose = false
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -1806,6 +1857,8 @@ verbose = false
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2111,6 +2164,8 @@ product_id = 2
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2155,6 +2210,8 @@ product_id = 2
                     browser_command: None,
                     browser_user: None,
                     browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
                 },
             );
         }
@@ -2284,6 +2341,8 @@ backend_type = "local"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2340,6 +2399,8 @@ backend_type = "local"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2388,6 +2449,8 @@ backend_type = "local"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2766,6 +2829,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         profiles.insert(
@@ -2796,6 +2861,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2869,6 +2936,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         profiles.insert(
@@ -2899,6 +2968,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -2943,6 +3014,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
             },
         );
         let config = AgentConfig {
@@ -3145,5 +3218,43 @@ portable = true
             }
             other => panic!("expected Tpm storage, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_port_mode_allows_same_browser_and_principal_user() {
+        let mut profile = make_delegated_profile();
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_user = Some(profile.principal_user.clone());
+        let pid = ProfileId::new("test").unwrap();
+        assert!(profile.validate(&pid).is_ok());
+    }
+
+    #[test]
+    fn test_port_mode_allows_browser_user_omitted() {
+        let mut profile = make_delegated_profile();
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_user = None;
+        let pid = ProfileId::new("test").unwrap();
+        assert!(profile.validate(&pid).is_ok());
+    }
+
+    #[test]
+    fn test_pipe_mode_rejects_same_browser_and_principal_user() {
+        let mut profile = make_delegated_profile();
+        profile.browser_cdp_expose = Some(CdpExposeMode::Pipe);
+        profile.browser_user = Some(profile.principal_user.clone());
+        let pid = ProfileId::new("test").unwrap();
+        let err = profile.validate(&pid).unwrap_err();
+        assert!(err.to_string().contains("browser_user must differ"));
+    }
+
+    #[test]
+    fn test_pipe_mode_default_rejects_same_browser_and_principal_user() {
+        let mut profile = make_delegated_profile();
+        profile.browser_cdp_expose = None;
+        profile.browser_user = Some(profile.principal_user.clone());
+        let pid = ProfileId::new("test").unwrap();
+        let err = profile.validate(&pid).unwrap_err();
+        assert!(err.to_string().contains("browser_user must differ"));
     }
 }

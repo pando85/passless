@@ -645,6 +645,8 @@ mod tests {
             browser_command: None,
             browser_user: None,
             browser_runtime_root: None,
+            browser_cdp_expose: None,
+            browser_cdp_port: None,
         };
 
         let config = config_from_profile(&profile).unwrap();
@@ -685,6 +687,8 @@ mod tests {
             browser_command: None,
             browser_user: None,
             browser_runtime_root: None,
+            browser_cdp_expose: None,
+            browser_cdp_port: None,
         };
 
         let result = config_from_profile(&profile);

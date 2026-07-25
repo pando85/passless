@@ -15,6 +15,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use passless_core::agent::config::CdpExposeMode;
 use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
 
 use rand::Rng;
@@ -198,6 +199,8 @@ pub struct BrowserConfig {
     pub target_gid: u32,
     pub daemon_uid: u32,
     pub daemon_gid: u32,
+    pub cdp_expose: CdpExposeMode,
+    pub cdp_port: u16,
 }
 
 pub trait ChildSpawner: Send + Sync {
@@ -360,6 +363,9 @@ pub enum LaunchError {
     InvalidStartUrl(String),
     RuntimeRootInvalid(String),
     HardeningFailed(String),
+    CdpDiscoveryTimeout,
+    InvalidArg(String),
+    EndpointFileWriteFailed(String, String),
 }
 
 impl fmt::Display for LaunchError {
@@ -381,6 +387,15 @@ impl fmt::Display for LaunchError {
             }
             LaunchError::HardeningFailed(msg) => {
                 write!(f, "browser hardening failed: {}", msg)
+            }
+            LaunchError::CdpDiscoveryTimeout => {
+                write!(f, "timed out waiting for DevToolsActivePort file")
+            }
+            LaunchError::InvalidArg(msg) => {
+                write!(f, "invalid browser argument: {}", msg)
+            }
+            LaunchError::EndpointFileWriteFailed(path, e) => {
+                write!(f, "failed to write CDP endpoint file '{}': {}", path, e)
             }
         }
     }
@@ -468,6 +483,7 @@ pub struct BrowserLease {
     pub cdp_buffer: VecDeque<String>,
     pub cdp_read_buf: Vec<u8>,
     pub child_reaped: bool,
+    pub cdp_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -560,6 +576,11 @@ impl BrowserProcessManager {
         endpoint_id: EndpointId,
         profile_id: ProfileId,
     ) -> Result<BrowserLeaseId, LaunchError> {
+        config
+            .hardening()
+            .validate()
+            .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
+
         let lease_id = BrowserLeaseId::new();
         let now = self.clock.now();
         let monotonic_secs = self.clock.monotonic_secs();
@@ -590,9 +611,28 @@ impl BrowserProcessManager {
                 .map_err(|_| LaunchError::InvalidStartUrl(url.clone()))?;
         }
 
-        let cdp = create_cdp_pipes().map_err(|e| LaunchError::PipeCreationFailed(e.to_string()))?;
+        let is_port_mode = config.cdp_expose == CdpExposeMode::Port;
 
-        let mut child = self.spawner.spawn_browser(config, &profile_dir, &cdp)?;
+        let (cdp_pipes, mut child, cdp_endpoint_url) = if is_port_mode {
+            let child = spawn_browser_port_mode(config, &profile_dir)?;
+            let discovered = if config.cdp_port > 0 {
+                wait_for_cdp_port(config.cdp_port, Duration::from_secs(30))?
+            } else {
+                discover_cdp_endpoint(&profile_dir, Duration::from_secs(30))?
+            };
+            write_cdp_endpoint(
+                &runtime_dir,
+                &discovered,
+                config.target_uid,
+                config.target_gid,
+            )?;
+            (None, child, Some(discovered))
+        } else {
+            let cdp =
+                create_cdp_pipes().map_err(|e| LaunchError::PipeCreationFailed(e.to_string()))?;
+            let child = self.spawner.spawn_browser(config, &profile_dir, &cdp)?;
+            (Some(cdp), child, None)
+        };
 
         let pid = child.id();
         let pgid = pid;
@@ -631,9 +671,14 @@ impl BrowserProcessManager {
 
         write_manifest_atomic(&runtime_dir, &manifest)?;
 
-        let daemon_endpoints = DaemonCdpEndpoints {
-            to_browser: unsafe { fs::File::from_raw_fd(cdp.daemon_to_browser_write) },
-            from_browser: unsafe { fs::File::from_raw_fd(cdp.daemon_from_browser_read) },
+        let (daemon_endpoints, consumed_pipes) = if let Some(cdp) = cdp_pipes {
+            let endpoints = DaemonCdpEndpoints {
+                to_browser: unsafe { fs::File::from_raw_fd(cdp.daemon_to_browser_write) },
+                from_browser: unsafe { fs::File::from_raw_fd(cdp.daemon_from_browser_read) },
+            };
+            (Some(endpoints), Some(cdp))
+        } else {
+            (None, None)
         };
 
         let lease = BrowserLease {
@@ -645,15 +690,17 @@ impl BrowserProcessManager {
             login_deadline,
             ttl_deadline: login_deadline,
             child: Some(child),
-            cdp: Some(daemon_endpoints),
+            cdp: daemon_endpoints,
             cdp_buffer: VecDeque::new(),
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
             child_reaped: false,
+            cdp_endpoint: cdp_endpoint_url,
         };
 
-        let mut consumed = cdp;
-        consumed.daemon_to_browser_write = -1;
-        consumed.daemon_from_browser_read = -1;
+        if let Some(mut consumed) = consumed_pipes {
+            consumed.daemon_to_browser_write = -1;
+            consumed.daemon_from_browser_read = -1;
+        }
 
         self.leases.insert(lease_id.clone(), lease);
 
@@ -920,6 +967,14 @@ impl BrowserProcessManager {
 
     pub fn remove(&mut self, lease_id: &BrowserLeaseId) -> Option<BrowserLease> {
         self.leases.remove(lease_id)
+    }
+
+    pub fn lease_cdp_endpoint(&self, lease_id: &BrowserLeaseId) -> Option<Option<String>> {
+        self.leases.get(lease_id).map(|l| l.cdp_endpoint.clone())
+    }
+
+    pub fn lease_has_cdp_pipes(&self, lease_id: &BrowserLeaseId) -> Option<bool> {
+        self.leases.get(lease_id).map(|l| l.cdp.is_some())
     }
 
     pub fn snapshot(&self, lease_id: &BrowserLeaseId) -> Option<LeaseSnapshot> {
@@ -1510,7 +1565,22 @@ fn create_cdp_pipes() -> io::Result<CdpPipes> {
     })
 }
 
-fn build_browser_command(config: &BrowserConfig, profile_dir: &Path) -> Command {
+pub(crate) fn build_browser_command(
+    config: &BrowserConfig,
+    profile_dir: &Path,
+) -> Result<Command, LaunchError> {
+    for arg in &config.extra_args {
+        if arg.starts_with("--remote-debugging-pipe")
+            || arg.starts_with("--remote-debugging-port")
+            || arg.starts_with("--remote-debugging-address")
+        {
+            return Err(LaunchError::InvalidArg(
+                "remote debugging flags are managed by passless; remove from browser_command"
+                    .into(),
+            ));
+        }
+    }
+
     let mut cmd = Command::new(&config.executable);
 
     cmd.arg(format!("--user-data-dir={}", profile_dir.display()));
@@ -1528,7 +1598,16 @@ fn build_browser_command(config: &BrowserConfig, profile_dir: &Path) -> Command 
     cmd.arg("--safebrowsing-disable-auto-update");
     cmd.arg("--metrics-recording-only");
     cmd.arg("--disable-features=TranslateUI");
-    cmd.arg("--remote-debugging-pipe");
+
+    match config.cdp_expose {
+        CdpExposeMode::Pipe => {
+            cmd.arg("--remote-debugging-pipe");
+        }
+        CdpExposeMode::Port => {
+            cmd.arg(format!("--remote-debugging-port={}", config.cdp_port));
+            cmd.arg("--remote-debugging-address=127.0.0.1");
+        }
+    }
 
     for arg in &config.extra_args {
         cmd.arg(arg);
@@ -1542,7 +1621,7 @@ fn build_browser_command(config: &BrowserConfig, profile_dir: &Path) -> Command 
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
 
-    cmd
+    Ok(cmd)
 }
 
 fn spawn_browser_hardened(
@@ -1555,7 +1634,7 @@ fn spawn_browser_hardened(
         .validate()
         .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
 
-    let mut cmd = build_browser_command(config, profile_dir);
+    let mut cmd = build_browser_command(config, profile_dir)?;
 
     let fd_read = cdp.browser_from_daemon_read;
     let fd_write = cdp.browser_to_daemon_write;
@@ -1586,7 +1665,7 @@ fn spawn_browser_hardened(
                 return Err(io::Error::last_os_error());
             }
 
-            setup.apply(&[CDP_FD_READ, CDP_FD_WRITE])
+            setup.apply(&[0, 1, 2, CDP_FD_READ, CDP_FD_WRITE])
         });
     }
 
@@ -1603,7 +1682,7 @@ fn spawn_browser_unhardened(
     profile_dir: &Path,
     cdp: &CdpPipes,
 ) -> Result<Child, LaunchError> {
-    let mut cmd = build_browser_command(config, profile_dir);
+    let mut cmd = build_browser_command(config, profile_dir)?;
 
     let fd_read = cdp.browser_from_daemon_read;
     let fd_write = cdp.browser_to_daemon_write;
@@ -1672,6 +1751,135 @@ fn spawn_browser_unhardened(
 
     cmd.spawn()
         .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+}
+
+fn spawn_browser_port_mode(
+    config: &BrowserConfig,
+    profile_dir: &Path,
+) -> Result<Child, LaunchError> {
+    let setup = config.hardening();
+    setup
+        .validate()
+        .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
+
+    let mut cmd = build_browser_command(config, profile_dir)?;
+
+    unsafe {
+        cmd.pre_exec(move || setup.apply(&[0, 1, 2]));
+    }
+
+    cmd.spawn()
+        .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+}
+
+pub(crate) fn discover_cdp_endpoint(
+    profile_dir: &Path,
+    timeout: Duration,
+) -> Result<String, LaunchError> {
+    let port_file = profile_dir.join("DevToolsActivePort");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(content) = fs::read_to_string(&port_file) {
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() >= 2 {
+                let port = lines[0].trim();
+                let ws_path = lines[1].trim();
+                return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(LaunchError::CdpDiscoveryTimeout);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_cdp_port(port: u16, timeout: Duration) -> Result<String, LaunchError> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let deadline = Instant::now() + timeout;
+    let addr = format!("127.0.0.1:{}", port);
+    loop {
+        if let Ok(mut stream) =
+            TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+        {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let request = format!(
+                "GET /json/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                addr
+            );
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut response = String::new();
+                let mut buf = [0u8; 4096];
+                let read_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if let Some(ws_url) = extract_web_socket_debugger_url(&response) {
+                                return Ok(ws_url);
+                            }
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            if Instant::now() >= read_deadline {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(LaunchError::CdpDiscoveryTimeout);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn extract_web_socket_debugger_url(http_response: &str) -> Option<String> {
+    let key = "webSocketDebuggerUrl";
+    let key_pos = http_response.find(key)?;
+    let after_key = &http_response[key_pos + key.len()..];
+    let ws_start = after_key.find("ws://")?;
+    let value = &after_key[ws_start..];
+    let end = value.find('"').unwrap_or(value.len());
+    Some(value[..end].to_string())
+}
+
+fn write_cdp_endpoint(
+    runtime_dir: &Path,
+    url: &str,
+    target_uid: u32,
+    target_gid: u32,
+) -> Result<(), LaunchError> {
+    let path = runtime_dir.join("cdp-endpoint");
+    fs::write(&path, url).map_err(|e| {
+        LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
+    })?;
+
+    let file = fs::File::open(&path).map_err(|e| {
+        LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
+    })?;
+    use std::os::unix::io::AsRawFd;
+    let ret = unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) };
+    if ret != 0 {
+        return Err(LaunchError::EndpointFileWriteFailed(
+            path.display().to_string(),
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+    let perms = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(&path, perms).map_err(|e| {
+        LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
+    })?;
+    Ok(())
 }
 
 fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
@@ -2092,6 +2300,8 @@ mod tests {
             target_gid: gid,
             daemon_uid: 0,
             daemon_gid: 0,
+            cdp_expose: CdpExposeMode::default(),
+            cdp_port: 0,
         }
     }
 
@@ -3640,6 +3850,8 @@ mod tests {
             target_gid: 1001,
             daemon_uid: 0,
             daemon_gid: 0,
+            cdp_expose: CdpExposeMode::default(),
+            cdp_port: 0,
         };
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -3667,6 +3879,8 @@ mod tests {
             target_gid: 1001,
             daemon_uid: 0,
             daemon_gid: 0,
+            cdp_expose: CdpExposeMode::default(),
+            cdp_port: 0,
         };
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -3738,6 +3952,8 @@ mod tests {
         let mut config = test_config(dir.path());
         config.daemon_uid = my_uid;
         config.daemon_gid = my_uid;
+        config.target_uid = my_uid + 1;
+        config.target_gid = my_uid + 1;
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
         assert!(matches!(result, Err(LaunchError::HardeningFailed(_))));
@@ -4851,5 +5067,169 @@ mod tests {
 
         let exits = mgr.check_exits();
         assert!(exits.is_empty());
+    }
+
+    #[test]
+    fn test_discover_cdp_endpoint_with_mock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_dir = dir.path().join("profile");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("DevToolsActivePort"),
+            "9222\n/devtools/browser/abc-123\n",
+        )
+        .unwrap();
+
+        let result = discover_cdp_endpoint(&profile_dir, Duration::from_secs(1)).unwrap();
+        assert_eq!(result, "ws://127.0.0.1:9222/devtools/browser/abc-123");
+    }
+
+    #[test]
+    fn test_discover_cdp_endpoint_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("no-such-dir");
+
+        let result = discover_cdp_endpoint(&nonexistent, Duration::from_millis(100));
+        assert!(matches!(result, Err(LaunchError::CdpDiscoveryTimeout)));
+    }
+
+    #[test]
+    fn test_build_browser_command_pipe_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: Vec::new(),
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+
+        let cmd = build_browser_command(&config, dir.path()).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.iter().any(|a| a == "--remote-debugging-pipe"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--remote-debugging-port"))
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--remote-debugging-address"))
+        );
+    }
+
+    #[test]
+    fn test_build_browser_command_port_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: Vec::new(),
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Port,
+            cdp_port: 9222,
+        };
+
+        let cmd = build_browser_command(&config, dir.path()).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.iter().any(|a| a == "--remote-debugging-port=9222"));
+        assert!(
+            args.iter()
+                .any(|a| a == "--remote-debugging-address=127.0.0.1")
+        );
+        assert!(!args.iter().any(|a| a == "--remote-debugging-pipe"));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_remote_debugging_port_in_extra_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: vec!["--remote-debugging-port=9999".to_string()],
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+
+        let result = build_browser_command(&config, dir.path());
+        assert!(matches!(result, Err(LaunchError::InvalidArg(_))));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_remote_debugging_pipe_in_extra_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: vec!["--remote-debugging-pipe".to_string()],
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+
+        let result = build_browser_command(&config, dir.path());
+        assert!(matches!(result, Err(LaunchError::InvalidArg(_))));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_remote_debugging_address_in_extra_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: vec!["--remote-debugging-address=0.0.0.0".to_string()],
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+
+        let result = build_browser_command(&config, dir.path());
+        assert!(matches!(result, Err(LaunchError::InvalidArg(_))));
     }
 }

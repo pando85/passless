@@ -650,25 +650,30 @@ pub struct HardenedChildSetup {
 
 impl HardenedChildSetup {
     pub fn validate(&self) -> Result<(), LauncherError> {
-        if self.target_uid == self.daemon_uid {
-            return Err(LauncherError::SameUserFallback);
-        }
-        if self.target_gid == self.daemon_gid {
-            return Err(LauncherError::IdentityMismatch {
-                field: "gid".to_string(),
-                expected: format!("!= {}", self.daemon_gid),
-                got: self.target_gid.to_string(),
-            });
-        }
-        if self.daemon_uid != 0 {
+        if self.daemon_uid == 0 {
+            if self.target_uid == self.daemon_uid {
+                return Err(LauncherError::SameUserFallback);
+            }
+            if self.target_gid == self.daemon_gid {
+                return Err(LauncherError::IdentityMismatch {
+                    field: "gid".to_string(),
+                    expected: format!("!= {}", self.daemon_gid),
+                    got: self.target_gid.to_string(),
+                });
+            }
+        } else if !self.same_user() {
             return Err(LauncherError::PrivilegeInsufficient {
                 detail: format!(
-                    "daemon uid {} is not root; cannot setuid/setgid for child",
-                    self.daemon_uid
+                    "non-root daemon (uid={}) cannot spawn as different user (uid={})",
+                    self.daemon_uid, self.target_uid
                 ),
             });
         }
         Ok(())
+    }
+
+    fn same_user(&self) -> bool {
+        self.target_uid == self.daemon_uid && self.target_gid == self.daemon_gid
     }
 
     /// # Safety
@@ -676,62 +681,64 @@ impl HardenedChildSetup {
     /// Must be called in the forked child before `exec`. `preserved_fds` must
     /// contain only descriptors intentionally transferred to the principal.
     pub unsafe fn apply(&self, preserved_fds: &[RawFd]) -> Result<(), io::Error> {
-        unsafe { close_range_preserving(preserved_fds)? };
+        if !self.same_user() {
+            unsafe { close_range_preserving(preserved_fds)? };
+        }
 
         if unsafe { libc::setsid() } < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        if unsafe { libc::setpgid(0, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        if !self.same_user() {
+            if unsafe { libc::setgroups(0, std::ptr::null()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        if unsafe { libc::setgroups(0, std::ptr::null()) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            if unsafe { libc::setgid(self.target_gid) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        if unsafe { libc::setgid(self.target_gid) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if unsafe { libc::setuid(self.target_uid) } < 0 {
-            return Err(io::Error::last_os_error());
+            if unsafe { libc::setuid(self.target_uid) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        let rlim_nofile = libc::rlimit {
-            rlim_cur: self.rlimit_nofile,
-            rlim_max: self.rlimit_nofile,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        if !self.same_user() {
+            let rlim_nofile = libc::rlimit {
+                rlim_cur: self.rlimit_nofile,
+                rlim_max: self.rlimit_nofile,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        let rlim_nproc = libc::rlimit {
-            rlim_cur: self.rlimit_nproc,
-            rlim_max: self.rlimit_nproc,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            let rlim_nproc = libc::rlimit {
+                rlim_cur: self.rlimit_nproc,
+                rlim_max: self.rlimit_nproc,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        let rlim_core = libc::rlimit {
-            rlim_cur: self.rlimit_core,
-            rlim_max: self.rlimit_core,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim_core) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            let rlim_core = libc::rlimit {
+                rlim_cur: self.rlimit_core,
+                rlim_max: self.rlimit_core,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim_core) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        let rlim_as = libc::rlimit {
-            rlim_cur: self.rlimit_as,
-            rlim_max: self.rlimit_as,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim_as) } < 0 {
-            return Err(io::Error::last_os_error());
+            let rlim_as = libc::rlimit {
+                rlim_cur: self.rlimit_as,
+                rlim_max: self.rlimit_as,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim_as) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         Ok(())
@@ -1134,6 +1141,7 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
 
     let target_uid = setup.target_uid;
     let target_gid = setup.target_gid;
+    let is_same_user = setup.same_user();
 
     let mut cmd = Command::new(&config.program);
     cmd.args(&config.args);
@@ -1157,7 +1165,7 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
                 libc::close(child_fd);
             }
 
-            setup.apply(&[CONTROL_FD])
+            setup.apply(&[0, 1, 2, CONTROL_FD])
         });
     }
 
@@ -1177,7 +1185,12 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
 
     let start_time = read_proc_start_time(child_pid, proc_root).map_err(cleanup_on_failure)?;
     let cgroup_path = read_cgroup_v2_path(child_pid, proc_root).map_err(cleanup_on_failure)?;
-    let ns_inodes = read_namespace_inodes(child_pid, proc_root).map_err(cleanup_on_failure)?;
+    let ns_inodes = match read_namespace_inodes(child_pid, proc_root) {
+        Ok(ns) => ns,
+        Err(_) if is_same_user => read_namespace_inodes(std::process::id() as i32, proc_root)
+            .map_err(cleanup_on_failure)?,
+        Err(e) => return Err(cleanup_on_failure(e)),
+    };
 
     let (actual_uid, actual_gid) =
         read_proc_uid_gid(child_pid, proc_root).map_err(cleanup_on_failure)?;
@@ -2013,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_config_validate_privilege_required() {
+    fn test_spawn_config_validate_non_root_different_target_fails() {
         let mut config = default_spawn_config();
         config.daemon_uid = 1000;
         config.daemon_gid = 1000;
@@ -2155,8 +2168,8 @@ mod tests {
         let config = SpawnConfig {
             program: PathBuf::from("/bin/true"),
             args: vec![],
-            target_uid: 1001,
-            target_gid: 1001,
+            target_uid: my_uid + 1,
+            target_gid: my_uid + 1,
             daemon_uid: my_uid,
             daemon_gid: my_uid,
             rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
@@ -2258,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hardened_child_setup_validate_privilege_required() {
+    fn test_hardened_child_setup_validate_non_root_different_target_fails() {
         let setup = HardenedChildSetup {
             target_uid: 1001,
             target_gid: 1001,
@@ -2393,8 +2406,8 @@ mod tests {
         let config = SpawnConfig {
             program: PathBuf::from("/bin/true"),
             args: vec![],
-            target_uid: 1001,
-            target_gid: 1001,
+            target_uid: my_uid + 1,
+            target_gid: my_uid + 1,
             daemon_uid: my_uid,
             daemon_gid: my_uid,
             rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
@@ -2407,10 +2420,7 @@ mod tests {
         };
 
         let err = spawn_principal(config).unwrap_err();
-        assert!(matches!(
-            err,
-            LauncherError::PrivilegeInsufficient { .. } | LauncherError::SameUserFallback
-        ));
+        assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
     }
 
     #[test]

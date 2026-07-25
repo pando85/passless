@@ -4071,6 +4071,8 @@ mod tests {
                     browser_command: None,
                     browser_user: None,
                     browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
                 },
             );
             AgentConfig {
@@ -5016,6 +5018,8 @@ mod tests {
                         browser_command: None,
                         browser_user: None,
                         browser_runtime_root: None,
+                        browser_cdp_expose: None,
+                        browser_cdp_port: None,
                     },
                 );
                 AgentConfig {
@@ -5667,6 +5671,8 @@ mod tests {
                         browser_command: None,
                         browser_user: None,
                         browser_runtime_root: None,
+                        browser_cdp_expose: None,
+                        browser_cdp_port: None,
                     },
                 );
                 AgentConfig {
