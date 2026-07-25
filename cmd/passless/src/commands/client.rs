@@ -1,6 +1,6 @@
 //! FIDO2 Client Management Commands
 
-use crate::authenticator::CMD_PASSLESS_RESET_UV_RETRIES;
+use crate::authenticator::{CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND};
 
 use std::collections::HashMap;
 
@@ -1471,7 +1471,7 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
                 passless_core::Error::Other(format!("Failed to get PIN token: {:?}", e))
             })?;
 
-        let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, 1];
+        let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
 
         let pin_uv_auth_param = encapsulation
             .authenticate(&auth_data, &pin_token_bytes)
@@ -1485,7 +1485,7 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
 
         // Build authenticated payload
         soft_fido2_ctap::cbor::MapBuilder::new()
-            .insert(1, 1u8)
+            .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
             .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
             .insert(3, pin_uv_auth_protocol)
             .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
@@ -1500,7 +1500,7 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
         }
 
         soft_fido2_ctap::cbor::MapBuilder::new()
-            .insert(1, 1u8)
+            .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
             .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
             .build()
             .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?

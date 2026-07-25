@@ -29,7 +29,7 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
 /// Passless vendor command for resetting built-in UV retries without deleting credentials.
 pub const CMD_PASSLESS_RESET_UV_RETRIES: u8 = 0x42;
 
-const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
+pub const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
 
 fn error_status_byte(error: SoftFido2Error) -> u8 {
     match error {
