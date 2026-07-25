@@ -674,13 +674,11 @@ impl HardenedChildSetup {
     /// Must be called in the forked child before `exec`. `preserved_fds` must
     /// contain only descriptors intentionally transferred to the principal.
     pub unsafe fn apply(&self, preserved_fds: &[RawFd]) -> Result<(), io::Error> {
-        unsafe { close_range_preserving(preserved_fds)? };
-
-        if unsafe { libc::setsid() } < 0 {
-            return Err(io::Error::last_os_error());
+        if !self.same_user() {
+            unsafe { close_range_preserving(preserved_fds)? };
         }
 
-        if unsafe { libc::setpgid(0, 0) } < 0 {
+        if unsafe { libc::setsid() } < 0 {
             return Err(io::Error::last_os_error());
         }
 
@@ -702,36 +700,38 @@ impl HardenedChildSetup {
             return Err(io::Error::last_os_error());
         }
 
-        let rlim_nofile = libc::rlimit {
-            rlim_cur: self.rlimit_nofile,
-            rlim_max: self.rlimit_nofile,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        if !self.same_user() {
+            let rlim_nofile = libc::rlimit {
+                rlim_cur: self.rlimit_nofile,
+                rlim_max: self.rlimit_nofile,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim_nofile) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        let rlim_nproc = libc::rlimit {
-            rlim_cur: self.rlimit_nproc,
-            rlim_max: self.rlimit_nproc,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            let rlim_nproc = libc::rlimit {
+                rlim_cur: self.rlimit_nproc,
+                rlim_max: self.rlimit_nproc,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &rlim_nproc) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        let rlim_core = libc::rlimit {
-            rlim_cur: self.rlimit_core,
-            rlim_max: self.rlimit_core,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim_core) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+            let rlim_core = libc::rlimit {
+                rlim_cur: self.rlimit_core,
+                rlim_max: self.rlimit_core,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim_core) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-        let rlim_as = libc::rlimit {
-            rlim_cur: self.rlimit_as,
-            rlim_max: self.rlimit_as,
-        };
-        if unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim_as) } < 0 {
-            return Err(io::Error::last_os_error());
+            let rlim_as = libc::rlimit {
+                rlim_cur: self.rlimit_as,
+                rlim_max: self.rlimit_as,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim_as) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
 
         Ok(())
