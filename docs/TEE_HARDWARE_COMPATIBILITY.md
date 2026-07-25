@@ -1,246 +1,197 @@
 # TEE Hardware Compatibility Analysis
 
-This document analyzes the compatibility of Trusted Execution Environment (TEE) solutions with Intel Core processors released after 2021, addressing the concerns raised in issue #168.
+This document analyzes the compatibility of Trusted Execution Environment (TEE) solutions with
+Intel Core processors released after 2021, addressing the concerns raised in issue #168.
 
-## Executive Summary
+## Summary
 
-**Critical Finding**: Intel SGX was deprecated starting from 11th generation Intel Core processors (2021 onwards), which significantly impacts the viability of SGX-based TEE solutions for modern consumer hardware.
+Intel SGX was deprecated starting from 11th generation Intel Core processors (2021 onwards), which
+significantly impacts the viability of SGX-based TEE solutions for modern consumer hardware.
 
-### TL;DR
+### Compatibility Overview
 
-| Solution | Works on Post-2021 Intel Core? | Status |
-|----------|-------------------------------|--------|
-| **Gramine (SGX)** | ❌ NO (11th gen+) | Deprecated on consumer CPUs |
-| **Occlum (SGX)** | ❌ NO (11th gen+) | Deprecated on consumer CPUs |
-| **Enarx** | ⚠️ LIMITED | Requires WebAssembly, hardware support varies |
-| **AMD SEV** | ✅ YES | Available on AMD EPYC, not consumer CPUs |
-| **Intel TDX** | ✅ YES | Available on 5th Gen Xeon Scalable (2023+) |
+| Solution | Post-2021 Intel Core | Status |
+|----------|---------------------|--------|
+| **Gramine (SGX)** | No (11th gen+) | Deprecated on consumer CPUs |
+| **Occlum (SGX)** | No (11th gen+) | Deprecated on consumer CPUs |
+| **Enarx** | Limited | Requires WebAssembly; hardware support varies |
+| **AMD SEV** | Yes | Available on AMD EPYC, not consumer CPUs |
+| **Intel TDX** | Yes | Available on 5th Gen Xeon Scalable (2023+) |
 
 ## Intel SGX Deprecation Timeline
 
 ### Affected Processors (SGX Removed)
 
-Intel deprecated SGX on **client platforms** starting with:
+Intel deprecated SGX on client platforms starting with:
 
-- **11th Generation Intel Core** (Rocket Lake, Tiger Lake) - 2021
-- **12th Generation Intel Core** (Alder Lake) - 2021
-- **13th Generation Intel Core** (Raptor Lake) - 2022
-- **14th Generation Intel Core** (Meteor Lake) - 2023
-- **Intel Core Ultra** (200 series) - 2024+
+- **11th Generation Intel Core** (Rocket Lake, Tiger Lake) — 2021
+- **12th Generation Intel Core** (Alder Lake) — 2021
+- **13th Generation Intel Core** (Raptor Lake) — 2022
+- **14th Generation Intel Core** (Meteor Lake) — 2023
+- **Intel Core Ultra** (200 series) — 2024+
 
 ### Still Supported (Server/Enterprise)
 
 Intel SGX remains available on:
+
 - **Intel Xeon Scalable processors** (3rd Gen and newer)
 - **Intel Xeon E-series** (select models)
 
-### Why SGX Was Deprecated
+### Reasons for Deprecation
 
 Intel's pivot away from SGX on consumer processors was driven by:
-1. **Multiple security vulnerabilities** (Foreshadow, Plundervolt, LVI, SGAxe, ÆPIC leak)
-2. **Limited adoption** in consumer applications
-3. **Shift to cloud/enterprise focus** for confidential computing
-4. **Development of newer technologies** (Intel TDX)
+
+1. Multiple security vulnerabilities (Foreshadow, Plundervolt, LVI, SGAxe, AEPI leak)
+2. Limited adoption in consumer applications
+3. Shift to cloud/enterprise focus for confidential computing
+4. Development of newer technologies (Intel TDX)
 
 ## Detailed Solution Analysis
 
 ### 1. Gramine (SGX-based)
 
-**Status**: ❌ Not viable for post-2021 Intel Core processors
+**Status: Not viable for post-2021 Intel Core processors**
 
-**Details**:
-- Gramine is actively maintained
-- Requires Intel SGX hardware support
-- **Cannot run on 11th gen+ Intel Core processors**
-- Still viable for:
-  - Older Intel Core processors (10th gen and earlier)
-  - Intel Xeon server processors
-  - Cloud environments with SGX-enabled instances
+Gramine is actively maintained and requires Intel SGX hardware support. It cannot run on 11th gen+
+Intel Core processors. It remains viable for older Intel Core processors (10th gen and earlier),
+Intel Xeon server processors, and cloud environments with SGX-enabled instances.
 
-**User Experience Impact**:
-- Users with modern Intel Core CPUs (2021+) cannot use Gramine
-- Requires specific hardware that is increasingly rare in consumer market
-- Cloud deployment possible but adds complexity
+Users with modern Intel Core CPUs (2021+) cannot use Gramine. The required hardware is increasingly
+rare in the consumer market. Cloud deployment is possible but adds complexity.
 
-**Recommendation**: **NOT RECOMMENDED** for Passless due to hardware incompatibility with modern consumer processors.
+**Recommendation:** Not recommended for Passless due to hardware incompatibility with modern
+consumer processors.
 
 ### 2. Occlum (SGX-based)
 
-**Status**: ❌ Not viable for post-2021 Intel Core processors
+**Status: Not viable for post-2021 Intel Core processors**
 
-**Details**:
-- Rust-based library OS for SGX enclaves
-- Same hardware limitations as Gramine
-- **Cannot run on 11th gen+ Intel Core processors**
-- Active development but limited to SGX-capable hardware
+Occlum is a Rust-based library OS for SGX enclaves. It shares the same hardware limitations as
+Gramine and cannot run on 11th gen+ Intel Core processors. Despite active development, it is
+limited to SGX-capable hardware.
 
-**User Experience Impact**:
-- Same limitations as Gramine
-- Requires older or server-grade hardware
-- No path forward for users with modern consumer CPUs
-
-**Recommendation**: **NOT RECOMMENDED** for Passless due to hardware incompatibility.
+**Recommendation:** Not recommended for Passless due to hardware incompatibility.
 
 ### 3. Enarx (WebAssembly-based)
 
-**Status**: ⚠️ Limited viability
+**Status: Limited viability**
 
-**Details**:
-- Hardware-architecture independent design
-- Uses WebAssembly runtime
-- Supports multiple TEE backends:
-  - Intel SGX (where available)
-  - AMD SEV (server processors)
-  - Intel TDX (newer Xeon processors)
-- **No releases since 2023** - project appears inactive
+Enarx has a hardware-architecture independent design using a WebAssembly runtime. It supports
+multiple TEE backends: Intel SGX (where available), AMD SEV (server processors), and Intel TDX
+(newer Xeon processors). However, the project has had no releases since 2023 and appears inactive.
 
-**User Experience Impact**:
-- Theoretical hardware compatibility through WebAssembly
-- Requires WebAssembly compilation of Passless
-- Limited backend support on consumer hardware
-- Uncertain project future
+The theoretical hardware compatibility through WebAssembly requires WebAssembly compilation of
+Passless, offers limited backend support on consumer hardware, and has an uncertain project future.
 
-**Recommendation**: **NOT RECOMMENDED** due to project inactivity and WebAssembly overhead.
+**Recommendation:** Not recommended due to project inactivity and WebAssembly overhead.
 
 ### 4. AMD SEV (Secure Encrypted Virtualization)
 
-**Status**: ✅ Available but not on consumer hardware
+**Status: Available but not on consumer hardware**
 
-**Details**:
-- Available on AMD EPYC server processors (Naples, Rome, Milan, Genoa)
-- Provides memory encryption for virtual machines
-- **Not available on AMD Ryzen consumer processors**
-- Requires server-grade hardware
+AMD SEV is available on AMD EPYC server processors (Naples, Rome, Milan, Genoa) and provides memory
+encryption for virtual machines. It is not available on AMD Ryzen consumer processors and requires
+server-grade hardware.
 
-**User Experience Impact**:
-- Not applicable to typical Passless users
-- Server/cloud deployment only
-- Requires AMD EPYC hardware
-
-**Recommendation**: **NOT APPLICABLE** for consumer-focused Passless deployment.
+**Recommendation:** Not applicable for consumer-focused Passless deployment.
 
 ### 5. Intel TDX (Trust Domain Extensions)
 
-**Status**: ✅ Available but not on consumer hardware
+**Status: Available but not on consumer hardware**
 
-**Details**:
-- Successor to SGX for cloud/enterprise workloads
-- Available on 5th Gen Intel Xeon Scalable processors (2023+)
-- Provides VM-level confidential computing
-- **Not available on Intel Core consumer processors**
-- Cloud providers offering TDX instances (Azure, AWS, GCP)
+Intel TDX is the successor to SGX for cloud/enterprise workloads, available on 5th Gen Intel Xeon
+Scalable processors (2023+). It provides VM-level confidential computing but is not available on
+Intel Core consumer processors. Cloud providers offering TDX instances include Azure, AWS, and GCP.
 
-**User Experience Impact**:
-- Not applicable to local Passless deployment
-- Cloud deployment possible
-- Requires specific server hardware or cloud instances
-
-**Recommendation**: **NOT APPLICABLE** for local consumer deployment, but viable for cloud scenarios.
+**Recommendation:** Not applicable for local consumer deployment, but viable for cloud scenarios.
 
 ## Alternative Approaches
 
-Given the hardware limitations, consider these alternatives:
+Given the hardware limitations, the following alternatives are available:
 
 ### 1. Software-Based Security (Current Approach)
 
-**Status**: ✅ Already implemented in Passless
+**Status: Already implemented in Passless**
 
-**Details**:
 - TPM 2.0 backend provides hardware-backed key storage
-- Memory locking (mlockall) prevents swapping
+- Memory locking (`mlockall`) prevents swapping
 - Core dump prevention
 - No new privileges flag
 - [Portable TPM backend](TPM_PORTABLE.md) (experimental): TPM-resident, non-exportable
   signing keys synchronized across devices via a recovery seed. Validated against swtpm;
-  cross-vendor hardware TPM testing is pending (see [interoperability matrix](TPM_PORTABLE.md#interoperability-matrix)).
+  cross-vendor hardware TPM testing is pending (see
+  [interoperability matrix](TPM_PORTABLE.md#interoperability-matrix)).
 
-**Advantages**:
-- Works on all modern hardware
-- No special CPU requirements
-- TPM 2.0 widely available since 2016
-- Minimal user experience impact
+This approach works on all modern hardware with no special CPU requirements. TPM 2.0 has been
+widely available since 2016 and has minimal user experience impact.
 
-**Recommendation**: **KEEP AND ENHANCE** - This is the most practical approach.
+**Recommendation:** Keep and enhance — this is the most practical approach.
 
 ### 2. Enhanced TPM Integration
 
-**Potential Improvements**:
-- Use TPM for more than just credential storage
-- Implement TPM-based attestation
-- Leverage TPM's RNG for cryptographic operations
-- Platform Configuration Registers (PCRs) for boot integrity
+Potential improvements include using the TPM for more than just credential storage, implementing
+TPM-based attestation, leveraging the TPM's RNG for cryptographic operations, and using Platform
+Configuration Registers (PCRs) for boot integrity.
 
-**Already implemented**:
-- [Portable TPM backend](TPM_PORTABLE.md): TPM-resident signing keys portable across devices
-  provisioned from the same recovery seed (experimental, ES256 only).
+The [Portable TPM backend](TPM_PORTABLE.md) already provides TPM-resident signing keys portable
+across devices provisioned from the same recovery seed (experimental, ES256 only).
 
-**Advantages**:
-- Available on all modern systems
-- No special hardware requirements beyond standard TPM
-- Works with post-2021 Intel Core processors
+## Recommendations
 
-## Recommendations for Passless
+### Primary: Continue with TPM 2.0
 
-### Primary Recommendation
+The TPM 2.0 backend should remain the primary security mechanism because it:
 
-**Continue with TPM 2.0 backend as the primary security mechanism.**
+1. Works on all modern hardware, including post-2021 Intel Core processors
+2. Has no special CPU requirements
+3. Is already implemented and tested
+4. Has minimal user experience impact
+5. Provides hardware-backed security without TEE complexity
 
-**Rationale**:
-1. ✅ Works on all modern hardware (including post-2021 Intel Core)
-2. ✅ No special CPU requirements
-3. ✅ Already implemented and tested
-4. ✅ Minimal user experience impact
-5. ✅ Hardware-backed security without TEE complexity
+### Secondary: Do Not Implement SGX-based TEE Solutions
 
-### Secondary Recommendation
+SGX-based solutions (Gramine, Occlum) should not be pursued because they:
 
-**Do NOT implement SGX-based TEE solutions (Gramine, Occlum).**
-
-**Rationale**:
-1. ❌ Incompatible with modern consumer processors
-2. ❌ Requires users to have older or server-grade hardware
-3. ❌ Significant user experience degradation
-4. ❌ Limited security benefit over TPM for this use case
-5. ❌ Adds complexity without broad benefit
+1. Are incompatible with modern consumer processors
+2. Require users to have older or server-grade hardware
+3. Cause significant user experience degradation
+4. Offer limited security benefit over TPM for this use case
+5. Add complexity without broad benefit
 
 ### Future Considerations
 
-**Monitor Intel TDX adoption**:
-- If Intel brings TDX to consumer Core processors, reconsider
-- Cloud deployment scenarios may benefit from TDX
-- Keep architecture flexible for future TEE integration
-
-**Enhance TPM capabilities**:
-- Implement TPM-based attestation
-- Use TPM for secure boot verification
-- Leverage TPM's cryptographic capabilities more extensively
+- **Monitor Intel TDX adoption:** If Intel brings TDX to consumer Core processors, reconsider.
+  Cloud deployment scenarios may benefit from TDX. Keep the architecture flexible for future TEE
+  integration.
+- **Enhance TPM capabilities:** Implement TPM-based attestation, use TPM for secure boot
+  verification, and leverage TPM cryptographic capabilities more extensively.
 
 ## Hardware Compatibility Matrix
 
-| Processor Generation | Release Year | SGX Support | TDX Support | Recommended Backend |
-|---------------------|--------------|-------------|-------------|-------------------|
-| Intel Core 10th gen | 2020 | ✅ Yes | ❌ No | TPM or SGX |
-| Intel Core 11th gen | 2021 | ❌ No | ❌ No | TPM only |
-| Intel Core 12th gen | 2021 | ❌ No | ❌ No | TPM only |
-| Intel Core 13th gen | 2022 | ❌ No | ❌ No | TPM only |
-| Intel Core 14th gen | 2023 | ❌ No | ❌ No | TPM only |
-| Intel Core Ultra | 2024+ | ❌ No | ❌ No | TPM only |
-| Intel Xeon 3rd gen | 2020 | ✅ Yes | ❌ No | TPM or SGX |
-| Intel Xeon 4th gen | 2022 | ✅ Yes | ❌ No | TPM or SGX |
-| Intel Xeon 5th gen | 2023+ | ✅ Yes | ✅ Yes | TPM, SGX, or TDX |
-| AMD Ryzen | All | ❌ No | ❌ No | TPM only |
-| AMD EPYC | All | ❌ No | ❌ No | TPM or SEV |
+| Processor Generation | Release Year | SGX | TDX | Recommended Backend |
+|---------------------|--------------|-----|-----|-------------------|
+| Intel Core 10th gen | 2020 | Yes | No | TPM or SGX |
+| Intel Core 11th gen | 2021 | No | No | TPM only |
+| Intel Core 12th gen | 2021 | No | No | TPM only |
+| Intel Core 13th gen | 2022 | No | No | TPM only |
+| Intel Core 14th gen | 2023 | No | No | TPM only |
+| Intel Core Ultra | 2024+ | No | No | TPM only |
+| Intel Xeon 3rd gen | 2020 | Yes | No | TPM or SGX |
+| Intel Xeon 4th gen | 2022 | Yes | No | TPM or SGX |
+| Intel Xeon 5th gen | 2023+ | Yes | Yes | TPM, SGX, or TDX |
+| AMD Ryzen | All | No | No | TPM only |
+| AMD EPYC | All | No | No | TPM or SEV |
 
 ## Conclusion
 
-The deprecation of Intel SGX on consumer processors after 2021 makes SGX-based TEE solutions (Gramine, Occlum) **impractical for Passless**. The existing TPM 2.0 backend provides strong security guarantees without hardware compatibility issues.
-
-**Final Recommendation**: Stick with TPM 2.0 as the primary security mechanism. It provides hardware-backed security, works on all modern hardware, and maintains the best user experience. Do not pursue SGX-based TEE solutions for this project.
+The deprecation of Intel SGX on consumer processors after 2021 makes SGX-based TEE solutions
+(Gramine, Occlum) impractical for Passless. The existing TPM 2.0 backend provides strong security
+guarantees without hardware compatibility issues and should remain the primary security mechanism.
 
 ## References
 
-- [Intel SGX Wikipedia](https://en.wikipedia.org/wiki/Software_Guard_Extensions)
-- [Intel SGX Deprecation Announcement](https://www.bleepingcomputer.com/news/security/new-intel-chips-wont-play-blu-ray-disks-due-to-sgx-deprecation/)
+- [Intel SGX — Wikipedia](https://en.wikipedia.org/wiki/Software_Guard_Extensions)
+- [Intel SGX Deprecation — BleepingComputer](https://www.bleepingcomputer.com/news/security/new-intel-chips-wont-play-blu-ray-disks-due-to-sgx-deprecation/)
 - [Gramine Project](https://gramineproject.io/)
 - [Enarx Project](https://enarx.dev/)
 - [Occlum Project](https://occlum.io/)
