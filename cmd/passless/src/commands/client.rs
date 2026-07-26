@@ -1,6 +1,6 @@
 //! FIDO2 Client Management Commands
 
-use crate::authenticator::CMD_PASSLESS_RESET_UV_RETRIES;
+use crate::authenticator::{CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND};
 
 use std::collections::HashMap;
 
@@ -1396,29 +1396,11 @@ pub fn pin_change(
     Ok(())
 }
 
-/// Reset built-in user verification retries on authenticator after PIN authentication
+/// Reset built-in user verification retries on authenticator
 pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
     let mut transport = open_authenticator(device)?;
 
-    if output == OutputFormat::Plain {
-        println!("Resetting built-in user verification retries (authenticated)...");
-        println!("Enter PIN: ");
-    }
-
-    let pin = read_password()
-        .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?;
-
-    if pin.is_empty() {
-        return Err(passless_core::Error::Other(
-            "PIN is required for authenticated UV retry reset".to_string(),
-        ));
-    }
-
-    if output == OutputFormat::Plain {
-        println!();
-    }
-
-    // Get authenticator info to determine supported pinUvAuthProtocol
+    // Get authenticator info to determine PIN status
     let info_response = Client::authenticator_get_info(&mut transport).map_err(|e| {
         passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
     })?;
@@ -1430,77 +1412,115 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
 
     let info = parse_authenticator_info(&info_value)?;
 
-    // Determine the preferred pinUvAuthProtocol
-    let pin_uv_auth_protocol = info
-        .pin_uv_auth_protocols
+    let client_pin_set = info
+        .options
         .as_ref()
-        .and_then(|protocols| protocols.last())
-        .copied()
-        .unwrap_or(1); // Default to protocol 1 if none specified
+        .and_then(|opts| opts.get("clientPin").copied())
+        .unwrap_or(false);
 
-    // Get a PIN token for credential management (which has the required permissions)
-    let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(
-        &mut transport,
-        match pin_uv_auth_protocol {
-            1 => soft_fido2::PinProtocol::V1,
-            2 => soft_fido2::PinProtocol::V2,
-            _ => soft_fido2::PinProtocol::V2, // Default to V2 for unknown protocols
-        },
-    )
-    .map_err(|e| {
-        passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e))
-    })?;
+    let payload_bytes = if client_pin_set {
+        // PIN-authenticated flow
+        if output == OutputFormat::Plain {
+            println!("Resetting built-in user verification retries...");
+            println!("Enter PIN: ");
+        }
 
-    let permissions = soft_fido2::request::Permission::CredentialManagement as u8;
-    let pin_token_bytes = encapsulation
-        .get_pin_uv_auth_token_using_pin_with_permissions(&mut transport, &pin, permissions, None)
-        .map_err(|e| passless_core::Error::Other(format!("Failed to get PIN token: {:?}", e)))?;
+        let pin = read_password()
+            .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?;
 
-    // Prepare authentication data for pinUvAuthParam computation
-    // [CMD_PASSLESS_RESET_UV_RETRIES, 1]
-    let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, 1];
+        if pin.is_empty() {
+            return Err(passless_core::Error::Other(
+                "PIN is required for authenticated UV retry reset".to_string(),
+            ));
+        }
 
-    // Compute pinUvAuthParam using the encapsulation's authenticate method
-    let pin_uv_auth_param = encapsulation
-        .authenticate(&auth_data, &pin_token_bytes)
+        if output == OutputFormat::Plain {
+            println!();
+        }
+
+        // Determine the preferred pinUvAuthProtocol
+        let pin_uv_auth_protocol = info
+            .pin_uv_auth_protocols
+            .as_ref()
+            .and_then(|protocols| protocols.last())
+            .copied()
+            .unwrap_or(1);
+
+        // Get a PIN token for credential management
+        let mut encapsulation = soft_fido2::PinUvAuthEncapsulation::new(
+            &mut transport,
+            match pin_uv_auth_protocol {
+                1 => soft_fido2::PinProtocol::V1,
+                2 => soft_fido2::PinProtocol::V2,
+                _ => soft_fido2::PinProtocol::V2,
+            },
+        )
         .map_err(|e| {
-            passless_core::Error::Other(format!("Failed to compute PIN UV auth param: {:?}", e))
+            passless_core::Error::Other(format!("Failed to initialize PIN protocol: {:?}", e))
         })?;
 
-    // Construct CBOR payload: map {1: subCommand=1, 3: pinUvAuthProtocol, 4: pinUvAuthParam}
-    let payload_bytes = soft_fido2_ctap::cbor::MapBuilder::new()
-        .insert(1, 1u8) // subCommand = 1
-        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
-        .insert(3, pin_uv_auth_protocol) // pinUvAuthProtocol
-        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
-        .insert_bytes(4, &pin_uv_auth_param) // pinUvAuthParam
-        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
-        .build()
-        .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?;
+        let permissions = soft_fido2::request::Permission::CredentialManagement as u8;
+        let pin_token_bytes = encapsulation
+            .get_pin_uv_auth_token_using_pin_with_permissions(
+                &mut transport,
+                &pin,
+                permissions,
+                None,
+            )
+            .map_err(|e| {
+                passless_core::Error::Other(format!("Failed to get PIN token: {:?}", e))
+            })?;
 
-    if output == OutputFormat::Plain {
-        println!("Sending authenticated UV retry reset command...");
-    }
+        let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
+
+        let pin_uv_auth_param = encapsulation
+            .authenticate(&auth_data, &pin_token_bytes)
+            .map_err(|e| {
+                passless_core::Error::Other(format!("Failed to compute PIN UV auth param: {:?}", e))
+            })?;
+
+        if output == OutputFormat::Plain {
+            println!("Sending authenticated UV retry reset command...");
+        }
+
+        // Build authenticated payload
+        soft_fido2_ctap::cbor::MapBuilder::new()
+            .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+            .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+            .insert(3, pin_uv_auth_protocol)
+            .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+            .insert_bytes(4, &pin_uv_auth_param)
+            .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+            .build()
+            .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+    } else {
+        // No PIN configured - send unauthenticated reset command
+        if output == OutputFormat::Plain {
+            println!("No PIN configured; resetting UV retries directly...");
+        }
+
+        soft_fido2_ctap::cbor::MapBuilder::new()
+            .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+            .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+            .build()
+            .map_err(|_| passless_core::Error::Other("Failed to build CBOR payload".to_string()))?
+    };
 
     // Send command 0x42 with the CBOR payload
     let response = transport
         .send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &payload_bytes, 30000)
-        .map_err(|e| {
-            passless_core::Error::Other(format!("Authenticated UV retry reset failed: {:?}", e))
-        })?;
+        .map_err(|e| passless_core::Error::Other(format!("UV retry reset failed: {:?}", e)))?;
 
     let success = response == [0xa0] || response.first() == Some(&0x00);
     if !success {
         return Err(passless_core::Error::Other(format!(
-            "Authenticated UV retry reset failed with status: 0x{:02x}",
+            "UV retry reset failed with status: 0x{:02x}",
             response.first().copied().unwrap_or(0xff)
         )));
     }
 
     // Parse the UV retries count from the response if available
     let uv_retries_count = if response.len() > 1 {
-        // Response format: [status, ...cbor_map]
-        // Try to parse the CBOR map to extract the count
         if let Ok(soft_fido2_ctap::cbor::Value::Map(map)) =
             soft_fido2_ctap::cbor::decode::<soft_fido2_ctap::cbor::Value>(&response[1..])
         {
@@ -1528,7 +1548,7 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
                     count
                 );
             } else {
-                println!("UV retries reset successfully (authenticated)!");
+                println!("UV retries reset successfully!");
                 println!("Note: The retry counter has been restored to the configured maximum.");
             }
         }
@@ -1542,11 +1562,7 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
             }
             let result = PinUvResetResult {
                 success: true,
-                message: if uv_retries_count.is_some() {
-                    "UV retries reset successfully".to_string()
-                } else {
-                    "UV retries reset successfully (authenticated)".to_string()
-                },
+                message: "UV retries reset successfully".to_string(),
                 uv_retries: uv_retries_count,
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());

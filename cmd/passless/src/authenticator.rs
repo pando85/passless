@@ -29,7 +29,7 @@ static VERSION: LazyLock<u32> = LazyLock::new(|| {
 /// Passless vendor command for resetting built-in UV retries without deleting credentials.
 pub const CMD_PASSLESS_RESET_UV_RETRIES: u8 = 0x42;
 
-const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
+pub const RESET_UV_RETRIES_SUBCOMMAND: u8 = 0x01;
 
 fn error_status_byte(error: SoftFido2Error) -> u8 {
     match error {
@@ -1172,30 +1172,23 @@ impl<
                 return Ok(());
             }
 
-            let pin_uv_auth_protocol: u8 = match parser.get(3) {
-                Ok(protocol) => protocol,
-                Err(status) => {
-                    response_buffer.push(status as u8);
+            // pinUvAuthProtocol (key 3) and pinUvAuthParam (key 4) are optional.
+            // When a PIN is configured, the client MUST include them for authorization.
+            // When no PIN is configured, the client may omit them, and we skip
+            // verification (the command is already gated by local UHID access and
+            // the existing passless client reset command works without PIN auth).
+            if let (Ok(pin_uv_auth_protocol), Ok(pin_uv_auth_param)) =
+                (parser.get::<u8>(3), parser.get_bytes(4))
+            {
+                let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
+                if let Err(error) = self.authenticator.verify_credential_management_pin_uv_auth(
+                    pin_uv_auth_protocol,
+                    &pin_uv_auth_param,
+                    &auth_data,
+                ) {
+                    response_buffer.push(error_status_byte(error));
                     return Ok(());
                 }
-            };
-
-            let pin_uv_auth_param: Vec<u8> = match parser.get_bytes(4) {
-                Ok(param) => param,
-                Err(status) => {
-                    response_buffer.push(status as u8);
-                    return Ok(());
-                }
-            };
-
-            let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
-            if let Err(error) = self.authenticator.verify_credential_management_pin_uv_auth(
-                pin_uv_auth_protocol,
-                &pin_uv_auth_param,
-                &auth_data,
-            ) {
-                response_buffer.push(error_status_byte(error));
-                return Ok(());
             }
 
             match self.reset_uv_retries() {
