@@ -1562,11 +1562,7 @@ pub fn pin_uv_reset(output: OutputFormat, device: Option<&str>) -> Result<()> {
             }
             let result = PinUvResetResult {
                 success: true,
-                message: if uv_retries_count.is_some() {
-                    "UV retries reset successfully".to_string()
-                } else {
-                    "UV retries reset successfully".to_string()
-                },
+                message: "UV retries reset successfully".to_string(),
                 uv_retries: uv_retries_count,
             };
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
