@@ -1,14 +1,14 @@
-//! Desktop notification handling for user verification
+//! Desktop notification handling for user presence and verification
 //!
 //! This module provides desktop notification support with compatibility for
-//! different notification servers (notify-osd, mako, etc.).
+//! different notification servers (notify-osd, mako, Dunst, etc.).
 
 use std::sync::{Arc, Mutex};
 
 use log::{debug, info, warn};
 use notify_rust::{Notification, Timeout, Urgency};
 
-/// Result of user verification via notification
+/// Result of user interaction via notification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationResult {
     /// User approved the operation
@@ -20,41 +20,101 @@ pub enum NotificationResult {
 /// Result of a yes/no question via notification
 pub type YesNoResult = NotificationResult;
 
-/// Check if the notification server requires special handling
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    UserPresence,
+    UserVerification,
+    YesNo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationActionMode {
+    Explicit,
+    Default,
+    DunstDefault,
+}
+
+impl NotificationActionMode {
+    fn uses_default_action(self) -> bool {
+        matches!(self, Self::Default | Self::DunstDefault)
+    }
+}
+
+/// Determine how actions should be exposed for a notification server.
 ///
-/// Some servers (notify-osd 1.0, mako 0.0.0) don't support action buttons properly
-/// and require using a "default" action instead.
-fn requires_default_action() -> bool {
+/// Legacy compatibility servers use a default action for all prompt types.
+/// Dunst gets that behavior only for CTAP user presence: its actions are
+/// supported but normally invoked through Dunst's interaction model instead
+/// of visible buttons. User verification deliberately keeps explicit actions
+/// so the UP compatibility path cannot silently weaken UV semantics.
+fn action_mode_for_server(
+    server_name: &str,
+    server_version: &str,
+    prompt_kind: PromptKind,
+) -> NotificationActionMode {
+    let server_name = server_name.to_lowercase();
+
+    match (server_name.as_str(), server_version) {
+        ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "") => {
+            NotificationActionMode::Default
+        }
+        ("dunst", _) if prompt_kind == PromptKind::UserPresence => {
+            NotificationActionMode::DunstDefault
+        }
+        _ => NotificationActionMode::Explicit,
+    }
+}
+
+fn notification_action_mode(prompt_kind: PromptKind) -> NotificationActionMode {
     notify_rust::get_server_information()
-        .map(|info| {
-            let server_name = info.name.to_lowercase();
+        .map(|server| {
+            let mode = action_mode_for_server(&server.name, &server.version, prompt_kind);
             debug!(
                 "Notification server: {} (version: {})",
-                info.name, info.version
+                server.name, server.version
             );
 
-            match (server_name.as_str(), info.version.as_str()) {
-                ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "") => {
-                    info!("Detected {} - using default action mode", server_name);
-                    true
+            match mode {
+                NotificationActionMode::Default => {
+                    info!("Detected {} - using default action mode", server.name);
                 }
-                _ => false,
+                NotificationActionMode::DunstDefault => {
+                    info!("Detected Dunst - using UP-specific default action mode");
+                }
+                NotificationActionMode::Explicit => {}
             }
+
+            mode
         })
         .unwrap_or_else(|e| {
             warn!("Failed to get notification server info: {}", e);
-            false
+            NotificationActionMode::Explicit
         })
 }
 
-/// Show a user verification notification and wait for response
-pub fn show_verification_notification(
+fn action_is_accepted(
+    action: &str,
+    affirmative_action: &str,
+    action_mode: NotificationActionMode,
+) -> bool {
+    if action == affirmative_action {
+        return true;
+    }
+
+    action == "default" && action_mode.uses_default_action()
+}
+
+fn show_confirmation_notification(
     operation: &str,
     relying_party: Option<&str>,
     user: Option<&str>,
     timeout_seconds: u32,
+    prompt_kind: PromptKind,
 ) -> Result<NotificationResult, String> {
-    // Build notification message
+    debug_assert!(prompt_kind != PromptKind::YesNo);
+
+    let action_mode = notification_action_mode(prompt_kind);
+
     let mut message = format!("Operation: {}", operation);
     if let Some(rp) = relying_party {
         message.push_str(&format!("\nRelying Party: {}", rp));
@@ -63,40 +123,43 @@ pub fn show_verification_notification(
         message.push_str(&format!("\nUser: {}", user));
     }
 
-    info!("Showing user verification notification");
+    if action_mode == NotificationActionMode::DunstDefault {
+        message.push_str(
+            "\n\nDunst: confirm by invoking this notification's action \
+             (middle-click by default). Closing the notification denies the request.",
+        );
+    }
 
-    // Check if we need to use default action mode
-    let default_means_user_present = requires_default_action();
+    let summary = match prompt_kind {
+        PromptKind::UserPresence => "👆 User Presence Required",
+        PromptKind::UserVerification => "🔒 User Verification Required",
+        PromptKind::YesNo => unreachable!("yes/no prompts use show_yes_no_notification"),
+    };
 
-    // Shared state to capture the action
+    info!("Showing {} notification", summary);
+
     let action_result = Arc::new(Mutex::new(None));
     let action_result_clone = action_result.clone();
 
-    // Build notification with appropriate actions
     let mut notification = Notification::new();
     notification
-        .summary("🔒 User Verification Required")
+        .summary(summary)
         .body(&message)
         .icon("security-high")
         .timeout(Timeout::Milliseconds(timeout_seconds * 1000))
         .urgency(Urgency::Critical);
 
-    if default_means_user_present {
-        // For servers that don't support action buttons properly,
-        // use a single "default" action that accepts on click
+    if action_mode.uses_default_action() {
         notification.action("default", "");
     } else {
-        // For servers with proper action button support
         notification.action("approve", "Accept");
         notification.action("deny", "Deny");
     }
 
-    // Show the notification
     let handle = notification
         .show()
         .map_err(|e| format!("Failed to show notification: {}", e))?;
 
-    // Wait for user action
     handle.wait_for_action(|action| {
         debug!("User action received: {}", action);
         let mut result = action_result_clone
@@ -105,31 +168,61 @@ pub fn show_verification_notification(
         *result = Some(action.to_string());
     });
 
-    // Process the action taken
     let action = action_result
         .lock()
         .expect("Failed to lock action result")
         .clone()
         .unwrap_or_else(|| "__closed".to_string());
 
-    let user_present = match action.as_str() {
-        "approve" => true,
-        "deny" => false,
-        "default" => default_means_user_present,
-        "__closed" => false,
-        other => {
-            debug!("Unknown action '{}' - treating as denied", other);
-            false
-        }
-    };
-
-    if user_present {
-        info!("User verification accepted via notification");
+    if action_is_accepted(&action, "approve", action_mode) {
+        info!("Notification accepted");
         Ok(NotificationResult::Accepted)
     } else {
-        info!("User verification denied or notification closed");
+        if action != "deny" && action != "__closed" {
+            debug!("Unknown action '{}' - treating as denied", action);
+        }
+        info!("Notification denied or closed");
         Ok(NotificationResult::Denied)
     }
+}
+
+/// Show a CTAP user-presence notification and wait for response.
+///
+/// User presence is a consent gesture (for example, touching a hardware key),
+/// so notification activation may be used as the explicit gesture on daemons
+/// such as Dunst that do not expose action buttons directly.
+pub fn show_user_presence_notification(
+    operation: &str,
+    relying_party: Option<&str>,
+    user: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<NotificationResult, String> {
+    show_confirmation_notification(
+        operation,
+        relying_party,
+        user,
+        timeout_seconds,
+        PromptKind::UserPresence,
+    )
+}
+
+/// Show a user-verification notification and wait for response.
+///
+/// Unlike user presence, Dunst activation is not treated as verification: the
+/// user must invoke the explicit Accept action through Dunst's action UI.
+pub fn show_verification_notification(
+    operation: &str,
+    relying_party: Option<&str>,
+    user: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<NotificationResult, String> {
+    show_confirmation_notification(
+        operation,
+        relying_party,
+        user,
+        timeout_seconds,
+        PromptKind::UserVerification,
+    )
 }
 
 /// Show a yes/no question notification and wait for response
@@ -145,37 +238,30 @@ pub fn show_verification_notification(
 pub fn show_yes_no_notification(title: &str, question: &str) -> Result<YesNoResult, String> {
     info!("Showing yes/no notification: {}", title);
 
-    // Check if we need to use default action mode
-    let default_means_yes = requires_default_action();
+    let action_mode = notification_action_mode(PromptKind::YesNo);
 
-    // Shared state to capture the action
     let action_result = Arc::new(Mutex::new(None));
     let action_result_clone = action_result.clone();
 
-    // Build notification with appropriate actions
     let mut notification = Notification::new();
     notification
         .summary(title)
         .body(question)
         .icon("dialog-question")
-        .timeout(Timeout::Never) // Wait for user action
+        .timeout(Timeout::Never)
         .urgency(Urgency::Critical);
 
-    if default_means_yes {
-        // For servers that don't support action buttons properly
+    if action_mode.uses_default_action() {
         notification.action("default", "");
     } else {
-        // For servers with proper action button support
         notification.action("yes", "Yes");
         notification.action("no", "No");
     }
 
-    // Show the notification
     let handle = notification
         .show()
         .map_err(|e| format!("Failed to show notification: {}", e))?;
 
-    // Wait for user action
     handle.wait_for_action(|action| {
         debug!("User action received: {}", action);
         let mut result = action_result_clone
@@ -184,28 +270,19 @@ pub fn show_yes_no_notification(title: &str, question: &str) -> Result<YesNoResu
         *result = Some(action.to_string());
     });
 
-    // Process the action taken
     let action = action_result
         .lock()
         .expect("Failed to lock action result")
         .clone()
         .unwrap_or_else(|| "__closed".to_string());
 
-    let user_said_yes = match action.as_str() {
-        "yes" => true,
-        "no" => false,
-        "default" => default_means_yes,
-        "__closed" => false,
-        other => {
-            debug!("Unknown action '{}' - treating as no", other);
-            false
-        }
-    };
-
-    if user_said_yes {
+    if action_is_accepted(&action, "yes", action_mode) {
         info!("User answered yes");
         Ok(YesNoResult::Accepted)
     } else {
+        if action != "no" && action != "__closed" {
+            debug!("Unknown action '{}' - treating as no", action);
+        }
         info!("User answered no or closed notification");
         Ok(YesNoResult::Denied)
     }
@@ -271,8 +348,89 @@ mod tests {
     }
 
     #[test]
-    fn test_requires_default_action_doesnt_panic() {
-        // Just ensure the function doesn't panic
-        let _ = requires_default_action();
+    fn test_dunst_default_action_is_up_only() {
+        assert_eq!(
+            action_mode_for_server("dunst", "1.13.0", PromptKind::UserPresence),
+            NotificationActionMode::DunstDefault
+        );
+        assert_eq!(
+            action_mode_for_server("Dunst", "1.13.0", PromptKind::UserPresence),
+            NotificationActionMode::DunstDefault
+        );
+        assert_eq!(
+            action_mode_for_server("dunst", "1.13.0", PromptKind::UserVerification),
+            NotificationActionMode::Explicit
+        );
+        assert_eq!(
+            action_mode_for_server("dunst", "1.13.0", PromptKind::YesNo),
+            NotificationActionMode::Explicit
+        );
+    }
+
+    #[test]
+    fn test_legacy_default_action_servers_are_preserved() {
+        for (name, version) in [
+            ("notify-osd", "1.0"),
+            ("mako", "0.0.0"),
+            ("quickshell", ""),
+        ] {
+            for prompt_kind in [
+                PromptKind::UserPresence,
+                PromptKind::UserVerification,
+                PromptKind::YesNo,
+            ] {
+                assert_eq!(
+                    action_mode_for_server(name, version, prompt_kind),
+                    NotificationActionMode::Default
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unknown_servers_use_explicit_actions() {
+        assert_eq!(
+            action_mode_for_server("gnome-shell", "47", PromptKind::UserPresence),
+            NotificationActionMode::Explicit
+        );
+    }
+
+    #[test]
+    fn test_default_action_acceptance_is_mode_specific() {
+        assert!(action_is_accepted(
+            "default",
+            "approve",
+            NotificationActionMode::DunstDefault
+        ));
+        assert!(action_is_accepted(
+            "default",
+            "approve",
+            NotificationActionMode::Default
+        ));
+        assert!(!action_is_accepted(
+            "default",
+            "approve",
+            NotificationActionMode::Explicit
+        ));
+        assert!(action_is_accepted(
+            "approve",
+            "approve",
+            NotificationActionMode::Explicit
+        ));
+        assert!(!action_is_accepted(
+            "deny",
+            "approve",
+            NotificationActionMode::DunstDefault
+        ));
+        assert!(!action_is_accepted(
+            "__closed",
+            "approve",
+            NotificationActionMode::DunstDefault
+        ));
+    }
+
+    #[test]
+    fn test_notification_action_mode_doesnt_panic() {
+        let _ = notification_action_mode(PromptKind::UserPresence);
     }
 }
