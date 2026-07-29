@@ -1,6 +1,6 @@
 #[cfg(feature = "agent")]
 use crate::agent::interaction::{AgentInteractionManager, action_from_info};
-use crate::notification::show_verification_notification;
+use crate::notification::{show_user_presence_notification, show_verification_notification};
 use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
 use crate::util::bytes_to_hex;
@@ -265,7 +265,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             return Ok(UpResult::Accepted);
         }
 
-        match show_verification_notification(
+        match show_user_presence_notification(
             info,
             Some(rp),
             user,
@@ -557,7 +557,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         };
 
         let count = storage.count_credentials();
-        debug!("Total credentials: {}", count);
+        debug!("Total credentials found: {}", count);
         Ok(count)
     }
 
