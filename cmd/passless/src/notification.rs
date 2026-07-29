@@ -369,11 +369,7 @@ mod tests {
 
     #[test]
     fn test_legacy_default_action_servers_are_preserved() {
-        for (name, version) in [
-            ("notify-osd", "1.0"),
-            ("mako", "0.0.0"),
-            ("quickshell", ""),
-        ] {
+        for (name, version) in [("notify-osd", "1.0"), ("mako", "0.0.0"), ("quickshell", "")] {
             for prompt_kind in [
                 PromptKind::UserPresence,
                 PromptKind::UserVerification,
