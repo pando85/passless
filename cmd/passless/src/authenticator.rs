@@ -428,9 +428,13 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                 debug!("Credential found");
                 Ok(Some(cred))
             }
-            Err(_) => {
+            Err(soft_fido2::Error::DoesNotExist) => {
                 debug!("Credential not found");
                 Ok(None)
+            }
+            Err(e) => {
+                error!("Storage error reading credential: {:?}", e);
+                Err(e)
             }
         }
     }
@@ -563,9 +567,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
     fn get_timestamp_ms(&self) -> u64 {
         let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+        let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap_or_default();
         since_the_epoch.as_millis() as u64
     }
 }
@@ -1225,8 +1227,10 @@ impl<
 
     /// Get storage information
     pub fn storage_info(&self) -> String {
-        let storage = self.storage.lock().unwrap();
-        format!("Credentials in storage: {}", storage.count_credentials())
+        match self.storage.lock() {
+            Ok(storage) => format!("Credentials in storage: {}", storage.count_credentials()),
+            Err(_) => "Failed to acquire storage lock".to_string(),
+        }
     }
 
     /// Register a custom CTAP command handler
