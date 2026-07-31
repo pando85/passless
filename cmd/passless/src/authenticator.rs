@@ -567,9 +567,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
     fn get_timestamp_ms(&self) -> u64 {
         let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
+        let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap_or_default();
         since_the_epoch.as_millis() as u64
     }
 }
