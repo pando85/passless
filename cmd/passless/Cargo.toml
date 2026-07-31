@@ -50,6 +50,7 @@ zeroize.workspace = true
 hex.workspace = true
 shadow-rs.workspace = true
 dirs.workspace = true
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 hmac = "0.13"
 rpassword = "7.3"
 atty = "0.2"
