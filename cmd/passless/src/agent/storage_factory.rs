@@ -1147,6 +1147,7 @@ mod tests {
             created: 1000,
             discoverable: true,
             extensions: soft_fido2::Extensions::default(),
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
         }
     }
 
@@ -1177,6 +1178,7 @@ mod tests {
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
                 cred_random: None,
+                backup_state: &cred.backup_state,
             };
             h.write(cred_ref).unwrap();
             assert_eq!(h.count_credentials(), 1);
@@ -1245,6 +1247,7 @@ mod tests {
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
                 cred_random: None,
+                backup_state: &cred.backup_state,
             };
             h.write(cred_ref).unwrap();
         }
@@ -1284,6 +1287,7 @@ mod tests {
             discoverable: &regressed.discoverable,
             cred_protect: regressed.extensions.cred_protect.as_ref(),
             cred_random: None,
+            backup_state: &regressed.backup_state,
         };
         let result = delegated.write(regressed_ref);
         assert!(result.is_err());
@@ -1304,6 +1308,7 @@ mod tests {
             discoverable: &same.discoverable,
             cred_protect: same.extensions.cred_protect.as_ref(),
             cred_random: None,
+            backup_state: &same.backup_state,
         };
         let result = delegated.write(same_ref);
         assert!(result.is_err());
@@ -1324,6 +1329,7 @@ mod tests {
             discoverable: &advanced.discoverable,
             cred_protect: advanced.extensions.cred_protect.as_ref(),
             cred_random: None,
+            backup_state: &advanced.backup_state,
         };
         let result = delegated.write(advanced_ref);
         assert!(result.is_ok());
@@ -1364,6 +1370,7 @@ mod tests {
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
                 cred_random: None,
+                backup_state: &cred.backup_state,
             }
         }
 

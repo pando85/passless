@@ -2,6 +2,7 @@
 pub mod agent;
 mod authenticator;
 mod commands;
+mod credential_backup;
 mod instance_lock;
 mod notification;
 mod pin_storage;
@@ -286,6 +287,30 @@ fn run() -> Result<()> {
                     credential_id,
                     user_name.as_deref(),
                     display_name.as_deref(),
+                ),
+                ClientAction::Backup {
+                    credential_id,
+                    recipient,
+                    output_file,
+                    confirm,
+                } => commands::client::credential_backup(
+                    *output,
+                    device.as_deref(),
+                    credential_id,
+                    recipient,
+                    output_file,
+                    *confirm,
+                ),
+                ClientAction::Restore {
+                    input_file,
+                    replace,
+                    confirm,
+                } => commands::client::credential_restore(
+                    *output,
+                    device.as_deref(),
+                    input_file,
+                    *replace,
+                    *confirm,
                 ),
                 ClientAction::Pin { action } => match action {
                     PinAction::Set { pin } => {

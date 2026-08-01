@@ -1,8 +1,16 @@
 //! FIDO2 Client Management Commands
 
 use crate::authenticator::{CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND};
+use crate::credential_backup::{
+    BACKUP_COMMIT_SUBCOMMAND, BACKUP_PREPARE_SUBCOMMAND, CMD_PASSLESS_BACKUP, CMD_PASSLESS_RESTORE,
+    MAX_BACKUP_BUNDLE_SIZE, backup_commit_auth_data, backup_prepare_auth_data, restore_auth_data,
+};
 
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use passless_core::{OutputFormat, Result};
 
@@ -1227,6 +1235,268 @@ pub fn rename(
     }
 
     transport.close();
+    Ok(())
+}
+
+fn vendor_pin_uv_auth(
+    transport: &mut Transport,
+    output: OutputFormat,
+    auth_data: &[u8],
+) -> Result<(u8, Vec<u8>)> {
+    let token = authenticate_for_credential_management(transport, output)?;
+    let protocol = token.protocol_u8();
+    let pin_protocol = match protocol {
+        1 => PinProtocol::V1,
+        _ => PinProtocol::V2,
+    };
+    let encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(transport, pin_protocol).map_err(|error| {
+            passless_core::Error::Other(format!(
+                "Failed to initialize PIN/UV authentication: {:?}",
+                error
+            ))
+        })?;
+    let param = encapsulation
+        .authenticate(auth_data, token.param())
+        .map_err(|error| {
+            passless_core::Error::Other(format!(
+                "Failed to authenticate credential backup request: {:?}",
+                error
+            ))
+        })?;
+    Ok((protocol, param))
+}
+
+fn vendor_response_payload<'a>(response: &'a [u8], operation: &str) -> Result<&'a [u8]> {
+    if response.is_empty() {
+        return Err(passless_core::Error::Other(format!(
+            "{} returned an empty response",
+            operation
+        )));
+    }
+    if response[0] == soft_fido2::StatusCode::Success as u8 {
+        return Ok(&response[1..]);
+    }
+    if response[0] & 0xe0 == 0xa0 {
+        return Ok(response);
+    }
+    Err(passless_core::Error::Other(format!(
+        "{} failed with CTAP status 0x{:02x}",
+        operation, response[0]
+    )))
+}
+
+fn atomic_write_backup(path: &Path, data: &[u8]) -> Result<()> {
+    if path.exists() {
+        return Err(passless_core::Error::Other(format!(
+            "Refusing to overwrite existing backup file: {}",
+            path.display()
+        )));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(passless_core::Error::Other(format!(
+            "Backup destination directory does not exist: {}",
+            parent.display()
+        )));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            passless_core::Error::Other("Invalid backup destination filename".to_string())
+        })?;
+    let temp_path = parent.join(format!(
+        ".{}.passless-tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result.map_err(|error| {
+        passless_core::Error::Other(format!("Failed to write backup atomically: {}", error))
+    })
+}
+
+fn read_backup(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path).map_err(|error| {
+        passless_core::Error::Other(format!(
+            "Failed to open backup file {}: {}",
+            path.display(),
+            error
+        ))
+    })?;
+    let mut bundle = Vec::new();
+    file.take((MAX_BACKUP_BUNDLE_SIZE + 1) as u64)
+        .read_to_end(&mut bundle)
+        .map_err(|error| {
+            passless_core::Error::Other(format!("Failed to read backup file: {}", error))
+        })?;
+    if bundle.is_empty() || bundle.len() > MAX_BACKUP_BUNDLE_SIZE {
+        return Err(passless_core::Error::Other(format!(
+            "Invalid backup size: {} bytes",
+            bundle.len()
+        )));
+    }
+    Ok(bundle)
+}
+
+pub fn credential_backup(
+    output: OutputFormat,
+    device: Option<&str>,
+    credential_id_hex: &str,
+    recipient: &str,
+    output_file: &PathBuf,
+    confirm: bool,
+) -> Result<()> {
+    if !confirm {
+        return Err(passless_core::Error::Other(
+            "Credential export requires --yes-i-understand-this-exports-a-passkey".to_string(),
+        ));
+    }
+    let credential_id = hex::decode(credential_id_hex).map_err(|error| {
+        passless_core::Error::Other(format!("Invalid credential ID hex: {:?}", error))
+    })?;
+    let mut transport = open_authenticator(device)?;
+
+    let prepare_auth_data = backup_prepare_auth_data(&credential_id, recipient);
+    let (protocol, auth_param) = vendor_pin_uv_auth(&mut transport, output, &prepare_auth_data)?;
+    let request = soft_fido2_ctap::cbor::MapBuilder::new()
+        .insert(1, BACKUP_PREPARE_SUBCOMMAND)
+        .and_then(|builder| builder.insert_bytes(2, &credential_id))
+        .and_then(|builder| builder.insert(3, recipient))
+        .and_then(|builder| builder.insert(4, protocol))
+        .and_then(|builder| builder.insert_bytes(5, &auth_param))
+        .and_then(|builder| builder.build())
+        .map_err(|_| passless_core::Error::Other("Failed to encode backup request".to_string()))?;
+    let response = transport
+        .send_ctap_command(CMD_PASSLESS_BACKUP, &request, 30_000)
+        .map_err(|error| {
+            passless_core::Error::Other(format!("Credential backup failed: {:?}", error))
+        })?;
+    let payload = vendor_response_payload(&response, "Credential backup prepare")?;
+    let parser = soft_fido2_ctap::cbor::MapParser::from_bytes(payload).map_err(|status| {
+        passless_core::Error::Other(format!("Invalid backup response: {:?}", status))
+    })?;
+    let bundle = parser.get_bytes(1).map_err(|status| {
+        passless_core::Error::Other(format!("Backup response omitted bundle: {:?}", status))
+    })?;
+    let token = parser.get_bytes(2).map_err(|status| {
+        passless_core::Error::Other(format!("Backup response omitted token: {:?}", status))
+    })?;
+    atomic_write_backup(output_file, &bundle)?;
+
+    let commit_auth_data = backup_commit_auth_data(&credential_id, &token);
+    let (protocol, auth_param) = vendor_pin_uv_auth(&mut transport, output, &commit_auth_data)?;
+    let commit_request = soft_fido2_ctap::cbor::MapBuilder::new()
+        .insert(1, BACKUP_COMMIT_SUBCOMMAND)
+        .and_then(|builder| builder.insert_bytes(2, &credential_id))
+        .and_then(|builder| builder.insert_bytes(3, &token))
+        .and_then(|builder| builder.insert(4, protocol))
+        .and_then(|builder| builder.insert_bytes(5, &auth_param))
+        .and_then(|builder| builder.build())
+        .map_err(|_| passless_core::Error::Other("Failed to encode backup commit".to_string()))?;
+    let commit_response = transport
+        .send_ctap_command(CMD_PASSLESS_BACKUP, &commit_request, 30_000)
+        .map_err(|error| {
+            passless_core::Error::Other(format!(
+                "Backup was written to {}, but authenticator finalization failed: {:?}",
+                output_file.display(),
+                error
+            ))
+        })?;
+    vendor_response_payload(&commit_response, "Credential backup commit")?;
+    transport.close();
+
+    match output {
+        OutputFormat::Plain => println!(
+            "Credential backed up successfully to {}. Backup state is now BE=1, BS=1.",
+            output_file.display()
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "credential_id": credential_id_hex,
+                "path": output_file,
+                "backup_eligible": true,
+                "backed_up": true
+            })
+        ),
+    }
+    Ok(())
+}
+
+pub fn credential_restore(
+    output: OutputFormat,
+    device: Option<&str>,
+    input_file: &Path,
+    replace: bool,
+    confirm: bool,
+) -> Result<()> {
+    if !confirm {
+        return Err(passless_core::Error::Other(
+            "Credential restore requires --yes-i-understand-this-restores-a-passkey".to_string(),
+        ));
+    }
+    let bundle = read_backup(input_file)?;
+    let mut transport = open_authenticator(device)?;
+    let auth_data = restore_auth_data(&bundle, replace);
+    let (protocol, auth_param) = vendor_pin_uv_auth(&mut transport, output, &auth_data)?;
+    let request = soft_fido2_ctap::cbor::MapBuilder::new()
+        .insert_bytes(1, &bundle)
+        .and_then(|builder| builder.insert(2, replace))
+        .and_then(|builder| builder.insert(3, protocol))
+        .and_then(|builder| builder.insert_bytes(4, &auth_param))
+        .and_then(|builder| builder.build())
+        .map_err(|_| passless_core::Error::Other("Failed to encode restore request".to_string()))?;
+    let response = transport
+        .send_ctap_command(CMD_PASSLESS_RESTORE, &request, 30_000)
+        .map_err(|error| {
+            passless_core::Error::Other(format!("Credential restore failed: {:?}", error))
+        })?;
+    let payload = vendor_response_payload(&response, "Credential restore")?;
+    let parser = soft_fido2_ctap::cbor::MapParser::from_bytes(payload).map_err(|status| {
+        passless_core::Error::Other(format!("Invalid restore response: {:?}", status))
+    })?;
+    let credential_id = parser.get_bytes(1).map_err(|status| {
+        passless_core::Error::Other(format!(
+            "Restore response omitted credential ID: {:?}",
+            status
+        ))
+    })?;
+    transport.close();
+
+    match output {
+        OutputFormat::Plain => println!(
+            "Credential {} restored successfully with BE=1, BS=1.",
+            hex::encode(&credential_id)
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "credential_id": hex::encode(&credential_id),
+                "replaced": replace,
+                "backup_eligible": true,
+                "backed_up": true
+            })
+        ),
+    }
     Ok(())
 }
 

@@ -1,5 +1,10 @@
 #[cfg(feature = "agent")]
 use crate::agent::interaction::{AgentInteractionManager, action_from_info};
+use crate::credential_backup::{
+    BACKUP_COMMIT_SUBCOMMAND, BACKUP_PREPARE_SUBCOMMAND, BackupError, CMD_PASSLESS_BACKUP,
+    CMD_PASSLESS_RESTORE, backup_commit_auth_data, backup_prepare_auth_data, bundle_token,
+    decrypt_credential, encrypt_credential, restore_auth_data,
+};
 use crate::notification::{show_user_presence_notification, show_verification_notification};
 use crate::pin_storage::PinStorage;
 use crate::storage::{CredentialFilter, CredentialStorage};
@@ -9,10 +14,12 @@ use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
 
 use soft_fido2::{
     Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
-    CredentialKeyProvider, CredentialRef, CtapCommand, Error as SoftFido2Error, PinState, Result,
-    SoftwareCredentialKeyProvider, StatusCode, UpResult, UvResult,
+    CredentialBackupState, CredentialKeyProvider, CredentialRef, CtapCommand,
+    Error as SoftFido2Error, PinState, Result, SoftwareCredentialKeyProvider, StatusCode, UpResult,
+    UvResult,
 };
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -614,6 +621,12 @@ pub struct AuthenticatorService<
     pub storage: Arc<Mutex<S>>,
     /// Maximum UV retries (configured value)
     max_uv_retries: u8,
+    /// Runtime feature gate for credential export/import.
+    credential_backup_enabled: bool,
+    /// False for TPM and other non-exportable key providers.
+    credential_backup_supported: bool,
+    /// Prepared bundles awaiting durable client-side persistence confirmation.
+    pending_backups: HashMap<Vec<u8>, [u8; 32]>,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, (), SoftwareCredentialKeyProvider> {
@@ -683,6 +696,11 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                 .extensions(vec!["credProtect".to_string()])
                 .firmware_version(*VERSION)
                 .constant_sign_count(security_config.constant_signature_counter)
+                .default_credential_backup_state(if security_config.enable_credential_backup {
+                    CredentialBackupState::Eligible
+                } else {
+                    CredentialBackupState::NotEligible
+                })
                 .algorithms(vec![-7])
                 .max_pin_retries(pin_config.max_retries)
                 .auto_lock_timeout(pin_config.auto_lock_timeout)
@@ -774,6 +792,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
+            .default_credential_backup_state(CredentialBackupState::NotEligible)
             .algorithms(vec![-7])
             .max_pin_retries(pin_config.max_retries)
             .auto_lock_timeout(pin_config.auto_lock_timeout)
@@ -846,6 +865,9 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             authenticator,
             storage,
             max_uv_retries: pin_config.max_uv_retries,
+            credential_backup_enabled: security_config.enable_credential_backup,
+            credential_backup_supported: true,
+            pending_backups: HashMap::new(),
         })
     }
 
@@ -876,6 +898,9 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             authenticator,
             storage,
             max_uv_retries: pin_config.max_uv_retries,
+            credential_backup_enabled: security_config.enable_credential_backup,
+            credential_backup_supported: true,
+            pending_backups: HashMap::new(),
         })
     }
 }
@@ -940,6 +965,11 @@ impl<
                 .extensions(vec!["credProtect".to_string()])
                 .firmware_version(*VERSION)
                 .constant_sign_count(security_config.constant_signature_counter)
+                .default_credential_backup_state(if security_config.enable_credential_backup {
+                    CredentialBackupState::Eligible
+                } else {
+                    CredentialBackupState::NotEligible
+                })
                 .algorithms(vec![-7])
                 .max_pin_retries(pin_config.max_retries)
                 .auto_lock_timeout(pin_config.auto_lock_timeout)
@@ -1032,6 +1062,7 @@ impl<
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
+            .default_credential_backup_state(CredentialBackupState::NotEligible)
             .algorithms(vec![-7])
             .max_pin_retries(pin_config.max_retries)
             .auto_lock_timeout(pin_config.auto_lock_timeout)
@@ -1111,6 +1142,9 @@ impl<
             authenticator,
             storage,
             max_uv_retries: pin_config.max_uv_retries,
+            credential_backup_enabled: false,
+            credential_backup_supported: false,
+            pending_backups: HashMap::new(),
         })
     }
 
@@ -1136,6 +1170,9 @@ impl<
             authenticator,
             storage,
             max_uv_retries: pin_config.max_uv_retries,
+            credential_backup_enabled: false,
+            credential_backup_supported: false,
+            pending_backups: HashMap::new(),
         })
     }
 
@@ -1147,8 +1184,319 @@ impl<
         Ok(())
     }
 
+    fn backup_error_status(error: BackupError) -> StatusCode {
+        match error {
+            BackupError::InvalidInput => StatusCode::InvalidParameter,
+            BackupError::InvalidBundle => StatusCode::InvalidCredential,
+            BackupError::UnsupportedCredential => StatusCode::UnsupportedOption,
+            BackupError::CryptoUnavailable | BackupError::CryptoFailed => {
+                StatusCode::IntegrityFailure
+            }
+            BackupError::TooLarge => StatusCode::RequestTooLarge,
+        }
+    }
+
+    fn credential_ref(credential: &Credential) -> CredentialRef<'_> {
+        CredentialRef {
+            id: &credential.id,
+            rp_id: &credential.rp.id,
+            rp_name: credential.rp.name.as_deref(),
+            user_id: &credential.user.id,
+            user_name: credential.user.name.as_deref(),
+            user_display_name: credential.user.display_name.as_deref(),
+            sign_count: &credential.sign_count,
+            alg: &credential.alg,
+            key: &credential.key,
+            created: &credential.created,
+            discoverable: &credential.discoverable,
+            cred_protect: credential.extensions.cred_protect.as_ref(),
+            backup_state: &credential.backup_state,
+            cred_random: credential.extensions.cred_random.as_ref(),
+        }
+    }
+
+    fn verify_backup_authorization(
+        &mut self,
+        protocol: u8,
+        param: &[u8],
+        auth_data: &[u8],
+    ) -> core::result::Result<(), u8> {
+        self.authenticator
+            .verify_credential_management_pin_uv_auth(protocol, param, auth_data)
+            .map_err(error_status_byte)
+    }
+
+    fn handle_backup_command(&mut self, payload: &[u8], response: &mut Vec<u8>) {
+        response.clear();
+        if !self.credential_backup_enabled || !self.credential_backup_supported {
+            response.push(StatusCode::UnsupportedOption as u8);
+            return;
+        }
+
+        let parser = match soft_fido2_ctap::cbor::MapParser::from_bytes(payload) {
+            Ok(parser) => parser,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+        let subcommand: u8 = match parser.get(1) {
+            Ok(value) => value,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+
+        match subcommand {
+            BACKUP_PREPARE_SUBCOMMAND => {
+                let credential_id = match parser.get_bytes(2) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let recipient: String = match parser.get(3) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let protocol: u8 = match parser.get(4) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let param = match parser.get_bytes(5) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let auth_data = backup_prepare_auth_data(&credential_id, &recipient);
+                if let Err(status) = self.verify_backup_authorization(protocol, &param, &auth_data)
+                {
+                    response.push(status);
+                    return;
+                }
+
+                let mut credential = {
+                    let mut storage = match self.storage.lock() {
+                        Ok(storage) => storage,
+                        Err(_) => {
+                            response.push(StatusCode::Other as u8);
+                            return;
+                        }
+                    };
+                    match storage.read(&credential_id) {
+                        Ok(credential) => credential,
+                        Err(soft_fido2::Error::DoesNotExist) => {
+                            response.push(StatusCode::NoCredentials as u8);
+                            return;
+                        }
+                        Err(_) => {
+                            response.push(StatusCode::Other as u8);
+                            return;
+                        }
+                    }
+                };
+                credential.backup_state = CredentialBackupState::BackedUp;
+                let bundle = match encrypt_credential(&credential, &recipient) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        response.push(Self::backup_error_status(error) as u8);
+                        return;
+                    }
+                };
+                let token = bundle_token(&bundle);
+                self.pending_backups.insert(credential_id, token);
+
+                match soft_fido2_ctap::cbor::MapBuilder::new()
+                    .insert_bytes(1, &bundle)
+                    .and_then(|builder| builder.insert_bytes(2, &token))
+                    .and_then(|builder| builder.build())
+                {
+                    Ok(body) => {
+                        response.push(StatusCode::Success as u8);
+                        response.extend_from_slice(&body);
+                    }
+                    Err(_) => response.push(StatusCode::Other as u8),
+                }
+            }
+            BACKUP_COMMIT_SUBCOMMAND => {
+                let credential_id = match parser.get_bytes(2) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let token = match parser.get_bytes(3) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let protocol: u8 = match parser.get(4) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let param = match parser.get_bytes(5) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        response.push(status as u8);
+                        return;
+                    }
+                };
+                let auth_data = backup_commit_auth_data(&credential_id, &token);
+                if let Err(status) = self.verify_backup_authorization(protocol, &param, &auth_data)
+                {
+                    response.push(status);
+                    return;
+                }
+                if token.len() != 32
+                    || self
+                        .pending_backups
+                        .get(&credential_id)
+                        .map(|expected| expected.as_slice())
+                        != Some(token.as_slice())
+                {
+                    response.push(StatusCode::IntegrityFailure as u8);
+                    return;
+                }
+
+                let result = (|| -> Result<()> {
+                    let mut storage = self.storage.lock().map_err(|_| soft_fido2::Error::Other)?;
+                    let mut credential = storage.read(&credential_id)?;
+                    credential.backup_state = CredentialBackupState::BackedUp;
+                    storage.write(Self::credential_ref(&credential))
+                })();
+                match result {
+                    Ok(()) => {
+                        self.pending_backups.remove(&credential_id);
+                        response.push(StatusCode::Success as u8);
+                        response.push(0xa0);
+                    }
+                    Err(soft_fido2::Error::DoesNotExist) => {
+                        response.push(StatusCode::NoCredentials as u8)
+                    }
+                    Err(_) => response.push(StatusCode::Other as u8),
+                }
+            }
+            _ => response.push(StatusCode::InvalidSubcommand as u8),
+        }
+    }
+
+    fn handle_restore_command(&mut self, payload: &[u8], response: &mut Vec<u8>) {
+        response.clear();
+        if !self.credential_backup_enabled || !self.credential_backup_supported {
+            response.push(StatusCode::UnsupportedOption as u8);
+            return;
+        }
+
+        let parser = match soft_fido2_ctap::cbor::MapParser::from_bytes(payload) {
+            Ok(parser) => parser,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+        let bundle = match parser.get_bytes(1) {
+            Ok(value) => value,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+        let replace: bool = parser.get(2).unwrap_or(false);
+        let protocol: u8 = match parser.get(3) {
+            Ok(value) => value,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+        let param = match parser.get_bytes(4) {
+            Ok(value) => value,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+        let auth_data = restore_auth_data(&bundle, replace);
+        if let Err(status) = self.verify_backup_authorization(protocol, &param, &auth_data) {
+            response.push(status);
+            return;
+        }
+
+        let mut credential = match decrypt_credential(&bundle) {
+            Ok(credential) => credential,
+            Err(error) => {
+                response.push(Self::backup_error_status(error) as u8);
+                return;
+            }
+        };
+        credential.backup_state = CredentialBackupState::BackedUp;
+        let credential_id = credential.id.clone();
+
+        let result = (|| -> core::result::Result<(), StatusCode> {
+            let mut storage = self.storage.lock().map_err(|_| StatusCode::Other)?;
+            let existing = match storage.read(&credential_id) {
+                Ok(existing) => Some(existing),
+                Err(soft_fido2::Error::DoesNotExist) => None,
+                Err(_) => return Err(StatusCode::Other),
+            };
+            if existing.is_some() && !replace {
+                return Err(StatusCode::CredentialExcluded);
+            }
+            if existing.is_some() {
+                storage
+                    .delete(&credential_id)
+                    .map_err(|_| StatusCode::Other)?;
+            }
+            if storage.write(Self::credential_ref(&credential)).is_err() {
+                if let Some(previous) = existing {
+                    let _ = storage.write(Self::credential_ref(&previous));
+                }
+                return Err(StatusCode::Other);
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => match soft_fido2_ctap::cbor::MapBuilder::new()
+                .insert_bytes(1, &credential_id)
+                .and_then(|builder| builder.build())
+            {
+                Ok(body) => {
+                    response.push(StatusCode::Success as u8);
+                    response.extend_from_slice(&body);
+                }
+                Err(_) => response.push(StatusCode::Other as u8),
+            },
+            Err(status) => response.push(status as u8),
+        }
+    }
+
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
+        if request.first() == Some(&CMD_PASSLESS_BACKUP) {
+            self.handle_backup_command(&request[1..], response_buffer);
+            return Ok(());
+        }
+        if request.first() == Some(&CMD_PASSLESS_RESTORE) {
+            self.handle_restore_command(&request[1..], response_buffer);
+            return Ok(());
+        }
         if request.first() == Some(&CMD_PASSLESS_RESET_UV_RETRIES) {
             response_buffer.clear();
 
@@ -1266,6 +1614,7 @@ mod tests {
             check_mlock: false,
             disable_core_dumps: false,
             constant_signature_counter: false,
+            enable_credential_backup: false,
             always_uv: true,
             user_verification_registration: true,
             user_verification_authentication: true,
