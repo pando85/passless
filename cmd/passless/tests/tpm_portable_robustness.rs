@@ -409,6 +409,7 @@ fn test_5_4_portable_credential_survives_failed_overwrite() {
             hmac_secret: None,
             cred_random: None,
         },
+        backup_state: soft_fido2::CredentialBackupState::NotEligible,
     };
 
     adapter.write_credential(&cred).expect("write credential");

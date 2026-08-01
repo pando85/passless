@@ -951,6 +951,7 @@ mod tests {
             created: 1000,
             discoverable: true,
             extensions: soft_fido2::Extensions::default(),
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
         }
     }
 
@@ -1079,6 +1080,7 @@ mod tests {
             created: &cred.created,
             discoverable: &cred.discoverable,
             cred_protect: cred.extensions.cred_protect.as_ref(),
+            backup_state: &cred.backup_state,
             cred_random: None,
         }
     }
@@ -1294,6 +1296,7 @@ mod tests {
             created: &new_cred.created,
             discoverable: &new_cred.discoverable,
             cred_protect: new_cred.extensions.cred_protect.as_ref(),
+            backup_state: &new_cred.backup_state,
             cred_random: None,
         };
 
@@ -1349,6 +1352,7 @@ mod tests {
             created: &updated.created,
             discoverable: &updated.discoverable,
             cred_protect: updated.extensions.cred_protect.as_ref(),
+            backup_state: &updated.backup_state,
             cred_random: None,
         };
 
@@ -1387,6 +1391,7 @@ mod tests {
             created: &regressed.created,
             discoverable: &regressed.discoverable,
             cred_protect: regressed.extensions.cred_protect.as_ref(),
+            backup_state: &regressed.backup_state,
             cred_random: None,
         };
 
@@ -1426,6 +1431,7 @@ mod tests {
             created: &same_counter.created,
             discoverable: &same_counter.discoverable,
             cred_protect: same_counter.extensions.cred_protect.as_ref(),
+            backup_state: &same_counter.backup_state,
             cred_random: None,
         };
 
@@ -1556,6 +1562,7 @@ mod tests {
                     created: &cred.created,
                     discoverable: &cred.discoverable,
                     cred_protect: cred.extensions.cred_protect.as_ref(),
+                    backup_state: &cred.backup_state,
                     cred_random: None,
                 };
                 storage.write(cred_ref).unwrap();
@@ -1602,6 +1609,7 @@ mod tests {
                 created: &updated.created,
                 discoverable: &updated.discoverable,
                 cred_protect: updated.extensions.cred_protect.as_ref(),
+                backup_state: &updated.backup_state,
                 cred_random: None,
             };
             delegated.write(cred_ref).unwrap();
@@ -1796,6 +1804,7 @@ mod tests {
             created: &updated.created,
             discoverable: &updated.discoverable,
             cred_protect: updated.extensions.cred_protect.as_ref(),
+            backup_state: &updated.backup_state,
             cred_random: None,
         };
         assert!(delegated.write(credential_ref).is_err());
@@ -1844,6 +1853,7 @@ mod tests {
             created: &tampered.created,
             discoverable: &tampered.discoverable,
             cred_protect: tampered.extensions.cred_protect.as_ref(),
+            backup_state: &tampered.backup_state,
             cred_random: None,
         };
 
@@ -1883,6 +1893,7 @@ mod tests {
             created: &tampered.created,
             discoverable: &tampered.discoverable,
             cred_protect: tampered.extensions.cred_protect.as_ref(),
+            backup_state: &tampered.backup_state,
             cred_random: None,
         };
 
@@ -1921,6 +1932,7 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
+                backup_state: &cred.backup_state,
                 cred_random: None,
             }
         }
