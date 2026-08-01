@@ -1444,7 +1444,7 @@ pub fn credential_backup(
 pub fn credential_restore(
     output: OutputFormat,
     device: Option<&str>,
-    input_file: &PathBuf,
+    input_file: &Path,
     replace: bool,
     confirm: bool,
 ) -> Result<()> {
