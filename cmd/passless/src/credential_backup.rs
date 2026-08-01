@@ -50,9 +50,8 @@ pub fn encrypt_credential(
         version: BACKUP_FORMAT_VERSION,
         credential: credential.clone(),
     };
-    let plaintext = Zeroizing::new(
-        serde_cbor::to_vec(&envelope).map_err(|_| BackupError::InvalidBundle)?,
-    );
+    let plaintext =
+        Zeroizing::new(serde_cbor::to_vec(&envelope).map_err(|_| BackupError::InvalidBundle)?);
 
     let mut child = Command::new("gpg")
         .args([
@@ -221,7 +220,10 @@ mod tests {
         .unwrap();
         let decoded: CredentialBackupEnvelope = serde_cbor::from_slice(&plaintext).unwrap();
         assert_eq!(decoded.credential, original);
-        assert_eq!(decoded.credential.backup_state, CredentialBackupState::BackedUp);
+        assert_eq!(
+            decoded.credential.backup_state,
+            CredentialBackupState::BackedUp
+        );
     }
 
     #[test]
@@ -234,12 +236,18 @@ mod tests {
             backup_prepare_auth_data(&[1], "alice@example.com"),
             backup_prepare_auth_data(&[1], "bob@example.com")
         );
-        assert_ne!(restore_auth_data(b"bundle", false), restore_auth_data(b"bundle", true));
+        assert_ne!(
+            restore_auth_data(b"bundle", false),
+            restore_auth_data(b"bundle", true)
+        );
     }
 
     #[test]
     fn rejects_invalid_recipient() {
-        assert!(matches!(validate_recipient(""), Err(BackupError::InvalidInput)));
+        assert!(matches!(
+            validate_recipient(""),
+            Err(BackupError::InvalidInput)
+        ));
         assert!(matches!(
             validate_recipient(&"x".repeat(MAX_BACKUP_RECIPIENT_LENGTH + 1)),
             Err(BackupError::InvalidInput)

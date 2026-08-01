@@ -170,6 +170,10 @@ pub struct Credential<'a> {
 
     pub discoverable: bool,
 
+    /// Backup eligibility and current backup state.
+    #[serde(default)]
+    pub backup_state: soft_fido2::CredentialBackupState,
+
     #[serde(default)]
     pub extensions: Extensions,
 }
@@ -198,6 +202,7 @@ impl<'a> Credential<'a> {
             },
             created: cred.created,
             discoverable: cred.discoverable,
+            backup_state: cred.backup_state,
             extensions: Extensions {
                 cred_protect: cred.extensions.cred_protect,
                 hmac_secret: cred.extensions.hmac_secret,
@@ -237,6 +242,7 @@ impl<'a> Credential<'a> {
             },
             created: *cred_ref.created,
             discoverable: *cred_ref.discoverable,
+            backup_state: *cred_ref.backup_state,
             extensions: Extensions {
                 cred_protect: cred_ref.cred_protect.copied(),
                 hmac_secret: None,
@@ -265,6 +271,7 @@ impl<'a> Credential<'a> {
             key,
             created: self.created,
             discoverable: self.discoverable,
+            backup_state: self.backup_state,
             extensions: soft_fido2::Extensions {
                 cred_protect: self.extensions.cred_protect,
                 hmac_secret: self.extensions.hmac_secret,
@@ -291,6 +298,7 @@ impl<'a> Credential<'a> {
             key_format_version: self.key_format_version,
             created: self.created,
             discoverable: self.discoverable,
+            backup_state: self.backup_state,
             extensions: self.extensions,
         }
     }
@@ -322,6 +330,8 @@ impl<'a> Credential<'a> {
             key_format_version: Option<u16>,
             created: i64,
             discoverable: bool,
+            #[serde(default)]
+            backup_state: soft_fido2::CredentialBackupState,
             #[serde(default)]
             extensions: Extensions,
         }
@@ -361,6 +371,7 @@ impl<'a> Credential<'a> {
             key_format_version: owned.key_format_version,
             created: owned.created,
             discoverable: owned.discoverable,
+            backup_state: owned.backup_state,
             extensions: owned.extensions,
         })
     }
@@ -503,6 +514,7 @@ mod tests {
             key: soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0u8; 32])),
             created: 1234567890,
             discoverable: true,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
@@ -524,6 +536,10 @@ mod tests {
         assert_eq!(deserialized.alg, -7);
         assert_eq!(deserialized.created, 1234567890);
         assert!(deserialized.discoverable);
+        assert_eq!(
+            deserialized.backup_state,
+            soft_fido2::CredentialBackupState::NotEligible
+        );
     }
 
     #[test]
@@ -546,6 +562,7 @@ mod tests {
             key_format_version: None,
             created: 0,
             discoverable: true,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: Extensions::default(),
         };
 
@@ -577,6 +594,7 @@ mod tests {
             key: soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0u8; 32])),
             created: 1234567890,
             discoverable: true,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
