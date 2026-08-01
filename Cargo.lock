@@ -916,7 +916,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1369,7 +1369,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1777,7 +1777,7 @@ dependencies = [
  "shadow-rs",
  "soft-fido2",
  "soft-fido2-ctap",
- "soft-fido2-transport",
+ "soft-fido2-transport 0.16.0",
  "tempfile",
  "tokio",
  "toml",
@@ -2210,7 +2210,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2460,7 +2460,7 @@ dependencies = [
  "smallvec",
  "soft-fido2-crypto",
  "soft-fido2-ctap",
- "soft-fido2-transport",
+ "soft-fido2-transport 0.15.0",
  "spin",
  "zeroize",
 ]
@@ -2511,6 +2511,18 @@ checksum = "0a5ad0561a252bf233b92abf999344b0feb82842431054da0207d487818f346a"
 dependencies = [
  "hex",
  "hidapi",
+ "lazy_static",
+ "nix 0.31.3",
+ "smallvec",
+]
+
+[[package]]
+name = "soft-fido2-transport"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7da8b1bd0877f8640bce10a873c5768379c54e54c265c178afa9d39ae51c42e"
+dependencies = [
+ "hex",
  "lazy_static",
  "nix 0.31.3",
  "smallvec",
@@ -2625,7 +2637,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3051,7 +3063,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

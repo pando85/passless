@@ -24,7 +24,7 @@ passless-uhid = { path = "./passless-uhid", version = "0.14.0" }
 
 soft-fido2 = "0.15.0"
 soft-fido2-ctap = "0.15.0"
-soft-fido2-transport = "0.15.0"
+soft-fido2-transport = "0.16.0"
 
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
