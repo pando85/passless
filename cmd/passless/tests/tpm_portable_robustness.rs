@@ -404,6 +404,7 @@ fn test_5_4_portable_credential_survives_failed_overwrite() {
         key: generated.key,
         created: 1234567890,
         discoverable: true,
+        backup_state: soft_fido2::CredentialBackupState::NotEligible,
         extensions: soft_fido2::Extensions {
             cred_protect: Some(1),
             hmac_secret: None,

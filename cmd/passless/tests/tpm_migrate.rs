@@ -134,6 +134,7 @@ fn make_legacy_cred(cred_id: &[u8], rp_id: &str, scalar: &[u8; 32]) -> soft_fido
         key: soft_fido2_ctap::CredentialKey::software(SecBytes::from_slice(scalar)),
         created: 1234567890,
         discoverable: true,
+        backup_state: soft_fido2::CredentialBackupState::NotEligible,
         extensions: soft_fido2::Extensions {
             cred_protect: Some(1),
             hmac_secret: None,
@@ -691,6 +692,7 @@ fn test_tpm_migrate_eddsa_not_migratable() {
         key: soft_fido2_ctap::CredentialKey::software(SecBytes::from_slice(&eddsa_scalar)),
         created: 1234567890,
         discoverable: true,
+        backup_state: soft_fido2::CredentialBackupState::NotEligible,
         extensions: soft_fido2::Extensions {
             cred_protect: Some(1),
             hmac_secret: None,

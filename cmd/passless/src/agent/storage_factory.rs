@@ -1146,6 +1146,7 @@ mod tests {
             key: soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0xAA; 32])),
             created: 1000,
             discoverable: true,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: soft_fido2::Extensions::default(),
         }
     }
@@ -1176,6 +1177,7 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
+                backup_state: &cred.backup_state,
                 cred_random: None,
             };
             h.write(cred_ref).unwrap();
@@ -1244,6 +1246,7 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
+                backup_state: &cred.backup_state,
                 cred_random: None,
             };
             h.write(cred_ref).unwrap();
@@ -1283,6 +1286,7 @@ mod tests {
             created: &regressed.created,
             discoverable: &regressed.discoverable,
             cred_protect: regressed.extensions.cred_protect.as_ref(),
+            backup_state: &regressed.backup_state,
             cred_random: None,
         };
         let result = delegated.write(regressed_ref);
@@ -1303,6 +1307,7 @@ mod tests {
             created: &same.created,
             discoverable: &same.discoverable,
             cred_protect: same.extensions.cred_protect.as_ref(),
+            backup_state: &same.backup_state,
             cred_random: None,
         };
         let result = delegated.write(same_ref);
@@ -1323,6 +1328,7 @@ mod tests {
             created: &advanced.created,
             discoverable: &advanced.discoverable,
             cred_protect: advanced.extensions.cred_protect.as_ref(),
+            backup_state: &advanced.backup_state,
             cred_random: None,
         };
         let result = delegated.write(advanced_ref);
@@ -1363,6 +1369,7 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
+                backup_state: &cred.backup_state,
                 cred_random: None,
             }
         }

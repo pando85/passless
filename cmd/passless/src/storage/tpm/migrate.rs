@@ -232,6 +232,7 @@ fn migrate_one(
         key: imported.key,
         created: cred.created,
         discoverable: cred.discoverable,
+        backup_state: cred.backup_state,
         extensions: cred.extensions.clone(),
     };
 
