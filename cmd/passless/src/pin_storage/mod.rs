@@ -33,6 +33,9 @@ pub struct SerializablePinConfig {
     /// Force PIN change flag
     #[serde(default)]
     pub force_pin_change: bool,
+    /// Credential wrapping generation, incremented on reset to invalidate wrapped credentials
+    #[serde(default)]
+    pub credential_wrapping_generation: u64,
     /// Modification timestamp in milliseconds since Unix epoch
     /// Used for conflict resolution when syncing across machines
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +74,7 @@ impl From<&PinState> for SerializablePinConfig {
             min_pin_length: state.min_pin_length,
             version: state.version,
             force_pin_change: state.force_pin_change,
+            credential_wrapping_generation: state.credential_wrapping_generation,
             modified_at,
         }
     }
@@ -173,6 +177,9 @@ pub struct SerializablePinState {
     /// Force PIN change flag
     #[serde(default)]
     pub force_pin_change: bool,
+    /// Credential wrapping generation, incremented on reset to invalidate wrapped credentials
+    #[serde(default)]
+    pub credential_wrapping_generation: u64,
     /// Auto-lock timestamp in milliseconds since Unix epoch (None = not locked)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked_until: Option<u64>,
@@ -187,6 +194,7 @@ impl Default for SerializablePinState {
             min_pin_length: 4,
             version: 0,
             force_pin_change: false,
+            credential_wrapping_generation: 0,
             locked_until: None,
         }
     }
@@ -202,6 +210,7 @@ impl From<&PinState> for SerializablePinState {
             version: state.version,
             force_pin_change: state.force_pin_change,
             locked_until: state.locked_until,
+            credential_wrapping_generation: state.credential_wrapping_generation,
         }
     }
 }
@@ -220,6 +229,7 @@ impl From<SerializablePinState> for PinState {
             version: state.version,
             force_pin_change: state.force_pin_change,
             locked_until: state.locked_until,
+            credential_wrapping_generation: state.credential_wrapping_generation,
         }
     }
 }
@@ -245,6 +255,7 @@ impl SerializablePinState {
             version: config.version,
             force_pin_change: config.force_pin_change,
             locked_until: retries.locked_until,
+            credential_wrapping_generation: config.credential_wrapping_generation,
         }
     }
 }
