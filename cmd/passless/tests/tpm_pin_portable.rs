@@ -140,6 +140,7 @@ fn make_pin_state(pin: &str) -> PinState {
         version: 1,
         force_pin_change: false,
         locked_until: None,
+        credential_wrapping_generation: 0,
     }
 }
 
