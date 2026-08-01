@@ -161,8 +161,16 @@ pub struct SecurityConfig {
 
     /// Enable Passless encrypted credential backup/restore vendor commands.
     ///
+    /// Also sets the WebAuthn backup-eligibility (BE) flag assigned to newly
+    /// registered credentials: `false` (default) marks them single-device
+    /// (`BE=0`), `true` marks them backup-eligible (`BE=1`). Existing
+    /// credentials are not migrated; they keep the state they were created with.
+    ///
     /// Disabled by default because exporting a software credential changes its
-    /// security model. TPM and other non-exportable key providers remain unsupported.
+    /// security model. TPM and other non-exportable key providers remain
+    /// unsupported. Strict relying parties (e.g. Kanidm) reject a credential
+    /// whose BE flag changes after registration, so keep this setting stable.
+    /// See docs/CREDENTIAL_BACKUP.md.
     #[arg(
         long = "enable-credential-backup",
         env = "PASSLESS_ENABLE_CREDENTIAL_BACKUP",
