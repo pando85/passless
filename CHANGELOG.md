@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.15.0](https://github.com/pando85/passless/tree/v0.15.0) - 2026-08-01
+
+### Added
+
+- Add encrypted credential backup and restore (#383) ([6f707d6](https://github.com/pando85/passless/commit/6f707d6495bb7171dd1440a96288f708a9a086a1))
+
+### Build
+
+- deps: Update Rust crate clap to v4.6.5 (#381) ([e0d8e2d](https://github.com/pando85/passless/commit/e0d8e2d0b507a671fb5823b056497a6d7745b4dc))
+- deps: Update soft-fido2 to 0.16.1 (#387) ([51b6e41](https://github.com/pando85/passless/commit/51b6e419bedbb9f622b4125115a6508cbcac30d6))
+
 ## [v0.14.0](https://github.com/pando85/passless/tree/v0.14.0) - 2026-07-31
 
 ### Added
