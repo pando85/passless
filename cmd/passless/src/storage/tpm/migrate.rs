@@ -233,6 +233,7 @@ fn migrate_one(
         created: cred.created,
         discoverable: cred.discoverable,
         extensions: cred.extensions.clone(),
+        backup_state: cred.backup_state,
     };
 
     let mut portable_adapter =
