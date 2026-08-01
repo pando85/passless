@@ -62,6 +62,7 @@ Users should choose the solution that best fits their own security and practical
   - Local filesystem (testing only)
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
+- Encrypted credential [backup and restore](docs/CREDENTIAL_BACKUP.md) (software credentials)
 
 ## Android
 
