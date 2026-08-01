@@ -1776,7 +1776,7 @@ dependencies = [
  "sha2",
  "shadow-rs",
  "soft-fido2",
- "soft-fido2-ctap 0.16.0",
+ "soft-fido2-ctap",
  "soft-fido2-transport",
  "tempfile",
  "tokio",
@@ -2441,9 +2441,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c335fb59502a3e70096fc0415042302a3b723169aafedc23c2186bfc6e53a874"
+checksum = "b946b2cb7137bda5d85c48cc0698c159e521c02995f4181c7070f9dbbe1c18d9"
 dependencies = [
  "aes",
  "cbc",
@@ -2458,29 +2458,10 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto 0.15.0",
- "soft-fido2-ctap 0.15.0",
+ "soft-fido2-crypto",
+ "soft-fido2-ctap",
  "soft-fido2-transport",
  "spin",
- "zeroize",
-]
-
-[[package]]
-name = "soft-fido2-crypto"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5a498d3e634cf14c47f68f19bbea3c69e549edc2ca7ac85fe367dbdf2d3dc18"
-dependencies = [
- "aes",
- "cbc",
- "ed25519-dalek",
- "hkdf",
- "hmac",
- "p256",
- "rand",
- "sha2",
- "subtle",
- "thiserror",
  "zeroize",
 ]
 
@@ -2505,25 +2486,6 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "051bb98ecd8e825efa43adaea189fc0d80199ade4d8c8610959ce467c3c0d036"
-dependencies = [
- "cbor4ii",
- "rand",
- "secstr",
- "serde",
- "serde_bytes",
- "sha2",
- "smallvec",
- "soft-fido2-crypto 0.15.0",
- "subtle",
- "thiserror",
- "zeroize",
-]
-
-[[package]]
-name = "soft-fido2-ctap"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b86de7abfb9216eda04154b1cea2d08dc65c3ecb4422151f4ca3ae8e81775a7"
@@ -2535,7 +2497,7 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto 0.16.0",
+ "soft-fido2-crypto",
  "subtle",
  "thiserror",
  "zeroize",
@@ -2543,9 +2505,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-transport"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a5ad0561a252bf233b92abf999344b0feb82842431054da0207d487818f346a"
+checksum = "c7da8b1bd0877f8640bce10a873c5768379c54e54c265c178afa9d39ae51c42e"
 dependencies = [
  "hex",
  "hidapi",

@@ -265,6 +265,7 @@ impl<'a> Credential<'a> {
             key,
             created: self.created,
             discoverable: self.discoverable,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: soft_fido2::Extensions {
                 cred_protect: self.extensions.cred_protect,
                 hmac_secret: self.extensions.hmac_secret,
@@ -503,6 +504,7 @@ mod tests {
             key: soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0u8; 32])),
             created: 1234567890,
             discoverable: true,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
@@ -577,6 +579,7 @@ mod tests {
             key: soft_fido2_ctap::CredentialKey::software(SecBytes::new(vec![0u8; 32])),
             created: 1234567890,
             discoverable: true,
+            backup_state: soft_fido2::CredentialBackupState::NotEligible,
             extensions: soft_fido2::Extensions {
                 cred_protect: Some(1),
                 hmac_secret: None,
