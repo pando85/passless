@@ -6,6 +6,7 @@ use passless_rs::storage::TpmStorageAdapter;
 use passless_rs::storage::tpm::migrate::migrate_credentials;
 use passless_rs::storage::tpm::portable::{PortableParent, TpmCredentialKeyProvider};
 
+use soft_fido2::CredentialBackupState;
 use soft_fido2_ctap::SecBytes;
 use soft_fido2_ctap::key_provider::CredentialKeyProvider;
 
@@ -139,7 +140,7 @@ fn make_legacy_cred(cred_id: &[u8], rp_id: &str, scalar: &[u8; 32]) -> soft_fido
             hmac_secret: None,
             cred_random: None,
         },
-        backup_state: soft_fido2::CredentialBackupState::NotEligible,
+        backup_state: CredentialBackupState::NotEligible,
     }
 }
 
@@ -697,7 +698,7 @@ fn test_tpm_migrate_eddsa_not_migratable() {
             hmac_secret: None,
             cred_random: None,
         },
-        backup_state: soft_fido2::CredentialBackupState::NotEligible,
+        backup_state: CredentialBackupState::NotEligible,
     };
 
     write_legacy(&storage_dir, &tcti, &eddsa_cred);

@@ -1177,8 +1177,8 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
-                backup_state: &cred.backup_state,
                 cred_random: None,
+                backup_state: &cred.backup_state,
             };
             h.write(cred_ref).unwrap();
             assert_eq!(h.count_credentials(), 1);
@@ -1246,8 +1246,8 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
-                backup_state: &cred.backup_state,
                 cred_random: None,
+                backup_state: &cred.backup_state,
             };
             h.write(cred_ref).unwrap();
         }
@@ -1286,8 +1286,8 @@ mod tests {
             created: &regressed.created,
             discoverable: &regressed.discoverable,
             cred_protect: regressed.extensions.cred_protect.as_ref(),
-            backup_state: &regressed.backup_state,
             cred_random: None,
+            backup_state: &regressed.backup_state,
         };
         let result = delegated.write(regressed_ref);
         assert!(result.is_err());
@@ -1307,8 +1307,8 @@ mod tests {
             created: &same.created,
             discoverable: &same.discoverable,
             cred_protect: same.extensions.cred_protect.as_ref(),
-            backup_state: &same.backup_state,
             cred_random: None,
+            backup_state: &same.backup_state,
         };
         let result = delegated.write(same_ref);
         assert!(result.is_err());
@@ -1328,8 +1328,8 @@ mod tests {
             created: &advanced.created,
             discoverable: &advanced.discoverable,
             cred_protect: advanced.extensions.cred_protect.as_ref(),
-            backup_state: &advanced.backup_state,
             cred_random: None,
+            backup_state: &advanced.backup_state,
         };
         let result = delegated.write(advanced_ref);
         assert!(result.is_ok());
@@ -1369,8 +1369,8 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
-                backup_state: &cred.backup_state,
                 cred_random: None,
+                backup_state: &cred.backup_state,
             }
         }
 

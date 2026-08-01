@@ -233,7 +233,7 @@ fn migrate_one(
         created: cred.created,
         discoverable: cred.discoverable,
         extensions: cred.extensions.clone(),
-        backup_state: soft_fido2::CredentialBackupState::NotEligible,
+        backup_state: cred.backup_state,
     };
 
     let mut portable_adapter =

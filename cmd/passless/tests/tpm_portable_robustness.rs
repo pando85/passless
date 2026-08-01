@@ -9,6 +9,7 @@
 use passless_rs::storage::TpmStorageAdapter;
 use passless_rs::storage::tpm::portable::{PortableParent, TpmCredentialKeyProvider};
 use passless_rs::util::atomic_write_in_dir;
+use soft_fido2::CredentialBackupState;
 use soft_fido2_ctap::key_provider::CredentialKeyProvider;
 
 use std::process::{Child, Command};
@@ -409,7 +410,7 @@ fn test_5_4_portable_credential_survives_failed_overwrite() {
             hmac_secret: None,
             cred_random: None,
         },
-        backup_state: soft_fido2::CredentialBackupState::NotEligible,
+        backup_state: CredentialBackupState::NotEligible,
     };
 
     adapter.write_credential(&cred).expect("write credential");

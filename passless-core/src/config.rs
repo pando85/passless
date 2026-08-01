@@ -159,6 +159,21 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub constant_signature_counter: bool,
 
+    /// Enable Passless encrypted credential backup/restore vendor commands.
+    ///
+    /// Disabled by default because exporting a software credential changes its
+    /// security model. TPM and other non-exportable key providers remain unsupported.
+    #[arg(
+        long = "enable-credential-backup",
+        env = "PASSLESS_ENABLE_CREDENTIAL_BACKUP",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    pub enable_credential_backup: bool,
+
     /// Always require user verification for all operations
     /// - When PIN is set + pin.enforcement="required": requires PIN
     /// - When PIN is set + pin.enforcement="optional": depends on context
@@ -1183,6 +1198,33 @@ pub enum ClientAction {
         /// New display name (friendly name)
         #[arg(short = 'n', long = "display-name", value_name = "NAME")]
         display_name: Option<String>,
+    },
+    /// Export one software-backed credential as an opaque OpenPGP bundle.
+    Backup {
+        /// Credential ID in hexadecimal format
+        #[arg(value_name = "CREDENTIAL_ID")]
+        credential_id: String,
+        /// OpenPGP recipient key ID, fingerprint, or email
+        #[arg(long, value_name = "RECIPIENT")]
+        recipient: String,
+        /// Destination bundle path
+        #[arg(long, value_name = "PATH")]
+        output_file: PathBuf,
+        /// Explicitly acknowledge that a passkey is being exported
+        #[arg(long = "yes-i-understand-this-exports-a-passkey")]
+        confirm: bool,
+    },
+    /// Restore an encrypted Passless credential bundle.
+    Restore {
+        /// Source bundle path
+        #[arg(value_name = "PATH")]
+        input_file: PathBuf,
+        /// Replace a credential with the same ID
+        #[arg(long)]
+        replace: bool,
+        /// Explicitly acknowledge that a passkey is being restored
+        #[arg(long = "yes-i-understand-this-restores-a-passkey")]
+        confirm: bool,
     },
     /// PIN management commands
     Pin {

@@ -1080,8 +1080,8 @@ mod tests {
             created: &cred.created,
             discoverable: &cred.discoverable,
             cred_protect: cred.extensions.cred_protect.as_ref(),
-            backup_state: &cred.backup_state,
             cred_random: None,
+            backup_state: &cred.backup_state,
         }
     }
 
@@ -1296,8 +1296,8 @@ mod tests {
             created: &new_cred.created,
             discoverable: &new_cred.discoverable,
             cred_protect: new_cred.extensions.cred_protect.as_ref(),
-            backup_state: &new_cred.backup_state,
             cred_random: None,
+            backup_state: &new_cred.backup_state,
         };
 
         let result = delegated.write(cred_ref);
@@ -1352,8 +1352,8 @@ mod tests {
             created: &updated.created,
             discoverable: &updated.discoverable,
             cred_protect: updated.extensions.cred_protect.as_ref(),
-            backup_state: &updated.backup_state,
             cred_random: None,
+            backup_state: &updated.backup_state,
         };
 
         let result = delegated.write(cred_ref);
@@ -1391,8 +1391,8 @@ mod tests {
             created: &regressed.created,
             discoverable: &regressed.discoverable,
             cred_protect: regressed.extensions.cred_protect.as_ref(),
-            backup_state: &regressed.backup_state,
             cred_random: None,
+            backup_state: &regressed.backup_state,
         };
 
         let result = delegated.write(cred_ref);
@@ -1431,8 +1431,8 @@ mod tests {
             created: &same_counter.created,
             discoverable: &same_counter.discoverable,
             cred_protect: same_counter.extensions.cred_protect.as_ref(),
-            backup_state: &same_counter.backup_state,
             cred_random: None,
+            backup_state: &same_counter.backup_state,
         };
 
         let result = delegated.write(cred_ref);
@@ -1562,8 +1562,8 @@ mod tests {
                     created: &cred.created,
                     discoverable: &cred.discoverable,
                     cred_protect: cred.extensions.cred_protect.as_ref(),
-                    backup_state: &cred.backup_state,
                     cred_random: None,
+                    backup_state: &cred.backup_state,
                 };
                 storage.write(cred_ref).unwrap();
             });
@@ -1609,8 +1609,8 @@ mod tests {
                 created: &updated.created,
                 discoverable: &updated.discoverable,
                 cred_protect: updated.extensions.cred_protect.as_ref(),
-                backup_state: &updated.backup_state,
                 cred_random: None,
+                backup_state: &updated.backup_state,
             };
             delegated.write(cred_ref).unwrap();
         }
@@ -1804,8 +1804,8 @@ mod tests {
             created: &updated.created,
             discoverable: &updated.discoverable,
             cred_protect: updated.extensions.cred_protect.as_ref(),
-            backup_state: &updated.backup_state,
             cred_random: None,
+            backup_state: &updated.backup_state,
         };
         assert!(delegated.write(credential_ref).is_err());
     }
@@ -1853,8 +1853,8 @@ mod tests {
             created: &tampered.created,
             discoverable: &tampered.discoverable,
             cred_protect: tampered.extensions.cred_protect.as_ref(),
-            backup_state: &tampered.backup_state,
             cred_random: None,
+            backup_state: &tampered.backup_state,
         };
 
         let result = delegated.write(cred_ref);
@@ -1893,8 +1893,8 @@ mod tests {
             created: &tampered.created,
             discoverable: &tampered.discoverable,
             cred_protect: tampered.extensions.cred_protect.as_ref(),
-            backup_state: &tampered.backup_state,
             cred_random: None,
+            backup_state: &tampered.backup_state,
         };
 
         let result = delegated.write(cred_ref);
@@ -1932,8 +1932,8 @@ mod tests {
                 created: &cred.created,
                 discoverable: &cred.discoverable,
                 cred_protect: cred.extensions.cred_protect.as_ref(),
-                backup_state: &cred.backup_state,
                 cred_random: None,
+                backup_state: &cred.backup_state,
             }
         }
 

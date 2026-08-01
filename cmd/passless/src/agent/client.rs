@@ -563,6 +563,8 @@ mod tests {
 
     use crate::agent::ipc::{AdminHandler, IpcServer, PrincipalHandler, ProfileAccess, RuntimeDir};
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct EchoAdminHandler;
 
     impl AdminHandler for EchoAdminHandler {
@@ -928,6 +930,7 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
         let base = resolve_runtime_base().unwrap();
         assert!(base.is_absolute(), "base must be absolute: {:?}", base);
@@ -935,6 +938,7 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_rejects_relative() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var(ENV_RUNTIME_DIR, "relative/path") };
         let result = resolve_runtime_base();
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
@@ -943,6 +947,7 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_accepts_valid_dir() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -954,6 +959,7 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_rejects_symlink() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         std::fs::create_dir(&target).unwrap();
@@ -968,6 +974,7 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_rejects_wrong_mode() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
