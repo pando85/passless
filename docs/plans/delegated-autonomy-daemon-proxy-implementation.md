@@ -10,6 +10,69 @@
 
 This plan is complete only when every required phase below passes and ADR 0005 is updated to `Accepted` and `Implemented`. A skipped real-RP, negative-security, isolated-mode, confirm-policy, or portable-TPM gate is incomplete evidence, not a pass.
 
+The current branch is delivering the software-credential MVP, not claiming completion of the full ADR. The MVP may be merged when the software PR gate below passes. ADR 0005 remains in progress until the later cleanup and portable-TPM phases also pass.
+
+## Execution Checkpoint (2026-08-02)
+
+### Completed and pushed
+
+- `a7d37d1` documents the daemon-backed autonomous assertion plan.
+- `6f11374` aligns ADR 0005 with the daemon proxy architecture.
+- `75fb0ba` adds the controlled-Chromium autonomy gate.
+- `11ca363` adds the MV3 MAIN-world shim, isolated broker, generated lease extension, and browser launch integration.
+- `b39c2ee` adds the real-RP Gate C navigation-and-click harness.
+- The branch is `feat/agent-autonomous-auth`; no PR has been opened.
+
+### Implemented but not yet committed
+
+- `SignAssertion` protocol types, validation, and IPC dispatch.
+- The shared signing handler, canonical assertion construction, audit fail-closed behavior, operation serialization, credential resolution, and counter persistence.
+- One daemon-lifetime loopback HTTP server and a per-lease 256-bit bearer registry.
+- Production browser endpoint metadata, pending-token registration, lease binding, rollback, and lifecycle revocation.
+- Current grant ordering: create a pending grant request, launch an unusable pending browser lease, approve the exact grant, register its exact `GrantId` in the sign context, bind the bearer to the lease, then publish the pending runtime. The bearer is unusable before binding and grant TTL begins only after browser launch succeeds.
+- CORS preflight, bounded HTTP handling, stable secret-free errors, and full-scan token comparison.
+
+### Current blocker
+
+Cancellation after the post-launch grant approval must revoke the exact resolved grant as well as the bearer and browser lease. The current review found that `handle_cancel_delegation` can leave that grant reported as active. This code is not commit-ready until the cancellation path and its timeout/session equivalents have regression coverage proving that no active grant, usable token, or browser lease remains.
+
+### Verification completed on the evolving core
+
+- Default, `agent`, and all-feature builds have passed.
+- Agent Clippy with `-D warnings` has passed.
+- Focused signing, runtime, browser, policy, grant, and protocol suites have passed during implementation.
+- A broad run passed 2,137 Rust tests with zero failures and more than 302 shell/Node harness assertions. A parallel GPG filesystem-contention failure passed when rerun serially.
+- The extension behavioral suite, controlled-Chromium harness tests, and Gate C driver tests pass deterministically.
+
+These results must be repeated against the exact final tree after the cancellation fix. They are progress evidence, not the final acceptance record.
+
+### Live environment state
+
+- The persistent user config currently has no enabled agent profile. Live validation must use a mode-0600 disposable config and must not modify the persistent config.
+- The exact final binary must start an agent profile restricted to `tea.millaguie.net`, the existing software credential, `authorization = "allow"`, and CDP port mode.
+- The daemon-managed Chromium must load only the generated Passless extension. The endpoint bearer remains service-worker-only.
+- MCP Playwright attaches to the daemon-managed Chromium CDP endpoint and performs only navigation plus a click on `a.signin-passkey`.
+- CDP virtual-authenticator methods, credential injection, and key extraction remain forbidden.
+
+### Software MVP PR gate
+
+Before committing and opening the PR, all of the following are required:
+
+1. Cancellation, timeout, crash, session exit, profile disable, policy reload, endpoint failure, credential revocation, and daemon shutdown leave no usable bearer or active delegated grant.
+2. `cargo fmt`, default/agent/all-feature builds, agent Clippy with `-D warnings`, focused agent tests, protocol tests, and deterministic validation all pass on the exact final tree.
+3. Controlled Chromium Gate B passes with a daemon-built assertion, no native credential dialog, no allow-policy desktop notification, and sanitized audit evidence.
+4. Gate C authenticates at `https://tea.millaguie.net` using the existing software credential. MCP Playwright only navigates and clicks the passkey action; the RP establishes an authenticated session.
+5. Gate C evidence proves exact origin/challenge handling, daemon signing, active-grant use, policy allow, credential selection, counter persistence, and zero forbidden CDP WebAuthn methods.
+6. The final diff contains no bearer, credential reference, assertion, cookie, private key, disposable config, generated browser profile, or unsanitized evidence.
+7. The implementation and checkpoint documentation are committed and pushed, then a PR is opened against `pando85/passless` with exact verification results and explicit post-MVP deferrals.
+
+### Explicitly deferred beyond the software MVP PR
+
+- Portable-TPM autonomous signing and its controlled/real-RP gates.
+- Removal of the obsolete delegated ceremony/UHID path after the proxy path is proven in production.
+- Broader RP compatibility and autonomous registration override.
+- Marking ADR 0005 `Accepted` and `Implemented`; that requires every full-plan phase, including portable TPM, to pass.
+
 The final implementation must establish all of these properties:
 
 - Chromium performs autonomous assertion without its native credential dialog.
