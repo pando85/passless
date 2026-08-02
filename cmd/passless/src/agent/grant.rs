@@ -289,6 +289,7 @@ pub struct GrantRequest {
     pub credentials: Vec<CredentialRef>,
     pub requested_ttl_secs: u64,
     pub resolved: bool,
+    pub resolved_grant_id: Option<GrantId>,
 }
 
 #[derive(Debug)]
@@ -370,6 +371,16 @@ impl fmt::Debug for AuthorizationClaim {
             .field("consumed", &self.consumed.load(Ordering::Acquire))
             .finish()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GrantSnapshotForSign {
+    pub grant_id: GrantId,
+    pub profile_id: ProfileId,
+    pub rp_ids: Vec<String>,
+    pub credential_refs: Vec<CredentialRef>,
+    pub state: GrantState,
+    pub expiry_mono: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +489,7 @@ impl GrantRegistry {
             credentials: cred_set.sorted,
             requested_ttl_secs: params.requested_ttl_secs,
             resolved: false,
+            resolved_grant_id: None,
         };
 
         self.pending_requests.insert(request_id.clone(), request);
@@ -536,9 +548,16 @@ impl GrantRegistry {
 
         if let Some(req) = self.pending_requests.get_mut(request_id) {
             req.resolved = true;
+            req.resolved_grant_id = Some(grant_id.clone());
         }
 
         Ok(grant_id)
+    }
+
+    pub fn resolved_grant_id(&self, request_id: &GrantRequestId) -> Option<GrantId> {
+        self.pending_requests
+            .get(request_id)
+            .and_then(|r| r.resolved_grant_id.clone())
     }
 
     pub fn revoke_grant(
@@ -821,6 +840,21 @@ impl GrantRegistry {
         self.grants
             .get(grant_id)
             .is_some_and(|g| g.state() == GrantState::Active)
+    }
+
+    pub fn snapshot_for_sign(&self, grant_id: &GrantId) -> Option<GrantSnapshotForSign> {
+        let grant = self.grants.get(grant_id)?;
+        let state = grant.state();
+        let rp_ids: Vec<String> = grant.rp_ids.iter().cloned().collect();
+        let cred_refs: Vec<CredentialRef> = grant.credentials.iter().cloned().collect();
+        Some(GrantSnapshotForSign {
+            grant_id: grant.id.clone(),
+            profile_id: grant.profile_id.clone(),
+            rp_ids,
+            credential_refs: cred_refs,
+            state,
+            expiry_mono: grant.expiry_mono,
+        })
     }
 
     pub fn grant_policy_generation(&self, grant_id: &GrantId) -> Option<&PolicyGenerationId> {

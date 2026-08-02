@@ -463,6 +463,7 @@ pub enum PrincipalRequest {
         request_json: String,
         timeout_ms: u32,
     },
+    SignAssertion(SignAssertionRequest),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -502,6 +503,35 @@ pub enum PrincipalResponse {
     BrowserControl {
         messages: Vec<String>,
     },
+    SignAssertionResult(SignAssertionResponse),
+}
+
+const MAX_ORIGIN_LEN: usize = 512;
+const MAX_B64U_LEN: usize = 1024;
+const MAX_ALLOW_CREDENTIALS: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignAssertionRequest {
+    pub origin: String,
+    pub rp_id: String,
+    pub challenge_b64u: String,
+    #[serde(default)]
+    pub allow_credentials: Vec<String>,
+    #[serde(default)]
+    pub user_verification: bool,
+    #[serde(default)]
+    pub cross_origin: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignAssertionResponse {
+    pub credential_id_b64u: String,
+    pub authenticator_data_b64u: String,
+    pub signature_b64u: String,
+    pub user_handle_b64u: String,
+    pub client_data_json_b64u: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1219,6 +1249,26 @@ impl Validate for PrincipalRequest {
                     errors.push(format!(
                         "browser_control: timeout_ms must be between 1 and {}",
                         MAX_CDP_TIMEOUT_MS
+                    ));
+                }
+            }
+            Self::SignAssertion(req) => {
+                check_str(&req.origin, "origin", MAX_ORIGIN_LEN, &mut errors);
+                check_str(&req.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+                check_str(
+                    &req.challenge_b64u,
+                    "challenge_b64u",
+                    MAX_B64U_LEN,
+                    &mut errors,
+                );
+                if req.challenge_b64u.is_empty() {
+                    errors.push("sign_assertion: challenge_b64u must not be empty".into());
+                }
+                if req.allow_credentials.len() > MAX_ALLOW_CREDENTIALS {
+                    errors.push(format!(
+                        "sign_assertion: allow_credentials exceeds maximum length {} (got {})",
+                        MAX_ALLOW_CREDENTIALS,
+                        req.allow_credentials.len()
                     ));
                 }
             }
@@ -2799,5 +2849,113 @@ mod tests {
             profile_id: ProfileId::new("test").unwrap(),
         };
         assert!(req.validate().is_ok());
+    }
+
+    fn valid_sign_request() -> SignAssertionRequest {
+        SignAssertionRequest {
+            origin: "https://example.com".to_string(),
+            rp_id: "example.com".to_string(),
+            challenge_b64u: "dGVzdA".to_string(),
+            allow_credentials: vec![],
+            user_verification: false,
+            cross_origin: false,
+        }
+    }
+
+    #[test]
+    fn sign_assertion_valid_roundtrip() {
+        let req = valid_sign_request();
+        assert!(
+            PrincipalRequest::SignAssertion(req.clone())
+                .validate()
+                .is_ok()
+        );
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: SignAssertionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn sign_assertion_empty_origin_rejected() {
+        let mut req = valid_sign_request();
+        req.origin = String::new();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("origin")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_origin_rejected() {
+        let mut req = valid_sign_request();
+        req.origin = "x".repeat(MAX_ORIGIN_LEN + 1);
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("origin")));
+    }
+
+    #[test]
+    fn sign_assertion_empty_rp_id_rejected() {
+        let mut req = valid_sign_request();
+        req.rp_id = String::new();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("rp_id")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_rp_id_rejected() {
+        let mut req = valid_sign_request();
+        req.rp_id = "x".repeat(MAX_RP_ID_LEN + 1);
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("rp_id")));
+    }
+
+    #[test]
+    fn sign_assertion_empty_challenge_rejected() {
+        let mut req = valid_sign_request();
+        req.challenge_b64u = String::new();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("challenge_b64u")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_challenge_rejected() {
+        let mut req = valid_sign_request();
+        req.challenge_b64u = "x".repeat(MAX_B64U_LEN + 1);
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("challenge_b64u")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_allow_credentials_rejected() {
+        let mut req = valid_sign_request();
+        req.allow_credentials = vec!["x".repeat(64); MAX_ALLOW_CREDENTIALS + 1];
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("allow_credentials")));
+    }
+
+    #[test]
+    fn sign_assertion_null_in_origin_rejected() {
+        let mut req = valid_sign_request();
+        req.origin = "https://exam\0ple.com".to_string();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("origin")));
+    }
+
+    #[test]
+    fn sign_assertion_user_verification_roundtrip() {
+        let mut req = valid_sign_request();
+        req.user_verification = true;
+        assert!(
+            PrincipalRequest::SignAssertion(req.clone())
+                .validate()
+                .is_ok()
+        );
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: SignAssertionRequest = serde_json::from_str(&json).unwrap();
+        assert!(decoded.user_verification);
+    }
+
+    #[test]
+    fn sign_assertion_rejects_unknown_fields() {
+        let json = r#"{"origin":"https://example.com","rp_id":"example.com","challenge_b64u":"dGVzdA","allow_credentials":[],"user_verification":false,"cross_origin":false,"extra":"bad"}"#;
+        assert!(serde_json::from_str::<SignAssertionRequest>(json).is_err());
     }
 }

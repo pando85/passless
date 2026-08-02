@@ -251,6 +251,17 @@ impl PolicyGenerationSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GrantSignSnapshot {
+    pub grant_id: GrantId,
+    pub profile_id: ProfileId,
+    pub rp_ids: Vec<String>,
+    pub credential_refs: Vec<CredentialRef>,
+    pub state: super::grant::GrantState,
+    pub expiry_mono: u64,
+    pub is_revoked: bool,
+}
+
 pub struct AuthorizationHandle {
     ceremony_id: CeremonyId,
     grant_id: Option<passless_core::agent::GrantId>,
@@ -867,6 +878,43 @@ impl PolicyRuntime {
         result
     }
 
+    pub fn find_grants_by_credential_for_profile(
+        &self,
+        profile_id: &ProfileId,
+        cred_refs: &[passless_core::agent::CredentialRef],
+    ) -> Vec<passless_core::agent::GrantId> {
+        let grants = self.grants.lock().unwrap();
+        let registry = match grants.get(profile_id.as_str()) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        for cred_ref in cred_refs {
+            result.extend(registry.find_grant_id_by_credential(cred_ref));
+        }
+        result
+    }
+
+    pub fn resolve_grant_for_sign(
+        &self,
+        profile_id: &ProfileId,
+        grant_id: &GrantId,
+    ) -> Option<GrantSignSnapshot> {
+        let mut grants_map = self.grants.lock().unwrap();
+        let registry = grants_map.get_mut(profile_id.as_str())?;
+        let _ = registry.check_expired();
+        let snap = registry.snapshot_for_sign(grant_id)?;
+        let is_revoked = snap.state == super::grant::GrantState::Revoked;
+        Some(GrantSignSnapshot {
+            grant_id: snap.grant_id,
+            profile_id: snap.profile_id,
+            rp_ids: snap.rp_ids,
+            credential_refs: snap.credential_refs,
+            state: snap.state,
+            expiry_mono: snap.expiry_mono,
+            is_revoked,
+        })
+    }
     pub fn active_grant_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
         let grants = self.grants.lock().unwrap();
         grants
@@ -1506,6 +1554,23 @@ impl PolicyRuntime {
         result
     }
 
+    pub fn rollback_grant(&self, grant_id: &passless_core::agent::GrantId) {
+        let authority = super::intent::admin_authority();
+        let _ = self.admin_revoke_grant(grant_id, &authority);
+    }
+
+    pub fn resolved_grant_id_for_request(
+        &self,
+        profile_id: &ProfileId,
+        grant_request_id: &super::grant::GrantRequestId,
+    ) -> Option<passless_core::agent::GrantId> {
+        let grants = self.grants.lock().unwrap();
+        let profile_key = profile_id.as_str().to_string();
+        grants
+            .get(&profile_key)
+            .and_then(|g| g.resolved_grant_id(grant_request_id))
+    }
+
     pub fn principal_cancel_intent(
         &self,
         intent_id: &IntentId,
@@ -1606,7 +1671,7 @@ impl PolicyRuntime {
         &self,
         intent_params: CreateIntentParams,
         grant_params: GrantRequestParams,
-    ) -> Result<PendingRequestId, PendingCreateError> {
+    ) -> Result<(PendingRequestId, super::grant::GrantRequestId), PendingCreateError> {
         let now_mono = self.clock.monotonic_secs();
         let ttl_ms = intent_params.ttl_ms.unwrap_or(300_000);
         let ttl_secs = ttl_ms.div_ceil(1000);
@@ -1655,7 +1720,7 @@ impl PolicyRuntime {
             rp_id: normalized_rp,
             credential_ref,
             intent_id,
-            grant_request_id: Some(grant_request_id),
+            grant_request_id: Some(grant_request_id.clone()),
             state: PendingState::Waiting,
             created_at_mono: now_mono,
             deadline_mono: now_mono.saturating_add(ttl_secs),
@@ -1663,7 +1728,7 @@ impl PolicyRuntime {
 
         let mut pending_requests = self.pending_requests.lock().unwrap();
         pending_requests.insert(pending_id.as_str().to_string(), request);
-        Ok(pending_id)
+        Ok((pending_id, grant_request_id))
     }
 
     pub fn principal_cancel_pending(
@@ -1694,6 +1759,9 @@ impl PolicyRuntime {
             let profile_key = request.profile_id.as_str().to_string();
             let mut grants_map = self.grants.lock().unwrap();
             if let Some(grants) = grants_map.get_mut(&profile_key) {
+                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                    let _ = grants.revoke_grant(&grant_id, &authority);
+                }
                 let _ = grants.cancel_request(grant_request_id);
             }
         }
@@ -1822,9 +1890,13 @@ impl PolicyRuntime {
             let grants = grants_map
                 .get_mut(&profile_key)
                 .ok_or_else(|| CeremonyResolveError::GrantFailed("profile not found".into()))?;
-            let gid = grants
-                .approve_grant(&grant_request_id, &authority)
-                .map_err(|e| CeremonyResolveError::GrantFailed(e.to_string()))?;
+            let gid = if let Some(existing) = grants.resolved_grant_id(&grant_request_id) {
+                existing
+            } else {
+                grants
+                    .approve_grant(&grant_request_id, &authority)
+                    .map_err(|e| CeremonyResolveError::GrantFailed(e.to_string()))?
+            };
             Some(gid)
         } else {
             None
@@ -1888,6 +1960,9 @@ impl PolicyRuntime {
             let profile_key = pending_req.profile_id.as_str().to_string();
             let mut grants_map = self.grants.lock().unwrap();
             if let Some(grants) = grants_map.get_mut(&profile_key) {
+                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                    let _ = grants.revoke_grant(&grant_id, &authority);
+                }
                 let _ = grants.cancel_request(grant_request_id);
             }
         }
@@ -2145,6 +2220,9 @@ impl PolicyRuntime {
                     let profile_key = request.profile_id.as_str().to_string();
                     let mut grants_map = self.grants.lock().unwrap();
                     if let Some(grants) = grants_map.get_mut(&profile_key) {
+                        if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                            let _ = grants.revoke_grant(&grant_id, &authority);
+                        }
                         let _ = grants.cancel_request(grant_request_id);
                     }
                 }
@@ -2169,6 +2247,9 @@ impl PolicyRuntime {
                     let profile_key = request.profile_id.as_str().to_string();
                     let mut grants_map = self.grants.lock().unwrap();
                     if let Some(grants) = grants_map.get_mut(&profile_key) {
+                        if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                            let _ = grants.revoke_grant(&grant_id, &authority);
+                        }
                         let _ = grants.cancel_request(grant_request_id);
                     }
                 }
@@ -4357,7 +4438,7 @@ mod tests {
         let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
         let generation = runtime.current_generation();
 
-        let pending_id = runtime
+        let (pending_id, _grant_request_id) = runtime
             .principal_create_pending_delegated(
                 CreateIntentParams {
                     profile_id: pid.clone(),

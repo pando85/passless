@@ -1,0 +1,2533 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use log::{debug, warn};
+use sha2::{Digest, Sha256};
+
+use passless_core::agent::protocol::{
+    ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, SignAssertionRequest,
+    SignAssertionResponse,
+};
+use passless_core::agent::{AgentProfileConfig, CredentialRef, ProfileId};
+use passless_core::config::SecurityConfig;
+
+use super::audit::AuditGate;
+use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::policy_engine::PolicyRuntime;
+
+use crate::storage::CredentialStorage;
+
+use soft_fido2::CredentialKeyProvider;
+
+const B64U_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn b64u_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() * 4).div_ceil(3));
+    let mut i = 0;
+    while i + 2 < data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        out.push(B64U_CHARS[((n >> 18) & 0x3F) as usize] as char);
+        out.push(B64U_CHARS[((n >> 12) & 0x3F) as usize] as char);
+        out.push(B64U_CHARS[((n >> 6) & 0x3F) as usize] as char);
+        out.push(B64U_CHARS[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let remaining = data.len() - i;
+    if remaining == 1 {
+        let n = (data[i] as u32) << 16;
+        out.push(B64U_CHARS[((n >> 18) & 0x3F) as usize] as char);
+        out.push(B64U_CHARS[((n >> 12) & 0x3F) as usize] as char);
+    } else if remaining == 2 {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+        out.push(B64U_CHARS[((n >> 18) & 0x3F) as usize] as char);
+        out.push(B64U_CHARS[((n >> 12) & 0x3F) as usize] as char);
+        out.push(B64U_CHARS[((n >> 6) & 0x3F) as usize] as char);
+    }
+    out
+}
+
+pub fn b64u_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in s.as_bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => continue,
+            _ => return Err(format!("invalid base64url byte: {}", b)),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
+
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < '\x20' => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn build_client_data_json(origin: &str, challenge_b64u: &str, cross_origin: bool) -> Vec<u8> {
+    let mut cdj = String::with_capacity(128);
+    cdj.push_str("{\"type\":\"webauthn.get\",\"challenge\":\"");
+    cdj.push_str(challenge_b64u);
+    cdj.push_str("\",\"origin\":\"");
+    cdj.push_str(&json_escape_string(origin));
+    cdj.push('"');
+    if cross_origin {
+        cdj.push_str(",\"crossOrigin\":true");
+    }
+    cdj.push('}');
+    cdj.into_bytes()
+}
+
+pub fn build_authenticator_data(
+    rp_id: &str,
+    up: bool,
+    uv: bool,
+    backup_flags: u8,
+    sign_count: u32,
+) -> Vec<u8> {
+    let mut auth_data = Vec::with_capacity(37);
+    let mut hasher = Sha256::new();
+    hasher.update(rp_id.as_bytes());
+    auth_data.extend_from_slice(&hasher.finalize());
+    let mut flags = 0u8;
+    if up {
+        flags |= 0x01;
+    }
+    if uv {
+        flags |= 0x04;
+    }
+    flags |= backup_flags;
+    auth_data.push(flags);
+    auth_data.extend_from_slice(&sign_count.to_be_bytes());
+    auth_data
+}
+
+pub struct ParsedOrigin {
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+pub fn parse_origin(origin: &str) -> Option<ParsedOrigin> {
+    let rest = origin.strip_prefix("https://")?;
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.contains('/') && !rest.ends_with('/') {
+        return None;
+    }
+    let host_part = rest.trim_end_matches('/');
+    if host_part.is_empty() {
+        return None;
+    }
+    if host_part.contains('?') || host_part.contains('#') || host_part.contains('@') {
+        return None;
+    }
+    if host_part.contains(':') {
+        let (host, port_str) = host_part.rsplit_once(':').unwrap();
+        if host.is_empty() {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok()?;
+        Some(ParsedOrigin {
+            host: host.to_ascii_lowercase(),
+            port: Some(port),
+        })
+    } else {
+        Some(ParsedOrigin {
+            host: host_part.to_ascii_lowercase(),
+            port: None,
+        })
+    }
+}
+
+pub fn verify_origin_structural(origin: &str, rp_id: &str) -> bool {
+    let parsed = match parse_origin(origin) {
+        Some(p) => p,
+        None => return false,
+    };
+    let normalized_rp = rp_id.trim().to_ascii_lowercase();
+    if parsed.port.is_some() {
+        return false;
+    }
+    parsed.host == normalized_rp
+}
+
+fn normalize_rp_id(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = if a.len() > b.len() { a.len() } else { b.len() };
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..max_len {
+        let ab = if i < a.len() { a[i] } else { 0 };
+        let bb = if i < b.len() { b[i] } else { 0 };
+        diff |= (ab ^ bb) as usize;
+    }
+    diff == 0
+}
+
+pub fn generate_bearer_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    let mut rng = std::fs::File::open("/dev/urandom").map_err(|e| format!("urandom: {}", e))?;
+    rng.read_exact(&mut bytes)
+        .map_err(|e| format!("urandom read: {}", e))?;
+    Ok(b64u_encode(&bytes))
+}
+
+#[derive(Clone)]
+pub struct LeaseEntry {
+    pub context: SignContext,
+    pub handler: Arc<SignHandler>,
+    pub lease_id: Option<String>,
+}
+
+pub struct SignContextRegistry {
+    entries: Mutex<HashMap<String, LeaseEntry>>,
+}
+
+impl SignContextRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn register_pending(
+        &self,
+        token: String,
+        context: SignContext,
+        handler: Arc<SignHandler>,
+    ) -> Result<(), String> {
+        let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
+        if map.contains_key(&token) {
+            return Err("duplicate token".into());
+        }
+        map.insert(
+            token,
+            LeaseEntry {
+                context,
+                handler,
+                lease_id: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn bind_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
+        let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
+        if !map.contains_key(token) {
+            return Err("token not found".into());
+        }
+        if map.get(token).unwrap().lease_id.is_some() {
+            return Err("already bound".into());
+        }
+        map.get_mut(token).unwrap().lease_id = Some(lease_id);
+        Ok(())
+    }
+
+    pub fn lookup_bound(&self, token: &str) -> Option<LeaseEntry> {
+        let map = match self.entries.lock() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        let mut found_key: Option<String> = None;
+        for k in map.keys() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                found_key = Some(k.clone());
+            }
+        }
+        match found_key {
+            Some(key) => {
+                let entry = map.get(&key)?;
+                entry.lease_id.is_some().then(|| entry.clone())
+            }
+            None => None,
+        }
+    }
+
+    pub fn revoke(&self, token: &str) -> bool {
+        let mut map = match self.entries.lock() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        map.remove(token).is_some()
+    }
+
+    pub fn revoke_by_lease(&self, lease_id: &str) -> usize {
+        let mut map = match self.entries.lock() {
+            Ok(m) => m,
+            Err(_) => return 0,
+        };
+        let keys: Vec<String> = map
+            .iter()
+            .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = keys.len();
+        for k in keys {
+            map.remove(&k);
+        }
+        count
+    }
+
+    pub fn revoke_all(&self) {
+        if let Ok(mut map) = self.entries.lock() {
+            map.clear();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    pub fn all_entries(&self) -> Vec<LeaseEntry> {
+        let map = match self.entries.lock() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        map.values().cloned().collect()
+    }
+}
+
+impl Default for SignContextRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct SignHttpServer {
+    listener: TcpListener,
+    addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+}
+
+const MAX_HTTP_BODY_SIZE: usize = 16_384;
+const MAX_HTTP_HEADER_SIZE: usize = 8192;
+const MAX_CONNECTIONS: usize = 8;
+
+impl SignHttpServer {
+    pub fn bind(shutdown: Arc<AtomicBool>) -> Result<Self, String> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {}", e))?;
+        listener
+            .set_nonblocking(false)
+            .map_err(|e| format!("set_nonblocking failed: {}", e))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr failed: {}", e))?;
+        Ok(Self {
+            listener,
+            addr,
+            shutdown,
+        })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    pub fn serve(self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
+        let shutdown = self.shutdown.clone();
+        let listener = self.listener;
+        thread::spawn(move || {
+            listener.set_nonblocking(true).expect("set_nonblocking");
+            let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let current = active_count.load(Ordering::Acquire);
+                        if current >= MAX_CONNECTIONS {
+                            continue;
+                        }
+                        active_count.fetch_add(1, Ordering::AcqRel);
+                        let registry = registry.clone();
+                        let count = active_count.clone();
+                        thread::spawn(move || {
+                            if let Err(e) = handle_http_connection(stream, &registry) {
+                                debug!("sign http connection error: {}", e);
+                            }
+                            count.fetch_sub(1, Ordering::AcqRel);
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        warn!("sign http accept error: {}", e);
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        })
+    }
+}
+
+fn send_http_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>) {
+    let content_length = body.map(|b| b.len()).unwrap_or(0);
+    let header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        status, content_length
+    );
+    let _ = stream.write_all(header.as_bytes());
+    if let Some(body) = body {
+        let _ = stream.write_all(body);
+    }
+}
+
+fn send_http_error(stream: &mut TcpStream, status: &str, code: &str) {
+    let body = format!("{{\"error\":\"{}\"}}", code);
+    send_http_response(stream, status, Some(body.as_bytes()));
+}
+
+const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\n";
+
+fn send_sign_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>) {
+    let content_length = body.map(|b| b.len()).unwrap_or(0);
+    let header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
+        status, content_length, CORS_HEADERS
+    );
+    let _ = stream.write_all(header.as_bytes());
+    if let Some(body) = body {
+        let _ = stream.write_all(body);
+    }
+}
+
+fn send_sign_error(stream: &mut TcpStream, status: &str, code: &str) {
+    let body = format!("{{\"error\":\"{}\"}}", code);
+    send_sign_response(stream, status, Some(body.as_bytes()));
+}
+
+fn send_preflight_response(stream: &mut TcpStream) {
+    let response = format!(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n{}\r\n",
+        CORS_HEADERS
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn handle_http_connection(
+    mut stream: TcpStream,
+    registry: &SignContextRegistry,
+) -> Result<(), String> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; MAX_HTTP_HEADER_SIZE + MAX_HTTP_BODY_SIZE];
+    let mut total = 0;
+    loop {
+        let n = stream
+            .read(&mut buf[total..])
+            .map_err(|e| format!("read: {}", e))?;
+        if n == 0 {
+            return Err("connection closed before headers complete".into());
+        }
+        total += n;
+        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if total >= MAX_HTTP_HEADER_SIZE {
+            send_http_error(&mut stream, "413 Payload Too Large", "request_too_large");
+            return Ok(());
+        }
+    }
+    let header_end = buf[..total]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("no header terminator")?;
+    let header_str = std::str::from_utf8(&buf[..header_end]).map_err(|_| "invalid utf-8")?;
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines.next().ok_or("no request line")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or("no method")?;
+    let path = parts.next().ok_or("no path")?;
+    if method == "OPTIONS" && path == "/sign" {
+        send_preflight_response(&mut stream);
+        return Ok(());
+    }
+    if method != "POST" || path != "/sign" {
+        send_http_error(&mut stream, "404 Not Found", "not_found");
+        return Ok(());
+    }
+    let mut auth_header = None;
+    let mut content_type_header = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("authorization:") {
+            auth_header = Some(
+                line.split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
+        } else if lower.starts_with("content-type:") {
+            content_type_header = Some(
+                line.split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+    let auth = match auth_header {
+        Some(a) => a,
+        None => {
+            send_sign_error(&mut stream, "401 Unauthorized", "missing_authorization");
+            return Ok(());
+        }
+    };
+    let token = match auth.strip_prefix("Bearer ") {
+        Some(t) => t,
+        None => {
+            send_sign_error(
+                &mut stream,
+                "401 Unauthorized",
+                "invalid_authorization_scheme",
+            );
+            return Ok(());
+        }
+    };
+    let entry = match registry.lookup_bound(token) {
+        Some(e) => e,
+        None => {
+            send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
+            return Ok(());
+        }
+    };
+    if let Some(ct) = content_type_header
+        && !ct.to_ascii_lowercase().starts_with("application/json")
+    {
+        send_sign_error(
+            &mut stream,
+            "415 Unsupported Media Type",
+            "unsupported_content_type",
+        );
+        return Ok(());
+    }
+    let body_start = header_end + 4;
+    let content_length: usize = header_str
+        .lines()
+        .find_map(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower
+                .strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_SIZE {
+        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+        return Ok(());
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(&buf[body_start..total]);
+    let remaining = content_length.saturating_sub(total - body_start);
+    if remaining > 0 {
+        if remaining > MAX_HTTP_BODY_SIZE {
+            send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+            return Ok(());
+        }
+        let mut extra = vec![0u8; remaining];
+        stream
+            .read_exact(&mut extra)
+            .map_err(|e| format!("read body: {}", e))?;
+        body.extend_from_slice(&extra);
+    }
+    if body.len() > MAX_HTTP_BODY_SIZE {
+        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+        return Ok(());
+    }
+    let req: SignAssertionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            send_sign_error(&mut stream, "400 Bad Request", "invalid_json");
+            return Ok(());
+        }
+    };
+    match entry.handler.sign(&entry.context, &req) {
+        Ok(resp) => {
+            let resp_body =
+                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
+            send_sign_response(&mut stream, "200 OK", Some(&resp_body));
+        }
+        Err(e) => {
+            let (status, code) = match e.code {
+                ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
+                ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
+                ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
+                ErrorCode::NotFound => ("404 Not Found", "not_found"),
+                _ => ("500 Internal Server Error", "internal_error"),
+            };
+            send_sign_error(&mut stream, status, code);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct SignContext {
+    pub profile_id: ProfileId,
+    pub active_grant_id: passless_core::agent::GrantId,
+    pub profile_config: AgentProfileConfig,
+}
+
+#[derive(Clone)]
+pub struct SignHandler {
+    pub human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+    pub policy_runtime: Arc<PolicyRuntime>,
+    pub audit_gate: Arc<AuditGate>,
+    pub security_config: SecurityConfig,
+    pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
+    pub operation_lock: Arc<Mutex<()>>,
+}
+
+impl SignHandler {
+    pub fn sign(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        let normalized_rp = normalize_rp_id(&req.rp_id);
+
+        if !verify_origin_structural(&req.origin, &normalized_rp) {
+            let deny_event = PolicyDenyBuilder::new(
+                ctx.profile_id.clone(),
+                AuditAction::Authenticate,
+                &normalized_rp,
+                PolicyDenyReason::OriginInvalid,
+            )
+            .build();
+            let _ = self.audit_gate.record(deny_event);
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "origin not valid for RP",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let _op_lock = self.operation_lock.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "operation lock poisoned",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        let grant_snapshot = self
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
+            .ok_or_else(|| {
+                let deny_event = PolicyDenyBuilder::new(
+                    ctx.profile_id.clone(),
+                    AuditAction::Authenticate,
+                    &normalized_rp,
+                    PolicyDenyReason::GrantNotFound,
+                )
+                .build();
+                let _ = self.audit_gate.record(deny_event);
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "active grant not valid",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+
+        if grant_snapshot.is_revoked {
+            let deny_event = PolicyDenyBuilder::new(
+                ctx.profile_id.clone(),
+                AuditAction::Authenticate,
+                &normalized_rp,
+                PolicyDenyReason::GrantRevoked,
+            )
+            .build();
+            let _ = self.audit_gate.record(deny_event);
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "grant revoked",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        if grant_snapshot.state != super::grant::GrantState::Active {
+            let deny_event = PolicyDenyBuilder::new(
+                ctx.profile_id.clone(),
+                AuditAction::Authenticate,
+                &normalized_rp,
+                PolicyDenyReason::GrantExpired,
+            )
+            .build();
+            let _ = self.audit_gate.record(deny_event);
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "grant expired",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        if !grant_snapshot
+            .rp_ids
+            .iter()
+            .any(|id| normalize_rp_id(id) == normalized_rp)
+        {
+            let deny_event = PolicyDenyBuilder::new(
+                ctx.profile_id.clone(),
+                AuditAction::Authenticate,
+                &normalized_rp,
+                PolicyDenyReason::RpIdNotMatch,
+            )
+            .build();
+            let _ = self.audit_gate.record(deny_event);
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "RP ID not in active grant",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let ceremony_policy = ctx
+            .profile_config
+            .rule_for_rp(&normalized_rp)
+            .and_then(|rule| {
+                if rule.authenticate.authorization
+                    == passless_core::agent::AgentAuthorization::Allow
+                {
+                    Some(rule.authenticate)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                let deny_event = PolicyDenyBuilder::new(
+                    ctx.profile_id.clone(),
+                    AuditAction::Authenticate,
+                    &normalized_rp,
+                    PolicyDenyReason::ActionNotAllowed,
+                )
+                .build();
+                let _ = self.audit_gate.record(deny_event);
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "RP policy does not allow signing",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+
+        let resolved_cred_ref = grant_snapshot.credential_refs.first().ok_or_else(|| {
+            let deny_event = PolicyDenyBuilder::new(
+                ctx.profile_id.clone(),
+                AuditAction::Authenticate,
+                &normalized_rp,
+                PolicyDenyReason::CredentialNotMatch,
+            )
+            .build();
+            let _ = self.audit_gate.record(deny_event);
+            ProtocolError::new(
+                ErrorCode::Forbidden,
+                "no credential in active grant",
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let mut storage = self.human_storage.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "storage lock poisoned",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        let cred_id = Self::resolve_credential_id(&mut storage, resolved_cred_ref, &normalized_rp)?;
+
+        if !req.allow_credentials.is_empty() {
+            let cred_id_b64u = b64u_encode(&cred_id);
+            if !req.allow_credentials.contains(&cred_id_b64u) {
+                let deny_event = PolicyDenyBuilder::new(
+                    ctx.profile_id.clone(),
+                    AuditAction::Authenticate,
+                    &normalized_rp,
+                    PolicyDenyReason::AllowCredentialsMismatch,
+                )
+                .build();
+                let _ = self.audit_gate.record(deny_event);
+                return Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "credential not in allow_credentials",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        }
+
+        let allow_event = PolicyAllowBuilder::new(
+            ctx.profile_id.clone(),
+            AuditAction::Authenticate,
+            &normalized_rp,
+        )
+        .evidence_sources(
+            &ceremony_policy.authorization.to_string(),
+            &ceremony_policy.user_presence.to_string(),
+            &ceremony_policy.user_verification.to_string(),
+        )
+        .build();
+        self.audit_gate.record(allow_event).map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "audit record failed",
+                RecommendedAction::Retry,
+            )
+        })?;
+
+        let cred = storage.read(&cred_id).map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                "credential not found in storage",
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let new_sign_count =
+            if self.security_config.constant_signature_counter || !cred.discoverable {
+                0
+            } else {
+                cred.sign_count.saturating_add(1)
+            };
+
+        let write_back = !self.security_config.constant_signature_counter && cred.discoverable;
+        if write_back {
+            let mut updated_cred = cred.clone();
+            updated_cred.sign_count = new_sign_count;
+            let cred_ref = soft_fido2::CredentialRef {
+                id: &updated_cred.id,
+                rp_id: &updated_cred.rp.id,
+                rp_name: updated_cred.rp.name.as_deref(),
+                user_id: &updated_cred.user.id,
+                user_name: updated_cred.user.name.as_deref(),
+                user_display_name: updated_cred.user.display_name.as_deref(),
+                sign_count: &updated_cred.sign_count,
+                alg: &updated_cred.alg,
+                key: &updated_cred.key,
+                created: &updated_cred.created,
+                discoverable: &updated_cred.discoverable,
+                cred_protect: updated_cred.extensions.cred_protect.as_ref(),
+                backup_state: &updated_cred.backup_state,
+                cred_random: updated_cred.extensions.cred_random.as_ref(),
+            };
+            storage.write(cred_ref).map_err(|_| {
+                let deny_event = PolicyDenyBuilder::new(
+                    ctx.profile_id.clone(),
+                    AuditAction::Authenticate,
+                    &normalized_rp,
+                    PolicyDenyReason::CounterPersistenceFailure,
+                )
+                .build();
+                let _ = self.audit_gate.record(deny_event);
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "failed to write updated credential",
+                    RecommendedAction::Retry,
+                )
+            })?;
+        }
+
+        let backup_flags = cred.backup_state.flags();
+        let up = ceremony_policy.user_presence != passless_core::agent::UserPresenceSource::None;
+        let uv = req.user_verification
+            || ceremony_policy.user_verification
+                != passless_core::agent::UserVerificationSource::None;
+
+        let authenticator_data =
+            build_authenticator_data(&normalized_rp, up, uv, backup_flags, new_sign_count);
+
+        let client_data_json =
+            build_client_data_json(&req.origin, &req.challenge_b64u, req.cross_origin);
+        let client_data_hash = Sha256::digest(&client_data_json);
+
+        let sig_input = [&authenticator_data[..], &client_data_hash[..]].concat();
+        let signature = self
+            .key_provider
+            .sign(&cred.key, cred.alg, &sig_input)
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "signing failed",
+                    RecommendedAction::Retry,
+                )
+            })?;
+
+        Ok(PrincipalResponse::SignAssertionResult(
+            SignAssertionResponse {
+                credential_id_b64u: b64u_encode(&cred.id),
+                authenticator_data_b64u: b64u_encode(&authenticator_data),
+                signature_b64u: b64u_encode(&signature),
+                user_handle_b64u: b64u_encode(&cred.user.id),
+                client_data_json_b64u: b64u_encode(&client_data_json),
+            },
+        ))
+    }
+
+    fn resolve_credential_id(
+        storage: &mut Box<dyn CredentialStorage>,
+        cred_ref: &CredentialRef,
+        rp_id: &str,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let cred = storage
+            .read_first(crate::storage::CredentialFilter::ByRp(rp_id.to_string()))
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::NotFound,
+                    "no credentials for RP in storage",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+        let href = CredentialRef::with_default_domain(&cred.id);
+        if href == *cred_ref {
+            return Ok(cred.id.clone());
+        }
+        while let Ok(cred) = storage.read_next() {
+            let href = CredentialRef::with_default_domain(&cred.id);
+            if href == *cred_ref {
+                return Ok(cred.id.clone());
+            }
+        }
+        Err(ProtocolError::new(
+            ErrorCode::NotFound,
+            "credential ref not found in storage",
+            RecommendedAction::FixRequest,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_data_json_no_cross_origin() {
+        let cdj = build_client_data_json("https://example.com", "dGVzdA", false);
+        let expected =
+            br#"{"type":"webauthn.get","challenge":"dGVzdA","origin":"https://example.com"}"#;
+        assert_eq!(cdj, expected);
+    }
+
+    #[test]
+    fn test_client_data_json_with_cross_origin() {
+        let cdj = build_client_data_json("https://example.com", "dGVzdA", true);
+        let expected = br#"{"type":"webauthn.get","challenge":"dGVzdA","origin":"https://example.com","crossOrigin":true}"#;
+        assert_eq!(cdj, expected);
+    }
+
+    #[test]
+    fn test_client_data_json_cross_origin_false_omitted() {
+        let cdj = build_client_data_json("https://example.com", "dGVzdA", false);
+        let s = std::str::from_utf8(&cdj).unwrap();
+        assert!(!s.contains("crossOrigin"));
+    }
+
+    #[test]
+    fn test_client_data_json_escaping() {
+        let cdj = build_client_data_json("https://ex\"ample.com", "dGVzdA", false);
+        let s = std::str::from_utf8(&cdj).unwrap();
+        assert!(s.contains("ex\\\"ample.com"));
+    }
+
+    #[test]
+    fn test_authenticator_data_bytes() {
+        let auth_data = build_authenticator_data("example.com", true, true, 0x08, 42);
+        assert_eq!(auth_data.len(), 37);
+        let mut hasher = Sha256::new();
+        hasher.update(b"example.com");
+        let expected_rp_hash = hasher.finalize();
+        assert_eq!(&auth_data[0..32], expected_rp_hash.as_slice());
+        assert_eq!(auth_data[32], 0x01 | 0x04 | 0x08);
+        assert_eq!(&auth_data[33..37], &42u32.to_be_bytes());
+    }
+
+    #[test]
+    fn test_authenticator_data_no_flags() {
+        let auth_data = build_authenticator_data("example.com", false, false, 0, 0);
+        assert_eq!(auth_data[32], 0x00);
+        assert_eq!(&auth_data[33..37], &0u32.to_be_bytes());
+    }
+
+    #[test]
+    fn test_authenticator_data_backup_flags() {
+        let auth_data = build_authenticator_data("example.com", true, false, 0x08, 0);
+        assert_eq!(auth_data[32], 0x01 | 0x08);
+    }
+
+    #[test]
+    fn test_origin_verification_exact_match() {
+        assert!(verify_origin_structural(
+            "https://example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_denied() {
+        assert!(!verify_origin_structural("https://evil.com", "example.com"));
+    }
+
+    #[test]
+    fn test_origin_verification_rejects_http() {
+        assert!(!verify_origin_structural(
+            "http://example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_rejects_port() {
+        assert!(!verify_origin_structural(
+            "https://example.com:8443",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_rejects_path() {
+        assert!(!verify_origin_structural(
+            "https://example.com/path",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_rejects_query() {
+        assert!(!verify_origin_structural(
+            "https://example.com?foo=bar",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_rejects_fragment() {
+        assert!(!verify_origin_structural(
+            "https://example.com#frag",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_rejects_credentials() {
+        assert!(!verify_origin_structural(
+            "https://user:pass@example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_case_insensitive_host() {
+        assert!(verify_origin_structural(
+            "https://Example.COM",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_parse_origin_valid() {
+        let parsed = parse_origin("https://example.com").unwrap();
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, None);
+    }
+
+    #[test]
+    fn test_parse_origin_with_port() {
+        let parsed = parse_origin("https://example.com:8443").unwrap();
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, Some(8443));
+    }
+
+    #[test]
+    fn test_parse_origin_invalid_scheme() {
+        assert!(parse_origin("http://example.com").is_none());
+    }
+
+    #[test]
+    fn test_parse_origin_empty_host() {
+        assert!(parse_origin("https://").is_none());
+    }
+
+    #[test]
+    fn test_b64u_roundtrip() {
+        let data = b"hello world";
+        let encoded = b64u_encode(data);
+        let decoded = b64u_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_b64u_no_padding() {
+        assert!(!b64u_encode(b"a").contains('='));
+        assert!(!b64u_encode(b"ab").contains('='));
+        assert!(!b64u_encode(b"abc").contains('='));
+    }
+
+    #[test]
+    fn test_b64u_empty() {
+        assert_eq!(b64u_encode(b""), "");
+        assert_eq!(b64u_decode("").unwrap(), b"");
+    }
+
+    #[test]
+    fn test_constant_time_eq_equal() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_not_equal() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_length() {
+        assert!(!constant_time_eq(b"hello", b"hell"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_43_vs_299_bytes() {
+        let a = vec![0u8; 43];
+        let b = vec![0u8; 299];
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_constant_time_eq_empty_nonempty() {
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"x", b""));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_http_server_binds_loopback() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        assert!(server.addr().ip().is_loopback());
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn test_generate_bearer_token_entropy() {
+        let token = generate_bearer_token().unwrap();
+        let decoded = b64u_decode(&token).unwrap();
+        assert_eq!(decoded.len(), 32);
+        assert!(!token.contains('='));
+        assert!(!token.contains('+'));
+        assert!(!token.contains('/'));
+    }
+
+    #[test]
+    fn test_generate_bearer_token_unique() {
+        let t1 = generate_bearer_token().unwrap();
+        let t2 = generate_bearer_token().unwrap();
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn test_generate_bearer_token_format() {
+        let token = generate_bearer_token().unwrap();
+        assert_eq!(token.len(), 43);
+        for ch in token.chars() {
+            assert!(
+                ch.is_ascii_alphanumeric() || ch == '-' || ch == '_',
+                "invalid char in token: {}",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_register_and_lookup_denies_unbound() {
+        let registry = SignContextRegistry::new();
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        assert!(registry.lookup_bound(&token).is_none());
+    }
+
+    #[test]
+    fn test_registry_bind_and_lookup() {
+        let registry = SignContextRegistry::new();
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry.bind_lease(&token, "lease-1".to_string()).unwrap();
+        assert!(registry.lookup_bound(&token).is_some());
+    }
+
+    #[test]
+    fn test_registry_duplicate_token() {
+        let registry = SignContextRegistry::new();
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx.clone(), handler.clone())
+            .unwrap();
+        assert!(registry.register_pending(token, ctx, handler).is_err());
+    }
+
+    #[test]
+    fn test_registry_duplicate_lease_binding() {
+        let registry = SignContextRegistry::new();
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry.bind_lease(&token, "lease-1".to_string()).unwrap();
+        assert!(registry.bind_lease(&token, "lease-2".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_registry_two_token_isolation() {
+        let registry = SignContextRegistry::new();
+        let t1 = generate_bearer_token().unwrap();
+        let t2 = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(t1.clone(), ctx.clone(), handler.clone())
+            .unwrap();
+        registry.register_pending(t2.clone(), ctx, handler).unwrap();
+        registry.bind_lease(&t1, "lease-a".to_string()).unwrap();
+        registry.bind_lease(&t2, "lease-b".to_string()).unwrap();
+        let e1 = registry.lookup_bound(&t1).unwrap();
+        let e2 = registry.lookup_bound(&t2).unwrap();
+        assert_eq!(e1.lease_id.as_deref(), Some("lease-a"));
+        assert_eq!(e2.lease_id.as_deref(), Some("lease-b"));
+    }
+
+    #[test]
+    fn test_registry_unknown_token() {
+        let registry = SignContextRegistry::new();
+        assert!(registry.lookup_bound("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_registry_revoke() {
+        let registry = SignContextRegistry::new();
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry.bind_lease(&token, "lease-1".to_string()).unwrap();
+        assert!(registry.revoke(&token));
+        assert!(registry.lookup_bound(&token).is_none());
+        assert!(!registry.revoke(&token));
+    }
+
+    #[test]
+    fn test_registry_revoke_by_lease() {
+        let registry = SignContextRegistry::new();
+        let t1 = generate_bearer_token().unwrap();
+        let t2 = generate_bearer_token().unwrap();
+        let t3 = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(t1.clone(), ctx.clone(), handler.clone())
+            .unwrap();
+        registry
+            .register_pending(t2.clone(), ctx.clone(), handler.clone())
+            .unwrap();
+        registry.register_pending(t3.clone(), ctx, handler).unwrap();
+        registry.bind_lease(&t1, "lease-x".to_string()).unwrap();
+        registry.bind_lease(&t2, "lease-x".to_string()).unwrap();
+        registry.bind_lease(&t3, "lease-y".to_string()).unwrap();
+        assert_eq!(registry.revoke_by_lease("lease-x"), 2);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.lookup_bound(&t3).is_some());
+    }
+
+    #[test]
+    fn test_registry_revoke_all() {
+        let registry = SignContextRegistry::new();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        for i in 0..3 {
+            let token = generate_bearer_token().unwrap();
+            registry
+                .register_pending(token.clone(), ctx.clone(), handler.clone())
+                .unwrap();
+            registry.bind_lease(&token, format!("lease-{}", i)).unwrap();
+        }
+        assert_eq!(registry.len(), 3);
+        registry.revoke_all();
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_concurrent_lookup_revoke() {
+        let registry = Arc::new(SignContextRegistry::new());
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        let mut tokens = Vec::new();
+        for i in 0..20 {
+            let token = generate_bearer_token().unwrap();
+            registry
+                .register_pending(token.clone(), ctx.clone(), handler.clone())
+                .unwrap();
+            registry.bind_lease(&token, format!("lease-{}", i)).unwrap();
+            tokens.push(token);
+        }
+        let mut handles = Vec::new();
+        for token in tokens.clone() {
+            let reg = registry.clone();
+            handles.push(thread::spawn(move || {
+                let _ = reg.lookup_bound(&token);
+                let _ = reg.revoke(&token);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_agent_endpoint_metadata_contains_sign_port_and_bearer() {
+        use crate::agent::browser::AgentEndpointMetadata;
+        let token = generate_bearer_token().unwrap();
+        let metadata = AgentEndpointMetadata {
+            port: 12345,
+            bearer_token: token.clone(),
+        };
+        assert_eq!(metadata.port, 12345);
+        assert_eq!(metadata.bearer_token, token);
+    }
+
+    #[test]
+    fn test_register_then_revoke_cleans_up_before_bind() {
+        let registry = SignContextRegistry::new();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        let token = generate_bearer_token().unwrap();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        assert!(registry.lookup_bound(&token).is_none());
+        assert_eq!(registry.len(), 1);
+        assert!(registry.revoke(&token));
+        assert_eq!(registry.len(), 0);
+        assert!(registry.lookup_bound(&token).is_none());
+    }
+
+    #[test]
+    fn test_register_bind_then_revoke_cleans_up() {
+        let registry = SignContextRegistry::new();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        let token = generate_bearer_token().unwrap();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry
+            .bind_lease(&token, "lease-rollback".to_string())
+            .unwrap();
+        assert!(registry.lookup_bound(&token).is_some());
+        assert!(registry.revoke(&token));
+        assert_eq!(registry.len(), 0);
+        assert!(registry.lookup_bound(&token).is_none());
+    }
+
+    #[test]
+    fn test_http_valid_bound_roundtrip() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry.bind_lease(&token, "lease-rt".to_string()).unwrap();
+        let handle = server.serve(registry);
+        let body = serde_json::to_vec(&SignAssertionRequest {
+            origin: "https://example.com".to_string(),
+            rp_id: "example.com".to_string(),
+            challenge_b64u: "dGVzdA".to_string(),
+            allow_credentials: vec![],
+            user_verification: false,
+            cross_origin: false,
+        })
+        .unwrap();
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            token,
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        let mut resp_buf = vec![0u8; 8192];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("200 OK"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_unknown_bearer_401() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let handle = server.serve(registry);
+        let body = b"{}";
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer unknown_token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("401"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_unbound_bearer_401() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        let handle = server.serve(registry);
+        let body = b"{}";
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            token,
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("401"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_revoked_bearer_401() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry
+            .bind_lease(&token, "lease-rev".to_string())
+            .unwrap();
+        registry.revoke(&token);
+        let handle = server.serve(registry);
+        let body = b"{}";
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            token,
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("401"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_missing_bearer() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let handle = server.serve(registry);
+        let body = b"{}";
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("401"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_wrong_method() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry.bind_lease(&token, "lease-m".to_string()).unwrap();
+        let handle = server.serve(registry);
+        let request = format!(
+            "GET /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
+            token
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("404"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_wrong_path() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry.bind_lease(&token, "lease-p".to_string()).unwrap();
+        let handle = server.serve(registry);
+        let request = format!(
+            "POST /other HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+            token
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("404"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_listener_loopback_only() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        assert!(server.addr().ip().is_loopback());
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn test_shutdown_join() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let registry = Arc::new(SignContextRegistry::new());
+        let handle = server.serve(registry);
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_p256_sign_verify_through_provider() {
+        let provider = soft_fido2::SoftwareCredentialKeyProvider;
+        let generated = provider.generate(-7).unwrap();
+        let message = b"test message for signing";
+        let signature = provider.sign(&generated.key, -7, message).unwrap();
+        assert!(!signature.is_empty());
+    }
+
+    #[test]
+    fn test_http_options_sign_preflight() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let handle = server.serve(registry);
+        let request = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("204 No Content"));
+        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
+        assert!(resp_str.contains("Access-Control-Allow-Methods: POST"));
+        assert!(resp_str.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
+        assert!(!resp_str.contains("Access-Control-Allow-Credentials"));
+        assert!(!resp_str.contains("evil.example.com"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_options_wrong_path_404() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let handle = server.serve(registry);
+        let request = "OPTIONS /other HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("404"));
+        assert!(!resp_str.contains("Access-Control"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_post_error_has_cors_no_reflected_origin() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let handle = server.serve(registry);
+        let body = b"{}";
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("401"));
+        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
+        assert!(!resp_str.contains("attacker.example.com"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_success_has_cors() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        registry
+            .bind_lease(&token, "lease-cors".to_string())
+            .unwrap();
+        let handle = server.serve(registry);
+        let body = serde_json::to_vec(&SignAssertionRequest {
+            origin: "https://example.com".to_string(),
+            rp_id: "example.com".to_string(),
+            challenge_b64u: "dGVzdA".to_string(),
+            allow_credentials: vec![],
+            user_verification: false,
+            cross_origin: false,
+        })
+        .unwrap();
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            token,
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        let mut resp_buf = vec![0u8; 8192];
+        let n = stream.read(&mut resp_buf).unwrap();
+        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
+        assert!(resp_str.contains("200 OK"));
+        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
+        assert!(resp_str.contains("Access-Control-Allow-Methods: POST"));
+        assert!(resp_str.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_http_unbound_bearer_same_401_as_unknown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let addr = server.addr();
+        let registry = Arc::new(SignContextRegistry::new());
+        let token = generate_bearer_token().unwrap();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let ctx = f.make_ctx();
+        registry
+            .register_pending(token.clone(), ctx, handler)
+            .unwrap();
+        let handle = server.serve(registry);
+        let body = b"{}";
+        let request = format!(
+            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            token,
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let mut total = 0;
+        loop {
+            let n = stream.read(&mut resp_buf[total..]).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                let header_end = resp_buf[..total]
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .unwrap();
+                let header_str = std::str::from_utf8(&resp_buf[..header_end]).unwrap();
+                if let Some(cl) = header_str.lines().find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                }) {
+                    let body_start = header_end + 4;
+                    let body_len = total.saturating_sub(body_start);
+                    if body_len >= cl {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        let resp_str = std::str::from_utf8(&resp_buf[..total]).unwrap();
+        assert!(resp_str.contains("401"));
+        assert!(resp_str.contains("invalid_bearer"));
+        assert!(!resp_str.contains("unbound_bearer"));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap();
+    }
+
+    pub(super) mod sign_handler_tests {
+        use super::*;
+        use crate::agent::audit::AuditGate;
+        use crate::agent::browser;
+        use crate::agent::grant::GrantRequestParams;
+        use crate::agent::intent;
+        use crate::agent::policy_engine::PolicyRuntime;
+        use crate::storage::{CredentialFilter, CredentialStorage};
+        use passless_core::agent::{
+            AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
+            AgentRpRule, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+        };
+        use passless_core::config::SecurityConfig;
+        use soft_fido2::{
+            CredentialBackupState, CredentialKey, CredentialKeyError, CredentialKeyProviderId,
+            GeneratedCredentialKey, RelyingParty, SoftwareCredentialKeyProvider, User,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        use std::time::Instant;
+
+        struct MockClock {
+            inner: Mutex<MockClockInner>,
+        }
+        struct MockClockInner {
+            base: Instant,
+            offset: Duration,
+        }
+        impl MockClock {
+            fn new() -> Self {
+                Self {
+                    inner: Mutex::new(MockClockInner {
+                        base: Instant::now(),
+                        offset: Duration::ZERO,
+                    }),
+                }
+            }
+            fn advance(&self, d: Duration) {
+                self.inner.lock().unwrap().offset += d;
+            }
+        }
+        impl browser::Clock for MockClock {
+            fn now(&self) -> Instant {
+                let inner = self.inner.lock().unwrap();
+                inner.base + inner.offset
+            }
+            fn monotonic_secs(&self) -> u64 {
+                self.inner.lock().unwrap().offset.as_secs()
+            }
+        }
+
+        struct MockMonoClock {
+            inner: Mutex<MockClockInner>,
+        }
+        impl MockMonoClock {
+            fn new() -> Self {
+                Self {
+                    inner: Mutex::new(MockClockInner {
+                        base: Instant::now(),
+                        offset: Duration::ZERO,
+                    }),
+                }
+            }
+        }
+        impl intent::MonotonicClock for MockMonoClock {
+            fn now(&self) -> intent::MonotonicTime {
+                let inner = self.inner.lock().unwrap();
+                let elapsed = inner.offset;
+                intent::MonotonicTime::from_millis(elapsed.as_millis() as u64)
+            }
+        }
+
+        struct RecordingKeyProvider {
+            inner: SoftwareCredentialKeyProvider,
+            sign_count: AtomicUsize,
+        }
+        impl RecordingKeyProvider {
+            fn new() -> Self {
+                Self {
+                    inner: SoftwareCredentialKeyProvider,
+                    sign_count: AtomicUsize::new(0),
+                }
+            }
+            fn sign_calls(&self) -> usize {
+                self.sign_count.load(Ordering::Acquire)
+            }
+        }
+        impl soft_fido2::CredentialKeyProvider for RecordingKeyProvider {
+            fn provider_id(&self) -> CredentialKeyProviderId {
+                self.inner.provider_id()
+            }
+            fn supports_algorithm(&self, algorithm: i32) -> bool {
+                self.inner.supports_algorithm(algorithm)
+            }
+            fn generate(
+                &self,
+                algorithm: i32,
+            ) -> core::result::Result<GeneratedCredentialKey, CredentialKeyError> {
+                self.inner.generate(algorithm)
+            }
+            fn sign(
+                &self,
+                key: &CredentialKey,
+                algorithm: i32,
+                data: &[u8],
+            ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
+                self.sign_count.fetch_add(1, Ordering::AcqRel);
+                self.inner.sign(key, algorithm, data)
+            }
+        }
+
+        struct WriteCountingStorage {
+            creds: Mutex<Vec<soft_fido2::Credential>>,
+            write_count: AtomicU64,
+        }
+        impl WriteCountingStorage {
+            fn new() -> Self {
+                Self {
+                    creds: Mutex::new(Vec::new()),
+                    write_count: AtomicU64::new(0),
+                }
+            }
+            fn writes(&self) -> u64 {
+                self.write_count.load(Ordering::Acquire)
+            }
+            fn add_cred(&self, cred: soft_fido2::Credential) {
+                self.creds.lock().unwrap().push(cred);
+            }
+        }
+        impl CredentialStorage for WriteCountingStorage {
+            fn read_first(
+                &mut self,
+                filter: CredentialFilter,
+            ) -> soft_fido2::Result<soft_fido2::Credential> {
+                let creds = self.creds.lock().unwrap();
+                match filter {
+                    CredentialFilter::ByRp(rp_id) => creds
+                        .iter()
+                        .find(|c| c.rp.id == rp_id)
+                        .cloned()
+                        .ok_or(soft_fido2::Error::Other),
+                    CredentialFilter::None => {
+                        creds.first().cloned().ok_or(soft_fido2::Error::Other)
+                    }
+                    CredentialFilter::ById(id) => creds
+                        .iter()
+                        .find(|c| c.id == id)
+                        .cloned()
+                        .ok_or(soft_fido2::Error::Other),
+                    CredentialFilter::ByHash(_) => Err(soft_fido2::Error::Other),
+                }
+            }
+            fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+                Err(soft_fido2::Error::Other)
+            }
+            fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+                self.creds
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c.id == id)
+                    .cloned()
+                    .ok_or(soft_fido2::Error::Other)
+            }
+            fn write(&mut self, cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+                self.write_count.fetch_add(1, Ordering::AcqRel);
+                let owned = cred.to_owned();
+                let mut creds = self.creds.lock().unwrap();
+                if let Some(existing) = creds.iter_mut().find(|c| c.id == owned.id) {
+                    *existing = owned;
+                } else {
+                    creds.push(owned);
+                }
+                Ok(())
+            }
+            fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
+                self.creds.lock().unwrap().retain(|c| c.id != id);
+                Ok(())
+            }
+            fn count_credentials(&self) -> usize {
+                self.creds.lock().unwrap().len()
+            }
+        }
+
+        pub struct TestFixture {
+            profile_id: ProfileId,
+            grant_id: passless_core::agent::GrantId,
+            clock: Arc<MockClock>,
+            policy_runtime: Arc<PolicyRuntime>,
+            storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+            key_provider: Arc<RecordingKeyProvider>,
+            audit_gate: Arc<AuditGate>,
+            operation_lock: Arc<Mutex<()>>,
+            security_config: SecurityConfig,
+            profile_config: AgentProfileConfig,
+        }
+
+        impl TestFixture {
+            pub fn new(constant_counter: bool) -> Self {
+                let tmp = tempfile::tempdir().unwrap();
+                let audit_path = tmp.path().to_path_buf();
+                drop(tmp);
+                std::fs::create_dir_all(&audit_path).unwrap();
+                std::fs::set_permissions(
+                    &audit_path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                )
+                .unwrap();
+                let audit_gate = Arc::new(AuditGate::open(&audit_path).unwrap());
+
+                let profile_id = ProfileId::new("test-profile").unwrap();
+                let cred_id = vec![1u8; 32];
+                let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred_id);
+
+                let provider = SoftwareCredentialKeyProvider;
+                let generated = provider.generate(-7).unwrap();
+                let key = generated.key;
+
+                let cred = soft_fido2::Credential {
+                    id: cred_id.clone(),
+                    rp: RelyingParty::new("example.com".into()),
+                    user: User::new(vec![1, 2, 3]),
+                    sign_count: 0,
+                    alg: -7,
+                    key: key.clone(),
+                    created: 0,
+                    discoverable: true,
+                    backup_state: CredentialBackupState::NotEligible,
+                    extensions: soft_fido2::Extensions::default(),
+                };
+
+                let storage = Arc::new(Mutex::new(Box::new({
+                    let s = WriteCountingStorage::new();
+                    s.add_cred(cred);
+                    s
+                })
+                    as Box<dyn CredentialStorage>));
+
+                let profile_config = AgentProfileConfig {
+                    mode: AgentMode::DelegatedSession,
+                    principal_user: String::new(),
+                    rp_ids: vec!["example.com".to_string()],
+                    require_uv: false,
+                    credential_refs: Some(vec![cred_ref.clone()]),
+                    max_grant_ttl: None,
+                    max_session_ttl: None,
+                    storage: None,
+                    registration_allowed: false,
+                    rules: vec![AgentRpRule {
+                        rp_id: "example.com".to_string(),
+                        register: AgentCeremonyPolicy::deny(),
+                        authenticate: AgentCeremonyPolicy {
+                            authorization: AgentAuthorization::Allow,
+                            user_presence: UserPresenceSource::Policy,
+                            user_verification: UserVerificationSource::Policy,
+                        },
+                    }],
+                    delegated_registration_storage: None,
+                    device: DeviceIdentity {
+                        name: "test-device".to_string(),
+                        phys: "test-phys".to_string(),
+                        uniq: "test-uniq".to_string(),
+                        vendor_id: 0x1234,
+                        product_id: 0x5678,
+                    },
+                    start_url: None,
+                    browser_command: None,
+                    browser_user: None,
+                    browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
+                };
+
+                let mut profiles = BTreeMap::new();
+                profiles.insert("test-profile".to_string(), profile_config.clone());
+                let agent_config = AgentConfig {
+                    enabled: true,
+                    profiles,
+                    audit_path: Some(audit_path),
+                };
+
+                let clock = Arc::new(MockClock::new());
+                let mono_clock = Arc::new(MockMonoClock::new());
+
+                let policy_runtime = Arc::new(
+                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                );
+
+                let session_id = passless_core::agent::PrincipalSessionId::new();
+                let endpoint_id = passless_core::agent::EndpointId::new();
+
+                let grant_req_id = policy_runtime
+                    .admin_request_grant(GrantRequestParams {
+                        profile_id: profile_id.clone(),
+                        session_id: session_id.clone(),
+                        endpoint_id: endpoint_id.clone(),
+                        principal_digest: [0u8; 32],
+                        rp_ids: vec!["example.com".to_string()],
+                        credentials: vec![cred_ref.clone()],
+                        requested_ttl_secs: 300,
+                    })
+                    .unwrap();
+
+                let authority = intent::admin_authority();
+                let grant_id = policy_runtime
+                    .admin_approve_grant(&grant_req_id, &authority)
+                    .unwrap();
+
+                let key_provider = Arc::new(RecordingKeyProvider::new());
+                let operation_lock = Arc::new(Mutex::new(()));
+                let security_config = SecurityConfig {
+                    check_mlock: false,
+                    disable_core_dumps: false,
+                    constant_signature_counter: constant_counter,
+                    enable_credential_backup: false,
+                    always_uv: false,
+                    user_verification_registration: false,
+                    user_verification_authentication: false,
+                    notification_timeout: 0,
+                };
+
+                Self {
+                    profile_id,
+                    grant_id,
+                    clock,
+                    policy_runtime,
+                    storage,
+                    key_provider,
+                    audit_gate,
+                    operation_lock,
+                    security_config,
+                    profile_config,
+                }
+            }
+
+            pub fn make_handler(&self) -> SignHandler {
+                SignHandler {
+                    human_storage: self.storage.clone(),
+                    policy_runtime: self.policy_runtime.clone(),
+                    audit_gate: self.audit_gate.clone(),
+                    security_config: self.security_config.clone(),
+                    key_provider: self.key_provider.clone(),
+                    operation_lock: self.operation_lock.clone(),
+                }
+            }
+
+            pub fn make_ctx(&self) -> SignContext {
+                SignContext {
+                    profile_id: self.profile_id.clone(),
+                    active_grant_id: self.grant_id.clone(),
+                    profile_config: self.profile_config.clone(),
+                }
+            }
+
+            fn make_req(&self) -> SignAssertionRequest {
+                SignAssertionRequest {
+                    origin: "https://example.com".to_string(),
+                    rp_id: "example.com".to_string(),
+                    challenge_b64u: "dGVzdA".to_string(),
+                    allow_credentials: vec![],
+                    user_verification: false,
+                    cross_origin: false,
+                }
+            }
+        }
+
+        fn assert_denied(
+            result: &Result<PrincipalResponse, ProtocolError>,
+            provider: &RecordingKeyProvider,
+            storage_writes_before: u64,
+            storage: &WriteCountingStorage,
+        ) {
+            assert!(result.is_err());
+            assert_eq!(provider.sign_calls(), 0);
+            assert_eq!(storage.writes(), storage_writes_before);
+        }
+
+        fn get_write_counting_storage(
+            storage: &Arc<Mutex<Box<dyn CredentialStorage>>>,
+        ) -> &WriteCountingStorage {
+            let boxed = storage.lock().unwrap();
+            unsafe {
+                &*(boxed.as_ref() as *const dyn CredentialStorage as *const WriteCountingStorage)
+            }
+        }
+
+        #[test]
+        fn sign_allow_and_verify() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn sign_wrong_origin_denied() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.origin = "https://evil.com".to_string();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn sign_wrong_rp_denied() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.rp_id = "other.com".to_string();
+            req.origin = "https://other.com".to_string();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn sign_wrong_allow_credentials_denied() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.allow_credentials = vec!["d3Jvbmc".to_string()];
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn sign_wrong_grant_denied() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let fake_grant_id = passless_core::agent::GrantId::new();
+            let ctx = SignContext {
+                profile_id: f.profile_id.clone(),
+                active_grant_id: fake_grant_id,
+                profile_config: f.profile_config.clone(),
+            };
+            let req = f.make_req();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn sign_wrong_profile_denied() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let wrong_profile = ProfileId::new("wrong-profile").unwrap();
+            let ctx = SignContext {
+                profile_id: wrong_profile,
+                active_grant_id: f.grant_id.clone(),
+                profile_config: f.profile_config.clone(),
+            };
+            let req = f.make_req();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn sign_expired_grant_denied() {
+            let f = TestFixture::new(true);
+            f.clock.advance(Duration::from_secs(301));
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn sign_revoked_grant_denied() {
+            let f = TestFixture::new(true);
+            f.policy_runtime.revoke_grant_by_id(&f.grant_id).unwrap();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert_denied(
+                &result,
+                &f.key_provider,
+                writes_before,
+                get_write_counting_storage(&f.storage),
+            );
+        }
+
+        #[test]
+        fn constant_counter_no_write() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+            assert_eq!(
+                get_write_counting_storage(&f.storage).writes(),
+                writes_before
+            );
+        }
+
+        #[test]
+        fn monotonic_sequential_counter() {
+            let f = TestFixture::new(false);
+            for i in 0..3u32 {
+                let handler = f.make_handler();
+                let ctx = f.make_ctx();
+                let req = f.make_req();
+                let result = handler.sign(&ctx, &req);
+                assert!(result.is_ok());
+                assert_eq!(
+                    get_write_counting_storage(&f.storage).writes(),
+                    (i + 1) as u64
+                );
+            }
+        }
+
+        #[test]
+        fn concurrent_counter_serialization() {
+            let f = TestFixture::new(false);
+            let handler = Arc::new(f.make_handler());
+            let ctx = Arc::new(f.make_ctx());
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let h = handler.clone();
+                let c = ctx.clone();
+                handles.push(std::thread::spawn(move || {
+                    let req = SignAssertionRequest {
+                        origin: "https://example.com".to_string(),
+                        rp_id: "example.com".to_string(),
+                        challenge_b64u: "dGVzdA".to_string(),
+                        allow_credentials: vec![],
+                        user_verification: false,
+                        cross_origin: false,
+                    };
+                    h.sign(&c, &req)
+                }));
+            }
+            let mut success_count = 0;
+            for h in handles {
+                if h.join().unwrap().is_ok() {
+                    success_count += 1;
+                }
+            }
+            assert_eq!(success_count, 4);
+            assert_eq!(get_write_counting_storage(&f.storage).writes(), 4);
+        }
+
+        #[test]
+        fn persisted_counter_visible_after_reconstruct() {
+            let f = TestFixture::new(false);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+            assert_eq!(get_write_counting_storage(&f.storage).writes(), 1);
+
+            let handler2 = f.make_handler();
+            let ctx2 = f.make_ctx();
+            let req2 = f.make_req();
+            let result2 = handler2.sign(&ctx2, &req2);
+            assert!(result2.is_ok());
+            assert_eq!(get_write_counting_storage(&f.storage).writes(), 2);
+        }
+
+        #[test]
+        fn ipc_dispatch_uses_same_sign_core_as_delegation() {
+            let f = TestFixture::new(true);
+            let delegation_handler = f.make_handler();
+            let delegation_ctx = f.make_ctx();
+            let delegation_req = f.make_req();
+            let delegation_result = delegation_handler.sign(&delegation_ctx, &delegation_req);
+            assert!(delegation_result.is_ok());
+
+            let ipc_handler = f.make_handler();
+            let ipc_ctx = f.make_ctx();
+            let ipc_req = f.make_req();
+            let ipc_result = ipc_handler.sign(&ipc_ctx, &ipc_req);
+            assert!(ipc_result.is_ok());
+
+            match (&delegation_result, &ipc_result) {
+                (
+                    Ok(PrincipalResponse::SignAssertionResult(dr)),
+                    Ok(PrincipalResponse::SignAssertionResult(ir)),
+                ) => {
+                    assert_eq!(dr.credential_id_b64u, ir.credential_id_b64u);
+                    assert_eq!(dr.signature_b64u, ir.signature_b64u);
+                    assert_eq!(dr.authenticator_data_b64u, ir.authenticator_data_b64u);
+                }
+                _ => panic!("expected SignAssertionResult from both"),
+            }
+        }
+
+        #[test]
+        fn ipc_handler_constructed_from_delegated_deps_can_sign() {
+            let f = TestFixture::new(true);
+            let storage = f.storage.clone();
+            let policy_runtime = f.policy_runtime.clone();
+            let audit_gate = f.audit_gate.clone();
+            let key_provider = f.key_provider.clone();
+            let operation_lock = f.operation_lock.clone();
+            let security_config = f.security_config.clone();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+
+            let handler = SignHandler {
+                human_storage: storage,
+                policy_runtime: policy_runtime.clone(),
+                audit_gate: audit_gate.clone(),
+                security_config: security_config.clone(),
+                key_provider: key_provider.clone(),
+                operation_lock: operation_lock.clone(),
+            };
+
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn sign_handler_is_identical_struct_for_ipc_and_delegation() {
+            let f = TestFixture::new(true);
+            let handler = f.make_handler();
+
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+
+            let handler2 = f.make_handler();
+            let ctx2 = f.make_ctx();
+            let req2 = f.make_req();
+            let result2 = handler2.sign(&ctx2, &req2);
+            assert!(result2.is_ok());
+
+            match (&result, &result2) {
+                (
+                    Ok(PrincipalResponse::SignAssertionResult(a)),
+                    Ok(PrincipalResponse::SignAssertionResult(b)),
+                ) => {
+                    assert_eq!(a.credential_id_b64u, b.credential_id_b64u);
+                    assert_eq!(a.signature_b64u, b.signature_b64u);
+                }
+                _ => panic!("expected SignAssertionResult"),
+            }
+        }
+    }
+}

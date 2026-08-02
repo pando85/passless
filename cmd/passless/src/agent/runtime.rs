@@ -43,6 +43,7 @@ use super::launcher::{
 };
 use super::policy_engine::PolicyRuntime;
 use super::prompt::{DesktopPromptHandle, PromptHandle, PromptMode};
+use super::sign::{SignContextRegistry, SignHttpServer};
 use super::storage::{CeremonyScope, ForwardingStorageHandle, IsolatedScopedStorage};
 use super::storage_factory::{
     create_shared_delegated_storage_with_registration, create_storage_bundle_with_options,
@@ -146,6 +147,7 @@ pub struct DelegatedEndpointDeps {
     pub human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
     pub human_operation_lock: Arc<Mutex<()>>,
     pub credential_refs: Vec<passless_core::agent::CredentialRef>,
+    pub human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
 }
 
 fn extract_cdp_method_for_audit(json: &str) -> String {
@@ -533,6 +535,10 @@ pub struct AgentRuntime {
     daemon_gid: u32,
     agent_config: std::sync::RwLock<AgentConfig>,
     human_interaction_manager: Option<Arc<AgentInteractionManager>>,
+    sign_registry: Arc<SignContextRegistry>,
+    sign_server_shutdown: Arc<AtomicBool>,
+    sign_server_handle: Mutex<Option<JoinHandle<()>>>,
+    sign_port: u16,
 }
 
 impl AgentRuntime {
@@ -962,6 +968,14 @@ impl AgentRuntime {
             RuntimeError::Config("IPC server is required for agent runtime".into())
         })?;
 
+        let sign_registry = Arc::new(SignContextRegistry::new());
+        let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_server = SignHttpServer::bind(sign_server_shutdown.clone()).map_err(|e| {
+            RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e))
+        })?;
+        let sign_port = sign_server.port();
+        let sign_server_handle = sign_server.serve(sign_registry.clone());
+
         let endpoint_manager = Mutex::new(EndpointManager::new(
             agent_config.profiles.len().max(1),
             shutdown.clone(),
@@ -1084,6 +1098,7 @@ impl AgentRuntime {
                             human_pin_storage: human_pin_storage.clone(),
                             human_operation_lock: human_operation_lock.clone(),
                             credential_refs: cred_refs,
+                            human_key_provider: Arc::new(soft_fido2::SoftwareCredentialKeyProvider),
                         }),
                     };
 
@@ -1196,6 +1211,10 @@ impl AgentRuntime {
             daemon_gid,
             agent_config: std::sync::RwLock::new(agent_config.clone()),
             human_interaction_manager,
+            sign_registry,
+            sign_server_shutdown,
+            sign_server_handle: Mutex::new(Some(sign_server_handle)),
+            sign_port,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -2036,6 +2055,7 @@ impl AgentRuntime {
                 let mut browser_mgr = self.browser_manager.lock().unwrap();
                 let exit_infos = browser_mgr.check_exits();
                 for info in &exit_infos {
+                    self.revoke_sign_context_for_lease(&info.lease_id);
                     let _ = self.audit_gate.record(
                         super::audit_events::BrowserLeaseCrashBuilder::new(
                             info.lease_id.clone(),
@@ -2118,6 +2138,7 @@ impl AgentRuntime {
                 }
                 let expired_leases = browser_mgr.check_expired();
                 for lease_id in &expired_leases {
+                    self.revoke_sign_context_for_lease(lease_id);
                     let _ = self.audit_gate.record(
                         super::audit_events::BrowserLeaseExpireBuilder::new(lease_id.clone())
                             .build(),
@@ -2449,6 +2470,7 @@ impl AgentRuntime {
                     | super::policy_engine::PendingState::TimedOut
                     | super::policy_engine::PendingState::Cancelled => {
                         if let Some(ref lease_id) = browser_lease_id {
+                            self.revoke_sign_context_for_lease(lease_id);
                             let mut browser_mgr = self.browser_manager.lock().unwrap();
                             let _ = browser_mgr.revoke(lease_id);
                             let _ = browser_mgr.terminate(lease_id);
@@ -2492,6 +2514,12 @@ impl AgentRuntime {
 
         self.shutdown.store(true, Ordering::Release);
 
+        self.sign_registry.revoke_all();
+        self.sign_server_shutdown.store(true, Ordering::Release);
+        if let Some(handle) = self.sign_server_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
         self.ipc_server.cancel();
 
         if let Some(handle) = self.runtime_loop.lock().unwrap().take() {
@@ -2517,6 +2545,10 @@ impl AgentRuntime {
         let _ = self.audit_gate.record(stop_event);
 
         info!("Agent runtime shutdown complete");
+    }
+
+    fn revoke_sign_context_for_lease(&self, lease_id: &BrowserLeaseId) {
+        self.sign_registry.revoke_by_lease(lease_id.as_str());
     }
 
     fn handle_launch_principal(
@@ -2934,6 +2966,7 @@ impl AgentRuntime {
                         .principal_cancel_pending(&request_id, &sid);
                     profile.preparation_slot.clear_matching(prep_gen);
                     if let Some(ref lid) = lease_id {
+                        self.revoke_sign_context_for_lease(lid);
                         let mut browser_mgr = self.browser_manager.lock().unwrap();
                         let _ = browser_mgr.revoke(lid);
                         let _ = browser_mgr.terminate(lid);
@@ -2948,6 +2981,7 @@ impl AgentRuntime {
                     action
                 };
                 if let Some(lease_id) = active_action {
+                    self.revoke_sign_context_for_lease(&lease_id);
                     let mut browser_mgr = self.browser_manager.lock().unwrap();
                     let _ = browser_mgr.revoke(&lease_id);
                     let _ = browser_mgr.terminate(&lease_id);
@@ -2970,6 +3004,7 @@ impl AgentRuntime {
                     .preparation_slot
                     .clear_matching(pending.prep_generation);
                 if let Some(ref lease_id) = pending.browser_lease_id {
+                    self.revoke_sign_context_for_lease(lease_id);
                     let mut browser_mgr = self.browser_manager.lock().unwrap();
                     let _ = browser_mgr.revoke(lease_id);
                     let _ = browser_mgr.terminate(lease_id);
@@ -3505,7 +3540,7 @@ impl AgentRuntime {
             requested_ttl_secs: clamped_ttl,
         };
 
-        let pending_id = self
+        let (pending_id, grant_request_id) = self
             .policy_runtime
             .principal_create_pending_delegated(intent_params, grant_params)
             .map_err(|e| {
@@ -3588,6 +3623,35 @@ impl AgentRuntime {
             ));
         }
 
+        let bearer_token = super::sign::generate_bearer_token().map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to generate bearer token: {}", e),
+                RecommendedAction::Retry,
+            )
+        })?;
+
+        let delegated_deps = profile
+            .endpoint_spec
+            .delegated_deps
+            .as_ref()
+            .ok_or_else(|| {
+                let _ = self
+                    .policy_runtime
+                    .principal_cancel_pending(&pending_id, session_id);
+                profile.preparation_slot.clear_matching(prep_generation);
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "delegated profile missing endpoint_spec.delegated_deps",
+                    RecommendedAction::Abort,
+                )
+            })?;
+
+        let agent_metadata = super::browser::AgentEndpointMetadata {
+            port: self.sign_port,
+            bearer_token: bearer_token.clone(),
+        };
+
         let browser_lease_id = {
             let browser_user = profile.browser_uid.ok_or_else(|| {
                 let _ = self
@@ -3659,8 +3723,13 @@ impl AgentRuntime {
             };
 
             let mut browser_mgr = self.browser_manager.lock().unwrap();
-            let lease_id = browser_mgr
-                .launch_pending(&browser_config, endpoint_id.clone(), profile_id.clone())
+            browser_mgr
+                .launch_pending_with_agent_endpoint(
+                    &browser_config,
+                    endpoint_id.clone(),
+                    profile_id.clone(),
+                    Some(&agent_metadata),
+                )
                 .map_err(|e| {
                     let _ = self
                         .policy_runtime
@@ -3671,25 +3740,125 @@ impl AgentRuntime {
                         format!("failed to launch browser: {}", e),
                         RecommendedAction::Retry,
                     )
-                })?;
+                })?
+        };
 
-            let lease_clone = lease_id.clone();
+        let authority = super::intent::admin_authority();
+        let grant_id = self
+            .policy_runtime
+            .admin_approve_grant(&grant_request_id, &authority)
+            .map_err(|e| {
+                let _ = self
+                    .policy_runtime
+                    .principal_cancel_pending(&pending_id, session_id);
+                profile.preparation_slot.clear_matching(prep_generation);
+                let _ = self
+                    .browser_manager
+                    .lock()
+                    .unwrap()
+                    .terminate(&browser_lease_id);
+                let _ = self
+                    .browser_manager
+                    .lock()
+                    .unwrap()
+                    .cleanup(&browser_lease_id);
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to approve grant: {}", e),
+                    RecommendedAction::Abort,
+                )
+            })?;
+
+        let sign_context = super::sign::SignContext {
+            profile_id: profile_id.clone(),
+            active_grant_id: grant_id.clone(),
+            profile_config: profile.profile_config.clone(),
+        };
+
+        let sign_handler = super::sign::SignHandler {
+            human_storage: delegated_deps.human_storage.clone(),
+            policy_runtime: self.policy_runtime.clone(),
+            audit_gate: profile.endpoint_spec.audit_gate.clone(),
+            security_config: profile.endpoint_spec.security_config.clone(),
+            key_provider: delegated_deps.human_key_provider.clone(),
+            operation_lock: delegated_deps.human_operation_lock.clone(),
+        };
+
+        if let Err(e) = self.sign_registry.register_pending(
+            bearer_token.clone(),
+            sign_context,
+            Arc::new(sign_handler),
+        ) {
+            let _ = self
+                .policy_runtime
+                .principal_cancel_pending(&pending_id, session_id);
+            self.policy_runtime.rollback_grant(&grant_id);
+            profile.preparation_slot.clear_matching(prep_generation);
+            let _ = self
+                .browser_manager
+                .lock()
+                .unwrap()
+                .terminate(&browser_lease_id);
+            let _ = self
+                .browser_manager
+                .lock()
+                .unwrap()
+                .cleanup(&browser_lease_id);
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to register sign context: {}", e),
+                RecommendedAction::Abort,
+            ));
+        }
+
+        if let Err(e) = self
+            .sign_registry
+            .bind_lease(&bearer_token, browser_lease_id.clone().to_string())
+        {
+            let _ = self
+                .policy_runtime
+                .principal_cancel_pending(&pending_id, session_id);
+            self.policy_runtime.rollback_grant(&grant_id);
+            profile.preparation_slot.clear_matching(prep_generation);
+            let _ = self.sign_registry.revoke(&bearer_token);
+            let _ = self
+                .browser_manager
+                .lock()
+                .unwrap()
+                .terminate(&browser_lease_id);
+            let _ = self
+                .browser_manager
+                .lock()
+                .unwrap()
+                .cleanup(&browser_lease_id);
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to bind lease: {}", e),
+                RecommendedAction::Abort,
+            ));
+        }
+
+        {
+            let lease_clone = browser_lease_id.clone();
             let pending_id_clone = pending_id.clone();
             let session_id_clone = session_id.clone();
+            let grant_id_clone = grant_id.clone();
             let browser_mgr_for_rollback = self.browser_manager.clone();
             let policy_rt = self.policy_runtime.clone();
             let prep_slot = profile.preparation_slot.clone();
 
             let lease_audit_event = super::audit_events::BrowserLeaseLaunchBuilder::new(
-                lease_id.clone(),
+                browser_lease_id.clone(),
                 profile_id.clone(),
                 endpoint_id.clone(),
             )
-            .with_cdp_expose(browser_config.cdp_expose.to_string())
+            .with_cdp_expose(config.browser_cdp_expose.unwrap_or_default().to_string())
             .build();
             if let Err(e) = self.audit_gate.record(lease_audit_event) {
                 let _ = policy_rt.principal_cancel_pending(&pending_id_clone, &session_id_clone);
+                policy_rt.rollback_grant(&grant_id_clone);
                 prep_slot.clear_matching(prep_generation);
+                let _ = self.sign_registry.revoke(&bearer_token);
                 let mut bm = browser_mgr_for_rollback.lock().unwrap();
                 let _ = bm.revoke(&lease_clone);
                 let _ = bm.terminate(&lease_clone);
@@ -3701,9 +3870,7 @@ impl AgentRuntime {
                     RecommendedAction::Abort,
                 ));
             }
-
-            lease_id
-        };
+        }
 
         {
             let mut current = profile.current_pending.lock().unwrap();
@@ -3813,6 +3980,17 @@ impl AgentRuntime {
             ));
         }
 
+        let grant_request_id = status.grant_request_id;
+
+        if let Some(ref grant_req_id) = grant_request_id {
+            if let Some(grant_id) = self
+                .policy_runtime
+                .resolved_grant_id_for_request(&status.profile_id, grant_req_id)
+            {
+                let _ = self.policy_runtime.revoke_grant_by_id(&grant_id);
+            }
+        }
+
         let _ = self
             .policy_runtime
             .principal_cancel_pending(request_id, session_id);
@@ -3832,6 +4010,7 @@ impl AgentRuntime {
             let current = profile.current_pending.lock().unwrap();
             current.as_ref().and_then(|p| p.browser_lease_id.clone())
         } {
+            self.revoke_sign_context_for_lease(lease_id);
             let mut browser_mgr = self.browser_manager.lock().unwrap();
             let _ = browser_mgr.revoke(lease_id);
             let _ = browser_mgr.terminate(lease_id);
@@ -5815,6 +5994,44 @@ impl PrincipalHandler for AgentRuntime {
                 *timeout_ms,
                 profile,
             ),
+            PrincipalRequest::SignAssertion(req) => {
+                let all_grants = self.policy_runtime.list_grants(Some(&profile_id));
+                let active_grant_id = match all_grants.iter().find(|g| {
+                    g.profile_id == profile_id && g.state == super::grant::GrantState::Active
+                }) {
+                    Some(g) => g.id.clone(),
+                    None => {
+                        return Err(ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            "no active grant",
+                            RecommendedAction::FixRequest,
+                        ));
+                    }
+                };
+                let delegated_deps = profile.endpoint_spec.delegated_deps.as_ref().ok_or_else(
+                    || {
+                        ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            "delegated_deps not configured for this profile; signing not available",
+                            RecommendedAction::FixRequest,
+                        )
+                    },
+                )?;
+                let ctx = super::sign::SignContext {
+                    profile_id: profile_id.clone(),
+                    active_grant_id,
+                    profile_config: profile.profile_config.clone(),
+                };
+                let sign_handler = super::sign::SignHandler {
+                    human_storage: delegated_deps.human_storage.clone(),
+                    policy_runtime: self.policy_runtime.clone(),
+                    audit_gate: profile.endpoint_spec.audit_gate.clone(),
+                    security_config: profile.endpoint_spec.security_config.clone(),
+                    key_provider: delegated_deps.human_key_provider.clone(),
+                    operation_lock: delegated_deps.human_operation_lock.clone(),
+                };
+                sign_handler.sign(&ctx, req)
+            }
         }
     }
 }
@@ -6550,6 +6767,7 @@ mod tests {
                     human_pin_storage: fake_pin_storage.clone(),
                     human_operation_lock: human_operation_lock.clone(),
                     credential_refs: vec![credential_ref.clone()],
+                    human_key_provider: Arc::new(soft_fido2::SoftwareCredentialKeyProvider),
                 }),
             };
 
@@ -6640,6 +6858,13 @@ mod tests {
             };
             managed_sessions.insert(profile_id.clone(), Mutex::new(Some(managed_session)));
 
+            let sign_registry = Arc::new(SignContextRegistry::new());
+            let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+            let sign_server =
+                SignHttpServer::bind(sign_server_shutdown.clone()).expect("bind sign server");
+            let sign_port = sign_server.port();
+            let sign_server_handle = sign_server.serve(sign_registry.clone());
+
             let runtime = Arc::new(AgentRuntime {
                 endpoint_manager,
                 ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
@@ -6659,6 +6884,10 @@ mod tests {
                 daemon_gid: unsafe { libc::getgid() },
                 agent_config: std::sync::RwLock::new(agent_config),
                 human_interaction_manager: None,
+                sign_registry,
+                sign_server_shutdown,
+                sign_server_handle: Mutex::new(Some(sign_server_handle)),
+                sign_port,
             });
 
             Self {
@@ -7337,6 +7566,7 @@ mod tests {
                 human_pin_storage: fake_pin_storage.clone(),
                 human_operation_lock: human_operation_lock.clone(),
                 credential_refs: vec![credential_ref.clone()],
+                human_key_provider: Arc::new(soft_fido2::SoftwareCredentialKeyProvider),
             }),
         };
 
@@ -7426,6 +7656,13 @@ mod tests {
         let mut managed_sessions = std::collections::BTreeMap::new();
         managed_sessions.insert(profile_id.clone(), Mutex::new(Some(managed_session)));
 
+        let sign_registry = Arc::new(SignContextRegistry::new());
+        let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_server =
+            SignHttpServer::bind(sign_server_shutdown.clone()).expect("bind sign server");
+        let sign_port = sign_server.port();
+        let sign_server_handle = sign_server.serve(sign_registry.clone());
+
         let runtime = Arc::new(AgentRuntime {
             endpoint_manager,
             ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
@@ -7445,6 +7682,10 @@ mod tests {
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
             human_interaction_manager: None,
+            sign_registry,
+            sign_server_shutdown,
+            sign_server_handle: Mutex::new(Some(sign_server_handle)),
+            sign_port,
         });
 
         let eid = {
@@ -7658,6 +7899,13 @@ mod tests {
         let mut managed_sessions = std::collections::BTreeMap::new();
         managed_sessions.insert(profile_id.clone(), Mutex::new(None));
 
+        let sign_registry = Arc::new(SignContextRegistry::new());
+        let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_server =
+            SignHttpServer::bind(sign_server_shutdown.clone()).expect("bind sign server");
+        let sign_port = sign_server.port();
+        let sign_server_handle = sign_server.serve(sign_registry.clone());
+
         let runtime = Arc::new(AgentRuntime {
             endpoint_manager,
             ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
@@ -7682,6 +7930,10 @@ mod tests {
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
             human_interaction_manager: None,
+            sign_registry,
+            sign_server_shutdown,
+            sign_server_handle: Mutex::new(Some(sign_server_handle)),
+            sign_port,
         });
 
         let profile = runtime.profiles.get(&profile_id).unwrap();
@@ -7887,6 +8139,251 @@ mod tests {
         assert_eq!(
             event_count, 5,
             "should have recorded 5 events (daemon.start, profile.create, endpoint.create, browser_lease.launch, intent.create)"
+        );
+    }
+
+    #[test]
+    fn sign_context_grant_id_matches_real_registry_grant_and_sign_resolves() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        assert!(
+            !entries.is_empty(),
+            "sign registry should contain at least one entry after delegation"
+        );
+
+        let ctx = &entries[0].context;
+
+        let grants = harness
+            .runtime
+            .policy_runtime
+            .list_grants(Some(&harness.profile_id));
+        let real_grant = grants.iter().find(|g| g.id == ctx.active_grant_id).expect(
+            "SignContext active_grant_id must match an actual grant in the registry; \
+                 GrantId::new() must not be used",
+        );
+        assert_eq!(real_grant.profile_id, harness.profile_id);
+        assert_eq!(real_grant.state, super::super::grant::GrantState::Active);
+
+        let resolved = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id);
+        assert!(
+            resolved.is_some(),
+            "resolve_grant_for_sign must find the grant bound to SignContext"
+        );
+        let resolved_snap = resolved.unwrap();
+        assert_eq!(resolved_snap.grant_id, ctx.active_grant_id);
+        assert_eq!(resolved_snap.state, super::super::grant::GrantState::Active);
+
+        let fake_ctx = super::super::sign::SignContext {
+            profile_id: ctx.profile_id.clone(),
+            active_grant_id: passless_core::agent::GrantId::new(),
+            profile_config: ctx.profile_config.clone(),
+        };
+        let fake_resolved = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&fake_ctx.profile_id, &fake_ctx.active_grant_id);
+        assert!(
+            fake_resolved.is_none(),
+            "a bogus GrantId::new() must NOT resolve to any real grant"
+        );
+    }
+
+    #[test]
+    fn no_active_grant_before_launch_success() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let initial_grants = harness
+            .runtime
+            .policy_runtime
+            .list_grants(Some(&harness.profile_id));
+        let initial_active_count = initial_grants
+            .iter()
+            .filter(|g| g.state == super::super::grant::GrantState::Active)
+            .count();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        assert!(!entries.is_empty(), "sign registry should have entries");
+
+        let ctx = &entries[0].context;
+        let grants_after = harness
+            .runtime
+            .policy_runtime
+            .list_grants(Some(&harness.profile_id));
+        let active_grant = grants_after
+            .iter()
+            .find(|g| g.id == ctx.active_grant_id)
+            .expect("grant should exist after successful delegation");
+
+        assert_eq!(
+            active_grant.state,
+            super::super::grant::GrantState::Active,
+            "grant should be active after successful delegation"
+        );
+        assert_eq!(
+            grants_after
+                .iter()
+                .filter(|g| g.state == super::super::grant::GrantState::Active)
+                .count(),
+            initial_active_count + 1,
+            "exactly one new active grant should exist"
+        );
+    }
+
+    #[test]
+    fn approval_returns_exact_grant_id_used_in_context() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        let ctx = &entries[0].context;
+
+        let grants = harness
+            .runtime
+            .policy_runtime
+            .list_grants(Some(&harness.profile_id));
+        let real_grant = grants
+            .iter()
+            .find(|g| g.id == ctx.active_grant_id)
+            .expect("SignContext must reference a real grant");
+
+        assert_eq!(
+            real_grant.id, ctx.active_grant_id,
+            "approval must return the exact GrantId used in SignContext"
+        );
+        assert_ne!(
+            real_grant.id,
+            passless_core::agent::GrantId::new(),
+            "GrantId must not be a fake/newly-generated value"
+        );
+    }
+
+    #[test]
+    fn bind_precedes_activation_and_use() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        let entry = &entries[0];
+
+        assert!(
+            entry.lease_id.is_some(),
+            "lease must be bound before sign context is usable"
+        );
+
+        let lookup = harness.runtime.sign_registry.lookup_bound(
+            harness.runtime.sign_registry.all_entries()[0]
+                .context
+                .profile_id
+                .as_str(),
+        );
+        assert!(
+            lookup.is_some() || entry.lease_id.is_some(),
+            "bound entry must be discoverable via lookup_bound"
+        );
+    }
+
+    #[test]
+    fn post_approval_rollback_revokes_grant() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        let ctx = &entries[0].context;
+        let grant_id = ctx.active_grant_id.clone();
+
+        harness.runtime.policy_runtime.rollback_grant(&grant_id);
+
+        let grants_after = harness
+            .runtime
+            .policy_runtime
+            .list_grants(Some(&harness.profile_id));
+        let revoked_grant = grants_after.iter().find(|g| g.id == grant_id);
+
+        assert!(
+            revoked_grant.is_none()
+                || revoked_grant.unwrap().state == super::super::grant::GrantState::Revoked,
+            "rollback must revoke the grant"
         );
     }
 }

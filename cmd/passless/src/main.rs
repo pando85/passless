@@ -614,6 +614,7 @@ fn run() -> Result<()> {
                             security_config,
                             pin_config,
                             shutdown.clone(),
+                            None,
                         ) {
                             Ok(rt) => Some(rt),
                             Err(e) => {
@@ -659,6 +660,7 @@ fn run() -> Result<()> {
                             security_config,
                             pin_config,
                             shutdown.clone(),
+                            None,
                         ) {
                             Ok(rt) => Some(rt),
                             Err(e) => {

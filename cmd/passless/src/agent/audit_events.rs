@@ -683,6 +683,12 @@ pub enum PolicyDenyReason {
     SessionMismatch,
     UvRequired,
     StaleGeneration,
+    OriginInvalid,
+    OriginMismatch,
+    AllowCredentialsMismatch,
+    AuditFailure,
+    CounterPersistenceFailure,
+    GrantRevoked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
