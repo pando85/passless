@@ -130,10 +130,14 @@ av_controlled_rp_register_begin() {
     local user_name="${2:-testuser}"
     local user_id="${3:-default-user}"
 
+    local payload
+    payload=$(jq -n --arg un "$user_name" --arg ui "$user_id" \
+        '{userName: $un, userId: $ui}')
+
     curl -s --max-time 10 \
         -X POST \
         -H "Content-Type: application/json" \
-        -d "{\"userName\":\"${user_name}\",\"userId\":\"${user_id}\"}" \
+        -d "$payload" \
         "http://127.0.0.1:${port}/api/register/begin" 2>/dev/null
 }
 
@@ -154,7 +158,7 @@ av_controlled_rp_auth_begin() {
 
     local payload
     if [[ -n "$user_id" ]]; then
-        payload="{\"userId\":\"${user_id}\"}"
+        payload=$(jq -n --arg ui "$user_id" '{userId: $ui}')
     else
         payload="{}"
     fi
