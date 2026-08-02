@@ -34,6 +34,7 @@ const MAX_LOGIN_TIMEOUT_SECS: u64 = 600;
 const MIN_LOGIN_TIMEOUT_SECS: u64 = 10;
 const MANIFEST_FILENAME: &str = "browser-manifest.json";
 const QUARANTINE_PREFIX: &str = "quarantine";
+const AGENT_EXTENSION_DIR: &str = "agent-extension";
 const CDP_FD_READ: RawFd = 3;
 const CDP_FD_WRITE: RawFd = 4;
 const RLIMIT_NOFILE_CUR: u64 = 256;
@@ -183,6 +184,12 @@ pub struct BrowserManifest {
     pub created_monotonic_secs: u64,
     pub ttl_monotonic_secs: u64,
     pub endpoint_scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEndpointMetadata {
+    pub port: u16,
+    pub bearer_token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +373,7 @@ pub enum LaunchError {
     CdpDiscoveryTimeout,
     InvalidArg(String),
     EndpointFileWriteFailed(String, String),
+    ExtensionSetupFailed(String),
 }
 
 impl fmt::Display for LaunchError {
@@ -396,6 +404,9 @@ impl fmt::Display for LaunchError {
             }
             LaunchError::EndpointFileWriteFailed(path, e) => {
                 write!(f, "failed to write CDP endpoint file '{}': {}", path, e)
+            }
+            LaunchError::ExtensionSetupFailed(msg) => {
+                write!(f, "extension setup failed: {}", msg)
             }
         }
     }
@@ -576,6 +587,16 @@ impl BrowserProcessManager {
         endpoint_id: EndpointId,
         profile_id: ProfileId,
     ) -> Result<BrowserLeaseId, LaunchError> {
+        self.launch_pending_with_agent_endpoint(config, endpoint_id, profile_id, None)
+    }
+
+    pub fn launch_pending_with_agent_endpoint(
+        &mut self,
+        config: &BrowserConfig,
+        endpoint_id: EndpointId,
+        profile_id: ProfileId,
+        agent_endpoint: Option<&AgentEndpointMetadata>,
+    ) -> Result<BrowserLeaseId, LaunchError> {
         config
             .hardening()
             .validate()
@@ -601,6 +622,15 @@ impl BrowserProcessManager {
         create_lease_dir(&profile_dir, config.target_uid, config.target_gid).map_err(|e| {
             LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
         })?;
+
+        if let Some(metadata) = agent_endpoint {
+            let _ext_dir = generate_agent_extension(
+                &runtime_dir,
+                metadata,
+                config.target_uid,
+                config.target_gid,
+            )?;
+        }
 
         let profile_fp = fingerprint_path(&profile_dir).map_err(|e| {
             LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
@@ -1565,6 +1595,104 @@ fn create_cdp_pipes() -> io::Result<CdpPipes> {
     })
 }
 
+fn render_channel_script(template: &str, channel: &str) -> String {
+    template.replace("__PASSLESS_CHANNEL__", channel)
+}
+
+fn render_worker_script(template: &str, channel: &str, metadata: &AgentEndpointMetadata) -> String {
+    let bearer_literal = serde_json::to_string(&metadata.bearer_token).unwrap();
+    template
+        .replace("__PASSLESS_CHANNEL__", channel)
+        .replace("__PASSLESS_PORT__", &metadata.port.to_string())
+        .replace("__PASSLESS_BEARER__", &bearer_literal)
+}
+
+fn write_extension_file(
+    dir: &Path,
+    name: &str,
+    content: &str,
+    mode: u32,
+    target_uid: u32,
+    target_gid: u32,
+) -> Result<(), LaunchError> {
+    let path = dir.join(name);
+    fs::write(&path, content)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("write {}: {}", name, e)))?;
+    let file = fs::File::open(&path)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("open {}: {}", name, e)))?;
+    let ret = unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) };
+    if ret != 0 {
+        return Err(LaunchError::ExtensionSetupFailed(format!(
+            "chown {}: {}",
+            name,
+            io::Error::last_os_error()
+        )));
+    }
+    drop(file);
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("chmod {}: {}", name, e)))?;
+    Ok(())
+}
+
+fn generate_agent_extension(
+    runtime_dir: &Path,
+    metadata: &AgentEndpointMetadata,
+    target_uid: u32,
+    target_gid: u32,
+) -> Result<PathBuf, LaunchError> {
+    let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
+    create_lease_dir(&ext_dir, target_uid, target_gid)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("extension dir: {}", e)))?;
+
+    let channel_bytes: [u8; 32] = rand::thread_rng().r#gen();
+    let channel: String = channel_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    write_extension_file(
+        &ext_dir,
+        "manifest.json",
+        include_str!("../../assets/agent-extension/manifest.json"),
+        0o644,
+        target_uid,
+        target_gid,
+    )?;
+    write_extension_file(
+        &ext_dir,
+        "main.js",
+        &render_channel_script(
+            include_str!("../../assets/agent-extension/main.js"),
+            &channel,
+        ),
+        0o644,
+        target_uid,
+        target_gid,
+    )?;
+    write_extension_file(
+        &ext_dir,
+        "broker.js",
+        &render_channel_script(
+            include_str!("../../assets/agent-extension/broker.js"),
+            &channel,
+        ),
+        0o644,
+        target_uid,
+        target_gid,
+    )?;
+    write_extension_file(
+        &ext_dir,
+        "worker.js",
+        &render_worker_script(
+            include_str!("../../assets/agent-extension/worker.js"),
+            &channel,
+            metadata,
+        ),
+        0o600,
+        target_uid,
+        target_gid,
+    )?;
+
+    Ok(ext_dir)
+}
+
 pub(crate) fn build_browser_command(
     config: &BrowserConfig,
     profile_dir: &Path,
@@ -1579,6 +1707,12 @@ pub(crate) fn build_browser_command(
                     .into(),
             ));
         }
+        if is_managed_extension_or_profile_flag(arg) {
+            return Err(LaunchError::InvalidArg(
+                "extension and profile flags are managed by passless; remove from browser_command"
+                    .into(),
+            ));
+        }
     }
 
     let mut cmd = Command::new(&config.executable);
@@ -1587,7 +1721,15 @@ pub(crate) fn build_browser_command(
     cmd.arg("--no-first-run");
     cmd.arg("--no-default-browser-check");
     cmd.arg("--disable-sync");
-    cmd.arg("--disable-extensions");
+    let ext_dir = profile_dir
+        .parent()
+        .unwrap_or(profile_dir)
+        .join(AGENT_EXTENSION_DIR);
+    if ext_dir.is_dir() {
+        cmd.arg(format!("--load-extension={}", ext_dir.display()));
+    } else {
+        cmd.arg("--disable-extensions");
+    }
     cmd.arg("--disable-save-password-bubble");
     cmd.arg("--disable-client-side-phishing-detection");
     cmd.arg("--password-store=basic");
@@ -1622,6 +1764,19 @@ pub(crate) fn build_browser_command(
     cmd.stderr(Stdio::null());
 
     Ok(cmd)
+}
+
+fn is_managed_extension_or_profile_flag(arg: &str) -> bool {
+    let flag = arg.split('=').next().unwrap_or(arg);
+    matches!(
+        flag,
+        "--load-extension"
+            | "--disable-extensions"
+            | "--disable-extensions-except"
+            | "--user-data-dir"
+            | "--allowlisted-extension-id"
+            | "--disable-extensions-file-access-check"
+    )
 }
 
 fn spawn_browser_hardened(
@@ -5231,5 +5386,920 @@ mod tests {
 
         let result = build_browser_command(&config, dir.path());
         assert!(matches!(result, Err(LaunchError::InvalidArg(_))));
+    }
+
+    fn make_reject_config(dir: &Path, extra: &str) -> BrowserConfig {
+        BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: vec![extra.to_string()],
+            runtime_root: dir.to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        }
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_load_extension_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--load-extension=/tmp/ext");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_load_extension_space_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--load-extension");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_disable_extensions_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--disable-extensions");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_disable_extensions_except() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--disable-extensions-except=/tmp/ext");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_user_data_dir_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--user-data-dir=/tmp/profile");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_user_data_dir_space_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--user-data-dir");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_allowlisted_extension_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--allowlisted-extension-id=abcdef");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_disable_extensions_file_access_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--disable-extensions-file-access-check");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_browser_command_allows_unrelated_extra_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: vec![
+                "--window-size=800,600".to_string(),
+                "--incognito".to_string(),
+            ],
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+        assert!(build_browser_command(&config, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_render_channel_script_replaces_channel() {
+        let template = r#"(function(ch){})("__PASSLESS_CHANNEL__");"#;
+        let result = render_channel_script(template, "abc123");
+        assert!(result.contains("abc123"));
+        assert!(!result.contains("__PASSLESS_CHANNEL__"));
+    }
+
+    #[test]
+    fn test_render_worker_script_replaces_all_placeholders() {
+        let template =
+            r#"(function(p,b){})("__PASSLESS_CHANNEL__",__PASSLESS_PORT__,__PASSLESS_BEARER__);"#;
+        let metadata = AgentEndpointMetadata {
+            port: 54321,
+            bearer_token: "secrettoken".to_string(),
+        };
+        let result = render_worker_script(template, "chan123", &metadata);
+        assert!(result.contains("chan123"));
+        assert!(result.contains("54321"));
+        assert!(result.contains("secrettoken"));
+        assert!(!result.contains("__PASSLESS_CHANNEL__"));
+        assert!(!result.contains("__PASSLESS_PORT__"));
+        assert!(!result.contains("__PASSLESS_BEARER__"));
+    }
+
+    #[test]
+    fn test_render_channel_script_does_not_expose_port_or_bearer() {
+        let rendered = render_channel_script(
+            include_str!("../../assets/agent-extension/main.js"),
+            "testchannel",
+        );
+        assert!(!rendered.contains("__PASSLESS_PORT__"));
+        assert!(!rendered.contains("__PASSLESS_BEARER__"));
+        assert!(rendered.contains("testchannel"));
+        assert!(!rendered.contains("__PASSLESS_CHANNEL__"));
+    }
+
+    #[test]
+    fn test_render_channel_script_broker_no_port_or_bearer() {
+        let rendered = render_channel_script(
+            include_str!("../../assets/agent-extension/broker.js"),
+            "testchannel",
+        );
+        assert!(!rendered.contains("__PASSLESS_PORT__"));
+        assert!(!rendered.contains("__PASSLESS_BEARER__"));
+        assert!(rendered.contains("testchannel"));
+    }
+
+    #[test]
+    fn test_render_worker_script_contains_endpoint_secrets() {
+        let metadata = AgentEndpointMetadata {
+            port: 60000,
+            bearer_token: "beartoken99".to_string(),
+        };
+        let rendered = render_worker_script(
+            include_str!("../../assets/agent-extension/worker.js"),
+            "wchan",
+            &metadata,
+        );
+        assert!(rendered.contains("60000"));
+        assert!(rendered.contains("beartoken99"));
+        assert!(!rendered.contains("__PASSLESS_PORT__"));
+        assert!(!rendered.contains("__PASSLESS_BEARER__"));
+    }
+
+    #[test]
+    fn test_generate_agent_extension_creates_correct_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-ext");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "deadbeef".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        assert!(ext_dir.is_dir());
+        assert!(ext_dir.join("manifest.json").exists());
+        assert!(ext_dir.join("main.js").exists());
+        assert!(ext_dir.join("broker.js").exists());
+        assert!(ext_dir.join("worker.js").exists());
+        assert!(!ext_dir.join("config.js").exists());
+        assert!(!ext_dir.join("content.js").exists());
+    }
+
+    #[test]
+    fn test_extension_dir_permissions_are_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-perm");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let mode = fs::symlink_metadata(&ext_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_worker_js_permissions_are_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-wperm");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let mode = fs::symlink_metadata(ext_dir.join("worker.js"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_main_js_permissions_are_0644() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-mperm");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let main_mode = fs::symlink_metadata(ext_dir.join("main.js"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(main_mode, 0o644);
+        let broker_mode = fs::symlink_metadata(ext_dir.join("broker.js"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(broker_mode, 0o644);
+        let manifest_mode = fs::symlink_metadata(ext_dir.join("manifest.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(manifest_mode, 0o644);
+    }
+
+    #[test]
+    fn test_generated_scripts_have_no_unresolved_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-noplace");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        for name in &["main.js", "broker.js", "worker.js"] {
+            let content = fs::read_to_string(ext_dir.join(name)).unwrap();
+            assert!(
+                !content.contains("__PASSLESS_CHANNEL__"),
+                "{} has unresolved channel placeholder",
+                name
+            );
+            assert!(
+                !content.contains("__PASSLESS_PORT__"),
+                "{} has unresolved port placeholder",
+                name
+            );
+            assert!(
+                !content.contains("__PASSLESS_BEARER__"),
+                "{} has unresolved bearer placeholder",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_main_js_has_no_port_or_bearer_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-nosec");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "supersecretbearer".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let main_content = fs::read_to_string(ext_dir.join("main.js")).unwrap();
+        assert!(!main_content.contains("55555"));
+        assert!(!main_content.contains("supersecretbearer"));
+        let broker_content = fs::read_to_string(ext_dir.join("broker.js")).unwrap();
+        assert!(!broker_content.contains("55555"));
+        assert!(!broker_content.contains("supersecretbearer"));
+    }
+
+    #[test]
+    fn test_no_metadata_file_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-nometa");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        for entry in fs::read_dir(&lease_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.contains("metadata"), "found metadata file: {}", name);
+        }
+        for entry in fs::read_dir(&ext_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains("metadata"),
+                "found metadata file in ext dir: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_manifest_json_is_valid_mv3() {
+        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
+        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
+        assert_eq!(parsed["manifest_version"], 3);
+        assert_eq!(parsed["name"], "passless-agent");
+    }
+
+    #[test]
+    fn test_manifest_has_main_world_content_script() {
+        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
+        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
+        let scripts = parsed["content_scripts"].as_array().unwrap();
+        let main_script = scripts
+            .iter()
+            .find(|s| s["world"] == "MAIN")
+            .expect("MAIN world content script required");
+        assert_eq!(main_script["run_at"], "document_start");
+        assert_eq!(main_script["all_frames"], true);
+        let js = main_script["js"].as_array().unwrap();
+        assert!(js.iter().any(|j| j == "main.js"));
+    }
+
+    #[test]
+    fn test_manifest_has_isolated_world_broker() {
+        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
+        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
+        let scripts = parsed["content_scripts"].as_array().unwrap();
+        let isolated_script = scripts
+            .iter()
+            .find(|s| s["world"] == "ISOLATED")
+            .expect("ISOLATED world content script required");
+        assert_eq!(isolated_script["run_at"], "document_start");
+        assert_eq!(isolated_script["all_frames"], true);
+        let js = isolated_script["js"].as_array().unwrap();
+        assert!(js.iter().any(|j| j == "broker.js"));
+    }
+
+    #[test]
+    fn test_manifest_has_service_worker() {
+        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
+        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
+        assert_eq!(parsed["background"]["service_worker"], "worker.js");
+    }
+
+    #[test]
+    fn test_manifest_has_loopback_host_permission() {
+        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
+        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
+        let hosts = parsed["host_permissions"].as_array().unwrap();
+        assert!(
+            hosts.iter().any(|h| h == "http://127.0.0.1/*"),
+            "host_permissions must include http://127.0.0.1/*"
+        );
+    }
+
+    #[test]
+    fn test_main_js_template_syntax_valid() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{}/assets/agent-extension/main.js", manifest_dir);
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .status();
+        if let Ok(s) = status {
+            assert!(s.success(), "main.js has syntax errors");
+        }
+    }
+
+    #[test]
+    fn test_broker_js_template_syntax_valid() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{}/assets/agent-extension/broker.js", manifest_dir);
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .status();
+        if let Ok(s) = status {
+            assert!(s.success(), "broker.js has syntax errors");
+        }
+    }
+
+    #[test]
+    fn test_worker_js_template_syntax_valid() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{}/assets/agent-extension/worker.js", manifest_dir);
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .status();
+        if let Ok(s) = status {
+            assert!(s.success(), "worker.js has syntax errors");
+        }
+    }
+
+    #[test]
+    fn test_generated_scripts_pass_node_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-nodecheck");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        for name in &["main.js", "broker.js", "worker.js"] {
+            let path = ext_dir.join(name);
+            let status = std::process::Command::new("node")
+                .arg("--check")
+                .arg(&path)
+                .status();
+            if let Ok(s) = status {
+                assert!(s.success(), "generated {} has syntax errors", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_launch_pending_without_agent_endpoint_skips_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let lease_id = mgr
+            .launch_pending(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let lease = &mgr.leases[&lease_id];
+        let runtime_dir = &lease.manifest.runtime_dir;
+        assert!(
+            !runtime_dir.join(AGENT_EXTENSION_DIR).exists(),
+            "extension dir should not exist without agent endpoint"
+        );
+    }
+
+    #[test]
+    fn test_launch_pending_with_none_agent_endpoint_skips_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                None,
+            )
+            .unwrap();
+
+        let lease = &mgr.leases[&lease_id];
+        let runtime_dir = &lease.manifest.runtime_dir;
+        assert!(!runtime_dir.join(AGENT_EXTENSION_DIR).exists());
+    }
+
+    #[test]
+    fn test_launch_pending_with_agent_endpoint_creates_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "deadbeef".to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+
+        let lease = &mgr.leases[&lease_id];
+        let runtime_dir = &lease.manifest.runtime_dir;
+        let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
+        assert!(ext_dir.is_dir());
+        assert!(ext_dir.join("manifest.json").exists());
+        assert!(ext_dir.join("main.js").exists());
+        assert!(ext_dir.join("broker.js").exists());
+        assert!(ext_dir.join("worker.js").exists());
+
+        let worker_content = fs::read_to_string(ext_dir.join("worker.js")).unwrap();
+        assert!(worker_content.contains("55555"));
+        assert!(worker_content.contains("deadbeef"));
+    }
+
+    #[test]
+    fn test_launch_pending_with_agent_endpoint_no_metadata_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+
+        let lease = &mgr.leases[&lease_id];
+        let runtime_dir = &lease.manifest.runtime_dir;
+        for entry in fs::read_dir(runtime_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains("metadata"),
+                "no metadata file should be written, found: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_browser_command_uses_generated_extension_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok".to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+
+        let lease = &mgr.leases[&lease_id];
+        let profile_dir = &lease.manifest.profile_dir;
+        let cmd = build_browser_command(&config, profile_dir).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.iter().any(|a| a.starts_with("--load-extension=")),
+            "should load extension when metadata provided"
+        );
+        assert!(!args.iter().any(|a| a == "--disable-extensions"));
+    }
+
+    #[test]
+    fn test_browser_command_disables_extensions_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let lease_id = mgr
+            .launch_pending(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let lease = &mgr.leases[&lease_id];
+        let profile_dir = &lease.manifest.profile_dir;
+        let cmd = build_browser_command(&config, profile_dir).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.iter().any(|a| a == "--disable-extensions"),
+            "should disable extensions when no metadata provided"
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--load-extension=")));
+    }
+
+    #[test]
+    fn test_agent_extension_behavioral_node_suite() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let test_path = format!("{manifest_dir}/tests/agent_extension_behavioral.js");
+        let status = std::process::Command::new("node").arg(&test_path).status();
+        if let Ok(s) = status {
+            assert!(s.success(), "agent extension behavioral suite failed");
+        }
+    }
+
+    #[test]
+    fn test_generated_worker_js_parses_with_special_character_bearer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-bearer-special");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "tok\"en\\with\nspecial\u{00e9}".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let path = ext_dir.join("worker.js");
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .status();
+        if let Ok(s) = status {
+            assert!(
+                s.success(),
+                "generated worker.js with special bearer has syntax errors"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generated_worker_bearer_not_in_main_or_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-bearer-iso");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        create_lease_dir(&lease_dir, uid, gid).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "supersecretbearertoken".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let main_content = fs::read_to_string(ext_dir.join("main.js")).unwrap();
+        let broker_content = fs::read_to_string(ext_dir.join("broker.js")).unwrap();
+        assert!(!main_content.contains("supersecretbearertoken"));
+        assert!(!broker_content.contains("supersecretbearertoken"));
+    }
+
+    #[test]
+    fn test_extension_cleanup_removes_worker_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "cleanup-test-token-xyz".to_string(),
+        };
+        config.executable = PathBuf::from("/bin/sleep");
+        config.extra_args = vec!["60".to_string()];
+
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+        let runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
+        let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
+        let worker_path = ext_dir.join("worker.js");
+        let worker_content = fs::read_to_string(&worker_path).unwrap();
+        assert!(worker_content.contains("cleanup-test-token-xyz"));
+
+        mgr.terminate(&lease_id).unwrap();
+        let safety = mgr.cleanup(&lease_id).unwrap();
+        assert!(matches!(safety, CleanupSafety::Clean));
+        assert!(!runtime_dir.exists());
+    }
+
+    #[test]
+    fn test_extension_quarantine_contains_worker_token_on_cleanup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+        config.executable = PathBuf::from("/bin/sleep");
+        config.extra_args = vec!["60".to_string()];
+
+        let metadata = AgentEndpointMetadata {
+            port: 55555,
+            bearer_token: "quarantine-token-abc".to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+        let _runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
+        let profile_dir = mgr.leases[&lease_id].manifest.profile_dir.clone();
+
+        mgr.terminate(&lease_id).unwrap();
+
+        let _ = fs::remove_dir_all(&profile_dir);
+        let real_elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&real_elsewhere).unwrap();
+        unix_fs::symlink(&real_elsewhere, &profile_dir).unwrap();
+
+        let safety = mgr.cleanup(&lease_id).unwrap();
+        match safety {
+            CleanupSafety::Quarantined {
+                ref quarantine_path,
+                ..
+            } => {
+                let ext_dir = quarantine_path.join(AGENT_EXTENSION_DIR);
+                let worker_path = ext_dir.join("worker.js");
+                if worker_path.exists() {
+                    let content = fs::read_to_string(&worker_path).unwrap();
+                    assert!(
+                        content.contains("quarantine-token-abc"),
+                        "quarantined worker should still contain the bearer token"
+                    );
+                }
+                let _ = fs::remove_dir_all(quarantine_path);
+            }
+            CleanupSafety::Failed { .. } => {}
+            CleanupSafety::Clean => panic!("expected quarantine or failure"),
+        }
+    }
+
+    #[test]
+    fn test_build_browser_command_loads_extension_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let profile_dir = runtime_dir.join("profile");
+        let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::write(ext_dir.join("manifest.json"), "{}").unwrap();
+
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: Vec::new(),
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+
+        let cmd = build_browser_command(&config, &profile_dir).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a.starts_with("--load-extension=")));
+        assert!(!args.iter().any(|a| a == "--disable-extensions"));
+    }
+
+    #[test]
+    fn test_build_browser_command_disables_extensions_when_no_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_dir = dir.path().join("no-ext").join("profile");
+        fs::create_dir_all(&profile_dir).unwrap();
+
+        let config = BrowserConfig {
+            executable: PathBuf::from("/usr/bin/chromium"),
+            start_url: None,
+            extra_args: Vec::new(),
+            runtime_root: dir.path().to_path_buf(),
+            ttl: Duration::from_secs(300),
+            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            rp_ids: vec!["example.com".to_string()],
+            target_uid: 1000,
+            target_gid: 1000,
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::Pipe,
+            cdp_port: 0,
+        };
+
+        let cmd = build_browser_command(&config, &profile_dir).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a == "--disable-extensions"));
+        assert!(!args.iter().any(|a| a.starts_with("--load-extension=")));
+    }
+
+    #[test]
+    fn test_agent_endpoint_metadata_serde_roundtrip() {
+        let metadata = AgentEndpointMetadata {
+            port: 50000,
+            bearer_token: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        let parsed: AgentEndpointMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, metadata);
+    }
+
+    #[test]
+    fn test_extension_setup_failed_display() {
+        let e = LaunchError::ExtensionSetupFailed("test error".to_string());
+        assert!(e.to_string().contains("extension setup failed"));
+        assert!(e.to_string().contains("test error"));
+    }
+
+    #[test]
+    fn test_is_managed_extension_or_profile_flag() {
+        assert!(is_managed_extension_or_profile_flag(
+            "--load-extension=/tmp/ext"
+        ));
+        assert!(is_managed_extension_or_profile_flag("--load-extension"));
+        assert!(is_managed_extension_or_profile_flag("--disable-extensions"));
+        assert!(is_managed_extension_or_profile_flag(
+            "--disable-extensions-except=/tmp/ext"
+        ));
+        assert!(is_managed_extension_or_profile_flag(
+            "--disable-extensions-except"
+        ));
+        assert!(is_managed_extension_or_profile_flag(
+            "--user-data-dir=/tmp/profile"
+        ));
+        assert!(is_managed_extension_or_profile_flag("--user-data-dir"));
+        assert!(is_managed_extension_or_profile_flag(
+            "--allowlisted-extension-id=abc"
+        ));
+        assert!(is_managed_extension_or_profile_flag(
+            "--disable-extensions-file-access-check"
+        ));
+        assert!(!is_managed_extension_or_profile_flag("--incognito"));
+        assert!(!is_managed_extension_or_profile_flag(
+            "--window-size=800,600"
+        ));
+        assert!(!is_managed_extension_or_profile_flag("--disable-sync"));
     }
 }
