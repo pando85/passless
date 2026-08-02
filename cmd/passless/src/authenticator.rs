@@ -166,6 +166,8 @@ pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     pin_config: PinConfig,
     #[cfg(feature = "agent")]
     interaction_manager: Option<Arc<AgentInteractionManager>>,
+    #[cfg(feature = "agent")]
+    agent_mode: bool,
 }
 
 impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
@@ -182,6 +184,8 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             pin_config,
             #[cfg(feature = "agent")]
             interaction_manager: None,
+            #[cfg(feature = "agent")]
+            agent_mode: false,
         }
     }
 
@@ -192,6 +196,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         security_config: SecurityConfig,
         pin_config: PinConfig,
         interaction_manager: Arc<AgentInteractionManager>,
+        agent_mode: bool,
     ) -> Self {
         Self {
             storage,
@@ -199,6 +204,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             security_config,
             pin_config,
             interaction_manager: Some(interaction_manager),
+            agent_mode,
         }
     }
 }
@@ -217,13 +223,17 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                     }
                     None => {
                         if manager.has_active_token() {
-                            warn!(
-                                "Agent interaction token mismatch/expired for UP on rp={}",
+                            debug!(
+                                "Agent interaction token active, auto-approving UP for rp={}",
                                 rp
                             );
-                            return Ok(UpResult::Denied);
+                            return Ok(UpResult::Accepted);
                         }
                     }
+                }
+                if self.agent_mode {
+                    debug!("Agent mode: auto-approving UP for rp={}", rp);
+                    return Ok(UpResult::Accepted);
                 }
             }
         }
@@ -300,13 +310,17 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                     }
                     None => {
                         if manager.has_active_token() {
-                            warn!(
-                                "Agent interaction token mismatch/expired for UV on rp={}",
+                            debug!(
+                                "Agent interaction token active, auto-approving UV for rp={}",
                                 rp
                             );
-                            return Ok(UvResult::Denied);
+                            return Ok(UvResult::AcceptedWithUp);
                         }
                     }
+                }
+                if self.agent_mode {
+                    debug!("Agent mode: auto-approving UV for rp={}", rp);
+                    return Ok(UvResult::AcceptedWithUp);
                 }
             }
         }
@@ -766,7 +780,26 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         pin_config: PinConfig,
         interaction_manager: Option<Arc<AgentInteractionManager>>,
     ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
-        let is_agent = interaction_manager.is_some();
+        Self::build_authenticator_with_interaction_and_options(
+            storage,
+            pin_storage,
+            security_config,
+            pin_config,
+            interaction_manager,
+            true,
+        )
+    }
+
+    #[cfg(feature = "agent")]
+    fn build_authenticator_with_interaction_and_options(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Option<Arc<AgentInteractionManager>>,
+        use_agent_options: bool,
+    ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
+        let is_agent = use_agent_options;
 
         let options = if is_agent {
             AuthenticatorOptions {
@@ -832,6 +865,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                 security_config,
                 pin_config.clone(),
                 mgr.clone(),
+                use_agent_options,
             ),
             None => PasslessCallbacks::new(
                 storage,
@@ -933,6 +967,33 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             storage,
             pin_storage,
             built_in_uv_policy: None,
+            max_uv_retries: pin_config.max_uv_retries,
+            credential_backup_enabled: security_config.enable_credential_backup,
+            credential_backup_supported: true,
+            pending_backups: HashMap::new(),
+        })
+    }
+
+    #[cfg(feature = "agent")]
+    pub fn with_shared_storage_and_pre_authorization(
+        storage: Arc<Mutex<S>>,
+        pin_storage: Option<Arc<Mutex<P>>>,
+        security_config: SecurityConfig,
+        pin_config: PinConfig,
+        interaction_manager: Arc<AgentInteractionManager>,
+    ) -> Result<Self> {
+        let authenticator = Self::build_authenticator_with_interaction_and_options(
+            storage.clone(),
+            pin_storage.clone(),
+            security_config.clone(),
+            pin_config.clone(),
+            Some(interaction_manager),
+            false,
+        )?;
+
+        Ok(Self {
+            authenticator,
+            storage,
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
@@ -1111,6 +1172,7 @@ impl<
                 security_config,
                 pin_config.clone(),
                 mgr.clone(),
+                is_agent,
             ),
             None => PasslessCallbacks::new(
                 storage,

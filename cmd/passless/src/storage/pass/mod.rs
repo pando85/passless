@@ -265,7 +265,10 @@ impl PassStorageAdapter {
         // Parse credential from decrypted bytes
         let credential: soft_fido2::Credential = Credential::from_bytes(plaintext.unsecure_ref())
             .map(|cred| cred.to_soft_fido2())
-            .map_err(|e| Error::Storage(format!("Failed to parse credential: {:?}", e)))?;
+            .map_err(|e| {
+                error!("Failed to parse credential from {:?}: {:?}", path, e);
+                Error::Storage(format!("Failed to parse credential: {:?}", e))
+            })?;
 
         // Cache the decrypted credential with automatic TTL
         self.cache.insert(path.to_path_buf(), credential.clone());

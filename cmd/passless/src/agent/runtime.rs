@@ -80,6 +80,7 @@ pub struct RuntimeStartParams<'a> {
     pub pin_config: PinConfig,
     pub shutdown: Arc<AtomicBool>,
     pub endpoint_factory: Option<EndpointFactory>,
+    pub human_interaction_manager: Option<Arc<AgentInteractionManager>>,
 }
 
 struct CreateIntentParams<'a> {
@@ -531,9 +532,11 @@ pub struct AgentRuntime {
     daemon_uid: u32,
     daemon_gid: u32,
     agent_config: std::sync::RwLock<AgentConfig>,
+    human_interaction_manager: Option<Arc<AgentInteractionManager>>,
 }
 
 impl AgentRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
         human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
@@ -542,6 +545,7 @@ impl AgentRuntime {
         security_config: SecurityConfig,
         pin_config: PinConfig,
         shutdown: Arc<AtomicBool>,
+        human_interaction_manager: Option<Arc<AgentInteractionManager>>,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factories(RuntimeStartParams {
             human_storage,
@@ -552,6 +556,7 @@ impl AgentRuntime {
             pin_config,
             shutdown,
             endpoint_factory: None,
+            human_interaction_manager,
         })
     }
 
@@ -565,6 +570,7 @@ impl AgentRuntime {
             pin_config,
             shutdown,
             endpoint_factory,
+            human_interaction_manager,
         } = params;
         let daemon_uid = unsafe { libc::getuid() };
         let daemon_gid = unsafe { libc::getgid() };
@@ -1189,6 +1195,7 @@ impl AgentRuntime {
             daemon_uid,
             daemon_gid,
             agent_config: std::sync::RwLock::new(agent_config.clone()),
+            human_interaction_manager,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -3528,7 +3535,7 @@ impl AgentRuntime {
             policy_digest: generation.digest.clone(),
             credential_ref: Some(credential_ref.clone()),
             untrusted_metadata: super::ceremony::BoundedUntrustedMetadata::new(
-                normalized_rp,
+                normalized_rp.clone(),
                 passless_core::agent::protocol::IntentAction::Authenticate,
                 true,
             )
@@ -3707,6 +3714,29 @@ impl AgentRuntime {
                 browser_lease_id: Some(browser_lease_id),
                 clamped_session_ttl_secs: clamped_ttl,
             });
+        }
+
+        if ceremony_policy.authorization == passless_core::agent::AgentAuthorization::Allow {
+            if let Some(ref manager) = self.human_interaction_manager {
+                let up_approved =
+                    ceremony_policy.user_presence != passless_core::agent::UserPresenceSource::None;
+                let uv_approved = ceremony_policy.user_verification
+                    == passless_core::agent::UserVerificationSource::Policy;
+                info!(
+                    "Minting human interaction token: rp={}, up={}, uv={}, ttl={}s",
+                    normalized_rp, up_approved, uv_approved, clamped_grant_ttl
+                );
+                manager.mint(
+                    normalized_rp.clone(),
+                    passless_core::agent::protocol::IntentAction::Authenticate,
+                    0,
+                    up_approved,
+                    uv_approved,
+                    std::time::Duration::from_secs(clamped_grant_ttl),
+                );
+            } else {
+                info!("No human_interaction_manager available for token minting");
+            }
         }
 
         Ok(PrincipalResponse::DelegationRequested {
@@ -5333,19 +5363,14 @@ impl AgentRuntime {
             let eid_guard = profile.endpoint_id.lock().unwrap();
             if eid_guard.is_none() {
                 drop(eid_guard);
-                match self.create_profile_endpoint(&profile.endpoint_spec) {
-                    Ok(eid) => {
-                        let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                        *eid_guard = Some(eid);
-                    }
-                    Err(e) => {
-                        return Err(ProtocolError::new(
-                            ErrorCode::Internal,
-                            format!("failed to create endpoint for delegation: {}", e),
-                            RecommendedAction::Retry,
-                        ));
-                    }
-                }
+                let eid = passless_core::agent::EndpointId::new();
+                info!(
+                    "Profile '{}' using human-shared endpoint (no agent UHID device): {}",
+                    profile_id.as_str(),
+                    eid.as_str()
+                );
+                let mut eid_guard = profile.endpoint_id.lock().unwrap();
+                *eid_guard = Some(eid);
             }
         }
         let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
@@ -6633,6 +6658,7 @@ mod tests {
                 daemon_uid: unsafe { libc::getuid() },
                 daemon_gid: unsafe { libc::getgid() },
                 agent_config: std::sync::RwLock::new(agent_config),
+                human_interaction_manager: None,
             });
 
             Self {
@@ -7418,6 +7444,7 @@ mod tests {
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
+            human_interaction_manager: None,
         });
 
         let eid = {
@@ -7654,6 +7681,7 @@ mod tests {
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
+            human_interaction_manager: None,
         });
 
         let profile = runtime.profiles.get(&profile_id).unwrap();
