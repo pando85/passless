@@ -30,7 +30,15 @@ The first implementation will extend the trusted Passless daemon to own:
 
 The daemon creates each agent endpoint with a unique kernel-visible identity. Linux device permissions and the principal sandbox make that endpoint visible only to its associated browser. The agent browser cannot access the human endpoint, and ordinary human browser processes cannot access agent endpoints.
 
-No extension, native host, WebAuthn proxy, injected script, or custom browser build participates in the ceremony.
+No extension, native host, WebAuthn proxy, injected script, or custom browser build participates in the human or isolated-mode ceremony.
+
+> **Amendment:** [ADR 0005](0005-delegated-autonomous-authentication-redesign.md) amends the
+> delegated-session autonomous path to use a daemon-loaded MV3 extension with a MAIN-world
+> `navigator.credentials.get` override and a localhost daemon signing channel. The human and
+> isolated ceremony paths, the UHID endpoint model, and the no-extension design for those modes
+> remain unchanged. The `confirm`-policy human prompt path is also unchanged. Implementation of
+> ADR 0005 is **in progress**; see the
+> [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md).
 
 ## High-level architecture
 
@@ -425,7 +433,15 @@ Rejected. Running agent endpoints in a separate process would require inter-proc
 
 ### Browser extension or native messaging host for agent WebAuthn
 
-Rejected. Adding a browser extension or native messaging host introduces a browser integration TCB, bypasses the stock browser's origin validation, and requires per-browser maintenance. Stock browser WebAuthn over a dedicated UHID endpoint reuses existing origin enforcement without browser modification.
+Rejected for human and isolated-mode ceremonies. Adding a browser extension or native messaging
+host introduces a browser integration TCB, bypasses the stock browser's origin validation, and
+requires per-browser maintenance. Stock browser WebAuthn over a dedicated UHID endpoint reuses
+existing origin enforcement without browser modification.
+
+> **Note:** [ADR 0005](0005-delegated-autonomous-authentication-redesign.md) adopts a
+> daemon-loaded MV3 extension for the delegated-session autonomous path only, where the
+> stock-browser UHID approach cannot achieve headless autonomy without key extraction.
+> The human and isolated paths retain the no-extension design.
 
 ### Per-request classification on a shared endpoint
 

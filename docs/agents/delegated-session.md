@@ -4,6 +4,12 @@ Delegated-session mode permits exact-policy authentication using configured huma
 when explicitly selected, registration into the human store. The RP sees the same account context
 as ordinary use by the human.
 
+> **Note:** Autonomous (`allow`) assertions for delegated sessions are being redesigned under
+> [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md) to use a
+> daemon-loaded MV3 extension and localhost daemon signing channel instead of a UHID ceremony.
+> The `confirm` path remains an explicit human prompt. Implementation is **in progress**; see
+> the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md).
+
 ## Semantics
 
 - The delegated credential is the same user credential. The RP cannot distinguish agent
@@ -67,8 +73,13 @@ product_id = 22136
      --session-ttl 900 --reason "CI deploy"
    ```
 4. The daemon launches an ephemeral browser and evaluates the exact authentication rule.
-5. A `confirm` rule presents the trusted prompt; an `allow` rule resolves the one-shot operation
-   without a notification. The configured UP/UV sources are recorded in audit.
+5. An `allow` rule is resolved autonomously by the daemon's policy check with no desktop
+   notification. A `confirm` rule is not auto-signed and remains an explicit human prompt path.
+   A `deny` rule fails closed. The configured UP/UV sources are recorded in audit.
+   Under ADR 0005, the autonomous path uses a daemon-loaded MV3 extension that reads the
+   frame origin via a MAIN-world override and forwards the request to the daemon over a
+   localhost bearer channel; the daemon validates origin, grant, policy, credential ref,
+   and audit before signing. Implementation is **in progress**.
 6. The local browser lease starts at the clamped monotonic deadline.
 7. The grant and delegated credential view are consumed after the assertion.
 
@@ -151,7 +162,9 @@ product_id = 22136
      --rp github.com --credential <credential-ref-hex> \
      --session-ttl 900 --reason "Playwright automation"
    ```
-4. The daemon performs the WebAuthn ceremony and launches Chromium with
+4. The daemon performs the WebAuthn ceremony (confirm-policy human prompt) or, for allow-policy
+   assertions under ADR 0005, loads an MV3 extension that routes the assertion through the
+   daemon signing channel. Chromium is launched with
    `--remote-debugging-port=<N> --remote-debugging-address=127.0.0.1`.
 5. The daemon reads Chromium's `DevToolsActivePort` file to discover the WebSocket URL.
 6. The daemon writes the full WebSocket URL to `<runtime_dir>/cdp-endpoint`

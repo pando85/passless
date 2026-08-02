@@ -32,6 +32,13 @@ An exact action using `authorization = "allow"` and policy UP/UV is fully unatte
 administrator policy resolves the one-shot operation without displaying a notification. Policy UP
 and UV are machine authorization claims, not evidence that a human was present or locally verified.
 
+For delegated-session autonomy, the `allow` path is resolved by the daemon signing oracle via
+the MV3 extension and localhost channel described in
+[ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md). A `confirm` rule
+is not auto-signed and remains an explicit human prompt. A `deny` rule fails closed. Daemon-side
+origin, grant, policy, credential-ref, audit, and key-provider checks are load-bearing; the
+bearer token is defense-in-depth. Implementation is **in progress**.
+
 The RP receives ordinary WebAuthn UP/UV flags and generally cannot distinguish human evidence from
 policy evidence. Passless records the selected authorization and evidence sources in its audit log,
 so operators must treat the rule itself as authority to make those claims. One-shot binding,
@@ -40,12 +47,18 @@ For a complete setup, see the [fully unattended isolated workflow](isolated.md#f
 
 ## Origin vs RP ID
 
-The stock browser validates that the calling origin may use the requested RP ID. Passless
-receives the RP ID and `clientDataHash` through CTAP. It does not receive the exact web
-origin. Agent policy is keyed by exact RP ID, not origin.
+For human and isolated modes, the stock browser validates that the calling origin may use the
+requested RP ID. Passless receives the RP ID and `clientDataHash` through CTAP. It does not
+receive the exact web origin. Agent policy is keyed by exact RP ID, not origin.
+
+For delegated-session autonomous authentication under
+[ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md), the daemon
+validates the frame origin read by a MAIN-world extension override. Daemon-side origin, grant,
+policy, credential-ref, audit, and key-provider checks are load-bearing. The per-session
+localhost bearer token is defense-in-depth. Implementation is **in progress**.
 
 A configured `start_url` is operational configuration, not origin evidence. Passless never
-claims independent visibility of the exact web origin.
+claims independent visibility of the exact web origin for CTAP-based paths.
 
 ## Browser-control authority warning
 

@@ -119,7 +119,7 @@ On restart, the daemon:
 
 | Feature | Required for | Notes |
 |---|---|---|
-| UHID (`uhid` module) | All agent modes | Virtual HID device creation |
+| UHID (`uhid` module) | Human, isolated, and confirm-policy modes | Virtual HID device creation |
 | hidraw | Browser access to agent endpoints | Per-profile group policy via udev |
 | pidfd / `close_range` | Principal session management | Clean process tree teardown |
 | `SOCK_SEQPACKET` | Admin and principal IPC | Versioned local contracts |
@@ -133,9 +133,12 @@ On restart, the daemon:
 
 **Browser requirements:**
 
-- Stock browser with WebAuthn support (no modifications, extensions, or native messaging hosts).
-- Ability to access hidraw nodes via udev group policy.
+- Stock browser with WebAuthn support for human and isolated-mode ceremonies.
+- Ability to access hidraw nodes via udev group policy (human and isolated modes).
 - Ephemeral profile support (no personal sync, extensions, or saved state).
+- Delegated-session autonomous authentication loads a daemon-generated MV3 extension via
+  `--load-extension`; see [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md).
+  Implementation is **in progress**.
 
 **Known limitations:**
 
@@ -211,7 +214,9 @@ Example systemd, tmpfiles, udev, and sysusers configurations are provided in `co
 - Linux only. No remote principals or non-Unix isolation in the first release.
 - Delegated mode does not create a new RP-visible agent identity.
 - Local lease expiry does not guarantee RP-side session invalidation.
-- Passless sees the CTAP RP ID but not the exact web origin.
+- For human and isolated modes, Passless sees the CTAP RP ID but not the exact web origin.
+  Delegated-session autonomous authentication validates frame origin in the daemon; see
+  [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md).
 - Browser-control (CDP) output may contain session state; treat it as full-session authority.
 - Host root and kernel compromise are outside the threat model.
 - RP-supported OAuth, workload identity, and service accounts are preferred for unattended use.

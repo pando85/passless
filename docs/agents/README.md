@@ -10,6 +10,12 @@ Agent mode is **implemented** but **not yet validated for production use**. Phas
 evidence is available in `tools/agent-uhid-feasibility/evidence.md`. Full production validation
 (Phase 9) is pending.
 
+Delegated-session autonomous authentication is being redesigned under
+[ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md) to route assertions
+through a daemon-loaded MV3 extension and localhost daemon signing channel. Implementation is
+**in progress**; see the
+[implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md).
+
 ## Documentation
 
 - [Configuration reference](configuration.md) — complete field definitions and validation rules
@@ -24,14 +30,18 @@ evidence is available in `tools/agent-uhid-feasibility/evidence.md`. Full produc
 
 - [ADR 0001: Agent authentication security model](../decisions/0001-agent-authentication-security-model.md)
 - [ADR 0002: Native WebAuthn agent architecture](../decisions/0002-native-webauthn-agent-architecture.md)
+- [ADR 0005: Delegated autonomous authentication redesign](../decisions/0005-delegated-autonomous-authentication-redesign.md)
 - [Implementation plan](../plans/agent-passkey-implementation.md)
+- [Delegated autonomy daemon proxy implementation](../plans/delegated-autonomy-daemon-proxy-implementation.md)
 
 ## Key principles
 
 1. **Autonomy is explicit.** Each exact RP/action rule denies, confirms, or allows the ceremony and
    selects human or policy UP/UV evidence. Missing rules deny.
-2. **Stock browser only.** No browser modification, extension, native messaging host, or WebAuthn
-   proxy. Origin validation remains in the stock browser.
+2. **Stock browser for human and isolated paths.** No browser modification, extension, native
+   messaging host, or WebAuthn proxy for human or isolated-mode ceremonies. Delegated-session
+   autonomous authentication uses a daemon-loaded MV3 extension and localhost signing channel;
+   see [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md).
 3. **Exact RP ID matching.** Passless matches the CTAP RP ID exactly against policy. It does not
    receive or validate the exact web origin.
 4. **One-shot grants.** Delegated mode permits exactly one authentication assertion per grant.
