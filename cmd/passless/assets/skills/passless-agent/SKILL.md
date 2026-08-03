@@ -76,6 +76,61 @@ This path works with non-extractable TPM keys because the daemon performs `TPM2_
 
 Implementation status: implemented and verified against a real relying party on 2026-08-03. The daemon signing oracle, the MAIN-world override extension, HTTP integration/security/audit/counter tests, cancellation cleanup regression tests, and portable-TPM unit suites are complete (see [ADR 0005](../../../../docs/decisions/0005-delegated-autonomous-authentication-redesign.md) and the [verification matrix](../../../../docs/plans/adr-0005-verification-matrix.md)). The full TPM E2E with a real credential is the remaining rollout slice; the bypassed delegated pre-authorization path has been removed.
 
+## Passkey Registration
+
+Agents can register passkeys without human interaction using the daemon-backed extension.
+
+### Configuration
+
+Enable registration in your agent profile:
+
+```toml
+[[profiles.ci-agent.rules]]
+rp_id = "gitea.example.com"
+register = { authorization = "allow", user_presence = "none", user_verification = "none" }
+authenticate = { authorization = "allow", user_presence = "none", user_verification = "none" }
+```
+
+### Registration Flow
+
+1. Request a registration grant via IPC:
+   ```rust
+   AdminRequest::RequestRegistration {
+       profile_id: "ci-agent".into(),
+       rp_id: "gitea.example.com".into(),
+       max_session_ttl: 300,
+       reason: Some("CI/CD setup".into()),
+   }
+   ```
+
+2. Navigate to the RP's registration page in the agent-launched browser
+
+3. The extension intercepts `navigator.credentials.create()` and forwards to the daemon's `/register` endpoint
+
+4. The daemon:
+   - Validates the registration grant
+   - Checks policy (register.authorization == Allow)
+   - Generates a new keypair via CredentialKeyProvider
+   - Constructs authenticatorData with attested credential data
+   - Writes the credential to storage
+   - Returns the attestation object
+
+5. The extension returns a duck-typed PublicKeyCredential to the RP
+
+6. The credential is now available for authentication
+
+### Security Model
+
+- Registration is **denied by default** - requires explicit per-RP opt-in
+- The daemon enforces origin, policy, and grant validation
+- Private keys never leave the daemon (even during generation)
+- All registration operations are audited
+- Works with both software and TPM backends
+
+### Examples
+
+See the [Agent Registration Guide](../../../../docs/AGENT_REGISTRATION.md) for detailed examples.
+
 ## Legacy/test-only: CDP virtual authenticator
 
 **This workflow is legacy and test-only. It is not the production autonomy mechanism.** It extracts the raw private key from the pass vault and injects it into Chromium's virtual authenticator, bypassing the daemon's policy and audit gates. It cannot support non-extractable TPM keys. Use it only for development and testing in trusted environments. The production path is the daemon-backed MAIN-world override described above.

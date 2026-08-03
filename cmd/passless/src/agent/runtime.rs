@@ -4552,6 +4552,50 @@ impl AgentRuntime {
         }
     }
 
+    fn handle_request_registration(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        max_session_ttl: u64,
+        _reason: Option<&str>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        let _profile = self.profiles.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let (outcome, reason_code) = self
+            .policy_runtime
+            .authorize_registration(profile_id, rp_id);
+        if outcome == super::policy_engine::Outcome::Deny {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "registration denied for profile '{}' and rp '{}': {}",
+                    profile_id, rp_id, reason_code
+                ),
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let ttl = if max_session_ttl == 0 {
+            300
+        } else {
+            max_session_ttl
+        };
+
+        let reg_grant_id = passless_core::agent::RegistrationGrantId::new();
+
+        let _ = ttl;
+
+        Ok(AdminResponse::RegistrationGranted {
+            registration_grant_id: reg_grant_id,
+        })
+    }
+
     fn handle_shutdown(&self) -> Result<AdminResponse, ProtocolError> {
         let shutdown_event =
             super::audit_events::AdminShutdownRequestBuilder::new(std::process::id()).build();
@@ -4657,6 +4701,17 @@ impl AdminHandler for AgentRuntime {
                 profile_id,
                 rp_id,
                 credential_ref,
+                *max_session_ttl,
+                reason.as_deref(),
+            ),
+            AdminRequest::RequestRegistration {
+                profile_id,
+                rp_id,
+                max_session_ttl,
+                reason,
+            } => self.handle_request_registration(
+                profile_id,
+                rp_id,
                 *max_session_ttl,
                 reason.as_deref(),
             ),

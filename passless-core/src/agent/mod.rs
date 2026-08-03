@@ -10,7 +10,7 @@ pub use config::{
 };
 pub use ids::{
     BrowserLeaseId, CredentialRef, EndpointId, GrantId, IdError, IntentId, PendingRequestId,
-    PolicyGenerationId, PrincipalSessionId, ProfileId,
+    PolicyGenerationId, PrincipalSessionId, ProfileId, RegistrationGrantId,
 };
 pub use policy::{Policy, PolicyDigest, PolicyError, PolicyParams};
 pub use protocol::{
@@ -24,6 +24,6 @@ pub use protocol::{
     PrincipalInstructions, PrincipalLaunchedResponse, PrincipalRequest, PrincipalRequestFrame,
     PrincipalResponse, PrincipalResponseFrame, ProfileDiagnosticReport, ProfileInfo, ProfileList,
     ProfileStatusResponse, ProfileSummary, ProtocolError, ProtocolVersion, RecommendedAction,
-    RequestFrame, ResponseFrame, Role, SeqpacketCodec, SessionInfo, SessionList, Validate,
-    ValidationErrors,
+    RegisterCredentialRequest, RegisterCredentialResponse, RequestFrame, ResponseFrame, Role,
+    SeqpacketCodec, SessionInfo, SessionList, Validate, ValidationErrors,
 };

@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod launcher;
 pub mod policy_engine;
 pub mod prompt;
+pub mod register;
 pub mod runtime;
 pub mod sign;
 pub mod storage;

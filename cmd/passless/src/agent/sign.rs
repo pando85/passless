@@ -10,8 +10,8 @@ use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
 use passless_core::agent::protocol::{
-    ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, SignAssertionRequest,
-    SignAssertionResponse,
+    ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, RegisterCredentialRequest,
+    SignAssertionRequest, SignAssertionResponse,
 };
 use passless_core::agent::{AgentProfileConfig, CredentialRef, ProfileId};
 use passless_core::config::SecurityConfig;
@@ -19,6 +19,7 @@ use passless_core::config::SecurityConfig;
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
 use super::policy_engine::PolicyRuntime;
+use super::register::{RegisterContext, RegisterHandler};
 
 use crate::storage::CredentialStorage;
 
@@ -26,7 +27,7 @@ use soft_fido2::CredentialKeyProvider;
 
 const B64U_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn b64u_encode(data: &[u8]) -> String {
+pub fn b64u_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity((data.len() * 4).div_ceil(3));
     let mut i = 0;
     while i + 2 < data.len() {
@@ -214,13 +215,59 @@ pub struct LeaseEntry {
 
 pub struct SignContextRegistry {
     entries: Mutex<HashMap<String, LeaseEntry>>,
+    registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
+}
+
+#[derive(Clone)]
+pub struct RegistrationLeaseEntry {
+    pub context: RegisterContext,
+    pub handler: Arc<RegisterHandler>,
 }
 
 impl SignContextRegistry {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            registration_entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn register_pending_registration(
+        &self,
+        token: String,
+        context: RegisterContext,
+        handler: Arc<RegisterHandler>,
+    ) -> Result<(), String> {
+        let mut map = self
+            .registration_entries
+            .lock()
+            .map_err(|_| "registry lock poisoned")?;
+        if map.contains_key(&token) {
+            return Err("duplicate token".into());
+        }
+        map.insert(token, RegistrationLeaseEntry { context, handler });
+        Ok(())
+    }
+
+    pub fn lookup_registration(&self, token: &str) -> Option<RegistrationLeaseEntry> {
+        let map = match self.registration_entries.lock() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        for (k, v) in map.iter() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    pub fn revoke_registration(&self, token: &str) -> bool {
+        let mut map = match self.registration_entries.lock() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        map.remove(token).is_some()
     }
 
     pub fn register_pending(
@@ -487,11 +534,11 @@ fn handle_http_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("no method")?;
     let path = parts.next().ok_or("no path")?;
-    if method == "OPTIONS" && path == "/sign" {
+    if method == "OPTIONS" && (path == "/sign" || path == "/register") {
         send_preflight_response(&mut stream);
         return Ok(());
     }
-    if method != "POST" || path != "/sign" {
+    if method != "POST" || (path != "/sign" && path != "/register") {
         send_http_error(&mut stream, "404 Not Found", "not_found");
         return Ok(());
     }
@@ -538,13 +585,99 @@ fn handle_http_connection(
             return Ok(());
         }
     };
+    let is_register = path == "/register";
     let entry = match registry.lookup_bound(token) {
         Some(e) => e,
         None => {
+            if is_register {
+                let reg_entry = match registry.lookup_registration(token) {
+                    Some(e) => e,
+                    None => {
+                        send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
+                        return Ok(());
+                    }
+                };
+                if let Some(ct) = content_type_header
+                    && !ct.to_ascii_lowercase().starts_with("application/json")
+                {
+                    send_sign_error(
+                        &mut stream,
+                        "415 Unsupported Media Type",
+                        "unsupported_content_type",
+                    );
+                    return Ok(());
+                }
+                let body_start = header_end + 4;
+                let content_length: usize = header_str
+                    .lines()
+                    .find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                if content_length > MAX_HTTP_BODY_SIZE {
+                    send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+                    return Ok(());
+                }
+                let mut body = Vec::new();
+                body.extend_from_slice(&buf[body_start..total]);
+                let remaining = content_length.saturating_sub(total - body_start);
+                if remaining > 0 {
+                    if remaining > MAX_HTTP_BODY_SIZE {
+                        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+                        return Ok(());
+                    }
+                    let mut extra = vec![0u8; remaining];
+                    stream
+                        .read_exact(&mut extra)
+                        .map_err(|e| format!("read body: {}", e))?;
+                    body.extend_from_slice(&extra);
+                }
+                if body.len() > MAX_HTTP_BODY_SIZE {
+                    send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+                    return Ok(());
+                }
+                let req: RegisterCredentialRequest = match serde_json::from_slice(&body) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        send_sign_error(&mut stream, "400 Bad Request", "invalid_json");
+                        return Ok(());
+                    }
+                };
+                match reg_entry.handler.register(&reg_entry.context, &req) {
+                    Ok(resp) => {
+                        let resp_body = serde_json::to_vec(&resp)
+                            .map_err(|e| format!("json serialize: {}", e))?;
+                        send_sign_response(&mut stream, "200 OK", Some(&resp_body));
+                    }
+                    Err(e) => {
+                        let (status, code) = match e.code {
+                            ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
+                            ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
+                            ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
+                            ErrorCode::NotFound => ("404 Not Found", "not_found"),
+                            ErrorCode::Conflict => ("409 Conflict", "conflict"),
+                            _ => ("500 Internal Server Error", "internal_error"),
+                        };
+                        send_sign_error(&mut stream, status, code);
+                    }
+                }
+                return Ok(());
+            }
             send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
             return Ok(());
         }
     };
+    if is_register {
+        send_sign_error(
+            &mut stream,
+            "400 Bad Request",
+            "sign_token_not_for_register",
+        );
+        return Ok(());
+    }
     if let Some(ct) = content_type_header
         && !ct.to_ascii_lowercase().starts_with("application/json")
     {

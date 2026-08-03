@@ -613,6 +613,7 @@ pub struct PolicyRuntime {
     current: RwLock<Arc<PolicyGenerationSnapshot>>,
     intents: Mutex<IntentStore>,
     grants: Mutex<HashMap<String, GrantRegistry>>,
+    registration_grants: Mutex<HashMap<String, super::grant::RegistrationGrantRegistry>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
@@ -648,6 +649,7 @@ impl PolicyRuntime {
             current: RwLock::new(gen_arc),
             intents: Mutex::new(intent_store),
             grants: Mutex::new(grant_registries),
+            registration_grants: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashMap::new()),
             clock,
@@ -813,6 +815,68 @@ impl PolicyRuntime {
 
     pub fn digest(&self) -> PolicyDigest {
         self.current.read().unwrap().digest.clone()
+    }
+
+    pub fn authorize_registration(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+    ) -> (Outcome, ReasonCode) {
+        let generation = self.current.read().unwrap();
+        let snapshot = match generation.find_snapshot(profile_id) {
+            Some(s) => s,
+            None => return (Outcome::Deny, ReasonCode::ProfileNotFound),
+        };
+
+        if !snapshot.registration_allowed {
+            return (Outcome::Deny, ReasonCode::DelegatedRegistrationDenied);
+        }
+
+        let normalized = rp_id.trim().to_ascii_lowercase();
+        match snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.rp_id.trim().to_ascii_lowercase() == normalized)
+        {
+            Some(rule) => {
+                if rule.register.authorization == AgentAuthorization::Deny {
+                    (Outcome::Deny, ReasonCode::ActionNotAllowed)
+                } else {
+                    (Outcome::Allow, ReasonCode::Allowed)
+                }
+            }
+            None => (Outcome::Deny, ReasonCode::RpIdNotExactMatch),
+        }
+    }
+
+    pub fn request_registration_grant(
+        &self,
+        profile_id: ProfileId,
+        rp_id: String,
+    ) -> Result<passless_core::agent::RegistrationGrantId, super::grant::GrantError> {
+        let profile_key = profile_id.as_str().to_string();
+        let mut reg_grants = self.registration_grants.lock().unwrap();
+
+        let registry = reg_grants.entry(profile_key).or_insert_with(|| {
+            super::grant::RegistrationGrantRegistry::new(Arc::clone(&self.clock), 300)
+        });
+
+        let session_id = passless_core::agent::PrincipalSessionId::new();
+        let endpoint_id = passless_core::agent::EndpointId::new();
+
+        registry.request_registration(profile_id, session_id, endpoint_id, [0u8; 32], rp_id, 300)
+    }
+
+    pub fn resolve_registration_grant(
+        &self,
+        profile_id: &ProfileId,
+        grant_id: &passless_core::agent::RegistrationGrantId,
+        rp_id: &str,
+    ) -> Option<super::grant::RegistrationGrantSnapshot> {
+        let profile_key = profile_id.as_str().to_string();
+        let reg_grants = self.registration_grants.lock().unwrap();
+        let registry = reg_grants.get(&profile_key)?;
+        registry.resolve_registration_grant(grant_id, rp_id)
     }
 
     pub fn list_grants(
@@ -4013,5 +4077,117 @@ mod tests {
             snapshot.to_delegation_state(),
             passless_core::agent::protocol::DelegationState::Approved
         );
+    }
+
+    #[test]
+    fn test_authorize_registration_allowed() {
+        let mut config = make_isolated_config("reg-test", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-test").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-test").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Allow);
+        assert_eq!(reason, ReasonCode::Allowed);
+    }
+
+    #[test]
+    fn test_authorize_registration_denied_by_rule() {
+        let mut config = make_isolated_config("reg-deny", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-deny").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-deny").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::ActionNotAllowed);
+    }
+
+    #[test]
+    fn test_authorize_registration_denied_global() {
+        let config = make_isolated_config("reg-global", vec!["example.com"], false);
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-global").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::DelegatedRegistrationDenied);
+    }
+
+    #[test]
+    fn test_authorize_registration_profile_not_found() {
+        let config = make_isolated_config("existing", vec!["example.com"], true);
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("nonexistent").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::ProfileNotFound);
+    }
+
+    #[test]
+    fn test_authorize_registration_rp_not_in_rules() {
+        let mut config = make_isolated_config("reg-norp", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-norp").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-norp").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "other.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::RpIdNotExactMatch);
+    }
+
+    #[test]
+    fn test_authorize_registration_rp_normalization() {
+        let mut config = make_isolated_config("reg-norm", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-norm").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-norm").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "EXAMPLE.COM");
+        assert_eq!(outcome, Outcome::Allow);
+        assert_eq!(reason, ReasonCode::Allowed);
     }
 }

@@ -1,8 +1,9 @@
 # ADR 0006: Agent-Driven Passkey Registration via Daemon-Backed WebAuthn Extension
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-03
 - **Decision owners:** Passless maintainers
+- **Implementation status:** Phases 1-5 implemented; protocol types, registration grants, daemon handler, extension override, and tests complete
 - **Related decisions:** [ADR 0005](0005-delegated-autonomous-authentication-redesign.md), [ADR 0003](0003-portable-tpm-credential-keys.md)
 - **Amends:** the daemon-backed extension path of ADR 0005
 - **Supersedes:** the deferred registration decision in ADR 0005

@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::ids::{
     CredentialRef, EndpointId, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
+    RegistrationGrantId,
 };
 
 #[cfg(target_os = "linux")]
@@ -23,6 +24,11 @@ const MAX_USER_NAME_LEN: usize = 256;
 const MAX_DISPLAY_NAME_LEN: usize = 256;
 const MAX_REASON_LEN: usize = 1024;
 const MAX_DIAGNOSTIC_LEN: usize = 4096;
+const MAX_REG_ORIGIN_LEN: usize = 2048;
+const MAX_REG_CHALLENGE_B64U_LEN: usize = 1376;
+const MAX_REG_USER_ID_B64U_LEN: usize = 88;
+const MAX_REG_EXCLUDE_CREDENTIALS: usize = 64;
+const MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN: usize = 344;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,6 +372,13 @@ pub enum AdminRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    RequestRegistration {
+        profile_id: ProfileId,
+        rp_id: String,
+        max_session_ttl: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     Shutdown,
 }
 
@@ -403,7 +416,12 @@ pub enum AdminResponse {
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
-    DelegationRequested { request_id: PendingRequestId },
+    DelegationRequested {
+        request_id: PendingRequestId,
+    },
+    RegistrationGranted {
+        registration_grant_id: RegistrationGrantId,
+    },
     ShutdownAccepted,
 }
 
@@ -509,6 +527,32 @@ pub enum PrincipalResponse {
 const MAX_ORIGIN_LEN: usize = 512;
 const MAX_B64U_LEN: usize = 1024;
 const MAX_ALLOW_CREDENTIALS: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterCredentialRequest {
+    pub origin: String,
+    pub rp_id: String,
+    pub challenge_b64u: String,
+    pub user_id_b64u: String,
+    pub user_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rp_name: Option<String>,
+    pub exclude_credentials: Vec<String>,
+    pub user_verification: bool,
+    pub cross_origin: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterCredentialResponse {
+    pub credential_id_b64u: String,
+    pub authenticator_data_b64u: String,
+    pub attestation_object_b64u: String,
+    pub client_data_json_b64u: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1159,6 +1203,12 @@ impl Validate for AdminRequest {
                     check_str(r, "reason", MAX_REASON_LEN, &mut errors);
                 }
             }
+            Self::RequestRegistration { rp_id, reason, .. } => {
+                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+                if let Some(r) = reason {
+                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
+                }
+            }
             Self::WaitPrincipal { timeout_ms, .. } => {
                 if *timeout_ms > 5000 {
                     errors.push(format!(
@@ -1269,6 +1319,61 @@ impl Validate for PrincipalRequest {
                         req.allow_credentials.len()
                     ));
                 }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationErrors(errors))
+        }
+    }
+}
+
+impl Validate for RegisterCredentialRequest {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = Vec::new();
+        check_str(&self.origin, "origin", MAX_REG_ORIGIN_LEN, &mut errors);
+        check_str(&self.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+        check_str(
+            &self.challenge_b64u,
+            "challenge_b64u",
+            MAX_REG_CHALLENGE_B64U_LEN,
+            &mut errors,
+        );
+        if self.challenge_b64u.is_empty() {
+            errors.push("challenge_b64u: must not be empty".into());
+        }
+        check_str(
+            &self.user_id_b64u,
+            "user_id_b64u",
+            MAX_REG_USER_ID_B64U_LEN,
+            &mut errors,
+        );
+        if self.user_id_b64u.is_empty() {
+            errors.push("user_id_b64u: must not be empty".into());
+        }
+        check_str(&self.user_name, "user_name", MAX_USER_NAME_LEN, &mut errors);
+        if let Some(ref name) = self.user_display_name {
+            check_str(name, "user_display_name", MAX_DISPLAY_NAME_LEN, &mut errors);
+        }
+        if let Some(ref name) = self.rp_name {
+            check_str(name, "rp_name", MAX_DISPLAY_NAME_LEN, &mut errors);
+        }
+        if self.exclude_credentials.len() > MAX_REG_EXCLUDE_CREDENTIALS {
+            errors.push(format!(
+                "exclude_credentials: exceeds maximum count {} (got {})",
+                MAX_REG_EXCLUDE_CREDENTIALS,
+                self.exclude_credentials.len()
+            ));
+        }
+        for (i, cred) in self.exclude_credentials.iter().enumerate() {
+            if cred.len() > MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN {
+                errors.push(format!(
+                    "exclude_credentials[{}]: exceeds maximum length {} (got {})",
+                    i,
+                    MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN,
+                    cred.len()
+                ));
             }
         }
         if errors.is_empty() {

@@ -146,6 +146,10 @@ opaque_id!(
     PendingRequestId,
     "Opaque identifier for a pending principal request."
 );
+opaque_id!(
+    RegistrationGrantId,
+    "Opaque identifier for a registration grant."
+);
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
