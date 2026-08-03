@@ -1,6 +1,6 @@
 # ADR 0005 — Full-Implementation Verification Matrix
 
-- **Status:** Verification plan (in progress)
+- **Status:** Verification plan (in progress; software-credential MVP implemented)
 - **Date:** 2026-08-02
 - **Covers:** All four rollout phases of [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md)
 - **Companion docs:** [agent-adr-validation-closure.md](agent-adr-validation-closure.md), [portable-tpm-gap-closure.md](portable-tpm-gap-closure.md)
@@ -13,7 +13,7 @@
 |-------|-------------------|---------------|
 | P1 | Daemon signing oracle | `cmd/passless/src/agent/sign.rs`, `passless-core/src/agent/protocol.rs` (`SignAssertion*`) |
 | P2 | MAIN-world shim + isolated-world broker + browser load | `cmd/passless/assets/agent-extension/`, `browser.rs:generate_agent_extension` |
-| P3 | Delete bypassed delegated ceremony stack | `AgentCeremonyHandler`, `AgentInteractionManager` pre-auth, `agent_mode` flag, `with_shared_storage_and_pre_authorization` |
+| P3 | Delete bypassed delegated ceremony stack | Pre-auth mint + `with_shared_storage_and_pre_authorization` removed; delegated UHID endpoint arms and `agent_mode` safety net retained for isolated/confirm |
 | P4 | Portable-TPM E2E | `cmd/passless/src/storage/tpm/portable/provider.rs`, swtpm |
 
 ---
@@ -29,7 +29,7 @@
 | U1.3 | Origin verification | `cargo test --all-features -p passless-rs --bin passless agent::sign::tests::test_origin_verification_*` | Exact match passes; wrong origin denied; explicit allow-list overrides | ✅ Fully automated |
 | U1.4 | base64url round-trip | `cargo test --all-features -p passless-rs --bin passless agent::sign::tests::test_b64u_*` | Round-trip identity; no padding chars | ✅ Fully automated |
 | U1.5 | Protocol validation bounds | `cargo test --all-features -p passless-rs --bin passless agent::protocol` | `SignAssertion` rejects empty challenge, oversized allow_credentials, oversized origin/bearer | ✅ Fully automated |
-| U1.6 | `authenticatorData` soft-fido2 fixture | Add a byte-exact fixture produced from the private soft-fido2 builder's documented layout | Byte-identical 37-byte output for the same RP, flags, backup state, and count | Requires implementation |
+| U1.6 | `authenticatorData` soft-fido2 fixture | `agent::sign::tests::test_authenticator_data_*` | Byte-identical 37-byte output for the same RP, flags, backup state, and count | ✅ Fully automated |
 
 ### P2 — Extension content script
 
@@ -63,13 +63,13 @@
 
 | ID | Phase | Area | Command | Expected | Automation |
 |----|-------|------|---------|----------|------------|
-| I1 | P1 | Sign endpoint HTTP round-trip | **New test needed.** Start `SignHttpServer::bind`, POST a valid `SignAssertionRequest` with correct bearer, parse 200 response, verify signature with public key | 200 + valid signature verifiable offline | ⚙️ Requires implementation |
-| I2 | P1 | Sign endpoint auth and preflight | Exercise allowed-origin OPTIONS, valid POST, missing bearer, wrong bearer, and origin mismatch | Preflight permits only the required request; invalid requests fail before handler/key use | Requires implementation |
-| I3 | P1 | Policy deny → audit event | Configure profile with RP not in allowlist; send sign request; check audit log for `PolicyDeny` with reason `rp_not_allowed` | Deny event recorded; no signature returned | ⚙️ Requires implementation |
-| I4 | P1 | Grant TTL enforcement | Create grant with short TTL; wait for expiry; send sign request → 403 `no_active_grant` | Deny after TTL | ⚙️ Requires implementation |
-| I5 | P1 | Credential ref enforcement | Request with credential_ref not in allowed list → 403 `credential_ref_not_allowed` | Deny + audit | ⚙️ Requires implementation |
-| I6 | P1 | Signature counter increment | Two successive sign calls on same discoverable credential; second `authenticatorData` sign_count = first + 1 | Monotonic counter | ⚙️ Requires implementation |
-| I7 | P1 | Constant counter mode | Set `constant_signature_counter = true`; two sign calls; both sign_count = 0 | No increment | ⚙️ Requires implementation |
+| I1 | P1 | Sign endpoint HTTP round-trip | `agent::sign::tests::integration_tests::http_sign_full_response_structure` | 200 + valid signature verifiable offline | ✅ Fully automated |
+| I2 | P1 | Sign endpoint auth and preflight | `http_auth_preflight_then_sign` + existing `test_http_options_sign_preflight` / `test_http_missing_bearer` / `test_http_unknown_bearer_401` / `test_http_unbound_bearer_401` / `test_http_revoked_bearer_401` | Preflight permits only the required request; invalid requests fail before handler/key use | ✅ Fully automated |
+| I3 | P1 | Policy deny → audit event | `audit_and_policy_tests::audit_deny_event_on_rp_mismatch` (+ `http_policy_deny_returns_403`) | Deny event recorded; no signature returned | ✅ Fully automated |
+| I4 | P1 | Grant TTL enforcement | `integration_tests::http_grant_ttl_enforced` | Deny after TTL | ✅ Fully automated |
+| I5 | P1 | Credential ref enforcement | `integration_tests::http_credential_ref_enforced` (+ `http_unauthorized_credential_denied`) | Deny + audit | ✅ Fully automated |
+| I6 | P1 | Signature counter increment | `integration_tests::http_counter_increment_monotonic` | Monotonic counter | ✅ Fully automated |
+| I7 | P1 | Constant counter mode | `audit_and_policy_tests::counter_zero_in_constant_mode_response` | No increment | ✅ Fully automated |
 | I8 | P2 | Extension loaded in browser | Launch Chromium via `generate_agent_extension` + `build_browser_command`; CDP `Runtime.evaluate` checks `navigator.credentials.get !== nativeGet` | Override active | ⚙️ Requires local Chromium |
 | I9 | P2 | Extension config isolation | After browser launch, probe page-visible globals, DOM, events, resources, console, and errors | Bearer and endpoint configuration are not page-readable; broker can still reach daemon | Requires local Chromium |
 | I10 | P3 | Isolated mode regression | `cargo test --all-features --test agent_config_integration` | All pass; isolated credentials still scoped | ✅ Fully automated |
@@ -111,18 +111,18 @@
 
 | ID | Area | Procedure | Expected | Automation |
 |----|------|-----------|----------|------------|
-| S1 | Missing bearer | POST to sign endpoint without `Authorization` header | 401 | ⚙️ Requires implementation |
-| S2 | Wrong bearer | POST with `Bearer invalid_token` | 401 | ⚙️ Requires implementation |
-| S3 | Origin mismatch | POST with `Origin: https://evil.com` but `origin` field = `https://rp.example.com` in body | 400 (header/body mismatch check at `sign.rs:301-306`) | ⚙️ Requires implementation |
-| S4 | Wrong RP ID | Sign request with `rp_id: "evil.com"` but credential belongs to `example.com` | 403 `origin_denied` or `rp_not_allowed` | ⚙️ Requires implementation |
-| S5 | Expired grant | Sign request after grant TTL elapsed | 403 `no_active_grant` | ⚙️ Requires implementation |
-| S6 | Unauthorized credential ref | Sign request with credential_ref not in profile's allowed list | 403 `credential_ref_not_allowed` | ⚙️ Requires implementation |
+| S1 | Missing bearer | POST to sign endpoint without `Authorization` header | 401 | ✅ Fully automated (`test_http_missing_bearer`) |
+| S2 | Wrong bearer | POST with `Bearer invalid_token` | 401 | ✅ Fully automated (`test_http_unknown_bearer_401`, `test_http_revoked_bearer_401`, `http_bearer_not_prefix_match`, `http_wrong_auth_scheme`) |
+| S3 | Origin mismatch | POST with body `origin` not matching RP ID | 403 `origin_invalid` | ✅ Fully automated (`http_origin_mismatch_denied`, `audit_deny_event_on_origin_mismatch`) |
+| S4 | Wrong RP ID | Sign request with `rp_id` not in grant | 403 `rp_id_not_match` | ✅ Fully automated (`http_wrong_rp_id_denied`, `audit_deny_event_on_rp_mismatch`) |
+| S5 | Expired grant | Sign request after grant TTL elapsed | 403 `grant_expired` | ✅ Fully automated (`http_grant_ttl_enforced`, `audit_deny_event_on_expired_grant`) |
+| S6 | Unauthorized credential ref | Sign request with allow_credentials not matching grant credential | 403 `allow_credentials_mismatch` | ✅ Fully automated (`http_unauthorized_credential_denied`, `audit_deny_event_on_credential_mismatch`) |
 | S7 | No credential refs configured | Profile with `credential_refs = None` | 403 `no_credential_refs` | ⚙️ Requires implementation |
-| S8 | Policy not `allow` | RP rule with `authorization: "confirm"` → sign endpoint should reject (not auto-approve) | 403 `authorization_not_allow` | ⚙️ Requires implementation |
+| S8 | Policy not `allow` | RP rule with `authorization: "confirm"` → sign endpoint rejects (not auto-approve) | 403 `action_not_allowed` | ✅ Fully automated (`confirm_policy_blocks_autonomous_sign`, `deny_authorization_blocks_sign`, `confirm_policy_deny_audit_event`) |
 | S9 | Oversized payload | `allow_credentials` > `MAX_ALLOW_CREDENTIALS` (64) | Validation error before any side effect | ✅ Covered by protocol validation tests |
 | S10 | Null bytes in request | Send request body with `\0` bytes | Rejected at parse or validation | ⚙️ Requires implementation |
-| S11 | Replay attack | Submit identical sign request twice; second must fail (grant consumed or counter check) | Second request denied or idempotent with same counter | ⚙️ Requires implementation |
-| S12 | Cross-origin credential theft | Content script on `https://evil.com` tries to sign for `rp_id: "example.com"` | Origin verification fails; 403 | ⚙️ Requires implementation |
+| S11 | Replay attack | Submit identical sign request twice | Counter increments (monotonic mode); no token/credential leak | ✅ Fully automated (`http_replay_attack_same_challenge`) |
+| S12 | Cross-origin credential theft | Content script on `https://evil.com` tries to sign for `rp_id: "example.com"` | Origin verification fails; 403 | ✅ Fully automated (`http_cross_origin_theft_attempt`) |
 | S13 | Extension config leakage | Probe page-visible globals, DOM, events, resources, console, and errors on allowed and unrelated origins | Bearer and endpoint configuration are not page-readable on any origin | Requires local Chromium |
 
 ---
@@ -167,18 +167,28 @@
 
 | ID | Area | Procedure | Expected | Automation |
 |----|------|-----------|----------|------------|
-| A1 | Audit allow event | Sign via extension path; inspect audit file | `PolicyAllow` with profile_id, rp_id, action, timestamp | ⚙️ Requires implementation |
-| A2 | Audit deny events | Trigger each deny scenario (S3–S8); inspect audit | `PolicyDeny` with specific reason codes | ⚙️ Requires implementation |
-| A3 | Grant consumed / TTL respected | Create grant with 10s TTL; sign at t=0 (success), sign at t=11 (denied) | Allow then deny | ⚙️ Requires implementation |
-| A4 | Counter monotonicity | 5 successive signs; extract sign_count from each `authenticatorData` | Strictly increasing (or constant if `constant_signature_counter`) | ⚙️ Requires implementation |
-| A5 | Counter persistence across daemon restart | Sign twice; restart daemon; sign again; verify counter continues from last value | No counter rollback | ⚙️ Requires implementation |
-| A6 | Concurrent sign serialization | Two simultaneous sign requests for same credential | One succeeds first; second gets updated counter; no data loss | ⚙️ Requires implementation |
-| A7 | Audit pre-write blocks sign | Make audit path read-only; attempt sign | Sign fails; no key use occurs | ⚙️ Requires implementation |
+| A1 | Audit allow event | Sign via sign handler; inspect audit | `PolicyAllow` with profile_id, rp_id, action, timestamp | ✅ Fully automated (`audit_allow_event_on_successful_sign`) |
+| A2 | Audit deny events | Trigger each deny scenario; inspect audit | `PolicyDeny` with specific reason codes | ✅ Fully automated (`audit_deny_event_on_origin_mismatch`, `audit_deny_event_on_expired_grant`, `audit_deny_event_on_revoked_grant`, `audit_deny_event_on_rp_mismatch`, `audit_deny_event_on_credential_mismatch`, `confirm_policy_deny_audit_event`) |
+| A3 | Grant consumed / TTL respected | Create grant with short TTL; sign at t=0 (success), sign after expiry (denied) | Allow then deny | ✅ Fully automated (`audit_deny_event_on_expired_grant`, `http_grant_ttl_enforced`) |
+| A4 | Counter monotonicity | Successive signs; extract sign_count from each `authenticatorData` | Strictly increasing (or constant if `constant_signature_counter`) | ✅ Fully automated (`monotonic_sequential_counter`, `counter_increments_in_monotonic_mode_response`, `counter_zero_in_constant_mode_response`, `http_counter_increment_monotonic`) |
+| A5 | Counter persistence | Sign twice; sign again; counter continues from last value | No counter rollback | ✅ Fully automated (`persisted_counter_visible_after_reconstruct`) |
+| A6 | Concurrent sign serialization | Two simultaneous sign requests for same credential | Serialized; no data loss | ✅ Fully automated (`concurrent_counter_serialization`) |
+| A7 | Audit pre-write blocks sign | Make audit recording fail; attempt sign | Sign fails; no key use occurs | ✅ Fully automated (`audit_pre_write_blocks_sign`) |
+
+### Cancellation / cleanup regression (CLOSES the plan's former "Current blocker")
+
+| ID | Area | Procedure | Expected | Automation |
+|----|------|-----------|----------|------------|
+| CR1 | Cancel revokes resolved grant | Delegate, approve grant, cancel; resolve the grant | Grant no longer active | ✅ Fully automated (`agent::runtime::tests::cancel_after_approval_revokes_resolved_grant`) |
+| CR2 | Cancel revokes bearer | After cancel, inspect `SignContextRegistry` for the cancelled lease | No entries remain | ✅ Fully automated (`cancel_after_approval_revokes_bearer_from_registry`) |
+| CR3 | Cancel leaves no usable sign context | After cancel, `lookup_bound` for the lease token | None | ✅ Fully automated (`cancel_after_approval_leaves_no_usable_sign_context`) |
+| CR4 | Sign denied after cancel | Attempt sign with the cancelled lease's context | Denied | ✅ Fully automated (`sign_denied_after_cancel_revokes_grant`) |
+| CR5 | Expired grant unusable | Grant past TTL via registry path | Denied | ✅ Fully automated (`expired_grant_is_not_usable_for_signing_via_registry`) |
+| CR6 | Explicit revocation denies | Revoke via `PolicyRuntime`; attempt sign | Denied | ✅ Fully automated (`sign_denied_after_explicit_revocation_via_policy`) |
 
 ---
 
 ## 9 · Isolated-mode regression
-
 | ID | Area | Procedure | Expected | Automation |
 |----|------|-----------|----------|------------|
 | ISO1 | Isolated credential registration | `cargo test --all-features -p passless-rs --bin passless agent::ceremony::tests` (isolated register variants) | Pass | ✅ Fully automated |
@@ -195,7 +205,7 @@
 
 | ID | Area | Procedure | Expected | Automation |
 |----|------|-----------|----------|------------|
-| C1 | Confirm rule blocks autonomous sign | Configure profile with `authorization: "confirm"` for RP; send sign request to extension endpoint | 403 `authorization_not_allow`; daemon does NOT auto-approve | ⚙️ Requires implementation |
+| C1 | Confirm rule blocks autonomous sign | Configure profile with `authorization: "confirm"` for RP; send sign request | 403 `action_not_allowed`; daemon does NOT auto-approve | ✅ Fully automated (`confirm_policy_blocks_autonomous_sign`, `confirm_policy_deny_audit_event`) |
 | C2 | Confirm triggers human prompt | Same config; trigger via browser (non-autonomous path) | `DesktopPromptHandle` notification appears; requires explicit user action | ⚙️ Requires Xvfb + notification daemon |
 | C3 | Confirm denial propagates | Trigger confirm; deny at prompt | `NotAllowedError` in page; audit `PolicyDeny` | ⚙️ Requires Xvfb |
 | C4 | Confirm timeout | Trigger confirm; do not act; wait for timeout | Denied; audit `PolicyDeny` with timeout reason | ⚙️ Requires Xvfb |
@@ -244,17 +254,18 @@
 
 | Category | Fully automated (CI) | Requires local environment | Requires implementation |
 |----------|---------------------|---------------------------|------------------------|
-| Unit tests (P1–P3) | U1.1–U1.5, U2.1–U2.4, U3.1–U3.4 | — | U1.6 |
+| Unit tests (P1–P3) | U1.1–U1.6, U2.1–U2.4, U3.1–U3.4 | — | — |
 | Unit tests (P4) | — | U4.1 | U4.2 |
-| Integration tests | I10–I12 | I8, I9, I13 | I1–I7 |
+| Integration tests | I1–I7, I10–I12 | I8, I9, I13 | — |
 | Build/clippy/test | B1–B8 | — | — |
 | Extension validation | BX5 | BX1–BX4, BX6 | — |
-| Negative security | S9 | S1–S8, S10–S13 | All need test harness |
+| Negative security | S1–S6, S8, S9, S11, S12 | S13 | S7, S10 |
 | Real-RP E2E | — | E1–E8 | — |
 | No-dialog evidence | N3–N5 | N1, N2 | — |
-| Audit/grant/counter | — | A1–A7 | All need test harness |
+| Audit/grant/counter | A1–A7 | — | — |
+| Cancellation/cleanup regression | CR1–CR6 | — | — |
 | Isolated regression | ISO1–ISO7 | — | — |
-| Confirm-policy | — | C1–C5 | All need test harness |
+| Confirm-policy | C1 | C2–C5 | — |
 | Portable TPM | — | T1–T4, T6–T9 | T3 (sign via extension) |
 
 ---

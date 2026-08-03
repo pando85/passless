@@ -81,7 +81,6 @@ pub struct RuntimeStartParams<'a> {
     pub pin_config: PinConfig,
     pub shutdown: Arc<AtomicBool>,
     pub endpoint_factory: Option<EndpointFactory>,
-    pub human_interaction_manager: Option<Arc<AgentInteractionManager>>,
 }
 
 struct CreateIntentParams<'a> {
@@ -534,7 +533,6 @@ pub struct AgentRuntime {
     daemon_uid: u32,
     daemon_gid: u32,
     agent_config: std::sync::RwLock<AgentConfig>,
-    human_interaction_manager: Option<Arc<AgentInteractionManager>>,
     sign_registry: Arc<SignContextRegistry>,
     sign_server_shutdown: Arc<AtomicBool>,
     sign_server_handle: Mutex<Option<JoinHandle<()>>>,
@@ -551,7 +549,6 @@ impl AgentRuntime {
         security_config: SecurityConfig,
         pin_config: PinConfig,
         shutdown: Arc<AtomicBool>,
-        human_interaction_manager: Option<Arc<AgentInteractionManager>>,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factories(RuntimeStartParams {
             human_storage,
@@ -562,7 +559,6 @@ impl AgentRuntime {
             pin_config,
             shutdown,
             endpoint_factory: None,
-            human_interaction_manager,
         })
     }
 
@@ -576,7 +572,6 @@ impl AgentRuntime {
             pin_config,
             shutdown,
             endpoint_factory,
-            human_interaction_manager,
         } = params;
         let daemon_uid = unsafe { libc::getuid() };
         let daemon_gid = unsafe { libc::getgid() };
@@ -1210,7 +1205,6 @@ impl AgentRuntime {
             daemon_uid,
             daemon_gid,
             agent_config: std::sync::RwLock::new(agent_config.clone()),
-            human_interaction_manager,
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
@@ -3883,29 +3877,6 @@ impl AgentRuntime {
             });
         }
 
-        if ceremony_policy.authorization == passless_core::agent::AgentAuthorization::Allow {
-            if let Some(ref manager) = self.human_interaction_manager {
-                let up_approved =
-                    ceremony_policy.user_presence != passless_core::agent::UserPresenceSource::None;
-                let uv_approved = ceremony_policy.user_verification
-                    == passless_core::agent::UserVerificationSource::Policy;
-                info!(
-                    "Minting human interaction token: rp={}, up={}, uv={}, ttl={}s",
-                    normalized_rp, up_approved, uv_approved, clamped_grant_ttl
-                );
-                manager.mint(
-                    normalized_rp.clone(),
-                    passless_core::agent::protocol::IntentAction::Authenticate,
-                    0,
-                    up_approved,
-                    uv_approved,
-                    std::time::Duration::from_secs(clamped_grant_ttl),
-                );
-            } else {
-                info!("No human_interaction_manager available for token minting");
-            }
-        }
-
         Ok(PrincipalResponse::DelegationRequested {
             request_id: pending_id,
         })
@@ -3982,13 +3953,12 @@ impl AgentRuntime {
 
         let grant_request_id = status.grant_request_id;
 
-        if let Some(ref grant_req_id) = grant_request_id {
-            if let Some(grant_id) = self
+        if let Some(ref grant_req_id) = grant_request_id
+            && let Some(grant_id) = self
                 .policy_runtime
                 .resolved_grant_id_for_request(&status.profile_id, grant_req_id)
-            {
-                let _ = self.policy_runtime.revoke_grant_by_id(&grant_id);
-            }
+        {
+            let _ = self.policy_runtime.revoke_grant_by_id(&grant_id);
         }
 
         let _ = self
@@ -6883,7 +6853,6 @@ mod tests {
                 daemon_uid: unsafe { libc::getuid() },
                 daemon_gid: unsafe { libc::getgid() },
                 agent_config: std::sync::RwLock::new(agent_config),
-                human_interaction_manager: None,
                 sign_registry,
                 sign_server_shutdown,
                 sign_server_handle: Mutex::new(Some(sign_server_handle)),
@@ -7681,7 +7650,6 @@ mod tests {
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
-            human_interaction_manager: None,
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
@@ -7929,7 +7897,6 @@ mod tests {
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
-            human_interaction_manager: None,
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
@@ -8384,6 +8351,348 @@ mod tests {
             revoked_grant.is_none()
                 || revoked_grant.unwrap().state == super::super::grant::GrantState::Revoked,
             "rollback must revoke the grant"
+        );
+    }
+
+    #[test]
+    fn cancel_after_approval_revokes_resolved_grant() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let response = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+        let request_id = match response {
+            PrincipalResponse::DelegationRequested { request_id } => request_id,
+            _ => panic!("expected DelegationRequested"),
+        };
+
+        let entries_before = harness.runtime.sign_registry.all_entries();
+        let grant_id = entries_before[0].context.active_grant_id.clone();
+
+        let snapshot_before = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&harness.profile_id, &grant_id);
+        assert!(
+            snapshot_before.is_some(),
+            "grant should exist before cancel"
+        );
+        assert_eq!(
+            snapshot_before.unwrap().state,
+            super::super::grant::GrantState::Active
+        );
+
+        let cancel_result = harness.runtime.handle_cancel_delegation(
+            &harness.profile_id,
+            &harness.session_id,
+            &request_id,
+            harness.profile(),
+        );
+        assert!(matches!(
+            cancel_result,
+            Ok(PrincipalResponse::DelegationCancelled)
+        ));
+
+        let snapshot_after = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&harness.profile_id, &grant_id);
+        assert!(
+            snapshot_after.is_none()
+                || snapshot_after.as_ref().unwrap().is_revoked
+                || snapshot_after.as_ref().unwrap().state
+                    != super::super::grant::GrantState::Active,
+            "grant must be revoked or non-active after cancellation, got {:?}",
+            snapshot_after.map(|s| s.state)
+        );
+
+        let grants = harness
+            .runtime
+            .policy_runtime
+            .list_grants(Some(&harness.profile_id));
+        let active_count = grants
+            .iter()
+            .filter(|g| g.id == grant_id && g.state == super::super::grant::GrantState::Active)
+            .count();
+        assert_eq!(
+            active_count, 0,
+            "no active grant should remain after cancellation"
+        );
+    }
+
+    #[test]
+    fn cancel_after_approval_revokes_bearer_from_registry() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let response = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+        let request_id = match response {
+            PrincipalResponse::DelegationRequested { request_id } => request_id,
+            _ => panic!("expected DelegationRequested"),
+        };
+
+        let entries_before = harness.runtime.sign_registry.all_entries();
+        assert!(
+            !entries_before.is_empty(),
+            "sign registry should have entries before cancel"
+        );
+        let lease_id_before = entries_before[0].lease_id.clone();
+        assert!(
+            lease_id_before.is_some(),
+            "lease should be bound before cancel"
+        );
+
+        let cancel_result = harness.runtime.handle_cancel_delegation(
+            &harness.profile_id,
+            &harness.session_id,
+            &request_id,
+            harness.profile(),
+        );
+        assert!(cancel_result.is_ok());
+
+        let entries_after = harness.runtime.sign_registry.all_entries();
+        let remaining_with_lease = entries_after
+            .iter()
+            .filter(|e| e.lease_id == lease_id_before)
+            .count();
+        assert_eq!(
+            remaining_with_lease, 0,
+            "no entries with the cancelled lease should remain in sign registry"
+        );
+    }
+
+    #[test]
+    fn cancel_after_approval_leaves_no_usable_sign_context() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let response = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+        let request_id = match response {
+            PrincipalResponse::DelegationRequested { request_id } => request_id,
+            _ => panic!("expected DelegationRequested"),
+        };
+
+        let registry_size_before = harness.runtime.sign_registry.len();
+        assert!(
+            registry_size_before > 0,
+            "registry should have entries before cancel"
+        );
+
+        let cancel_result = harness.runtime.handle_cancel_delegation(
+            &harness.profile_id,
+            &harness.session_id,
+            &request_id,
+            harness.profile(),
+        );
+        assert!(cancel_result.is_ok());
+
+        let registry_size_after = harness.runtime.sign_registry.len();
+        let entries_after = harness.runtime.sign_registry.all_entries();
+        let bound_entries: Vec<_> = entries_after
+            .iter()
+            .filter(|e| e.lease_id.is_some())
+            .collect();
+        assert!(
+            bound_entries.is_empty(),
+            "no bound sign contexts should remain after cancellation, found {}",
+            bound_entries.len()
+        );
+        assert!(
+            registry_size_after < registry_size_before || registry_size_after == 0,
+            "registry should have fewer or no entries after cancellation"
+        );
+    }
+
+    #[test]
+    fn sign_denied_after_cancel_revokes_grant() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let response = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+        let request_id = match response {
+            PrincipalResponse::DelegationRequested { request_id } => request_id,
+            _ => panic!("expected DelegationRequested"),
+        };
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        let grant_id = entries[0].context.active_grant_id.clone();
+        let profile_id = entries[0].context.profile_id.clone();
+
+        let resolved_before = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&profile_id, &grant_id);
+        assert!(resolved_before.is_some());
+        assert!(!resolved_before.unwrap().is_revoked);
+
+        let cancel_result = harness.runtime.handle_cancel_delegation(
+            &harness.profile_id,
+            &harness.session_id,
+            &request_id,
+            harness.profile(),
+        );
+        assert!(cancel_result.is_ok());
+
+        let resolved_after = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&profile_id, &grant_id);
+        let sign_would_be_denied = match resolved_after {
+            None => true,
+            Some(snap) => snap.is_revoked || snap.state != super::super::grant::GrantState::Active,
+        };
+        assert!(
+            sign_would_be_denied,
+            "sign should be denied after cancel: grant must be revoked, expired, or gone"
+        );
+    }
+
+    #[test]
+    fn expired_grant_is_not_usable_for_signing_via_registry() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        let ctx = &entries[0].context;
+        let grant_id = ctx.active_grant_id.clone();
+
+        let resolved = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &grant_id);
+        assert!(resolved.is_some(), "grant should exist before revocation");
+        assert_eq!(
+            resolved.unwrap().state,
+            super::super::grant::GrantState::Active
+        );
+
+        harness
+            .runtime
+            .policy_runtime
+            .revoke_grant_by_id(&grant_id)
+            .unwrap();
+
+        let resolved_after = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &grant_id);
+        let is_unusable = match resolved_after {
+            None => true,
+            Some(snap) => snap.is_revoked || snap.state != super::super::grant::GrantState::Active,
+        };
+        assert!(
+            is_unusable,
+            "grant must be unusable for signing after explicit revocation"
+        );
+    }
+
+    #[test]
+    fn sign_denied_after_explicit_revocation_via_policy() {
+        let harness = RuntimeHarness::new_delegated();
+        let endpoint_id = harness.create_endpoint();
+
+        let _result = harness
+            .runtime
+            .handle_request_delegation(RequestDelegationParams {
+                profile_id: &harness.profile_id,
+                session_id: &harness.session_id,
+                endpoint_id: &endpoint_id,
+                rp_id: &harness.rp_id,
+                credential_ref: &harness.credential_ref,
+                max_session_ttl: 300,
+                principal_reason: None,
+                profile: harness.profile(),
+                session_digest: &harness.process_digest,
+            })
+            .unwrap();
+
+        let entries = harness.runtime.sign_registry.all_entries();
+        let grant_id = entries[0].context.active_grant_id.clone();
+        let profile_id = entries[0].context.profile_id.clone();
+
+        harness
+            .runtime
+            .policy_runtime
+            .revoke_grant_by_id(&grant_id)
+            .unwrap();
+
+        let resolved = harness
+            .runtime
+            .policy_runtime
+            .resolve_grant_for_sign(&profile_id, &grant_id);
+        let sign_would_be_denied = match resolved {
+            None => true,
+            Some(snap) => snap.is_revoked || snap.state != super::super::grant::GrantState::Active,
+        };
+        assert!(
+            sign_would_be_denied,
+            "sign must be denied after explicit grant revocation via policy runtime"
         );
     }
 }

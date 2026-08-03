@@ -1865,7 +1865,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, AtomicUsize};
         use std::time::Instant;
 
-        struct MockClock {
+        pub struct MockClock {
             inner: Mutex<MockClockInner>,
         }
         struct MockClockInner {
@@ -1873,7 +1873,7 @@ mod tests {
             offset: Duration,
         }
         impl MockClock {
-            fn new() -> Self {
+            pub fn new() -> Self {
                 Self {
                     inner: Mutex::new(MockClockInner {
                         base: Instant::now(),
@@ -1881,7 +1881,7 @@ mod tests {
                     }),
                 }
             }
-            fn advance(&self, d: Duration) {
+            pub fn advance(&self, d: Duration) {
                 self.inner.lock().unwrap().offset += d;
             }
         }
@@ -1895,11 +1895,11 @@ mod tests {
             }
         }
 
-        struct MockMonoClock {
+        pub struct MockMonoClock {
             inner: Mutex<MockClockInner>,
         }
         impl MockMonoClock {
-            fn new() -> Self {
+            pub fn new() -> Self {
                 Self {
                     inner: Mutex::new(MockClockInner {
                         base: Instant::now(),
@@ -1916,12 +1916,12 @@ mod tests {
             }
         }
 
-        struct RecordingKeyProvider {
+        pub struct RecordingKeyProvider {
             inner: SoftwareCredentialKeyProvider,
             sign_count: AtomicUsize,
         }
         impl RecordingKeyProvider {
-            fn new() -> Self {
+            pub fn new() -> Self {
                 Self {
                     inner: SoftwareCredentialKeyProvider,
                     sign_count: AtomicUsize::new(0),
@@ -1955,12 +1955,12 @@ mod tests {
             }
         }
 
-        struct WriteCountingStorage {
+        pub struct WriteCountingStorage {
             creds: Mutex<Vec<soft_fido2::Credential>>,
             write_count: AtomicU64,
         }
         impl WriteCountingStorage {
-            fn new() -> Self {
+            pub fn new() -> Self {
                 Self {
                     creds: Mutex::new(Vec::new()),
                     write_count: AtomicU64::new(0),
@@ -1969,7 +1969,7 @@ mod tests {
             fn writes(&self) -> u64 {
                 self.write_count.load(Ordering::Acquire)
             }
-            fn add_cred(&self, cred: soft_fido2::Credential) {
+            pub fn add_cred(&self, cred: soft_fido2::Credential) {
                 self.creds.lock().unwrap().push(cred);
             }
         }
@@ -2031,7 +2031,7 @@ mod tests {
         pub struct TestFixture {
             profile_id: ProfileId,
             grant_id: passless_core::agent::GrantId,
-            clock: Arc<MockClock>,
+            pub clock: Arc<MockClock>,
             policy_runtime: Arc<PolicyRuntime>,
             storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
             key_provider: Arc<RecordingKeyProvider>,
@@ -2528,6 +2528,1045 @@ mod tests {
                 }
                 _ => panic!("expected SignAssertionResult"),
             }
+        }
+    }
+
+    mod audit_and_policy_tests {
+        use super::sign_handler_tests::*;
+        use super::*;
+
+        use crate::agent::audit::AuditGate;
+        use crate::agent::grant::GrantRequestParams;
+        use crate::agent::intent;
+        use crate::agent::policy_engine::PolicyRuntime;
+        use crate::storage::CredentialStorage;
+
+        use passless_core::agent::{
+            AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
+            AgentRpRule, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+        };
+        use passless_core::config::SecurityConfig;
+
+        use soft_fido2::{
+            CredentialBackupState, CredentialKeyProvider, RelyingParty,
+            SoftwareCredentialKeyProvider, User,
+        };
+
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const FRAME_MAGIC: u32 = 0x41554449;
+        const HEADER_SIZE: usize = 88;
+
+        fn read_audit_events(audit_dir: &std::path::Path) -> Vec<serde_json::Value> {
+            let mut events = Vec::new();
+            let mut entries: Vec<_> = std::fs::read_dir(audit_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("audit-") && name.ends_with(".log")
+                })
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+
+            for entry in entries {
+                let data = std::fs::read(entry.path()).unwrap();
+                if data.len() <= HEADER_SIZE {
+                    continue;
+                }
+                let mut offset = HEADER_SIZE;
+                while offset + 12 <= data.len() {
+                    let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                    if magic != FRAME_MAGIC {
+                        break;
+                    }
+                    let frame_len =
+                        u64::from_le_bytes(data[offset + 4..offset + 12].try_into().unwrap())
+                            as usize;
+                    if offset + 12 + frame_len > data.len() {
+                        break;
+                    }
+                    let body = &data[offset + 12..offset + 12 + frame_len];
+                    if body.len() < 28 {
+                        break;
+                    }
+                    let payload_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
+                    if body.len() < 28 + payload_len + 64 {
+                        break;
+                    }
+                    let payload = &body[28..28 + payload_len];
+                    let event: serde_json::Value = serde_json::from_slice(payload).unwrap();
+                    events.push(event);
+                    offset += 12 + frame_len;
+                }
+            }
+            events
+        }
+
+        fn find_policy_events(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+            events
+                .iter()
+                .filter(|e| {
+                    e.get("kind")
+                        .and_then(|k| k.as_str())
+                        .is_some_and(|k| k == "policy.allow" || k == "policy.deny")
+                })
+                .collect()
+        }
+
+        struct AuditTestFixture {
+            profile_id: ProfileId,
+            grant_id: passless_core::agent::GrantId,
+            clock: Arc<MockClock>,
+            policy_runtime: Arc<PolicyRuntime>,
+            storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+            key_provider: Arc<RecordingKeyProvider>,
+            audit_gate: Arc<AuditGate>,
+            operation_lock: Arc<Mutex<()>>,
+            security_config: SecurityConfig,
+            profile_config: AgentProfileConfig,
+            audit_dir: std::path::PathBuf,
+        }
+
+        impl AuditTestFixture {
+            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&str>) -> Self {
+                let tmp = tempfile::tempdir().unwrap();
+                let audit_path = tmp.path().to_path_buf();
+                drop(tmp);
+                std::fs::create_dir_all(&audit_path).unwrap();
+                std::fs::set_permissions(
+                    &audit_path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                )
+                .unwrap();
+                let audit_gate = Arc::new(AuditGate::open(&audit_path).unwrap());
+
+                let profile_id = ProfileId::new("test-profile").unwrap();
+                let cred_id = vec![1u8; 32];
+                let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred_id);
+
+                let provider = SoftwareCredentialKeyProvider;
+                let generated = provider.generate(-7).unwrap();
+                let key = generated.key;
+
+                let cred = soft_fido2::Credential {
+                    id: cred_id.clone(),
+                    rp: RelyingParty::new("example.com".into()),
+                    user: User::new(vec![1, 2, 3]),
+                    sign_count: 0,
+                    alg: -7,
+                    key: key.clone(),
+                    created: 0,
+                    discoverable: true,
+                    backup_state: CredentialBackupState::NotEligible,
+                    extensions: soft_fido2::Extensions::default(),
+                };
+
+                let storage = Arc::new(Mutex::new(Box::new({
+                    let s = WriteCountingStorage::new();
+                    s.add_cred(cred);
+                    s
+                })
+                    as Box<dyn CredentialStorage>));
+
+                let rp_id_strings: Vec<String> =
+                    grant_rp_ids.iter().map(|s| s.to_string()).collect();
+
+                let profile_config = AgentProfileConfig {
+                    mode: AgentMode::DelegatedSession,
+                    principal_user: String::new(),
+                    rp_ids: rp_id_strings.clone(),
+                    require_uv: false,
+                    credential_refs: Some(vec![cred_ref.clone()]),
+                    max_grant_ttl: None,
+                    max_session_ttl: None,
+                    storage: None,
+                    registration_allowed: false,
+                    rules,
+                    delegated_registration_storage: None,
+                    device: DeviceIdentity {
+                        name: "test-device".to_string(),
+                        phys: "test-phys".to_string(),
+                        uniq: "test-uniq".to_string(),
+                        vendor_id: 0x1234,
+                        product_id: 0x5678,
+                    },
+                    start_url: None,
+                    browser_command: None,
+                    browser_user: None,
+                    browser_runtime_root: None,
+                    browser_cdp_expose: None,
+                    browser_cdp_port: None,
+                };
+
+                let mut profiles = BTreeMap::new();
+                profiles.insert("test-profile".to_string(), profile_config.clone());
+                let agent_config = AgentConfig {
+                    enabled: true,
+                    profiles,
+                    audit_path: Some(audit_path.clone()),
+                };
+
+                let clock = Arc::new(MockClock::new());
+                let mono_clock = Arc::new(MockMonoClock::new());
+
+                let policy_runtime = Arc::new(
+                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                );
+
+                let session_id = passless_core::agent::PrincipalSessionId::new();
+                let endpoint_id = passless_core::agent::EndpointId::new();
+
+                let grant_req_id = policy_runtime
+                    .admin_request_grant(GrantRequestParams {
+                        profile_id: profile_id.clone(),
+                        session_id: session_id.clone(),
+                        endpoint_id: endpoint_id.clone(),
+                        principal_digest: [0u8; 32],
+                        rp_ids: grant_rp_ids.iter().map(|s| s.to_string()).collect(),
+                        credentials: vec![cred_ref.clone()],
+                        requested_ttl_secs: 300,
+                    })
+                    .unwrap();
+
+                let authority = intent::admin_authority();
+                let grant_id = policy_runtime
+                    .admin_approve_grant(&grant_req_id, &authority)
+                    .unwrap();
+
+                let key_provider = Arc::new(RecordingKeyProvider::new());
+                let operation_lock = Arc::new(Mutex::new(()));
+                let security_config = SecurityConfig {
+                    check_mlock: false,
+                    disable_core_dumps: false,
+                    constant_signature_counter: true,
+                    enable_credential_backup: false,
+                    always_uv: false,
+                    user_verification_registration: false,
+                    user_verification_authentication: false,
+                    notification_timeout: 0,
+                };
+
+                Self {
+                    profile_id,
+                    grant_id,
+                    clock,
+                    policy_runtime,
+                    storage,
+                    key_provider,
+                    audit_gate,
+                    operation_lock,
+                    security_config,
+                    profile_config,
+                    audit_dir: audit_path,
+                }
+            }
+
+            fn default_allow() -> Self {
+                let rule = AgentRpRule {
+                    rp_id: "example.com".to_string(),
+                    register: AgentCeremonyPolicy::deny(),
+                    authenticate: AgentCeremonyPolicy {
+                        authorization: AgentAuthorization::Allow,
+                        user_presence: UserPresenceSource::Policy,
+                        user_verification: UserVerificationSource::Policy,
+                    },
+                };
+                Self::new(vec![rule], vec!["example.com"])
+            }
+
+            fn make_handler(&self) -> SignHandler {
+                SignHandler {
+                    human_storage: self.storage.clone(),
+                    policy_runtime: self.policy_runtime.clone(),
+                    audit_gate: self.audit_gate.clone(),
+                    security_config: self.security_config.clone(),
+                    key_provider: self.key_provider.clone(),
+                    operation_lock: self.operation_lock.clone(),
+                }
+            }
+
+            fn make_ctx(&self) -> SignContext {
+                SignContext {
+                    profile_id: self.profile_id.clone(),
+                    active_grant_id: self.grant_id.clone(),
+                    profile_config: self.profile_config.clone(),
+                }
+            }
+
+            fn make_req(&self) -> SignAssertionRequest {
+                SignAssertionRequest {
+                    origin: "https://example.com".to_string(),
+                    rp_id: "example.com".to_string(),
+                    challenge_b64u: "dGVzdA".to_string(),
+                    allow_credentials: vec![],
+                    user_verification: false,
+                    cross_origin: false,
+                }
+            }
+        }
+
+        fn allow_rule(rp_id: &str) -> AgentRpRule {
+            AgentRpRule {
+                rp_id: rp_id.to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Allow,
+                    user_presence: UserPresenceSource::Policy,
+                    user_verification: UserVerificationSource::Policy,
+                },
+            }
+        }
+
+        fn confirm_rule(rp_id: &str) -> AgentRpRule {
+            AgentRpRule {
+                rp_id: rp_id.to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Confirm,
+                    user_presence: UserPresenceSource::Human,
+                    user_verification: UserVerificationSource::None,
+                },
+            }
+        }
+
+        fn deny_rule(rp_id: &str) -> AgentRpRule {
+            AgentRpRule {
+                rp_id: rp_id.to_string(),
+                register: AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Confirm,
+                    user_presence: UserPresenceSource::Human,
+                    user_verification: UserVerificationSource::None,
+                },
+                authenticate: AgentCeremonyPolicy::deny(),
+            }
+        }
+
+        #[test]
+        fn audit_allow_event_on_successful_sign() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.allow");
+            assert_eq!(last["profile_id"], "test-profile");
+            assert_eq!(last["action"], "authenticate");
+            assert_eq!(last["rp_id"], "example.com");
+        }
+
+        #[test]
+        fn audit_deny_event_on_origin_mismatch() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.origin = "https://evil.com".to_string();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.deny");
+            assert_eq!(last["reason"], "origin_invalid");
+        }
+
+        #[test]
+        fn audit_deny_event_on_expired_grant() {
+            let f = AuditTestFixture::default_allow();
+            f.clock.advance(Duration::from_secs(301));
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.deny");
+            assert_eq!(last["reason"], "grant_expired");
+        }
+
+        #[test]
+        fn audit_deny_event_on_revoked_grant() {
+            let f = AuditTestFixture::default_allow();
+            f.policy_runtime.revoke_grant_by_id(&f.grant_id).unwrap();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.deny");
+            assert_eq!(last["reason"], "grant_revoked");
+        }
+
+        #[test]
+        fn audit_deny_event_on_rp_mismatch() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.rp_id = "other.com".to_string();
+            req.origin = "https://other.com".to_string();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.deny");
+            assert_eq!(last["reason"], "rp_id_not_match");
+        }
+
+        #[test]
+        fn audit_deny_event_on_credential_mismatch() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.allow_credentials = vec!["d3Jvbmc".to_string()];
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.deny");
+            assert_eq!(last["reason"], "allow_credentials_mismatch");
+        }
+
+        #[test]
+        fn audit_pre_write_blocks_sign() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bad_path = tmp.path().join("not_a_dir");
+            std::fs::write(&bad_path, b"block").unwrap();
+
+            let result = AuditGate::open(&bad_path);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn counter_zero_in_constant_mode_response() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+
+            match result.unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => {
+                    let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+                    assert!(auth_data.len() >= 37);
+                    let counter = u32::from_be_bytes(auth_data[33..37].try_into().unwrap());
+                    assert_eq!(counter, 0);
+                }
+                _ => panic!("expected SignAssertionResult"),
+            }
+        }
+
+        #[test]
+        fn counter_increments_in_monotonic_mode_response() {
+            let rule = AgentRpRule {
+                rp_id: "example.com".to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Allow,
+                    user_presence: UserPresenceSource::Policy,
+                    user_verification: UserVerificationSource::Policy,
+                },
+            };
+            let mut f = AuditTestFixture::new(vec![rule], vec!["example.com"]);
+            f.security_config.constant_signature_counter = false;
+
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result1 = handler.sign(&ctx, &req);
+            assert!(result1.is_ok());
+
+            let handler2 = f.make_handler();
+            let ctx2 = f.make_ctx();
+            let req2 = f.make_req();
+            let result2 = handler2.sign(&ctx2, &req2);
+            assert!(result2.is_ok());
+
+            match result1.unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => {
+                    let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+                    let counter = u32::from_be_bytes(auth_data[33..37].try_into().unwrap());
+                    assert_eq!(counter, 1);
+                }
+                _ => panic!("expected SignAssertionResult"),
+            }
+
+            match result2.unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => {
+                    let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+                    let counter = u32::from_be_bytes(auth_data[33..37].try_into().unwrap());
+                    assert_eq!(counter, 2);
+                }
+                _ => panic!("expected SignAssertionResult"),
+            }
+        }
+
+        #[test]
+        fn confirm_policy_blocks_autonomous_sign() {
+            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn confirm_policy_deny_audit_event() {
+            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.deny");
+            assert_eq!(last["reason"], "action_not_allowed");
+        }
+
+        #[test]
+        fn allow_policy_permits_sign() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert!(!policy_events.is_empty());
+            let last = policy_events.last().unwrap();
+            assert_eq!(last["kind"], "policy.allow");
+            assert_eq!(last["profile_id"], "test-profile");
+            assert_eq!(last["action"], "authenticate");
+            assert_eq!(last["rp_id"], "example.com");
+        }
+
+        #[test]
+        fn deny_authorization_blocks_sign() {
+            let f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let result = handler.sign(&ctx, &req);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn mixed_policies_per_rp() {
+            let f = AuditTestFixture::new(
+                vec![allow_rule("example.com"), deny_rule("other.com")],
+                vec!["example.com", "other.com"],
+            );
+
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req_allowed = f.make_req();
+            req_allowed.rp_id = "example.com".to_string();
+            req_allowed.origin = "https://example.com".to_string();
+            let result_allowed = handler.sign(&ctx, &req_allowed);
+            assert!(result_allowed.is_ok());
+
+            let handler2 = f.make_handler();
+            let ctx2 = f.make_ctx();
+            let mut req_denied = f.make_req();
+            req_denied.rp_id = "other.com".to_string();
+            req_denied.origin = "https://other.com".to_string();
+            let result_denied = handler2.sign(&ctx2, &req_denied);
+            assert!(result_denied.is_err());
+        }
+    }
+
+    mod integration_tests {
+        use super::sign_handler_tests::TestFixture;
+        use super::*;
+
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        fn http_request(addr: SocketAddr, request: &str, body: &[u8]) -> String {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            let mut resp_buf = vec![0u8; 32768];
+            let mut total = 0;
+            loop {
+                match stream.read(&mut resp_buf[total..]) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&resp_buf[..total]).to_string()
+        }
+
+        fn http_body(resp: &str) -> &str {
+            resp.split("\r\n\r\n").nth(1).unwrap_or("")
+        }
+
+        fn setup_bound(
+            constant_counter: bool,
+        ) -> (
+            Arc<AtomicBool>,
+            SocketAddr,
+            Arc<SignContextRegistry>,
+            String,
+            TestFixture,
+            thread::JoinHandle<()>,
+        ) {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+            let addr = server.addr();
+            let registry = Arc::new(SignContextRegistry::new());
+            let token = generate_bearer_token().unwrap();
+            let f = TestFixture::new(constant_counter);
+            let handler = Arc::new(f.make_handler());
+            let ctx = f.make_ctx();
+            registry
+                .register_pending(token.clone(), ctx, handler)
+                .unwrap();
+            registry
+                .bind_lease(&token, "lease-integ".to_string())
+                .unwrap();
+            let handle = server.serve(registry.clone());
+            (shutdown, addr, registry, token, f, handle)
+        }
+
+        fn sign_request_body(
+            origin: &str,
+            rp_id: &str,
+            challenge: &str,
+            allow_credentials: Vec<String>,
+            cross_origin: bool,
+        ) -> Vec<u8> {
+            serde_json::to_vec(&SignAssertionRequest {
+                origin: origin.to_string(),
+                rp_id: rp_id.to_string(),
+                challenge_b64u: challenge.to_string(),
+                allow_credentials,
+                user_verification: false,
+                cross_origin,
+            })
+            .unwrap()
+        }
+
+        fn format_sign_request(token: &str, body: &[u8]) -> String {
+            format!(
+                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                token,
+                body.len()
+            )
+        }
+
+        fn extract_counter(auth_data_b64u: &str) -> u32 {
+            let auth_data = b64u_decode(auth_data_b64u).unwrap();
+            assert!(auth_data.len() >= 37);
+            u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]])
+        }
+
+        #[test]
+        fn http_sign_full_response_structure() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("200 OK"));
+            let body_str = http_body(&resp);
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            let inner = parsed.get("sign_assertion_result").unwrap();
+            assert!(inner.get("credential_id_b64u").is_some());
+            assert!(inner.get("authenticator_data_b64u").is_some());
+            assert!(inner.get("signature_b64u").is_some());
+            assert!(inner.get("user_handle_b64u").is_some());
+            assert!(inner.get("client_data_json_b64u").is_some());
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_auth_preflight_then_sign() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let preflight = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
+            let preflight_resp = http_request(addr, preflight, b"");
+            assert!(preflight_resp.contains("204 No Content"));
+            assert!(preflight_resp.contains("Access-Control-Allow-Origin: *"));
+            assert!(preflight_resp.contains("Access-Control-Allow-Methods: POST"));
+            assert!(
+                preflight_resp
+                    .contains("Access-Control-Allow-Headers: Authorization, Content-Type")
+            );
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format_sign_request(&token, &body);
+            let sign_resp = http_request(addr, &req, &body);
+            assert!(sign_resp.contains("200 OK"));
+            assert!(sign_resp.contains("Access-Control-Allow-Origin: *"));
+            assert!(sign_resp.contains("Access-Control-Allow-Methods: POST"));
+            assert!(
+                sign_resp.contains("Access-Control-Allow-Headers: Authorization, Content-Type")
+            );
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_policy_deny_returns_403() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("403"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("forbidden"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_grant_ttl_enforced() {
+            let (shutdown, addr, _registry, token, f, handle) = setup_bound(true);
+            f.clock.advance(Duration::from_secs(301));
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("403"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("forbidden"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_credential_ref_enforced() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("200 OK"));
+            let body_str = http_body(&resp);
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            let inner = parsed.get("sign_assertion_result").unwrap();
+            let cred_id = inner.get("credential_id_b64u").unwrap().as_str().unwrap();
+            let expected = b64u_encode(&[1u8; 32]);
+            assert_eq!(cred_id, expected);
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_counter_increment_monotonic() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
+            let body1 = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req1 = format_sign_request(&token, &body1);
+            let resp1 = http_request(addr, &req1, &body1);
+            assert!(resp1.contains("200 OK"));
+            let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
+            let inner1 = parsed1.get("sign_assertion_result").unwrap();
+            let auth1 = inner1
+                .get("authenticator_data_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let counter1 = extract_counter(auth1);
+            let body2 = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "Y2hhbA",
+                vec![],
+                false,
+            );
+            let req2 = format_sign_request(&token, &body2);
+            let resp2 = http_request(addr, &req2, &body2);
+            assert!(resp2.contains("200 OK"));
+            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
+            let inner2 = parsed2.get("sign_assertion_result").unwrap();
+            let auth2 = inner2
+                .get("authenticator_data_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let counter2 = extract_counter(auth2);
+            assert_eq!(counter1, 1);
+            assert_eq!(counter2, 2);
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_content_type_validation() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = b"{}";
+            let req = format!(
+                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                token,
+                body.len()
+            );
+            let resp = http_request(addr, &req, body);
+            assert!(resp.contains("415"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("unsupported_content_type"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_origin_mismatch_denied() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body =
+                sign_request_body("https://evil.com", "example.com", "dGVzdA", vec![], false);
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("403"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("forbidden"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_wrong_rp_id_denied() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("403"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("forbidden"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_unauthorized_credential_denied() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let wrong_cred = b64u_encode(b"wrong_credential_id_bytes_1234567");
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![wrong_cred],
+                false,
+            );
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("403"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("forbidden"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_replay_attack_same_challenge() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format_sign_request(&token, &body);
+            let resp1 = http_request(addr, &req, &body);
+            assert!(resp1.contains("200 OK"));
+            let resp2 = http_request(addr, &req, &body);
+            assert!(resp2.contains("200 OK"));
+            let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
+            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
+            let auth1 = parsed1
+                .get("sign_assertion_result")
+                .unwrap()
+                .get("authenticator_data_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let auth2 = parsed2
+                .get("sign_assertion_result")
+                .unwrap()
+                .get("authenticator_data_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let counter1 = extract_counter(auth1);
+            let counter2 = extract_counter(auth2);
+            assert_eq!(counter1, 1);
+            assert_eq!(counter2, 2);
+            let sig1 = parsed1
+                .get("sign_assertion_result")
+                .unwrap()
+                .get("signature_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let sig2 = parsed2
+                .get("sign_assertion_result")
+                .unwrap()
+                .get("signature_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            assert_ne!(sig1, sig2);
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_invalid_json_body() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = b"{invalid json!!";
+            let req = format_sign_request(&token, body);
+            let resp = http_request(addr, &req, body);
+            assert!(resp.contains("400"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("invalid_json"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_body_too_large() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let req = format!(
+                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n",
+                token
+            );
+            let resp = http_request(addr, &req, b"");
+            assert!(resp.contains("413"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("body_too_large"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_bearer_not_prefix_match() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let prefix = &token[..10];
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format_sign_request(prefix, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("401"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("invalid_bearer"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_wrong_auth_scheme() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = sign_request_body(
+                "https://example.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                false,
+            );
+            let req = format!(
+                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                token,
+                body.len()
+            );
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("401"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("invalid_authorization_scheme"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn http_cross_origin_theft_attempt() {
+            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let body = sign_request_body(
+                "https://attacker.com",
+                "example.com",
+                "dGVzdA",
+                vec![],
+                true,
+            );
+            let req = format_sign_request(&token, &body);
+            let resp = http_request(addr, &req, &body);
+            assert!(resp.contains("403"));
+            let body_str = http_body(&resp);
+            assert!(body_str.contains("forbidden"));
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
         }
     }
 }

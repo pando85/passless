@@ -3,7 +3,7 @@
 - **Status:** Accepted (finding); In progress (redesign)
 - **Date:** 2026-08-02
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Phases 1 and 2 in progress; completion is governed by the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md)
+- **Implementation status:** Phases 1–3 implemented and unit-tested; Phase 5 partially removed; real-RP (Phase 4) and portable-TPM (Phase 6) gates remain. Completion is governed by the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md)
 - **Related decisions:** [ADR 0002](0002-native-webauthn-agent-architecture.md), [ADR 0003](0003-portable-tpm-credential-keys.md), [ADR 0004](0004-external-cdp-endpoint-exposure.md)
 - **Amends:** the delegated-autonomous path of ADR 0002, and the interaction-manager / pre-authorization additions on branch `feat/agent-autonomous-auth`
 
@@ -66,7 +66,8 @@ The CDP virtual-authenticator key-injection workflow is retained only as a **doc
 
 - Load-bearing, unchanged: `isolated` mode; `confirm`-policy human prompts; the grant / policy / refs / audit machinery; the `CredentialKeyProvider` abstraction (software + portable TPM); browser launch and CDP exposure (still used by the agent to drive the page).
 - Load-bearing, repurposed: the grant lifecycle and policy/audit checks now gate the new daemon sign-assertion command instead of a CTAP ceremony.
-- Not load-bearing for delegated autonomy (slated for removal): the delegated agent UHID endpoint, the delegated `AgentCeremonyHandler`, the interaction-manager pre-authorization mint, the `agent_mode` callback flag, the `with_shared_storage_and_pre_authorization` constructor.
+- Removed: the interaction-manager pre-authorization mint, the `human_interaction_manager` plumbing, and the `with_shared_storage_and_pre_authorization` constructor.
+- Not load-bearing for delegated autonomy (still present, slated for later removal after the real-RP gate): the delegated agent UHID endpoint, the delegated `AgentCeremonyHandler`, and the `agent_mode` callback safety net.
 
 ## Rollout
 

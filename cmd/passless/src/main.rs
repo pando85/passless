@@ -488,14 +488,11 @@ fn run() -> Result<()> {
                     let boxed_pin: Box<dyn crate::pin_storage::PinStorage> =
                         Box::new(pin_storage_inner);
                     let pin_storage = Arc::new(Mutex::new(boxed_pin));
-                    let human_interaction_manager =
-                        Arc::new(agent::interaction::AgentInteractionManager::new());
-                    let service = AuthenticatorService::with_shared_storage_and_pre_authorization(
+                    let service = AuthenticatorService::with_shared_storage(
                         shared_storage.clone(),
                         Some(pin_storage.clone()),
                         security_config.clone(),
                         pin_config.clone(),
-                        human_interaction_manager.clone(),
                     )?;
 
                     let agent_runtime = match agent::runtime::AgentRuntime::start(
@@ -506,7 +503,6 @@ fn run() -> Result<()> {
                         security_config,
                         pin_config,
                         shutdown.clone(),
-                        Some(human_interaction_manager),
                     ) {
                         Ok(rt) => Some(rt),
                         Err(e) => {
@@ -545,14 +541,11 @@ fn run() -> Result<()> {
                     let boxed_pin: Box<dyn crate::pin_storage::PinStorage> =
                         Box::new(pin_storage_inner);
                     let pin_storage = Arc::new(Mutex::new(boxed_pin));
-                    let human_interaction_manager =
-                        Arc::new(agent::interaction::AgentInteractionManager::new());
-                    let service = AuthenticatorService::with_shared_storage_and_pre_authorization(
+                    let service = AuthenticatorService::with_shared_storage(
                         shared_storage.clone(),
                         Some(pin_storage.clone()),
                         security_config.clone(),
                         pin_config.clone(),
-                        human_interaction_manager.clone(),
                     )?;
 
                     let agent_runtime = match agent::runtime::AgentRuntime::start(
@@ -563,7 +556,6 @@ fn run() -> Result<()> {
                         security_config,
                         pin_config,
                         shutdown.clone(),
-                        Some(human_interaction_manager),
                     ) {
                         Ok(rt) => Some(rt),
                         Err(e) => {
@@ -614,7 +606,6 @@ fn run() -> Result<()> {
                             security_config,
                             pin_config,
                             shutdown.clone(),
-                            None,
                         ) {
                             Ok(rt) => Some(rt),
                             Err(e) => {
@@ -660,7 +651,6 @@ fn run() -> Result<()> {
                             security_config,
                             pin_config,
                             shutdown.clone(),
-                            None,
                         ) {
                             Ok(rt) => Some(rt),
                             Err(e) => {

@@ -973,33 +973,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             pending_backups: HashMap::new(),
         })
     }
-
-    #[cfg(feature = "agent")]
-    pub fn with_shared_storage_and_pre_authorization(
-        storage: Arc<Mutex<S>>,
-        pin_storage: Option<Arc<Mutex<P>>>,
-        security_config: SecurityConfig,
-        pin_config: PinConfig,
-        interaction_manager: Arc<AgentInteractionManager>,
-    ) -> Result<Self> {
-        let authenticator = Self::build_authenticator_with_interaction_and_options(
-            storage.clone(),
-            pin_storage.clone(),
-            security_config.clone(),
-            pin_config.clone(),
-            Some(interaction_manager),
-            false,
-        )?;
-
-        Ok(Self {
-            authenticator,
-            storage,
-            max_uv_retries: pin_config.max_uv_retries,
-            credential_backup_enabled: security_config.enable_credential_backup,
-            credential_backup_supported: true,
-            pending_backups: HashMap::new(),
-        })
-    }
 }
 
 impl<

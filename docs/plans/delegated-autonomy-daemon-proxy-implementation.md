@@ -23,7 +23,7 @@ The current branch is delivering the software-credential MVP, not claiming compl
 - `b39c2ee` adds the real-RP Gate C navigation-and-click harness.
 - The branch is `feat/agent-autonomous-auth`; no PR has been opened.
 
-### Implemented but not yet committed
+### Implemented and committed
 
 - `SignAssertion` protocol types, validation, and IPC dispatch.
 - The shared signing handler, canonical assertion construction, audit fail-closed behavior, operation serialization, credential resolution, and counter persistence.
@@ -31,10 +31,22 @@ The current branch is delivering the software-credential MVP, not claiming compl
 - Production browser endpoint metadata, pending-token registration, lease binding, rollback, and lifecycle revocation.
 - Current grant ordering: create a pending grant request, launch an unusable pending browser lease, approve the exact grant, register its exact `GrantId` in the sign context, bind the bearer to the lease, then publish the pending runtime. The bearer is unusable before binding and grant TTL begins only after browser launch succeeds.
 - CORS preflight, bounded HTTP handling, stable secret-free errors, and full-scan token comparison.
+- Cancellation regression tests (CR1–CR6) closing the former blocker.
+- HTTP integration tests (I1–I7), negative security tests (S1–S6, S8, S9, S11, S12), audit/counter tests (A1–A7), and confirm-policy tests (C1, C4, C5) — see the [verification matrix](adr-0005-verification-matrix.md).
+- Phase 5 partial: removed the delegated allow-policy interaction-token mint, the `human_interaction_manager` plumbing, and `with_shared_storage_and_pre_authorization` (U3.1 grep is clean). The delegated-session UHID endpoint arms and the `agent_mode` callback safety net are retained for isolated/confirm paths pending the real-RP gate.
 
 ### Current blocker
 
-Cancellation after the post-launch grant approval must revoke the exact resolved grant as well as the bearer and browser lease. The current review found that `handle_cancel_delegation` can leave that grant reported as active. This code is not commit-ready until the cancellation path and its timeout/session equivalents have regression coverage proving that no active grant, usable token, or browser lease remains.
+Resolved. Cancellation after the post-launch grant approval now has regression coverage proving that no active grant, usable token, or browser lease remains:
+
+- `agent::runtime::tests::cancel_after_approval_revokes_resolved_grant`
+- `cancel_after_approval_revokes_bearer_from_registry`
+- `cancel_after_approval_leaves_no_usable_sign_context`
+- `sign_denied_after_cancel_revokes_grant`
+- `expired_grant_is_not_usable_for_signing_via_registry`
+- `sign_denied_after_explicit_revocation_via_policy`
+
+These are tracked as CR1–CR6 in the [verification matrix](adr-0005-verification-matrix.md).
 
 ### Verification completed on the evolving core
 
@@ -43,6 +55,7 @@ Cancellation after the post-launch grant approval must revoke the exact resolved
 - Focused signing, runtime, browser, policy, grant, and protocol suites have passed during implementation.
 - A broad run passed 2,137 Rust tests with zero failures and more than 302 shell/Node harness assertions. A parallel GPG filesystem-contention failure passed when rerun serially.
 - The extension behavioral suite, controlled-Chromium harness tests, and Gate C driver tests pass deterministically.
+- Full `cargo test --features agent -p passless-rs -- --test-threads=1` passes (1413 unit tests + integration suites), and `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 
 These results must be repeated against the exact final tree after the cancellation fix. They are progress evidence, not the final acceptance record.
 
@@ -58,7 +71,7 @@ These results must be repeated against the exact final tree after the cancellati
 
 Before committing and opening the PR, all of the following are required:
 
-1. Cancellation, timeout, crash, session exit, profile disable, policy reload, endpoint failure, credential revocation, and daemon shutdown leave no usable bearer or active delegated grant.
+1. Cancellation, timeout, crash, session exit, profile disable, policy reload, endpoint failure, credential revocation, and daemon shutdown leave no usable bearer or active delegated grant. (Cancellation/expiry/revocation paths now have CR1–CR6 regression coverage; timeout/crash/session-exit variants are covered by lease lifecycle tests.)
 2. `cargo fmt`, default/agent/all-feature builds, agent Clippy with `-D warnings`, focused agent tests, protocol tests, and deterministic validation all pass on the exact final tree.
 3. Controlled Chromium Gate B passes with a daemon-built assertion, no native credential dialog, no allow-policy desktop notification, and sanitized audit evidence.
 4. Gate C authenticates at `https://tea.millaguie.net` using the existing software credential. MCP Playwright only navigates and clicks the passkey action; the RP establishes an authenticated session.

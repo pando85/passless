@@ -74,7 +74,7 @@ The safe production path for fully autonomous authentication is an MV3 extension
 
 This path works with non-extractable TPM keys because the daemon performs `TPM2_Sign` directly; no key material is injected into the browser.
 
-Implementation status: not yet complete. The daemon signing oracle and the MAIN-world override extension are planned (see [ADR 0005](../../../../docs/decisions/0005-delegated-autonomous-authentication-redesign.md)). Do not rely on this path until the rollout slices are green.
+Implementation status: implemented for the software-credential MVP. The daemon signing oracle, the MAIN-world override extension, HTTP integration/security/audit/counter tests, and cancellation cleanup regression tests are complete (see [ADR 0005](../../../../docs/decisions/0005-delegated-autonomous-authentication-redesign.md) and the [verification matrix](../../../../docs/plans/adr-0005-verification-matrix.md)). The real-RP gate and portable-TPM gate are the remaining rollout slices before full closure; the bypassed delegated pre-authorization path has been removed.
 
 ## Legacy/test-only: CDP virtual authenticator
 
