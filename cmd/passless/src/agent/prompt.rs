@@ -23,14 +23,12 @@ const MIN_MIN_REVIEW_DELAY_MS: u64 = 0;
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
     Isolated,
-    DelegatedSession,
 }
 
 impl fmt::Display for PromptMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Isolated => write!(f, "isolated"),
-            Self::DelegatedSession => write!(f, "delegated_session"),
         }
     }
 }
@@ -979,10 +977,6 @@ mod tests {
             serde_json::to_string(&PromptMode::Isolated).unwrap(),
             "\"isolated\""
         );
-        assert_eq!(
-            serde_json::to_string(&PromptMode::DelegatedSession).unwrap(),
-            "\"delegated_session\""
-        );
     }
 
     #[test]
@@ -1288,7 +1282,7 @@ mod tests {
     fn test_build_security_body_exact_snapshot_with_clamped_ttls() {
         let req = PromptRequest::builder()
             .profile_id(test_profile_id())
-            .mode(PromptMode::DelegatedSession)
+            .mode(PromptMode::Isolated)
             .action(PromptAction::Register)
             .rp_id("login.example.com")
             .credential_label("work-key")
@@ -1304,7 +1298,7 @@ mod tests {
         let body = build_security_body(&req);
 
         let expected = "Profile (trusted): test-profile\n\
-            Mode (trusted): delegated_session\n\
+            Mode (trusted): isolated\n\
             Exact relying party (trusted): login.example.com\n\
             Action (trusted): register\n\
             Credential label (trusted): work-key\n\

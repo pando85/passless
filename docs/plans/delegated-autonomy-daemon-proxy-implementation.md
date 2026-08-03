@@ -473,6 +473,71 @@ Suggested commit subject:
 feat(agent): route autonomous assertions through daemon
 ```
 
+## Phase 8: Deprecation of Delegated UHID Path
+
+### Overview
+
+The delegated agent UHID endpoint was the original bypassed ceremony path. The new daemon sign endpoint (`/sign`) via the browser extension completely replaces it. This phase removes the old delegated UHID code.
+
+### Phase 8.1: Soft Deprecation
+
+**Status: SKIPPED**
+
+Skipped soft deprecation in favor of direct removal, given the comprehensive analysis and clear removal order.
+
+### Phase 8.2: Hard Removal
+
+**Status: ✅ COMPLETED 2026-08-03**
+
+Removed all delegated endpoint code (~10,500 lines total):
+
+**Storage Layer (~1550 lines):**
+- `storage.rs`: Removed `SharedDelegatedStorage` struct, delegated error variants, delegated tests
+- `storage_factory.rs`: Removed delegated factory functions and tests
+
+**Config Layer (594 lines):**
+- `config.rs`: Removed `AgentMode::DelegatedSession` variant, `DelegatedRegistrationStorage` enum, validation block, 27 delegated tests
+- `policy.rs`: Removed `delegated_registration_storage` field and encoding
+- `protocol.rs`: Removed `EndpointDiagnosticState::LazyDelegated` variant
+
+**Test Code (~2389 lines):**
+- Removed 20+ delegated tests from runtime.rs, sign.rs, doctor.rs, policy_engine.rs
+- Removed delegated helper functions and test fixtures
+
+**Production Code (~6000 lines):**
+- `runtime.rs`: Removed `DelegatedEndpointDeps`, `destroy_delegated_endpoint()`, `handle_request_delegation()`, all `AgentMode::DelegatedSession` match arms
+- `policy_engine.rs`: Removed `authorize_delegated()` method
+- `prompt.rs`: Removed `PromptMode::DelegatedSession` variant
+- `authenticator.rs`: Renamed `agent_mode` → `isolated_mode`
+
+**Verification:**
+```bash
+cargo build --features agent  # ✅ PASS
+cargo test --features agent --lib  # ✅ 491 passed, 0 failed
+cargo clippy --features agent --all-targets -- -D warnings  # ✅ PASS
+grep -rn "DelegatedSession\|delegated_deps\|destroy_delegated_endpoint" --include="*.rs"  # ✅ 0 references
+```
+
+### Phase 8.3: Cleanup
+
+**Status: ✅ COMPLETED 2026-08-03**
+
+Completed in Phase 8.2:
+- ✅ Renamed `agent_mode` to `isolated_mode` (only used for isolated mode)
+- ✅ Removed all references to delegated UHID autonomy
+- ✅ Cleaned up all test fixtures that used delegated paths
+- ✅ Updated all code to remove delegated UHID references
+
+### Exit Gate
+
+**Status: ✅ VERIFIED 2026-08-03**
+
+- ✅ No code references to delegated UHID endpoint remain (0 matches)
+- ✅ All tests pass without delegated paths (491 passed)
+- ✅ Build passes with no warnings
+- ✅ Clippy passes with no warnings
+- ✅ `agent_mode` renamed to `isolated_mode`
+
 ## Failure and Rollback
 
 - Any origin, policy, grant, credential, audit, storage, or provider uncertainty fails closed with no assertion.

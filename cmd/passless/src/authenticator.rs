@@ -167,7 +167,7 @@ pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     #[cfg(feature = "agent")]
     interaction_manager: Option<Arc<AgentInteractionManager>>,
     #[cfg(feature = "agent")]
-    agent_mode: bool,
+    isolated_mode: bool,
 }
 
 impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
@@ -185,7 +185,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             #[cfg(feature = "agent")]
             interaction_manager: None,
             #[cfg(feature = "agent")]
-            agent_mode: false,
+            isolated_mode: false,
         }
     }
 
@@ -196,7 +196,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         security_config: SecurityConfig,
         pin_config: PinConfig,
         interaction_manager: Arc<AgentInteractionManager>,
-        agent_mode: bool,
+        isolated_mode: bool,
     ) -> Self {
         Self {
             storage,
@@ -204,7 +204,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             security_config,
             pin_config,
             interaction_manager: Some(interaction_manager),
-            agent_mode,
+            isolated_mode,
         }
     }
 }
@@ -231,8 +231,8 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                         }
                     }
                 }
-                if self.agent_mode {
-                    debug!("Agent mode: auto-approving UP for rp={}", rp);
+                if self.isolated_mode {
+                    debug!("Isolated mode: auto-approving UP for rp={}", rp);
                     return Ok(UpResult::Accepted);
                 }
             }
@@ -318,8 +318,8 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                         }
                     }
                 }
-                if self.agent_mode {
-                    debug!("Agent mode: auto-approving UV for rp={}", rp);
+                if self.isolated_mode {
+                    debug!("Isolated mode: auto-approving UV for rp={}", rp);
                     return Ok(UvResult::AcceptedWithUp);
                 }
             }

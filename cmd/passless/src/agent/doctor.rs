@@ -458,7 +458,6 @@ pub fn build_profile_diagnostic_report(
                 EndpointDiagnosticState::Unavailable
             }
         }
-        AgentMode::DelegatedSession => EndpointDiagnosticState::LazyDelegated,
     };
 
     let audit_ok = audit_gate.ping();
@@ -761,29 +760,6 @@ mod tests {
         }
     }
 
-    fn make_delegated_profile_info() -> ProfileStartupInfo {
-        ProfileStartupInfo {
-            storage_roots: vec![],
-            browser_runtime_root: Some(BrowserRuntimeRootInfo {
-                path: PathBuf::from("/tmp/browser-root"),
-                expected_uid: 1001,
-            }),
-            uid_checks: vec![
-                UidCheck {
-                    label: "principal_vs_daemon".into(),
-                    passed: true,
-                    message: "principal uid differs from daemon".into(),
-                },
-                UidCheck {
-                    label: "browser_vs_principal".into(),
-                    passed: true,
-                    message: "browser uid differs from principal".into(),
-                },
-            ],
-            device_identity_unique: true,
-        }
-    }
-
     #[test]
     fn test_healthy_startup_no_profiles() {
         let probes = MockProbes::all_healthy();
@@ -879,7 +855,7 @@ mod tests {
     #[test]
     fn test_stale_verified_process_is_fatal() {
         let probes = MockProbes::stale_verified_process();
-        let profiles = vec![("test".into(), make_delegated_profile_info())];
+        let profiles = vec![("test".into(), make_profile_info())];
         let result =
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(!result.is_ok());
@@ -894,15 +870,6 @@ mod tests {
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(!result.is_ok());
         assert!(result.fatal.iter().any(|f| f.contains("audit")));
-    }
-
-    #[test]
-    fn test_healthy_lazy_delegated() {
-        let probes = MockProbes::all_healthy();
-        let profiles = vec![("delegated".into(), make_delegated_profile_info())];
-        let result =
-            run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
-        assert!(result.is_ok(), "fatal: {:?}", result.fatal);
     }
 
     #[test]
@@ -1011,34 +978,6 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_diagnostic_report_delegated_lazy() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let audit = AuditGate::open(dir.path()).unwrap();
-        let pid = ProfileId::new("delegated").unwrap();
-
-        let report = build_profile_diagnostic_report(ProfileDiagnosticParams {
-            profile_id: &pid,
-            enabled: true,
-            mode: AgentMode::DelegatedSession,
-            endpoint_has_id: false,
-            browser_lease_state: Some("active"),
-            policy_generation: 3,
-            audit_gate: &audit,
-            pin_storage_available: true,
-            pin_set: true,
-            require_uv: true,
-        });
-
-        assert!(report.is_healthy());
-        assert_eq!(
-            report.endpoint_state,
-            EndpointDiagnosticState::LazyDelegated
-        );
-        assert_eq!(report.browser_lease_state, Some("active".into()));
-    }
-
-    #[test]
     fn test_profile_diagnostic_report_disabled_unhealthy() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1120,7 +1059,7 @@ mod tests {
     #[test]
     fn test_stale_manifest_result_none_is_nonfatal() {
         let probes = MockProbes::all_healthy();
-        let profiles = vec![("test".into(), make_delegated_profile_info())];
+        let profiles = vec![("test".into(), make_profile_info())];
         let result =
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(result.is_ok());
@@ -1136,7 +1075,7 @@ mod tests {
     fn test_stale_manifest_quarantined_is_nonfatal() {
         let mut probes = MockProbes::all_healthy();
         probes.stale_result = StaleManifestResult::Quarantined { count: 2 };
-        let profiles = vec![("test".into(), make_delegated_profile_info())];
+        let profiles = vec![("test".into(), make_profile_info())];
         let result =
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(result.is_ok());
@@ -1147,86 +1086,6 @@ mod tests {
             .unwrap();
         assert!(check.passed);
         assert!(check.message.contains("2"));
-    }
-
-    #[test]
-    fn test_delegated_pin_set_report_healthy() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let audit = AuditGate::open(dir.path()).unwrap();
-        let pid = ProfileId::new("delegated-pin-set").unwrap();
-
-        let report = build_profile_diagnostic_report(ProfileDiagnosticParams {
-            profile_id: &pid,
-            enabled: true,
-            mode: AgentMode::DelegatedSession,
-            endpoint_has_id: false,
-            browser_lease_state: None,
-            policy_generation: 1,
-            audit_gate: &audit,
-            pin_storage_available: true,
-            pin_set: true,
-            require_uv: true,
-        });
-
-        assert!(report.is_healthy());
-        assert!(report.pin_storage_available);
-        assert!(report.pin_set);
-        let pin_set_check = report.checks.iter().find(|c| c.name == "pin_set").unwrap();
-        assert!(pin_set_check.passed);
-    }
-
-    #[test]
-    fn test_delegated_pin_unset_report_unhealthy_with_require_uv() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let audit = AuditGate::open(dir.path()).unwrap();
-        let pid = ProfileId::new("delegated-pin-unset").unwrap();
-
-        let report = build_profile_diagnostic_report(ProfileDiagnosticParams {
-            profile_id: &pid,
-            enabled: true,
-            mode: AgentMode::DelegatedSession,
-            endpoint_has_id: false,
-            browser_lease_state: None,
-            policy_generation: 1,
-            audit_gate: &audit,
-            pin_storage_available: true,
-            pin_set: false,
-            require_uv: true,
-        });
-
-        assert!(!report.is_healthy());
-        assert!(report.pin_storage_available);
-        assert!(!report.pin_set);
-        let pin_set_check = report.checks.iter().find(|c| c.name == "pin_set").unwrap();
-        assert!(!pin_set_check.passed);
-        assert!(pin_set_check.message.contains("require_uv"));
-    }
-
-    #[test]
-    fn test_delegated_pin_unset_no_require_uv_healthy() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let audit = AuditGate::open(dir.path()).unwrap();
-        let pid = ProfileId::new("delegated-pin-unset-no-uv").unwrap();
-
-        let report = build_profile_diagnostic_report(ProfileDiagnosticParams {
-            profile_id: &pid,
-            enabled: true,
-            mode: AgentMode::DelegatedSession,
-            endpoint_has_id: false,
-            browser_lease_state: None,
-            policy_generation: 1,
-            audit_gate: &audit,
-            pin_storage_available: true,
-            pin_set: false,
-            require_uv: false,
-        });
-
-        assert!(report.is_healthy());
-        let pin_set_check = report.checks.iter().find(|c| c.name == "pin_set").unwrap();
-        assert!(pin_set_check.passed);
     }
 
     #[test]

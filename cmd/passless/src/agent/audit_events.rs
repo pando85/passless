@@ -2402,7 +2402,7 @@ mod tests {
             .build(),
             PromptTimeoutBuilder::new(
                 pid.clone(),
-                PromptMode::DelegatedSession,
+                PromptMode::Isolated,
                 PromptAction::Authenticate,
                 "example.com",
                 60,

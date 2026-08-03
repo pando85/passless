@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use passless_core::agent::{
-    AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration, CredentialRef,
+    AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration,
     DeviceIdentity, validate_rp_id,
 };
 
@@ -34,7 +34,6 @@ fn isolated_profile() -> AgentProfileConfig {
         }),
         registration_allowed: false,
         rules: vec![],
-        delegated_registration_storage: None,
         device: minimal_device(),
         start_url: None,
         browser_command: None,
@@ -45,39 +44,9 @@ fn isolated_profile() -> AgentProfileConfig {
     }
 }
 
-fn delegated_profile() -> AgentProfileConfig {
-    AgentProfileConfig {
-        mode: AgentMode::DelegatedSession,
-        principal_user: "testuser".into(),
-        rp_ids: vec!["example.com".into()],
-        require_uv: true,
-        credential_refs: Some(vec![CredentialRef::from_hex(&"aa".repeat(32)).unwrap()]),
-        max_grant_ttl: Some(BoundedDuration::new(3600).unwrap()),
-        max_session_ttl: Some(BoundedDuration::new(7200).unwrap()),
-        storage: None,
-        registration_allowed: false,
-        rules: vec![],
-        delegated_registration_storage: None,
-        device: minimal_device(),
-        start_url: None,
-        browser_command: Some(vec!["/usr/bin/browser".into()]),
-        browser_user: Some("browseruser".into()),
-        browser_runtime_root: Some(PathBuf::from("/tmp/browser-runtime")),
-        browser_cdp_expose: None,
-        browser_cdp_port: None,
-    }
-}
-
 #[test]
 fn isolated_profile_validates_successfully() {
     let profile = isolated_profile();
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    assert!(profile.validate(&pid).is_ok());
-}
-
-#[test]
-fn delegated_profile_validates_successfully() {
-    let profile = delegated_profile();
     let pid = passless_core::agent::ProfileId::new("test").unwrap();
     assert!(profile.validate(&pid).is_ok());
 }
@@ -116,93 +85,6 @@ fn isolated_mode_rejects_browser_runtime_root() {
     let pid = passless_core::agent::ProfileId::new("test").unwrap();
     let err = profile.validate(&pid).unwrap_err();
     assert!(err.to_string().contains("browser_runtime_root"));
-}
-
-#[test]
-fn delegated_session_requires_require_uv() {
-    let mut profile = delegated_profile();
-    profile.require_uv = false;
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("require_uv"));
-}
-
-#[test]
-fn delegated_session_rejects_storage() {
-    let mut profile = delegated_profile();
-    profile.storage = Some(AgentStorageConfig::Local {
-        path: PathBuf::from("/tmp/x"),
-        pin_path: PathBuf::from("/tmp/y"),
-    });
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("delegated-session must not specify")
-    );
-}
-
-#[test]
-fn delegated_session_requires_credential_refs() {
-    let mut profile = delegated_profile();
-    profile.credential_refs = None;
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("credential_refs"));
-}
-
-#[test]
-fn delegated_session_requires_non_empty_credential_refs() {
-    let mut profile = delegated_profile();
-    profile.credential_refs = Some(vec![]);
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("must not be empty"));
-}
-
-#[test]
-fn delegated_session_requires_max_grant_ttl() {
-    let mut profile = delegated_profile();
-    profile.max_grant_ttl = None;
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("max_grant_ttl"));
-}
-
-#[test]
-fn delegated_session_requires_max_session_ttl() {
-    let mut profile = delegated_profile();
-    profile.max_session_ttl = None;
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("max_session_ttl"));
-}
-
-#[test]
-fn delegated_session_requires_browser_command() {
-    let mut profile = delegated_profile();
-    profile.browser_command = None;
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("browser_command"));
-}
-
-#[test]
-fn delegated_session_browser_user_must_differ_from_principal() {
-    let mut profile = delegated_profile();
-    profile.browser_user = Some("testuser".into());
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("must differ"));
-}
-
-#[test]
-fn delegated_session_browser_runtime_root_must_be_absolute() {
-    let mut profile = delegated_profile();
-    profile.browser_runtime_root = Some(PathBuf::from("relative/path"));
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("absolute path"));
 }
 
 #[test]
@@ -248,34 +130,6 @@ fn invalid_rp_id_in_profile_rejected() {
     let pid = passless_core::agent::ProfileId::new("test").unwrap();
     let err = profile.validate(&pid).unwrap_err();
     assert!(err.to_string().contains("scheme"));
-}
-
-#[test]
-fn start_url_must_use_https() {
-    let mut profile = delegated_profile();
-    profile.start_url = Some("http://example.com".into());
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("HTTPS"));
-}
-
-#[test]
-fn start_url_must_match_rp_id() {
-    let mut profile = delegated_profile();
-    profile.rp_ids = vec!["example.com".into()];
-    profile.start_url = Some("https://other.com/page".into());
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("must match exactly one"));
-}
-
-#[test]
-fn start_url_matches_subdomain_rp_id() {
-    let mut profile = delegated_profile();
-    profile.rp_ids = vec!["example.com".into()];
-    profile.start_url = Some("https://sub.example.com/page".into());
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    assert!(profile.validate(&pid).is_ok());
 }
 
 #[test]
@@ -416,24 +270,6 @@ fn pass_storage_pin_path_traversal_rejected() {
     };
     let err = storage.validate().unwrap_err();
     assert!(err.to_string().contains("path traversal"));
-}
-
-#[test]
-fn browser_command_with_nul_byte_rejected() {
-    let mut profile = delegated_profile();
-    profile.browser_command = Some(vec!["/bin/browser\0evil".into()]);
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("NUL"));
-}
-
-#[test]
-fn empty_browser_command_rejected() {
-    let mut profile = delegated_profile();
-    profile.browser_command = Some(vec![]);
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("must not be empty"));
 }
 
 #[test]

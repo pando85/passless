@@ -2083,7 +2083,7 @@ mod tests {
                     as Box<dyn CredentialStorage>));
 
                 let profile_config = AgentProfileConfig {
-                    mode: AgentMode::DelegatedSession,
+                    mode: AgentMode::Isolated,
                     principal_user: String::new(),
                     rp_ids: vec!["example.com".to_string()],
                     require_uv: false,
@@ -2101,7 +2101,6 @@ mod tests {
                             user_verification: UserVerificationSource::Policy,
                         },
                     }],
-                    delegated_registration_storage: None,
                     device: DeviceIdentity {
                         name: "test-device".to_string(),
                         phys: "test-phys".to_string(),
@@ -2476,59 +2475,6 @@ mod tests {
                 _ => panic!("expected SignAssertionResult from both"),
             }
         }
-
-        #[test]
-        fn ipc_handler_constructed_from_delegated_deps_can_sign() {
-            let f = TestFixture::new(true);
-            let storage = f.storage.clone();
-            let policy_runtime = f.policy_runtime.clone();
-            let audit_gate = f.audit_gate.clone();
-            let key_provider = f.key_provider.clone();
-            let operation_lock = f.operation_lock.clone();
-            let security_config = f.security_config.clone();
-            let ctx = f.make_ctx();
-            let req = f.make_req();
-
-            let handler = SignHandler {
-                human_storage: storage,
-                policy_runtime: policy_runtime.clone(),
-                audit_gate: audit_gate.clone(),
-                security_config: security_config.clone(),
-                key_provider: key_provider.clone(),
-                operation_lock: operation_lock.clone(),
-            };
-
-            let result = handler.sign(&ctx, &req);
-            assert!(result.is_ok());
-        }
-
-        #[test]
-        fn sign_handler_is_identical_struct_for_ipc_and_delegation() {
-            let f = TestFixture::new(true);
-            let handler = f.make_handler();
-
-            let ctx = f.make_ctx();
-            let req = f.make_req();
-            let result = handler.sign(&ctx, &req);
-            assert!(result.is_ok());
-
-            let handler2 = f.make_handler();
-            let ctx2 = f.make_ctx();
-            let req2 = f.make_req();
-            let result2 = handler2.sign(&ctx2, &req2);
-            assert!(result2.is_ok());
-
-            match (&result, &result2) {
-                (
-                    Ok(PrincipalResponse::SignAssertionResult(a)),
-                    Ok(PrincipalResponse::SignAssertionResult(b)),
-                ) => {
-                    assert_eq!(a.credential_id_b64u, b.credential_id_b64u);
-                    assert_eq!(a.signature_b64u, b.signature_b64u);
-                }
-                _ => panic!("expected SignAssertionResult"),
-            }
-        }
     }
 
     mod audit_and_policy_tests {
@@ -2676,7 +2622,7 @@ mod tests {
                     grant_rp_ids.iter().map(|s| s.to_string()).collect();
 
                 let profile_config = AgentProfileConfig {
-                    mode: AgentMode::DelegatedSession,
+                    mode: AgentMode::Isolated,
                     principal_user: String::new(),
                     rp_ids: rp_id_strings.clone(),
                     require_uv: false,
@@ -2686,7 +2632,6 @@ mod tests {
                     storage: None,
                     registration_allowed: false,
                     rules,
-                    delegated_registration_storage: None,
                     device: DeviceIdentity {
                         name: "test-device".to_string(),
                         phys: "test-phys".to_string(),

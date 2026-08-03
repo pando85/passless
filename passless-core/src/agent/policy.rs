@@ -62,7 +62,6 @@ pub struct PolicyParams {
     pub browser_user: String,
     pub browser_runtime_root: String,
     pub rules: Vec<AgentRpRule>,
-    pub delegated_registration_storage: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +90,6 @@ pub struct Policy {
     pub browser_user: String,
     pub browser_runtime_root: String,
     pub rules: Vec<AgentRpRule>,
-    pub delegated_registration_storage: String,
 }
 
 impl Policy {
@@ -137,7 +135,6 @@ impl Policy {
             browser_user: params.browser_user,
             browser_runtime_root: params.browser_runtime_root,
             rules: sorted_rules,
-            delegated_registration_storage: params.delegated_registration_storage,
         };
         policy.validate()?;
         Ok(policy)
@@ -174,7 +171,6 @@ impl Policy {
             browser_user: String::new(),
             browser_runtime_root: String::new(),
             rules: vec![],
-            delegated_registration_storage: String::new(),
         })
     }
 
@@ -477,10 +473,6 @@ pub mod cbor {
                 encode_text(&policy.browser_runtime_root),
             ),
             ("rules".to_string(), encode_rules(&policy.rules)),
-            (
-                "delegated_registration_storage".to_string(),
-                encode_text(&policy.delegated_registration_storage),
-            ),
         ];
         encode_map_sorted(&entries)
     }
@@ -565,7 +557,6 @@ pub mod cbor {
             "browser_user",
             "browser_runtime_root",
             "rules",
-            "delegated_registration_storage",
         ];
         keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         keys
@@ -809,7 +800,7 @@ mod tests {
         let cbor = policy.to_deterministic_cbor();
         assert_eq!(cbor[0] & 0xe0, 0xa0);
         assert_eq!(cbor[0] & 0x1f, 24);
-        assert_eq!(cbor[1], 25);
+        assert_eq!(cbor[1], 24);
     }
 
     #[test]
@@ -935,7 +926,6 @@ mod tests {
             browser_user: "alice".to_string(),
             browser_runtime_root: String::new(),
             rules: vec![],
-            delegated_registration_storage: String::new(),
         })
         .unwrap();
         let p2 = Policy::from_params(PolicyParams {
@@ -962,7 +952,6 @@ mod tests {
             browser_user: "bob".to_string(),
             browser_runtime_root: String::new(),
             rules: vec![],
-            delegated_registration_storage: String::new(),
         })
         .unwrap();
         assert_ne!(p1.digest(), p2.digest());
@@ -995,7 +984,6 @@ mod tests {
             browser_user: String::new(),
             browser_runtime_root: "/run/browser-a".to_string(),
             rules: vec![],
-            delegated_registration_storage: String::new(),
         })
         .unwrap();
         let p2 = Policy::from_params(PolicyParams {
@@ -1022,7 +1010,6 @@ mod tests {
             browser_user: String::new(),
             browser_runtime_root: "/run/browser-b".to_string(),
             rules: vec![],
-            delegated_registration_storage: String::new(),
         })
         .unwrap();
         assert_ne!(p1.digest(), p2.digest());
@@ -1122,7 +1109,7 @@ mod tests {
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
         assert_eq!(cbor_bytes[0] & 0x1f, 24);
-        assert_eq!(cbor_bytes[1], 25);
+        assert_eq!(cbor_bytes[1], 24);
         assert!(!cbor_bytes.is_empty());
         assert_ne!(cbor_bytes[0], 0xbf);
     }
@@ -1152,7 +1139,7 @@ mod tests {
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
         assert_eq!(cbor_bytes[0] & 0x1f, 24);
-        assert_eq!(cbor_bytes[1], 25);
+        assert_eq!(cbor_bytes[1], 24);
         assert!(!cbor_bytes.is_empty());
     }
 
@@ -1180,7 +1167,7 @@ mod tests {
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
         assert_eq!(cbor_bytes[0] & 0x1f, 24);
-        assert_eq!(cbor_bytes[1], 25);
+        assert_eq!(cbor_bytes[1], 24);
     }
 
     #[test]
@@ -1275,7 +1262,7 @@ mod tests {
     #[test]
     fn test_sorted_keys_complete() {
         let keys = cbor::sorted_keys_for_policy();
-        assert_eq!(keys.len(), 25);
+        assert_eq!(keys.len(), 24);
         assert!(keys.contains(&"version"));
         assert!(keys.contains(&"profile_id"));
         assert!(keys.contains(&"mode"));
@@ -1300,7 +1287,6 @@ mod tests {
         assert!(keys.contains(&"browser_user"));
         assert!(keys.contains(&"browser_runtime_root"));
         assert!(keys.contains(&"rules"));
-        assert!(keys.contains(&"delegated_registration_storage"));
     }
 
     #[test]
@@ -1340,7 +1326,6 @@ mod tests {
                 "browser_runtime_root",
                 "registration_allowed",
                 "max_concurrent_grants",
-                "delegated_registration_storage",
             ]
         );
     }

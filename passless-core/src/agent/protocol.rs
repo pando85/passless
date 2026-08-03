@@ -721,7 +721,6 @@ pub struct DoctorCheck {
 #[serde(rename_all = "snake_case")]
 pub enum EndpointDiagnosticState {
     Ready,
-    LazyDelegated,
     Unavailable,
 }
 
@@ -729,7 +728,6 @@ impl fmt::Display for EndpointDiagnosticState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ready => write!(f, "ready"),
-            Self::LazyDelegated => write!(f, "lazy_delegated"),
             Self::Unavailable => write!(f, "unavailable"),
         }
     }

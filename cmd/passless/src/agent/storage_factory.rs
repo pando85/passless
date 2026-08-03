@@ -633,7 +633,6 @@ mod tests {
             }),
             registration_allowed: false,
             rules: vec![],
-            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "test".to_string(),
                 phys: "test".to_string(),
@@ -675,7 +674,6 @@ mod tests {
             storage: None,
             registration_allowed: false,
             rules: vec![],
-            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "test".to_string(),
                 phys: "test".to_string(),
