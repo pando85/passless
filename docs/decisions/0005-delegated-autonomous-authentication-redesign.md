@@ -84,6 +84,13 @@ Implementation is sequenced so that no signing code ships without a real-RP roun
 - Whether the same extension also handles credential creation (`navigator.credentials.create`) for delegated registration, or registration stays human-driven.
 - Activation threshold for the `webAuthenticationProxy` fallback: define which relying parties require native `instanceof` and ship the proxy path only for those.
 
+## Related Documentation
+
+- [Grant Mechanism & Authentication Flows](../plans/adr-0005-grant-mechanism.md) - Detailed explanation of the grant system and authentication flows
+- [Architecture & Verification Diagrams](../plans/adr-0005-architecture-diagrams.md) - System architecture and flow diagrams
+- [Implementation Plan](../plans/delegated-autonomy-daemon-proxy-implementation.md) - Phase-by-phase implementation status
+- [Verification Matrix](../plans/adr-0005-verification-matrix.md) - Test coverage and verification status
+
 ## References
 
 - [`chrome.webAuthenticationProxy`](https://developer.chrome.com/docs/extensions/reference/api/webAuthenticationProxy) extension API.
