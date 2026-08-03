@@ -81,11 +81,15 @@ Implementation is sequenced so that no signing code ships without a real-RP roun
 ## Deferred decisions
 
 - Extension-daemon channel: per-session localhost bearer token written into the browser profile directory (defense-in-depth; the load-bearing gates are daemon-side origin/policy/grant checks). Native messaging remains an option.
-- Whether the same extension also handles credential creation (`navigator.credentials.create`) for delegated registration, or registration stays human-driven.
 - Activation threshold for the `webAuthenticationProxy` fallback: define which relying parties require native `instanceof` and ship the proxy path only for those.
+
+## Superseded decisions
+
+- ~~Whether the same extension also handles credential creation (`navigator.credentials.create`) for delegated registration, or registration stays human-driven.~~ → Resolved by [ADR 0006](0006-agent-passkey-registration.md): the extension overrides both `create()` and `get()`, and the daemon provides a `/register` endpoint mirroring the `/sign` endpoint.
 
 ## Related Documentation
 
+- [ADR 0006: Agent Passkey Registration](0006-agent-passkey-registration.md) - Extends this ADR to cover credential creation
 - [Grant Mechanism & Authentication Flows](../plans/adr-0005-grant-mechanism.md) - Detailed explanation of the grant system and authentication flows
 - [Architecture & Verification Diagrams](../plans/adr-0005-architecture-diagrams.md) - System architecture and flow diagrams
 - [Implementation Plan](../plans/delegated-autonomy-daemon-proxy-implementation.md) - Phase-by-phase implementation status
