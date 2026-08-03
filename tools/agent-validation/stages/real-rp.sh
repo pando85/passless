@@ -150,7 +150,7 @@ stage_real_rp() {
     local driver_timeout="${AV_REAL_RP_TIMEOUT:-60}"
 
     AV_CDP_PORT="$cdp_port" \
-    AV_REAL_RP_URL="${AV_REAL_RP_URL:-https://tea.millaguie.net}" \
+    AV_REAL_RP_URL="${AV_REAL_RP_URL:-}" \
     AV_EVIDENCE_DIR="$evidence_dir" \
     timeout "${driver_timeout}s" \
         "${AV_PASSLESS_BIN:-passless}" agent run --profile "${AV_DAEMON_PROFILE}" \

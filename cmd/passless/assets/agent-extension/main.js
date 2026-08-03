@@ -90,10 +90,7 @@
         if (idBytes.length === 0 || idBytes.length > MAX_CREDENTIAL_ID_BYTES) {
           throw new TypeError("invalid credential id length");
         }
-        allowCredentials.push({
-          id_b64u: b64urlEncode(idBytes),
-          type: "public-key"
-        });
+        allowCredentials.push(b64urlEncode(idBytes));
       }
     }
 
@@ -101,7 +98,7 @@
       rp_id: rpId,
       challenge_b64u: b64urlEncode(challenge),
       allow_credentials: allowCredentials,
-      user_verification: uv
+      user_verification: uv === "required"
     };
   }
 

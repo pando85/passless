@@ -17,7 +17,7 @@ fi
 # shellcheck disable=SC2034
 AV_LIB_REAL_RP_LOADED=true
 
-AV_REAL_RP_URL="${AV_REAL_RP_URL:-https://tea.millaguie.net}"
+AV_REAL_RP_URL="${AV_REAL_RP_URL:-}"
 AV_REAL_RP_CREDENTIAL_REF="${AV_REAL_RP_CREDENTIAL_REF:-}"
 # shellcheck disable=SC2034
 AV_REAL_RP_DRIVER="${AV_REAL_RP_DRIVER:-${AV_VALIDATION_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/browser/real-rp-driver.js}"
@@ -51,7 +51,7 @@ av_gc_env_check() {
 }
 
 av_gc_real_rp_reachable() {
-    local url="${1:-${AV_REAL_RP_URL:-https://tea.millaguie.net}}"
+    local url="${1:-${AV_REAL_RP_URL:-}}"
     local code
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null) || code="000"
     if [[ "$code" == "000" ]]; then

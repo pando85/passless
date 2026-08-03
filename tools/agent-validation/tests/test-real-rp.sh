@@ -96,11 +96,11 @@ MOCK
 
     cat >> "$mock_bin" << 'MOCK'
     *"agent run --profile"*"node"*)
-        printf '{"navigation_ok":true,"click_ok":true,"url_origin":"https://tea.millaguie.net","title_class":"dashboard","self_check":"pass"}\n'
+        printf '{"navigation_ok":true,"click_ok":true,"url_origin":"https://rp.example.net","title_class":"dashboard","self_check":"pass"}\n'
         exit 0
         ;;
     *"agent-admin --output json audit export"*)
-        printf '{"entries":[{"action":"authenticate","rp_id":"tea.millaguie.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
+        printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
     *"delegation revoke"*)
@@ -403,7 +403,7 @@ test_gc_sanitize_audit_strips_secrets() {
     jq -n '{
         entries: [{
             action: "authenticate",
-            rp_id: "tea.millaguie.net",
+            rp_id: "rp.example.net",
             credential_ref: "secret-ref-12345",
             user_handle: "secret-handle",
             raw_assertion: "base64data",
@@ -840,7 +840,7 @@ case "$received" in
         exit 10
         ;;
     *"agent-admin --output json audit export"*)
-        printf '{"entries":[{"action":"authenticate","rp_id":"tea.millaguie.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
+        printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
     *"delegation revoke"*)
@@ -909,7 +909,7 @@ case "$received" in
         exit 0
         ;;
     *"agent-admin --output json audit export"*)
-        printf '{"entries":[{"action":"authenticate","rp_id":"tea.millaguie.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
+        printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
     *"delegation revoke"*)
@@ -953,7 +953,7 @@ test_gc_stage_nav_only_click_fail() {
 #!/usr/bin/env node
 'use strict';
 var s = 'a.signin-passkey';
-var result = {self_check:"pass",navigation_ok:true,click_ok:false,url_origin:"https://tea.millaguie.net",url_path:"/user/login",title_class:"login_page",called_forbidden:false,duration_ms:0};
+var result = {self_check:"pass",navigation_ok:true,click_ok:false,url_origin:"https://rp.example.net",url_path:"/user/login",title_class:"login_page",called_forbidden:false,duration_ms:0};
 process.stdout.write(JSON.stringify(result) + '\n');
 process.exit(0);
 DRIVER
@@ -973,11 +973,11 @@ case "$received" in
         exit 0
         ;;
     *"agent run --profile"*"node"*)
-        printf '{"navigation_ok":true,"click_ok":false,"url_origin":"https://tea.millaguie.net","title_class":"login_page","self_check":"pass"}\n'
+        printf '{"navigation_ok":true,"click_ok":false,"url_origin":"https://rp.example.net","title_class":"login_page","self_check":"pass"}\n'
         exit 0
         ;;
     *"agent-admin --output json audit export"*)
-        printf '{"entries":[{"action":"authenticate","rp_id":"tea.millaguie.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
+        printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
     *"delegation revoke"*)
@@ -1055,7 +1055,7 @@ case "$received" in
         exit 0
         ;;
     *"agent-admin --output json audit export"*)
-        printf '{"entries":[{"action":"authenticate","rp_id":"tea.millaguie.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
+        printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
     *"delegation revoke"*)

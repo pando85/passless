@@ -130,21 +130,21 @@ describe('Gate C Real-RP Driver', () => {
   describe('GateCDriver constructor', () => {
     it('stores cdpPort, rpUrl, evidenceDir', () => {
       const { GateCDriver } = require(DRIVER_PATH);
-      const driver = new GateCDriver(9222, 'https://tea.millaguie.net', '/tmp');
+      const driver = new GateCDriver(9222, 'https://rp.example.net', '/tmp');
       assert.strictEqual(driver.cdpPort, 9222);
-      assert.strictEqual(driver.rpUrl, 'https://tea.millaguie.net');
+      assert.strictEqual(driver.rpUrl, 'https://rp.example.net');
       assert.strictEqual(driver.evidenceDir, '/tmp');
     });
 
     it('initializes with empty calledMethods', () => {
       const { GateCDriver } = require(DRIVER_PATH);
-      const driver = new GateCDriver(9222, 'https://tea.millaguie.net', '/tmp');
+      const driver = new GateCDriver(9222, 'https://rp.example.net', '/tmp');
       assert.deepStrictEqual(driver.calledMethods, []);
     });
 
     it('initializes as not connected', () => {
       const { GateCDriver } = require(DRIVER_PATH);
-      const driver = new GateCDriver(9222, 'https://tea.millaguie.net', '/tmp');
+      const driver = new GateCDriver(9222, 'https://rp.example.net', '/tmp');
       assert.strictEqual(driver.connected, false);
     });
   });

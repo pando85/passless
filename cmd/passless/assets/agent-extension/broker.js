@@ -16,11 +16,9 @@
     if (req.allow_credentials.length > MAX_ALLOW_CREDENTIALS) return false;
     for (var i = 0; i < req.allow_credentials.length; i++) {
       var c = req.allow_credentials[i];
-      if (!c || typeof c !== "object") return false;
-      if (typeof c.id_b64u !== "string" || c.id_b64u.length === 0 || c.id_b64u.length > MAX_CREDENTIAL_ID_B64U_LEN) return false;
-      if (c.type !== "public-key") return false;
+      if (typeof c !== "string" || c.length === 0 || c.length > MAX_CREDENTIAL_ID_B64U_LEN) return false;
     }
-    if (req.user_verification !== "required" && req.user_verification !== "preferred" && req.user_verification !== "discouraged") return false;
+    if (typeof req.user_verification !== "boolean") return false;
     return true;
   }
 

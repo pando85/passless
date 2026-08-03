@@ -49,20 +49,12 @@
     }
     for (var i = 0; i < req.allow_credentials.length; i++) {
       var c = req.allow_credentials[i];
-      if (!c || typeof c !== "object") {
-        sendResponse({ ok: false });
-        return false;
-      }
-      if (typeof c.id_b64u !== "string" || c.id_b64u.length === 0 || c.id_b64u.length > MAX_CREDENTIAL_ID_B64U_LEN) {
-        sendResponse({ ok: false });
-        return false;
-      }
-      if (c.type !== "public-key") {
+      if (typeof c !== "string" || c.length === 0 || c.length > MAX_CREDENTIAL_ID_B64U_LEN) {
         sendResponse({ ok: false });
         return false;
       }
     }
-    if (req.user_verification !== "required" && req.user_verification !== "preferred" && req.user_verification !== "discouraged") {
+    if (typeof req.user_verification !== "boolean") {
       sendResponse({ ok: false });
       return false;
     }
@@ -108,7 +100,10 @@
       if (!response.ok) throw new Error("request denied");
       return response.json();
     }).then(function(response) {
-      sendResponse({ ok: true, response: response });
+      if (!response || typeof response !== "object" || !response.sign_assertion_result) {
+        throw new Error("malformed daemon response");
+      }
+      sendResponse({ ok: true, response: response.sign_assertion_result });
     }).catch(function() {
       sendResponse({ ok: false });
     });

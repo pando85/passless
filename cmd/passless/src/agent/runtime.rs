@@ -3058,13 +3058,30 @@ impl AgentRuntime {
         credential_ref: &passless_core::agent::CredentialRef,
     ) -> Option<String> {
         let mut storage_guard = storage.lock().ok()?;
-        let cred = storage_guard.read(credential_ref.as_bytes()).ok()?;
-
-        cred.user
-            .display_name
-            .as_ref()
-            .map(|s| s.to_string())
-            .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()))
+        let cred = storage_guard
+            .read_first(crate::storage::CredentialFilter::None)
+            .ok()?;
+        let href = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+        if href == *credential_ref {
+            return cred
+                .user
+                .display_name
+                .as_ref()
+                .map(|s| s.to_string())
+                .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()));
+        }
+        while let Ok(cred) = storage_guard.read_next() {
+            let href = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+            if href == *credential_ref {
+                return cred
+                    .user
+                    .display_name
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()));
+            }
+        }
+        None
     }
 
     fn handle_create_intent(

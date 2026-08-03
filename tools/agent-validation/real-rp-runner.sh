@@ -41,7 +41,7 @@ Required environment variables:
     AV_REAL_RP_CREDENTIAL_REF   Credential reference (never printed/stored)
 
 Optional environment variables:
-    AV_REAL_RP_URL              Real RP URL (default: https://tea.millaguie.net)
+    AV_REAL_RP_URL              Real RP URL (required for Gate C)
     AV_REAL_RP_TIMEOUT          Driver timeout seconds (default: 60)
     EVIDENCE_BASE_DIR           Evidence base (default: target/agent-validation)
 EOF

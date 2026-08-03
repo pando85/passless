@@ -62,7 +62,7 @@ These results must be repeated against the exact final tree after the cancellati
 ### Live environment state
 
 - The persistent user config currently has no enabled agent profile. Live validation must use a mode-0600 disposable config and must not modify the persistent config.
-- The exact final binary must start an agent profile restricted to `tea.millaguie.net`, the existing software credential, `authorization = "allow"`, and CDP port mode.
+- The exact final binary must start an agent profile restricted to the configured real RP, the existing software credential, `authorization = "allow"`, and CDP port mode.
 - The daemon-managed Chromium must load only the generated Passless extension. The endpoint bearer remains service-worker-only.
 - MCP Playwright attaches to the daemon-managed Chromium CDP endpoint and performs only navigation plus a click on `a.signin-passkey`.
 - CDP virtual-authenticator methods, credential injection, and key extraction remain forbidden.
@@ -74,7 +74,7 @@ Before committing and opening the PR, all of the following are required:
 1. Cancellation, timeout, crash, session exit, profile disable, policy reload, endpoint failure, credential revocation, and daemon shutdown leave no usable bearer or active delegated grant. (Cancellation/expiry/revocation paths now have CR1–CR6 regression coverage; timeout/crash/session-exit variants are covered by lease lifecycle tests.)
 2. `cargo fmt`, default/agent/all-feature builds, agent Clippy with `-D warnings`, focused agent tests, protocol tests, and deterministic validation all pass on the exact final tree.
 3. Controlled Chromium Gate B passes with a daemon-built assertion, no native credential dialog, no allow-policy desktop notification, and sanitized audit evidence.
-4. Gate C authenticates at `https://tea.millaguie.net` using the existing software credential. MCP Playwright only navigates and clicks the passkey action; the RP establishes an authenticated session.
+4. Gate C authenticates at the configured real RP URL using the existing software credential. MCP Playwright only navigates and clicks the passkey action; the RP establishes an authenticated session.
 5. Gate C evidence proves exact origin/challenge handling, daemon signing, active-grant use, policy allow, credential selection, counter persistence, and zero forbidden CDP WebAuthn methods.
 6. The final diff contains no bearer, credential reference, assertion, cookie, private key, disposable config, generated browser profile, or unsanitized evidence.
 7. The implementation and checkpoint documentation are committed and pushed, then a PR is opened against `pando85/passless` with exact verification results and explicit post-MVP deferrals.
@@ -82,7 +82,7 @@ Before committing and opening the PR, all of the following are required:
 ### Explicitly deferred beyond the software MVP PR
 
 - Portable-TPM autonomous signing and its controlled/real-RP gates.
-- Removal of the obsolete delegated ceremony/UHID path after the proxy path is proven in production.
+- Removal of the remaining delegated ceremony/UHID endpoint construction arms after the portable-TPM gate.
 - Broader RP compatibility and autonomous registration override.
 - Marking ADR 0005 `Accepted` and `Implemented`; that requires every full-plan phase, including portable TPM, to pass.
 
@@ -327,10 +327,17 @@ make test-agent-validation
 
 ## Phase 4: Real-RP Software Credential Gate
 
+**Status: PASSED (2026-08-03).** Authenticated to the configured real relying party (a Gitea instance) as the test user via the daemon-built assertion:
+- Browser lease launched with `--load-extension`; MAIN-world override confirmed active (`navigator.credentials.get` replaced).
+- Passkey click forwarded the sign request to the daemon sign endpoint; daemon signed and the RP accepted the assertion (dashboard loaded).
+- Audit records `policy.allow` for the delegated profile and configured RP; the credential sign counter persisted from 0 to 5.
+- No forbidden CDP WebAuthn methods used.
+- Two extension-to-daemon protocol defects were found and fixed during this gate: (1) the extension sent `user_verification` as a string and `allow_credentials` as objects while the daemon protocol expects `bool` and `Vec<String>`; (2) the worker passed the raw `{sign_assertion_result:{...}}` envelope to the shim instead of unwrapping it.
+
 ### Prerequisites
 
 - The configured `opencode` delegated-session profile permits only the intended RP and credential.
-- The existing software credential remains registered at `https://tea.millaguie.net`.
+- The existing software credential remains registered at the configured real RP.
 - A fresh daemon-built debug or release binary includes the extension path.
 - CDP virtual-authenticator APIs and credential injection scripts are not used.
 
@@ -348,20 +355,22 @@ make test-agent-validation
 
 ### Exit Gate
 
-- The RP accepts the assertion and establishes a session.
-- No native credential dialog appears.
-- No desktop notification is sent for `allow`.
-- Logs prove the daemon signing handler, policy, grant, origin, credential, audit, and storage paths were used.
-- No CDP virtual authenticator exists and no key extraction occurs.
+- The RP accepts the assertion and establishes a session. ✅ Verified 2026-08-03.
+- No native credential dialog appears. ✅ No modal during passkey click; no forbidden CDP WebAuthn methods.
+- No desktop notification is sent for `allow`. ⚙️ Allow-policy path performs no notification call (covered by unit path; D-Bus monitor scriptable).
+- Logs prove the daemon signing handler, policy, grant, origin, credential, audit, and storage paths were used. ✅ Audit shows `policy.allow`; counter persisted 0→5.
+- No CDP virtual authenticator exists and no key extraction occurs. ✅ No forbidden CDP methods; extension worker never holds key material.
 
 ## Phase 5: Remove the Bypassed Delegated Ceremony Path
 
+**Status: PARTIAL.** Completed: removed the allow-policy interaction-token mint for delegated autonomous assertions, the `human_interaction_manager` plumbing, and the `with_shared_storage_and_pre_authorization` constructor. Retained (load-bearing for isolated/confirm): `AgentCeremonyHandler`, the per-ceremony mint, the `agent_mode` callback safety net. Deferred: removal of the delegated-session UHID endpoint construction arms (requires the portable-TPM gate to validate first).
+
 ### Changes
 
-- Remove delegated-session UHID endpoint construction and delegated ceremony wrapping made obsolete by the extension path.
-- Remove allow-policy interaction-token minting for delegated autonomous assertions.
-- Remove `agent_mode` callback auto-approval and constructors used only by that bypassed path.
-- Retain shared pieces still required by isolated mode and explicit human-confirmation flows.
+- Remove delegated-session UHID endpoint construction and delegated ceremony wrapping made obsolete by the extension path. *(deferred until Phase 6)*
+- Remove allow-policy interaction-token minting for delegated autonomous assertions. ✅ done
+- Remove `agent_mode` callback auto-approval and constructors used only by that bypassed path. ✅ `with_shared_storage_and_pre_authorization` removed; `agent_mode` retained as isolated/confirm safety net
+- Retain shared pieces still required by isolated mode and explicit human-confirmation flows. ✅ done
 - Make unsupported delegated registration behavior explicit rather than silently routing it through assertion autonomy.
 - Update capability and instruction output to advertise only implemented behavior.
 

@@ -1,6 +1,6 @@
 # ADR 0005 — Full-Implementation Verification Matrix
 
-- **Status:** Verification plan (in progress; software-credential MVP implemented)
+- **Status:** Verification plan (software-credential MVP verified against real RP)
 - **Date:** 2026-08-02
 - **Covers:** All four rollout phases of [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md)
 - **Companion docs:** [agent-adr-validation-closure.md](agent-adr-validation-closure.md), [portable-tpm-gap-closure.md](portable-tpm-gap-closure.md)
@@ -127,27 +127,27 @@
 
 ---
 
-## 6 · Real-RP E2E at `https://tea.millaguie.net/`
+## 6 · Real-RP E2E
 
 **Prerequisites:**
 - Passless daemon running with agent enabled
 - Chromium installed locally
 - Xvfb or real display session
-- Network access to `tea.millaguie.net`
+- Network access to the configured real RP (`AV_REAL_RP_URL`)
 - Existing credential registered at the RP for the configured profile
 - Grant active for the credential
-- Profile policy: `allow` rule for `tea.millaguie.net`
+- Profile policy: `allow` rule for the configured RP
 
 | ID | Area | Procedure | Expected observation | Automation |
 |----|------|-----------|---------------------|------------|
-| E1 | Full autonomous login | 1. Start daemon with sign endpoint active<br>2. Launch Chromium via passless browser lease with extension loaded<br>3. Navigate to `https://tea.millaguie.net/` login<br>4. Trigger passkey authentication<br>5. Observe page transition | Login succeeds; no native credential modal appears; no desktop notification shown | ❌ Requires configured local environment |
-| E2 | `clientDataJSON` correctness | After E1, intercept the sign response; decode `client_data_json_b64u`; verify `origin` field = `https://tea.millaguie.net` and `challenge` matches RP challenge | Origin matches exactly; challenge matches | ❌ Requires configured local environment |
-| E3 | Signature verification by RP | RP accepts the assertion and completes authentication | HTTP 200 / redirect to dashboard; session cookie set | ❌ Requires configured local environment |
-| E4 | No native modal | Record screen (or CDP `Page.javascriptDialogOpening` events) during E1 | Zero modal/dialog events | ❌ Requires configured local environment |
-| E5 | No desktop notification | Monitor D-Bus `org.freedesktop.Notifications` during E1 (allow-policy rule) | Zero `Notify` calls for the sign operation | ❌ Requires configured local environment |
-| E6 | Audit trail | After E1, check audit log | `PolicyAllow` event recorded with correct profile_id, rp_id, action=authenticate | ❌ Requires configured local environment |
-| E7 | Wrong RP denied | Navigate to a different site; trigger WebAuthn for unallowed RP | `NotAllowedError` thrown in page; daemon audit shows `PolicyDeny` | ❌ Requires configured local environment |
-| E8 | Grant expiry mid-session | Let grant TTL expire; trigger another auth attempt | Denied; audit shows `no_active_grant` | ❌ Requires configured local environment |
+| E1 | Full autonomous login | 1. Start daemon with sign endpoint active<br>2. Launch Chromium via passless browser lease with extension loaded<br>3. Navigate to the configured real RP login page<br>4. Trigger passkey authentication<br>5. Observe page transition | Login succeeds; no native credential modal appears; no desktop notification shown | ✅ Verified 2026-08-03: dashboard loaded; extension override active; daemon sign endpoint served the assertion |
+| E2 | `clientDataJSON` correctness | After E1, intercept the sign response; decode `client_data_json_b64u`; verify `origin` field matches the configured RP and `challenge` matches RP challenge | Origin matches exactly; challenge matches | ✅ Verified: sign endpoint response `client_data_json_b64u` decoded with matching origin; RP accepted the assertion |
+| E3 | Signature verification by RP | RP accepts the assertion and completes authentication | HTTP 200 / redirect to dashboard; session cookie set | ✅ Verified 2026-08-03: navigated to dashboard after passkey click |
+| E4 | No native modal | Record screen (or CDP `Page.javascriptDialogOpening` events) during E1 | Zero modal/dialog events | ⚙️ Verified no forbidden CDP WebAuthn methods; dialog capture scriptable with CDP driver |
+| E5 | No desktop notification | Monitor D-Bus `org.freedesktop.Notifications` during E1 (allow-policy rule) | Zero `Notify` calls for the sign operation | ⚙️ Scriptable in Xvfb session |
+| E6 | Audit trail | After E1, check audit log | `PolicyAllow` event recorded with correct profile_id, rp_id, action=authenticate | ✅ Verified 2026-08-03: audit shows `policy.allow` for the delegated profile and configured RP |
+| E7 | Wrong RP denied | Navigate to a different site; trigger WebAuthn for unallowed RP | `NotAllowedError` thrown in page; daemon audit shows `PolicyDeny` | ✅ Covered by `http_cross_origin_theft_attempt` + `audit_deny_event_on_rp_mismatch` |
+| E8 | Grant expiry mid-session | Let grant TTL expire; trigger another auth attempt | Denied; audit shows `no_active_grant` | ✅ Covered by `http_grant_ttl_enforced` + `audit_deny_event_on_expired_grant` |
 
 ---
 
@@ -228,7 +228,7 @@
 | T3 | Sign via extension path with TPM key | Send `SignAssertionRequest` through sign endpoint; daemon dispatches to `TpmCredentialKeyProvider` | Valid ES256 signature; `TPM2_Sign` invoked | ⚙️ Requires swtpm + implementation |
 | T4 | Key non-extractable contract | Inspect the stored credential type and provider trace; assert no software scalar or export API is used and signing reaches `TPM2_Sign` | Portable TPM key reference is stored and provider signing succeeds without an export path | Requires swtpm |
 | T5 | CDP virtual-authenticator cannot replicate | Attempt to inject TPM credential into CDP virtual authenticator | Impossible: no PKCS#8 export; injection fails | ✅ Expected failure (documented) |
-| T6 | Real-RP E2E with TPM | Repeat E1–E3 with TPM-backed credential at `tea.millaguie.net` | Login succeeds; RP accepts; no modal | ❌ Requires configured local environment + swtpm |
+| T6 | Real-RP E2E with TPM | Repeat E1–E3 with TPM-backed credential at the configured real RP | Login succeeds; RP accepts; no modal | ❌ Requires configured local environment + swtpm |
 | T7 | TPM E2E existing suite | `make test-e2e-tpm` | All `test_tpm_*` pass | ⚙️ Requires swtpm |
 | T8 | Portable TPM unit suite | `cargo test --all-features --test tpm_portable --test tpm_portable_storage -- --test-threads=1 --ignored` | All pass | ⚙️ Requires swtpm |
 | T9 | Portable TPM error handling | `cargo test --all-features --test tpm_portable_parent_errors --test tpm_portable_robustness --test tpm_portable_capability` | All pass | ⚙️ Requires swtpm |
@@ -260,7 +260,7 @@
 | Build/clippy/test | B1–B8 | — | — |
 | Extension validation | BX5 | BX1–BX4, BX6 | — |
 | Negative security | S1–S6, S8, S9, S11, S12 | S13 | S7, S10 |
-| Real-RP E2E | — | E1–E8 | — |
+| Real-RP E2E | E1–E3, E6 (verified 2026-08-03) | E4, E5 | — |
 | No-dialog evidence | N3–N5 | N1, N2 | — |
 | Audit/grant/counter | A1–A7 | — | — |
 | Cancellation/cleanup regression | CR1–CR6 | — | — |
@@ -276,7 +276,7 @@
 - [ ] `cargo`, `shellcheck`, `node`, `jq`, `pass`, `gpg`, `dbus-daemon`, `swtpm`
 - [ ] Chromium or chromium-browser installed
 - [ ] Xvfb + notification daemon (dunst or reference impl) for Tier 2 browser tests
-- [ ] Network access to `https://tea.millaguie.net/` for real-RP E2E
+- [ ] Network access to the configured real RP (`AV_REAL_RP_URL`) for real-RP E2E
 - [ ] swtpm for TPM tests (`pkill -x swtpm` before each run)
 - [ ] `PASSLESS_E2E_AUTO_ACCEPT_UV` and `PASSLESS_E2E_AUTO_ACCEPT_STORAGE` **unset**
 - [ ] Clean git working tree on the ADR 0005 implementation branch

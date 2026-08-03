@@ -275,7 +275,7 @@ test("main: intercepts publicKey get and posts to broker", async function() {
   assert.strictEqual(posted.data.source, "passless-agent-main");
   assert.strictEqual(posted.data.channel, ch);
   assert.strictEqual(posted.data.request.rp_id, "example.com");
-  assert.strictEqual(posted.data.request.user_verification, "preferred");
+  assert.strictEqual(posted.data.request.user_verification, false);
 });
 
 test("main: passes through non-publicKey options to original get", async function() {
@@ -494,7 +494,7 @@ test("main: accepts all valid userVerification values", async function() {
       p.catch(function() {});
     });
     assert.strictEqual(sandbox._postMessageCalls.length, 1, "should post for uv=" + uv);
-    assert.strictEqual(sandbox._postMessageCalls[0].data.request.user_verification, uv);
+    assert.strictEqual(sandbox._postMessageCalls[0].data.request.user_verification, uv === "required");
   }
 });
 
@@ -812,9 +812,8 @@ test("main: valid allowCredentials are serialized correctly", async function() {
 
   const posted = sandbox._postMessageCalls[0];
   assert.strictEqual(posted.data.request.allow_credentials.length, 1);
-  assert.strictEqual(posted.data.request.allow_credentials[0].id_b64u, b64url(credId));
-  assert.strictEqual(posted.data.request.allow_credentials[0].type, "public-key");
-  assert.strictEqual(posted.data.request.user_verification, "required");
+  assert.strictEqual(posted.data.request.allow_credentials[0], b64url(credId));
+  assert.strictEqual(posted.data.request.user_verification, true);
 });
 
 test("main: defaults userVerification to preferred when omitted", async function() {
@@ -831,7 +830,7 @@ test("main: defaults userVerification to preferred when omitted", async function
   });
 
   const posted = sandbox._postMessageCalls[0];
-  assert.strictEqual(posted.data.request.user_verification, "preferred");
+  assert.strictEqual(posted.data.request.user_verification, false);
 });
 
 // ======================== BROKER.JS BEHAVIORAL TESTS ========================
@@ -854,7 +853,7 @@ test("broker: forwards valid request to chrome.runtime.sendMessage", async funct
           rp_id: "example.com",
           challenge_b64u: b64url(makeChallenge(32)),
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -881,7 +880,7 @@ test("broker: rejects message from wrong source", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       {},
@@ -906,7 +905,7 @@ test("broker: rejects message with wrong channel", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -931,7 +930,7 @@ test("broker: rejects message from wrong origin", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -956,7 +955,7 @@ test("broker: rejects request with invalid rp_id", async function() {
           rp_id: "",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -971,7 +970,7 @@ test("broker: rejects request with too many allow_credentials", async function()
   const ch = "broker-ch6";
   const creds = [];
   for (let i = 0; i < 65; i++) {
-    creds.push({ id_b64u: "abc", type: "public-key" });
+    creds.push("abc");
   }
 
   const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
@@ -986,7 +985,7 @@ test("broker: rejects request with too many allow_credentials", async function()
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: creds,
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -1038,7 +1037,7 @@ test("broker: relays failure response back to main", async function() {
           rp_id: "example.com",
           challenge_b64u: b64url(makeChallenge(32)),
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -1058,7 +1057,7 @@ test("broker: rejects oversized message JSON", async function() {
   const ch = "broker-ch9";
   const bigCreds = [];
   for (let i = 0; i < 64; i++) {
-    bigCreds.push({ id_b64u: "x".repeat(512), type: "public-key" });
+    bigCreds.push("x".repeat(512));
   }
 
   const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
@@ -1073,7 +1072,7 @@ test("broker: rejects oversized message JSON", async function() {
           rp_id: "example.com",
           challenge_b64u: "x".repeat(2048),
           allow_credentials: bigCreds,
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -1098,7 +1097,7 @@ test("broker: rejects message with empty id", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -1109,7 +1108,7 @@ test("broker: rejects message with empty id", async function() {
   assert.strictEqual(sandbox._chromeSendMessage, undefined);
 });
 
-test("broker: rejects credential with non-public-key type", async function() {
+test("broker: rejects credential id that is not a string", async function() {
   const ch = "broker-ch11";
   const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
     const messageHandler = listeners["message"];
@@ -1122,8 +1121,8 @@ test("broker: rejects credential with non-public-key type", async function() {
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
-          allow_credentials: [{ id_b64u: "abc", type: "password" }],
-          user_verification: "preferred",
+          allow_credentials: [42],
+          user_verification: false,
         },
       },
       sandbox.window,
@@ -1150,7 +1149,7 @@ test("worker: validates sender.url must be valid URL", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1175,7 +1174,7 @@ test("worker: validates sender.url must be https:", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1199,7 +1198,7 @@ test("worker: validates sender.id against chrome.runtime.id", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1214,7 +1213,7 @@ test("worker: accepts matching sender.id", async function() {
   const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
     sandbox._fetchResponse = {
       ok: true,
-      json: function() { return Promise.resolve({ credential_id_b64u: "abc" }); },
+      json: function() { return Promise.resolve({ sign_assertion_result: { credential_id_b64u: "abc" } }); },
     };
 
     const listener = sandbox._listeners[0];
@@ -1226,7 +1225,7 @@ test("worker: accepts matching sender.id", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1254,7 +1253,7 @@ test("worker: derives origin and cross_origin from sender.url", async function()
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1285,7 +1284,7 @@ test("worker: computes cross_origin=true for unrelated domain", async function()
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1310,7 +1309,7 @@ test("worker: constructs fresh request object (not passthrough)", async function
       rp_id: "example.com",
       challenge_b64u: "aaa",
       allow_credentials: [],
-      user_verification: "preferred",
+      user_verification: false,
       extra_field: "should_not_appear",
     };
     const sender = { url: "https://example.com/page" };
@@ -1345,7 +1344,7 @@ test("worker: sends bearer token in Authorization header", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1376,7 +1375,7 @@ test("worker: bearer token with special characters is safely injected", async fu
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1406,7 +1405,7 @@ test("worker: fetches correct URL with port", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1430,7 +1429,7 @@ test("worker: rejects rp_id exceeding MAX_RP_ID_LEN", async function() {
           rp_id: "x".repeat(254),
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1453,7 +1452,7 @@ test("worker: rejects challenge_b64u exceeding MAX_CHALLENGE_B64U_LEN", async fu
           rp_id: "example.com",
           challenge_b64u: "x".repeat(2049),
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1470,7 +1469,7 @@ test("worker: rejects allow_credentials exceeding MAX_ALLOW_CREDENTIALS", async 
     let response = null;
     const creds = [];
     for (let i = 0; i < 65; i++) {
-      creds.push({ id_b64u: "abc", type: "public-key" });
+      creds.push("abc");
     }
     const sender = { url: "https://example.com/page" };
     listener(
@@ -1480,7 +1479,7 @@ test("worker: rejects allow_credentials exceeding MAX_ALLOW_CREDENTIALS", async 
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: creds,
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1531,7 +1530,7 @@ test("worker: accepts all valid user_verification values", async function() {
             rp_id: "example.com",
             challenge_b64u: "aaa",
             allow_credentials: [],
-            user_verification: uv,
+            user_verification: uv === "required",
           },
         },
         sender,
@@ -1542,7 +1541,7 @@ test("worker: accepts all valid user_verification values", async function() {
     await flushPromises();
     assert.strictEqual(sandbox._fetchCalls.length, 1, "should fetch for uv=" + uv);
     const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
-    assert.strictEqual(body.user_verification, uv);
+    assert.strictEqual(body.user_verification, uv === "required");
   }
 });
 
@@ -1562,7 +1561,7 @@ test("worker: malformed daemon response results in ok:false", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1591,7 +1590,7 @@ test("worker: fetch error results in ok:false", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1612,7 +1611,7 @@ test("worker: rejects request body exceeding MAX_REQUEST_BYTES", async function(
     let response = null;
     const bigCreds = [];
     for (let i = 0; i < 64; i++) {
-      bigCreds.push({ id_b64u: "x".repeat(512), type: "public-key" });
+      bigCreds.push("x".repeat(512));
     }
     const sender = { url: "https://example.com/page" };
     listener(
@@ -1622,7 +1621,7 @@ test("worker: rejects request body exceeding MAX_REQUEST_BYTES", async function(
           rp_id: "example.com",
           challenge_b64u: "x".repeat(2048),
           allow_credentials: bigCreds,
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1645,7 +1644,7 @@ test("worker: rejects message from wrong source", async function() {
           rp_id: "example.com",
           challenge_b64u: "aaa",
           allow_credentials: [],
-          user_verification: "preferred",
+          user_verification: false,
         },
       },
       sender,
@@ -1671,7 +1670,7 @@ test("worker: rejects message without request", async function() {
   });
 });
 
-test("worker: rejects credential id_b64u exceeding MAX_CREDENTIAL_ID_B64U_LEN", async function() {
+test("worker: rejects credential id exceeding MAX_CREDENTIAL_ID_B64U_LEN", async function() {
   const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
@@ -1682,8 +1681,8 @@ test("worker: rejects credential id_b64u exceeding MAX_CREDENTIAL_ID_B64U_LEN", 
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
-          allow_credentials: [{ id_b64u: "x".repeat(513), type: "public-key" }],
-          user_verification: "preferred",
+          allow_credentials: ["x".repeat(513)],
+          user_verification: false,
         },
       },
       sender,
@@ -1694,7 +1693,7 @@ test("worker: rejects credential id_b64u exceeding MAX_CREDENTIAL_ID_B64U_LEN", 
   });
 });
 
-test("worker: rejects credential with non-public-key type", async function() {
+test("worker: rejects credential id that is not a string", async function() {
   const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
@@ -1705,8 +1704,8 @@ test("worker: rejects credential with non-public-key type", async function() {
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
-          allow_credentials: [{ id_b64u: "abc", type: "password" }],
-          user_verification: "preferred",
+          allow_credentials: [42],
+          user_verification: false,
         },
       },
       sender,
@@ -1751,7 +1750,7 @@ test("uv: main defaults empty string userVerification to preferred", async funct
   });
   await flushPromises();
   assert.strictEqual(sandbox._postMessageCalls.length, 1);
-  assert.strictEqual(sandbox._postMessageCalls[0].data.request.user_verification, "preferred");
+  assert.strictEqual(sandbox._postMessageCalls[0].data.request.user_verification, false);
 });
 
 test("uv: broker rejects numeric user_verification", async function() {

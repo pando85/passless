@@ -203,7 +203,8 @@ class GateCDriver {
 
 async function main() {
   const cdpPort = parseInt(process.env.AV_CDP_PORT || '9222', 10);
-  const rpUrl = process.env.AV_REAL_RP_URL || 'https://tea.millaguie.net';
+  const rpUrl = process.env.AV_REAL_RP_URL;
+  if (!rpUrl) throw new Error('AV_REAL_RP_URL is required');
   const evidenceDir = process.env.AV_EVIDENCE_DIR || '/tmp';
 
   const driver = new GateCDriver(cdpPort, rpUrl, evidenceDir);

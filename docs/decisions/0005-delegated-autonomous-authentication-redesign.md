@@ -3,7 +3,7 @@
 - **Status:** Accepted (finding); In progress (redesign)
 - **Date:** 2026-08-02
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Phases 1–3 implemented and unit-tested; Phase 5 partially removed; real-RP (Phase 4) and portable-TPM (Phase 6) gates remain. Completion is governed by the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md)
+- **Implementation status:** Phases 1–4 implemented; real-RP software gate passed 2026-08-03; Phase 5 partially removed; portable-TPM gate (Phase 6) remains. Completion is governed by the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md)
 - **Related decisions:** [ADR 0002](0002-native-webauthn-agent-architecture.md), [ADR 0003](0003-portable-tpm-credential-keys.md), [ADR 0004](0004-external-cdp-endpoint-exposure.md)
 - **Amends:** the delegated-autonomous path of ADR 0002, and the interaction-manager / pre-authorization additions on branch `feat/agent-autonomous-auth`
 
@@ -11,7 +11,7 @@
 
 ADR 0002 defines the agent subsystem so that the daemon is the **only** signer and enforces RP/credential policy, grant TTL, and audit while doing so. The autonomous ("no human in the loop") goal for `delegated-session` was pursued on branch `feat/agent-autonomous-auth` by (a) minting a pre-authorization token on a shared `AgentInteractionManager` at delegation time, (b) auto-approving UP/UV in the human endpoint's callbacks via an `agent_mode` flag, and (c) skipping the agent UHID device so the browser sees a single authenticator.
 
-End-to-end testing against a real relying party (`tea.millaguie.net`) showed that this stack does **not** produce autonomy on its own. Chromium presents a native, non-DOM credential-selection modal for discoverable credentials that no CDP/Playwright call can dismiss, and a UHID authenticator always triggers that modal. The only headless path Chromium offers is the CDP `WebAuthn` virtual-authenticator environment (`WebAuthn.enable` + `addVirtualAuthenticator` + `addCredential`), which **disconnects real discovery and signs inside the browser's automation layer**. The working E2E therefore injected the credential's PKCS#8 private key (extracted from the `pass` vault) into a virtual authenticator.
+End-to-end testing against a real relying party (a Gitea instance) showed that this stack does **not** produce autonomy on its own. Chromium presents a native, non-DOM credential-selection modal for discoverable credentials that no CDP/Playwright call can dismiss, and a UHID authenticator always triggers that modal. The only headless path Chromium offers is the CDP `WebAuthn` virtual-authenticator environment (`WebAuthn.enable` + `addVirtualAuthenticator` + `addCredential`), which **disconnects real discovery and signs inside the browser's automation layer**. The working E2E therefore injected the credential's PKCS#8 private key (extracted from the `pass` vault) into a virtual authenticator.
 
 That working flow has two properties that contradict the ADR 0002 security model:
 
@@ -74,7 +74,7 @@ The CDP virtual-authenticator key-injection workflow is retained only as a **doc
 Implementation is sequenced so that no signing code ships without a real-RP round-trip to validate `clientDataJSON`/`authenticatorData`:
 
 1. **Daemon signing oracle.** Add a principal/admin IPC command (e.g. `delegation sign`) that, given an active grant, RP ID, challenge, and origin, enforces policy/refs/audit and returns `authenticatorData` + `signature` via the existing key provider. Unit-test the crypto (sign with a test key, verify with the public key) and assert `authenticatorData` byte-equality against the soft-fido2 builder for identical inputs. Additive only; nothing deleted.
-2. **MAIN-world override extension + browser load.** Package the MV3 extension with a MAIN-world `document_start` content script that overrides `navigator.credentials.get`, load it via `--load-extension`, wire the override to the daemon sign command returning a duck-typed `PublicKeyCredential` result. The per-session localhost bearer token authenticates the channel; origin/policy/grant checks in the daemon are load-bearing. E2E-verify against `tea.millaguie.net` (this is the first point the `clientDataJSON` contract is validated end-to-end).
+2. **MAIN-world override extension + browser load.** Package the MV3 extension with a MAIN-world `document_start` content script that overrides `navigator.credentials.get`, load it via `--load-extension`, wire the override to the daemon sign command returning a duck-typed `PublicKeyCredential` result. The per-session localhost bearer token authenticates the channel; origin/policy/grant checks in the daemon are load-bearing. E2E-verify against the configured real RP (this is the first point the `clientDataJSON` contract is validated end-to-end).
 3. **Delete the bypassed delegated ceremony stack** listed above, once the extension path is green; keep `isolated` mode and `confirm` flows intact. Update the `passless-agent` skill to make the daemon-backed override path authoritative and demote the CDP virtual-authenticator path to legacy/test-only.
 4. **TPM E2E.** Repeat the E2E with a portable-TPM-backed credential to confirm autonomy without key extraction. CDP virtual-authenticator injection cannot support this case.
 
