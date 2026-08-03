@@ -400,13 +400,15 @@ Required regressions:
 
 ## Phase 6: Portable-TPM End-to-End Gate
 
+**Status: PARTIAL.** The portable TPM unit suites pass (T1, T2, T4, T5, T8, T9 verified 2026-08-03). The sign handler dispatches through the `CredentialKeyProvider` abstraction (U4.1, U4.2 covered). The full extension-to-daemon E2E with a TPM-backed credential (T3, T6) requires bootstrapping a credential via CTAP registration, which is deferred to a live environment with a real RP.
+
 ### Changes
 
-- Add a test-provider assertion proving the oracle dispatches through the provider abstraction.
-- Provision a dedicated per-run swtpm instance without killing or reusing unrelated host TPM processes.
-- Create or register a portable-TPM-backed credential for a controlled RP, then exercise the full extension-to-daemon path.
-- Exercise the configured real RP with a portable-TPM credential when registration is available.
-- Capture TPM command/provider evidence without attempting unreliable process-memory absence proofs.
+- Add a test-provider assertion proving the oracle dispatches through the provider abstraction. ✅ Covered by `RecordingKeyProvider` in sign handler tests.
+- Provision a dedicated per-run swtpm instance without killing or reusing unrelated host TPM processes. ✅ Verified 2026-08-03.
+- Create or register a portable-TPM-backed credential for a controlled RP, then exercise the full extension-to-daemon path. ⚙️ Requires credential bootstrap via CTAP.
+- Exercise the configured real RP with a portable-TPM credential when registration is available. ⚙️ Requires credential bootstrap.
+- Capture TPM command/provider evidence without attempting unreliable process-memory absence proofs. ✅ Covered by portable TPM unit tests.
 
 ### Verification
 

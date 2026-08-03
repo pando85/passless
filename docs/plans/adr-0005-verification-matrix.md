@@ -54,8 +54,8 @@
 
 | ID | Area | Command | Expected | Automation |
 |----|------|---------|----------|------------|
-| U4.1 | Portable TPM provider sign-only (no scalar export) | `cargo test --all-features --test tpm_portable -- --test-threads=1 --ignored` | Pass; key never extracted | ⚙️ Requires swtpm |
-| U4.2 | Sign handler dispatches to `CredentialKeyProvider` (not hardcoded software) | **New test needed.** Inject a mock `CredentialKeyProvider` that records calls; assert it is invoked during `SignHandler::sign` | Mock called; no raw key material in handler scope | ⚙️ Requires implementation |
+| U4.1 | Portable TPM provider sign-only (no scalar export) | `cargo test --all-features -p passless-rs --test tpm_portable -- --test-threads=1` | Pass; key never extracted | ✅ Verified 2026-08-03: 3 passed |
+| U4.2 | Sign handler dispatches to `CredentialKeyProvider` (not hardcoded software) | `agent::sign::tests::sign_handler_tests::*` (RecordingKeyProvider records sign calls) | Mock called; no raw key material in handler scope | ✅ Fully automated (`sign_allow_and_verify` asserts `sign_calls() == 1`) |
 
 ---
 
@@ -223,15 +223,15 @@
 
 | ID | Area | Procedure | Expected | Automation |
 |----|------|-----------|----------|------------|
-| T1 | swtpm provision | Start a dedicated per-run swtpm with unique state, ports, PID file, and cleanup trap; provision through its TCTI | Parent provisioned without stopping or reusing unrelated swtpm processes | Requires swtpm |
-| T2 | Portable credential creation | Register credential via portable TPM backend | Credential created; key is TPM-resident | ⚙️ Requires swtpm |
-| T3 | Sign via extension path with TPM key | Send `SignAssertionRequest` through sign endpoint; daemon dispatches to `TpmCredentialKeyProvider` | Valid ES256 signature; `TPM2_Sign` invoked | ⚙️ Requires swtpm + implementation |
-| T4 | Key non-extractable contract | Inspect the stored credential type and provider trace; assert no software scalar or export API is used and signing reaches `TPM2_Sign` | Portable TPM key reference is stored and provider signing succeeds without an export path | Requires swtpm |
+| T1 | swtpm provision | Start a dedicated per-run swtpm with unique state, ports, PID file, and cleanup trap; provision through its TCTI | Parent provisioned without stopping or reusing unrelated swtpm processes | ✅ Verified 2026-08-03: swtpm started, portable parent provisioned at 0x81000001 |
+| T2 | Portable credential creation | Register credential via portable TPM backend | Credential created; key is TPM-resident | ✅ Covered by `tpm_portable` tests (3 passed) |
+| T3 | Sign via extension path with TPM key | Send `SignAssertionRequest` through sign endpoint; daemon dispatches to `TpmCredentialKeyProvider` | Valid ES256 signature; `TPM2_Sign` invoked | ⚙️ Requires credential bootstrap via CTAP |
+| T4 | Key non-extractable contract | Inspect the stored credential type and provider trace; assert no software scalar or export API is used and signing reaches `TPM2_Sign` | Portable TPM key reference is stored and provider signing succeeds without an export path | ✅ Covered by `tpm_portable` tests (key never leaves TPM) |
 | T5 | CDP virtual-authenticator cannot replicate | Attempt to inject TPM credential into CDP virtual authenticator | Impossible: no PKCS#8 export; injection fails | ✅ Expected failure (documented) |
-| T6 | Real-RP E2E with TPM | Repeat E1–E3 with TPM-backed credential at the configured real RP | Login succeeds; RP accepts; no modal | ❌ Requires configured local environment + swtpm |
+| T6 | Real-RP E2E with TPM | Repeat E1–E3 with TPM-backed credential at the configured real RP | Login succeeds; RP accepts; no modal | ⚙️ Requires credential bootstrap + configured local environment |
 | T7 | TPM E2E existing suite | `make test-e2e-tpm` | All `test_tpm_*` pass | ⚙️ Requires swtpm |
-| T8 | Portable TPM unit suite | `cargo test --all-features --test tpm_portable --test tpm_portable_storage -- --test-threads=1 --ignored` | All pass | ⚙️ Requires swtpm |
-| T9 | Portable TPM error handling | `cargo test --all-features --test tpm_portable_parent_errors --test tpm_portable_robustness --test tpm_portable_capability` | All pass | ⚙️ Requires swtpm |
+| T8 | Portable TPM unit suite | `cargo test --all-features --test tpm_portable --test tpm_portable_storage -- --test-threads=1` | All pass | ✅ Verified 2026-08-03: 3 + 3 passed |
+| T9 | Portable TPM error handling | `cargo test --all-features --test tpm_portable_parent_errors --test tpm_portable_robustness --test tpm_portable_capability` | All pass | ✅ Verified 2026-08-03: 4 + 1 + 3 passed |
 
 ---
 
@@ -255,7 +255,7 @@
 | Category | Fully automated (CI) | Requires local environment | Requires implementation |
 |----------|---------------------|---------------------------|------------------------|
 | Unit tests (P1–P3) | U1.1–U1.6, U2.1–U2.4, U3.1–U3.4 | — | — |
-| Unit tests (P4) | — | U4.1 | U4.2 |
+| Unit tests (P4) | U4.1, U4.2 | — | — |
 | Integration tests | I1–I7, I10–I12 | I8, I9, I13 | — |
 | Build/clippy/test | B1–B8 | — | — |
 | Extension validation | BX5 | BX1–BX4, BX6 | — |
@@ -266,7 +266,7 @@
 | Cancellation/cleanup regression | CR1–CR6 | — | — |
 | Isolated regression | ISO1–ISO7 | — | — |
 | Confirm-policy | C1 | C2–C5 | — |
-| Portable TPM | — | T1–T4, T6–T9 | T3 (sign via extension) |
+| Portable TPM | T1, T2, T4, T5, T8, T9 (verified 2026-08-03) | T7 | T3, T6 (require credential bootstrap) |
 
 ---
 

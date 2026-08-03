@@ -3,7 +3,7 @@
 - **Status:** Accepted (finding); In progress (redesign)
 - **Date:** 2026-08-02
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Phases 1–4 implemented; real-RP software gate passed 2026-08-03; Phase 5 partially removed; portable-TPM gate (Phase 6) remains. Completion is governed by the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md)
+- **Implementation status:** Phases 1–4 implemented; real-RP software gate passed 2026-08-03; Phase 5 partially removed; Phase 6 portable-TPM unit suites pass (full E2E deferred); completion is governed by the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md)
 - **Related decisions:** [ADR 0002](0002-native-webauthn-agent-architecture.md), [ADR 0003](0003-portable-tpm-credential-keys.md), [ADR 0004](0004-external-cdp-endpoint-exposure.md)
 - **Amends:** the delegated-autonomous path of ADR 0002, and the interaction-manager / pre-authorization additions on branch `feat/agent-autonomous-auth`
 
