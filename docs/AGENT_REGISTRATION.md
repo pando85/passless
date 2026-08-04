@@ -38,53 +38,43 @@ authenticate = { authorization = "allow", user_presence = "none", user_verificat
 - `rules[].register.user_presence`: UP requirement (none/human)
 - `rules[].register.user_verification`: UV requirement (none/human)
 
-### Step 2: Request Registration Grant
+### Step 2: Launch Browser with Extension
 
-From your agent process, request a registration grant via IPC:
+The `browser launch` command automatically requests registration grants for all allowed RP IDs in the profile:
 
-```rust
-use passless_core::agent::{AdminRequest, AdminResponse};
-
-let request = AdminRequest::RequestRegistration {
-    profile_id: "ci-agent".into(),
-    rp_id: "gitea.example.com".into(),
-    max_session_ttl: 300,
-    reason: Some("CI/CD setup".into()),
-};
-
-let response = agent_client.send(request).await?;
-
-let grant_id = match response {
-    AdminResponse::RegistrationGranted { registration_grant_id } => registration_grant_id,
-    _ => return Err("Registration denied".into()),
-};
+```bash
+passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/register
 ```
 
-### Step 3: Navigate to Registration Page
+This command:
+- Generates a bearer token for the session
+- Requests registration grants for all allowed RP IDs
+- Registers registration and sign contexts with the daemon
+- Launches Chromium with the agent extension loaded
 
-Launch the browser with the extension and navigate to the RP's registration page:
-
-```rust
-let browser = launch_browser_with_extension(&grant_id)?;
-browser.navigate("https://gitea.example.com/register").await?;
+**Output:**
+```json
+{
+  "lease_id": "abc123...",
+  "profile_id": "ci-agent",
+  "pid": 12345,
+  "start_url": "https://gitea.example.com/register"
+}
 ```
 
-### Step 4: Trigger Registration
+### Step 3: Trigger Registration
 
 The extension automatically intercepts `navigator.credentials.create()` and handles the registration flow. No additional code is needed on the agent side.
 
-### Step 5: Use the Credential
+### Step 4: Use the Credential
 
-After registration, the credential is stored and can be used for authentication:
+After registration, the credential is stored and can be used for authentication. The same browser session can be used for authentication, or you can launch a new session:
 
-```rust
-let auth_request = AdminRequest::RequestDelegation {
-    profile_id: "ci-agent".into(),
-    rp_id: "gitea.example.com".into(),
-    credential_ref: new_credential_ref,
-    max_session_ttl: 300,
-    reason: Some("CI/CD authentication".into()),
-};
+```bash
+# Launch a new browser session for authentication
+passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/login
+
+# The extension intercepts navigator.credentials.get() and handles authentication
 ```
 
 ## Security Considerations
@@ -157,32 +147,23 @@ Registration grants are:
 
 ### Example 1: CI/CD Pipeline Setup
 
-```rust
-let grant = request_registration_grant("ci-agent", "gitea.example.com", 300).await?;
+```bash
+# Launch browser with extension
+passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/user/sign_up
 
-let browser = launch_browser(grant).await?;
-browser.navigate("https://gitea.example.com/user/sign_up").await?;
-
-browser.fill_field("username", "ci-bot").await?;
-browser.fill_field("email", "ci-bot@example.com").await?;
-browser.click("Register").await?;
-
-// Extension handles passkey registration automatically
-// Credential is now available for authentication
+# The extension intercepts navigator.credentials.create() when the page triggers it
+# Credential is now available for authentication
 ```
 
 ### Example 2: Credential Rotation
 
-```rust
-let grant = request_registration_grant("ci-agent", "gitea.example.com", 300).await?;
+```bash
+# Launch browser with extension
+passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/user/settings/security
 
-let browser = launch_browser(grant).await?;
-browser.navigate("https://gitea.example.com/user/settings/security").await?;
-
-browser.click("Add Passkey").await?;
-
-// Extension handles registration
-// Old credential can be revoked if needed
+# Click "Add Passkey" on the page
+# Extension handles registration automatically
+# Old credential can be revoked if needed
 ```
 
 ## Related Documentation

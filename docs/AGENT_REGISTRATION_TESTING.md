@@ -91,29 +91,34 @@ INFO Sign HTTP server listening on 127.0.0.1:<port>
 
 Note the port number for later use.
 
-### Step 3: Request a registration grant
+### Step 3: Launch browser with extension
 
 ```bash
-passless agent-admin delegation request-registration \
-  --profile webauthn-test \
-  --rp webauthn.io \
-  --session-ttl 300
+passless agent-admin browser launch --profile webauthn-test --url https://webauthn.io/
 ```
 
+This command:
+- Generates a bearer token for the session
+- Requests registration grants for all allowed RP IDs
+- Registers registration and sign contexts
+- Launches Chromium with the agent extension loaded
+
 Expected output:
-```
-registration_grant_id: <hex-id>
-rp_id: webauthn.io
-session_ttl: 300
+```json
+{
+  "lease_id": "abc123...",
+  "profile_id": "webauthn-test",
+  "pid": 12345,
+  "start_url": "https://webauthn.io/"
+}
 ```
 
 ### Step 4: Register on webauthn.io
 
-1. Open a browser with the passless extension loaded
-2. Navigate to https://webauthn.io/
-3. Enter username `passless-agent-test`
-4. Click **Register**
-5. The extension intercepts `navigator.credentials.create()` and forwards to the daemon
+1. The browser is already open at https://webauthn.io/
+2. Enter username `passless-agent-test`
+3. Click **Register**
+4. The extension intercepts `navigator.credentials.create()` and forwards to the daemon
 
 ### Step 5: Verify the result
 
@@ -177,7 +182,7 @@ cargo test --features agent -- agent:: --nocapture
 
 - [ ] Daemon starts without errors
 - [ ] HTTP server binds to a port (check log for `Sign HTTP server listening`)
-- [ ] Registration grant is created via `agent-admin delegation request-registration`
+- [ ] `browser launch` creates registration grants and contexts
 - [ ] `/register` endpoint accepts POST requests with bearer token
 - [ ] Credential is stored in the backend (check storage directory)
 - [ ] `clientDataJSON` contains `"type":"webauthn.create"`

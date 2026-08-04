@@ -1,5 +1,41 @@
 # Operations
 
+## Browser management
+
+Launch a browser session with the agent extension loaded:
+
+```bash
+passless agent-admin browser launch --profile <profile> [--url <start-url>]
+```
+
+The command:
+- Generates a bearer token for the session
+- Requests registration grants for all allowed RP IDs in the profile
+- Registers registration and sign contexts with the daemon
+- Launches Chromium with the agent extension loaded via `--load-extension`
+- Returns a lease ID, profile ID, PID, and start URL
+
+The extension intercepts `navigator.credentials.create()` and `navigator.credentials.get()` calls,
+forwarding them to the daemon's `/register` and `/sign` HTTP endpoints. Registration and
+authentication proceed autonomously according to the profile's policy rules.
+
+**Output:**
+```json
+{
+  "lease_id": "abc123...",
+  "profile_id": "ci-agent",
+  "pid": 12345,
+  "start_url": "https://example.com/"
+}
+```
+
+**Notes:**
+- The browser runs with a dedicated user data directory under `/run/user/<uid>/passless/browser/`
+- The extension is generated per-lease with the daemon's port and bearer token baked in
+- Registration contexts are created for all RP IDs allowed by the profile's rules
+- Sign contexts are created if credentials exist in storage for the profile
+- Browser leases expire after the configured TTL (default 1 hour)
+
 ## Audit
 
 Audit events are hash-chained, owner-only, append-oriented JSONL records. They cover
