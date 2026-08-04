@@ -958,6 +958,7 @@ impl AgentRuntime {
             RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e))
         })?;
         let sign_port = sign_server.port();
+        info!("Sign HTTP server listening on 127.0.0.1:{}", sign_port);
         let sign_server_handle = sign_server.serve(sign_registry.clone());
 
         let endpoint_manager = Mutex::new(EndpointManager::new(

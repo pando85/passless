@@ -1095,6 +1095,21 @@ pub enum AdminDelegationAction {
         #[arg(long)]
         confirm: bool,
     },
+    /// Request a new registration
+    RequestRegistration {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Relying party ID
+        #[arg(long, value_name = "RP_ID")]
+        rp: String,
+        /// Session TTL in seconds
+        #[arg(long, value_name = "SECONDS")]
+        session_ttl: u64,
+        /// Reason for the registration
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
 }
 
 /// Admin session actions

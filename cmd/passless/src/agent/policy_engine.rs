@@ -745,7 +745,7 @@ impl PolicyRuntime {
             normalized_rp_ids: normalized_rp_ids.clone(),
             credential_refs: credential_refs.clone(),
             allowed_actions: allowed_actions.iter().cloned().collect(),
-            registration_allowed: config.registration_allowed,
+            registration_allowed: config.registration_allowed || config.allows_registration(),
             require_uv: config.require_uv,
             max_concurrent_grants,
             max_grant_ttl: max_grant_ttl_secs,
@@ -785,7 +785,7 @@ impl PolicyRuntime {
             max_session_ttl_secs,
             max_concurrent_grants,
             require_uv: config.require_uv,
-            registration_allowed: config.registration_allowed,
+            registration_allowed: config.registration_allowed || config.allows_registration(),
             allowed_actions,
             rules,
         })

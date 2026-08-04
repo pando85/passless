@@ -623,6 +623,51 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
+        AdminDelegationAction::RequestRegistration {
+            profile,
+            rp,
+            session_ttl,
+            reason,
+        } => {
+            let req = AdminRequest::RequestRegistration {
+                profile_id: parse_profile_id(profile)?,
+                rp_id: rp.clone(),
+                max_session_ttl: *session_ttl,
+                reason: reason.clone(),
+            };
+            let resp = client
+                .request(req)
+                .map_err(|e| Error::Other(e.to_string()))?;
+            match resp {
+                passless_core::agent::AdminResponse::RegistrationGranted {
+                    registration_grant_id,
+                } => {
+                    #[derive(Serialize)]
+                    struct RegistrationGrantedOut {
+                        registration_grant_id: String,
+                        rp_id: String,
+                        session_ttl: u64,
+                    }
+                    let out = RegistrationGrantedOut {
+                        registration_grant_id: registration_grant_id.to_string(),
+                        rp_id: rp.clone(),
+                        session_ttl: *session_ttl,
+                    };
+                    match output {
+                        OutputFormat::Json => admin_output_json(&out),
+                        OutputFormat::Plain => {
+                            println!("registration_grant_id: {}", out.registration_grant_id);
+                            println!("rp_id: {}", out.rp_id);
+                            println!("session_ttl: {}", out.session_ttl);
+                            Ok(())
+                        }
+                    }
+                }
+                _ => Err(Error::Other(
+                    "unexpected response for registration request".to_string(),
+                )),
+            }
+        }
     }
 }
 
