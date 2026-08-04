@@ -379,6 +379,11 @@ pub enum AdminRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    LaunchBrowser {
+        profile_id: ProfileId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start_url: Option<String>,
+    },
     Shutdown,
 }
 
@@ -413,6 +418,7 @@ pub enum AdminResponse {
     DelegationList(GrantList),
     DelegationRevoked,
     PrincipalLaunched(PrincipalLaunchedResponse),
+    BrowserLaunched(BrowserLaunchedResponse),
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
@@ -734,6 +740,15 @@ pub struct PrincipalLaunchedResponse {
     pub session_id: PrincipalSessionId,
     pub pid: u32,
     pub profile_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserLaunchedResponse {
+    pub lease_id: String,
+    pub profile_id: String,
+    pub pid: u32,
+    pub start_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1168,6 +1183,7 @@ impl Validate for AdminRequest {
             | Self::RevokeDelegation { .. } => {}
             Self::ShowProfile { .. } | Self::ShowPolicy { .. } | Self::ProfileCheck { .. } => {}
             Self::AuditExport { .. } => {}
+            Self::LaunchBrowser { .. } => {}
             Self::LaunchPrincipal { command, .. } => {
                 if command.is_empty() {
                     errors.push("launch_principal: command must not be empty".into());

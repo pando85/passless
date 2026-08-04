@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,7 +30,7 @@ const PASSLESS_AAGUID: [u8; 16] = [
 #[derive(Clone)]
 pub struct RegisterContext {
     pub profile_id: ProfileId,
-    pub registration_grant_id: RegistrationGrantId,
+    pub registration_grants: HashMap<String, RegistrationGrantId>,
     pub profile_config: AgentProfileConfig,
 }
 
@@ -76,7 +77,25 @@ impl RegisterHandler {
 
         let grant_snapshot = self
             .policy_runtime
-            .resolve_registration_grant(&ctx.profile_id, &ctx.registration_grant_id, &normalized_rp)
+            .resolve_registration_grant(
+                &ctx.profile_id,
+                ctx.registration_grants.get(&normalized_rp).ok_or_else(|| {
+                    let deny_event = PolicyDenyBuilder::new(
+                        ctx.profile_id.clone(),
+                        AuditAction::Register,
+                        &normalized_rp,
+                        PolicyDenyReason::GrantNotFound,
+                    )
+                    .build();
+                    let _ = self.audit_gate.record(deny_event);
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "registration grant not found for RP",
+                        RecommendedAction::FixRequest,
+                    )
+                })?,
+                &normalized_rp,
+            )
             .ok_or_else(|| {
                 let deny_event = PolicyDenyBuilder::new(
                     ctx.profile_id.clone(),
@@ -572,7 +591,7 @@ mod tests {
 
     struct RegisterTestFixture {
         profile_id: ProfileId,
-        registration_grant_id: RegistrationGrantId,
+        registration_grants: HashMap<String, RegistrationGrantId>,
         clock: Arc<MockClock>,
         policy_runtime: Arc<PolicyRuntime>,
         storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
@@ -619,9 +638,13 @@ mod tests {
                 PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
             );
 
-            let registration_grant_id = policy_runtime
-                .request_registration_grant(profile_id.clone(), "example.com".to_string())
-                .unwrap();
+            let mut registration_grants = HashMap::new();
+            registration_grants.insert(
+                "example.com".to_string(),
+                policy_runtime
+                    .request_registration_grant(profile_id.clone(), "example.com".to_string())
+                    .unwrap(),
+            );
 
             let key_provider = Arc::new(SoftwareCredentialKeyProvider);
             let operation_lock = Arc::new(Mutex::new(()));
@@ -629,7 +652,7 @@ mod tests {
 
             Self {
                 profile_id,
-                registration_grant_id,
+                registration_grants,
                 clock,
                 policy_runtime,
                 storage,
@@ -655,7 +678,7 @@ mod tests {
         fn make_ctx(&self) -> RegisterContext {
             RegisterContext {
                 profile_id: self.profile_id.clone(),
-                registration_grant_id: self.registration_grant_id.clone(),
+                registration_grants: self.registration_grants.clone(),
                 profile_config: self.profile_config.clone(),
             }
         }
@@ -744,9 +767,13 @@ mod tests {
         let policy_runtime =
             Arc::new(PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap());
 
-        let registration_grant_id = policy_runtime
-            .request_registration_grant(profile_id.clone(), "example.com".to_string())
-            .unwrap();
+        let mut registration_grants = HashMap::new();
+        registration_grants.insert(
+            "example.com".to_string(),
+            policy_runtime
+                .request_registration_grant(profile_id.clone(), "example.com".to_string())
+                .unwrap(),
+        );
 
         let key_provider = Arc::new(SoftwareCredentialKeyProvider);
         let operation_lock = Arc::new(Mutex::new(()));
@@ -754,7 +781,7 @@ mod tests {
 
         RegisterTestFixture {
             profile_id,
-            registration_grant_id,
+            registration_grants,
             clock,
             policy_runtime,
             storage,
@@ -964,9 +991,11 @@ mod tests {
     fn test_register_rejects_invalid_grant_id() {
         let f = RegisterTestFixture::new();
         let handler = f.make_handler();
+        let mut registration_grants = HashMap::new();
+        registration_grants.insert("example.com".to_string(), RegistrationGrantId::new());
         let ctx = RegisterContext {
             profile_id: f.profile_id.clone(),
-            registration_grant_id: RegistrationGrantId::new(),
+            registration_grants,
             profile_config: f.profile_config.clone(),
         };
         let req = f.make_req();
@@ -1111,7 +1140,7 @@ mod tests {
         let other_profile = ProfileId::new("other-profile").unwrap();
         let ctx = RegisterContext {
             profile_id: other_profile,
-            registration_grant_id: f.registration_grant_id.clone(),
+            registration_grants: f.registration_grants.clone(),
             profile_config: f.profile_config.clone(),
         };
         let req = f.make_req();

@@ -27,7 +27,7 @@ use super::audit_events::{
     BackendKind, DaemonStartBuilder, DaemonStopBuilder, EndpointCreateBuilder, FailReason,
     ProfileCreateBuilder, ProfileFailBuilder, StopReason,
 };
-use super::browser::{BrowserProcessManager, Clock, SystemClock};
+use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
 use super::ceremony::{
     AgentCeremonyHandler, CeremonyPreparationSlot, StaticCeremonyContext,
     StaticCeremonyContextConfig,
@@ -46,6 +46,7 @@ use super::prompt::{DesktopPromptHandle, PromptHandle, PromptMode};
 use super::sign::{SignContextRegistry, SignHttpServer};
 use super::storage::{CeremonyScope, ForwardingStorageHandle, IsolatedScopedStorage};
 use super::storage_factory::create_storage_bundle_with_options;
+use passless_core::agent::config::CdpExposeMode;
 
 use crate::authenticator::AuthenticatorService;
 use crate::storage::CredentialStorage;
@@ -4588,13 +4589,268 @@ impl AgentRuntime {
             max_session_ttl
         };
 
-        let reg_grant_id = passless_core::agent::RegistrationGrantId::new();
+        let reg_grant_id = self
+            .policy_runtime
+            .request_registration_grant(profile_id.clone(), rp_id.to_string())
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to request registration grant: {}", e),
+                    RecommendedAction::Retry,
+                )
+            })?;
 
         let _ = ttl;
 
         Ok(AdminResponse::RegistrationGranted {
             registration_grant_id: reg_grant_id,
         })
+    }
+
+    fn handle_launch_browser(
+        &self,
+        profile_id: &ProfileId,
+        start_url: Option<&str>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        let profile = self.profiles.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let endpoint_id = profile.endpoint_id.lock().unwrap().clone().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' has no active endpoint", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let profile_config = &profile.profile_config;
+
+        let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::BadRequest,
+                format!("profile '{}' has no browser_command configured", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let executable = PathBuf::from(&browser_command[0]);
+        let extra_args = browser_command[1..].to_vec();
+
+        let runtime_root = profile_config
+            .browser_runtime_root
+            .clone()
+            .unwrap_or_else(|| {
+                dirs::runtime_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("passless")
+                    .join("browser")
+            });
+
+        let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
+        let browser_gid = profile.browser_gid.unwrap_or(profile.daemon_gid);
+
+        let rp_ids = if !profile_config.rp_ids.is_empty() {
+            profile_config.rp_ids.clone()
+        } else {
+            profile_config.allowed_rp_ids()
+        };
+
+        let config = BrowserConfig {
+            executable,
+            start_url: start_url
+                .map(|s| s.to_string())
+                .or_else(|| profile_config.start_url.clone()),
+            extra_args,
+            runtime_root,
+            ttl: std::time::Duration::from_secs(3600),
+            login_timeout: std::time::Duration::from_secs(300),
+            rp_ids,
+            target_uid: browser_uid,
+            target_gid: browser_gid,
+            daemon_uid: profile.daemon_uid,
+            daemon_gid: profile.daemon_gid,
+            cdp_expose: profile_config
+                .browser_cdp_expose
+                .unwrap_or(CdpExposeMode::Pipe),
+            cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
+        };
+
+        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "browser manager lock poisoned",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        // Generate bearer token for this browser session
+        let bearer_token = super::sign::generate_bearer_token().map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to generate bearer token: {}", e),
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        // Request registration grants for all allowed RP IDs
+        let mut registration_grants = std::collections::HashMap::new();
+        for rp_id in &config.rp_ids {
+            match self
+                .policy_runtime
+                .request_registration_grant(profile_id.clone(), rp_id.clone())
+            {
+                Ok(grant_id) => {
+                    registration_grants.insert(rp_id.clone(), grant_id);
+                }
+                Err(e) => {
+                    debug!(
+                        "failed to request registration grant for rp={}: {}",
+                        rp_id, e
+                    );
+                }
+            }
+        }
+
+        // Create registration context and handler
+        let register_ctx = super::register::RegisterContext {
+            profile_id: profile_id.clone(),
+            registration_grants,
+            profile_config: profile_config.clone(),
+        };
+
+        let key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync> =
+            Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
+
+        let register_handler = Arc::new(super::register::RegisterHandler {
+            human_storage: profile.credential_storage.clone(),
+            policy_runtime: self.policy_runtime.clone(),
+            audit_gate: self.audit_gate.clone(),
+            key_provider,
+            security_config: profile.endpoint_spec.security_config.clone(),
+            operation_lock: profile.operation_lock.clone(),
+        });
+
+        // Register the bearer token with the sign registry for registration
+        self.sign_registry
+            .register_pending_registration(bearer_token.clone(), register_ctx, register_handler)
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to register registration context: {}", e),
+                    RecommendedAction::Abort,
+                )
+            })?;
+
+        let metadata = super::browser::AgentEndpointMetadata {
+            port: self.sign_port,
+            bearer_token: bearer_token.clone(),
+        };
+
+        let lease_id = browser_manager
+            .launch_pending_with_agent_endpoint(
+                &config,
+                endpoint_id.clone(),
+                profile_id.clone(),
+                Some(&metadata),
+            )
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to launch browser: {}", e),
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+
+        let snapshot = browser_manager.snapshot(&lease_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "browser lease not found after launch",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        let pid = snapshot.pid;
+
+        // Try to register sign context for authentication (if credentials exist)
+        if let Ok(mut storage) = profile.credential_storage.lock() {
+            if let Ok(cred) = storage.read_first(crate::storage::CredentialFilter::None) {
+                let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+                let session_id = passless_core::agent::PrincipalSessionId::new();
+                let grant_params = super::grant::GrantRequestParams {
+                    profile_id: profile_id.clone(),
+                    session_id,
+                    endpoint_id: endpoint_id.clone(),
+                    principal_digest: [0u8; 32],
+                    rp_ids: config.rp_ids.clone(),
+                    credentials: vec![cred_ref],
+                    requested_ttl_secs: 300,
+                };
+                match self.policy_runtime.admin_request_grant(grant_params) {
+                    Ok(request_id) => {
+                        match self
+                            .policy_runtime
+                            .admin_approve_grant(&request_id, &super::intent::admin_authority())
+                        {
+                            Ok(grant_id) => {
+                                let sign_ctx = super::sign::SignContext {
+                                    profile_id: profile_id.clone(),
+                                    active_grant_id: grant_id,
+                                    profile_config: profile_config.clone(),
+                                };
+                                let sign_key_provider: Arc<
+                                    dyn soft_fido2::CredentialKeyProvider + Send + Sync,
+                                > = Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
+                                let sign_handler = Arc::new(super::sign::SignHandler {
+                                    human_storage: profile.credential_storage.clone(),
+                                    policy_runtime: self.policy_runtime.clone(),
+                                    audit_gate: self.audit_gate.clone(),
+                                    security_config: profile.endpoint_spec.security_config.clone(),
+                                    key_provider: sign_key_provider,
+                                    operation_lock: profile.operation_lock.clone(),
+                                });
+                                if let Err(e) = self.sign_registry.register_pending(
+                                    bearer_token.clone(),
+                                    sign_ctx,
+                                    sign_handler,
+                                ) {
+                                    log::error!("failed to register sign context: {}", e);
+                                } else if let Err(e) = self
+                                    .sign_registry
+                                    .bind_lease(&bearer_token, lease_id.to_string())
+                                {
+                                    log::error!("failed to bind sign context to lease: {}", e);
+                                } else {
+                                    info!(
+                                        "sign context registered and bound to lease for profile={}",
+                                        profile_id
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("failed to approve grant: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("failed to request grant: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(AdminResponse::BrowserLaunched(
+            passless_core::agent::protocol::BrowserLaunchedResponse {
+                lease_id: lease_id.to_string(),
+                profile_id: profile_id.to_string(),
+                pid,
+                start_url: config.start_url,
+            },
+        ))
     }
 
     fn handle_shutdown(&self) -> Result<AdminResponse, ProtocolError> {
@@ -4716,6 +4972,10 @@ impl AdminHandler for AgentRuntime {
                 *max_session_ttl,
                 reason.as_deref(),
             ),
+            AdminRequest::LaunchBrowser {
+                profile_id,
+                start_url,
+            } => self.handle_launch_browser(profile_id, start_url.as_deref()),
             AdminRequest::Shutdown => self.handle_shutdown(),
         }
     }

@@ -5,9 +5,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use passless_core::{
-    AdminAuditAction, AdminAuditExportFormat, AdminCredentialAction, AdminDelegationAction,
-    AdminPolicyAction, AdminProfileAction, AdminSessionAction, AgentAdminAction, AgentSkillScope,
-    AgentSkillTarget, CredentialRef, Error, GrantId, OutputFormat, ProfileId, Result,
+    AdminAuditAction, AdminAuditExportFormat, AdminBrowserAction, AdminCredentialAction,
+    AdminDelegationAction, AdminPolicyAction, AdminProfileAction, AdminSessionAction,
+    AgentAdminAction, AgentSkillScope, AgentSkillTarget, CredentialRef, Error, GrantId,
+    OutputFormat, ProfileId, Result,
 };
 
 use passless_core::agent::PrincipalSessionId;
@@ -168,6 +169,7 @@ pub fn dispatch_admin(output: OutputFormat, action: &AgentAdminAction) -> Result
         AgentAdminAction::Credential { action } => dispatch_admin_credential(output, action),
         AgentAdminAction::Delegation { action } => dispatch_admin_delegation(output, action),
         AgentAdminAction::Session { action } => dispatch_admin_session(output, action),
+        AgentAdminAction::Browser { action } => dispatch_browser(output, action),
         AgentAdminAction::Audit { action } => dispatch_audit(output, action),
         AgentAdminAction::Shutdown { confirm } => dispatch_shutdown(output, *confirm),
     }
@@ -750,6 +752,37 @@ fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> 
                         }
                     }
                 }
+                _ => Err(Error::Other("unexpected response".to_string())),
+            }
+        }
+    }
+}
+
+fn dispatch_browser(output: OutputFormat, action: &AdminBrowserAction) -> Result<()> {
+    let mut client = connect_admin_client()?;
+    match action {
+        AdminBrowserAction::Launch { profile, url } => {
+            let profile_id = parse_profile_id(profile)?;
+            let req = AdminRequest::LaunchBrowser {
+                profile_id,
+                start_url: url.clone(),
+            };
+            let resp = client
+                .request(req)
+                .map_err(|e| Error::Other(e.to_string()))?;
+            match resp {
+                passless_core::agent::AdminResponse::BrowserLaunched(info) => match output {
+                    OutputFormat::Json => admin_output_json(&info),
+                    OutputFormat::Plain => {
+                        println!("lease_id: {}", info.lease_id);
+                        println!("profile_id: {}", info.profile_id);
+                        println!("pid: {}", info.pid);
+                        if let Some(ref url) = info.start_url {
+                            println!("start_url: {}", url);
+                        }
+                        Ok(())
+                    }
+                },
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
