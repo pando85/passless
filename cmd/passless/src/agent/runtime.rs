@@ -4777,68 +4777,68 @@ impl AgentRuntime {
         let pid = snapshot.pid;
 
         // Try to register sign context for authentication (if credentials exist)
-        if let Ok(mut storage) = profile.credential_storage.lock() {
-            if let Ok(cred) = storage.read_first(crate::storage::CredentialFilter::None) {
-                let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
-                let session_id = passless_core::agent::PrincipalSessionId::new();
-                let grant_params = super::grant::GrantRequestParams {
-                    profile_id: profile_id.clone(),
-                    session_id,
-                    endpoint_id: endpoint_id.clone(),
-                    principal_digest: [0u8; 32],
-                    rp_ids: config.rp_ids.clone(),
-                    credentials: vec![cred_ref],
-                    requested_ttl_secs: 300,
-                };
-                match self.policy_runtime.admin_request_grant(grant_params) {
-                    Ok(request_id) => {
-                        match self
-                            .policy_runtime
-                            .admin_approve_grant(&request_id, &super::intent::admin_authority())
-                        {
-                            Ok(grant_id) => {
-                                let sign_ctx = super::sign::SignContext {
-                                    profile_id: profile_id.clone(),
-                                    active_grant_id: grant_id,
-                                    profile_config: profile_config.clone(),
-                                };
-                                let sign_key_provider: Arc<
-                                    dyn soft_fido2::CredentialKeyProvider + Send + Sync,
-                                > = Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
-                                let sign_handler = Arc::new(super::sign::SignHandler {
-                                    human_storage: profile.credential_storage.clone(),
-                                    policy_runtime: self.policy_runtime.clone(),
-                                    audit_gate: self.audit_gate.clone(),
-                                    security_config: profile.endpoint_spec.security_config.clone(),
-                                    key_provider: sign_key_provider,
-                                    operation_lock: profile.operation_lock.clone(),
-                                });
-                                if let Err(e) = self.sign_registry.register_pending(
-                                    bearer_token.clone(),
-                                    sign_ctx,
-                                    sign_handler,
-                                ) {
-                                    log::error!("failed to register sign context: {}", e);
-                                } else if let Err(e) = self
-                                    .sign_registry
-                                    .bind_lease(&bearer_token, lease_id.to_string())
-                                {
-                                    log::error!("failed to bind sign context to lease: {}", e);
-                                } else {
-                                    info!(
-                                        "sign context registered and bound to lease for profile={}",
-                                        profile_id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("failed to approve grant: {}", e);
+        if let Ok(mut storage) = profile.credential_storage.lock()
+            && let Ok(cred) = storage.read_first(crate::storage::CredentialFilter::None)
+        {
+            let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+            let session_id = passless_core::agent::PrincipalSessionId::new();
+            let grant_params = super::grant::GrantRequestParams {
+                profile_id: profile_id.clone(),
+                session_id,
+                endpoint_id: endpoint_id.clone(),
+                principal_digest: [0u8; 32],
+                rp_ids: config.rp_ids.clone(),
+                credentials: vec![cred_ref],
+                requested_ttl_secs: 300,
+            };
+            match self.policy_runtime.admin_request_grant(grant_params) {
+                Ok(request_id) => {
+                    match self
+                        .policy_runtime
+                        .admin_approve_grant(&request_id, &super::intent::admin_authority())
+                    {
+                        Ok(grant_id) => {
+                            let sign_ctx = super::sign::SignContext {
+                                profile_id: profile_id.clone(),
+                                active_grant_id: grant_id,
+                                profile_config: profile_config.clone(),
+                            };
+                            let sign_key_provider: Arc<
+                                dyn soft_fido2::CredentialKeyProvider + Send + Sync,
+                            > = Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
+                            let sign_handler = Arc::new(super::sign::SignHandler {
+                                human_storage: profile.credential_storage.clone(),
+                                policy_runtime: self.policy_runtime.clone(),
+                                audit_gate: self.audit_gate.clone(),
+                                security_config: profile.endpoint_spec.security_config.clone(),
+                                key_provider: sign_key_provider,
+                                operation_lock: profile.operation_lock.clone(),
+                            });
+                            if let Err(e) = self.sign_registry.register_pending(
+                                bearer_token.clone(),
+                                sign_ctx,
+                                sign_handler,
+                            ) {
+                                log::error!("failed to register sign context: {}", e);
+                            } else if let Err(e) = self
+                                .sign_registry
+                                .bind_lease(&bearer_token, lease_id.to_string())
+                            {
+                                log::error!("failed to bind sign context to lease: {}", e);
+                            } else {
+                                info!(
+                                    "sign context registered and bound to lease for profile={}",
+                                    profile_id
+                                );
                             }
                         }
+                        Err(e) => {
+                            log::error!("failed to approve grant: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        log::error!("failed to request grant: {}", e);
-                    }
+                }
+                Err(e) => {
+                    log::error!("failed to request grant: {}", e);
                 }
             }
         }
