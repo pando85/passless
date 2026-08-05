@@ -185,7 +185,7 @@ av_gc_start_cdp_capture() {
 }
 
 av_gc_stop_cdp_capture() {
-    local capture_pid="${1:-${AV_GC_CDP_EVENT_PID:-}}"
+    local capture_pid="${AV_GC_CDP_EVENT_PID:-}"
     if [[ -n "$capture_pid" ]] && kill -0 "$capture_pid" 2>/dev/null; then
         kill -INT "$capture_pid" 2>/dev/null || true
         sleep 0.5
