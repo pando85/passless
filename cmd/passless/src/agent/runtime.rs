@@ -27,7 +27,7 @@ use super::audit_events::{
     BackendKind, DaemonStartBuilder, DaemonStopBuilder, EndpointCreateBuilder, FailReason,
     ProfileCreateBuilder, ProfileFailBuilder, StopReason,
 };
-use super::browser::{BrowserProcessManager, Clock, SystemClock};
+use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
 use super::ceremony::{
     AgentCeremonyHandler, CeremonyPreparationSlot, StaticCeremonyContext,
     StaticCeremonyContextConfig,
@@ -43,10 +43,10 @@ use super::launcher::{
 };
 use super::policy_engine::PolicyRuntime;
 use super::prompt::{DesktopPromptHandle, PromptHandle, PromptMode};
+use super::sign::{SignContextRegistry, SignHttpServer};
 use super::storage::{CeremonyScope, ForwardingStorageHandle, IsolatedScopedStorage};
-use super::storage_factory::{
-    create_shared_delegated_storage_with_registration, create_storage_bundle_with_options,
-};
+use super::storage_factory::create_storage_bundle_with_options;
+use passless_core::agent::config::CdpExposeMode;
 
 use crate::authenticator::AuthenticatorService;
 use crate::storage::CredentialStorage;
@@ -57,7 +57,6 @@ use passless_uhid::RawUhidDevice;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WORKERS: usize = 16;
-const DELEGATED_DESTROY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_COMPLETED_SESSIONS: usize = 256;
 const COMPLETED_SESSION_TTL: Duration = Duration::from_secs(600);
 const WAIT_PRINCIPAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -96,6 +95,7 @@ struct CreateIntentParams<'a> {
     session_digest: &'a super::intent::ProcessIdentityDigest,
 }
 
+#[allow(dead_code)]
 struct RequestDelegationParams<'a> {
     profile_id: &'a ProfileId,
     session_id: &'a PrincipalSessionId,
@@ -126,7 +126,6 @@ pub struct EndpointSpec {
     #[cfg(test)]
     pub test_transport_factory: Option<TestTransportFactory>,
     pub isolated_deps: Option<IsolatedEndpointDeps>,
-    pub delegated_deps: Option<DelegatedEndpointDeps>,
 }
 
 #[derive(Clone)]
@@ -137,14 +136,6 @@ pub struct IsolatedEndpointDeps {
     #[cfg(feature = "tpm")]
     pub tpm_key_provider:
         Arc<Mutex<Option<crate::storage::tpm::portable::TpmCredentialKeyProvider>>>,
-}
-
-#[derive(Clone)]
-pub struct DelegatedEndpointDeps {
-    pub human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
-    pub human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
-    pub human_operation_lock: Arc<Mutex<()>>,
-    pub credential_refs: Vec<passless_core::agent::CredentialRef>,
 }
 
 fn extract_cdp_method_for_audit(json: &str) -> String {
@@ -531,9 +522,15 @@ pub struct AgentRuntime {
     daemon_uid: u32,
     daemon_gid: u32,
     agent_config: std::sync::RwLock<AgentConfig>,
+    sign_registry: Arc<SignContextRegistry>,
+    sign_server_shutdown: Arc<AtomicBool>,
+    sign_server_handle: Mutex<Option<JoinHandle<()>>>,
+    #[allow(dead_code)]
+    sign_port: u16,
 }
 
 impl AgentRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
         human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
@@ -557,9 +554,9 @@ impl AgentRuntime {
 
     pub fn start_with_factories(params: RuntimeStartParams<'_>) -> Result<Arc<Self>, RuntimeError> {
         let RuntimeStartParams {
-            human_storage,
-            human_pin_storage,
-            human_operation_lock,
+            human_storage: _human_storage,
+            human_pin_storage: _human_pin_storage,
+            human_operation_lock: _human_operation_lock,
             agent_config,
             security_config,
             pin_config,
@@ -956,6 +953,15 @@ impl AgentRuntime {
             RuntimeError::Config("IPC server is required for agent runtime".into())
         })?;
 
+        let sign_registry = Arc::new(SignContextRegistry::new());
+        let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_server = SignHttpServer::bind(sign_server_shutdown.clone()).map_err(|e| {
+            RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e))
+        })?;
+        let sign_port = sign_server.port();
+        info!("Sign HTTP server listening on 127.0.0.1:{}", sign_port);
+        let sign_server_handle = sign_server.serve(sign_registry.clone());
+
         let endpoint_manager = Mutex::new(EndpointManager::new(
             agent_config.profiles.len().max(1),
             shutdown.clone(),
@@ -1038,50 +1044,9 @@ impl AgentRuntime {
                             #[cfg(feature = "tpm")]
                             tpm_key_provider: Arc::new(Mutex::new(bundle.tpm_key_provider)),
                         }),
-                        delegated_deps: None,
                     };
 
                     Ok((spec, ceremony_scope, bundle.credential_storage))
-                }
-                AgentMode::DelegatedSession => {
-                    let cred_refs = profile.credential_refs.clone().unwrap_or_default();
-
-                    let ceremony_scope = CeremonyScope::new();
-
-                    let effective_pin_config = if profile.requires_human_uv() {
-                        let mut cfg = pin_config.clone();
-                        cfg.enforcement = passless_core::config::PinEnforcement::Required;
-                        cfg
-                    } else {
-                        pin_config.clone()
-                    };
-
-                    let spec = EndpointSpec {
-                        profile_name: name.clone(),
-                        profile_id: profile_id.clone(),
-                        mode: AgentMode::DelegatedSession,
-                        profile_config: profile.clone(),
-                        security_config: security_config.clone(),
-                        pin_config: effective_pin_config,
-                        interaction_manager: interaction_manager.clone(),
-                        preparation_slot: preparation_slot.clone(),
-                        operation_lock: profile_op_lock.clone(),
-                        policy_runtime: policy_runtime.clone(),
-                        audit_gate: audit_gate.clone(),
-                        event_tx: event_tx.clone(),
-                        endpoint_factory: endpoint_factory.clone(),
-                        #[cfg(test)]
-                        test_transport_factory: None,
-                        isolated_deps: None,
-                        delegated_deps: Some(DelegatedEndpointDeps {
-                            human_storage: human_storage.clone(),
-                            human_pin_storage: human_pin_storage.clone(),
-                            human_operation_lock: human_operation_lock.clone(),
-                            credential_refs: cred_refs,
-                        }),
-                    };
-
-                    Ok((spec, ceremony_scope, human_storage.clone()))
                 }
             };
 
@@ -1115,7 +1080,6 @@ impl AgentRuntime {
                                 }
                             }
                         }
-                        AgentMode::DelegatedSession => None,
                     };
 
                     profiles.insert(
@@ -1189,6 +1153,10 @@ impl AgentRuntime {
             daemon_uid,
             daemon_gid,
             agent_config: std::sync::RwLock::new(agent_config.clone()),
+            sign_registry,
+            sign_server_shutdown,
+            sign_server_handle: Mutex::new(Some(sign_server_handle)),
+            sign_port,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -1483,128 +1451,6 @@ impl AgentRuntime {
 
                 Ok(endpoint_id)
             }
-            AgentMode::DelegatedSession => {
-                let deps = spec.delegated_deps.as_ref().ok_or_else(|| {
-                    RuntimeError::Config(format!(
-                        "profile '{}': delegated spec missing delegated_deps",
-                        name
-                    ))
-                })?;
-
-                let (delegated_storage, ceremony_scope) = {
-                    let _op = deps.human_operation_lock.lock().map_err(|e| {
-                        RuntimeError::Storage(format!(
-                            "profile '{}': failed to acquire human operation lock: {}",
-                            name, e
-                        ))
-                    })?;
-                    create_shared_delegated_storage_with_registration(
-                        deps.human_storage.clone(),
-                        spec.profile_config.allowed_rp_ids(),
-                        deps.credential_refs.clone(),
-                        spec.security_config.constant_signature_counter,
-                        spec.profile_config.delegated_registration_storage.is_some(),
-                    )
-                    .map_err(|e| {
-                        RuntimeError::Storage(format!(
-                            "profile '{}': failed to create delegated storage: {}",
-                            name, e
-                        ))
-                    })?
-                };
-
-                let delegated_storage = Arc::new(Mutex::new(delegated_storage));
-
-                let service = AuthenticatorService::with_shared_storage_and_interaction(
-                    delegated_storage,
-                    Some(deps.human_pin_storage.clone()),
-                    spec.security_config.clone(),
-                    spec.pin_config.clone(),
-                    spec.interaction_manager.clone(),
-                )
-                .map_err(|e| {
-                    RuntimeError::Service(format!(
-                        "profile '{}': failed to create authenticator service: {}",
-                        name, e
-                    ))
-                })?;
-
-                let ceremony_scope_inner = ceremony_scope;
-                let op_lock_for_ctx = deps.human_operation_lock.clone();
-                let prompt_mode = PromptMode::DelegatedSession;
-
-                let audit_gate_for_before_start = spec.audit_gate.clone();
-                let profile_id_for_before_start = profile_id.clone();
-                let name_for_before_start = name.clone();
-
-                let endpoint_id = endpoint_manager
-                    .create_and_start_full(
-                        binding,
-                        name.to_string(),
-                        move |generated_endpoint_id: &EndpointId| {
-                            *generated_endpoint_for_factory.lock().unwrap() =
-                                Some(generated_endpoint_id.clone());
-                            let service_handler = ServiceHandler::new(service);
-
-                            let prompt_handle: Arc<dyn PromptHandle> =
-                                Arc::new(DesktopPromptHandle::default_config());
-
-                            let ceremony_context =
-                                StaticCeremonyContext::new(StaticCeremonyContextConfig {
-                                    profile_id: profile_id_inner.clone(),
-                                    endpoint_id: generated_endpoint_id.clone(),
-                                    mode: prompt_mode,
-                                    policy_runtime: policy_runtime_inner.clone(),
-                                    audit_gate: audit_gate_inner.clone(),
-                                    ceremony_scope: ceremony_scope_inner.clone(),
-                                    require_uv,
-                                    prompt_handle,
-                                    preparation_slot: preparation_slot_inner.clone(),
-                                })
-                                .with_interaction_manager(interaction_manager_inner.clone())
-                                .with_operation_lock(op_lock_for_ctx.clone());
-
-                            AgentCeremonyHandler::new(service_handler, ceremony_context)
-                        },
-                        device_factory,
-                        WorkerHooks {
-                            on_response_sent: Some(Box::new(move || {
-                                if let Some(endpoint_id) =
-                                    generated_endpoint_for_hooks.lock().unwrap().clone()
-                                {
-                                    let _ = event_tx_inner.send(EndpointEvent::ResponseSent {
-                                        endpoint_id,
-                                        profile_id: profile_id_for_hooks.clone(),
-                                    });
-                                }
-                            })),
-                        },
-                        Some(Box::new(move |eid: &EndpointId| {
-                            let create_event = EndpointCreateBuilder::new(
-                                eid.clone(),
-                                profile_id_for_before_start.clone(),
-                            )
-                            .build();
-                            audit_gate_for_before_start
-                                .record(create_event)
-                                .map_err(|e| {
-                                    format!(
-                                        "profile '{}' endpoint create audit failed: {}",
-                                        name_for_before_start, e
-                                    )
-                                })?;
-                            Ok(())
-                        })),
-                    )
-                    .map_err(|e| RuntimeError::Endpoint(format!("profile '{}': {}", name, e)))?;
-
-                info!(
-                    "Profile '{}' {:?} endpoint created: {}",
-                    name, spec.mode, endpoint_id
-                );
-
-                Ok(endpoint_id)
-            }
         }
     }
 
@@ -1664,131 +1510,6 @@ impl AgentRuntime {
         let interaction_manager_inner = spec.interaction_manager.clone();
 
         match spec.mode {
-            AgentMode::DelegatedSession => {
-                let deps = spec.delegated_deps.as_ref().ok_or_else(|| {
-                    RuntimeError::Config(format!(
-                        "profile '{}': delegated spec missing delegated_deps",
-                        name
-                    ))
-                })?;
-
-                let (delegated_storage, ceremony_scope) = {
-                    let _op = deps.human_operation_lock.lock().map_err(|e| {
-                        RuntimeError::Storage(format!(
-                            "profile '{}': failed to acquire human operation lock: {}",
-                            name, e
-                        ))
-                    })?;
-                    super::storage_factory::create_shared_delegated_storage_with_registration(
-                        deps.human_storage.clone(),
-                        spec.profile_config.allowed_rp_ids(),
-                        deps.credential_refs.clone(),
-                        spec.security_config.constant_signature_counter,
-                        spec.profile_config.delegated_registration_storage.is_some(),
-                    )
-                    .map_err(|e| {
-                        RuntimeError::Storage(format!(
-                            "profile '{}': failed to create delegated storage: {}",
-                            name, e
-                        ))
-                    })?
-                };
-
-                let delegated_storage = Arc::new(Mutex::new(delegated_storage));
-
-                let service =
-                    crate::authenticator::AuthenticatorService::with_shared_storage_and_interaction(
-                        delegated_storage,
-                        Some(deps.human_pin_storage.clone()),
-                        spec.security_config.clone(),
-                        spec.pin_config.clone(),
-                        spec.interaction_manager.clone(),
-                    )
-                    .map_err(|e| {
-                        RuntimeError::Service(format!(
-                            "profile '{}': failed to create authenticator service: {}",
-                            name, e
-                        ))
-                    })?;
-
-                let ceremony_scope_inner = ceremony_scope;
-                let op_lock_for_ctx = deps.human_operation_lock.clone();
-                let prompt_mode = super::prompt::PromptMode::DelegatedSession;
-
-                let audit_gate_for_before_start = spec.audit_gate.clone();
-                let profile_id_for_before_start = profile_id.clone();
-                let name_for_before_start = name.clone();
-
-                let endpoint_id = endpoint_manager
-                    .create_and_start_with_transport_full(
-                        binding,
-                        name.to_string(),
-                        move |generated_endpoint_id: &EndpointId| {
-                            *generated_endpoint_for_factory.lock().unwrap() =
-                                Some(generated_endpoint_id.clone());
-                            let service_handler = ServiceHandler::new(service);
-
-                            let prompt_handle: Arc<dyn super::prompt::PromptHandle> =
-                                Arc::new(super::prompt::DesktopPromptHandle::default_config());
-
-                            let ceremony_context = super::ceremony::StaticCeremonyContext::new(
-                                super::ceremony::StaticCeremonyContextConfig {
-                                    profile_id: profile_id_inner.clone(),
-                                    endpoint_id: generated_endpoint_id.clone(),
-                                    mode: prompt_mode,
-                                    policy_runtime: policy_runtime_inner.clone(),
-                                    audit_gate: audit_gate_inner.clone(),
-                                    ceremony_scope: ceremony_scope_inner.clone(),
-                                    require_uv,
-                                    prompt_handle,
-                                    preparation_slot: preparation_slot_inner.clone(),
-                                },
-                            )
-                            .with_interaction_manager(interaction_manager_inner.clone())
-                            .with_operation_lock(op_lock_for_ctx.clone());
-
-                            super::ceremony::AgentCeremonyHandler::new(
-                                service_handler,
-                                ceremony_context,
-                            )
-                        },
-                        move || {
-                            test_transport_factory()
-                                .map_err(|e| format!("test transport factory failed: {}", e))
-                        },
-                        crate::worker::WorkerHooks {
-                            on_response_sent: Some(Box::new(move || {
-                                if let Some(endpoint_id) =
-                                    generated_endpoint_for_hooks.lock().unwrap().clone()
-                                {
-                                    let _ = event_tx_inner.send(EndpointEvent::ResponseSent {
-                                        endpoint_id,
-                                        profile_id: profile_id_for_hooks.clone(),
-                                    });
-                                }
-                            })),
-                        },
-                        Some(Box::new(move |eid: &EndpointId| {
-                            let create_event = super::audit_events::EndpointCreateBuilder::new(
-                                eid.clone(),
-                                profile_id_for_before_start.clone(),
-                            )
-                            .build();
-                            audit_gate_for_before_start
-                                .record(create_event)
-                                .map_err(|e| {
-                                    format!(
-                                        "profile '{}' endpoint create audit failed: {}",
-                                        name_for_before_start, e
-                                    )
-                                })?;
-                            Ok(())
-                        })),
-                    )
-                    .map_err(|e| RuntimeError::Endpoint(format!("profile '{}': {}", name, e)))?;
-
-                Ok(endpoint_id)
-            }
             AgentMode::Isolated => {
                 let deps = spec.isolated_deps.as_ref().ok_or_else(|| {
                     RuntimeError::Config(format!(
@@ -1925,78 +1646,6 @@ impl AgentRuntime {
         Ok(eid)
     }
 
-    fn destroy_delegated_endpoint(&self, profile: &ProfileRuntime) -> Result<(), RuntimeError> {
-        let eid = {
-            let mut guard = profile.endpoint_id.lock().unwrap();
-            guard.take()
-        };
-
-        let eid = match eid {
-            Some(e) => e,
-            None => return Ok(()),
-        };
-
-        {
-            let mut em = self.endpoint_manager.lock().unwrap();
-            em.cancel(&eid);
-            let outcome = em.destroy(&eid, Some(DELEGATED_DESTROY_TIMEOUT));
-            match outcome {
-                super::endpoint_manager::DestroyOutcome::Destroyed { .. } => {
-                    let destroy_event = super::audit_events::EndpointDestroyBuilder::new(
-                        eid.clone(),
-                        profile.profile_id.clone(),
-                    )
-                    .build();
-                    let _ = profile.endpoint_spec.audit_gate.record(destroy_event);
-                    info!(
-                        "Delegated endpoint destroyed: {} for profile {}",
-                        eid, profile.profile_id
-                    );
-                    Ok(())
-                }
-                super::endpoint_manager::DestroyOutcome::TimedOut { .. } => {
-                    let fail_event = super::audit_events::EndpointFailBuilder::new(
-                        eid.clone(),
-                        profile.profile_id.clone(),
-                        FailReason::Timeout,
-                    )
-                    .build();
-                    let _ = profile.endpoint_spec.audit_gate.record(fail_event);
-                    Err(RuntimeError::Endpoint(format!(
-                        "endpoint {} destroy timed out",
-                        eid
-                    )))
-                }
-                super::endpoint_manager::DestroyOutcome::WorkerFailed { error, .. } => {
-                    let fail_event = super::audit_events::EndpointFailBuilder::new(
-                        eid.clone(),
-                        profile.profile_id.clone(),
-                        FailReason::InternalError,
-                    )
-                    .build();
-                    let _ = profile.endpoint_spec.audit_gate.record(fail_event);
-                    Err(RuntimeError::Endpoint(format!(
-                        "endpoint {} worker failed: {}",
-                        eid, error
-                    )))
-                }
-                super::endpoint_manager::DestroyOutcome::WorkerPanicked { .. } => {
-                    let fail_event = super::audit_events::EndpointFailBuilder::new(
-                        eid.clone(),
-                        profile.profile_id.clone(),
-                        FailReason::InternalError,
-                    )
-                    .build();
-                    let _ = profile.endpoint_spec.audit_gate.record(fail_event);
-                    Err(RuntimeError::Endpoint(format!(
-                        "endpoint {} worker panicked",
-                        eid
-                    )))
-                }
-            }
-        }
-    }
-
     fn runtime_loop(self: &Arc<Self>) {
         info!("Agent runtime loop started");
         let loop_sleep = Duration::from_millis(50);
@@ -2029,6 +1678,7 @@ impl AgentRuntime {
                 let mut browser_mgr = self.browser_manager.lock().unwrap();
                 let exit_infos = browser_mgr.check_exits();
                 for info in &exit_infos {
+                    self.revoke_sign_context_for_lease(&info.lease_id);
                     let _ = self.audit_gate.record(
                         super::audit_events::BrowserLeaseCrashBuilder::new(
                             info.lease_id.clone(),
@@ -2111,6 +1761,7 @@ impl AgentRuntime {
                 }
                 let expired_leases = browser_mgr.check_expired();
                 for lease_id in &expired_leases {
+                    self.revoke_sign_context_for_lease(lease_id);
                     let _ = self.audit_gate.record(
                         super::audit_events::BrowserLeaseExpireBuilder::new(lease_id.clone())
                             .build(),
@@ -2346,102 +1997,16 @@ impl AgentRuntime {
 
                 match status.state {
                     super::policy_engine::PendingState::Approved => {
-                        match profile.mode {
-                            AgentMode::DelegatedSession => {
-                                if let Some(ref lease_id) = browser_lease_id {
-                                    let clamped_ttl = Duration::from_secs(
-                                        profile
-                                            .current_pending
-                                            .lock()
-                                            .unwrap()
-                                            .as_ref()
-                                            .map(|p| p.clamped_session_ttl_secs)
-                                            .unwrap_or(0),
-                                    );
-                                    let _clamped_ttl_secs = clamped_ttl.as_secs();
-
-                                    let destroy_result = self.destroy_delegated_endpoint(profile);
-
-                                    match destroy_result {
-                                        Ok(()) => {
-                                            let mut browser_mgr =
-                                                self.browser_manager.lock().unwrap();
-                                            let activation_result = browser_mgr
-                                                .activate_after_assertion(lease_id, clamped_ttl);
-                                            match activation_result {
-                                                Ok(_) => {
-                                                    let _ttl_deadline =
-                                                        Instant::now() + clamped_ttl;
-                                                    let mut current =
-                                                        profile.current_pending.lock().unwrap();
-                                                    let taken = current.take();
-                                                    drop(current);
-                                                    let mut active =
-                                                        profile.active_browser.lock().unwrap();
-                                                    *active = taken.map(|p| ActiveBrowserLease {
-                                                        lease_id: p
-                                                            .browser_lease_id
-                                                            .unwrap_or_else(|| lease_id.clone()),
-                                                        session_id: p.session_id,
-                                                    });
-                                                }
-                                                Err(_) => {
-                                                    let _ = browser_mgr.revoke(lease_id);
-                                                    let _ = browser_mgr.terminate(lease_id);
-                                                    let _ = browser_mgr.cleanup(lease_id);
-                                                    browser_mgr.remove(lease_id);
-                                                    profile
-                                                        .preparation_slot
-                                                        .clear_matching(prep_generation);
-                                                    let mut current =
-                                                        profile.current_pending.lock().unwrap();
-                                                    *current = None;
-                                                    let mut active =
-                                                        profile.active_browser.lock().unwrap();
-                                                    *active = None;
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {
-                                            let mut browser_mgr =
-                                                self.browser_manager.lock().unwrap();
-                                            let _ = browser_mgr.revoke(lease_id);
-                                            let _ = browser_mgr.terminate(lease_id);
-                                            let _ = browser_mgr.cleanup(lease_id);
-                                            browser_mgr.remove(lease_id);
-                                            profile
-                                                .preparation_slot
-                                                .clear_matching(prep_generation);
-                                            let mut current =
-                                                profile.current_pending.lock().unwrap();
-                                            *current = None;
-                                            let mut active = profile.active_browser.lock().unwrap();
-                                            *active = None;
-                                            profile.enabled.store(false, Ordering::Release);
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            AgentMode::Isolated => {}
-                        }
                         profile.preparation_slot.clear_matching(prep_generation);
-                        if profile.mode != AgentMode::DelegatedSession || browser_lease_id.is_none()
-                        {
-                            let mut current = profile.current_pending.lock().unwrap();
-                            *current = None;
-                        }
-                        if profile.mode == AgentMode::DelegatedSession && browser_lease_id.is_none()
-                        {
-                            let _ = self.destroy_delegated_endpoint(profile);
-                        }
+                        let mut current = profile.current_pending.lock().unwrap();
+                        *current = None;
                     }
                     super::policy_engine::PendingState::Waiting => {}
                     super::policy_engine::PendingState::Denied
                     | super::policy_engine::PendingState::TimedOut
                     | super::policy_engine::PendingState::Cancelled => {
                         if let Some(ref lease_id) = browser_lease_id {
+                            self.revoke_sign_context_for_lease(lease_id);
                             let mut browser_mgr = self.browser_manager.lock().unwrap();
                             let _ = browser_mgr.revoke(lease_id);
                             let _ = browser_mgr.terminate(lease_id);
@@ -2451,11 +2016,6 @@ impl AgentRuntime {
                         profile.preparation_slot.clear_matching(prep_generation);
                         let mut current = profile.current_pending.lock().unwrap();
                         *current = None;
-
-                        if profile.mode == AgentMode::DelegatedSession {
-                            drop(current);
-                            let _ = self.destroy_delegated_endpoint(profile);
-                        }
                     }
                 }
             }
@@ -2485,6 +2045,12 @@ impl AgentRuntime {
 
         self.shutdown.store(true, Ordering::Release);
 
+        self.sign_registry.revoke_all();
+        self.sign_server_shutdown.store(true, Ordering::Release);
+        if let Some(handle) = self.sign_server_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
         self.ipc_server.cancel();
 
         if let Some(handle) = self.runtime_loop.lock().unwrap().take() {
@@ -2510,6 +2076,10 @@ impl AgentRuntime {
         let _ = self.audit_gate.record(stop_event);
 
         info!("Agent runtime shutdown complete");
+    }
+
+    fn revoke_sign_context_for_lease(&self, lease_id: &BrowserLeaseId) {
+        self.sign_registry.revoke_by_lease(lease_id.as_str());
     }
 
     fn handle_launch_principal(
@@ -2927,6 +2497,7 @@ impl AgentRuntime {
                         .principal_cancel_pending(&request_id, &sid);
                     profile.preparation_slot.clear_matching(prep_gen);
                     if let Some(ref lid) = lease_id {
+                        self.revoke_sign_context_for_lease(lid);
                         let mut browser_mgr = self.browser_manager.lock().unwrap();
                         let _ = browser_mgr.revoke(lid);
                         let _ = browser_mgr.terminate(lid);
@@ -2941,6 +2512,7 @@ impl AgentRuntime {
                     action
                 };
                 if let Some(lease_id) = active_action {
+                    self.revoke_sign_context_for_lease(&lease_id);
                     let mut browser_mgr = self.browser_manager.lock().unwrap();
                     let _ = browser_mgr.revoke(&lease_id);
                     let _ = browser_mgr.terminate(&lease_id);
@@ -2963,6 +2535,7 @@ impl AgentRuntime {
                     .preparation_slot
                     .clear_matching(pending.prep_generation);
                 if let Some(ref lease_id) = pending.browser_lease_id {
+                    self.revoke_sign_context_for_lease(lease_id);
                     let mut browser_mgr = self.browser_manager.lock().unwrap();
                     let _ = browser_mgr.revoke(lease_id);
                     let _ = browser_mgr.terminate(lease_id);
@@ -3022,13 +2595,30 @@ impl AgentRuntime {
         credential_ref: &passless_core::agent::CredentialRef,
     ) -> Option<String> {
         let mut storage_guard = storage.lock().ok()?;
-        let cred = storage_guard.read(credential_ref.as_bytes()).ok()?;
-
-        cred.user
-            .display_name
-            .as_ref()
-            .map(|s| s.to_string())
-            .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()))
+        let cred = storage_guard
+            .read_first(crate::storage::CredentialFilter::None)
+            .ok()?;
+        let href = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+        if href == *credential_ref {
+            return cred
+                .user
+                .display_name
+                .as_ref()
+                .map(|s| s.to_string())
+                .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()));
+        }
+        while let Ok(cred) = storage_guard.read_next() {
+            let href = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+            if href == *credential_ref {
+                return cred
+                    .user
+                    .display_name
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()));
+            }
+        }
+        None
     }
 
     fn handle_create_intent(
@@ -3050,16 +2640,10 @@ impl AgentRuntime {
         } = params;
         use passless_core::agent::protocol::IntentAction;
 
-        let delegated_registration = profile.mode == AgentMode::DelegatedSession
-            && *action == IntentAction::Register
-            && profile
-                .profile_config
-                .delegated_registration_storage
-                .is_some();
-        if profile.mode != AgentMode::Isolated && !delegated_registration {
+        if profile.mode != AgentMode::Isolated {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                "CreateIntent is allowed only for isolated profiles or explicitly configured delegated registration",
+                "CreateIntent is allowed only for isolated profiles",
                 RecommendedAction::FixRequest,
             ));
         }
@@ -3370,348 +2954,13 @@ impl AgentRuntime {
 
     fn handle_request_delegation(
         &self,
-        params: RequestDelegationParams<'_>,
+        _params: RequestDelegationParams<'_>,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let RequestDelegationParams {
-            profile_id,
-            session_id,
-            endpoint_id,
-            rp_id,
-            credential_ref,
-            max_session_ttl,
-            principal_reason,
-            profile,
-            session_digest,
-        } = params;
-        if profile.mode != AgentMode::DelegatedSession {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "RequestDelegation is only allowed for delegated profiles",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let normalized_rp = rp_id.trim().to_ascii_lowercase();
-        let config = &profile.profile_config;
-
-        if !config
-            .allowed_rp_ids()
-            .iter()
-            .any(|id| id.trim().to_ascii_lowercase() == normalized_rp)
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "RP ID does not exactly match configured RP IDs",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let allowed_refs = config.credential_refs.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::Forbidden,
-                "no credential refs configured for this profile",
-                RecommendedAction::Abort,
-            )
-        })?;
-        if !allowed_refs.iter().any(|r| r == credential_ref) {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "credential ref does not exactly match configured refs",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let ceremony_policy = config
-            .rule_for_rp(&normalized_rp)
-            .map(|rule| rule.authenticate)
-            .filter(|policy| policy.authorization != passless_core::agent::AgentAuthorization::Deny)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "delegated authentication is denied for this RP",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        if max_session_ttl == 0 {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "max_session_ttl must be > 0",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let profile_max_ttl = config
-            .max_session_ttl
-            .as_ref()
-            .map(|d| d.as_secs())
-            .unwrap_or(3600);
-        let clamped_ttl = max_session_ttl.min(profile_max_ttl);
-
-        {
-            let current = profile.current_pending.lock().unwrap();
-            if current.is_some() {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "another pending request is already active for this profile",
-                    RecommendedAction::RetryWithBackoff,
-                ));
-            }
-        }
-
-        {
-            let active = profile.active_browser.lock().unwrap();
-            if active.is_some() {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "a browser session is already active for this profile",
-                    RecommendedAction::RetryWithBackoff,
-                ));
-            }
-        }
-
-        let generation = self.policy_runtime.current_generation();
-        let process_digest = session_digest.clone();
-
-        let intent_params = super::intent::CreateIntentParams {
-            profile_id: profile_id.clone(),
-            session_id: session_id.clone(),
-            endpoint_id: endpoint_id.clone(),
-            process_digest: process_digest.clone(),
-            action: passless_core::agent::protocol::IntentAction::Authenticate,
-            rp_id: normalized_rp.clone(),
-            credential_ref: Some(credential_ref.clone()),
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            require_uv: ceremony_policy.user_verification
-                != passless_core::agent::UserVerificationSource::None,
-            ttl_ms: Some(300_000),
-        };
-
-        let grant_params = super::grant::GrantRequestParams {
-            profile_id: profile_id.clone(),
-            session_id: session_id.clone(),
-            endpoint_id: endpoint_id.clone(),
-            principal_digest: *process_digest.as_bytes(),
-            rp_ids: vec![normalized_rp.clone()],
-            credentials: vec![credential_ref.clone()],
-            requested_ttl_secs: clamped_ttl,
-        };
-
-        let pending_id = self
-            .policy_runtime
-            .principal_create_pending_delegated(intent_params, grant_params)
-            .map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to create pending delegation: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
-
-        let config = &profile.profile_config;
-        let max_grant_ttl = config.max_grant_ttl.map(|d| d.as_secs()).unwrap_or(300);
-        let requested_grant_ttl = max_grant_ttl;
-        let clamped_grant_ttl = requested_grant_ttl.min(max_grant_ttl).max(5);
-
-        let trusted_credential_label = if let Some(ref deps) = profile.endpoint_spec.delegated_deps
-        {
-            Self::resolve_credential_label(&deps.human_storage, credential_ref)
-        } else {
-            None
-        };
-
-        let prep_input = super::ceremony::CeremonyPreparationInput {
-            session_id: session_id.clone(),
-            process_digest,
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            credential_ref: Some(credential_ref.clone()),
-            untrusted_metadata: super::ceremony::BoundedUntrustedMetadata::new(
-                normalized_rp,
-                passless_core::agent::protocol::IntentAction::Authenticate,
-                true,
-            )
-            .with_principal_reason(principal_reason),
-            clamped_grant_ttl_secs: clamped_grant_ttl,
-            clamped_session_ttl_secs: clamped_ttl,
-            trusted_credential_label,
-        };
-
-        let guard = profile.preparation_slot.install(prep_input).map_err(|e| {
-            let _ = self
-                .policy_runtime
-                .principal_cancel_pending(&pending_id, session_id);
-            ProtocolError::new(
-                ErrorCode::Conflict,
-                format!("failed to install preparation: {}", e),
-                RecommendedAction::Retry,
-            )
-        })?;
-
-        let prep_generation = guard.generation();
-        guard.disarm();
-
-        let status = self
-            .policy_runtime
-            .principal_pending_status(&pending_id, session_id)
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "failed to read pending status",
-                    RecommendedAction::Abort,
-                )
-            })?;
-
-        let intent_create_event = super::audit_events::IntentCreateBuilder::new(
-            status.intent_id.clone(),
-            profile_id.clone(),
-            super::audit_events::AuditAction::Authenticate,
-        )
-        .build();
-        if let Err(e) = self.audit_gate.record(intent_create_event) {
-            let _ = self
-                .policy_runtime
-                .principal_cancel_pending(&pending_id, session_id);
-            profile.preparation_slot.clear_matching(prep_generation);
-            return Err(ProtocolError::new(
-                ErrorCode::Internal,
-                format!("audit record failed: {}", e),
-                RecommendedAction::Abort,
-            ));
-        }
-
-        let browser_lease_id = {
-            let browser_user = profile.browser_uid.ok_or_else(|| {
-                let _ = self
-                    .policy_runtime
-                    .principal_cancel_pending(&pending_id, session_id);
-                profile.preparation_slot.clear_matching(prep_generation);
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "profile has no browser user configured",
-                    RecommendedAction::Abort,
-                )
-            })?;
-            let browser_gid = profile.browser_gid.ok_or_else(|| {
-                let _ = self
-                    .policy_runtime
-                    .principal_cancel_pending(&pending_id, session_id);
-                profile.preparation_slot.clear_matching(prep_generation);
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "profile has no browser gid configured",
-                    RecommendedAction::Abort,
-                )
-            })?;
-
-            let browser_command = config.browser_command.as_ref().ok_or_else(|| {
-                let _ = self
-                    .policy_runtime
-                    .principal_cancel_pending(&pending_id, session_id);
-                profile.preparation_slot.clear_matching(prep_generation);
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "profile has no browser_command configured",
-                    RecommendedAction::Abort,
-                )
-            })?;
-
-            let executable = std::path::PathBuf::from(&browser_command[0]);
-            let extra_args = if browser_command.len() > 1 {
-                browser_command[1..].to_vec()
-            } else {
-                Vec::new()
-            };
-
-            let login_timeout_secs = config
-                .max_grant_ttl
-                .as_ref()
-                .map(|d| d.as_secs())
-                .unwrap_or(120);
-            let session_ttl = std::time::Duration::from_secs(clamped_ttl);
-            let login_timeout = std::time::Duration::from_secs(login_timeout_secs);
-
-            let browser_config = super::browser::BrowserConfig {
-                executable,
-                start_url: config.start_url.clone(),
-                extra_args,
-                runtime_root: config
-                    .browser_runtime_root
-                    .clone()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/var/run/passless-browser")),
-                ttl: session_ttl,
-                login_timeout,
-                rp_ids: config.allowed_rp_ids(),
-                target_uid: browser_user,
-                target_gid: browser_gid,
-                daemon_uid: self.daemon_uid,
-                daemon_gid: self.daemon_gid,
-                cdp_expose: config.browser_cdp_expose.unwrap_or_default(),
-                cdp_port: config.browser_cdp_port.unwrap_or(0),
-            };
-
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
-            let lease_id = browser_mgr
-                .launch_pending(&browser_config, endpoint_id.clone(), profile_id.clone())
-                .map_err(|e| {
-                    let _ = self
-                        .policy_runtime
-                        .principal_cancel_pending(&pending_id, session_id);
-                    profile.preparation_slot.clear_matching(prep_generation);
-                    ProtocolError::new(
-                        ErrorCode::Internal,
-                        format!("failed to launch browser: {}", e),
-                        RecommendedAction::Retry,
-                    )
-                })?;
-
-            let lease_clone = lease_id.clone();
-            let pending_id_clone = pending_id.clone();
-            let session_id_clone = session_id.clone();
-            let browser_mgr_for_rollback = self.browser_manager.clone();
-            let policy_rt = self.policy_runtime.clone();
-            let prep_slot = profile.preparation_slot.clone();
-
-            let lease_audit_event = super::audit_events::BrowserLeaseLaunchBuilder::new(
-                lease_id.clone(),
-                profile_id.clone(),
-                endpoint_id.clone(),
-            )
-            .with_cdp_expose(browser_config.cdp_expose.to_string())
-            .build();
-            if let Err(e) = self.audit_gate.record(lease_audit_event) {
-                let _ = policy_rt.principal_cancel_pending(&pending_id_clone, &session_id_clone);
-                prep_slot.clear_matching(prep_generation);
-                let mut bm = browser_mgr_for_rollback.lock().unwrap();
-                let _ = bm.revoke(&lease_clone);
-                let _ = bm.terminate(&lease_clone);
-                let _ = bm.cleanup(&lease_clone);
-                bm.remove(&lease_clone);
-                return Err(ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("browser lease audit record failed: {}", e),
-                    RecommendedAction::Abort,
-                ));
-            }
-
-            lease_id
-        };
-
-        {
-            let mut current = profile.current_pending.lock().unwrap();
-            *current = Some(PendingRuntime {
-                request_id: pending_id.clone(),
-                prep_generation,
-                session_id: session_id.clone(),
-                browser_lease_id: Some(browser_lease_id),
-                clamped_session_ttl_secs: clamped_ttl,
-            });
-        }
-
-        Ok(PrincipalResponse::DelegationRequested {
-            request_id: pending_id,
-        })
+        Err(ProtocolError::new(
+            ErrorCode::Forbidden,
+            "request delegation is not supported; delegated mode has been removed",
+            RecommendedAction::FixRequest,
+        ))
     }
 
     fn handle_show_delegation(
@@ -3783,6 +3032,16 @@ impl AgentRuntime {
             ));
         }
 
+        let grant_request_id = status.grant_request_id;
+
+        if let Some(ref grant_req_id) = grant_request_id
+            && let Some(grant_id) = self
+                .policy_runtime
+                .resolved_grant_id_for_request(&status.profile_id, grant_req_id)
+        {
+            let _ = self.policy_runtime.revoke_grant_by_id(&grant_id);
+        }
+
         let _ = self
             .policy_runtime
             .principal_cancel_pending(request_id, session_id);
@@ -3802,6 +3061,7 @@ impl AgentRuntime {
             let current = profile.current_pending.lock().unwrap();
             current.as_ref().and_then(|p| p.browser_lease_id.clone())
         } {
+            self.revoke_sign_context_for_lease(lease_id);
             let mut browser_mgr = self.browser_manager.lock().unwrap();
             let _ = browser_mgr.revoke(lease_id);
             let _ = browser_mgr.terminate(lease_id);
@@ -4213,15 +3473,11 @@ impl AgentRuntime {
             .unwrap_or(0);
 
         let (pin_storage_available, pin_set) = {
-            let pin_storage = if let Some(ref isolated) = profile.endpoint_spec.isolated_deps {
-                Some(isolated.pin_storage.clone())
-            } else {
-                profile
-                    .endpoint_spec
-                    .delegated_deps
-                    .as_ref()
-                    .map(|delegated| delegated.human_pin_storage.clone())
-            };
+            let pin_storage = profile
+                .endpoint_spec
+                .isolated_deps
+                .as_ref()
+                .map(|isolated| isolated.pin_storage.clone());
 
             match pin_storage {
                 Some(ps) => {
@@ -4286,7 +3542,6 @@ impl AgentRuntime {
                         }
                     }
                 }
-                AgentMode::DelegatedSession => {}
             }
         } else {
             let em = self.endpoint_manager.lock().unwrap();
@@ -4371,36 +3626,6 @@ impl AgentRuntime {
                 browser_mgr.remove(&lease.lease_id);
             }
             *active = None;
-        }
-
-        {
-            let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-            let has_endpoint = {
-                let eid_guard = profile.endpoint_id.lock().unwrap();
-                eid_guard.is_some()
-            };
-            if has_endpoint {
-                let destroy_result = self.destroy_delegated_endpoint(profile);
-                if let Err(e) = destroy_result {
-                    let disable_failed_event =
-                        super::audit_events::AdminProfileDisableFailedBuilder::new(
-                            profile_id.clone(),
-                            DisableRequestReason::AdminRequested,
-                            e.to_string(),
-                        )
-                        .build();
-                    let _ = self.audit_gate.record(disable_failed_event);
-
-                    return Err(ProtocolError::new(
-                        ErrorCode::Conflict,
-                        format!(
-                            "profile '{}' disabled but endpoint destroy failed: {}",
-                            profile_id, e
-                        ),
-                        RecommendedAction::RetryWithBackoff,
-                    ));
-                }
-            }
         }
 
         if let Some(session_slot) = self.managed_sessions.get(profile_id) {
@@ -4627,14 +3852,6 @@ impl AgentRuntime {
                 continue;
             }
 
-            if profile.mode == AgentMode::DelegatedSession {
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "cannot show credentials in delegated mode",
-                    RecommendedAction::FixRequest,
-                ));
-            }
-
             let _op = profile.operation_lock.lock().map_err(|e| {
                 ProtocolError::new(
                     ErrorCode::Internal,
@@ -4817,22 +4034,6 @@ impl AgentRuntime {
         }
 
         if !_found_isolated {
-            for profile in self.profiles.values() {
-                if profile.mode == AgentMode::DelegatedSession {
-                    let is_in_profile = profile
-                        .profile_config
-                        .credential_refs
-                        .as_ref()
-                        .is_some_and(|refs| refs.iter().any(|r| r == credential_ref));
-                    if is_in_profile {
-                        return Err(ProtocolError::new(
-                            ErrorCode::Forbidden,
-                            "cannot delete credentials in delegated mode",
-                            RecommendedAction::FixRequest,
-                        ));
-                    }
-                }
-            }
             return Err(ProtocolError::new(
                 ErrorCode::NotFound,
                 "credential not found in any isolated profile",
@@ -4894,22 +4095,6 @@ impl AgentRuntime {
         }
 
         if !found_isolated {
-            for profile in self.profiles.values() {
-                if profile.mode == AgentMode::DelegatedSession {
-                    let is_in_profile = profile
-                        .profile_config
-                        .credential_refs
-                        .as_ref()
-                        .is_some_and(|refs| refs.iter().any(|r| r == credential_ref));
-                    if is_in_profile {
-                        return Err(ProtocolError::new(
-                            ErrorCode::Forbidden,
-                            "cannot rename credentials in delegated mode",
-                            RecommendedAction::FixRequest,
-                        ));
-                    }
-                }
-            }
             return Err(ProtocolError::new(
                 ErrorCode::NotFound,
                 "credential not found in any isolated profile",
@@ -5333,19 +4518,14 @@ impl AgentRuntime {
             let eid_guard = profile.endpoint_id.lock().unwrap();
             if eid_guard.is_none() {
                 drop(eid_guard);
-                match self.create_profile_endpoint(&profile.endpoint_spec) {
-                    Ok(eid) => {
-                        let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                        *eid_guard = Some(eid);
-                    }
-                    Err(e) => {
-                        return Err(ProtocolError::new(
-                            ErrorCode::Internal,
-                            format!("failed to create endpoint for delegation: {}", e),
-                            RecommendedAction::Retry,
-                        ));
-                    }
-                }
+                let eid = passless_core::agent::EndpointId::new();
+                info!(
+                    "Profile '{}' using human-shared endpoint (no agent UHID device): {}",
+                    profile_id.as_str(),
+                    eid.as_str()
+                );
+                let mut eid_guard = profile.endpoint_id.lock().unwrap();
+                *eid_guard = Some(eid);
             }
         }
         let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
@@ -5372,6 +4552,305 @@ impl AgentRuntime {
                 RecommendedAction::Retry,
             )),
         }
+    }
+
+    fn handle_request_registration(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        max_session_ttl: u64,
+        _reason: Option<&str>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        let _profile = self.profiles.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let (outcome, reason_code) = self
+            .policy_runtime
+            .authorize_registration(profile_id, rp_id);
+        if outcome == super::policy_engine::Outcome::Deny {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "registration denied for profile '{}' and rp '{}': {}",
+                    profile_id, rp_id, reason_code
+                ),
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let ttl = if max_session_ttl == 0 {
+            300
+        } else {
+            max_session_ttl
+        };
+
+        let reg_grant_id = self
+            .policy_runtime
+            .request_registration_grant(profile_id.clone(), rp_id.to_string())
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to request registration grant: {}", e),
+                    RecommendedAction::Retry,
+                )
+            })?;
+
+        let _ = ttl;
+
+        Ok(AdminResponse::RegistrationGranted {
+            registration_grant_id: reg_grant_id,
+        })
+    }
+
+    fn handle_launch_browser(
+        &self,
+        profile_id: &ProfileId,
+        start_url: Option<&str>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        let profile = self.profiles.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let endpoint_id = profile.endpoint_id.lock().unwrap().clone().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' has no active endpoint", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let profile_config = &profile.profile_config;
+
+        let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::BadRequest,
+                format!("profile '{}' has no browser_command configured", profile_id),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+
+        let executable = PathBuf::from(&browser_command[0]);
+        let extra_args = browser_command[1..].to_vec();
+
+        let runtime_root = profile_config
+            .browser_runtime_root
+            .clone()
+            .unwrap_or_else(|| {
+                dirs::runtime_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("passless")
+                    .join("browser")
+            });
+
+        let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
+        let browser_gid = profile.browser_gid.unwrap_or(profile.daemon_gid);
+
+        let rp_ids = if !profile_config.rp_ids.is_empty() {
+            profile_config.rp_ids.clone()
+        } else {
+            profile_config.allowed_rp_ids()
+        };
+
+        let config = BrowserConfig {
+            executable,
+            start_url: start_url
+                .map(|s| s.to_string())
+                .or_else(|| profile_config.start_url.clone()),
+            extra_args,
+            runtime_root,
+            ttl: std::time::Duration::from_secs(3600),
+            login_timeout: std::time::Duration::from_secs(300),
+            rp_ids,
+            target_uid: browser_uid,
+            target_gid: browser_gid,
+            daemon_uid: profile.daemon_uid,
+            daemon_gid: profile.daemon_gid,
+            cdp_expose: profile_config
+                .browser_cdp_expose
+                .unwrap_or(CdpExposeMode::Pipe),
+            cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
+        };
+
+        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "browser manager lock poisoned",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        // Generate bearer token for this browser session
+        let bearer_token = super::sign::generate_bearer_token().map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to generate bearer token: {}", e),
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        // Request registration grants for all allowed RP IDs
+        let mut registration_grants = std::collections::HashMap::new();
+        for rp_id in &config.rp_ids {
+            match self
+                .policy_runtime
+                .request_registration_grant(profile_id.clone(), rp_id.clone())
+            {
+                Ok(grant_id) => {
+                    registration_grants.insert(rp_id.clone(), grant_id);
+                }
+                Err(e) => {
+                    debug!(
+                        "failed to request registration grant for rp={}: {}",
+                        rp_id, e
+                    );
+                }
+            }
+        }
+
+        // Create registration context and handler
+        let register_ctx = super::register::RegisterContext {
+            profile_id: profile_id.clone(),
+            registration_grants,
+            profile_config: profile_config.clone(),
+        };
+
+        let key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync> =
+            Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
+
+        let register_handler = Arc::new(super::register::RegisterHandler {
+            human_storage: profile.credential_storage.clone(),
+            policy_runtime: self.policy_runtime.clone(),
+            audit_gate: self.audit_gate.clone(),
+            key_provider,
+            security_config: profile.endpoint_spec.security_config.clone(),
+            operation_lock: profile.operation_lock.clone(),
+        });
+
+        // Register the bearer token with the sign registry for registration
+        self.sign_registry
+            .register_pending_registration(bearer_token.clone(), register_ctx, register_handler)
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to register registration context: {}", e),
+                    RecommendedAction::Abort,
+                )
+            })?;
+
+        let metadata = super::browser::AgentEndpointMetadata {
+            port: self.sign_port,
+            bearer_token: bearer_token.clone(),
+        };
+
+        let lease_id = browser_manager
+            .launch_pending_with_agent_endpoint(
+                &config,
+                endpoint_id.clone(),
+                profile_id.clone(),
+                Some(&metadata),
+            )
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to launch browser: {}", e),
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+
+        let snapshot = browser_manager.snapshot(&lease_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "browser lease not found after launch",
+                RecommendedAction::Abort,
+            )
+        })?;
+
+        let pid = snapshot.pid;
+
+        // Try to register sign context for authentication (if credentials exist)
+        if let Ok(mut storage) = profile.credential_storage.lock()
+            && let Ok(cred) = storage.read_first(crate::storage::CredentialFilter::None)
+        {
+            let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+            let session_id = passless_core::agent::PrincipalSessionId::new();
+            let grant_params = super::grant::GrantRequestParams {
+                profile_id: profile_id.clone(),
+                session_id,
+                endpoint_id: endpoint_id.clone(),
+                principal_digest: [0u8; 32],
+                rp_ids: config.rp_ids.clone(),
+                credentials: vec![cred_ref],
+                requested_ttl_secs: 300,
+            };
+            match self.policy_runtime.admin_request_grant(grant_params) {
+                Ok(request_id) => {
+                    match self
+                        .policy_runtime
+                        .admin_approve_grant(&request_id, &super::intent::admin_authority())
+                    {
+                        Ok(grant_id) => {
+                            let sign_ctx = super::sign::SignContext {
+                                profile_id: profile_id.clone(),
+                                active_grant_id: grant_id,
+                                profile_config: profile_config.clone(),
+                            };
+                            let sign_key_provider: Arc<
+                                dyn soft_fido2::CredentialKeyProvider + Send + Sync,
+                            > = Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
+                            let sign_handler = Arc::new(super::sign::SignHandler {
+                                human_storage: profile.credential_storage.clone(),
+                                policy_runtime: self.policy_runtime.clone(),
+                                audit_gate: self.audit_gate.clone(),
+                                security_config: profile.endpoint_spec.security_config.clone(),
+                                key_provider: sign_key_provider,
+                                operation_lock: profile.operation_lock.clone(),
+                            });
+                            if let Err(e) = self.sign_registry.register_pending(
+                                bearer_token.clone(),
+                                sign_ctx,
+                                sign_handler,
+                            ) {
+                                log::error!("failed to register sign context: {}", e);
+                            } else if let Err(e) = self
+                                .sign_registry
+                                .bind_lease(&bearer_token, lease_id.to_string())
+                            {
+                                log::error!("failed to bind sign context to lease: {}", e);
+                            } else {
+                                info!(
+                                    "sign context registered and bound to lease for profile={}",
+                                    profile_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("failed to approve grant: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("failed to request grant: {}", e);
+                }
+            }
+        }
+
+        Ok(AdminResponse::BrowserLaunched(
+            passless_core::agent::protocol::BrowserLaunchedResponse {
+                lease_id: lease_id.to_string(),
+                profile_id: profile_id.to_string(),
+                pid,
+                start_url: config.start_url,
+            },
+        ))
     }
 
     fn handle_shutdown(&self) -> Result<AdminResponse, ProtocolError> {
@@ -5482,6 +4961,21 @@ impl AdminHandler for AgentRuntime {
                 *max_session_ttl,
                 reason.as_deref(),
             ),
+            AdminRequest::RequestRegistration {
+                profile_id,
+                rp_id,
+                max_session_ttl,
+                reason,
+            } => self.handle_request_registration(
+                profile_id,
+                rp_id,
+                *max_session_ttl,
+                reason.as_deref(),
+            ),
+            AdminRequest::LaunchBrowser {
+                profile_id,
+                start_url,
+            } => self.handle_launch_browser(profile_id, start_url.as_deref()),
             AdminRequest::Shutdown => self.handle_shutdown(),
         }
     }
@@ -5643,30 +5137,6 @@ impl PrincipalHandler for AgentRuntime {
                 grant_ttl_secs,
                 session_ttl_secs,
             } => {
-                if profile.mode == AgentMode::DelegatedSession
-                    && *action == passless_core::agent::protocol::IntentAction::Register
-                    && profile
-                        .profile_config
-                        .delegated_registration_storage
-                        .is_some()
-                {
-                    let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-                    let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                    if eid_guard.is_none() {
-                        *eid_guard = Some(self.create_profile_endpoint(&profile.endpoint_spec).map_err(
-                            |e| {
-                                ProtocolError::new(
-                                    ErrorCode::Internal,
-                                    format!(
-                                        "failed to create endpoint for delegated registration: {}",
-                                        e
-                                    ),
-                                    RecommendedAction::Retry,
-                                )
-                            },
-                        )?);
-                    }
-                }
                 let eid = profile.endpoint_id.lock().unwrap().clone();
                 match eid {
                     Some(ref eid) => self.handle_create_intent(CreateIntentParams {
@@ -5790,6 +5260,11 @@ impl PrincipalHandler for AgentRuntime {
                 *timeout_ms,
                 profile,
             ),
+            PrincipalRequest::SignAssertion(_req) => Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "sign assertions are not available; delegated mode has been removed",
+                RecommendedAction::FixRequest,
+            )),
         }
     }
 }
@@ -5823,7 +5298,7 @@ mod tests {
     fn worker_tracker_reap_finished_removes_completed_handles() {
         let tracker = WorkerTracker::new();
         let h1 = std::thread::spawn(|| {});
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let gate_clone = gate.clone();
         let h2 = std::thread::spawn(move || {
             let (lock, cvar) = &*gate_clone;
@@ -6064,12 +5539,6 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_id_mutex_starts_as_none_for_delegated() {
-        let eid: Mutex<Option<EndpointId>> = Mutex::new(None);
-        assert!(eid.lock().unwrap().is_none());
-    }
-
-    #[test]
     fn endpoint_id_mutex_can_store_and_retrieve() {
         let eid: Mutex<Option<EndpointId>> = Mutex::new(None);
         let new_id = EndpointId::new();
@@ -6140,7 +5609,6 @@ mod tests {
                 storage: None,
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: passless_core::agent::DeviceIdentity {
                     name: "test".to_string(),
                     phys: "test".to_string(),
@@ -6183,7 +5651,6 @@ mod tests {
             endpoint_factory: None,
             test_transport_factory: None,
             isolated_deps: None,
-            delegated_deps: None,
         };
 
         let spec2 = spec1.clone();
@@ -6233,43 +5700,7 @@ mod tests {
 
     // --- Runtime orchestration tests ---
 
-    use std::sync::Condvar;
     use std::sync::atomic::AtomicUsize;
-
-    struct ControllableEndpoint {
-        release: Arc<(Mutex<bool>, Condvar)>,
-        released: Arc<AtomicBool>,
-    }
-
-    impl ControllableEndpoint {
-        fn release_blocking(handle: &Arc<(Mutex<bool>, Condvar)>) {
-            let (lock, cvar) = &**handle;
-            let mut released = lock.lock().unwrap();
-            *released = true;
-            cvar.notify_all();
-        }
-    }
-
-    impl crate::worker::HidEndpoint for ControllableEndpoint {
-        fn read_packet(
-            &mut self,
-            _buffer: &mut [u8; 64],
-        ) -> Result<Option<usize>, crate::worker::WorkerError> {
-            let (lock, cvar) = &*self.release;
-            let mut released = lock.lock().unwrap();
-            while !*released {
-                released = cvar.wait(released).unwrap();
-            }
-            self.released.store(true, Ordering::SeqCst);
-            Err(crate::worker::WorkerError::Read(
-                "endpoint released".to_string(),
-            ))
-        }
-
-        fn write_packet(&mut self, _data: &[u8; 64]) -> Result<(), crate::worker::WorkerError> {
-            Ok(())
-        }
-    }
 
     struct QuickExitEndpoint {
         call_count: std::sync::atomic::AtomicUsize,
@@ -6319,10 +5750,12 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn write_count(&self) -> usize {
             self.write_counter.load(Ordering::SeqCst)
         }
 
+        #[allow(dead_code)]
         fn read_sign_count(&self) -> usize {
             self.read_sign_counter.load(Ordering::SeqCst)
         }
@@ -6384,1117 +5817,6 @@ mod tests {
         }
     }
 
-    struct RuntimeHarness {
-        runtime: Arc<AgentRuntime>,
-        profile_id: ProfileId,
-        session_id: PrincipalSessionId,
-        process_digest: super::super::intent::ProcessIdentityDigest,
-        credential_ref: passless_core::agent::CredentialRef,
-        rp_id: String,
-        _temp_dir: tempfile::TempDir,
-    }
-
-    impl Drop for RuntimeHarness {
-        fn drop(&mut self) {
-            self.runtime.shutdown.store(true, Ordering::Release);
-            {
-                let mut browser_mgr = self.runtime.browser_manager.lock().unwrap();
-                browser_mgr.terminate_all();
-            }
-            self.runtime.worker_tracker.join_all();
-            {
-                let mut em = self.runtime.endpoint_manager.lock().unwrap();
-                em.cancel_all();
-                let _ = em.shutdown_all(Some(Duration::from_secs(1)));
-            }
-        }
-    }
-
-    impl RuntimeHarness {
-        fn new_delegated() -> Self {
-            Self::new_delegated_with_profile_name("test-delegated")
-        }
-
-        fn new_delegated_with_profile_name(name: &str) -> Self {
-            let temp_dir = tempfile::tempdir().unwrap();
-            let audit_dir = temp_dir.path().join("audit");
-            std::fs::create_dir_all(&audit_dir).unwrap();
-            let browser_runtime_dir = temp_dir.path().join("browser-runtime");
-            std::fs::create_dir_all(&browser_runtime_dir).unwrap();
-
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-            std::fs::set_permissions(&browser_runtime_dir, std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-
-            let audit_gate = Arc::new(super::super::audit::AuditGate::open(&audit_dir).unwrap());
-            let clock: Arc<dyn super::super::browser::Clock> =
-                Arc::new(super::super::browser::SystemClock);
-            let monotonic_clock: Arc<dyn super::super::intent::MonotonicClock> =
-                Arc::new(super::super::intent::SystemClock::new());
-
-            let browser_manager = Arc::new(Mutex::new(
-                super::super::browser::BrowserProcessManager::with_spawner(
-                    clock.clone(),
-                    Arc::new(super::super::browser::TestSpawner),
-                ),
-            ));
-
-            let mut cred_bytes = [0u8; 32];
-            cred_bytes[..16].copy_from_slice(b"test-cred-id-001");
-            let credential_ref = passless_core::agent::CredentialRef::from_bytes(cred_bytes);
-            let rp_id = "example.com".to_string();
-
-            let fake_storage = Arc::new(Mutex::new(Box::new(FakeCredentialStorage::new())
-                as Box<dyn crate::storage::CredentialStorage>));
-            let fake_pin_storage = Arc::new(Mutex::new(
-                Box::new(FakePinStorage) as Box<dyn crate::pin_storage::PinStorage>
-            ));
-            let human_operation_lock = Arc::new(Mutex::new(()));
-
-            let profile_id = ProfileId::new(name).unwrap();
-            let profile_config = passless_core::agent::AgentProfileConfig {
-                mode: AgentMode::DelegatedSession,
-                principal_user: "testuser".to_string(),
-                rp_ids: vec![rp_id.clone()],
-                require_uv: true,
-                credential_refs: Some(vec![credential_ref.clone()]),
-                max_grant_ttl: Some(passless_core::agent::BoundedDuration::new(300).unwrap()),
-                max_session_ttl: Some(passless_core::agent::BoundedDuration::new(900).unwrap()),
-                storage: None,
-                registration_allowed: false,
-                rules: vec![],
-                delegated_registration_storage: None,
-                device: passless_core::agent::DeviceIdentity {
-                    name: "test-device".to_string(),
-                    phys: "test-phys".to_string(),
-                    uniq: "test-uniq".to_string(),
-                    vendor_id: 0x1234,
-                    product_id: 0x5678,
-                },
-                start_url: Some("https://example.com/login".to_string()),
-                browser_command: Some(vec!["/bin/true".to_string()]),
-                browser_user: Some("browseruser".to_string()),
-                browser_runtime_root: Some(temp_dir.path().join("browser-runtime")),
-                browser_cdp_expose: None,
-                browser_cdp_port: None,
-            };
-
-            let agent_config = {
-                let mut config = passless_core::agent::AgentConfig::default();
-                config
-                    .profiles
-                    .insert(name.to_string(), profile_config.clone());
-                config
-            };
-            let policy_runtime = Arc::new(
-                super::super::policy_engine::PolicyRuntime::new(
-                    &agent_config,
-                    clock.clone(),
-                    monotonic_clock.clone(),
-                )
-                .unwrap(),
-            );
-
-            let preparation_slot = Arc::new(super::super::ceremony::CeremonyPreparationSlot::new());
-            let interaction_manager =
-                Arc::new(super::super::interaction::AgentInteractionManager::new());
-            let operation_lock = Arc::new(Mutex::new(()));
-            let (event_tx, event_rx) = mpsc::channel();
-
-            let spec = EndpointSpec {
-                profile_name: name.to_string(),
-                profile_id: profile_id.clone(),
-                mode: AgentMode::DelegatedSession,
-                profile_config: profile_config.clone(),
-                security_config: SecurityConfig::default(),
-                pin_config: PinConfig::default(),
-                interaction_manager: interaction_manager.clone(),
-                preparation_slot: preparation_slot.clone(),
-                operation_lock: operation_lock.clone(),
-                policy_runtime: policy_runtime.clone(),
-                audit_gate: audit_gate.clone(),
-                event_tx: event_tx.clone(),
-                endpoint_factory: None,
-                test_transport_factory: Some(Arc::new(|| {
-                    Ok(Box::new(QuickExitEndpoint::new()) as Box<dyn crate::worker::HidEndpoint>)
-                })),
-                isolated_deps: None,
-                delegated_deps: Some(DelegatedEndpointDeps {
-                    human_storage: fake_storage.clone(),
-                    human_pin_storage: fake_pin_storage.clone(),
-                    human_operation_lock: human_operation_lock.clone(),
-                    credential_refs: vec![credential_ref.clone()],
-                }),
-            };
-
-            let endpoint_manager =
-                Mutex::new(super::super::endpoint_manager::EndpointManager::new(
-                    1,
-                    Arc::new(AtomicBool::new(false)),
-                    crate::worker::WorkerConfig::default(),
-                ));
-
-            let _ceremony_scope = super::super::storage::CeremonyScope::new();
-
-            let profile_runtime = ProfileRuntime {
-                profile_name: name.to_string(),
-                profile_id: profile_id.clone(),
-                uid: 1000,
-                gid: 1000,
-                endpoint_id: Mutex::new(None),
-                lifecycle_lock: Mutex::new(()),
-                endpoint_spec: spec,
-                preparation_slot,
-                operation_lock,
-                mode: AgentMode::DelegatedSession,
-                profile_config,
-                current_pending: Mutex::new(None),
-                active_browser: Mutex::new(None),
-                daemon_uid: unsafe { libc::getuid() },
-                daemon_gid: unsafe { libc::getgid() },
-                browser_uid: Some(1000),
-                browser_gid: Some(1000),
-                enabled: AtomicBool::new(true),
-                credential_storage: fake_storage.clone(),
-            };
-
-            let mut profiles = std::collections::BTreeMap::new();
-            profiles.insert(profile_id.clone(), profile_runtime);
-
-            let session_id = PrincipalSessionId::new();
-            let process_digest =
-                super::super::intent::ProcessIdentityDigest::compute_from_session_identity(
-                    &super::super::intent::SessionIdentityParams {
-                        uid: 1000,
-                        gid: 1000,
-                        pid: 12345,
-                        start_time: 1000,
-                        cgroup_path: "/test/cgroup".to_string(),
-                        ns_user: 100,
-                        ns_pid: 200,
-                        ns_mnt: 300,
-                    },
-                );
-
-            let mut managed_sessions = std::collections::BTreeMap::new();
-            let mut dummy_child = std::process::Command::new("/bin/true")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("failed to spawn dummy child for test session");
-            let dummy_pid = dummy_child.id() as i32;
-            let _ = dummy_child.wait();
-            let dummy_session = super::super::launcher::PrincipalSession {
-                child: std::process::Command::new("/bin/true")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .expect("failed to spawn dummy child"),
-                capability: super::super::launcher::SessionCapability::generate(),
-                identity: super::super::launcher::PeerIdentity::new(
-                    1000,
-                    1000,
-                    dummy_pid,
-                    1000,
-                    "/test/cgroup".to_string(),
-                    super::super::launcher::NamespaceInodes::new(100, 200, 300),
-                ),
-                pidfd: None,
-                proc_root: std::path::PathBuf::from("/proc"),
-            };
-            let managed_session = ManagedPrincipalSession {
-                session_id: session_id.clone(),
-                profile_id: profile_id.clone(),
-                session: dummy_session,
-                process_digest: process_digest.clone(),
-                created_at: Instant::now(),
-                deadline: Instant::now() + Duration::from_secs(3600),
-            };
-            managed_sessions.insert(profile_id.clone(), Mutex::new(Some(managed_session)));
-
-            let runtime = Arc::new(AgentRuntime {
-                endpoint_manager,
-                ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
-                audit_gate,
-                policy_runtime,
-                browser_manager,
-                profiles,
-                managed_sessions,
-                completed_sessions: Mutex::new(std::collections::BTreeMap::new()),
-                event_rx: Mutex::new(event_rx),
-                shutdown: Arc::new(AtomicBool::new(false)),
-                shutdown_requested: AtomicBool::new(false),
-                runtime_cleanup_started: AtomicBool::new(false),
-                runtime_loop: Mutex::new(None),
-                worker_tracker: WorkerTracker::new(),
-                daemon_uid: unsafe { libc::getuid() },
-                daemon_gid: unsafe { libc::getgid() },
-                agent_config: std::sync::RwLock::new(agent_config),
-            });
-
-            Self {
-                runtime,
-                profile_id,
-                session_id,
-                process_digest,
-                credential_ref,
-                rp_id,
-                _temp_dir: temp_dir,
-            }
-        }
-
-        fn profile(&self) -> &ProfileRuntime {
-            self.runtime.profiles.get(&self.profile_id).unwrap()
-        }
-
-        fn create_endpoint(&self) -> EndpointId {
-            let profile = self.profile();
-            let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-            {
-                let eid_guard = profile.endpoint_id.lock().unwrap();
-                if eid_guard.is_some() {
-                    return eid_guard.clone().unwrap();
-                }
-            }
-            let eid = self
-                .runtime
-                .create_profile_endpoint(&profile.endpoint_spec)
-                .unwrap();
-            *profile.endpoint_id.lock().unwrap() = Some(eid.clone());
-            std::thread::sleep(Duration::from_millis(10));
-            eid
-        }
-
-        fn reap_workers(&self) {
-            self.runtime.reap_stopped_workers();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        fn complete_delegation_cycle(&self, endpoint_id: &EndpointId) {
-            let generation = self.runtime.policy_runtime.current_generation();
-            let tuple = super::super::policy_engine::CeremonyTuple {
-                profile_id: self.profile_id.clone(),
-                session_id: self.session_id.clone(),
-                endpoint_id: endpoint_id.clone(),
-                process_digest: self.process_digest.clone(),
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                action: passless_core::agent::protocol::IntentAction::Authenticate,
-                rp_id: self.rp_id.clone(),
-                credential_ref: Some(self.credential_ref.clone()),
-            };
-            let approval = super::super::policy_engine::TrustedApproval::new();
-            let _bound = self
-                .runtime
-                .policy_runtime
-                .ceremony_resolve_pending(&tuple, &approval)
-                .unwrap();
-
-            self.runtime
-                .handle_endpoint_event(EndpointEvent::ResponseSent {
-                    endpoint_id: endpoint_id.clone(),
-                    profile_id: self.profile_id.clone(),
-                });
-
-            self.reap_workers();
-        }
-    }
-
-    #[test]
-    fn handle_request_delegation_creates_pending_and_installs_preparation() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id = harness.create_endpoint();
-
-        let result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: Some("test reason".to_string()),
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            });
-
-        assert!(
-            result.is_ok(),
-            "delegation request failed: {:?}",
-            result.err()
-        );
-        let response = result.unwrap();
-        match response {
-            PrincipalResponse::DelegationRequested { request_id } => {
-                let pending = harness.profile().current_pending.lock().unwrap();
-                assert!(pending.is_some(), "current_pending should be set");
-                let pending = pending.as_ref().unwrap();
-                assert_eq!(pending.request_id, request_id);
-                assert_eq!(pending.session_id, harness.session_id);
-                assert_eq!(pending.clamped_session_ttl_secs, 300);
-                assert_eq!(
-                    harness
-                        .profile()
-                        .preparation_slot
-                        .snapshot()
-                        .unwrap()
-                        .clamped_session_ttl_secs(),
-                    300
-                );
-                assert!(
-                    pending.browser_lease_id.is_some(),
-                    "browser lease should be set"
-                );
-            }
-            _ => panic!("expected DelegationRequested response"),
-        }
-    }
-
-    #[test]
-    fn cancel_delegation_cleans_up_browser_lease() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id = harness.create_endpoint();
-        let response = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 120,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            })
-            .unwrap();
-        let request_id = match response {
-            PrincipalResponse::DelegationRequested { request_id } => request_id,
-            _ => panic!("expected DelegationRequested response"),
-        };
-        let lease_id = harness
-            .profile()
-            .current_pending
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|pending| pending.browser_lease_id.clone())
-            .unwrap();
-        let runtime_root = harness._temp_dir.path().join("browser-runtime");
-        assert!(std::fs::read_dir(&runtime_root).unwrap().next().is_some());
-
-        let result = harness.runtime.handle_cancel_delegation(
-            &harness.profile_id,
-            &harness.session_id,
-            &request_id,
-            harness.profile(),
-        );
-
-        assert!(matches!(result, Ok(PrincipalResponse::DelegationCancelled)));
-        assert!(
-            harness
-                .runtime
-                .browser_manager
-                .lock()
-                .unwrap()
-                .snapshot(&lease_id)
-                .is_none()
-        );
-        assert!(std::fs::read_dir(runtime_root).unwrap().next().is_none());
-        assert!(harness.profile().current_pending.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn resolve_pending_through_ceremony_destroys_endpoint_before_browser_active() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id = harness.create_endpoint();
-
-        let result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            })
-            .unwrap();
-
-        let _request_id = match result {
-            PrincipalResponse::DelegationRequested { request_id } => request_id,
-            _ => panic!("expected DelegationRequested"),
-        };
-
-        let generation = harness.runtime.policy_runtime.current_generation();
-        let tuple = super::super::policy_engine::CeremonyTuple {
-            profile_id: harness.profile_id.clone(),
-            session_id: harness.session_id.clone(),
-            endpoint_id: endpoint_id.clone(),
-            process_digest: harness.process_digest.clone(),
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: passless_core::agent::protocol::IntentAction::Authenticate,
-            rp_id: harness.rp_id.clone(),
-            credential_ref: Some(harness.credential_ref.clone()),
-        };
-        let approval = super::super::policy_engine::TrustedApproval::new();
-        let bound = harness
-            .runtime
-            .policy_runtime
-            .ceremony_resolve_pending(&tuple, &approval)
-            .unwrap();
-
-        harness
-            .runtime
-            .handle_endpoint_event(EndpointEvent::ResponseSent {
-                endpoint_id: endpoint_id.clone(),
-                profile_id: harness.profile_id.clone(),
-            });
-
-        harness.reap_workers();
-
-        let endpoint_after = harness.profile().endpoint_id.lock().unwrap().clone();
-        assert!(
-            endpoint_after.is_none(),
-            "endpoint should be destroyed after ResponseSent, got {:?}",
-            endpoint_after
-        );
-
-        let active = harness.profile().active_browser.lock().unwrap();
-        assert!(
-            active.is_some(),
-            "active_browser should be set after approval"
-        );
-        assert_eq!(active.as_ref().unwrap().session_id, harness.session_id);
-
-        let pending = harness.profile().current_pending.lock().unwrap();
-        assert!(
-            pending.is_none(),
-            "current_pending should be cleared after approval"
-        );
-
-        assert!(bound.grant_id().is_some(), "grant should be created");
-    }
-
-    #[test]
-    fn second_delegation_after_cleanup_creates_fresh_endpoints() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id_1 = harness.create_endpoint();
-
-        let _result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id_1,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            })
-            .unwrap();
-
-        harness.complete_delegation_cycle(&endpoint_id_1);
-
-        let endpoint_after = harness.profile().endpoint_id.lock().unwrap().clone();
-        assert!(
-            endpoint_after.is_none(),
-            "endpoint should be cleared after delegation cycle"
-        );
-
-        let active = harness.profile().active_browser.lock().unwrap();
-        assert!(
-            active.is_some(),
-            "active_browser should be set after successful delegation"
-        );
-        drop(active);
-
-        {
-            let mut browser_mgr = harness.runtime.browser_manager.lock().unwrap();
-            browser_mgr.terminate_all();
-        }
-        {
-            let mut active = harness.profile().active_browser.lock().unwrap();
-            *active = None;
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-
-        let endpoint_id_2 = harness.create_endpoint();
-        assert_ne!(
-            endpoint_id_1, endpoint_id_2,
-            "second endpoint should have fresh ID"
-        );
-
-        let result2 = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id_2,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            });
-
-        assert!(
-            result2.is_ok(),
-            "second delegation should succeed after cleanup"
-        );
-    }
-
-    #[test]
-    fn stale_endpoint_event_leaves_state_unchanged() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id = harness.create_endpoint();
-
-        let result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            })
-            .unwrap();
-
-        let request_id = match result {
-            PrincipalResponse::DelegationRequested { request_id } => request_id,
-            _ => panic!("expected DelegationRequested"),
-        };
-
-        let stale_endpoint_id = EndpointId::new();
-        harness
-            .runtime
-            .handle_endpoint_event(EndpointEvent::ResponseSent {
-                endpoint_id: stale_endpoint_id,
-                profile_id: harness.profile_id.clone(),
-            });
-
-        let pending = harness.profile().current_pending.lock().unwrap();
-        assert!(pending.is_some(), "pending should remain after stale event");
-        assert_eq!(pending.as_ref().unwrap().request_id, request_id);
-
-        let active = harness.profile().active_browser.lock().unwrap();
-        assert!(
-            active.is_none(),
-            "active_browser should not be set by stale event"
-        );
-
-        let endpoint_after = harness.profile().endpoint_id.lock().unwrap().clone();
-        assert_eq!(
-            endpoint_after,
-            Some(endpoint_id),
-            "endpoint_id should be unchanged"
-        );
-    }
-
-    #[test]
-    fn second_delegation_after_cleanup_creates_fresh_endpoint() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id_1 = harness.create_endpoint();
-
-        let _result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id_1,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            })
-            .unwrap();
-
-        let generation = harness.runtime.policy_runtime.current_generation();
-        let tuple = super::super::policy_engine::CeremonyTuple {
-            profile_id: harness.profile_id.clone(),
-            session_id: harness.session_id.clone(),
-            endpoint_id: endpoint_id_1.clone(),
-            process_digest: harness.process_digest.clone(),
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: passless_core::agent::protocol::IntentAction::Authenticate,
-            rp_id: harness.rp_id.clone(),
-            credential_ref: Some(harness.credential_ref.clone()),
-        };
-        let approval = super::super::policy_engine::TrustedApproval::new();
-        let _bound = harness
-            .runtime
-            .policy_runtime
-            .ceremony_resolve_pending(&tuple, &approval)
-            .unwrap();
-
-        harness
-            .runtime
-            .handle_endpoint_event(EndpointEvent::ResponseSent {
-                endpoint_id: endpoint_id_1.clone(),
-                profile_id: harness.profile_id.clone(),
-            });
-
-        harness.reap_workers();
-
-        {
-            let mut active = harness.profile().active_browser.lock().unwrap();
-            *active = None;
-        }
-        {
-            let mut eid = harness.profile().endpoint_id.lock().unwrap();
-            *eid = None;
-        }
-
-        let endpoint_id_2 = harness.create_endpoint();
-        assert_ne!(
-            endpoint_id_1, endpoint_id_2,
-            "second endpoint should have fresh ID"
-        );
-
-        let result2 = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id_2,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            });
-
-        assert!(
-            result2.is_ok(),
-            "second delegation should succeed after cleanup"
-        );
-    }
-
-    #[test]
-    fn concurrent_delegation_creates_exactly_one_endpoint() {
-        use std::sync::Barrier;
-        use std::sync::atomic::AtomicUsize;
-
-        let harness = Arc::new(RuntimeHarness::new_delegated());
-        let create_count = Arc::new(AtomicUsize::new(0));
-        let conflict_count = Arc::new(AtomicUsize::new(0));
-        let endpoint_ids = Arc::new(Mutex::new(Vec::new()));
-        let num_threads = 4;
-        let barrier = Arc::new(Barrier::new(num_threads));
-
-        let threads: Vec<_> = (0..num_threads)
-            .map(|_| {
-                let harness = harness.clone();
-                let create_count = create_count.clone();
-                let conflict_count = conflict_count.clone();
-                let endpoint_ids = endpoint_ids.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    let profile = harness.profile();
-                    barrier.wait();
-                    let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-                    {
-                        let eid_guard = profile.endpoint_id.lock().unwrap();
-                        if eid_guard.is_some() {
-                            conflict_count.fetch_add(1, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-                    let eid = harness
-                        .runtime
-                        .create_profile_endpoint(&profile.endpoint_spec)
-                        .unwrap();
-                    create_count.fetch_add(1, Ordering::SeqCst);
-                    endpoint_ids.lock().unwrap().push(eid.clone());
-                    *profile.endpoint_id.lock().unwrap() = Some(eid);
-                })
-            })
-            .collect();
-
-        for t in threads {
-            t.join().unwrap();
-        }
-
-        assert_eq!(
-            create_count.load(Ordering::SeqCst),
-            1,
-            "endpoint should be created exactly once"
-        );
-        assert_eq!(
-            conflict_count.load(Ordering::SeqCst),
-            num_threads - 1,
-            "all other threads should see existing endpoint (conflict)"
-        );
-        assert_eq!(
-            endpoint_ids.lock().unwrap().len(),
-            1,
-            "only one endpoint ID should be stored"
-        );
-    }
-
-    #[test]
-    fn human_operation_lock_serializes_storage_access() {
-        let harness = RuntimeHarness::new_delegated();
-        let profile = harness.profile();
-        let deps = profile.endpoint_spec.delegated_deps.as_ref().unwrap();
-        let human_op_lock = deps.human_operation_lock.clone();
-        let human_storage = deps.human_storage.clone();
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let lock = human_op_lock.clone();
-                let storage = human_storage.clone();
-                let counter = counter.clone();
-                std::thread::spawn(move || {
-                    let _guard = lock.lock().unwrap();
-                    let _storage_guard = storage.lock().unwrap();
-                    let prev = counter.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(1));
-                    let after = counter.load(Ordering::SeqCst);
-                    assert_eq!(
-                        after,
-                        prev + 1,
-                        "counter should increment serially under lock"
-                    );
-                })
-            })
-            .collect();
-
-        for t in threads {
-            t.join().unwrap();
-        }
-
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            8,
-            "all threads should have executed"
-        );
-    }
-
-    #[test]
-    fn timeout_no_activation_with_blocking_endpoint() {
-        let blocking_release = Arc::new((Mutex::new(false), Condvar::new()));
-        let blocking_release_for_factory = blocking_release.clone();
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let audit_dir = temp_dir.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).unwrap();
-        let browser_runtime_dir = temp_dir.path().join("browser-runtime");
-        std::fs::create_dir_all(&browser_runtime_dir).unwrap();
-
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&browser_runtime_dir, std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-
-        let audit_gate = Arc::new(super::super::audit::AuditGate::open(&audit_dir).unwrap());
-        let clock: Arc<dyn super::super::browser::Clock> =
-            Arc::new(super::super::browser::SystemClock);
-        let monotonic_clock: Arc<dyn super::super::intent::MonotonicClock> =
-            Arc::new(super::super::intent::SystemClock::new());
-
-        let browser_manager = Arc::new(Mutex::new(
-            super::super::browser::BrowserProcessManager::with_spawner(
-                clock.clone(),
-                Arc::new(super::super::browser::TestSpawner),
-            ),
-        ));
-
-        let mut cred_bytes = [0u8; 32];
-        cred_bytes[..16].copy_from_slice(b"test-cred-id-001");
-        let credential_ref = passless_core::agent::CredentialRef::from_bytes(cred_bytes);
-        let rp_id = "example.com".to_string();
-
-        let fake_storage =
-            Arc::new(Mutex::new(Box::new(FakeCredentialStorage::new())
-                as Box<dyn crate::storage::CredentialStorage>));
-        let fake_pin_storage = Arc::new(Mutex::new(
-            Box::new(FakePinStorage) as Box<dyn crate::pin_storage::PinStorage>
-        ));
-        let human_operation_lock = Arc::new(Mutex::new(()));
-
-        let profile_id = ProfileId::new("test-timeout").unwrap();
-        let profile_config = passless_core::agent::AgentProfileConfig {
-            mode: AgentMode::DelegatedSession,
-            principal_user: "testuser".to_string(),
-            rp_ids: vec![rp_id.clone()],
-            require_uv: true,
-            credential_refs: Some(vec![credential_ref.clone()]),
-            max_grant_ttl: Some(passless_core::agent::BoundedDuration::new(300).unwrap()),
-            max_session_ttl: Some(passless_core::agent::BoundedDuration::new(900).unwrap()),
-            storage: None,
-            registration_allowed: false,
-            rules: vec![],
-            delegated_registration_storage: None,
-            device: passless_core::agent::DeviceIdentity {
-                name: "test-device".to_string(),
-                phys: "test-phys".to_string(),
-                uniq: "test-uniq".to_string(),
-                vendor_id: 0x1234,
-                product_id: 0x5678,
-            },
-            start_url: Some("https://example.com/login".to_string()),
-            browser_command: Some(vec!["/bin/true".to_string()]),
-            browser_user: Some("browseruser".to_string()),
-            browser_runtime_root: Some(temp_dir.path().join("browser-runtime")),
-            browser_cdp_expose: None,
-            browser_cdp_port: None,
-        };
-
-        let agent_config = {
-            let mut config = passless_core::agent::AgentConfig::default();
-            config
-                .profiles
-                .insert("test-timeout".to_string(), profile_config.clone());
-            config
-        };
-        let policy_runtime = Arc::new(
-            super::super::policy_engine::PolicyRuntime::new(
-                &agent_config,
-                clock.clone(),
-                monotonic_clock.clone(),
-            )
-            .unwrap(),
-        );
-
-        let preparation_slot = Arc::new(super::super::ceremony::CeremonyPreparationSlot::new());
-        let interaction_manager =
-            Arc::new(super::super::interaction::AgentInteractionManager::new());
-        let operation_lock = Arc::new(Mutex::new(()));
-        let (event_tx, event_rx) = mpsc::channel();
-
-        let spec = EndpointSpec {
-            profile_name: "test-timeout".to_string(),
-            profile_id: profile_id.clone(),
-            mode: AgentMode::DelegatedSession,
-            profile_config: profile_config.clone(),
-            security_config: SecurityConfig::default(),
-            pin_config: PinConfig::default(),
-            interaction_manager: interaction_manager.clone(),
-            preparation_slot: preparation_slot.clone(),
-            operation_lock: operation_lock.clone(),
-            policy_runtime: policy_runtime.clone(),
-            audit_gate: audit_gate.clone(),
-            event_tx: event_tx.clone(),
-            endpoint_factory: None,
-            test_transport_factory: Some(Arc::new(move || {
-                let ep = ControllableEndpoint {
-                    release: blocking_release_for_factory.clone(),
-                    released: Arc::new(AtomicBool::new(false)),
-                };
-                Ok(Box::new(ep) as Box<dyn crate::worker::HidEndpoint>)
-            })),
-            isolated_deps: None,
-            delegated_deps: Some(DelegatedEndpointDeps {
-                human_storage: fake_storage.clone(),
-                human_pin_storage: fake_pin_storage.clone(),
-                human_operation_lock: human_operation_lock.clone(),
-                credential_refs: vec![credential_ref.clone()],
-            }),
-        };
-
-        let endpoint_manager = Mutex::new(super::super::endpoint_manager::EndpointManager::new(
-            1,
-            Arc::new(AtomicBool::new(false)),
-            crate::worker::WorkerConfig::default(),
-        ));
-
-        let _ceremony_scope = super::super::storage::CeremonyScope::new();
-        let session_id = PrincipalSessionId::new();
-        let process_digest =
-            super::super::intent::ProcessIdentityDigest::compute_from_session_identity(
-                &super::super::intent::SessionIdentityParams {
-                    uid: 1000,
-                    gid: 1000,
-                    pid: 12345,
-                    start_time: 1000,
-                    cgroup_path: "/test/cgroup".to_string(),
-                    ns_user: 100,
-                    ns_pid: 200,
-                    ns_mnt: 300,
-                },
-            );
-
-        let mut dummy_child = std::process::Command::new("/bin/true")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to spawn dummy child");
-        let dummy_pid = dummy_child.id() as i32;
-        let _ = dummy_child.wait();
-        let dummy_session = super::super::launcher::PrincipalSession {
-            child: std::process::Command::new("/bin/true")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("failed to spawn dummy child"),
-            capability: super::super::launcher::SessionCapability::generate(),
-            identity: super::super::launcher::PeerIdentity::new(
-                1000,
-                1000,
-                dummy_pid,
-                1000,
-                "/test/cgroup".to_string(),
-                super::super::launcher::NamespaceInodes::new(100, 200, 300),
-            ),
-            pidfd: None,
-            proc_root: std::path::PathBuf::from("/proc"),
-        };
-        let managed_session = ManagedPrincipalSession {
-            session_id: session_id.clone(),
-            profile_id: profile_id.clone(),
-            session: dummy_session,
-            process_digest: process_digest.clone(),
-            created_at: Instant::now(),
-            deadline: Instant::now() + Duration::from_secs(3600),
-        };
-
-        let profile_runtime = ProfileRuntime {
-            profile_name: "test-timeout".to_string(),
-            profile_id: profile_id.clone(),
-            uid: 1000,
-            gid: 1000,
-            endpoint_id: Mutex::new(None),
-            lifecycle_lock: Mutex::new(()),
-            endpoint_spec: spec,
-            preparation_slot,
-            operation_lock,
-            mode: AgentMode::DelegatedSession,
-            profile_config,
-            current_pending: Mutex::new(None),
-            active_browser: Mutex::new(None),
-            daemon_uid: unsafe { libc::getuid() },
-            daemon_gid: unsafe { libc::getgid() },
-            browser_uid: Some(1000),
-            browser_gid: Some(1000),
-            enabled: AtomicBool::new(true),
-            credential_storage: fake_storage.clone(),
-        };
-
-        let mut profiles = std::collections::BTreeMap::new();
-        profiles.insert(profile_id.clone(), profile_runtime);
-
-        let mut managed_sessions = std::collections::BTreeMap::new();
-        managed_sessions.insert(profile_id.clone(), Mutex::new(Some(managed_session)));
-
-        let runtime = Arc::new(AgentRuntime {
-            endpoint_manager,
-            ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
-            audit_gate,
-            policy_runtime,
-            browser_manager,
-            profiles,
-            managed_sessions,
-            completed_sessions: Mutex::new(std::collections::BTreeMap::new()),
-            event_rx: Mutex::new(event_rx),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_requested: AtomicBool::new(false),
-            runtime_cleanup_started: AtomicBool::new(false),
-            runtime_loop: Mutex::new(None),
-            worker_tracker: WorkerTracker::new(),
-            daemon_uid: unsafe { libc::getuid() },
-            daemon_gid: unsafe { libc::getgid() },
-            agent_config: std::sync::RwLock::new(agent_config),
-        });
-
-        let eid = {
-            let profile = runtime.profiles.get(&profile_id).unwrap();
-            let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-            let eid = runtime
-                .create_profile_endpoint(&profile.endpoint_spec)
-                .unwrap();
-            *profile.endpoint_id.lock().unwrap() = Some(eid.clone());
-            eid
-        };
-        std::thread::sleep(Duration::from_millis(10));
-
-        let profile = runtime.profiles.get(&profile_id).unwrap();
-        let result = runtime.handle_request_delegation(RequestDelegationParams {
-            profile_id: &profile_id,
-            session_id: &session_id,
-            endpoint_id: &eid,
-            rp_id: &rp_id,
-            credential_ref: &credential_ref,
-            max_session_ttl: 300,
-            principal_reason: None,
-            profile,
-            session_digest: &process_digest,
-        });
-        assert!(result.is_ok());
-
-        let generation = runtime.policy_runtime.current_generation();
-        let tuple = super::super::policy_engine::CeremonyTuple {
-            profile_id: profile_id.clone(),
-            session_id: session_id.clone(),
-            endpoint_id: eid.clone(),
-            process_digest: process_digest.clone(),
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: passless_core::agent::protocol::IntentAction::Authenticate,
-            rp_id: rp_id.clone(),
-            credential_ref: Some(credential_ref.clone()),
-        };
-        let approval = super::super::policy_engine::TrustedApproval::new();
-        let _bound = runtime
-            .policy_runtime
-            .ceremony_resolve_pending(&tuple, &approval)
-            .unwrap();
-
-        runtime.handle_endpoint_event(EndpointEvent::ResponseSent {
-            endpoint_id: eid.clone(),
-            profile_id: profile_id.clone(),
-        });
-
-        let active = profile.active_browser.lock().unwrap();
-        assert!(
-            active.is_none(),
-            "active_browser must remain None when endpoint destroy times out"
-        );
-        drop(active);
-
-        assert!(
-            !profile.enabled.load(Ordering::Acquire),
-            "profile should be disabled after destroy timeout"
-        );
-
-        ControllableEndpoint::release_blocking(&blocking_release);
-        std::thread::sleep(Duration::from_millis(100));
-
-        {
-            let mut browser_mgr = runtime.browser_manager.lock().unwrap();
-            browser_mgr.terminate_all();
-        }
-        runtime.worker_tracker.join_all();
-        {
-            let mut em = runtime.endpoint_manager.lock().unwrap();
-            em.cancel_all();
-            let _ = em.shutdown_all(Some(Duration::from_secs(1)));
-        }
-    }
-
     #[test]
     fn isolated_endpoint_persists_across_operations() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -7529,7 +5851,6 @@ mod tests {
                     }),
                     registration_allowed: false,
                     rules: vec![],
-                    delegated_registration_storage: None,
                     device: passless_core::agent::DeviceIdentity {
                         name: "test-iso-device".to_string(),
                         phys: "test-iso-phys".to_string(),
@@ -7594,7 +5915,6 @@ mod tests {
                 #[cfg(feature = "tpm")]
                 tpm_key_provider: Arc::new(Mutex::new(None)),
             }),
-            delegated_deps: None,
         };
 
         let endpoint_manager = Mutex::new(super::super::endpoint_manager::EndpointManager::new(
@@ -7631,6 +5951,13 @@ mod tests {
         let mut managed_sessions = std::collections::BTreeMap::new();
         managed_sessions.insert(profile_id.clone(), Mutex::new(None));
 
+        let sign_registry = Arc::new(SignContextRegistry::new());
+        let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_server =
+            SignHttpServer::bind(sign_server_shutdown.clone()).expect("bind sign server");
+        let sign_port = sign_server.port();
+        let sign_server_handle = sign_server.serve(sign_registry.clone());
+
         let runtime = Arc::new(AgentRuntime {
             endpoint_manager,
             ipc_server: Arc::new(super::super::ipc::IpcServer::new_test_dummy()),
@@ -7654,6 +5981,10 @@ mod tests {
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             agent_config: std::sync::RwLock::new(agent_config),
+            sign_registry,
+            sign_server_shutdown,
+            sign_server_handle: Mutex::new(Some(sign_server_handle)),
+            sign_port,
         });
 
         let profile = runtime.profiles.get(&profile_id).unwrap();
@@ -7694,171 +6025,5 @@ mod tests {
             em.cancel_all();
             let _ = em.shutdown_all(Some(Duration::from_secs(1)));
         }
-    }
-
-    #[test]
-    fn second_delegation_rejected_while_active_browser() {
-        let harness = RuntimeHarness::new_delegated();
-        let endpoint_id = harness.create_endpoint();
-
-        let _result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &endpoint_id,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            })
-            .unwrap();
-
-        let generation = harness.runtime.policy_runtime.current_generation();
-        let tuple = super::super::policy_engine::CeremonyTuple {
-            profile_id: harness.profile_id.clone(),
-            session_id: harness.session_id.clone(),
-            endpoint_id: endpoint_id.clone(),
-            process_digest: harness.process_digest.clone(),
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: passless_core::agent::protocol::IntentAction::Authenticate,
-            rp_id: harness.rp_id.clone(),
-            credential_ref: Some(harness.credential_ref.clone()),
-        };
-        let approval = super::super::policy_engine::TrustedApproval::new();
-        let _bound = harness
-            .runtime
-            .policy_runtime
-            .ceremony_resolve_pending(&tuple, &approval)
-            .unwrap();
-
-        harness
-            .runtime
-            .handle_endpoint_event(EndpointEvent::ResponseSent {
-                endpoint_id: endpoint_id.clone(),
-                profile_id: harness.profile_id.clone(),
-            });
-        harness.reap_workers();
-
-        let active = harness.profile().active_browser.lock().unwrap();
-        assert!(
-            active.is_some(),
-            "active_browser should be set after successful delegation"
-        );
-        drop(active);
-
-        let new_endpoint_id = EndpointId::new();
-        let second_result = harness
-            .runtime
-            .handle_request_delegation(RequestDelegationParams {
-                profile_id: &harness.profile_id,
-                session_id: &harness.session_id,
-                endpoint_id: &new_endpoint_id,
-                rp_id: &harness.rp_id,
-                credential_ref: &harness.credential_ref,
-                max_session_ttl: 300,
-                principal_reason: None,
-                profile: harness.profile(),
-                session_digest: &harness.process_digest,
-            });
-
-        assert!(
-            second_result.is_err(),
-            "second delegation should be rejected while browser is active"
-        );
-        let err = second_result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Conflict);
-    }
-
-    #[test]
-    fn storage_fake_persists_writes_and_tracks_read_sign_counter() {
-        let mut storage = FakeCredentialStorage::new();
-
-        assert_eq!(storage.write_count(), 0);
-        assert_eq!(storage.read_sign_count(), 0);
-        assert_eq!(storage.count_credentials(), 0);
-
-        let _ = storage.read_first(crate::storage::CredentialFilter::None);
-        assert_eq!(storage.read_sign_count(), 1);
-
-        let _ = storage.read_next();
-        assert_eq!(storage.read_sign_count(), 2);
-
-        let _ = storage.read(b"nonexistent");
-        assert_eq!(storage.read_sign_count(), 3);
-
-        let result = storage.read(b"nonexistent");
-        assert!(result.is_err());
-        assert_eq!(storage.read_sign_count(), 4);
-
-        assert_eq!(storage.write_count(), 0);
-        assert_eq!(storage.count_credentials(), 0);
-    }
-
-    #[test]
-    fn audit_records_endpoint_and_browser_events() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let audit_dir = temp_dir.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        let audit_gate = Arc::new(super::super::audit::AuditGate::open(&audit_dir).unwrap());
-
-        let start_event =
-            super::super::audit_events::DaemonStartBuilder::new(1234, BackendKind::Local).build();
-        audit_gate.record(start_event).unwrap();
-
-        let profile_id = ProfileId::new("test-audit").unwrap();
-        let create_event =
-            super::super::audit_events::ProfileCreateBuilder::new(profile_id.clone()).build();
-        audit_gate.record(create_event).unwrap();
-
-        let endpoint_id = EndpointId::new();
-        let endpoint_event = super::super::audit_events::EndpointCreateBuilder::new(
-            endpoint_id.clone(),
-            profile_id.clone(),
-        )
-        .build();
-        audit_gate.record(endpoint_event).unwrap();
-
-        let lease_id = passless_core::agent::BrowserLeaseId::new();
-        let lease_event = super::super::audit_events::BrowserLeaseLaunchBuilder::new(
-            lease_id.clone(),
-            profile_id.clone(),
-            endpoint_id.clone(),
-        )
-        .build();
-        audit_gate.record(lease_event).unwrap();
-
-        let intent_id = passless_core::agent::IntentId::new();
-        let intent_event = super::super::audit_events::IntentCreateBuilder::new(
-            intent_id.clone(),
-            profile_id.clone(),
-            super::super::audit_events::AuditAction::Authenticate,
-        )
-        .build();
-        audit_gate.record(intent_event).unwrap();
-
-        let audit_file = audit_dir.join("audit-000000.log");
-        assert!(
-            audit_file.exists(),
-            "audit file should exist after recording events"
-        );
-
-        let metadata = std::fs::metadata(&audit_file).unwrap();
-        assert!(
-            metadata.len() > 0,
-            "audit file should contain data after recording events"
-        );
-
-        let event_count = audit_gate.verify_all().unwrap();
-        assert_eq!(
-            event_count, 5,
-            "should have recorded 5 events (daemon.start, profile.create, endpoint.create, browser_lease.launch, intent.create)"
-        );
     }
 }

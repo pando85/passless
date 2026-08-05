@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use passless_core::agent::{
     CredentialRef, EndpointId, GrantId, PolicyDigest, PolicyGenerationId, PrincipalSessionId,
-    ProfileId,
+    ProfileId, RegistrationGrantId,
 };
 
 use super::browser::Clock;
@@ -29,7 +29,10 @@ pub enum GrantError {
     RpIdTooLong(String),
     TooManyRpIds(usize),
     TooManyCredentials(usize),
-    TtlExceedsProfileMax { requested: u64, max: u64 },
+    TtlExceedsProfileMax {
+        requested: u64,
+        max: u64,
+    },
     TtlZero,
     GrantNotActive(GrantId),
     GrantNotFound(GrantId),
@@ -44,7 +47,15 @@ pub enum GrantError {
     ClockAmbiguity,
     PendingRequestNotFound(GrantRequestId),
     RequestAlreadyResolved(GrantRequestId),
-    MaxConcurrentGrantsExceeded { limit: u64 },
+    MaxConcurrentGrantsExceeded {
+        limit: u64,
+    },
+    RegistrationGrantNotFound(RegistrationGrantId),
+    RegistrationGrantNotActive(RegistrationGrantId),
+    RegistrationRpIdMismatch {
+        grant_rp: String,
+        request_rp: String,
+    },
 }
 
 impl fmt::Display for GrantError {
@@ -81,6 +92,22 @@ impl fmt::Display for GrantError {
             Self::RequestAlreadyResolved(id) => write!(f, "request {} already resolved", id),
             Self::MaxConcurrentGrantsExceeded { limit } => {
                 write!(f, "max concurrent grants exceeded (limit: {})", limit)
+            }
+            Self::RegistrationGrantNotFound(id) => {
+                write!(f, "registration grant {} not found", id)
+            }
+            Self::RegistrationGrantNotActive(id) => {
+                write!(f, "registration grant {} is not active", id)
+            }
+            Self::RegistrationRpIdMismatch {
+                grant_rp,
+                request_rp,
+            } => {
+                write!(
+                    f,
+                    "registration grant RP ID '{}' does not match request RP ID '{}'",
+                    grant_rp, request_rp
+                )
             }
         }
     }
@@ -289,6 +316,7 @@ pub struct GrantRequest {
     pub credentials: Vec<CredentialRef>,
     pub requested_ttl_secs: u64,
     pub resolved: bool,
+    pub resolved_grant_id: Option<GrantId>,
 }
 
 #[derive(Debug)]
@@ -370,6 +398,16 @@ impl fmt::Debug for AuthorizationClaim {
             .field("consumed", &self.consumed.load(Ordering::Acquire))
             .finish()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GrantSnapshotForSign {
+    pub grant_id: GrantId,
+    pub profile_id: ProfileId,
+    pub rp_ids: Vec<String>,
+    pub credential_refs: Vec<CredentialRef>,
+    pub state: GrantState,
+    pub expiry_mono: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +516,7 @@ impl GrantRegistry {
             credentials: cred_set.sorted,
             requested_ttl_secs: params.requested_ttl_secs,
             resolved: false,
+            resolved_grant_id: None,
         };
 
         self.pending_requests.insert(request_id.clone(), request);
@@ -536,9 +575,16 @@ impl GrantRegistry {
 
         if let Some(req) = self.pending_requests.get_mut(request_id) {
             req.resolved = true;
+            req.resolved_grant_id = Some(grant_id.clone());
         }
 
         Ok(grant_id)
+    }
+
+    pub fn resolved_grant_id(&self, request_id: &GrantRequestId) -> Option<GrantId> {
+        self.pending_requests
+            .get(request_id)
+            .and_then(|r| r.resolved_grant_id.clone())
     }
 
     pub fn revoke_grant(
@@ -823,6 +869,21 @@ impl GrantRegistry {
             .is_some_and(|g| g.state() == GrantState::Active)
     }
 
+    pub fn snapshot_for_sign(&self, grant_id: &GrantId) -> Option<GrantSnapshotForSign> {
+        let grant = self.grants.get(grant_id)?;
+        let state = grant.state();
+        let rp_ids: Vec<String> = grant.rp_ids.iter().cloned().collect();
+        let cred_refs: Vec<CredentialRef> = grant.credentials.iter().cloned().collect();
+        Some(GrantSnapshotForSign {
+            grant_id: grant.id.clone(),
+            profile_id: grant.profile_id.clone(),
+            rp_ids,
+            credential_refs: cred_refs,
+            state,
+            expiry_mono: grant.expiry_mono,
+        })
+    }
+
     pub fn grant_policy_generation(&self, grant_id: &GrantId) -> Option<&PolicyGenerationId> {
         self.grants.get(grant_id).map(|g| &g.policy_generation)
     }
@@ -849,6 +910,231 @@ impl GrantRegistry {
 
     pub fn cancel_claims_for_grant(&mut self, grant_id: &GrantId) {
         self.claims.retain(|_, c| c.grant_id != *grant_id);
+    }
+}
+
+#[derive(Debug)]
+pub struct RegistrationGrant {
+    pub id: RegistrationGrantId,
+    pub profile_id: ProfileId,
+    pub session_id: PrincipalSessionId,
+    pub endpoint_id: EndpointId,
+    pub principal_digest: [u8; 32],
+    pub rp_id: String,
+    pub issued_at_mono: u64,
+    pub expiry_mono: u64,
+    state: AtomicU8,
+}
+
+impl RegistrationGrant {
+    pub fn state(&self) -> GrantState {
+        GrantState::from_atomic(self.state.load(Ordering::Acquire)).unwrap_or(GrantState::Revoked)
+    }
+
+    fn try_transition(&self, from: GrantState, to: GrantState) -> bool {
+        self.state
+            .compare_exchange(
+                from.to_atomic(),
+                to.to_atomic(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistrationGrantSnapshot {
+    pub grant_id: RegistrationGrantId,
+    pub profile_id: ProfileId,
+    pub rp_id: String,
+    pub state: GrantState,
+    pub issued_at_mono: u64,
+    pub expiry_mono: u64,
+}
+
+pub struct RegistrationGrantRegistry {
+    grants: HashMap<RegistrationGrantId, RegistrationGrant>,
+    clock: Arc<dyn Clock>,
+    max_ttl_secs: u64,
+    last_seen_mono: u64,
+}
+
+impl RegistrationGrantRegistry {
+    pub fn new(clock: Arc<dyn Clock>, max_ttl_secs: u64) -> Self {
+        Self {
+            grants: HashMap::new(),
+            clock,
+            max_ttl_secs,
+            last_seen_mono: 0,
+        }
+    }
+
+    fn check_clock(&mut self) -> Result<(), GrantError> {
+        let now = self.clock.monotonic_secs();
+        if now < self.last_seen_mono {
+            self.fail_closed_all();
+            return Err(GrantError::ClockAmbiguity);
+        }
+        self.last_seen_mono = now;
+        Ok(())
+    }
+
+    pub fn request_registration(
+        &mut self,
+        profile_id: ProfileId,
+        session_id: PrincipalSessionId,
+        endpoint_id: EndpointId,
+        principal_digest: [u8; 32],
+        rp_id: String,
+        ttl_secs: u64,
+    ) -> Result<RegistrationGrantId, GrantError> {
+        self.check_clock()?;
+
+        let normalized_rp = normalize_rp_id(&rp_id)?;
+
+        if ttl_secs == 0 {
+            return Err(GrantError::TtlZero);
+        }
+        if ttl_secs > self.max_ttl_secs {
+            return Err(GrantError::TtlExceedsProfileMax {
+                requested: ttl_secs,
+                max: self.max_ttl_secs,
+            });
+        }
+
+        let ttl = clamp_ttl(ttl_secs, self.max_ttl_secs);
+        let now = self.clock.monotonic_secs();
+        let grant_id = RegistrationGrantId::new();
+
+        let grant = RegistrationGrant {
+            id: grant_id.clone(),
+            profile_id,
+            session_id,
+            endpoint_id,
+            principal_digest,
+            rp_id: normalized_rp,
+            issued_at_mono: now,
+            expiry_mono: now.saturating_add(ttl),
+            state: AtomicU8::new(GRANT_STATE_ACTIVE),
+        };
+
+        self.grants.insert(grant_id.clone(), grant);
+        Ok(grant_id)
+    }
+
+    pub fn resolve_registration_grant(
+        &self,
+        grant_id: &RegistrationGrantId,
+        rp_id: &str,
+    ) -> Option<RegistrationGrantSnapshot> {
+        let grant = self.grants.get(grant_id)?;
+        let normalized_rp = normalize_rp_id(rp_id).ok()?;
+
+        if grant.state() != GrantState::Active {
+            return None;
+        }
+
+        let now = self.clock.monotonic_secs();
+        if now >= grant.expiry_mono {
+            return None;
+        }
+
+        if grant.rp_id != normalized_rp {
+            return None;
+        }
+
+        Some(RegistrationGrantSnapshot {
+            grant_id: grant.id.clone(),
+            profile_id: grant.profile_id.clone(),
+            rp_id: grant.rp_id.clone(),
+            state: grant.state(),
+            issued_at_mono: grant.issued_at_mono,
+            expiry_mono: grant.expiry_mono,
+        })
+    }
+
+    pub fn revoke_registration(&self, grant_id: &RegistrationGrantId) -> Result<(), GrantError> {
+        let grant = self
+            .grants
+            .get(grant_id)
+            .ok_or_else(|| GrantError::RegistrationGrantNotFound(grant_id.clone()))?;
+
+        let current = grant.state();
+        if current != GrantState::Active {
+            return Err(GrantError::RegistrationGrantNotActive(grant_id.clone()));
+        }
+
+        if grant.try_transition(GrantState::Active, GrantState::Revoked) {
+            Ok(())
+        } else {
+            Err(GrantError::RegistrationGrantNotActive(grant_id.clone()))
+        }
+    }
+
+    pub fn check_expired(&mut self) -> Vec<RegistrationGrantId> {
+        let now = self.clock.monotonic_secs();
+        let mut expired = Vec::new();
+
+        for (id, grant) in &self.grants {
+            if grant.state() == GrantState::Active && now >= grant.expiry_mono {
+                expired.push(id.clone());
+            }
+        }
+
+        for id in &expired {
+            if let Some(grant) = self.grants.get(id) {
+                let _ = grant.try_transition(GrantState::Active, GrantState::Expired);
+            }
+        }
+
+        expired
+    }
+
+    pub fn on_principal_exit(&mut self, session_id: &PrincipalSessionId) {
+        for grant in self.grants.values() {
+            if grant.session_id == *session_id && grant.state() == GrantState::Active {
+                let _ = grant.try_transition(GrantState::Active, GrantState::Revoked);
+            }
+        }
+    }
+
+    pub fn on_daemon_restart(&mut self) {
+        self.grants.clear();
+        self.last_seen_mono = 0;
+    }
+
+    fn fail_closed_all(&mut self) {
+        for grant in self.grants.values() {
+            if grant.state() == GrantState::Active {
+                let _ = grant.try_transition(GrantState::Active, GrantState::Revoked);
+            }
+        }
+    }
+
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.grants
+            .values()
+            .filter(|g| g.state() == GrantState::Active)
+            .count()
+    }
+
+    pub fn list_all_snapshots(&self) -> Vec<RegistrationGrantSnapshot> {
+        self.grants
+            .values()
+            .map(|grant| RegistrationGrantSnapshot {
+                grant_id: grant.id.clone(),
+                profile_id: grant.profile_id.clone(),
+                rp_id: grant.rp_id.clone(),
+                state: grant.state(),
+                issued_at_mono: grant.issued_at_mono,
+                expiry_mono: grant.expiry_mono,
+            })
+            .collect()
     }
 }
 
@@ -2174,5 +2460,346 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), unique.len());
+    }
+
+    fn make_reg_registry(clock: &Arc<MockClock>) -> RegistrationGrantRegistry {
+        RegistrationGrantRegistry::new(clock.clone(), 300)
+    }
+
+    #[test]
+    fn test_registration_grant_creation() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let gid = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "example.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        let snap = registry
+            .resolve_registration_grant(&gid, "example.com")
+            .unwrap();
+        assert_eq!(snap.state, GrantState::Active);
+        assert_eq!(snap.rp_id, "example.com");
+        assert_eq!(snap.profile_id, test_profile_id());
+    }
+
+    #[test]
+    fn test_registration_grant_rp_id_mismatch() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let gid = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "example.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .resolve_registration_grant(&gid, "other.com")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_registration_grant_expiry() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let gid = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "example.com".to_string(),
+                10,
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .resolve_registration_grant(&gid, "example.com")
+                .is_some()
+        );
+
+        clock.advance(Duration::from_secs(11));
+        let expired = registry.check_expired();
+        assert_eq!(expired.len(), 1);
+
+        assert!(
+            registry
+                .resolve_registration_grant(&gid, "example.com")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_registration_grant_revocation() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let gid = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "example.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        registry.revoke_registration(&gid).unwrap();
+
+        assert!(
+            registry
+                .resolve_registration_grant(&gid, "example.com")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_registration_grant_revoke_nonexistent() {
+        let clock = test_clock();
+        let registry = make_reg_registry(&clock);
+        let fake_id = RegistrationGrantId::new();
+
+        assert!(matches!(
+            registry.revoke_registration(&fake_id),
+            Err(GrantError::RegistrationGrantNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_registration_grant_ttl_zero_rejected() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let result = registry.request_registration(
+            test_profile_id(),
+            session,
+            test_endpoint_id(),
+            test_digest(1000),
+            "example.com".to_string(),
+            0,
+        );
+        assert!(matches!(result, Err(GrantError::TtlZero)));
+    }
+
+    #[test]
+    fn test_registration_grant_ttl_exceeds_max() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let result = registry.request_registration(
+            test_profile_id(),
+            session,
+            test_endpoint_id(),
+            test_digest(1000),
+            "example.com".to_string(),
+            999,
+        );
+        assert!(matches!(
+            result,
+            Err(GrantError::TtlExceedsProfileMax { .. })
+        ));
+    }
+
+    #[test]
+    fn test_registration_grant_wildcard_rp_rejected() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let result = registry.request_registration(
+            test_profile_id(),
+            session,
+            test_endpoint_id(),
+            test_digest(1000),
+            "*.example.com".to_string(),
+            60,
+        );
+        assert!(matches!(result, Err(GrantError::WildcardRpId(_))));
+    }
+
+    #[test]
+    fn test_registration_grant_rp_normalization() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let gid = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "Example.COM".to_string(),
+                60,
+            )
+            .unwrap();
+
+        let snap = registry
+            .resolve_registration_grant(&gid, "EXAMPLE.com")
+            .unwrap();
+        assert_eq!(snap.rp_id, "example.com");
+    }
+
+    #[test]
+    fn test_registration_grant_principal_exit() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let s1 = test_session_id();
+        let s2 = test_session_id();
+
+        let g1 = registry
+            .request_registration(
+                test_profile_id(),
+                s1.clone(),
+                test_endpoint_id(),
+                test_digest(1000),
+                "a.com".to_string(),
+                60,
+            )
+            .unwrap();
+        let g2 = registry
+            .request_registration(
+                test_profile_id(),
+                s2.clone(),
+                test_endpoint_id(),
+                test_digest(2000),
+                "b.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(registry.active_count(), 2);
+
+        registry.on_principal_exit(&s1);
+
+        assert!(registry.resolve_registration_grant(&g1, "a.com").is_none());
+        assert!(registry.resolve_registration_grant(&g2, "b.com").is_some());
+    }
+
+    #[test]
+    fn test_registration_grant_daemon_restart() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let _gid = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "example.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(registry.grant_count(), 1);
+
+        registry.on_daemon_restart();
+
+        assert_eq!(registry.grant_count(), 0);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn test_registration_grant_id_unique() {
+        let ids: Vec<String> = (0..100)
+            .map(|_| RegistrationGrantId::new().as_str().to_string())
+            .collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len());
+    }
+
+    #[test]
+    fn test_registration_grant_counts() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        assert_eq!(registry.grant_count(), 0);
+        assert_eq!(registry.active_count(), 0);
+
+        let g1 = registry
+            .request_registration(
+                test_profile_id(),
+                session.clone(),
+                test_endpoint_id(),
+                test_digest(1000),
+                "a.com".to_string(),
+                60,
+            )
+            .unwrap();
+        let _g2 = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "b.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        assert_eq!(registry.grant_count(), 2);
+        assert_eq!(registry.active_count(), 2);
+
+        registry.revoke_registration(&g1).unwrap();
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.grant_count(), 2);
+    }
+
+    #[test]
+    fn test_registration_grant_list_snapshots() {
+        let clock = test_clock();
+        let mut registry = make_reg_registry(&clock);
+        let session = test_session_id();
+
+        let _g1 = registry
+            .request_registration(
+                test_profile_id(),
+                session.clone(),
+                test_endpoint_id(),
+                test_digest(1000),
+                "a.com".to_string(),
+                60,
+            )
+            .unwrap();
+        let _g2 = registry
+            .request_registration(
+                test_profile_id(),
+                session,
+                test_endpoint_id(),
+                test_digest(1000),
+                "b.com".to_string(),
+                60,
+            )
+            .unwrap();
+
+        let snapshots = registry.list_all_snapshots();
+        assert_eq!(snapshots.len(), 2);
     }
 }

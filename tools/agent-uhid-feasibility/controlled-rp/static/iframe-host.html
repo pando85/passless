@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cross-Origin Iframe Host</title>
+<style>
+body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+h1 { color: #58a6ff; font-size: 1.2rem; }
+iframe { border: 2px solid #30363d; width: 600px; height: 300px; }
+#result { margin-top: 1rem; padding: 0.5rem; background: #161b22; border: 1px solid #30363d; }
+</style>
+</head>
+<body>
+<h1>Cross-Origin Iframe Host</h1>
+<p>Host origin: <span id="hostOrigin"></span></p>
+<iframe id="sender-iframe" src="" sandbox="allow-scripts allow-same-origin"></iframe>
+<div id="result">Waiting for iframe message...</div>
+<script>
+document.getElementById('hostOrigin').textContent = location.origin;
+const params = new URLSearchParams(location.search);
+const senderOrigin = params.get('senderOrigin') || 'http://127.0.0.1:8444';
+const iframe = document.getElementById('sender-iframe');
+iframe.src = senderOrigin + '/iframe-sender.html';
+window.__iframe_sender_result = null;
+window.addEventListener('message', function(event) {
+    if (event.origin === senderOrigin) {
+        window.__iframe_sender_result = {
+            origin: event.origin,
+            senderUrl: event.data && event.data.senderUrl,
+            type: event.data && event.data.type,
+            error: event.data && event.data.error
+        };
+        document.getElementById('result').textContent = JSON.stringify(window.__iframe_sender_result, null, 2);
+    }
+});
+</script>
+</body>
+</html>

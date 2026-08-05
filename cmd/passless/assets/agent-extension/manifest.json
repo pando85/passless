@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "passless-agent",
+  "version": "1.0.0",
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*/*"],
+      "js": ["broker.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://*/*"],
+      "js": ["main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}

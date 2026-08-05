@@ -964,6 +964,11 @@ pub enum AgentAdminAction {
         #[command(subcommand)]
         action: AdminSessionAction,
     },
+    /// Browser session management
+    Browser {
+        #[command(subcommand)]
+        action: AdminBrowserAction,
+    },
     /// Audit log management
     Audit {
         #[command(subcommand)]
@@ -1095,6 +1100,21 @@ pub enum AdminDelegationAction {
         #[arg(long)]
         confirm: bool,
     },
+    /// Request a new registration
+    RequestRegistration {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Relying party ID
+        #[arg(long, value_name = "RP_ID")]
+        rp: String,
+        /// Session TTL in seconds
+        #[arg(long, value_name = "SECONDS")]
+        session_ttl: u64,
+        /// Reason for the registration
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
 }
 
 /// Admin session actions
@@ -1121,6 +1141,21 @@ pub enum AdminSessionAction {
         /// Confirm the revocation
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+/// Admin browser actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminBrowserAction {
+    /// Launch a browser session with the agent extension
+    Launch {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Start URL to open in the browser
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
     },
 }
 

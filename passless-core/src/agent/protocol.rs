@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::ids::{
     CredentialRef, EndpointId, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
+    RegistrationGrantId,
 };
 
 #[cfg(target_os = "linux")]
@@ -23,6 +24,11 @@ const MAX_USER_NAME_LEN: usize = 256;
 const MAX_DISPLAY_NAME_LEN: usize = 256;
 const MAX_REASON_LEN: usize = 1024;
 const MAX_DIAGNOSTIC_LEN: usize = 4096;
+const MAX_REG_ORIGIN_LEN: usize = 2048;
+const MAX_REG_CHALLENGE_B64U_LEN: usize = 1376;
+const MAX_REG_USER_ID_B64U_LEN: usize = 88;
+const MAX_REG_EXCLUDE_CREDENTIALS: usize = 64;
+const MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN: usize = 344;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,6 +372,18 @@ pub enum AdminRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    RequestRegistration {
+        profile_id: ProfileId,
+        rp_id: String,
+        max_session_ttl: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    LaunchBrowser {
+        profile_id: ProfileId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start_url: Option<String>,
+    },
     Shutdown,
 }
 
@@ -400,10 +418,16 @@ pub enum AdminResponse {
     DelegationList(GrantList),
     DelegationRevoked,
     PrincipalLaunched(PrincipalLaunchedResponse),
+    BrowserLaunched(BrowserLaunchedResponse),
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
-    DelegationRequested { request_id: PendingRequestId },
+    DelegationRequested {
+        request_id: PendingRequestId,
+    },
+    RegistrationGranted {
+        registration_grant_id: RegistrationGrantId,
+    },
     ShutdownAccepted,
 }
 
@@ -463,6 +487,7 @@ pub enum PrincipalRequest {
         request_json: String,
         timeout_ms: u32,
     },
+    SignAssertion(SignAssertionRequest),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -502,6 +527,61 @@ pub enum PrincipalResponse {
     BrowserControl {
         messages: Vec<String>,
     },
+    SignAssertionResult(SignAssertionResponse),
+}
+
+const MAX_ORIGIN_LEN: usize = 512;
+const MAX_B64U_LEN: usize = 1024;
+const MAX_ALLOW_CREDENTIALS: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterCredentialRequest {
+    pub origin: String,
+    pub rp_id: String,
+    pub challenge_b64u: String,
+    pub user_id_b64u: String,
+    pub user_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rp_name: Option<String>,
+    pub exclude_credentials: Vec<String>,
+    pub user_verification: bool,
+    pub cross_origin: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterCredentialResponse {
+    pub credential_id_b64u: String,
+    pub authenticator_data_b64u: String,
+    pub attestation_object_b64u: String,
+    pub client_data_json_b64u: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignAssertionRequest {
+    pub origin: String,
+    pub rp_id: String,
+    pub challenge_b64u: String,
+    #[serde(default)]
+    pub allow_credentials: Vec<String>,
+    #[serde(default)]
+    pub user_verification: bool,
+    #[serde(default)]
+    pub cross_origin: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignAssertionResponse {
+    pub credential_id_b64u: String,
+    pub authenticator_data_b64u: String,
+    pub signature_b64u: String,
+    pub user_handle_b64u: String,
+    pub client_data_json_b64u: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -664,6 +744,15 @@ pub struct PrincipalLaunchedResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct BrowserLaunchedResponse {
+    pub lease_id: String,
+    pub profile_id: String,
+    pub pid: u32,
+    pub start_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalWaitResponse {
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -691,7 +780,6 @@ pub struct DoctorCheck {
 #[serde(rename_all = "snake_case")]
 pub enum EndpointDiagnosticState {
     Ready,
-    LazyDelegated,
     Unavailable,
 }
 
@@ -699,7 +787,6 @@ impl fmt::Display for EndpointDiagnosticState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ready => write!(f, "ready"),
-            Self::LazyDelegated => write!(f, "lazy_delegated"),
             Self::Unavailable => write!(f, "unavailable"),
         }
     }
@@ -1096,6 +1183,7 @@ impl Validate for AdminRequest {
             | Self::RevokeDelegation { .. } => {}
             Self::ShowProfile { .. } | Self::ShowPolicy { .. } | Self::ProfileCheck { .. } => {}
             Self::AuditExport { .. } => {}
+            Self::LaunchBrowser { .. } => {}
             Self::LaunchPrincipal { command, .. } => {
                 if command.is_empty() {
                     errors.push("launch_principal: command must not be empty".into());
@@ -1126,6 +1214,12 @@ impl Validate for AdminRequest {
             }
             Self::TerminatePrincipal { .. } => {}
             Self::RequestDelegation { rp_id, reason, .. } => {
+                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+                if let Some(r) = reason {
+                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
+                }
+            }
+            Self::RequestRegistration { rp_id, reason, .. } => {
                 check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
                 if let Some(r) = reason {
                     check_str(r, "reason", MAX_REASON_LEN, &mut errors);
@@ -1221,6 +1315,81 @@ impl Validate for PrincipalRequest {
                         MAX_CDP_TIMEOUT_MS
                     ));
                 }
+            }
+            Self::SignAssertion(req) => {
+                check_str(&req.origin, "origin", MAX_ORIGIN_LEN, &mut errors);
+                check_str(&req.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+                check_str(
+                    &req.challenge_b64u,
+                    "challenge_b64u",
+                    MAX_B64U_LEN,
+                    &mut errors,
+                );
+                if req.challenge_b64u.is_empty() {
+                    errors.push("sign_assertion: challenge_b64u must not be empty".into());
+                }
+                if req.allow_credentials.len() > MAX_ALLOW_CREDENTIALS {
+                    errors.push(format!(
+                        "sign_assertion: allow_credentials exceeds maximum length {} (got {})",
+                        MAX_ALLOW_CREDENTIALS,
+                        req.allow_credentials.len()
+                    ));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationErrors(errors))
+        }
+    }
+}
+
+impl Validate for RegisterCredentialRequest {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errors = Vec::new();
+        check_str(&self.origin, "origin", MAX_REG_ORIGIN_LEN, &mut errors);
+        check_str(&self.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+        check_str(
+            &self.challenge_b64u,
+            "challenge_b64u",
+            MAX_REG_CHALLENGE_B64U_LEN,
+            &mut errors,
+        );
+        if self.challenge_b64u.is_empty() {
+            errors.push("challenge_b64u: must not be empty".into());
+        }
+        check_str(
+            &self.user_id_b64u,
+            "user_id_b64u",
+            MAX_REG_USER_ID_B64U_LEN,
+            &mut errors,
+        );
+        if self.user_id_b64u.is_empty() {
+            errors.push("user_id_b64u: must not be empty".into());
+        }
+        check_str(&self.user_name, "user_name", MAX_USER_NAME_LEN, &mut errors);
+        if let Some(ref name) = self.user_display_name {
+            check_str(name, "user_display_name", MAX_DISPLAY_NAME_LEN, &mut errors);
+        }
+        if let Some(ref name) = self.rp_name {
+            check_str(name, "rp_name", MAX_DISPLAY_NAME_LEN, &mut errors);
+        }
+        if self.exclude_credentials.len() > MAX_REG_EXCLUDE_CREDENTIALS {
+            errors.push(format!(
+                "exclude_credentials: exceeds maximum count {} (got {})",
+                MAX_REG_EXCLUDE_CREDENTIALS,
+                self.exclude_credentials.len()
+            ));
+        }
+        for (i, cred) in self.exclude_credentials.iter().enumerate() {
+            if cred.len() > MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN {
+                errors.push(format!(
+                    "exclude_credentials[{}]: exceeds maximum length {} (got {})",
+                    i,
+                    MAX_REG_EXCLUDE_CREDENTIAL_ENTRY_LEN,
+                    cred.len()
+                ));
             }
         }
         if errors.is_empty() {
@@ -2799,5 +2968,113 @@ mod tests {
             profile_id: ProfileId::new("test").unwrap(),
         };
         assert!(req.validate().is_ok());
+    }
+
+    fn valid_sign_request() -> SignAssertionRequest {
+        SignAssertionRequest {
+            origin: "https://example.com".to_string(),
+            rp_id: "example.com".to_string(),
+            challenge_b64u: "dGVzdA".to_string(),
+            allow_credentials: vec![],
+            user_verification: false,
+            cross_origin: false,
+        }
+    }
+
+    #[test]
+    fn sign_assertion_valid_roundtrip() {
+        let req = valid_sign_request();
+        assert!(
+            PrincipalRequest::SignAssertion(req.clone())
+                .validate()
+                .is_ok()
+        );
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: SignAssertionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn sign_assertion_empty_origin_rejected() {
+        let mut req = valid_sign_request();
+        req.origin = String::new();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("origin")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_origin_rejected() {
+        let mut req = valid_sign_request();
+        req.origin = "x".repeat(MAX_ORIGIN_LEN + 1);
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("origin")));
+    }
+
+    #[test]
+    fn sign_assertion_empty_rp_id_rejected() {
+        let mut req = valid_sign_request();
+        req.rp_id = String::new();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("rp_id")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_rp_id_rejected() {
+        let mut req = valid_sign_request();
+        req.rp_id = "x".repeat(MAX_RP_ID_LEN + 1);
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("rp_id")));
+    }
+
+    #[test]
+    fn sign_assertion_empty_challenge_rejected() {
+        let mut req = valid_sign_request();
+        req.challenge_b64u = String::new();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("challenge_b64u")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_challenge_rejected() {
+        let mut req = valid_sign_request();
+        req.challenge_b64u = "x".repeat(MAX_B64U_LEN + 1);
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("challenge_b64u")));
+    }
+
+    #[test]
+    fn sign_assertion_oversized_allow_credentials_rejected() {
+        let mut req = valid_sign_request();
+        req.allow_credentials = vec!["x".repeat(64); MAX_ALLOW_CREDENTIALS + 1];
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("allow_credentials")));
+    }
+
+    #[test]
+    fn sign_assertion_null_in_origin_rejected() {
+        let mut req = valid_sign_request();
+        req.origin = "https://exam\0ple.com".to_string();
+        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("origin")));
+    }
+
+    #[test]
+    fn sign_assertion_user_verification_roundtrip() {
+        let mut req = valid_sign_request();
+        req.user_verification = true;
+        assert!(
+            PrincipalRequest::SignAssertion(req.clone())
+                .validate()
+                .is_ok()
+        );
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: SignAssertionRequest = serde_json::from_str(&json).unwrap();
+        assert!(decoded.user_verification);
+    }
+
+    #[test]
+    fn sign_assertion_rejects_unknown_fields() {
+        let json = r#"{"origin":"https://example.com","rp_id":"example.com","challenge_b64u":"dGVzdA","allow_credentials":[],"user_verification":false,"cross_origin":false,"extra":"bad"}"#;
+        assert!(serde_json::from_str::<SignAssertionRequest>(json).is_err());
     }
 }

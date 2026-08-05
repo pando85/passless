@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use passless_config_doc::ConfigDoc;
@@ -30,15 +30,12 @@ const HUMAN_PRODUCT_ID: u16 = 0x0a37;
 pub enum AgentMode {
     #[serde(rename = "isolated")]
     Isolated,
-    #[serde(rename = "delegated-session")]
-    DelegatedSession,
 }
 
 impl fmt::Display for AgentMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentMode::Isolated => write!(f, "isolated"),
-            AgentMode::DelegatedSession => write!(f, "delegated-session"),
         }
     }
 }
@@ -49,11 +46,7 @@ impl std::str::FromStr for AgentMode {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "isolated" => Ok(AgentMode::Isolated),
-            "delegated-session" => Ok(AgentMode::DelegatedSession),
-            _ => Err(format!(
-                "Invalid agent mode '{}'. Must be: isolated, delegated-session",
-                s
-            )),
+            _ => Err(format!("Invalid agent mode '{}'. Must be: isolated", s)),
         }
     }
 }
@@ -201,20 +194,6 @@ pub struct AgentRpRule {
     pub rp_id: String,
     pub register: AgentCeremonyPolicy,
     pub authenticate: AgentCeremonyPolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DelegatedRegistrationStorage {
-    Human,
-}
-
-impl fmt::Display for DelegatedRegistrationStorage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Human => f.write_str("human"),
-        }
-    }
 }
 
 fn default_gpg_backend() -> String {
@@ -510,8 +489,6 @@ pub struct AgentProfileConfig {
 
     #[serde(default)]
     pub rules: Vec<AgentRpRule>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegated_registration_storage: Option<DelegatedRegistrationStorage>,
 
     pub device: DeviceIdentity,
 
@@ -539,7 +516,7 @@ impl AgentProfileConfig {
             .iter()
             .map(|rp_id| AgentRpRule {
                 rp_id: rp_id.clone(),
-                register: if self.registration_allowed && self.mode == AgentMode::Isolated {
+                register: if self.registration_allowed {
                     AgentCeremonyPolicy::legacy_confirm(self.require_uv)
                 } else {
                     AgentCeremonyPolicy::deny()
@@ -640,108 +617,7 @@ impl AgentProfileConfig {
         }
 
         match self.mode {
-            AgentMode::DelegatedSession => {
-                if self.rules.is_empty() && !self.require_uv {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated-session requires require_uv = true",
-                        profile_id
-                    )));
-                }
-                if self.storage.is_some() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated-session must not specify isolated \
-                         backend storage fields",
-                        profile_id
-                    )));
-                }
-                if self.allows_registration() && self.delegated_registration_storage.is_none() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated registration requires delegated_registration_storage",
-                        profile_id,
-                    )));
-                }
-                if self.allows_authentication() {
-                    let refs = self.credential_refs.as_ref().ok_or_else(|| {
-                        Error::Config(format!(
-                            "agent profile '{}': delegated authentication requires credential_refs",
-                            profile_id
-                        ))
-                    })?;
-                    if refs.is_empty() {
-                        return Err(Error::Config(format!(
-                            "agent profile '{}': credential_refs must not be empty",
-                            profile_id
-                        )));
-                    }
-                }
-                if self.max_grant_ttl.is_none() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated-session requires max_grant_ttl",
-                        profile_id
-                    )));
-                }
-                if self.max_session_ttl.is_none() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated-session requires max_session_ttl",
-                        profile_id
-                    )));
-                }
-                if self.browser_command.is_none() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated-session requires browser_command",
-                        profile_id
-                    )));
-                }
-
-                let cdp_port_mode = self.browser_cdp_expose == Some(CdpExposeMode::Port);
-
-                if let Some(ref browser_user) = self.browser_user {
-                    if browser_user.is_empty() {
-                        return Err(Error::Config(format!(
-                            "agent profile '{}': browser_user must not be empty",
-                            profile_id
-                        )));
-                    }
-                    if browser_user.contains('\0') {
-                        return Err(Error::Config(format!(
-                            "agent profile '{}': browser_user must not contain NUL bytes",
-                            profile_id
-                        )));
-                    }
-                    if !cdp_port_mode && *browser_user == self.principal_user {
-                        return Err(Error::Config(format!(
-                            "agent profile '{}': browser_user must differ from principal_user \
-                             (unless browser_cdp_expose = \"port\")",
-                            profile_id
-                        )));
-                    }
-                } else if !cdp_port_mode {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': delegated-session requires browser_user \
-                         (or set browser_cdp_expose = \"port\" to use principal_user)",
-                        profile_id
-                    )));
-                }
-
-                let browser_runtime_root = self.browser_runtime_root.as_ref().ok_or_else(|| {
-                    Error::Config(format!(
-                        "agent profile '{}': delegated-session requires browser_runtime_root",
-                        profile_id
-                    ))
-                })?;
-                validate_browser_runtime_root(browser_runtime_root, profile_id)?;
-
-                if let Some(ref url) = self.start_url {
-                    validate_start_url(url, &self.allowed_rp_ids(), profile_id)?;
-                }
-            }
             AgentMode::Isolated => {
-                if self.delegated_registration_storage.is_some() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': isolated mode must not specify delegated_registration_storage",
-                        profile_id,
-                    )));
-                }
                 if self.storage.is_none() {
                     return Err(Error::Config(format!(
                         "agent profile '{}': isolated mode requires storage backend configuration",
@@ -777,83 +653,6 @@ impl AgentProfileConfig {
 
         Ok(())
     }
-}
-
-fn validate_browser_runtime_root(path: &Path, profile_id: &ProfileId) -> Result<()> {
-    let path_str = path.to_string_lossy();
-    if path_str.contains('\0') {
-        return Err(Error::Config(format!(
-            "agent profile '{}': browser_runtime_root must not contain NUL bytes",
-            profile_id
-        )));
-    }
-    if !path.is_absolute() {
-        return Err(Error::Config(format!(
-            "agent profile '{}': browser_runtime_root must be an absolute path",
-            profile_id
-        )));
-    }
-    if path_str.len() > 4096 {
-        return Err(Error::Config(format!(
-            "agent profile '{}': browser_runtime_root path too long",
-            profile_id
-        )));
-    }
-    Ok(())
-}
-
-fn validate_start_url(raw_url: &str, rp_ids: &[String], profile_id: &ProfileId) -> Result<()> {
-    let rest = raw_url.strip_prefix("https://").ok_or_else(|| {
-        Error::Config(format!(
-            "agent profile '{}': start_url must use HTTPS scheme",
-            profile_id,
-        ))
-    })?;
-
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-
-    if host.is_empty() {
-        return Err(Error::Config(format!(
-            "agent profile '{}': start_url must have a valid host",
-            profile_id,
-        )));
-    }
-
-    let host_normalized = host.to_ascii_lowercase();
-
-    if !is_valid_dns_name(&host_normalized) && !is_ip_address(&host_normalized) {
-        return Err(Error::Config(format!(
-            "agent profile '{}': start_url host '{}' is not a valid hostname",
-            profile_id, host,
-        )));
-    }
-
-    let matching: Vec<&str> = rp_ids
-        .iter()
-        .filter(|rp_id| {
-            let rp = rp_id.trim().to_ascii_lowercase();
-            host_normalized == rp || host_normalized.ends_with(&format!(".{}", rp))
-        })
-        .map(|s| s.as_str())
-        .collect();
-
-    if matching.len() != 1 {
-        return Err(Error::Config(format!(
-            "agent profile '{}': start_url host '{}' must match exactly one allowed RP ID, matched {:?}",
-            profile_id, host, matching,
-        )));
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigDoc)]
@@ -1229,32 +1028,13 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_mode_serde_delegated_session() {
-        let mode = AgentMode::DelegatedSession;
-        let json = serde_json::to_string(&mode).unwrap();
-        assert_eq!(json, "\"delegated-session\"");
-        let mode2: AgentMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(mode, mode2);
-    }
-
-    #[test]
     fn test_agent_mode_from_str() {
         assert_eq!(
             "isolated".parse::<AgentMode>().unwrap(),
             AgentMode::Isolated
         );
-        assert_eq!(
-            "delegated-session".parse::<AgentMode>().unwrap(),
-            AgentMode::DelegatedSession
-        );
         assert!("delegated".parse::<AgentMode>().is_err());
         assert!("invalid".parse::<AgentMode>().is_err());
-    }
-
-    #[test]
-    fn test_agent_mode_rejects_bare_delegated() {
-        let result: std::result::Result<AgentMode, _> = serde_json::from_str("\"delegated\"");
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1268,35 +1048,6 @@ mod tests {
     fn test_agent_config_validate_disabled_skips_checks() {
         let config = AgentConfig::default();
         assert!(config.validate(None).is_ok());
-    }
-
-    fn make_delegated_profile() -> AgentProfileConfig {
-        AgentProfileConfig {
-            mode: AgentMode::DelegatedSession,
-            principal_user: "test-user".to_string(),
-            rp_ids: vec!["example.com".to_string()],
-            require_uv: true,
-            credential_refs: Some(vec![CredentialRef::with_default_domain(b"user-github")]),
-            max_grant_ttl: Some(BoundedDuration::new(120).unwrap()),
-            max_session_ttl: Some(BoundedDuration::new(900).unwrap()),
-            storage: None,
-            registration_allowed: false,
-            rules: vec![],
-            delegated_registration_storage: None,
-            device: DeviceIdentity {
-                name: "passless-agent-test".to_string(),
-                phys: "test-phys".to_string(),
-                uniq: "test-uniq-001".to_string(),
-                vendor_id: 0x1234,
-                product_id: 0x5678,
-            },
-            start_url: None,
-            browser_command: Some(vec!["firefox".to_string()]),
-            browser_user: Some("browser-user".to_string()),
-            browser_runtime_root: Some(PathBuf::from("/var/run/passless-browser")),
-            browser_cdp_expose: None,
-            browser_cdp_port: None,
-        }
     }
 
     fn make_isolated_profile() -> AgentProfileConfig {
@@ -1314,7 +1065,6 @@ mod tests {
             }),
             registration_allowed: true,
             rules: vec![],
-            delegated_registration_storage: None,
             device: DeviceIdentity {
                 name: "passless-agent-iso".to_string(),
                 phys: "iso-phys".to_string(),
@@ -1332,55 +1082,12 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_delegated_session_requires_uv() {
-        let mut profile = make_delegated_profile();
-        profile.require_uv = false;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("require_uv"));
-    }
-
-    #[test]
-    fn test_profile_delegated_session_requires_credential_refs() {
-        let mut profile = make_delegated_profile();
-        profile.credential_refs = None;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("credential_refs"));
-    }
-
-    #[test]
-    fn test_profile_delegated_session_requires_grant_ttl() {
-        let mut profile = make_delegated_profile();
-        profile.max_grant_ttl = None;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("max_grant_ttl"));
-    }
-
-    #[test]
-    fn test_profile_delegated_session_requires_session_ttl() {
-        let mut profile = make_delegated_profile();
-        profile.max_session_ttl = None;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("max_session_ttl"));
-    }
-
-    #[test]
     fn test_profile_isolated_requires_storage() {
         let mut profile = make_isolated_profile();
         profile.storage = None;
         let pid = ProfileId::new("test").unwrap();
         let err = profile.validate(&pid).unwrap_err();
         assert!(err.to_string().contains("storage"));
-    }
-
-    #[test]
-    fn test_profile_delegated_valid() {
-        let profile = make_delegated_profile();
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
     }
 
     #[test]
@@ -1497,31 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delegated_registration_requires_explicit_storage_target() {
-        let mut profile = make_delegated_profile();
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
-        profile.rules = vec![AgentRpRule {
-            rp_id: "example.com".to_string(),
-            register: policy(
-                AgentAuthorization::Allow,
-                UserPresenceSource::Policy,
-                UserVerificationSource::Policy,
-            ),
-            authenticate: AgentCeremonyPolicy::deny(),
-        }];
-        profile.credential_refs = None;
-
-        let profile_id = ProfileId::new("test").unwrap();
-        let err = profile.validate(&profile_id).unwrap_err();
-        assert!(err.to_string().contains("delegated_registration_storage"));
-
-        profile.delegated_registration_storage = Some(DelegatedRegistrationStorage::Human);
-        assert!(profile.validate(&profile_id).is_ok());
-    }
-
-    #[test]
     fn test_explicit_rules_toml_roundtrip() {
         let input = r#"
 mode = "isolated"
@@ -1587,49 +1269,6 @@ pin_path = "/tmp/p"
 "#;
         let result: std::result::Result<AgentConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_config_toml_delegated_session_roundtrip() {
-        let toml_str = r#"
-enabled = true
-audit_path = "/var/lib/passless/audit"
-
-[profiles.opencode]
-mode = "delegated-session"
-principal_user = "passless-opencode"
-rp_ids = ["github.com"]
-require_uv = true
-credential_refs = ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]
-max_grant_ttl = 120
-max_session_ttl = 900
-browser_command = ["firefox", "--kiosk"]
-start_url = "https://github.com/dashboard"
-browser_user = "passless-browser"
-browser_runtime_root = "/var/run/passless-browser"
-
-[profiles.opencode.device]
-name = "passless-agent-opencode"
-phys = "opencode-phys"
-uniq = "opencode-uniq"
-vendor_id = 4660
-product_id = 22136
-"#;
-        let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.profiles.len(), 1);
-        let profile = config.profiles.get("opencode").unwrap();
-        assert_eq!(profile.mode, AgentMode::DelegatedSession);
-        assert_eq!(profile.principal_user, "passless-opencode");
-        assert!(profile.require_uv);
-        assert_eq!(profile.browser_user.as_deref(), Some("passless-browser"));
-        assert_eq!(
-            profile
-                .browser_runtime_root
-                .as_ref()
-                .map(|p| p.display().to_string()),
-            Some("/var/run/passless-browser".to_string())
-        );
     }
 
     #[test]
@@ -1733,7 +1372,6 @@ verbose = false
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: device.clone(),
                 start_url: None,
                 browser_command: None,
@@ -1759,7 +1397,6 @@ verbose = false
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device,
                 start_url: None,
                 browser_command: None,
@@ -1797,7 +1434,6 @@ verbose = false
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -1845,7 +1481,6 @@ verbose = false
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -1897,15 +1532,6 @@ product_id = 2
         use super::super::ids::CredentialRef;
         let _cred_ref = CredentialRef::with_default_domain(b"test-credential");
         assert_eq!(_cred_ref.as_bytes().len(), 32);
-    }
-
-    #[test]
-    fn test_profile_principal_user_required() {
-        let mut profile = make_delegated_profile();
-        profile.principal_user = String::new();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("principal_user"));
     }
 
     #[test]
@@ -2037,82 +1663,6 @@ product_id = 2
     }
 
     #[test]
-    fn test_browser_command_empty_rejected() {
-        let mut profile = make_delegated_profile();
-        profile.browser_command = Some(vec![]);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_command"));
-    }
-
-    #[test]
-    fn test_browser_command_nul_in_arg_rejected() {
-        let mut profile = make_delegated_profile();
-        profile.browser_command = Some(vec!["firefox\0--flag".to_string()]);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_delegated_session_requires_browser_command() {
-        let mut profile = make_delegated_profile();
-        profile.browser_command = None;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_command"));
-    }
-
-    #[test]
-    fn test_delegated_session_start_url_https_required() {
-        let mut profile = make_delegated_profile();
-        profile.start_url = Some("http://example.com/dashboard".to_string());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("HTTPS"));
-    }
-
-    #[test]
-    fn test_delegated_session_start_url_must_match_rp_id() {
-        let mut profile = make_delegated_profile();
-        profile.rp_ids = vec!["example.com".to_string()];
-        profile.start_url = Some("https://other.com/dashboard".to_string());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("exactly one"));
-    }
-
-    #[test]
-    fn test_delegated_session_start_url_must_match_exactly_one_rp_id() {
-        let mut profile = make_delegated_profile();
-        profile.rp_ids = vec!["example.com".to_string(), "example.org".to_string()];
-        profile.start_url = Some("https://other.com/dashboard".to_string());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("exactly one"));
-    }
-
-    #[test]
-    fn test_delegated_session_start_url_valid_subdomain() {
-        let mut profile = make_delegated_profile();
-        profile.rp_ids = vec!["example.com".to_string()];
-        profile.start_url = Some("https://app.example.com/dashboard".to_string());
-        profile.browser_command = Some(vec!["firefox".to_string()]);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_delegated_session_start_url_exact_host_match() {
-        let mut profile = make_delegated_profile();
-        profile.rp_ids = vec!["example.com".to_string()];
-        profile.start_url = Some("https://example.com/dashboard".to_string());
-        profile.browser_command = Some(vec!["firefox".to_string()]);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
     fn test_enabled_requires_audit_path() {
         let config = AgentConfig {
             enabled: true,
@@ -2152,7 +1702,6 @@ product_id = 2
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "overlap-test".to_string(),
                     phys: "p".to_string(),
@@ -2198,7 +1747,6 @@ product_id = 2
                     }),
                     registration_allowed: false,
                     rules: vec![],
-                    delegated_registration_storage: None,
                     device: DeviceIdentity {
                         name: format!("dev-{}", name),
                         phys: format!("phys-{}", name),
@@ -2329,7 +1877,6 @@ backend_type = "local"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2387,7 +1934,6 @@ backend_type = "local"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2437,7 +1983,6 @@ backend_type = "local"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2519,40 +2064,6 @@ product_id = 2
         let result: std::result::Result<AgentConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pin_store"));
-    }
-
-    #[test]
-    fn test_delegated_session_rejects_storage_local() {
-        let toml_str = r#"
-enabled = true
-audit_path = "/tmp/audit"
-
-[profiles.bot]
-mode = "delegated-session"
-principal_user = "u"
-rp_ids = ["example.com"]
-require_uv = true
-credential_refs = ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]
-max_grant_ttl = 120
-max_session_ttl = 900
-browser_command = ["firefox"]
-
-[profiles.bot.device]
-name = "n"
-phys = "p"
-uniq = "u"
-vendor_id = 1
-product_id = 2
-
-[profiles.bot.storage.local]
-path = "/tmp/creds"
-pin_path = "/tmp/pin"
-"#;
-        let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        let pid = ProfileId::new("bot").unwrap();
-        let err = config.profiles["bot"].validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("delegated-session"));
-        assert!(err.to_string().contains("storage"));
     }
 
     #[test]
@@ -2817,7 +2328,6 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2849,7 +2359,6 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "b".to_string(),
                     phys: "b".to_string(),
@@ -2924,7 +2433,6 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -2956,7 +2464,6 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "b".to_string(),
                     phys: "b".to_string(),
@@ -3002,7 +2509,6 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: DeviceIdentity {
                     name: "a".to_string(),
                     phys: "a".to_string(),
@@ -3052,60 +2558,6 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         let cred = storage.credential_state_path();
         let pin = storage.pin_state_path();
         assert_ne!(cred, pin);
-    }
-
-    #[test]
-    fn test_delegated_session_requires_browser_user() {
-        let mut profile = make_delegated_profile();
-        profile.browser_user = None;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_user"));
-    }
-
-    #[test]
-    fn test_delegated_session_browser_user_must_not_be_empty() {
-        let mut profile = make_delegated_profile();
-        profile.browser_user = Some(String::new());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_user"));
-    }
-
-    #[test]
-    fn test_delegated_session_browser_user_must_not_contain_nul() {
-        let mut profile = make_delegated_profile();
-        profile.browser_user = Some("browser\0user".to_string());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_delegated_session_browser_user_must_differ_from_principal() {
-        let mut profile = make_delegated_profile();
-        profile.browser_user = Some("test-user".to_string());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("differ"));
-    }
-
-    #[test]
-    fn test_delegated_session_requires_browser_runtime_root() {
-        let mut profile = make_delegated_profile();
-        profile.browser_runtime_root = None;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_runtime_root"));
-    }
-
-    #[test]
-    fn test_delegated_session_browser_runtime_root_must_be_absolute() {
-        let mut profile = make_delegated_profile();
-        profile.browser_runtime_root = Some(PathBuf::from("relative/path"));
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("absolute"));
     }
 
     #[test]
@@ -3218,43 +2670,5 @@ portable = true
             }
             other => panic!("expected Tpm storage, got: {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_port_mode_allows_same_browser_and_principal_user() {
-        let mut profile = make_delegated_profile();
-        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
-        profile.browser_user = Some(profile.principal_user.clone());
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_port_mode_allows_browser_user_omitted() {
-        let mut profile = make_delegated_profile();
-        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
-        profile.browser_user = None;
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_pipe_mode_rejects_same_browser_and_principal_user() {
-        let mut profile = make_delegated_profile();
-        profile.browser_cdp_expose = Some(CdpExposeMode::Pipe);
-        profile.browser_user = Some(profile.principal_user.clone());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_user must differ"));
-    }
-
-    #[test]
-    fn test_pipe_mode_default_rejects_same_browser_and_principal_user() {
-        let mut profile = make_delegated_profile();
-        profile.browser_cdp_expose = None;
-        profile.browser_user = Some(profile.principal_user.clone());
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_user must differ"));
     }
 }

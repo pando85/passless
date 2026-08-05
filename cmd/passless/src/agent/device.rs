@@ -815,7 +815,7 @@ mod tests {
         let registry = EndpointRegistry::new(10);
         let binding = EndpointBinding {
             profile_id: ProfileId::new("my-profile").unwrap(),
-            mode: AgentMode::DelegatedSession,
+            mode: AgentMode::Isolated,
         };
 
         let snapshot = match registry.create_endpoint(binding.clone()) {

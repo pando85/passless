@@ -26,6 +26,7 @@ echo "=== Phase 1: shellcheck ===" >&2
 shellcheck -S warning \
     tools/agent-validation/run.sh \
     tools/agent-validation/validate \
+    tools/agent-validation/real-rp-runner.sh \
     tools/agent-validation/lib/*.sh \
     tools/agent-validation/stages/*.sh \
     tools/agent-validation/browser/*.sh \
@@ -43,6 +44,8 @@ shell_tests=(
     tools/agent-validation/tests/test-uninstall-rehearsal.sh
     tools/agent-validation/tests/test-fault-injection.sh
     tools/agent-validation/tests/test-secret-scanning.sh
+    tools/agent-validation/tests/test-controlled-chromium.sh
+    tools/agent-validation/tests/test-real-rp.sh
 )
 
 echo "=== Phase 2: shell tests ===" >&2
@@ -50,6 +53,12 @@ for test_script in "${shell_tests[@]}"; do
     echo "--- Running: $test_script ---" >&2
     timeout 300s bash "$test_script"
 done
+
+echo "=== Phase 2b: node tests (CDP event capture) ===" >&2
+node --test tools/agent-validation/tests/test-cdp-event-capture.js
+
+echo "=== Phase 2c: node tests (Gate C real-RP driver) ===" >&2
+node --test tools/agent-validation/tests/test-gate-c-real-rp.js
 
 echo "=== Phase 3: cargo test (parallel) ===" >&2
 timeout 600s cargo test --all-features -- \

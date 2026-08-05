@@ -683,6 +683,12 @@ pub enum PolicyDenyReason {
     SessionMismatch,
     UvRequired,
     StaleGeneration,
+    OriginInvalid,
+    OriginMismatch,
+    AllowCredentialsMismatch,
+    AuditFailure,
+    CounterPersistenceFailure,
+    GrantRevoked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2396,7 +2402,7 @@ mod tests {
             .build(),
             PromptTimeoutBuilder::new(
                 pid.clone(),
-                PromptMode::DelegatedSession,
+                PromptMode::Isolated,
                 PromptAction::Authenticate,
                 "example.com",
                 60,

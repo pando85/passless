@@ -12,8 +12,7 @@ use passless_core::agent::{
 
 use super::browser::Clock;
 use super::grant::{
-    CeremonyId, ClaimIntent, GrantError, GrantQueryParams, GrantRegistry, GrantRequestId,
-    GrantRequestParams,
+    CeremonyId, ClaimIntent, GrantError, GrantRegistry, GrantRequestId, GrantRequestParams,
 };
 use super::intent::{
     AdminAuthority, CreateIntentParams, IntentConsumeInfo, IntentError, IntentQueryParams,
@@ -182,7 +181,6 @@ pub struct PolicySnapshot {
     pub registration_allowed: bool,
     pub allowed_actions: BTreeSet<String>,
     pub rules: Vec<AgentRpRule>,
-    pub delegated_registration_storage: String,
 }
 
 impl PolicySnapshot {
@@ -249,6 +247,17 @@ impl PolicyGenerationSnapshot {
     pub fn is_stale(&self, max_age: Duration, now_mono: u64) -> bool {
         now_mono.saturating_sub(self.created_at_mono) > max_age.as_secs()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GrantSignSnapshot {
+    pub grant_id: GrantId,
+    pub profile_id: ProfileId,
+    pub rp_ids: Vec<String>,
+    pub credential_refs: Vec<CredentialRef>,
+    pub state: super::grant::GrantState,
+    pub expiry_mono: u64,
+    pub is_revoked: bool,
 }
 
 pub struct AuthorizationHandle {
@@ -604,6 +613,7 @@ pub struct PolicyRuntime {
     current: RwLock<Arc<PolicyGenerationSnapshot>>,
     intents: Mutex<IntentStore>,
     grants: Mutex<HashMap<String, GrantRegistry>>,
+    registration_grants: Mutex<HashMap<String, super::grant::RegistrationGrantRegistry>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
@@ -639,6 +649,7 @@ impl PolicyRuntime {
             current: RwLock::new(gen_arc),
             intents: Mutex::new(intent_store),
             grants: Mutex::new(grant_registries),
+            registration_grants: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashMap::new()),
             clock,
@@ -734,7 +745,7 @@ impl PolicyRuntime {
             normalized_rp_ids: normalized_rp_ids.clone(),
             credential_refs: credential_refs.clone(),
             allowed_actions: allowed_actions.iter().cloned().collect(),
-            registration_allowed: config.registration_allowed,
+            registration_allowed: config.registration_allowed || config.allows_registration(),
             require_uv: config.require_uv,
             max_concurrent_grants,
             max_grant_ttl: max_grant_ttl_secs,
@@ -756,10 +767,6 @@ impl PolicyRuntime {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             rules: rules.clone(),
-            delegated_registration_storage: config
-                .delegated_registration_storage
-                .map(|target| target.to_string())
-                .unwrap_or_default(),
         };
 
         let policy = Policy::from_params(params)
@@ -778,13 +785,9 @@ impl PolicyRuntime {
             max_session_ttl_secs,
             max_concurrent_grants,
             require_uv: config.require_uv,
-            registration_allowed: config.registration_allowed,
+            registration_allowed: config.registration_allowed || config.allows_registration(),
             allowed_actions,
             rules,
-            delegated_registration_storage: config
-                .delegated_registration_storage
-                .map(|target| target.to_string())
-                .unwrap_or_default(),
         })
     }
 
@@ -812,6 +815,68 @@ impl PolicyRuntime {
 
     pub fn digest(&self) -> PolicyDigest {
         self.current.read().unwrap().digest.clone()
+    }
+
+    pub fn authorize_registration(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+    ) -> (Outcome, ReasonCode) {
+        let generation = self.current.read().unwrap();
+        let snapshot = match generation.find_snapshot(profile_id) {
+            Some(s) => s,
+            None => return (Outcome::Deny, ReasonCode::ProfileNotFound),
+        };
+
+        if !snapshot.registration_allowed {
+            return (Outcome::Deny, ReasonCode::DelegatedRegistrationDenied);
+        }
+
+        let normalized = rp_id.trim().to_ascii_lowercase();
+        match snapshot
+            .rules
+            .iter()
+            .find(|rule| rule.rp_id.trim().to_ascii_lowercase() == normalized)
+        {
+            Some(rule) => {
+                if rule.register.authorization == AgentAuthorization::Deny {
+                    (Outcome::Deny, ReasonCode::ActionNotAllowed)
+                } else {
+                    (Outcome::Allow, ReasonCode::Allowed)
+                }
+            }
+            None => (Outcome::Deny, ReasonCode::RpIdNotExactMatch),
+        }
+    }
+
+    pub fn request_registration_grant(
+        &self,
+        profile_id: ProfileId,
+        rp_id: String,
+    ) -> Result<passless_core::agent::RegistrationGrantId, super::grant::GrantError> {
+        let profile_key = profile_id.as_str().to_string();
+        let mut reg_grants = self.registration_grants.lock().unwrap();
+
+        let registry = reg_grants.entry(profile_key).or_insert_with(|| {
+            super::grant::RegistrationGrantRegistry::new(Arc::clone(&self.clock), 300)
+        });
+
+        let session_id = passless_core::agent::PrincipalSessionId::new();
+        let endpoint_id = passless_core::agent::EndpointId::new();
+
+        registry.request_registration(profile_id, session_id, endpoint_id, [0u8; 32], rp_id, 300)
+    }
+
+    pub fn resolve_registration_grant(
+        &self,
+        profile_id: &ProfileId,
+        grant_id: &passless_core::agent::RegistrationGrantId,
+        rp_id: &str,
+    ) -> Option<super::grant::RegistrationGrantSnapshot> {
+        let profile_key = profile_id.as_str().to_string();
+        let reg_grants = self.registration_grants.lock().unwrap();
+        let registry = reg_grants.get(&profile_key)?;
+        registry.resolve_registration_grant(grant_id, rp_id)
     }
 
     pub fn list_grants(
@@ -867,6 +932,43 @@ impl PolicyRuntime {
         result
     }
 
+    pub fn find_grants_by_credential_for_profile(
+        &self,
+        profile_id: &ProfileId,
+        cred_refs: &[passless_core::agent::CredentialRef],
+    ) -> Vec<passless_core::agent::GrantId> {
+        let grants = self.grants.lock().unwrap();
+        let registry = match grants.get(profile_id.as_str()) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        for cred_ref in cred_refs {
+            result.extend(registry.find_grant_id_by_credential(cred_ref));
+        }
+        result
+    }
+
+    pub fn resolve_grant_for_sign(
+        &self,
+        profile_id: &ProfileId,
+        grant_id: &GrantId,
+    ) -> Option<GrantSignSnapshot> {
+        let mut grants_map = self.grants.lock().unwrap();
+        let registry = grants_map.get_mut(profile_id.as_str())?;
+        let _ = registry.check_expired();
+        let snap = registry.snapshot_for_sign(grant_id)?;
+        let is_revoked = snap.state == super::grant::GrantState::Revoked;
+        Some(GrantSignSnapshot {
+            grant_id: snap.grant_id,
+            profile_id: snap.profile_id,
+            rp_ids: snap.rp_ids,
+            credential_refs: snap.credential_refs,
+            state: snap.state,
+            expiry_mono: snap.expiry_mono,
+            is_revoked,
+        })
+    }
     pub fn active_grant_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
         let grants = self.grants.lock().unwrap();
         grants
@@ -1021,45 +1123,7 @@ impl PolicyRuntime {
             );
         }
 
-        if snapshot.credential_refs.is_empty()
-            && matches!(snapshot.mode, AgentMode::DelegatedSession)
-            && request.action == IntentAction::Authenticate
-        {
-            return (
-                Decision::deny(
-                    ReasonCode::EmptyCredentialList,
-                    OperatorAction::ContactAdmin,
-                ),
-                None,
-            );
-        }
-
         match snapshot.mode {
-            AgentMode::DelegatedSession => {
-                if request.action == IntentAction::Register
-                    && snapshot.delegated_registration_storage.is_empty()
-                {
-                    return (
-                        Decision::deny(
-                            ReasonCode::DelegatedRegistrationDenied,
-                            OperatorAction::None,
-                        ),
-                        None,
-                    );
-                }
-
-                if !snapshot.action_allowed(&request.action) {
-                    return (
-                        Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
-                        None,
-                    );
-                }
-                if request.action == IntentAction::Register {
-                    self.authorize_isolated(snapshot, request, &generation)
-                } else {
-                    self.authorize_delegated(snapshot, request, &generation)
-                }
-            }
             AgentMode::Isolated => {
                 if !snapshot.action_allowed(&request.action) {
                     return (
@@ -1071,146 +1135,6 @@ impl PolicyRuntime {
                 self.authorize_isolated(snapshot, request, &generation)
             }
         }
-    }
-
-    /// Lock ordering: intents first, then grants.
-    fn authorize_delegated(
-        &self,
-        snapshot: &PolicySnapshot,
-        request: &AuthorizationRequest,
-        _generation: &PolicyGenerationSnapshot,
-    ) -> (Decision, Option<AuthorizationHandle>) {
-        let mut intents = self.intents.lock().unwrap();
-        let mut grants_map = self.grants.lock().unwrap();
-
-        let profile_key = snapshot.profile_id.as_str().to_string();
-        let grants = match grants_map.get_mut(&profile_key) {
-            Some(g) => g,
-            None => {
-                return (
-                    Decision::deny(ReasonCode::ProfileNotFound, OperatorAction::ContactAdmin),
-                    None,
-                );
-            }
-        };
-
-        let grant_id = match grants.show_grant_by_profile_rp(&GrantQueryParams {
-            profile_id: &snapshot.profile_id,
-            session_id: &request.session_id,
-            endpoint_id: &request.endpoint_id,
-            principal_digest: request.process_digest.as_bytes(),
-            policy_generation: &request.policy_generation_id,
-            policy_digest: &snapshot.digest,
-            rp_id: &request.rp_id,
-            credential_ref: request.credential_ref.as_ref(),
-        }) {
-            Some(gid) => gid,
-            None => {
-                return (
-                    Decision::deny(ReasonCode::GrantMissingForDelegated, OperatorAction::Retry),
-                    None,
-                );
-            }
-        };
-
-        let intent_id = match intents.claim_approved(&IntentQueryParams {
-            profile_id: snapshot.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: Some(request.policy_generation_id.clone()),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-        }) {
-            Ok(iid) => iid,
-            Err(IntentError::NotFound) => {
-                return (
-                    Decision::deny(ReasonCode::IntentMissingForDelegated, OperatorAction::Retry),
-                    None,
-                );
-            }
-            Err(_) => {
-                return (
-                    Decision::deny(ReasonCode::IntentNotApproved, OperatorAction::Retry),
-                    None,
-                );
-            }
-        };
-
-        if snapshot.require_uv && !request.uv_enforced {
-            let _ = intents.rollback_claim(&intent_id);
-            return (
-                Decision::deny(ReasonCode::UvRequired, OperatorAction::VerifyUser),
-                None,
-            );
-        }
-
-        let claim_intent = ClaimIntent {
-            action: match request.action {
-                IntentAction::Register => "register".to_string(),
-                IntentAction::Authenticate => "authenticate".to_string(),
-            },
-            rp_id: request.rp_id.trim().to_ascii_lowercase(),
-            credential_ref: request
-                .credential_ref
-                .clone()
-                .unwrap_or_else(|| CredentialRef::with_default_domain(b"")),
-        };
-
-        let ceremony_id =
-            match grants.claim_for_authorize(&grant_id, &request.session_id, claim_intent) {
-                Ok(cid) => cid,
-                Err(_) => {
-                    let _ = intents.rollback_claim(&intent_id);
-                    return (
-                        Decision::deny(ReasonCode::PartialClaimFailed, OperatorAction::Retry),
-                        None,
-                    );
-                }
-            };
-
-        let handle = AuthorizationHandle {
-            ceremony_id: ceremony_id.clone(),
-            grant_id: Some(grant_id.clone()),
-            intent_id: Some(intent_id.clone()),
-            profile_id: snapshot.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: request.policy_generation_id.clone(),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-        };
-
-        let pending_auth = PendingAuthorization {
-            ceremony_id: ceremony_id.clone(),
-            grant_id: Some(grant_id),
-            intent_id: Some(intent_id),
-            profile_id: snapshot.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: request.policy_generation_id.clone(),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-            invalidated: false,
-        };
-
-        drop(intents);
-        drop(grants_map);
-
-        {
-            let mut pending = self.pending.lock().unwrap();
-            pending.insert(ceremony_id.as_str().to_string(), pending_auth);
-        }
-
-        (Decision::allow(ReasonCode::Allowed), Some(handle))
     }
 
     /// Lock ordering: intents only (no grants needed for isolated mode).
@@ -1506,6 +1430,23 @@ impl PolicyRuntime {
         result
     }
 
+    pub fn rollback_grant(&self, grant_id: &passless_core::agent::GrantId) {
+        let authority = super::intent::admin_authority();
+        let _ = self.admin_revoke_grant(grant_id, &authority);
+    }
+
+    pub fn resolved_grant_id_for_request(
+        &self,
+        profile_id: &ProfileId,
+        grant_request_id: &super::grant::GrantRequestId,
+    ) -> Option<passless_core::agent::GrantId> {
+        let grants = self.grants.lock().unwrap();
+        let profile_key = profile_id.as_str().to_string();
+        grants
+            .get(&profile_key)
+            .and_then(|g| g.resolved_grant_id(grant_request_id))
+    }
+
     pub fn principal_cancel_intent(
         &self,
         intent_id: &IntentId,
@@ -1606,7 +1547,7 @@ impl PolicyRuntime {
         &self,
         intent_params: CreateIntentParams,
         grant_params: GrantRequestParams,
-    ) -> Result<PendingRequestId, PendingCreateError> {
+    ) -> Result<(PendingRequestId, super::grant::GrantRequestId), PendingCreateError> {
         let now_mono = self.clock.monotonic_secs();
         let ttl_ms = intent_params.ttl_ms.unwrap_or(300_000);
         let ttl_secs = ttl_ms.div_ceil(1000);
@@ -1655,7 +1596,7 @@ impl PolicyRuntime {
             rp_id: normalized_rp,
             credential_ref,
             intent_id,
-            grant_request_id: Some(grant_request_id),
+            grant_request_id: Some(grant_request_id.clone()),
             state: PendingState::Waiting,
             created_at_mono: now_mono,
             deadline_mono: now_mono.saturating_add(ttl_secs),
@@ -1663,7 +1604,7 @@ impl PolicyRuntime {
 
         let mut pending_requests = self.pending_requests.lock().unwrap();
         pending_requests.insert(pending_id.as_str().to_string(), request);
-        Ok(pending_id)
+        Ok((pending_id, grant_request_id))
     }
 
     pub fn principal_cancel_pending(
@@ -1694,6 +1635,9 @@ impl PolicyRuntime {
             let profile_key = request.profile_id.as_str().to_string();
             let mut grants_map = self.grants.lock().unwrap();
             if let Some(grants) = grants_map.get_mut(&profile_key) {
+                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                    let _ = grants.revoke_grant(&grant_id, &authority);
+                }
                 let _ = grants.cancel_request(grant_request_id);
             }
         }
@@ -1822,9 +1766,13 @@ impl PolicyRuntime {
             let grants = grants_map
                 .get_mut(&profile_key)
                 .ok_or_else(|| CeremonyResolveError::GrantFailed("profile not found".into()))?;
-            let gid = grants
-                .approve_grant(&grant_request_id, &authority)
-                .map_err(|e| CeremonyResolveError::GrantFailed(e.to_string()))?;
+            let gid = if let Some(existing) = grants.resolved_grant_id(&grant_request_id) {
+                existing
+            } else {
+                grants
+                    .approve_grant(&grant_request_id, &authority)
+                    .map_err(|e| CeremonyResolveError::GrantFailed(e.to_string()))?
+            };
             Some(gid)
         } else {
             None
@@ -1888,6 +1836,9 @@ impl PolicyRuntime {
             let profile_key = pending_req.profile_id.as_str().to_string();
             let mut grants_map = self.grants.lock().unwrap();
             if let Some(grants) = grants_map.get_mut(&profile_key) {
+                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                    let _ = grants.revoke_grant(&grant_id, &authority);
+                }
                 let _ = grants.cancel_request(grant_request_id);
             }
         }
@@ -2145,6 +2096,9 @@ impl PolicyRuntime {
                     let profile_key = request.profile_id.as_str().to_string();
                     let mut grants_map = self.grants.lock().unwrap();
                     if let Some(grants) = grants_map.get_mut(&profile_key) {
+                        if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                            let _ = grants.revoke_grant(&grant_id, &authority);
+                        }
                         let _ = grants.cancel_request(grant_request_id);
                     }
                 }
@@ -2169,6 +2123,9 @@ impl PolicyRuntime {
                     let profile_key = request.profile_id.as_str().to_string();
                     let mut grants_map = self.grants.lock().unwrap();
                     if let Some(grants) = grants_map.get_mut(&profile_key) {
+                        if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                            let _ = grants.revoke_grant(&grant_id, &authority);
+                        }
                         let _ = grants.cancel_request(grant_request_id);
                     }
                 }
@@ -2257,7 +2214,7 @@ mod tests {
     use super::*;
     use passless_core::agent::{
         AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-        AgentRpRule, AgentStorageConfig, BoundedDuration, CredentialRef, DeviceIdentity, ProfileId,
+        AgentRpRule, AgentStorageConfig, CredentialRef, DeviceIdentity, ProfileId,
         UserPresenceSource, UserVerificationSource,
     };
     use std::collections::BTreeMap;
@@ -2266,7 +2223,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::browser::Clock;
-    use super::super::grant::GrantRequestParams;
     use super::super::intent::{
         CreateIntentParams, MonotonicClock, MonotonicTime, ProcessIdentityDigest,
     };
@@ -2349,49 +2305,11 @@ mod tests {
                 }),
                 registration_allowed,
                 rules: vec![],
-                delegated_registration_storage: None,
                 device: test_device(profile_name, 0x1234, 0x5678),
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
                 browser_runtime_root: None,
-                browser_cdp_expose: None,
-                browser_cdp_port: None,
-            },
-        );
-        AgentConfig {
-            enabled: true,
-            profiles,
-            audit_path: Some(PathBuf::from("/tmp/test-audit")),
-        }
-    }
-
-    fn make_delegated_config(
-        profile_name: &str,
-        rp_ids: Vec<&str>,
-        cred_refs: Vec<CredentialRef>,
-        require_uv: bool,
-    ) -> AgentConfig {
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            profile_name.to_string(),
-            AgentProfileConfig {
-                mode: AgentMode::DelegatedSession,
-                principal_user: "test-user".to_string(),
-                rp_ids: rp_ids.into_iter().map(|s| s.to_string()).collect(),
-                require_uv,
-                credential_refs: Some(cred_refs),
-                max_grant_ttl: Some(BoundedDuration::new(120).unwrap()),
-                max_session_ttl: Some(BoundedDuration::new(900).unwrap()),
-                storage: None,
-                registration_allowed: false,
-                rules: vec![],
-                delegated_registration_storage: None,
-                device: test_device(profile_name, 0x1234, 0x5679),
-                start_url: None,
-                browser_command: Some(vec!["firefox".to_string()]),
-                browser_user: Some("browser-user".to_string()),
-                browser_runtime_root: Some(PathBuf::from("/var/run/passless-browser")),
                 browser_cdp_expose: None,
                 browser_cdp_port: None,
             },
@@ -2453,19 +2371,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_delegated_snapshot() {
-        let cr = test_cred_ref(b"cred-1");
-        let config = make_delegated_config("del", vec!["github.com"], vec![cr.clone()], true);
-        let generation = PolicyRuntime::compile_generation(&config, 0).unwrap();
-
-        let s = &generation.snapshots[0];
-        assert_eq!(s.mode, AgentMode::DelegatedSession);
-        assert!(s.require_uv);
-        assert_eq!(s.credential_refs, vec![cr]);
-        assert!(!s.allowed_actions.contains("register"));
-    }
-
-    #[test]
     fn test_snapshot_deterministic_digest() {
         let config = make_isolated_config("det", vec!["example.com"], false);
         let gen1 = PolicyRuntime::compile_generation(&config, 0).unwrap();
@@ -2506,136 +2411,6 @@ mod tests {
         );
         assert!(snapshot.action_allowed(&IntentAction::Authenticate));
         assert!(!snapshot.action_allowed(&IntentAction::Register));
-    }
-
-    #[test]
-    fn test_delegated_registration_denied_without_explicit_rule() {
-        let cr = test_cred_ref(b"c1");
-        let config = make_delegated_config("delreg", vec!["example.com"], vec![cr], true);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("delreg").unwrap();
-
-        let request = make_auth_request(
-            &runtime,
-            pid,
-            IntentAction::Register,
-            "example.com",
-            None,
-            true,
-        );
-
-        let (decision, handle) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::ActionNotAllowed);
-        assert!(handle.is_none());
-    }
-
-    #[test]
-    fn test_delegated_auth_requires_grant_and_intent() {
-        let cr = test_cred_ref(b"c1");
-        let config = make_delegated_config("delauth", vec!["example.com"], vec![cr.clone()], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("delauth").unwrap();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-
-        let request = AuthorizationRequest {
-            profile_id: pid.clone(),
-            session_id: session.clone(),
-            endpoint_id: endpoint.clone(),
-            process_digest: process_digest.clone(),
-            policy_generation_id: runtime.current_generation().generation_id.clone(),
-            policy_digest: runtime.current_generation().digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: Some(cr.clone()),
-            uv_enforced: true,
-        };
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::GrantMissingForDelegated);
-
-        let authority = runtime.admin_authority();
-        let req_id = runtime
-            .admin_request_grant(GrantRequestParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                principal_digest: *process_digest.as_bytes(),
-                rp_ids: vec!["example.com".to_string()],
-                credentials: vec![cr.clone()],
-                requested_ttl_secs: 60,
-            })
-            .unwrap();
-        let _grant_id = runtime.admin_approve_grant(&req_id, &authority).unwrap();
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::IntentMissingForDelegated);
-    }
-
-    #[test]
-    fn test_delegated_auth_with_grant_and_intent_allowed() {
-        let cr = test_cred_ref(b"c1");
-        let config = make_delegated_config("delok", vec!["example.com"], vec![cr.clone()], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("delok").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let req_id = runtime
-            .admin_request_grant(GrantRequestParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                principal_digest: *process_digest.as_bytes(),
-                rp_ids: vec!["example.com".to_string()],
-                credentials: vec![cr.clone()],
-                requested_ttl_secs: 60,
-            })
-            .unwrap();
-        let _grant_id = runtime.admin_approve_grant(&req_id, &authority).unwrap();
-
-        let (intent_id, _token) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: Some(cr.clone()),
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: Some(cr),
-            uv_enforced: true,
-        };
-
-        let (decision, handle) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Allow);
-        assert!(handle.is_some());
     }
 
     #[test]
@@ -2822,68 +2597,6 @@ mod tests {
         let (runtime, _clock) = make_runtime(&config);
 
         let _authority = runtime.admin_authority();
-    }
-
-    #[test]
-    fn test_grant_intent_mismatch_denied() {
-        let cr = test_cred_ref(b"c1");
-        let config =
-            make_delegated_config("mismatch", vec!["example.com"], vec![cr.clone()], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("mismatch").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let req_id = runtime
-            .admin_request_grant(GrantRequestParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                principal_digest: *process_digest.as_bytes(),
-                rp_ids: vec!["example.com".to_string()],
-                credentials: vec![cr.clone()],
-                requested_ttl_secs: 60,
-            })
-            .unwrap();
-        let _grant_id = runtime.admin_approve_grant(&req_id, &authority).unwrap();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "other.com".to_string(),
-                credential_ref: Some(cr.clone()),
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: Some(cr),
-            uv_enforced: true,
-        };
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
     }
 
     #[test]
@@ -3217,78 +2930,6 @@ mod tests {
         let (decision, _) = runtime.authorize(&request);
         assert_eq!(decision.outcome, Outcome::Deny);
         assert_eq!(decision.reason, ReasonCode::GenerationStale);
-    }
-
-    #[test]
-    fn test_revoke_between_authorize_and_consume_denies() {
-        let cr = test_cred_ref(b"c1");
-        let config = make_delegated_config(
-            "revokeconsume",
-            vec!["example.com"],
-            vec![cr.clone()],
-            false,
-        );
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("revokeconsume").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let req_id = runtime
-            .admin_request_grant(GrantRequestParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                principal_digest: *process_digest.as_bytes(),
-                rp_ids: vec!["example.com".to_string()],
-                credentials: vec![cr.clone()],
-                requested_ttl_secs: 60,
-            })
-            .unwrap();
-        let grant_id = runtime.admin_approve_grant(&req_id, &authority).unwrap();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: Some(cr.clone()),
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: Some(cr),
-            uv_enforced: true,
-        };
-
-        let (decision, handle) = runtime.authorize(&request);
-        assert!(decision.is_allowed());
-        let h = handle.unwrap();
-
-        runtime.admin_revoke_grant(&grant_id, &authority).unwrap();
-
-        let result = runtime.consume_authorization(&h);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -4346,52 +3987,6 @@ mod tests {
     }
 
     #[test]
-    fn test_principal_pending_status_kind_delegated() {
-        let cr = test_cred_ref(b"kind_del");
-        let config =
-            make_delegated_config("status_kind", vec!["example.com"], vec![cr.clone()], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("status_kind").unwrap();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let pending_id = runtime
-            .principal_create_pending_delegated(
-                CreateIntentParams {
-                    profile_id: pid.clone(),
-                    session_id: session.clone(),
-                    endpoint_id: endpoint.clone(),
-                    process_digest: process_digest.clone(),
-                    action: IntentAction::Authenticate,
-                    rp_id: "example.com".to_string(),
-                    credential_ref: Some(cr.clone()),
-                    policy_generation: generation.generation_id.clone(),
-                    policy_digest: generation.digest.clone(),
-                    require_uv: false,
-                    ttl_ms: Some(60_000),
-                },
-                GrantRequestParams {
-                    profile_id: pid.clone(),
-                    session_id: session.clone(),
-                    endpoint_id: endpoint.clone(),
-                    principal_digest: *process_digest.as_bytes(),
-                    rp_ids: vec!["example.com".to_string()],
-                    credentials: vec![cr.clone()],
-                    requested_ttl_secs: 60,
-                },
-            )
-            .unwrap();
-
-        let status = runtime
-            .principal_pending_status(&pending_id, &session)
-            .unwrap();
-        assert_eq!(status.kind, PendingRequestKind::DelegatedAuth);
-        assert!(status.grant_request_id.is_some());
-    }
-
-    #[test]
     fn test_cleanup_expired_pending() {
         let config = make_isolated_config("cleanup_exp", vec!["example.com"], false);
         let (runtime, clock) = make_runtime(&config);
@@ -4482,5 +4077,117 @@ mod tests {
             snapshot.to_delegation_state(),
             passless_core::agent::protocol::DelegationState::Approved
         );
+    }
+
+    #[test]
+    fn test_authorize_registration_allowed() {
+        let mut config = make_isolated_config("reg-test", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-test").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-test").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Allow);
+        assert_eq!(reason, ReasonCode::Allowed);
+    }
+
+    #[test]
+    fn test_authorize_registration_denied_by_rule() {
+        let mut config = make_isolated_config("reg-deny", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-deny").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-deny").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::ActionNotAllowed);
+    }
+
+    #[test]
+    fn test_authorize_registration_denied_global() {
+        let config = make_isolated_config("reg-global", vec!["example.com"], false);
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-global").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::DelegatedRegistrationDenied);
+    }
+
+    #[test]
+    fn test_authorize_registration_profile_not_found() {
+        let config = make_isolated_config("existing", vec!["example.com"], true);
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("nonexistent").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "example.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::ProfileNotFound);
+    }
+
+    #[test]
+    fn test_authorize_registration_rp_not_in_rules() {
+        let mut config = make_isolated_config("reg-norp", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-norp").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-norp").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "other.com");
+        assert_eq!(outcome, Outcome::Deny);
+        assert_eq!(reason, ReasonCode::RpIdNotExactMatch);
+    }
+
+    #[test]
+    fn test_authorize_registration_rp_normalization() {
+        let mut config = make_isolated_config("reg-norm", vec!["example.com"], true);
+        let profile = config.profiles.get_mut("reg-norm").unwrap();
+        profile.rules = vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::None,
+                user_verification: UserVerificationSource::None,
+            },
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+
+        let (runtime, _clock) = make_runtime(&config);
+        let profile_id = ProfileId::new("reg-norm").unwrap();
+
+        let (outcome, reason) = runtime.authorize_registration(&profile_id, "EXAMPLE.COM");
+        assert_eq!(outcome, Outcome::Allow);
+        assert_eq!(reason, ReasonCode::Allowed);
     }
 }

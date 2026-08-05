@@ -1,5 +1,7 @@
 # Agent audit
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+
 Agent audit events are hash-chained, owner-only, append-oriented JSONL records. They cover
 authorization lifecycle, credential use, browser leases, policy changes, denials, and degradation.
 
@@ -100,9 +102,3 @@ Audit integrity is limited to:
 - **Local protection:** Owner-only permissions and hash-chaining detect tampering by non-root users.
 - **No external anchoring:** Host root can rewrite local audit without external anchoring. Optional TPM or remote checkpoints are not implemented in the first release.
 - **Rotation gaps:** If rotation fails or files are lost, the chain may have discontinuities. Verification reports these but cannot reconstruct missing records.
-
-## References
-
-- [ADR 0001: Normative security invariants](../decisions/0001-agent-authentication-security-model.md#normative-security-invariants)
-- [ADR 0002: Protected audit](../decisions/0002-native-webauthn-agent-architecture.md#audit)
-- [Operations: Audit](operations.md#audit)

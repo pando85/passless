@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use log::debug;
+
 use passless_core::agent::CredentialRef;
 
 use crate::storage::{CredentialFilter, CredentialStorage};
@@ -296,9 +298,11 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
             if self.allowed_cred_refs.contains(&href) {
                 index.insert(href, first.id.clone());
             }
+            let mut count = 1usize;
             loop {
                 match human.read_next() {
                     Ok(c) => {
+                        count += 1;
                         let href = cred_ref_from_id(&c.id);
                         if self.allowed_cred_refs.contains(&href) {
                             index.insert(href, c.id.clone());
@@ -309,7 +313,16 @@ impl<S: CredentialStorage> SharedDelegatedStorage<S> {
                         break;
                     }
                     Err(e) => {
-                        return Err(DelegatedError::Internal(format!("read_next: {}", e)));
+                        debug!(
+                            "build_index: read_next failed at credential #{}: {:?}",
+                            count + 1,
+                            e
+                        );
+                        return Err(DelegatedError::Internal(format!(
+                            "read_next at #{}: {}",
+                            count + 1,
+                            e
+                        )));
                     }
                 }
             }

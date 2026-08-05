@@ -28,7 +28,6 @@ fn base_params() -> PolicyParams {
         browser_user: "browseruser".into(),
         browser_runtime_root: "/tmp/browser".into(),
         rules: vec![],
-        delegated_registration_storage: String::new(),
     }
 }
 

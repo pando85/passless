@@ -8,12 +8,20 @@
 
 ## Purpose
 
-This plan implements two opt-in agent authentication modes without changing browser behavior:
+This plan implements two opt-in agent authentication modes:
 
 - `isolated`: persistent, agent-only credentials with independent storage and revocation.
 - `delegated-session`: one human-approved assertion using one existing user credential for one RP ID, followed by a short-lived ephemeral browser lease.
 
-The implementation uses separate UHID endpoints to classify human and agent requests. It does not use a browser extension, native messaging host, WebAuthn proxy, injected script, patched browser, raw signing API, or caller-supplied `clientDataHash`.
+The implementation uses separate UHID endpoints to classify human and agent requests. Human and isolated modes do not use a browser extension, native messaging host, WebAuthn proxy, injected script, patched browser, raw signing API, or caller-supplied `clientDataHash`.
+
+> **Amendment:** [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md)
+> redesigns the delegated-session autonomous (`allow`) path to use a daemon-loaded MV3 extension
+> with a MAIN-world `navigator.credentials.get` override and a localhost daemon signing channel.
+> The `confirm`-policy human prompt and isolated-mode paths remain unchanged. The CDP
+> virtual-authenticator key-injection workflow is retained as legacy/test-only and is
+> incompatible with non-extractable portable TPM keys. Implementation is **in progress**; see
+> the [delegated autonomy daemon proxy implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md).
 
 Each phase has a security exit gate. A phase that depends on an unproven gate does not begin until the gate passes. Failure causes design revision rather than a weaker fallback.
 
@@ -41,7 +49,9 @@ This work does not deliver:
 - Business-action authorization after login.
 - Guaranteed invalidation of an RP session when the local browser lease ends.
 - Cookie, token, private-key, PIN, raw assertion, or arbitrary signing APIs.
-- Browser modification, browser extensions, or WebAuthn proxying.
+- Browser modification, browser extensions, or WebAuthn proxying for human and isolated modes.
+  Delegated-session autonomy uses a daemon-loaded MV3 extension under ADR 0005; see the
+  [delegated autonomy daemon proxy implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md).
 - Remote agent support or non-Unix isolation in the first release.
 - Protection from host root, kernel compromise, or a malicious Passless administrator.
 - RP-supported OAuth, workload identity, or service-account provisioning.
@@ -128,7 +138,7 @@ Requirement IDs are stable across implementation, tests, and review evidence.
 | AUTH-01 | Set UP only from the exact action rule's configured human or policy source. |
 | AUTH-02 | Set UV only from the exact action rule's configured human, policy, or absent source. |
 | AUTH-03 | Audit distinguishes human and policy evidence; no principal request broadens the configured source. |
-| RP-01 | The stock browser remains responsible for origin-to-RP validation and client-data construction. |
+| RP-01 | The stock browser remains responsible for origin-to-RP validation and client-data construction in human and isolated modes. Delegated-session autonomy validates origin in the daemon via ADR 0005. |
 | RP-02 | Passless exactly matches the CTAP RP ID against policy and active authorization. |
 | RP-03 | Passless never claims independent visibility of the exact web origin. |
 | PRIN-01 | Authenticate a principal with peer identity, launcher identity, sandbox identity, and a protected session capability. |
@@ -597,6 +607,13 @@ Connect native CTAP requests to endpoint identity, authorization, policy, audit,
 11. The grant and delegated view are consumed, then the endpoint drains and is destroyed.
 12. The local browser lease starts at the clamped monotonic deadline.
 13. Expiry, revocation, browser exit, principal exit, or daemon shutdown terminates the browser and cleans the profile.
+
+> **Amendment:** ADR 0005 redesigns the delegated-session autonomous (`allow`) path. Steps 4–10
+> for allow-policy assertions now use a daemon-loaded MV3 extension that reads the frame origin
+> via a MAIN-world override, forwards the request over a localhost bearer channel to the daemon,
+> and the daemon validates origin, grant, policy, credential ref, and audit before signing. A
+> `confirm` rule still follows the human prompt path through steps 8–10. Implementation is
+> **in progress**; see the [implementation plan](delegated-autonomy-daemon-proxy-implementation.md).
 
 ### Tests
 

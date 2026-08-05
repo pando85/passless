@@ -1,5 +1,43 @@
 # Operations
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+
+## Browser management
+
+Launch a browser session with the agent extension loaded:
+
+```bash
+passless agent-admin browser launch --profile <profile> [--url <start-url>]
+```
+
+The command:
+- Generates a bearer token for the session
+- Requests registration grants for all allowed RP IDs in the profile
+- Registers registration and sign contexts with the daemon
+- Launches Chromium with the agent extension loaded via `--load-extension`
+- Returns a lease ID, profile ID, PID, and start URL
+
+The extension intercepts `navigator.credentials.create()` and `navigator.credentials.get()` calls,
+forwarding them to the daemon's `/register` and `/sign` HTTP endpoints. Registration and
+authentication proceed autonomously according to the profile's policy rules.
+
+**Output:**
+```json
+{
+  "lease_id": "abc123...",
+  "profile_id": "ci-agent",
+  "pid": 12345,
+  "start_url": "https://example.com/"
+}
+```
+
+**Notes:**
+- The browser runs with a dedicated user data directory under `/run/user/<uid>/passless/browser/`
+- The extension is generated per-lease with the daemon's port and bearer token baked in
+- Registration contexts are created for all RP IDs allowed by the profile's rules
+- Sign contexts are created if credentials exist in storage for the profile
+- Browser leases expire after the configured TTL (default 1 hour)
+
 ## Audit
 
 Audit events are hash-chained, owner-only, append-oriented JSONL records. They cover
@@ -119,31 +157,30 @@ On restart, the daemon:
 
 | Feature | Required for | Notes |
 |---|---|---|
-| UHID (`uhid` module) | All agent modes | Virtual HID device creation |
+| UHID (`uhid` module) | Human, isolated, and confirm-policy modes | Virtual HID device creation |
 | hidraw | Browser access to agent endpoints | Per-profile group policy via udev |
 | pidfd / `close_range` | Principal session management | Clean process tree teardown |
 | `SOCK_SEQPACKET` | Admin and principal IPC | Versioned local contracts |
 | Namespaces / cgroups | Principal isolation | Separate UID, device policy, filesystem policy |
 
-**Supported kernel range:** Linux 7.1.3-1-MANJARO tested. Minimum supported kernel is the oldest distribution kernel providing all of the above. See Phase 0 evidence in `tools/agent-uhid-feasibility/evidence.md` for tested combinations.
+**Supported kernel range:** Minimum supported kernel is the oldest distribution kernel providing
+all of the above.
 
 ## Browser support
 
-**Supported browser range:** Stock Chromium (via Playwright) tested with debug auto-accept UV. Production prompt approval flow is pending validation.
-
 **Browser requirements:**
 
-- Stock browser with WebAuthn support (no modifications, extensions, or native messaging hosts).
-- Ability to access hidraw nodes via udev group policy.
+- Stock browser with WebAuthn support for human and isolated-mode ceremonies.
+- Ability to access hidraw nodes via udev group policy (human and isolated modes).
 - Ephemeral profile support (no personal sync, extensions, or saved state).
+- Delegated-session autonomous authentication loads a daemon-generated MV3 extension via
+  `--load-extension`. Implementation is **in progress**.
 
 **Known limitations:**
 
 - Fresh ephemeral profiles may require federated or cross-site login for some RPs, which broadens practical session authority.
 - Browser-control (CDP) output may contain session state; treat it as full-session authority.
 - Local lease expiry does not guarantee RP-side session invalidation.
-
-See Phase 0 evidence in `tools/agent-uhid-feasibility/evidence.md` for tested browser versions and RP patterns.
 
 ## Browser and endpoint status
 
@@ -185,8 +222,6 @@ passless agent-admin install [auto|opencode|claude|pi] [--scope user|project] [-
 | `claude` | `~/.claude/skills/passless-agent/SKILL.md` | `.claude/skills/passless-agent/SKILL.md` |
 | `pi` | `~/.pi/agent/skills/passless-agent/SKILL.md` | `.pi/skills/passless-agent/SKILL.md` |
 
-Pi paths follow the [official Pi skills documentation](https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/skills.md).
-
 - `auto` detects installed agents by checking user config directories, project directories, and `PATH`.
 - `--scope user` installs to the user's home directory; `--scope project` installs to the project root.
 - `--force` replaces an existing different skill.
@@ -211,7 +246,8 @@ Example systemd, tmpfiles, udev, and sysusers configurations are provided in `co
 - Linux only. No remote principals or non-Unix isolation in the first release.
 - Delegated mode does not create a new RP-visible agent identity.
 - Local lease expiry does not guarantee RP-side session invalidation.
-- Passless sees the CTAP RP ID but not the exact web origin.
+- For human and isolated modes, Passless sees the CTAP RP ID but not the exact web origin.
+  Delegated-session autonomous authentication validates frame origin in the daemon.
 - Browser-control (CDP) output may contain session state; treat it as full-session authority.
 - Host root and kernel compromise are outside the threat model.
 - RP-supported OAuth, workload identity, and service accounts are preferred for unattended use.

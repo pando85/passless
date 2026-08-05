@@ -1,11 +1,52 @@
 # Isolated mode
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+
 Isolated profiles use agent-only credentials with independent storage, PIN state, and
 revocation. They cannot see or use human credentials.
 
 An isolated profile can be fully unattended. Setting an exact RP action to `allow` with policy
 UP/UV removes the human prompt, but does not make the authenticator unrestricted. Every operation
 still requires a one-shot intent and passes the normal endpoint, policy, storage, and audit gates.
+
+## How isolated mode works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Passless Daemon                       │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │  Isolated Profile: "release-bot"                   │ │
+│  │                                                     │ │
+│  │  ┌─────────────┐   ┌───────────────────────────┐   │ │
+│  │  │ Agent UHID   │   │ Isolated Credential Store │   │ │
+│  │  │ Endpoint     │   │ (local/pass/TPM)          │   │ │
+│  │  │ /dev/hidraw* │   │                           │   │ │
+│  │  └──────┬───────┘   └───────────────────────────┘   │ │
+│  │         │                                            │ │
+│  │  ┌──────┴────────────────────────────────────────┐  │ │
+│  │  │  Policy Engine                                 │  │ │
+│  │  │  rp_id="github.com"                            │  │ │
+│  │  │  register: allow / policy UP / policy UV       │  │ │
+│  │  │  authenticate: allow / policy UP / policy UV   │  │ │
+│  │  └────────────────────────────────────────────────┘  │ │
+│  │                                                     │ │
+│  │  ┌────────────────────────────────────────────────┐ │ │
+│  │  │  One-shot Intent (consumed on terminal result) │ │ │
+│  │  └────────────────────────────────────────────────┘ │ │
+│  └────────────────────────────────────────────────────┘ │
+│                                                          │
+│  Human endpoint and credentials are NOT accessible       │
+└─────────────────────────────────────────────────────────┘
+         ▲
+         │ CTAP (WebAuthn)
+         │
+┌────────┴────────┐
+│  Agent Process  │
+│  (principal     │
+│   user)         │
+└─────────────────┘
+```
 
 ## Credential store
 

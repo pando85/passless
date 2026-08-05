@@ -314,6 +314,49 @@ impl<'a> Credential<'a> {
     ///
     /// Format: Vec<u8> as CBOR arrays of integers (original soft-fido2 pre-serde_bytes format)
     pub fn from_bytes(data: &[u8]) -> Result<Credential<'static>, soft_fido2::Error> {
+        mod flexible_backup_state {
+            use serde::de::{self, Visitor};
+
+            pub fn deserialize<'de, D>(
+                deserializer: D,
+            ) -> Result<soft_fido2::CredentialBackupState, D::Error>
+            where
+                D: de::Deserializer<'de>,
+            {
+                struct BackupStateVisitor;
+
+                impl<'de> Visitor<'de> for BackupStateVisitor {
+                    type Value = soft_fido2::CredentialBackupState;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a boolean or camelCase string")
+                    }
+
+                    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                        Ok(if v {
+                            soft_fido2::CredentialBackupState::BackedUp
+                        } else {
+                            soft_fido2::CredentialBackupState::NotEligible
+                        })
+                    }
+
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                        match v {
+                            "notEligible" => Ok(soft_fido2::CredentialBackupState::NotEligible),
+                            "eligible" => Ok(soft_fido2::CredentialBackupState::Eligible),
+                            "backedUp" => Ok(soft_fido2::CredentialBackupState::BackedUp),
+                            _ => Err(de::Error::unknown_variant(
+                                v,
+                                &["notEligible", "eligible", "backedUp"],
+                            )),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_any(BackupStateVisitor)
+            }
+        }
+
         #[derive(serde::Deserialize)]
         struct OwnedCredential {
             #[serde(deserialize_with = "flexible_bytes::deserialize")]
@@ -330,7 +373,7 @@ impl<'a> Credential<'a> {
             key_format_version: Option<u16>,
             created: i64,
             discoverable: bool,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "flexible_backup_state::deserialize")]
             backup_state: soft_fido2::CredentialBackupState,
             #[serde(default)]
             extensions: Extensions,
