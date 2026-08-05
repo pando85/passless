@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.15.1](https://github.com/pando85/passless/tree/v0.15.1) - 2026-08-05
+
+### Fixed
+
+- Advertise dynamic built-in UV state (#395) ([19f4a14](https://github.com/pando85/passless/commit/19f4a14e71ecef8186f27e6d4eab9be07faa7654))
+
+### Documentation
+
+- Add credential backup and backup-eligibility guide (#391) ([6db1c32](https://github.com/pando85/passless/commit/6db1c32e681cb5148f2be0693e89b09ff882c3a3))
+
+### Build
+
+- deps: Update Rust crate base64 to v0.23.1 (#392) ([e8dca3a](https://github.com/pando85/passless/commit/e8dca3a691bfb53502896e5434f98d063b8f17f5))
+- deps: Upgrade soft-fido2 to 0.17.0 (#397) ([9b0e218](https://github.com/pando85/passless/commit/9b0e218b2f86e782168b1375884dd695486d2b38))
+
 ## [v0.15.0](https://github.com/pando85/passless/tree/v0.15.0) - 2026-08-01
 
 ### Added
