@@ -927,7 +927,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1380,7 +1380,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1787,7 +1787,7 @@ dependencies = [
  "sha2",
  "shadow-rs",
  "soft-fido2",
- "soft-fido2-ctap",
+ "soft-fido2-ctap 0.17.0",
  "soft-fido2-transport",
  "tempfile",
  "tokio",
@@ -2232,7 +2232,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2480,8 +2480,8 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto",
- "soft-fido2-ctap",
+ "soft-fido2-crypto 0.16.2",
+ "soft-fido2-ctap 0.16.2",
  "soft-fido2-transport",
  "spin",
  "zeroize",
@@ -2492,6 +2492,25 @@ name = "soft-fido2-crypto"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75dfd057c83f789ebfb140d76a29163edb6dba492d08af1028d33c5286a61ccc"
+dependencies = [
+ "aes",
+ "cbc",
+ "ed25519-dalek",
+ "hkdf",
+ "hmac",
+ "p256",
+ "rand 0.10.2",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "soft-fido2-crypto"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff3bd853b5f76ba1477ccac1e4c367d7eb48ab939647cc96eca3ef1456e989bb"
 dependencies = [
  "aes",
  "cbc",
@@ -2519,7 +2538,26 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto",
+ "soft-fido2-crypto 0.16.2",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "soft-fido2-ctap"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb91fe4b2a4b5af9587b41b527a5e7c284375fa9c3454e0200f8955326c38a9"
+dependencies = [
+ "cbor4ii",
+ "rand 0.10.2",
+ "secstr",
+ "serde",
+ "serde_bytes",
+ "sha2",
+ "smallvec",
+ "soft-fido2-crypto 0.17.0",
  "subtle",
  "thiserror",
  "zeroize",
@@ -2647,7 +2685,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3073,7 +3111,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
