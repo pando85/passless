@@ -2489,9 +2489,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-crypto"
-version = "0.16.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d857eaba0c41a51c298fc8ef6c49a3afe7f0a8f54360c48d8da70154db7aa64"
+checksum = "75dfd057c83f789ebfb140d76a29163edb6dba492d08af1028d33c5286a61ccc"
 dependencies = [
  "aes",
  "cbc",
@@ -2508,9 +2508,9 @@ dependencies = [
 
 [[package]]
 name = "soft-fido2-ctap"
-version = "0.16.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1475110e56eb7c625badd974e177ec1a7876d705b6d0b89f70877d96e8c4b182"
+checksum = "e32930ebc71f65c8acb8eb006172d99b8be550ebcf84b1031bcafe717ab68e0f"
 dependencies = [
  "cbor4ii",
  "rand 0.10.2",
@@ -2644,7 +2644,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
