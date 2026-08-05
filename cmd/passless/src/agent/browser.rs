@@ -2123,10 +2123,21 @@ fn check_identity_mismatch(pid: u32, expected: &ProcessIdentity) -> Option<Strin
         return Some("expected identity is invalid".to_string());
     }
 
-    let actual = read_process_identity(pid)?;
+    let stat_path = format!("/proc/{}/stat", pid);
+    if !Path::new(&stat_path).exists() {
+        return None;
+    }
+
+    let actual = match read_process_identity(pid) {
+        Some(identity) => identity,
+        None => return Some(format!("cannot read process identity for pid {}", pid)),
+    };
 
     if !actual.is_valid() {
-        return None;
+        return Some(format!(
+            "actual process identity for pid {} is invalid",
+            pid
+        ));
     }
 
     if actual.start_time_ticks != expected.start_time_ticks

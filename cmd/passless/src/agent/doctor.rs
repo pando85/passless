@@ -750,7 +750,10 @@ mod tests {
     fn make_profile_info() -> ProfileStartupInfo {
         ProfileStartupInfo {
             storage_roots: vec![("credential".into(), PathBuf::from("/tmp/creds"), 1000)],
-            browser_runtime_root: None,
+            browser_runtime_root: Some(BrowserRuntimeRootInfo {
+                path: PathBuf::from("/tmp/browser"),
+                expected_uid: 1000,
+            }),
             uid_checks: vec![UidCheck {
                 label: "principal_vs_daemon".into(),
                 passed: true,

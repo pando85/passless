@@ -298,9 +298,16 @@ fn parse_cgroup_v2_path(content: &str, path: &str) -> Result<String, LauncherErr
         }
     }
 
+    for line in content.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() == 3 {
+            return Ok(parts[2].to_string());
+        }
+    }
+
     Err(LauncherError::ProcParse {
         path: path.to_string(),
-        detail: "no cgroup v2 (0::) entry found".to_string(),
+        detail: "no cgroup entry found".to_string(),
     })
 }
 
@@ -1749,8 +1756,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cgroup_v2_path_fallback_to_v1() {
+        let content = "12:memory:/user.slice\n11:cpu:/user.slice\n";
+        let result = parse_cgroup_v2_path(content, "/proc/1234/cgroup").unwrap();
+        assert_eq!(result, "/user.slice");
+    }
+
+    #[test]
     fn test_parse_cgroup_v2_path_not_found() {
-        let content = "12:memory:/\n11:cpu:/\n";
+        let content = "";
         let err = parse_cgroup_v2_path(content, "/proc/1234/cgroup").unwrap_err();
         assert!(matches!(err, LauncherError::ProcParse { .. }));
     }
