@@ -22,9 +22,9 @@ passless-core = { path = "./passless-core", version = "0.15.0" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.15.0" }
 passless-uhid = { path = "./passless-uhid", version = "0.15.0" }
 
-soft-fido2 = "0.16.2"
-soft-fido2-ctap = "0.16.2"
-soft-fido2-transport = "0.16.2"
+soft-fido2 = "0.17.0"
+soft-fido2-ctap = "0.17.0"
+soft-fido2-transport = "0.17.0"
 
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }

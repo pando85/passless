@@ -1771,14 +1771,20 @@ mod tests {
         std::fs::create_dir_all(&credential_dir).expect("create credential directory");
         let storage = LocalStorageAdapter::new(credential_dir).expect("create credential storage");
 
-        let mut pin_state = pin_state_with_pin();
-        pin_state.uv_retries = 5;
+        let pin_state = PinState {
+            uv_retries: 5,
+            ..pin_state_with_pin()
+        };
         let pin_storage = Arc::new(Mutex::new(TestPinStorage::new(pin_state)));
 
-        let mut security_config = SecurityConfig::default();
-        security_config.always_uv = true;
-        let mut pin_config = PinConfig::default();
-        pin_config.enforcement = PinEnforcement::Optional;
+        let security_config = SecurityConfig {
+            always_uv: true,
+            ..Default::default()
+        };
+        let pin_config = PinConfig {
+            enforcement: PinEnforcement::Optional,
+            ..Default::default()
+        };
 
         let mut service = AuthenticatorService::with_pin_storage(
             storage,
