@@ -1,5 +1,7 @@
 # Agent troubleshooting
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+
 Common issues and diagnostics for agent mode.
 
 ## Agent support is disabled
@@ -178,10 +180,9 @@ passless agent-admin credential list --profile <profile>
 
 **Diagnosis:** Check kernel requirements in [operations.md](operations.md#kernel-requirements).
 
-**Fix:** Use a supported kernel and distribution. See Phase 0 evidence in `tools/agent-uhid-feasibility/evidence.md` for tested combinations.
+**Fix:** Use a supported kernel and distribution that provides UHID, hidraw, pidfd/close_range, SOCK_SEQPACKET, and namespaces/cgroups.
 
 ## Further help
 
 - Review the [security model](security.md) for threat model and design rationale.
-- Check the [implementation plan](../plans/agent-passkey-implementation.md) for phase status.
-- Consult [ADR 0001](../decisions/0001-agent-authentication-security-model.md) and [ADR 0002](../decisions/0002-native-webauthn-agent-architecture.md) for design decisions.
+- Check the [configuration reference](configuration.md) for field definitions and validation rules.

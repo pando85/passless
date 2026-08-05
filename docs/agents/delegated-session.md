@@ -1,14 +1,57 @@
 # Delegated-session mode
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+> Autonomous (`allow`) assertions for delegated sessions are being redesigned to use a
+> daemon-loaded MV3 extension and localhost daemon signing channel instead of a UHID ceremony.
+> The `confirm` path remains an explicit human prompt. Implementation is **in progress**.
+
 Delegated-session mode permits exact-policy authentication using configured human credentials and,
 when explicitly selected, registration into the human store. The RP sees the same account context
 as ordinary use by the human.
 
-> **Note:** Autonomous (`allow`) assertions for delegated sessions are being redesigned under
-> [ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md) to use a
-> daemon-loaded MV3 extension and localhost daemon signing channel instead of a UHID ceremony.
-> The `confirm` path remains an explicit human prompt. Implementation is **in progress**; see
-> the [implementation plan](../plans/delegated-autonomy-daemon-proxy-implementation.md).
+## How delegated-session mode works
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       Passless Daemon (root)                      │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Delegated Profile: "opencode"                              │ │
+│  │                                                              │ │
+│  │  ┌──────────────────┐   ┌────────────────────────────────┐  │ │
+│  │  │ Agent UHID        │   │ Human Credential Store         │  │ │
+│  │  │ Endpoint          │   │ (filtered view: 1 credential)  │  │ │
+│  │  │ /dev/hidraw*      │   │                                │  │ │
+│  │  └─────────┬─────────┘   └────────────────────────────────┘  │ │
+│  │            │                                                  │ │
+│  │  ┌─────────┴──────────────────────────────────────────────┐  │ │
+│  │  │  Policy Engine                                          │  │ │
+│  │  │  rp_id="github.com"                                     │  │ │
+│  │  │  authenticate: allow / policy UP / policy UV            │  │ │
+│  │  └─────────────────────────────────────────────────────────┘  │ │
+│  │                                                               │ │
+│  │  ┌────────────────────┐  ┌─────────────────────────────────┐ │ │
+│  │  │ One-shot Grant     │  │ Browser Lease                   │ │ │
+│  │  │ (consumed after    │  │ (ephemeral profile,             │ │ │
+│  │  │  one assertion)    │  │  auto-destroyed on expiry)      │ │ │
+│  │  └────────────────────┘  └─────────────────────────────────┘ │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Autonomous path (allow):                                   │ │
+│  │  MV3 extension → MAIN-world origin read → localhost sign    │ │
+│  │  channel → daemon validates origin/grant/policy → sign      │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+         ▲                              ▲
+         │ CTAP                         │ CDP (pipe or port)
+         │                              │
+┌────────┴────────┐          ┌──────────┴──────────┐
+│  Agent Process  │          │  Ephemeral Browser   │
+│  (principal     │          │  (browser user)      │
+│   user)         │          │                      │
+└─────────────────┘          └──────────────────────┘
+```
 
 ## Semantics
 
@@ -76,10 +119,10 @@ product_id = 22136
 5. An `allow` rule is resolved autonomously by the daemon's policy check with no desktop
    notification. A `confirm` rule is not auto-signed and remains an explicit human prompt path.
    A `deny` rule fails closed. The configured UP/UV sources are recorded in audit.
-   Under ADR 0005, the autonomous path uses a daemon-loaded MV3 extension that reads the
-   frame origin via a MAIN-world override and forwards the request to the daemon over a
-   localhost bearer channel; the daemon validates origin, grant, policy, credential ref,
-   and audit before signing. Implementation is **in progress**.
+   The autonomous path uses a daemon-loaded MV3 extension that reads the frame origin via a
+   MAIN-world override and forwards the request to the daemon over a localhost bearer channel;
+   the daemon validates origin, grant, policy, credential ref, and audit before signing.
+   Implementation is **in progress**.
 6. The local browser lease starts at the clamped monotonic deadline.
 7. The grant and delegated credential view are consumed after the assertion.
 
@@ -163,8 +206,8 @@ product_id = 22136
      --session-ttl 900 --reason "Playwright automation"
    ```
 4. The daemon performs the WebAuthn ceremony (confirm-policy human prompt) or, for allow-policy
-   assertions under ADR 0005, loads an MV3 extension that routes the assertion through the
-   daemon signing channel. Chromium is launched with
+   assertions, loads an MV3 extension that routes the assertion through the daemon signing
+   channel. Chromium is launched with
    `--remote-debugging-port=<N> --remote-debugging-address=127.0.0.1`.
 5. The daemon reads Chromium's `DevToolsActivePort` file to discover the WebSocket URL.
 6. The daemon writes the full WebSocket URL to `<runtime_dir>/cdp-endpoint`

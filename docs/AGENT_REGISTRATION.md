@@ -1,5 +1,7 @@
 # Agent Passkey Registration Guide
 
+> **EXPERIMENTAL** — Agent registration is not yet validated for production use.
+
 This guide explains how to configure and use agent-driven passkey registration.
 
 ## Overview
@@ -8,6 +10,36 @@ Agent registration allows automated processes to create passkeys without human i
 - Initial setup of CI/CD pipelines
 - Credential rotation
 - Provisioning credentials on new services
+
+## How registration works
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       Passless Daemon                             │
+│                                                                   │
+│  ┌─────────────────┐    ┌─────────────────────────────────────┐  │
+│  │ /register HTTP   │    │  Registration Pipeline              │  │
+│  │ endpoint         │───►│                                     │  │
+│  │ (127.0.0.1)      │    │  1. Validate bearer token           │  │
+│  └─────────────────┘    │  2. Check grant is active           │  │
+│                          │  3. Verify origin matches RP ID     │  │
+│         ▲                │  4. Evaluate policy (allow/deny)    │  │
+│         │                │  5. Reserve audit entry             │  │
+│  ┌──────┴────────────┐  │  6. Generate key (software/TPM)     │  │
+│  │ Browser Extension  │  │  7. Store credential               │  │
+│  │ intercepts         │  │  8. Write audit event              │  │
+│  │ credentials.create │  │  9. Return attestation             │  │
+│  │                    │  └─────────────────────────────────────┘  │
+│  └────────────────────┘                                           │
+└──────────────────────────────────────────────────────────────────┘
+         ▲
+         │ WebAuthn API
+         │
+┌────────┴────────┐
+│  Browser Page   │
+│  (RP website)   │
+└─────────────────┘
+```
 
 ## Prerequisites
 
@@ -165,9 +197,3 @@ passless agent-admin browser launch --profile ci-agent --url https://gitea.examp
 # Extension handles registration automatically
 # Old credential can be revoked if needed
 ```
-
-## Related Documentation
-
-- [ADR 0006: Agent Passkey Registration](decisions/0006-agent-passkey-registration.md)
-- [ADR 0005: Delegated Autonomous Authentication](decisions/0005-delegated-autonomous-authentication-redesign.md)
-- [Grant Mechanism & Authentication Flows](plans/adr-0005-grant-mechanism.md)

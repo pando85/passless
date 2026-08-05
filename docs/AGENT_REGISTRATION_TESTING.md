@@ -1,8 +1,10 @@
 # Agent Passkey Registration Testing Guide
 
+> **EXPERIMENTAL** — Agent registration is not yet validated for production use.
+
 ## Overview
 
-This document covers testing the agent-driven passkey registration feature (ADR 0006). The feature allows agents to register passkeys without human interaction via the daemon's `/register` HTTP endpoint and a browser extension that overrides `navigator.credentials.create()`.
+This document covers testing the agent-driven passkey registration feature. The feature allows agents to register passkeys without human interaction via the daemon's `/register` HTTP endpoint and a browser extension that overrides `navigator.credentials.create()`.
 
 **What this document covers:**
 - Manual testing with webauthn.io
@@ -329,9 +331,3 @@ This is correct WebAuthn behavior - the RP already has a credential for this use
 # Check daemon logs
 tail -50 /tmp/passless-webauthn-test/daemon.log
 ```
-
-## Related Documentation
-
-- [ADR 0006: Agent Passkey Registration](decisions/0006-agent-passkey-registration.md)
-- [Agent Registration Guide](AGENT_REGISTRATION.md)
-- [ADR 0005: Delegated Autonomous Authentication](decisions/0005-delegated-autonomous-authentication-redesign.md)

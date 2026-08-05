@@ -1,5 +1,7 @@
 # Agent security model
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+
 ## Threat model summary
 
 Agent mode extends the Passless daemon with multiple UHID endpoints, principal sessions,
@@ -10,6 +12,29 @@ and browser leases. The security boundary relies on:
 - One-shot intents and grants consumed on every terminal result.
 - Hash-chained audit that gates credential use.
 - Deny-by-default policy administered outside every principal.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Security Boundary                                │
+│                                                                      │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐   │
+│  │ Daemon (root) │    │ Principal   │    │ Browser              │   │
+│  │              │    │ (separate   │    │ (separate            │   │
+│  │ - Policy     │    │  Unix user) │    │  Unix user)          │   │
+│  │ - Storage    │◄──►│             │    │                      │   │
+│  │ - Audit      │    │ - Intents   │    │ - Ephemeral profile  │   │
+│  │ - Signing    │    │ - No admin  │    │ - No personal state  │   │
+│  │              │    │   access    │    │                      │   │
+│  └──────────────┘    └──────────────┘    └──────────────────────┘   │
+│        ▲                                                            │
+│        │  kernel-enforced                                           │
+│  ┌─────┴──────────────────────────────────────────────────────┐    │
+│  │  /dev/uhid, /dev/hidraw* — device permissions per profile  │    │
+│  │  Admin socket — daemon-only                                │    │
+│  │  Audit path — root-owned, mode 0700                        │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ## Authorization and UP/UV
 
@@ -33,11 +58,12 @@ administrator policy resolves the one-shot operation without displaying a notifi
 and UV are machine authorization claims, not evidence that a human was present or locally verified.
 
 For delegated-session autonomy, the `allow` path is resolved by the daemon signing oracle via
-the MV3 extension and localhost channel described in
-[ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md). A `confirm` rule
-is not auto-signed and remains an explicit human prompt. A `deny` rule fails closed. Daemon-side
-origin, grant, policy, credential-ref, audit, and key-provider checks are load-bearing; the
-bearer token is defense-in-depth. Implementation is **in progress**.
+the MV3 extension and localhost channel. The daemon-loaded MV3 extension reads the frame origin
+via a MAIN-world override and forwards the assertion request to the daemon over a localhost bearer
+channel. The daemon validates origin, grant, policy, credential ref, and audit before signing.
+A `confirm` rule is not auto-signed and remains an explicit human prompt. A `deny` rule fails
+closed. Daemon-side origin, grant, policy, credential-ref, audit, and key-provider checks are
+load-bearing; the bearer token is defense-in-depth. Implementation is **in progress**.
 
 The RP receives ordinary WebAuthn UP/UV flags and generally cannot distinguish human evidence from
 policy evidence. Passless records the selected authorization and evidence sources in its audit log,
@@ -51,11 +77,10 @@ For human and isolated modes, the stock browser validates that the calling origi
 requested RP ID. Passless receives the RP ID and `clientDataHash` through CTAP. It does not
 receive the exact web origin. Agent policy is keyed by exact RP ID, not origin.
 
-For delegated-session autonomous authentication under
-[ADR 0005](../decisions/0005-delegated-autonomous-authentication-redesign.md), the daemon
-validates the frame origin read by a MAIN-world extension override. Daemon-side origin, grant,
-policy, credential-ref, audit, and key-provider checks are load-bearing. The per-session
-localhost bearer token is defense-in-depth. Implementation is **in progress**.
+For delegated-session autonomous authentication, the daemon validates the frame origin read by a
+MAIN-world extension override. Daemon-side origin, grant, policy, credential-ref, audit, and
+key-provider checks are load-bearing. The per-session localhost bearer token is defense-in-depth.
+Implementation is **in progress**.
 
 A configured `start_url` is operational configuration, not origin evidence. Passless never
 claims independent visibility of the exact web origin for CTAP-based paths.

@@ -1,5 +1,8 @@
 # Agent configuration reference
 
+> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+> Configuration fields and validation rules may change.
+
 Agent support is disabled by default. All configuration lives under `[agents]` in the main
 TOML file. Unknown fields and invalid modes are rejected at load time.
 
