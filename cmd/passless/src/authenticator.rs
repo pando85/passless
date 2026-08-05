@@ -13,10 +13,10 @@ use crate::util::bytes_to_hex;
 use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
 
 use soft_fido2::{
-    Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions, Credential,
-    CredentialBackupState, CredentialKeyProvider, CredentialRef, CtapCommand,
-    Error as SoftFido2Error, PinState, Result, SoftwareCredentialKeyProvider, StatusCode, UpResult,
-    UvResult,
+    Authenticator, AuthenticatorCallbacks, AuthenticatorConfig, AuthenticatorOptions,
+    BuiltInUvState, Credential, CredentialBackupState, CredentialKeyProvider, CredentialRef,
+    CtapCommand, Error as SoftFido2Error, PinState, Result, SoftwareCredentialKeyProvider,
+    StatusCode, UpResult, UvResult,
 };
 
 use std::collections::HashMap;
@@ -605,6 +605,29 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BuiltInUvPolicy {
+    enforcement: PinEnforcement,
+    always_uv: bool,
+}
+
+impl BuiltInUvPolicy {
+    fn runtime_state(self, pin_is_set: bool) -> BuiltInUvState {
+        let requires_client_pin = pin_is_set
+            && match self.enforcement {
+                PinEnforcement::Never => false,
+                PinEnforcement::Optional => self.always_uv,
+                PinEnforcement::Required => true,
+            };
+
+        if requires_client_pin {
+            BuiltInUvState::SupportedNotConfigured
+        } else {
+            BuiltInUvState::Configured
+        }
+    }
+}
+
 /// Main authenticator service
 ///
 /// This service orchestrates the FIDO2 authenticator:
@@ -619,6 +642,10 @@ pub struct AuthenticatorService<
     pub authenticator: Authenticator<PasslessCallbacks<S, P>, K>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
+    /// PIN storage used to evaluate runtime verification availability.
+    pin_storage: Option<Arc<Mutex<P>>>,
+    /// Dynamic built-in UV policy; absent for agent authenticators.
+    built_in_uv_policy: Option<BuiltInUvPolicy>,
     /// Maximum UV retries (configured value)
     max_uv_retries: u8,
     /// Runtime feature gate for credential export/import.
@@ -861,14 +888,21 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             pin_config.clone(),
         )?;
 
-        Ok(Self {
+        let mut service = Self {
             authenticator,
             storage,
+            pin_storage,
+            built_in_uv_policy: Some(BuiltInUvPolicy {
+                enforcement: pin_config.enforcement,
+                always_uv: security_config.always_uv,
+            }),
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
             pending_backups: HashMap::new(),
-        })
+        };
+        service.refresh_built_in_uv_state()?;
+        Ok(service)
     }
 
     /// Create a new authenticator service with shared storage and an agent interaction manager
@@ -897,6 +931,8 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         Ok(Self {
             authenticator,
             storage,
+            pin_storage,
+            built_in_uv_policy: None,
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
@@ -1138,14 +1174,21 @@ impl<
             key_provider,
         )?;
 
-        Ok(Self {
+        let mut service = Self {
             authenticator,
             storage,
+            pin_storage,
+            built_in_uv_policy: Some(BuiltInUvPolicy {
+                enforcement: pin_config.enforcement,
+                always_uv: security_config.always_uv,
+            }),
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: false,
             credential_backup_supported: false,
             pending_backups: HashMap::new(),
-        })
+        };
+        service.refresh_built_in_uv_state()?;
+        Ok(service)
     }
 
     #[cfg(all(feature = "tpm", feature = "agent"))]
@@ -1169,11 +1212,33 @@ impl<
         Ok(Self {
             authenticator,
             storage,
+            pin_storage,
+            built_in_uv_policy: None,
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: false,
             credential_backup_supported: false,
             pending_backups: HashMap::new(),
         })
+    }
+
+    fn refresh_built_in_uv_state(&mut self) -> Result<()> {
+        let Some(policy) = self.built_in_uv_policy else {
+            return Ok(());
+        };
+
+        let pin_is_set = match &self.pin_storage {
+            Some(pin_storage) => {
+                let storage = pin_storage.lock().map_err(|_| SoftFido2Error::Other)?;
+                storage
+                    .load_pin_state()
+                    .map_err(SoftFido2Error::from)?
+                    .is_pin_set()
+            }
+            None => false,
+        };
+
+        self.authenticator
+            .set_built_in_uv_state(policy.runtime_state(pin_is_set))
     }
 
     fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
@@ -1489,6 +1554,8 @@ impl<
 
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
+        self.refresh_built_in_uv_state()?;
+
         if request.first() == Some(&CMD_PASSLESS_BACKUP) {
             self.handle_backup_command(&request[1..], response_buffer);
             return Ok(());
@@ -1598,6 +1665,188 @@ mod tests {
     use super::*;
 
     use crate::storage::LocalStorageAdapter;
+
+    use soft_fido2_ctap::SecPinHash;
+
+    struct TestPinStorage {
+        state: Mutex<PinState>,
+    }
+
+    impl TestPinStorage {
+        fn new(state: PinState) -> Self {
+            Self {
+                state: Mutex::new(state),
+            }
+        }
+
+        fn set_state(&self, state: PinState) {
+            *self.state.lock().expect("test PIN storage lock") = state;
+        }
+    }
+
+    impl PinStorage for TestPinStorage {
+        fn load_pin_state(&self) -> core::result::Result<PinState, StatusCode> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| StatusCode::Other)
+        }
+
+        fn save_pin_state(&self, state: &PinState) -> core::result::Result<(), StatusCode> {
+            *self.state.lock().map_err(|_| StatusCode::Other)? = state.clone();
+            Ok(())
+        }
+    }
+
+    fn pin_state_with_pin() -> PinState {
+        let mut state = PinState::new();
+        state.pin_hash = Some(SecPinHash::new([0x42; 32]));
+        state
+    }
+
+    fn get_info_uv(response: &[u8]) -> Option<bool> {
+        assert_eq!(response.first(), Some(&0x00));
+        let value: serde_cbor::Value =
+            serde_cbor::from_slice(&response[1..]).expect("decode authenticatorGetInfo");
+        let info = match value {
+            serde_cbor::Value::Map(info) => info,
+            other => panic!("expected GetInfo map, got {other:?}"),
+        };
+        let options = match info.get(&serde_cbor::Value::Integer(4)) {
+            Some(serde_cbor::Value::Map(options)) => options,
+            other => panic!("expected GetInfo options map, got {other:?}"),
+        };
+        match options.get(&serde_cbor::Value::Text("uv".to_string())) {
+            Some(serde_cbor::Value::Bool(value)) => Some(*value),
+            None => None,
+            other => panic!("expected boolean uv option, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_built_in_uv_policy_matrix() {
+        let state = |enforcement, always_uv, pin_is_set| {
+            BuiltInUvPolicy {
+                enforcement,
+                always_uv,
+            }
+            .runtime_state(pin_is_set)
+        };
+
+        for enforcement in [
+            PinEnforcement::Never,
+            PinEnforcement::Optional,
+            PinEnforcement::Required,
+        ] {
+            assert_eq!(state(enforcement, true, false), BuiltInUvState::Configured);
+            assert_eq!(state(enforcement, false, false), BuiltInUvState::Configured);
+        }
+
+        assert_eq!(
+            state(PinEnforcement::Never, true, true),
+            BuiltInUvState::Configured
+        );
+        assert_eq!(
+            state(PinEnforcement::Optional, false, true),
+            BuiltInUvState::Configured
+        );
+        assert_eq!(
+            state(PinEnforcement::Optional, true, true),
+            BuiltInUvState::SupportedNotConfigured
+        );
+        assert_eq!(
+            state(PinEnforcement::Required, false, true),
+            BuiltInUvState::SupportedNotConfigured
+        );
+        assert_eq!(
+            state(PinEnforcement::Required, true, true),
+            BuiltInUvState::SupportedNotConfigured
+        );
+    }
+
+    #[test]
+    fn test_get_info_tracks_runtime_pin_policy_without_consuming_uv_retries() {
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let credential_dir = temp_dir.path().join("credentials");
+        std::fs::create_dir_all(&credential_dir).expect("create credential directory");
+        let storage = LocalStorageAdapter::new(credential_dir).expect("create credential storage");
+
+        let mut pin_state = pin_state_with_pin();
+        pin_state.uv_retries = 5;
+        let pin_storage = Arc::new(Mutex::new(TestPinStorage::new(pin_state)));
+
+        let mut security_config = SecurityConfig::default();
+        security_config.always_uv = true;
+        let mut pin_config = PinConfig::default();
+        pin_config.enforcement = PinEnforcement::Optional;
+
+        let mut service = AuthenticatorService::with_pin_storage(
+            storage,
+            Some(pin_storage.clone()),
+            security_config,
+            pin_config,
+        )
+        .expect("create authenticator service");
+
+        assert_eq!(
+            service
+                .authenticator
+                .built_in_uv_state()
+                .expect("read built-in UV state"),
+            BuiltInUvState::SupportedNotConfigured
+        );
+
+        let mut response = Vec::new();
+        service
+            .handle(&[0x04], &mut response)
+            .expect("handle GetInfo with PIN");
+        assert_eq!(get_info_uv(&response), Some(false));
+        assert_eq!(
+            pin_storage
+                .lock()
+                .expect("test PIN storage")
+                .load_pin_state()
+                .expect("load PIN state")
+                .uv_retries,
+            5
+        );
+
+        pin_storage
+            .lock()
+            .expect("test PIN storage")
+            .set_state(PinState::new());
+        service
+            .handle(&[0x04], &mut response)
+            .expect("handle GetInfo without PIN");
+        assert_eq!(get_info_uv(&response), Some(true));
+        assert_eq!(
+            service
+                .authenticator
+                .built_in_uv_state()
+                .expect("read built-in UV state"),
+            BuiltInUvState::Configured
+        );
+
+        let mut pin_state = pin_state_with_pin();
+        pin_state.uv_retries = 5;
+        pin_storage
+            .lock()
+            .expect("test PIN storage")
+            .set_state(pin_state);
+        service
+            .handle(&[0x04], &mut response)
+            .expect("handle GetInfo after restoring PIN");
+        assert_eq!(get_info_uv(&response), Some(false));
+        assert_eq!(
+            pin_storage
+                .lock()
+                .expect("test PIN storage")
+                .load_pin_state()
+                .expect("load PIN state")
+                .uv_retries,
+            5
+        );
+    }
 
     #[test]
     fn test_service_creation() {
