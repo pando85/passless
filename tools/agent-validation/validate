@@ -1,0 +1,22 @@
+#!/bin/bash
+#
+# Entry point for agent validation orchestrator
+# Provides a simple interface to run the validation suite
+#
+
+set -euo pipefail
+
+# Determine script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The main orchestrator script
+ORCHESTRATOR_SCRIPT="$SCRIPT_DIR/run.sh"
+
+# Check if the orchestrator script exists
+if [[ ! -f "$ORCHESTRATOR_SCRIPT" ]]; then
+    echo "Error: Agent validation orchestrator not found at $ORCHESTRATOR_SCRIPT" >&2
+    exit 1
+fi
+
+# Execute the orchestrator with all passed arguments
+exec "$ORCHESTRATOR_SCRIPT" "$@"

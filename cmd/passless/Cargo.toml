@@ -1,0 +1,83 @@
+[package]
+name = "passless-rs"
+description = "FIDO2 security token emulator"
+categories = ["command-line-utilities"]
+keywords = ["passkeys", "fido2", "auth", "password-manager", "pass"]
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+version.workspace = true
+default-run = "passless"
+
+[[bin]]
+name = "passless"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-prompt-probe"
+path = "src/bin/agent-prompt-probe.rs"
+required-features = ["agent-validation"]
+
+[features]
+default = []
+tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]
+agent = ["passless-core/agent", "passless-uhid"]
+agent-validation = ["agent"]
+
+[dependencies]
+passless-core.workspace = true
+passless-uhid = { workspace = true, optional = true }
+soft-fido2.workspace = true
+soft-fido2-transport.workspace = true
+soft-fido2-ctap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+sha2.workspace = true
+serde_cbor.workspace = true
+serde.workspace = true
+prs-lib.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+nix.workspace = true
+notify-rust.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+ctrlc.workspace = true
+clap.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+shadow-rs.workspace = true
+dirs.workspace = true
+ciborium = "0.2"
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+hmac = "0.13"
+rpassword = "7.3"
+atty = "0.2"
+serde_bytes = "0.11.19"
+tss-esapi = { version = "7.6.0", optional = true }
+p256 = { version = "0.14", features = ["ecdh", "arithmetic"], optional = true }
+hkdf = { version = "0.13", optional = true }
+aes = { version = "0.9", optional = true }
+cipher = { version = "0.5", optional = true }
+
+[dev-dependencies]
+base64 = "0.23"
+ciborium = "0.2"
+tempfile = "3.14"
+hex = "0.4"
+soft-fido2-ctap.workspace = true
+toml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+passless-config-doc.workspace = true
+zbus = { workspace = true, features = ["tokio"] }
+tokio = { version = "1.0", features = ["rt", "macros", "time", "sync"] }
+
+[build-dependencies]
+passless-core.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+shadow-rs.workspace = true
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }

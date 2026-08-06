@@ -1,0 +1,14 @@
+{
+  "name": "controlled-rp",
+  "version": "1.0.0",
+  "description": "Standards-based WebAuthn RP test harness for Passless UHID feasibility",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/test_server.js"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "13.3.2"
+  }
+}

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cross-Origin Iframe Sender</title>
+<style>
+body { font-family: monospace; background: #161b22; color: #c9d1d9; padding: 1rem; }
+#status { padding: 0.5rem; background: #0d1117; border: 1px solid #30363d; }
+</style>
+</head>
+<body>
+<p>Sender origin: <span id="senderOrigin"></span></p>
+<div id="status">Checking WebAuthn in cross-origin iframe...</div>
+<script>
+document.getElementById('senderOrigin').textContent = location.origin;
+const statusEl = document.getElementById('status');
+const result = {
+    senderUrl: location.href,
+    type: 'cross-origin-sender-result',
+    isSecureContext: window.isSecureContext,
+    hasCredentials: !!navigator.credentials,
+    error: null
+};
+if (!window.isSecureContext) {
+    result.error = 'insecure_context';
+    statusEl.textContent = 'Insecure context - WebAuthn unavailable';
+} else if (!navigator.credentials) {
+    result.error = 'no_credentials_api';
+    statusEl.textContent = 'navigator.credentials unavailable';
+} else {
+    statusEl.textContent = 'WebAuthn API available in cross-origin iframe';
+}
+if (window.parent && window.parent !== window) {
+    window.parent.postMessage(result, '*');
+}
+</script>
+</body>
+</html>

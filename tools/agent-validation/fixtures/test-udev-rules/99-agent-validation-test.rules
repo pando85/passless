@@ -1,0 +1,21 @@
+# 99-agent-validation-test.rules
+# Run-specific test udev rules for agent-validation Tier 3.
+# Installed with a unique RUN_ID suffix for safe reversibility.
+#
+# These rules are for VALIDATION TESTING ONLY.
+# They mirror the identity model from 90-uhid-feasibility.rules
+# but use a distinct tag to avoid conflicts.
+#
+# Invariants:
+#   - /dev/uhid: daemon group only (NOT human fido group)
+#   - Validation probe hidraw: agent-probe group only
+#   - Must NOT grant human operators /dev/uhid access
+
+# /dev/uhid: daemon-only (PRIN-03, ROUTE-03)
+KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0660", GROUP="uhid-daemon"
+
+# Tag validation test probe devices
+SUBSYSTEM=="hid", ATTRS{idVendor}=="15d9", ATTRS{idProduct}=="f1d0", ENV{AGENT_VALIDATION_PROBE}="1"
+
+# Validation probe hidraw: per-agent-profile group only (ISOL-01)
+SUBSYSTEM=="hidraw", ENV{AGENT_VALIDATION_PROBE}=="1", MODE="0660", GROUP="fido-agent-probe"

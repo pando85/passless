@@ -1,0 +1,64 @@
+# Passless Agent Daemon
+#
+# The daemon MUST run as root to create UHID endpoints and enforce principal
+# isolation (separate UIDs, namespaces, device policy). Do not change User/Group.
+#
+# This unit does NOT grant /dev/uhid or human hidraw access to principals.
+# Per-profile hidraw group policy is handled by 70-passless-agent.rules.
+#
+# Review hardening directives for your distribution before enabling.
+# Some directives may conflict with dynamic setuid/browser launch.
+
+[Unit]
+Description=Passless FIDO2 Agent Daemon
+Documentation=https://github.com/pando85/passless
+After=network-online.target systemd-logind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/passless --verbose
+Restart=on-failure
+RestartSec=5s
+
+# The daemon requires root for UHID endpoint creation and principal isolation.
+# Do not add User= or Group= directives.
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent /var/run/passless-browser
+PrivateTmp=true
+# Note: /var/run/passless-browser/<profile> directories are created per-profile
+# and owned by the configured browser_user. The daemon creates and cleans these
+# directories, so the parent must remain writable under ProtectSystem=strict.
+
+# Process
+NoNewPrivileges=false
+# Note: NoNewPrivileges=false is required because the daemon uses setuid to
+# launch principal and browser processes under separate Unix identities.
+
+# Namespaces
+PrivateDevices=false
+# PrivateDevices cannot be enabled: Chromium enumerates dynamically created host
+# hidraw nodes after service startup, so static bind mounts are insufficient.
+# The daemon requires /dev/uhid; exact udev identity rules restrict each hidraw
+# node. Never grant /dev/uhid to principals or browser users.
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=passless-agent
+
+# Limits
+LimitMEMLOCK=64M
+LimitNOFILE=1024
+
+# Security
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
