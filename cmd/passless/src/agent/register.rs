@@ -15,13 +15,11 @@ use passless_core::config::SecurityConfig;
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
 use super::policy_engine::PolicyRuntime;
-use super::sign::{b64u_decode, b64u_encode, verify_origin_structural};
+use super::sign::{b64u_decode, b64u_encode, verify_origin_context};
 
 use crate::storage::CredentialStorage;
 
 use soft_fido2::CredentialKeyProvider;
-
-const COSE_ALG_ES256: i32 = -7;
 
 const PASSLESS_AAGUID: [u8; 16] = [
     0x66, 0x69, 0x64, 0x6F, 0x2E, 0x70, 0x61, 0x73, 0x73, 0x6C, 0x65, 0x73, 0x73, 0x2E, 0x72, 0x73,
@@ -51,7 +49,12 @@ impl RegisterHandler {
     ) -> Result<RegisterCredentialResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
 
-        if !verify_origin_structural(&req.origin, &normalized_rp) {
+        if !verify_origin_context(
+            &req.origin,
+            req.top_origin.as_deref(),
+            req.cross_origin,
+            &normalized_rp,
+        ) {
             let deny_event = PolicyDenyBuilder::new(
                 ctx.profile_id.clone(),
                 AuditAction::Register,
@@ -131,13 +134,7 @@ impl RegisterHandler {
         let ceremony_policy = ctx
             .profile_config
             .rule_for_rp(&normalized_rp)
-            .and_then(|rule| {
-                if rule.register.authorization == passless_core::agent::AgentAuthorization::Allow {
-                    Some(rule.register)
-                } else {
-                    None
-                }
-            })
+            .map(|rule| rule.register)
             .ok_or_else(|| {
                 let deny_event = PolicyDenyBuilder::new(
                     ctx.profile_id.clone(),
@@ -153,6 +150,51 @@ impl RegisterHandler {
                     RecommendedAction::FixRequest,
                 )
             })?;
+
+        match ceremony_policy.authorization {
+            passless_core::agent::AgentAuthorization::Deny => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "RP policy denies registration",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+            passless_core::agent::AgentAuthorization::Confirm => {
+                return Err(ProtocolError::new(
+                    ErrorCode::InteractionRequired,
+                    "human confirmation is required by policy",
+                    RecommendedAction::Retry,
+                ));
+            }
+            passless_core::agent::AgentAuthorization::Allow => {}
+        }
+
+        let human_uv_required = ceremony_policy.user_verification
+            == passless_core::agent::UserVerificationSource::Human
+            && (req.user_verification
+                || self.security_config.always_uv
+                || ctx.profile_config.human_verification_prompt
+                    == passless_core::agent::HumanVerificationPrompt::Always);
+        if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
+            || human_uv_required
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::InteractionRequired,
+                "human WebAuthn verification is required by policy",
+                RecommendedAction::Retry,
+            ));
+        }
+
+        let up = ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Agent;
+        let uv = ceremony_policy.user_verification
+            == passless_core::agent::UserVerificationSource::Agent;
+        if (req.user_verification || self.security_config.always_uv) && !uv {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "user verification is required but the configured evidence source is none",
+                RecommendedAction::FixRequest,
+            ));
+        }
 
         let user_id = b64u_decode(&req.user_id_b64u).map_err(|_| {
             ProtocolError::new(
@@ -209,7 +251,19 @@ impl RegisterHandler {
             )
         })?;
 
-        let generated = self.key_provider.generate(COSE_ALG_ES256).map_err(|_| {
+        let algorithm = req
+            .pub_key_cred_params
+            .iter()
+            .copied()
+            .find(|algorithm| self.key_provider.supports_algorithm(*algorithm))
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::BadRequest,
+                    "no requested public-key algorithm is supported by this backend",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+        let generated = self.key_provider.generate(algorithm).map_err(|_| {
             ProtocolError::new(
                 ErrorCode::Internal,
                 "key generation failed",
@@ -223,12 +277,15 @@ impl RegisterHandler {
             &normalized_rp,
             &credential_id,
             &generated.cose_public_key,
+            up,
+            uv,
         );
 
         let client_data_json = build_client_data_json_for_registration(
             &req.origin,
             &req.challenge_b64u,
             req.cross_origin,
+            req.top_origin.as_deref(),
         );
 
         let attestation_object = build_attestation_object(&authenticator_data);
@@ -250,7 +307,7 @@ impl RegisterHandler {
                 display_name: req.user_display_name.clone(),
             },
             sign_count: 0,
-            alg: COSE_ALG_ES256,
+            alg: algorithm,
             key: generated.key,
             created: now_ms,
             discoverable: true,
@@ -294,6 +351,7 @@ impl RegisterHandler {
 
         Ok(RegisterCredentialResponse {
             credential_id_b64u: b64u_encode(&credential_id),
+            public_key_algorithm: algorithm,
             authenticator_data_b64u: b64u_encode(&authenticator_data),
             attestation_object_b64u: b64u_encode(&attestation_object),
             client_data_json_b64u: b64u_encode(&client_data_json),
@@ -316,13 +374,22 @@ fn build_authenticator_data_for_registration(
     rp_id: &str,
     credential_id: &[u8],
     cose_public_key: &[u8],
+    up: bool,
+    uv: bool,
 ) -> Vec<u8> {
     let mut auth_data = Vec::with_capacity(37 + credential_id.len() + cose_public_key.len());
 
     let rp_id_hash = Sha256::digest(rp_id.as_bytes());
     auth_data.extend_from_slice(&rp_id_hash);
 
-    auth_data.push(0x41);
+    let mut flags = 0x40;
+    if up {
+        flags |= 0x01;
+    }
+    if uv {
+        flags |= 0x04;
+    }
+    auth_data.push(flags);
 
     auth_data.extend_from_slice(&0u32.to_be_bytes());
 
@@ -340,6 +407,7 @@ fn build_client_data_json_for_registration(
     origin: &str,
     challenge_b64u: &str,
     cross_origin: bool,
+    top_origin: Option<&str>,
 ) -> Vec<u8> {
     let mut cdj = String::with_capacity(128);
     cdj.push_str("{\"type\":\"webauthn.create\",\"challenge\":\"");
@@ -349,6 +417,11 @@ fn build_client_data_json_for_registration(
     cdj.push('"');
     if cross_origin {
         cdj.push_str(",\"crossOrigin\":true");
+        if let Some(top_origin) = top_origin {
+            cdj.push_str(",\"topOrigin\":\"");
+            cdj.push_str(&json_escape_string(top_origin));
+            cdj.push('"');
+        }
     }
     cdj.push('}');
     cdj.into_bytes()
@@ -555,6 +628,10 @@ mod tests {
 
     fn make_registration_profile_config() -> AgentProfileConfig {
         AgentProfileConfig {
+            max_operations: 64,
+            credential_selection: passless_core::agent::config::CredentialSelection::Single,
+            human_verification_prompt:
+                passless_core::agent::config::HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: String::new(),
             rp_ids: vec!["example.com".to_string()],
@@ -568,8 +645,8 @@ mod tests {
                 rp_id: "example.com".to_string(),
                 register: AgentCeremonyPolicy {
                     authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Policy,
-                    user_verification: UserVerificationSource::Policy,
+                    user_presence: UserPresenceSource::Agent,
+                    user_verification: UserVerificationSource::Agent,
                 },
                 authenticate: AgentCeremonyPolicy::deny(),
             }],
@@ -686,6 +763,7 @@ mod tests {
         fn make_req(&self) -> RegisterCredentialRequest {
             RegisterCredentialRequest {
                 origin: "https://example.com".to_string(),
+                top_origin: None,
                 rp_id: "example.com".to_string(),
                 challenge_b64u: "dGVzdA".to_string(),
                 user_id_b64u: "dXNlcg".to_string(),
@@ -693,6 +771,7 @@ mod tests {
                 user_display_name: Some("Test User".to_string()),
                 rp_name: Some("Example".to_string()),
                 exclude_credentials: vec![],
+                pub_key_cred_params: vec![-7],
                 user_verification: false,
                 cross_origin: false,
             }
@@ -701,6 +780,10 @@ mod tests {
 
     fn make_deny_profile_config() -> AgentProfileConfig {
         AgentProfileConfig {
+            max_operations: 64,
+            credential_selection: passless_core::agent::config::CredentialSelection::Single,
+            human_verification_prompt:
+                passless_core::agent::config::HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: String::new(),
             rp_ids: vec!["example.com".to_string()],
@@ -715,8 +798,8 @@ mod tests {
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
                     authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Policy,
-                    user_verification: UserVerificationSource::Policy,
+                    user_presence: UserPresenceSource::Agent,
+                    user_verification: UserVerificationSource::Agent,
                 },
             }],
             device: DeviceIdentity {
@@ -799,7 +882,8 @@ mod tests {
         let cred_id = vec![0xAA; 32];
         let cose_key = vec![0xBB; 20];
 
-        let auth_data = build_authenticator_data_for_registration(rp_id, &cred_id, &cose_key);
+        let auth_data =
+            build_authenticator_data_for_registration(rp_id, &cred_id, &cose_key, true, false);
 
         assert_eq!(auth_data[32], 0x41);
         assert_eq!(&auth_data[33..37], &0u32.to_be_bytes());
@@ -813,7 +897,8 @@ mod tests {
     #[test]
     fn test_build_authenticator_data_rp_id_hash() {
         let rp_id = "example.com";
-        let auth_data = build_authenticator_data_for_registration(rp_id, &[0; 10], &[0; 10]);
+        let auth_data =
+            build_authenticator_data_for_registration(rp_id, &[0; 10], &[0; 10], true, false);
 
         let mut hasher = Sha256::new();
         hasher.update(rp_id.as_bytes());
@@ -823,7 +908,8 @@ mod tests {
 
     #[test]
     fn test_build_client_data_json_for_registration_no_cross_origin() {
-        let cdj = build_client_data_json_for_registration("https://example.com", "dGVzdA", false);
+        let cdj =
+            build_client_data_json_for_registration("https://example.com", "dGVzdA", false, None);
         let expected =
             br#"{"type":"webauthn.create","challenge":"dGVzdA","origin":"https://example.com"}"#;
         assert_eq!(cdj, expected);
@@ -831,8 +917,13 @@ mod tests {
 
     #[test]
     fn test_build_client_data_json_for_registration_with_cross_origin() {
-        let cdj = build_client_data_json_for_registration("https://example.com", "dGVzdA", true);
-        let expected = br#"{"type":"webauthn.create","challenge":"dGVzdA","origin":"https://example.com","crossOrigin":true}"#;
+        let cdj = build_client_data_json_for_registration(
+            "https://example.com",
+            "dGVzdA",
+            true,
+            Some("https://top.example"),
+        );
+        let expected = br#"{"type":"webauthn.create","challenge":"dGVzdA","origin":"https://example.com","crossOrigin":true,"topOrigin":"https://top.example"}"#;
         assert_eq!(cdj, expected);
     }
 
@@ -1089,7 +1180,7 @@ mod tests {
         assert!(cdj_str.contains("\"origin\":\"https://example.com\""));
 
         let auth_data = b64u_decode(&resp.authenticator_data_b64u).unwrap();
-        assert_eq!(auth_data[32], 0x41);
+        assert_eq!(auth_data[32], 0x45);
         assert_eq!(&auth_data[37..53], &PASSLESS_AAGUID);
 
         let att_obj_bytes = b64u_decode(&resp.attestation_object_b64u).unwrap();
@@ -1114,7 +1205,6 @@ mod tests {
 
         let spoofed_origins = [
             "http://example.com",
-            "https://example.com:8443",
             "https://example.com/path",
             "https://example.com?foo=bar",
             "https://example.com#frag",
@@ -1130,6 +1220,18 @@ mod tests {
             assert!(result.is_err(), "should reject spoofed origin: {}", origin);
             assert_eq!(result.unwrap_err().code, ErrorCode::Forbidden);
         }
+    }
+
+    #[test]
+    fn test_register_explicit_https_port_allowed() {
+        let f = RegisterTestFixture::new();
+        let handler = f.make_handler();
+        let ctx = f.make_ctx();
+        let mut req = f.make_req();
+        req.origin = "https://example.com:8443".to_string();
+
+        let result = handler.register(&ctx, &req);
+        assert!(result.is_ok());
     }
 
     #[test]

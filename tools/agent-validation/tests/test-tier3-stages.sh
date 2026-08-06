@@ -174,7 +174,7 @@ test_stage_uninstall_rehearsal_dry_run() {
     source "${STAGES_DIR}/uninstall-rehearsal.sh"
 
     export AV_UNINSTALL_PASSLESS_BIN="/usr/bin/passless"
-    export AV_UNINSTALL_PROFILE_IDS="test-isolated,test-delegated"
+    export AV_UNINSTALL_PROFILE_IDS="test-isolated,test-same-user"
     export AV_UNINSTALL_HUMAN_STORE="/tmp/human-store"
     export AV_UNINSTALL_STORE_FORMAT="local-json"
     export AV_UNINSTALL_RP_URL="http://127.0.0.1:8443"

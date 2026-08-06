@@ -15,9 +15,9 @@ stage_browser_lease() {
     local ceremony_file="${evidence_dir}/agent-ceremonies-results.json"
 
     if [[ ! -f "$ceremony_file" ]] \
-        || ! jq -e '.status == "passed" and .delegated.authentication == "approved" \
-            and .delegated.second_assertion == "denied"' "$ceremony_file" >/dev/null 2>&1; then
-        jq -n '{status:"skipped",reason:"live delegated ceremony evidence unavailable"}' \
+        || ! jq -e '.status == "passed" and .same_user.authentication == "approved" \
+            and .same_user.second_assertion == "approved"' "$ceremony_file" >/dev/null 2>&1; then
+        jq -n '{status:"skipped",reason:"live same-user ceremony evidence unavailable"}' \
             > "$results_file"
         # shellcheck disable=SC2034
         STAGE_SKIPPED=true
@@ -33,7 +33,8 @@ stage_browser_lease() {
         agent::browser::tests::test_pid_mismatch_cleanup_quarantines
         agent::browser::tests::test_login_timeout_expires_pending_lease
         agent::browser::tests::test_transport_failure_pending_cleanup
-        agent::grant::tests::test_claim_one_shot_cannot_reuse
+        agent::sign::tests::test_registry_request_budget_is_shared_for_one_bearer
+        agent::sign::tests::sign_handler_tests::dynamic_grant_discovers_credential_created_after_approval
     )
     local test_name
     local log_file="${evidence_dir}/browser-lease-tests.log"
@@ -61,6 +62,6 @@ stage_browser_lease() {
     done
 
     jq -n --argjson count "${#tests[@]}" \
-        '{status:"passed",live_one_shot:true,deterministic_lifecycle_tests:$count}' \
+        '{status:"passed",live_bounded_session:true,deterministic_lifecycle_tests:$count}' \
         > "$results_file"
 }

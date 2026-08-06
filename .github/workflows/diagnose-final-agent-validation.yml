@@ -1,0 +1,45 @@
+name: Diagnose final agent validation
+
+on:
+  push:
+    branches:
+      - agent/unified-agent-modes-adr
+    paths:
+      - .github/workflows/diagnose-final-agent-validation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: Swatinem/rust-cache@v2
+      - name: Run deterministic validation with captured output
+        id: validation
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          make test-agent-validation 2>&1 | tee /tmp/agent-validation.log
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-agent-validation-log
+          path: /tmp/agent-validation.log
+          retention-days: 1
+      - name: Preserve failure status
+        if: steps.validation.outputs.status != '0'
+        run: exit 1

@@ -78,7 +78,7 @@ stage_agent_ceremonies() {
     local results_file="${EVIDENCE_DIR:-/tmp}/agent-ceremonies-results.json"
     local passless_bin="${AV_PASSLESS_BIN:-}"
     local isolated_profile="${AV_ISOLATED_PROFILE_ID:-}"
-    local delegated_profile="${AV_DELEGATED_PROFILE_ID:-}"
+    local same_user_profile="${AV_SAME_USER_PROFILE_ID:-}"
     local rp_id="${AV_RP_ID:-}"
     local rp_url="${AV_RP_URL:-}"
     local browser_user="${AV_BROWSER_USER:-}"
@@ -92,7 +92,7 @@ stage_agent_ceremonies() {
         return 0
     fi
 
-    if [[ -z "$passless_bin" || -z "$isolated_profile" || -z "$delegated_profile" \
+    if [[ -z "$passless_bin" || -z "$isolated_profile" || -z "$same_user_profile" \
         || -z "$rp_id" || -z "$rp_url" || -z "$browser_user" \
         || -z "$principal_user" || -z "$shared_root" ]]; then
         _av_ceremony_skip "$results_file" "live ceremony variables are incomplete"
@@ -174,24 +174,24 @@ stage_agent_ceremonies() {
     jq -e '.flow == "isolated" and .registration == "approved" and .authentication == "approved"' \
         "$isolated_dir/result.json" >/dev/null
 
-    local delegated_dir="$coord_root/delegated"
-    mkdir -p "$delegated_dir"
+    local same_user_dir="$coord_root/same-user"
+    mkdir -p "$same_user_dir"
     if [[ $EUID -eq 0 ]]; then
-        chown "$(id -u):$principal_gid" "$delegated_dir"
+        chown "$(id -u):$principal_gid" "$same_user_dir"
     else
-        sudo -- chown "$(id -u):$principal_gid" "$delegated_dir"
+        sudo -- chown "$(id -u):$principal_gid" "$same_user_dir"
     fi
-    chmod 770 "$delegated_dir"
+    chmod 770 "$same_user_dir"
 
-    _av_run_principal "$delegated_profile" \
-        AV_PASSLESS_BIN="$passless_bin" AV_PROFILE_ID="$delegated_profile" AV_RP_ID="$rp_id" \
-        AV_PRINCIPAL_FLOW=delegated \
-        AV_COORD_DIR="$delegated_dir" \
-        >"$delegated_dir/result.json" 2>"$delegated_dir/launch.stderr"
-    jq -e '.flow == "delegated" and .authentication == "approved" and .second_assertion == "denied" \
+    _av_run_principal "$same_user_profile" \
+        AV_PASSLESS_BIN="$passless_bin" AV_PROFILE_ID="$same_user_profile" AV_RP_ID="$rp_id" \
+        AV_PRINCIPAL_FLOW=same-user \
+        AV_COORD_DIR="$same_user_dir" \
+        >"$same_user_dir/result.json" 2>"$same_user_dir/launch.stderr"
+    jq -e '.flow == "same-user" and .authentication == "approved" and .second_assertion == "approved" \
         and .wrong_rp == "denied" and .wrong_credential == "denied"' \
-        "$delegated_dir/result.json" >/dev/null
+        "$same_user_dir/result.json" >/dev/null
 
-    jq -n '{status:"passed",isolated:{registration:"approved",authentication:"approved"},delegated:{authentication:"approved",second_assertion:"denied",wrong_rp:"denied",wrong_credential:"denied"}}' \
+    jq -n '{status:"passed",isolated:{registration:"approved",authentication:"approved"},same_user:{authentication:"approved",second_assertion:"approved",wrong_rp:"denied",wrong_credential:"denied"}}' \
         > "$results_file"
 }

@@ -27,6 +27,7 @@ use super::audit_events::{
     BackendKind, DaemonStartBuilder, DaemonStopBuilder, EndpointCreateBuilder, FailReason,
     ProfileCreateBuilder, ProfileFailBuilder, StopReason,
 };
+use super::backend::CredentialBackendHandle;
 use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
 use super::ceremony::{
     AgentCeremonyHandler, CeremonyPreparationSlot, StaticCeremonyContext,
@@ -45,7 +46,7 @@ use super::policy_engine::PolicyRuntime;
 use super::prompt::{DesktopPromptHandle, PromptHandle, PromptMode};
 use super::sign::{SignContextRegistry, SignHttpServer};
 use super::storage::{CeremonyScope, ForwardingStorageHandle, IsolatedScopedStorage};
-use super::storage_factory::create_storage_bundle_with_options;
+use super::storage_factory::{create_storage_bundle_with_options, key_provider_for_config};
 use passless_core::agent::config::CdpExposeMode;
 
 use crate::authenticator::AuthenticatorService;
@@ -74,6 +75,7 @@ pub struct RuntimeStartParams<'a> {
     pub human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
     pub human_operation_lock: Arc<Mutex<()>>,
+    pub human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
     pub pin_config: PinConfig,
@@ -193,6 +195,7 @@ pub struct ProfileRuntime {
     pub browser_uid: Option<u32>,
     pub browser_gid: Option<u32>,
     pub enabled: AtomicBool,
+    pub backend: CredentialBackendHandle,
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
 }
 
@@ -535,6 +538,7 @@ impl AgentRuntime {
         human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
         human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
         human_operation_lock: Arc<Mutex<()>>,
+        human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
         pin_config: PinConfig,
@@ -544,6 +548,7 @@ impl AgentRuntime {
             human_storage,
             human_pin_storage,
             human_operation_lock,
+            human_key_provider,
             agent_config,
             security_config,
             pin_config,
@@ -554,15 +559,22 @@ impl AgentRuntime {
 
     pub fn start_with_factories(params: RuntimeStartParams<'_>) -> Result<Arc<Self>, RuntimeError> {
         let RuntimeStartParams {
-            human_storage: _human_storage,
-            human_pin_storage: _human_pin_storage,
-            human_operation_lock: _human_operation_lock,
+            human_storage,
+            human_pin_storage,
+            human_operation_lock,
+            human_key_provider,
             agent_config,
             security_config,
             pin_config,
             shutdown,
             endpoint_factory,
         } = params;
+        let human_backend = CredentialBackendHandle::human(
+            human_storage,
+            human_pin_storage,
+            human_key_provider,
+            human_operation_lock,
+        );
         let daemon_uid = unsafe { libc::getuid() };
         let daemon_gid = unsafe { libc::getgid() };
         let _startup_mono = Instant::now();
@@ -992,9 +1004,34 @@ impl AgentRuntime {
 
             let preparation_slot = Arc::new(CeremonyPreparationSlot::new());
             let interaction_manager = Arc::new(AgentInteractionManager::new());
-            let profile_op_lock = Arc::new(Mutex::new(()));
 
-            let spec_result = match profile.mode {
+            let spec_result: Result<
+                (EndpointSpec, CeremonyScope, CredentialBackendHandle),
+                RuntimeError,
+            > = match profile.mode {
+                AgentMode::SameUser => {
+                    let ceremony_scope = CeremonyScope::new();
+                    let backend = human_backend.clone();
+                    let spec = EndpointSpec {
+                        profile_name: name.clone(),
+                        profile_id: profile_id.clone(),
+                        mode: AgentMode::SameUser,
+                        profile_config: profile.clone(),
+                        security_config: security_config.clone(),
+                        pin_config: pin_config.clone(),
+                        interaction_manager: interaction_manager.clone(),
+                        preparation_slot: preparation_slot.clone(),
+                        operation_lock: backend.operation_lock.clone(),
+                        policy_runtime: policy_runtime.clone(),
+                        audit_gate: audit_gate.clone(),
+                        event_tx: event_tx.clone(),
+                        endpoint_factory: endpoint_factory.clone(),
+                        #[cfg(test)]
+                        test_transport_factory: None,
+                        isolated_deps: None,
+                    };
+                    Ok((spec, ceremony_scope, backend))
+                }
                 AgentMode::Isolated => {
                     let storage_config = profile.storage.as_ref().ok_or_else(|| {
                         RuntimeError::Config(format!(
@@ -1010,7 +1047,20 @@ impl AgentRuntime {
                             name, e
                         ))
                     })?;
-
+                    let operation_lock = Arc::new(Mutex::new(()));
+                    let key_provider = key_provider_for_config(storage_config).map_err(|e| {
+                        RuntimeError::Storage(format!(
+                            "profile '{}': failed to resolve credential key provider: {}",
+                            name, e
+                        ))
+                    })?;
+                    let backend = CredentialBackendHandle::isolated(
+                        profile_id.clone(),
+                        bundle.credential_storage.clone(),
+                        bundle.pin_storage.clone(),
+                        key_provider,
+                        operation_lock.clone(),
+                    );
                     let ceremony_scope = CeremonyScope::new();
 
                     let effective_pin_config = if profile.requires_human_uv() {
@@ -1030,7 +1080,7 @@ impl AgentRuntime {
                         pin_config: effective_pin_config,
                         interaction_manager: interaction_manager.clone(),
                         preparation_slot: preparation_slot.clone(),
-                        operation_lock: profile_op_lock.clone(),
+                        operation_lock,
                         policy_runtime: policy_runtime.clone(),
                         audit_gate: audit_gate.clone(),
                         event_tx: event_tx.clone(),
@@ -1046,13 +1096,13 @@ impl AgentRuntime {
                         }),
                     };
 
-                    Ok((spec, ceremony_scope, bundle.credential_storage))
+                    Ok((spec, ceremony_scope, backend))
                 }
             };
-
             match spec_result {
-                Ok((spec, _ceremony_scope, cred_storage)) => {
+                Ok((spec, _ceremony_scope, backend)) => {
                     let initial_endpoint_id = match profile.mode {
+                        AgentMode::SameUser => Some(EndpointId::new()),
                         AgentMode::Isolated => {
                             match Self::create_endpoint_from_spec(
                                 &spec,
@@ -1093,7 +1143,7 @@ impl AgentRuntime {
                             lifecycle_lock: Mutex::new(()),
                             endpoint_spec: spec,
                             preparation_slot,
-                            operation_lock: profile_op_lock,
+                            operation_lock: backend.operation_lock.clone(),
                             mode: profile.mode,
                             profile_config: profile.clone(),
                             current_pending: Mutex::new(None),
@@ -1103,7 +1153,8 @@ impl AgentRuntime {
                             browser_uid,
                             browser_gid,
                             enabled: AtomicBool::new(true),
-                            credential_storage: cred_storage,
+                            credential_storage: backend.credential_storage.clone(),
+                            backend,
                         },
                     );
                 }
@@ -1230,6 +1281,10 @@ impl AgentRuntime {
         let interaction_manager_inner = spec.interaction_manager.clone();
 
         match spec.mode {
+            AgentMode::SameUser => Err(RuntimeError::Config(format!(
+                "profile '{}': same-user mode does not create an agent UHID endpoint",
+                name
+            ))),
             AgentMode::Isolated => {
                 let deps = spec.isolated_deps.as_ref().ok_or_else(|| {
                     RuntimeError::Config(format!(
@@ -1510,6 +1565,10 @@ impl AgentRuntime {
         let interaction_manager_inner = spec.interaction_manager.clone();
 
         match spec.mode {
+            AgentMode::SameUser => Err(RuntimeError::Config(format!(
+                "profile '{}': same-user mode does not create an agent UHID endpoint",
+                name
+            ))),
             AgentMode::Isolated => {
                 let deps = spec.isolated_deps.as_ref().ok_or_else(|| {
                     RuntimeError::Config(format!(
@@ -3526,6 +3585,10 @@ impl AgentRuntime {
 
         if !has_endpoint {
             match profile.mode {
+                AgentMode::SameUser => {
+                    let mut eid_guard = profile.endpoint_id.lock().unwrap();
+                    *eid_guard = Some(EndpointId::new());
+                }
                 AgentMode::Isolated => {
                     let _lifecycle = profile.lifecycle_lock.lock().unwrap();
                     match self.create_profile_endpoint(&profile.endpoint_spec) {
@@ -4723,16 +4786,13 @@ impl AgentRuntime {
             profile_config: profile_config.clone(),
         };
 
-        let key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync> =
-            Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
-
         let register_handler = Arc::new(super::register::RegisterHandler {
-            human_storage: profile.credential_storage.clone(),
+            human_storage: profile.backend.credential_storage.clone(),
             policy_runtime: self.policy_runtime.clone(),
             audit_gate: self.audit_gate.clone(),
-            key_provider,
+            key_provider: profile.backend.key_provider.clone(),
             security_config: profile.endpoint_spec.security_config.clone(),
-            operation_lock: profile.operation_lock.clone(),
+            operation_lock: profile.backend.operation_lock.clone(),
         });
 
         // Register the bearer token with the sign registry for registration
@@ -4776,11 +4836,37 @@ impl AgentRuntime {
 
         let pid = snapshot.pid;
 
-        // Try to register sign context for authentication (if credentials exist)
-        if let Ok(mut storage) = profile.credential_storage.lock()
-            && let Ok(cred) = storage.read_first(crate::storage::CredentialFilter::None)
+        // Register one authentication context for every credential in the selected
+        // backend that is both in RP scope and in the optional configured
+        // credential scope. Selection for a concrete ceremony happens in the
+        // sign handler using allowCredentials/discoverable semantics.
+        let mut credential_refs = Vec::new();
+        if let Ok(mut storage) = profile.backend.credential_storage.lock()
+            && let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None)
         {
-            let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+            loop {
+                let rp_allowed = config
+                    .rp_ids
+                    .iter()
+                    .any(|rp| rp.eq_ignore_ascii_case(&cred.rp.id));
+                let credential_ref =
+                    passless_core::agent::CredentialRef::with_default_domain(&cred.id);
+                let credential_allowed = profile_config
+                    .credential_refs
+                    .as_ref()
+                    .is_none_or(|refs| refs.iter().any(|candidate| candidate == &credential_ref));
+                if rp_allowed && credential_allowed {
+                    credential_refs.push(credential_ref);
+                }
+                match storage.read_next() {
+                    Ok(next) => cred = next,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let dynamic_credential_scope = profile_config.credential_refs.is_none();
+        if dynamic_credential_scope || !credential_refs.is_empty() {
             let session_id = passless_core::agent::PrincipalSessionId::new();
             let grant_params = super::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
@@ -4788,10 +4874,24 @@ impl AgentRuntime {
                 endpoint_id: endpoint_id.clone(),
                 principal_digest: [0u8; 32],
                 rp_ids: config.rp_ids.clone(),
-                credentials: vec![cred_ref],
-                requested_ttl_secs: 300,
+                credentials: if dynamic_credential_scope {
+                    Vec::new()
+                } else {
+                    credential_refs
+                },
+                requested_ttl_secs: profile_config
+                    .max_session_ttl
+                    .as_ref()
+                    .map(|ttl| ttl.as_secs())
+                    .unwrap_or(300),
             };
-            match self.policy_runtime.admin_request_grant(grant_params) {
+            let grant_request = if dynamic_credential_scope {
+                self.policy_runtime
+                    .admin_request_dynamic_grant(grant_params)
+            } else {
+                self.policy_runtime.admin_request_grant(grant_params)
+            };
+            match grant_request {
                 Ok(request_id) => {
                     match self
                         .policy_runtime
@@ -4803,16 +4903,13 @@ impl AgentRuntime {
                                 active_grant_id: grant_id,
                                 profile_config: profile_config.clone(),
                             };
-                            let sign_key_provider: Arc<
-                                dyn soft_fido2::CredentialKeyProvider + Send + Sync,
-                            > = Arc::new(soft_fido2::SoftwareCredentialKeyProvider);
                             let sign_handler = Arc::new(super::sign::SignHandler {
-                                human_storage: profile.credential_storage.clone(),
+                                human_storage: profile.backend.credential_storage.clone(),
                                 policy_runtime: self.policy_runtime.clone(),
                                 audit_gate: self.audit_gate.clone(),
                                 security_config: profile.endpoint_spec.security_config.clone(),
-                                key_provider: sign_key_provider,
-                                operation_lock: profile.operation_lock.clone(),
+                                key_provider: profile.backend.key_provider.clone(),
+                                operation_lock: profile.backend.operation_lock.clone(),
                             });
                             if let Err(e) = self.sign_registry.register_pending(
                                 bearer_token.clone(),
@@ -4841,6 +4938,11 @@ impl AgentRuntime {
                     log::error!("failed to request grant: {}", e);
                 }
             }
+        } else {
+            debug!(
+                "no configured credentials in backend scope for profile={}; authentication remains unavailable",
+                profile_id
+            );
         }
 
         Ok(AdminResponse::BrowserLaunched(
@@ -5599,6 +5701,10 @@ mod tests {
             profile_id: ProfileId::new("test").unwrap(),
             mode: AgentMode::Isolated,
             profile_config: passless_core::agent::AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                human_verification_prompt:
+                    passless_core::agent::config::HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "testuser".to_string(),
                 rp_ids: vec!["example.com".to_string()],
@@ -5838,6 +5944,10 @@ mod tests {
             config.profiles.insert(
                 "test-isolated".to_string(),
                 passless_core::agent::AgentProfileConfig {
+                    max_operations: 64,
+                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                    human_verification_prompt:
+                        passless_core::agent::config::HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
                     principal_user: "testuser".to_string(),
                     rp_ids: vec!["example.com".to_string()],
@@ -5923,6 +6033,14 @@ mod tests {
             crate::worker::WorkerConfig::default(),
         ));
 
+        let backend = CredentialBackendHandle::isolated(
+            profile_id.clone(),
+            cred_storage.clone(),
+            pin_storage.clone(),
+            Arc::new(soft_fido2::SoftwareCredentialKeyProvider),
+            operation_lock.clone(),
+        );
+
         let profile_runtime = ProfileRuntime {
             profile_name: "test-isolated".to_string(),
             profile_id: profile_id.clone(),
@@ -5942,6 +6060,7 @@ mod tests {
             browser_uid: None,
             browser_gid: None,
             enabled: AtomicBool::new(true),
+            backend,
             credential_storage: cred_storage.clone(),
         };
 

@@ -1124,7 +1124,7 @@ impl PolicyRuntime {
         }
 
         match snapshot.mode {
-            AgentMode::Isolated => {
+            AgentMode::SameUser | AgentMode::Isolated => {
                 if !snapshot.action_allowed(&request.action) {
                     return (
                         Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
@@ -1380,6 +1380,18 @@ impl PolicyRuntime {
             .get_mut(&profile_key)
             .ok_or(GrantError::ProfileMismatch)?;
         grants.request_grant(params)
+    }
+
+    pub fn admin_request_dynamic_grant(
+        &self,
+        params: GrantRequestParams,
+    ) -> Result<super::grant::GrantRequestId, GrantError> {
+        let profile_key = params.profile_id.as_str().to_string();
+        let mut grants_map = self.grants.lock().unwrap();
+        let grants = grants_map
+            .get_mut(&profile_key)
+            .ok_or(GrantError::ProfileMismatch)?;
+        grants.request_dynamic_grant(params)
     }
 
     pub fn admin_approve_grant(
@@ -2292,6 +2304,10 @@ mod tests {
         profiles.insert(
             profile_name.to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                human_verification_prompt:
+                    passless_core::agent::config::HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "test-user".to_string(),
                 rp_ids: rp_ids.into_iter().map(|s| s.to_string()).collect(),
@@ -2388,8 +2404,8 @@ mod tests {
             register: AgentCeremonyPolicy::deny(),
             authenticate: AgentCeremonyPolicy {
                 authorization: AgentAuthorization::Allow,
-                user_presence: UserPresenceSource::Policy,
-                user_verification: UserVerificationSource::Policy,
+                user_presence: UserPresenceSource::Agent,
+                user_verification: UserVerificationSource::Agent,
             },
         }];
 

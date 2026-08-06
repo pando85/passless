@@ -69,7 +69,7 @@ browser_evaluate() {
         <<<"$response"
 }
 
-run_delegated() {
+run_same_user() {
     local session_ttl="${AV_SESSION_TTL_SECS:-30}"
     local wrong_rp="${AV_WRONG_RP_ID:-wrong.invalid}"
     local wrong_credential="0000000000000000000000000000000000000000000000000000000000000000"
@@ -103,17 +103,17 @@ run_delegated() {
 
     result=$(browser_evaluate '(async()=>{const l=document.getElementById("log");const b=(l.innerText.match(/AUTH OK/g)||[]).length;document.getElementById("btnAuthenticate").click();for(let i=0;i<300;i++){await new Promise(r=>setTimeout(r,100));const t=l.innerText;if((t.match(/AUTH OK/g)||[]).length>b)return "auth_ok";if(t.includes("AUTH FAIL")||t.includes("Authentication error"))return "auth_failed";}return "timeout";})()')
     [[ "$result" == "auth_ok" ]] || exit 23
-    write_event delegated_authentication approved
+    write_event same_user_authentication approved
 
-    result=$(browser_evaluate '(async()=>{const l=document.getElementById("log");const b=(l.innerText.match(/AUTH FAIL|Authentication error/g)||[]).length;document.getElementById("btnAuthenticate").click();for(let i=0;i<300;i++){await new Promise(r=>setTimeout(r,100));const n=(l.innerText.match(/AUTH FAIL|Authentication error/g)||[]).length;if(n>b)return "denied";}return "not_denied";})()')
-    [[ "$result" == "denied" ]] || exit 24
-    write_event second_assertion_denied denied
+    result=$(browser_evaluate '(async()=>{const l=document.getElementById("log");const b=(l.innerText.match(/AUTH OK/g)||[]).length;document.getElementById("btnAuthenticate").click();for(let i=0;i<300;i++){await new Promise(r=>setTimeout(r,100));const t=l.innerText;if((t.match(/AUTH OK/g)||[]).length>b)return "auth_ok";if(t.includes("AUTH FAIL")||t.includes("Authentication error"))return "auth_failed";}return "timeout";})()')
+    [[ "$result" == "auth_ok" ]] || exit 24
+    write_event second_assertion_approved approved
 
-    jq -n '{flow:"delegated",wrong_rp:"denied",wrong_credential:"denied",authentication:"approved",second_assertion:"denied"}'
+    jq -n '{flow:"same-user",wrong_rp:"denied",wrong_credential:"denied",authentication:"approved",second_assertion:"approved"}'
 }
 
 case "$FLOW" in
     isolated) run_isolated ;;
-    delegated) run_delegated ;;
+    same-user) run_same_user ;;
     *) exit 2 ;;
 esac

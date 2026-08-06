@@ -10,6 +10,7 @@
   var MAX_CHALLENGE_B64U_LEN = 2048;
   var MAX_USER_NAME_LEN = 256;
   var MAX_USER_ID_B64U_LEN = 128;
+  var MAX_ALGORITHMS = 16;
 
   function isValidGetRequest(req) {
     if (!req || typeof req !== "object") return false;
@@ -36,6 +37,10 @@
     for (var i = 0; i < req.exclude_credentials.length; i++) {
       var c = req.exclude_credentials[i];
       if (typeof c !== "string" || c.length === 0 || c.length > MAX_CREDENTIAL_ID_B64U_LEN) return false;
+    }
+    if (!Array.isArray(req.pub_key_cred_params) || req.pub_key_cred_params.length === 0 || req.pub_key_cred_params.length > MAX_ALGORITHMS) return false;
+    for (var j = 0; j < req.pub_key_cred_params.length; j++) {
+      if (!Number.isInteger(req.pub_key_cred_params[j])) return false;
     }
     if (typeof req.user_verification !== "boolean") return false;
     return true;
@@ -79,6 +84,8 @@
         id: message.id,
         ok: !failed && response.ok === true,
         response: failed ? null : response.response,
+        fallback: !failed && response.fallback === true,
+        error: failed ? "broker_unavailable" : response.error,
         type: messageType
       }, location.origin);
     });

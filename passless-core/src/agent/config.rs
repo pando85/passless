@@ -26,8 +26,73 @@ const HUMAN_DEVICE_PHYS: &str = "virtual-fido-001";
 const HUMAN_VENDOR_ID: u16 = 0x15d9;
 const HUMAN_PRODUCT_ID: u16 = 0x0a37;
 
+const DEFAULT_MAX_OPERATIONS: u16 = 64;
+const MAX_OPERATIONS: u16 = 4096;
+
+fn default_max_operations() -> u16 {
+    DEFAULT_MAX_OPERATIONS
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CredentialSelection {
+    #[default]
+    Single,
+    FirstMatching,
+    Newest,
+    Credential(CredentialRef),
+}
+
+impl Serialize for CredentialSelection {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = match self {
+            Self::Single => "single".to_string(),
+            Self::FirstMatching => "first-matching".to_string(),
+            Self::Newest => "newest".to_string(),
+            Self::Credential(reference) => format!("credential:{reference}"),
+        };
+        serializer.serialize_str(&value)
+    }
+}
+
+impl<'de> Deserialize<'de> for CredentialSelection {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "single" => Ok(Self::Single),
+            "first-matching" | "first_matching" => Ok(Self::FirstMatching),
+            "newest" => Ok(Self::Newest),
+            _ => value
+                .strip_prefix("credential:")
+                .ok_or_else(|| serde::de::Error::custom(
+                    "credential_selection must be single, first-matching, newest, or credential:<ref>",
+                ))
+                .and_then(|reference| {
+                    CredentialRef::from_hex(reference)
+                        .map(Self::Credential)
+                        .map_err(serde::de::Error::custom)
+                }),
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HumanVerificationPrompt {
+    #[default]
+    Always,
+    WhenRequired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentMode {
+    #[serde(rename = "same-user", alias = "same_user")]
+    SameUser,
     #[serde(rename = "isolated")]
     Isolated,
 }
@@ -35,6 +100,7 @@ pub enum AgentMode {
 impl fmt::Display for AgentMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AgentMode::SameUser => write!(f, "same-user"),
             AgentMode::Isolated => write!(f, "isolated"),
         }
     }
@@ -45,8 +111,12 @@ impl std::str::FromStr for AgentMode {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
+            "same-user" | "same_user" => Ok(AgentMode::SameUser),
             "isolated" => Ok(AgentMode::Isolated),
-            _ => Err(format!("Invalid agent mode '{}'. Must be: isolated", s)),
+            _ => Err(format!(
+                "Invalid agent mode '{}'. Must be: same-user, isolated",
+                s
+            )),
         }
     }
 }
@@ -102,10 +172,12 @@ impl fmt::Display for AgentAuthorization {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum UserPresenceSource {
+    #[serde(rename = "human")]
     Human,
-    Policy,
+    #[serde(rename = "agent", alias = "policy")]
+    Agent,
+    #[serde(rename = "none")]
     None,
 }
 
@@ -113,17 +185,19 @@ impl fmt::Display for UserPresenceSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Human => f.write_str("human"),
-            Self::Policy => f.write_str("policy"),
+            Self::Agent => f.write_str("agent"),
             Self::None => f.write_str("none"),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum UserVerificationSource {
+    #[serde(rename = "human")]
     Human,
-    Policy,
+    #[serde(rename = "agent", alias = "policy")]
+    Agent,
+    #[serde(rename = "none")]
     None,
 }
 
@@ -131,18 +205,56 @@ impl fmt::Display for UserVerificationSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Human => f.write_str("human"),
-            Self::Policy => f.write_str("policy"),
+            Self::Agent => f.write_str("agent"),
             Self::None => f.write_str("none"),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ConfigDoc)]
 pub struct AgentCeremonyPolicy {
     pub authorization: AgentAuthorization,
     pub user_presence: UserPresenceSource,
     pub user_verification: UserVerificationSource,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentCeremonyPolicyFields {
+    authorization: AgentAuthorization,
+    user_presence: UserPresenceSource,
+    user_verification: UserVerificationSource,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentCeremonyPolicyRepr {
+    Alias(String),
+    Fields(AgentCeremonyPolicyFields),
+}
+
+impl<'de> Deserialize<'de> for AgentCeremonyPolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let repr = AgentCeremonyPolicyRepr::deserialize(deserializer)?;
+        match repr {
+            AgentCeremonyPolicyRepr::Alias(alias) => match alias.as_str() {
+                "deny" => Ok(Self::deny()),
+                "autonomous" => Ok(Self::autonomous()),
+                "supervised" => Ok(Self::supervised()),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown agent ceremony policy alias '{other}'; expected deny, autonomous, or supervised"
+                ))),
+            },
+            AgentCeremonyPolicyRepr::Fields(fields) => Ok(Self {
+                authorization: fields.authorization,
+                user_presence: fields.user_presence,
+                user_verification: fields.user_verification,
+            }),
+        }
+    }
 }
 
 impl AgentCeremonyPolicy {
@@ -184,6 +296,22 @@ impl AgentCeremonyPolicy {
             authorization: AgentAuthorization::Deny,
             user_presence: UserPresenceSource::None,
             user_verification: UserVerificationSource::None,
+        }
+    }
+
+    pub fn autonomous() -> Self {
+        Self {
+            authorization: AgentAuthorization::Allow,
+            user_presence: UserPresenceSource::Agent,
+            user_verification: UserVerificationSource::Agent,
+        }
+    }
+
+    pub fn supervised() -> Self {
+        Self {
+            authorization: AgentAuthorization::Confirm,
+            user_presence: UserPresenceSource::Human,
+            user_verification: UserVerificationSource::Human,
         }
     }
 }
@@ -408,7 +536,7 @@ impl<'de> Deserialize<'de> for BoundedDuration {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigDoc)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceIdentity {
     pub name: String,
@@ -479,8 +607,18 @@ pub struct AgentProfileConfig {
     pub credential_refs: Option<Vec<CredentialRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_grant_ttl: Option<BoundedDuration>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "session_ttl",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_session_ttl: Option<BoundedDuration>,
+    #[serde(default = "default_max_operations")]
+    pub max_operations: u16,
+    #[serde(default)]
+    pub credential_selection: CredentialSelection,
+    #[serde(default)]
+    pub human_verification_prompt: HumanVerificationPrompt,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<AgentStorageConfig>,
@@ -490,6 +628,7 @@ pub struct AgentProfileConfig {
     #[serde(default)]
     pub rules: Vec<AgentRpRule>,
 
+    #[serde(default)]
     pub device: DeviceIdentity,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,6 +709,23 @@ impl AgentProfileConfig {
                 profile_id
             )));
         }
+        if self.max_operations == 0 || self.max_operations > MAX_OPERATIONS {
+            return Err(Error::Config(format!(
+                "agent profile '{}': max_operations must be between 1 and {}",
+                profile_id, MAX_OPERATIONS
+            )));
+        }
+        if let CredentialSelection::Credential(reference) = &self.credential_selection
+            && self
+                .credential_refs
+                .as_ref()
+                .is_some_and(|refs| !refs.contains(reference))
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': credential_selection reference must be included in credential_refs",
+                profile_id
+            )));
+        }
 
         if !self.rules.is_empty()
             && (!self.rp_ids.is_empty() || self.registration_allowed || self.require_uv)
@@ -597,8 +753,6 @@ impl AgentProfileConfig {
                 .validate(profile_id, &rule.rp_id, "authentication")?;
         }
 
-        self.device.validate(profile_id)?;
-
         if let Some(ref cmd) = self.browser_command {
             if cmd.is_empty() {
                 return Err(Error::Config(format!(
@@ -617,7 +771,25 @@ impl AgentProfileConfig {
         }
 
         match self.mode {
+            AgentMode::SameUser => {
+                if self.storage.is_some() {
+                    return Err(Error::Config(format!(
+                        "agent profile '{}': same-user mode uses the human backend and must not specify storage",
+                        profile_id
+                    )));
+                }
+            }
             AgentMode::Isolated => {
+                if self.device.name.is_empty()
+                    || self.device.phys.is_empty()
+                    || self.device.uniq.is_empty()
+                {
+                    return Err(Error::Config(format!(
+                        "agent profile '{}': isolated mode requires a complete device identity",
+                        profile_id
+                    )));
+                }
+                self.device.validate(profile_id)?;
                 if self.storage.is_none() {
                     return Err(Error::Config(format!(
                         "agent profile '{}': isolated mode requires storage backend configuration",
@@ -738,6 +910,9 @@ impl AgentConfig {
 
         let mut device_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (pid, profile) in &validated_profiles {
+            if profile.mode == AgentMode::SameUser {
+                continue;
+            }
             let key = format!(
                 "{}:{}:{}:{}:{}",
                 profile.device.name,
@@ -1038,6 +1213,82 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_mode_serde_same_user() {
+        let mode = AgentMode::SameUser;
+        let json = serde_json::to_string(&mode).unwrap();
+        assert_eq!(json, "\"same-user\"");
+        assert_eq!(serde_json::from_str::<AgentMode>(&json).unwrap(), mode);
+        assert_eq!("same_user".parse::<AgentMode>().unwrap(), mode);
+    }
+
+    #[test]
+    fn test_ceremony_policy_aliases() {
+        let autonomous: AgentCeremonyPolicy = serde_json::from_str("\"autonomous\"").unwrap();
+        assert_eq!(autonomous, AgentCeremonyPolicy::autonomous());
+
+        let supervised: AgentCeremonyPolicy = serde_json::from_str("\"supervised\"").unwrap();
+        assert_eq!(supervised, AgentCeremonyPolicy::supervised());
+
+        let denied: AgentCeremonyPolicy = serde_json::from_str("\"deny\"").unwrap();
+        assert_eq!(denied, AgentCeremonyPolicy::deny());
+    }
+
+    #[test]
+    fn test_legacy_policy_evidence_alias_normalizes_to_agent() {
+        let policy: AgentCeremonyPolicy = serde_json::from_str(
+            r#"{"authorization":"allow","user_presence":"policy","user_verification":"policy"}"#,
+        )
+        .unwrap();
+        assert_eq!(policy.user_presence, UserPresenceSource::Agent);
+        assert_eq!(policy.user_verification, UserVerificationSource::Agent);
+        let serialized = serde_json::to_string(&policy).unwrap();
+        assert!(serialized.contains("\"agent\""));
+        assert!(!serialized.contains("\"policy\""));
+    }
+
+    #[test]
+    fn test_same_user_profile_parses_without_storage_or_device() {
+        let toml_str = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit.jsonl"
+
+[profiles.opencode]
+mode = "same-user"
+principal_user = "alice"
+session_ttl = 600
+max_operations = 16
+
+[[profiles.opencode.rules]]
+rp_id = "github.com"
+authenticate = "autonomous"
+register = "deny"
+"#;
+        let config: AgentConfig = toml::from_str(toml_str).unwrap();
+        let profile = config.profiles.get("opencode").unwrap();
+        assert_eq!(profile.mode, AgentMode::SameUser);
+        assert_eq!(profile.max_operations, 16);
+        assert_eq!(profile.max_session_ttl.unwrap().as_secs(), 600);
+        assert!(profile.storage.is_none());
+        assert_eq!(
+            profile.rules[0].authenticate,
+            AgentCeremonyPolicy::autonomous()
+        );
+        assert!(config.validate(None).is_ok());
+    }
+
+    #[test]
+    fn test_same_user_profile_rejects_storage() {
+        let mut profile = make_isolated_profile();
+        profile.mode = AgentMode::SameUser;
+        profile.device = DeviceIdentity::default();
+        assert!(
+            profile
+                .validate(&ProfileId::new("same-user").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_agent_config_default_disabled() {
         let config = AgentConfig::default();
         assert!(!config.enabled);
@@ -1052,6 +1303,9 @@ mod tests {
 
     fn make_isolated_profile() -> AgentProfileConfig {
         AgentProfileConfig {
+            max_operations: 64,
+            credential_selection: CredentialSelection::Single,
+            human_verification_prompt: HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: "test-user".to_string(),
             rp_ids: vec!["example.com".to_string()],
@@ -1119,8 +1373,8 @@ mod tests {
             rp_id: "example.com".to_string(),
             register: policy(
                 AgentAuthorization::Allow,
-                UserPresenceSource::Policy,
-                UserVerificationSource::Policy,
+                UserPresenceSource::Agent,
+                UserVerificationSource::Agent,
             ),
             authenticate: policy(
                 AgentAuthorization::Confirm,
@@ -1169,7 +1423,7 @@ mod tests {
     fn test_deny_rejects_evidence() {
         let err = policy(
             AgentAuthorization::Deny,
-            UserPresenceSource::Policy,
+            UserPresenceSource::Agent,
             UserVerificationSource::None,
         )
         .validate(
@@ -1192,7 +1446,7 @@ mod tests {
             register: AgentCeremonyPolicy::deny(),
             authenticate: policy(
                 AgentAuthorization::Allow,
-                UserPresenceSource::Policy,
+                UserPresenceSource::Agent,
                 UserVerificationSource::None,
             ),
         };
@@ -1359,6 +1613,9 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -1384,6 +1641,9 @@ verbose = false
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u2".to_string(),
                 rp_ids: vec!["b.com".to_string()],
@@ -1421,6 +1681,9 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -1468,6 +1731,9 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -1689,6 +1955,9 @@ product_id = 2
         profiles.insert(
             "myprofile".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -1734,6 +2003,9 @@ product_id = 2
             profiles.insert(
                 name.to_string(),
                 AgentProfileConfig {
+                    max_operations: 64,
+                    credential_selection: CredentialSelection::Single,
+                    human_verification_prompt: HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
                     principal_user: format!("u-{}", name),
                     rp_ids: vec!["a.com".to_string()],
@@ -1864,6 +2136,9 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -1921,6 +2196,9 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -1970,6 +2248,9 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -2315,6 +2596,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -2346,6 +2630,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u2".to_string(),
                 rp_ids: vec!["b.com".to_string()],
@@ -2420,6 +2707,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],
@@ -2451,6 +2741,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u2".to_string(),
                 rp_ids: vec!["b.com".to_string()],
@@ -2496,6 +2789,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_operations: 64,
+                credential_selection: CredentialSelection::Single,
+                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
                 rp_ids: vec!["a.com".to_string()],

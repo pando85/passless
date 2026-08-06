@@ -1030,8 +1030,8 @@ mod tests {
         let mut allow = confirm.clone();
         allow.rules[0].authenticate = AgentCeremonyPolicy {
             authorization: AgentAuthorization::Allow,
-            user_presence: UserPresenceSource::Policy,
-            user_verification: UserVerificationSource::Policy,
+            user_presence: UserPresenceSource::Agent,
+            user_verification: UserVerificationSource::Agent,
         };
 
         assert_ne!(confirm.digest(), allow.digest());
