@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use passless_core::agent::config::{ANY_RP_ID, validate_rp_id};
 use passless_core::agent::protocol::IntentAction;
 use passless_core::agent::{
     AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
@@ -193,17 +194,23 @@ impl PolicySnapshot {
     }
 
     pub fn is_rp_exact_match(&self, rp_id: &str) -> bool {
-        let normalized = rp_id.trim().to_ascii_lowercase();
+        let Ok(normalized) = validate_rp_id(rp_id) else {
+            return false;
+        };
         self.normalized_rp_ids.contains(&normalized)
+            || self.normalized_rp_ids.iter().any(|id| id == ANY_RP_ID)
     }
 
     pub fn is_suffix_only(&self, rp_id: &str) -> bool {
-        let normalized = rp_id.trim().to_ascii_lowercase();
+        let Ok(normalized) = validate_rp_id(rp_id) else {
+            return false;
+        };
         if self.is_rp_exact_match(&normalized) {
             return false;
         }
         self.normalized_rp_ids
             .iter()
+            .filter(|id| id.as_str() != ANY_RP_ID)
             .any(|id| normalized.ends_with(&format!(".{}", id)))
     }
 
@@ -220,14 +227,20 @@ impl PolicySnapshot {
         rp_id: &str,
         action: &IntentAction,
     ) -> Option<&AgentCeremonyPolicy> {
-        let normalized = rp_id.trim().to_ascii_lowercase();
-        self.rules
+        let normalized = validate_rp_id(rp_id).ok()?;
+        let rule = self
+            .rules
             .iter()
-            .find(|rule| rule.rp_id.trim().to_ascii_lowercase() == normalized)
-            .map(|rule| match action {
-                IntentAction::Register => &rule.register,
-                IntentAction::Authenticate => &rule.authenticate,
-            })
+            .find(|rule| rule.rp_id.trim().eq_ignore_ascii_case(&normalized))
+            .or_else(|| {
+                self.rules
+                    .iter()
+                    .find(|rule| rule.rp_id.trim() == ANY_RP_ID)
+            })?;
+        Some(match action {
+            IntentAction::Register => &rule.register,
+            IntentAction::Authenticate => &rule.authenticate,
+        })
     }
 }
 
@@ -2427,6 +2440,55 @@ mod tests {
         );
         assert!(snapshot.action_allowed(&IntentAction::Authenticate));
         assert!(!snapshot.action_allowed(&IntentAction::Register));
+    }
+
+    #[test]
+    fn test_compile_same_user_wildcard_policy_with_exact_override() {
+        let mut config = make_isolated_config("wildcard", vec![], false);
+        let profile = config.profiles.get_mut("wildcard").unwrap();
+        profile.mode = AgentMode::SameUser;
+        profile.storage = None;
+        profile.rules = vec![
+            AgentRpRule {
+                rp_id: ANY_RP_ID.to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy::autonomous(),
+            },
+            AgentRpRule {
+                rp_id: "bank.example.com".to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy::supervised(),
+            },
+        ];
+
+        let generation = PolicyRuntime::compile_generation(&config, 0).unwrap();
+        let snapshot = &generation.snapshots[0];
+
+        assert!(snapshot.is_rp_exact_match("github.com"));
+        assert_eq!(
+            snapshot
+                .ceremony_policy("github.com", &IntentAction::Authenticate)
+                .unwrap(),
+            &AgentCeremonyPolicy::autonomous()
+        );
+        assert_eq!(
+            snapshot
+                .ceremony_policy("bank.example.com", &IntentAction::Authenticate)
+                .unwrap(),
+            &AgentCeremonyPolicy::supervised()
+        );
+        assert_eq!(
+            snapshot
+                .ceremony_policy("github.com", &IntentAction::Register)
+                .unwrap(),
+            &AgentCeremonyPolicy::deny()
+        );
+        assert!(!snapshot.is_rp_exact_match("com"));
+        assert!(
+            snapshot
+                .ceremony_policy("com", &IntentAction::Authenticate)
+                .is_none()
+        );
     }
 
     #[test]

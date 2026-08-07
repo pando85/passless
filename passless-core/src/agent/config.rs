@@ -26,6 +26,8 @@ const HUMAN_DEVICE_PHYS: &str = "virtual-fido-001";
 const HUMAN_VENDOR_ID: u16 = 0x15d9;
 const HUMAN_PRODUCT_ID: u16 = 0x0a37;
 
+pub const ANY_RP_ID: &str = "*";
+
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
 const MAX_OPERATIONS: u16 = 4096;
 
@@ -677,10 +679,17 @@ impl AgentProfileConfig {
     }
 
     pub fn rule_for_rp(&self, rp_id: &str) -> Option<AgentRpRule> {
-        let normalized = rp_id.trim().to_ascii_lowercase();
-        self.effective_rules()
+        let normalized = validate_rp_id(rp_id).ok()?;
+        let rules = self.effective_rules();
+        if let Some(rule) = rules
+            .iter()
+            .find(|rule| normalize_rp_id(&rule.rp_id) == normalized)
+        {
+            return Some(rule.clone());
+        }
+        rules
             .into_iter()
-            .find(|rule| rule.rp_id.trim().to_ascii_lowercase() == normalized)
+            .find(|rule| normalize_rp_id(&rule.rp_id) == ANY_RP_ID)
     }
 
     pub fn allows_registration(&self) -> bool {
@@ -739,7 +748,7 @@ impl AgentProfileConfig {
         let effective_rules = self.effective_rules();
         let mut normalized_rules = std::collections::BTreeSet::new();
         for rule in &effective_rules {
-            validate_rp_id(&rule.rp_id)?;
+            validate_agent_rp_rule_id(&rule.rp_id)?;
             let normalized = rule.rp_id.trim().to_ascii_lowercase();
             if !normalized_rules.insert(normalized) {
                 return Err(Error::Config(format!(
@@ -751,6 +760,36 @@ impl AgentProfileConfig {
                 .validate(profile_id, &rule.rp_id, "registration")?;
             rule.authenticate
                 .validate(profile_id, &rule.rp_id, "authentication")?;
+        }
+
+        if let Some(wildcard_rule) = effective_rules
+            .iter()
+            .find(|rule| normalize_rp_id(&rule.rp_id) == ANY_RP_ID)
+        {
+            if self.rules.is_empty() {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': wildcard RP scope '*' requires explicit rules",
+                    profile_id
+                )));
+            }
+            if self.mode != AgentMode::SameUser {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': wildcard RP scope '*' is only supported in same-user mode",
+                    profile_id
+                )));
+            }
+            if self.credential_refs.is_some() {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': wildcard RP scope '*' requires credential_refs to be omitted for dynamic credential discovery",
+                    profile_id
+                )));
+            }
+            if wildcard_rule.register.authorization != AgentAuthorization::Deny {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': wildcard RP scope '*' must deny registration",
+                    profile_id
+                )));
+            }
         }
 
         if let Some(ref cmd) = self.browser_command {
@@ -937,14 +976,16 @@ impl AgentConfig {
     }
 
     pub fn profiles_for_rp_id(&self, rp_id: &str) -> Vec<(&String, &AgentProfileConfig)> {
-        let normalized = normalize_rp_id(rp_id);
+        let Ok(normalized) = validate_rp_id(rp_id) else {
+            return Vec::new();
+        };
         self.profiles
             .iter()
             .filter(|(_, profile)| {
-                profile
-                    .effective_rules()
-                    .iter()
-                    .any(|rule| normalize_rp_id(&rule.rp_id) == normalized)
+                profile.effective_rules().iter().any(|rule| {
+                    let rule_rp = normalize_rp_id(&rule.rp_id);
+                    rule_rp == normalized || rule_rp == ANY_RP_ID
+                })
             })
             .collect()
     }
@@ -993,6 +1034,14 @@ fn is_valid_dns_name(s: &str) -> bool {
 fn is_public_suffix(domain: &str) -> bool {
     use psl::Psl;
     psl::List.domain(domain.as_bytes()).is_none()
+}
+
+pub fn validate_agent_rp_rule_id(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed == ANY_RP_ID {
+        return Ok(ANY_RP_ID.to_string());
+    }
+    validate_rp_id(trimmed)
 }
 
 pub fn validate_rp_id(raw: &str) -> Result<String> {
@@ -1109,6 +1158,12 @@ mod tests {
     fn test_rp_id_reject_wildcard() {
         assert!(validate_rp_id("*.example.com").is_err());
         assert!(validate_rp_id("*").is_err());
+    }
+
+    #[test]
+    fn test_agent_rp_rule_accepts_only_global_wildcard() {
+        assert_eq!(validate_agent_rp_rule_id(" * ").unwrap(), ANY_RP_ID);
+        assert!(validate_agent_rp_rule_id("*.example.com").is_err());
     }
 
     #[test]
@@ -1274,6 +1329,73 @@ register = "deny"
             AgentCeremonyPolicy::autonomous()
         );
         assert!(config.validate(None).is_ok());
+    }
+
+    #[test]
+    fn test_same_user_wildcard_rule_matches_valid_rps_and_exact_rule_wins() {
+        let toml_str = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit.jsonl"
+
+[profiles.opencode]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.opencode.rules]]
+rp_id = "*"
+authenticate = "autonomous"
+register = "deny"
+
+[[profiles.opencode.rules]]
+rp_id = "bank.example.com"
+authenticate = "supervised"
+register = "deny"
+"#;
+        let config: AgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.validate(None).is_ok());
+        let profile = config.profiles.get("opencode").unwrap();
+
+        assert_eq!(
+            profile.rule_for_rp("github.com").unwrap().authenticate,
+            AgentCeremonyPolicy::autonomous()
+        );
+        let exact = profile.rule_for_rp("bank.example.com").unwrap();
+        assert_eq!(exact.authenticate, AgentCeremonyPolicy::supervised());
+        assert_eq!(exact.register, AgentCeremonyPolicy::deny());
+        assert!(profile.rule_for_rp("com").is_none());
+
+        let matches = config.profiles_for_rp_id("github.com");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "opencode");
+
+        let mut restricted = profile.clone();
+        restricted.credential_refs = Some(vec![CredentialRef::with_default_domain(b"restricted")]);
+        let err = restricted
+            .validate(&ProfileId::new("restricted").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("credential_refs to be omitted"));
+
+        let mut registering = profile.clone();
+        registering.rules[0].register = AgentCeremonyPolicy::autonomous();
+        let err = registering
+            .validate(&ProfileId::new("registering").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("must deny registration"));
+
+        let mut isolated = profile.clone();
+        isolated.mode = AgentMode::Isolated;
+        let err = isolated
+            .validate(&ProfileId::new("isolated-wildcard").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("only supported in same-user mode"));
+
+        let mut legacy = profile.clone();
+        legacy.rules.clear();
+        legacy.rp_ids = vec![ANY_RP_ID.to_string()];
+        let err = legacy
+            .validate(&ProfileId::new("legacy-wildcard").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("requires explicit rules"));
     }
 
     #[test]

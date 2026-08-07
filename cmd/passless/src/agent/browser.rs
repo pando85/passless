@@ -15,7 +15,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use passless_core::agent::config::CdpExposeMode;
+use passless_core::agent::config::{ANY_RP_ID, CdpExposeMode, validate_rp_id};
 use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
 
 use rand::Rng;
@@ -1524,6 +1524,10 @@ fn validate_start_url(url: &str, rp_ids: &[String]) -> Result<(), ()> {
     }
 
     let host_normalized = host.to_ascii_lowercase();
+
+    if rp_ids.iter().any(|rp_id| rp_id.trim() == ANY_RP_ID) {
+        return validate_rp_id(&host_normalized).map(|_| ()).map_err(|_| ());
+    }
 
     let matching: Vec<&str> = rp_ids
         .iter()

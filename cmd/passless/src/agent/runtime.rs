@@ -4763,6 +4763,13 @@ impl AgentRuntime {
         // Request registration grants for all allowed RP IDs
         let mut registration_grants = std::collections::HashMap::new();
         for rp_id in &config.rp_ids {
+            let registration_allowed = profile_config.rule_for_rp(rp_id).is_some_and(|rule| {
+                rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
+            });
+            if !registration_allowed {
+                continue;
+            }
+
             match self
                 .policy_runtime
                 .request_registration_grant(profile_id.clone(), rp_id.clone())
