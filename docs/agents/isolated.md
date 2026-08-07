@@ -2,71 +2,54 @@
 
 > **EXPERIMENTAL** — Agent mode is not yet validated for production use.
 
-Isolated profiles use agent-only credentials with independent storage, PIN state, and
-revocation. They cannot see or use human credentials.
+Isolated profiles use agent-owned credentials with independent credential storage, verification/PIN state, key-provider state, operation locking, and revocation lifecycle. They cannot enumerate or sign with the human credential namespace.
 
-An isolated profile can be fully unattended. Setting an exact RP action to `allow` with policy
-UP/UV removes the human prompt, but does not make the authenticator unrestricted. Every operation
-still requires a one-shot intent and passes the normal endpoint, policy, storage, and audit gates.
+Use isolated mode as the default choice for unattended automation when the relying party can support a separate automation account or service identity.
 
-## How isolated mode works
+## Trust model
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Passless Daemon                       │
-│                                                          │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │  Isolated Profile: "release-bot"                   │ │
-│  │                                                     │ │
-│  │  ┌─────────────┐   ┌───────────────────────────┐   │ │
-│  │  │ Agent UHID   │   │ Isolated Credential Store │   │ │
-│  │  │ Endpoint     │   │ (local/pass/TPM)          │   │ │
-│  │  │ /dev/hidraw* │   │                           │   │ │
-│  │  └──────┬───────┘   └───────────────────────────┘   │ │
-│  │         │                                            │ │
-│  │  ┌──────┴────────────────────────────────────────┐  │ │
-│  │  │  Policy Engine                                 │  │ │
-│  │  │  rp_id="github.com"                            │  │ │
-│  │  │  register: allow / policy UP / policy UV       │  │ │
-│  │  │  authenticate: allow / policy UP / policy UV   │  │ │
-│  │  └────────────────────────────────────────────────┘  │ │
-│  │                                                     │ │
-│  │  ┌────────────────────────────────────────────────┐ │ │
-│  │  │  One-shot Intent (consumed on terminal result) │ │ │
-│  │  └────────────────────────────────────────────────┘ │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                          │
-│  Human endpoint and credentials are NOT accessible       │
-└─────────────────────────────────────────────────────────┘
-         ▲
-         │ CTAP (WebAuthn)
-         │
-┌────────┴────────┐
-│  Agent Process  │
-│  (principal     │
-│   user)         │
-└─────────────────┘
+An isolated agent may still be fully autonomous, but it authenticates as an agent-owned RP identity rather than the human's existing passkey identity.
+
+```text
+Passless daemon
+  ├─ human credential backend
+  │    └─ unavailable to isolated profile
+  │
+  └─ isolated profile: release-bot
+       ├─ isolated credential backend
+       ├─ isolated verification/PIN state
+       ├─ configured key provider (software/pass/TPM)
+       ├─ exact RP/action policy
+       ├─ bounded session / one-shot operation state
+       └─ audit
 ```
 
-## Credential store
+Autonomy is an action policy, not a credential-ownership mode. An isolated profile can use:
 
-Each isolated profile has its own storage backend (local, pass, or TPM) under a
-non-overlapping root. Credentials created in one profile are invisible to the human
-endpoint and to other profiles.
+- `deny` — operation not allowed;
+- `supervised` — human confirmation/evidence;
+- `autonomous` — agent-derived UP/UV after the bound agent/session gates succeed.
+
+Agent-derived evidence is not human interaction and must be recorded as `agent`, not `human`, in operator/audit surfaces.
+
+## Example autonomous profile
 
 ```toml
 [agents]
 enabled = true
-audit_path = "/var/lib/passless-agent/audit/events.jsonl"
+audit_path = "/var/lib/passless-agent/audit"
 
 [agents.profiles.release-bot]
 mode = "isolated"
 principal_user = "passless-release"
+max_session_ttl = 300
+max_operations = 8
+credential_selection = "single"
 
 [[agents.profiles.release-bot.rules]]
 rp_id = "github.com"
-register = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
-authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+register = "autonomous"
+authenticate = "autonomous"
 
 [agents.profiles.release-bot.storage.local]
 path = "/var/lib/passless-agent/release-bot/credentials"
@@ -80,140 +63,147 @@ vendor_id = 4660
 product_id = 22137
 ```
 
-This profile can register and authenticate at `github.com` without a notification. Policy UP/UV
-means that the operator-owned rule authorizes the WebAuthn flags; it does not represent a human
-being present or locally verified. See [unattended operation semantics](security.md#unattended-operation-semantics).
+The expanded autonomous policy is:
+
+```toml
+authenticate = {
+  authorization = "allow",
+  user_presence = "agent",
+  user_verification = "agent"
+}
+```
+
+The legacy evidence spelling `policy` may still parse as an alias, but current configuration, documentation, and audit terminology should use `agent`.
+
+## Storage isolation
+
+Each isolated profile has its own backend namespace. Supported backends follow the Passless build/configuration: local, pass-backed, and TPM where available.
+
+Validation rejects overlapping roots between:
+
+- isolated profiles;
+- isolated credential and PIN state where overlap is unsafe;
+- agent audit state;
+- the human backend state.
+
+This is a security invariant, not merely a directory-layout preference.
+
+For portable TPM credentials, the configured TPM provider remains the signer; agent mode must not silently substitute software keys.
 
 ## One-shot intents
 
-Every registration and authentication ceremony requires a one-shot intent.
+The isolated compatibility/native ceremony path requires an intent immediately before the matching WebAuthn operation.
 
 ### Registration
 
 ```bash
 passless agent --profile release-bot intent create register \
-  --rp github.com --reason "CI release signing"
+  --rp github.com \
+  --reason "initial release-bot enrollment"
 ```
 
-The intent binds to the first matching CTAP `makeCredential` request. A `confirm` rule displays
-the trusted prompt; an `allow` rule resolves it from policy without a notification. The credential
-is stored in the profile's isolated store. The intent is consumed on every terminal result.
-
-The principal creates the intent immediately before starting WebAuthn registration. An `allow`
-rule does not require an administrator to approve that individual intent.
+The intent is bound to the requested action/RP and current principal/policy state. An autonomous rule does not require per-operation administrator approval, but the ceremony still passes the daemon's policy, storage, audit, and operation gates.
 
 ### Authentication
 
 ```bash
 passless agent --profile release-bot intent create authenticate \
-  --rp github.com --credential <credential-ref-hex> --reason "release push"
+  --rp github.com \
+  --credential <credential-ref-hex> \
+  --reason "release push"
 ```
 
-The intent binds to the exact credential and RP ID. UP and UV use the sources configured in the
-exact action rule. The intent is consumed on every terminal result.
+The credential reference is non-secret. The private key remains in the isolated backend/key provider.
+
+Treat success, denial, cancellation, expiry, and terminal failure as consuming the operation authority. Create a new intent for a genuinely new operation rather than replaying a completed one.
+
+## Managed browser path
+
+Isolated profiles can also use the daemon-managed browser/extension pipeline where configured. The production extension forwards bounded WebAuthn requests to the daemon; it does not receive private keys or PINs.
+
+For the managed browser path:
+
+- origin/top-origin come from browser extension sender metadata rather than page claims;
+- RP/origin relationship is revalidated in the daemon;
+- conditional mediation/passkey autofill remains native;
+- unverifiable cross-origin Permissions Policy delegation remains native;
+- session operation budgets and replay detection apply;
+- audit gates credential use.
+
+The managed browser session is still application authority. After an isolated credential signs into its RP account, an agent controlling that browser can perform whatever actions that isolated account is allowed to perform.
 
 ## Fully unattended workflow
 
-1. Create the principal Unix user and daemon-owned storage described in
-   [configuration](configuration.md#setup).
-2. Configure one exact RP rule with `register` and `authenticate` set to `allow`, as shown above.
-3. Restart the daemon, then validate the loaded profile and policy:
+1. Create the principal Unix identity and isolated storage roots.
+2. Configure the narrowest exact RP rules required by the automation.
+3. Keep `max_session_ttl` and `max_operations` small.
+4. Validate before launch:
    ```bash
    passless agent-admin profile check release-bot
    passless agent-admin policy check release-bot
    ```
-4. Launch the automation under the configured principal identity:
+5. Launch the principal:
    ```bash
    passless agent run --profile release-bot -- /usr/local/bin/agent-command
    ```
-5. Inside that session, create one registration intent immediately before initiating the matching
-   WebAuthn registration:
+6. Inside the principal session, inspect:
    ```bash
-   passless agent --profile release-bot intent create register \
-     --rp github.com --reason "Initial unattended enrollment"
+   passless agent --profile release-bot doctor
+   passless agent --profile release-bot capabilities
+   passless agent --profile release-bot instructions
    ```
-6. List the resulting isolated credential and retain its non-secret reference:
-   ```bash
-   passless agent --profile release-bot credential list
-   ```
-7. For each authentication, create a fresh intent immediately before initiating WebAuthn:
-   ```bash
-   passless agent --profile release-bot intent create authenticate \
-     --rp github.com --credential <credential-ref-hex> --reason "CI release"
-   ```
+7. Create the required one-shot intent immediately before each isolated native ceremony, or use the managed browser path according to the profile/runtime configuration.
+8. Review audit and RP-side account/session state after enrollment or sensitive automation.
 
-Creating an intent does not itself perform WebAuthn. The following browser or client request must
-arrive on the profile's endpoint and match the intent. Each terminal result consumes the intent, so
-retries require a new one.
+## Registration
 
-### Boundaries retained without prompts
+Registration creates identity state. Allow it only where unattended enrollment is actually intended.
 
-- Only normalized exact RP IDs with explicit rules are eligible; missing or suffix-only rules deny.
-- Each request remains bound to its principal session, endpoint, process identity, policy
-  generation, action, RP ID, and credential reference where applicable.
-- Credentials and PIN state remain separate from human credentials and every other profile.
-- A durable audit reservation is still required before credential creation or use.
-- Policy reload, daemon restart, timeout, cancellation, denial, success, and failure invalidate or
-  consume the relevant one-shot state.
-- The principal cannot modify policy, access daemon-owned storage, or use another endpoint.
-
-## Launch and workflow
-
-```bash
-passless agent-admin profile check release-bot
-passless agent run --profile release-bot -- /usr/local/bin/agent-command
-```
-
-Principal commands (`intent`, `capabilities`, `doctor`, `credential`) run inside the
-launched session. The operator launches; the principal requests ceremonies.
-
-### `agent run` behavior
-
-The `agent run` command:
-
-- Requires the daemon to be running as root.
-- Requires an absolute executable path (no PATH lookup).
-- Attaches stdin/stdout/stderr to the principal process.
-- Waits for the principal process to exit and propagates its exit code.
-- On Ctrl+C, sends a termination request to the daemon and waits for graceful shutdown.
-- The principal process runs as the configured `principal_user` with device policy
-  enforced by the daemon.
-
-The command path must be absolute and owned by root to prevent PATH injection or
-symlink attacks from the principal user.
-
-## Revocation
-
-```bash
-passless agent-admin credential list -d github.com
-passless agent-admin credential revoke <credential-ref> --confirm
-passless agent-admin credential delete <credential-ref> --confirm
-```
-
-Revocation is local. Remove the credential at each RP separately.
-
-## Registration budget
-
-Use `register.authorization = "allow"` only where unattended enrollment is intended. Change it to
-`"confirm"` for supervised enrollment or replace the registration policy with an all-`none`
-`"deny"` rule after enrollment, then restart the daemon:
-
-```bash
-# Edit the exact RP registration rule
-sudo systemctl restart passless-agent
-```
-
-For example, retain unattended authentication while closing registration:
+After initial enrollment, a common safer policy is:
 
 ```toml
 [[agents.profiles.release-bot.rules]]
 rp_id = "github.com"
-register = { authorization = "deny", user_presence = "none", user_verification = "none" }
-authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+register = "deny"
+authenticate = "autonomous"
 ```
 
-The daemon loads the updated configuration on restart and recompiles policy. Existing isolated
-credentials remain usable for authentication; subsequent registration requests deny. The
-`agent-admin policy reload` command recompiles policy from the daemon's in-memory
-configuration snapshot and does not read from disk. See
-[configuration: policy reload](configuration.md#policy-reload-behavior) for details.
+Restart the daemon after editing on-disk configuration. `agent-admin policy reload` recompiles the daemon's current in-memory configuration snapshot; it is not a configuration-file reload mechanism.
+
+## Credential selection
+
+`credential_selection = "single"` is the safest default. It fails closed if discoverable authentication leaves multiple eligible isolated credentials.
+
+`first-matching`, `newest`, and explicit credential references are deterministic alternatives. Prefer explicit identity/account mapping when selecting the wrong RP account would be consequential.
+
+## Revocation
+
+List and revoke isolated credentials with the administrator CLI:
+
+```bash
+passless agent-admin credential list --profile release-bot
+passless agent-admin credential revoke <credential-ref> --confirm
+passless agent-admin credential delete <credential-ref> --confirm
+```
+
+Local revocation/deletion does not automatically revoke RP-side sessions or remove the credential from the RP account. Use the RP's own controls as well when necessary.
+
+Disable the entire profile immediately with:
+
+```bash
+passless agent-admin profile disable release-bot
+```
+
+## Boundaries retained under autonomy
+
+Even with `authenticate = "autonomous"`:
+
+- isolated code cannot select the human credential namespace;
+- policy is evaluated for the concrete action/RP;
+- the current principal/session and policy generation remain relevant;
+- credential scope/selection is daemon-controlled;
+- replay and operation-budget controls remain active on the managed browser path;
+- audit reservation is required before credential use/creation;
+- the principal cannot edit administrator policy or gain the admin socket merely because authentication is autonomous.
+
+See [security.md](security.md) for the shared threat model and [operations.md](operations.md) for browser/session authority, audit, and recovery guidance.

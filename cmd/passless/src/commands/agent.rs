@@ -151,32 +151,98 @@ fn dispatch_doctor(output: OutputFormat, profile: &str) -> Result<()> {
     }
 }
 
+fn capability_mode(mode: &str) -> (&'static str, bool) {
+    match mode {
+        "same-user" | "same_user" | "SameUser" => ("same-user", true),
+        "isolated" | "Isolated" => ("isolated", false),
+        _ => ("unknown", false),
+    }
+}
+
 fn dispatch_capabilities(output: OutputFormat, profile: &str) -> Result<()> {
     let mut client = connect_principal(profile)?;
     let resp = client
         .request(passless_core::agent::PrincipalRequest::Capabilities)
         .map_err(client_error_to_result)?;
     match resp {
-        passless_core::agent::PrincipalResponse::Capabilities(caps) => match output {
-            OutputFormat::Json => output_json(&caps),
-            OutputFormat::Plain => {
-                println!("profile: {}", caps.profile_id);
-                println!("mode: {}", caps.mode);
-                println!(
-                    "registration_allowed: {}",
-                    if caps.registration_allowed {
-                        "true"
-                    } else {
-                        "false"
-                    }
+        passless_core::agent::PrincipalResponse::Capabilities(caps) => {
+            let (canonical_mode, acts_as_human) = capability_mode(&caps.mode);
+            let wildcard_rp_scope = caps.allowed_rp_ids.iter().any(|rp| rp.trim() == "*");
+            let credential_namespace = if acts_as_human { "human" } else { "isolated" };
+            let rp_identity = if acts_as_human { "human" } else { "agent" };
+            let mut security_warnings = Vec::new();
+            if acts_as_human {
+                security_warnings.push(
+                    "HIGH: same-user exercises the human credential/RP identity; after login Passless does not constrain application actions",
                 );
-                println!("allowed_rp_ids:");
-                for rp in &caps.allowed_rp_ids {
-                    println!("  - {}", rp);
-                }
-                Ok(())
             }
-        },
+            if wildcard_rp_scope {
+                security_warnings.push(
+                    "CRITICAL: global RP scope '*' permits authentication to any valid RP with a matching credential",
+                );
+            }
+            if acts_as_human && caps.registration_allowed {
+                security_warnings.push(
+                    "HIGH: registration is enabled for a profile that uses the human credential backend",
+                );
+            }
+
+            #[derive(Serialize)]
+            struct CapabilitiesOutput<'a> {
+                profile_id: &'a str,
+                mode: &'a str,
+                allowed_rp_ids: &'a [String],
+                registration_allowed: bool,
+                credential_namespace: &'a str,
+                rp_identity: &'a str,
+                acts_as_human: bool,
+                wildcard_rp_scope: bool,
+                security_warnings: &'a [&'static str],
+            }
+
+            let view = CapabilitiesOutput {
+                profile_id: &caps.profile_id,
+                mode: canonical_mode,
+                allowed_rp_ids: &caps.allowed_rp_ids,
+                registration_allowed: caps.registration_allowed,
+                credential_namespace,
+                rp_identity,
+                acts_as_human,
+                wildcard_rp_scope,
+                security_warnings: &security_warnings,
+            };
+
+            match output {
+                OutputFormat::Json => output_json(&view),
+                OutputFormat::Plain => {
+                    println!("profile: {}", view.profile_id);
+                    println!("mode: {}", view.mode);
+                    println!("credential_namespace: {}", view.credential_namespace);
+                    println!("rp_identity: {}", view.rp_identity);
+                    println!("acts_as_human: {}", view.acts_as_human);
+                    println!("wildcard_rp_scope: {}", view.wildcard_rp_scope);
+                    println!(
+                        "registration_allowed: {}",
+                        if view.registration_allowed {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    );
+                    println!("allowed_rp_ids:");
+                    for rp in view.allowed_rp_ids {
+                        println!("  - {}", rp);
+                    }
+                    if !view.security_warnings.is_empty() {
+                        println!("security_warnings:");
+                        for warning in view.security_warnings {
+                            println!("  - {}", warning);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
         _ => Err(Error::Other("unexpected response".to_string())),
     }
 }
@@ -624,6 +690,9 @@ fn dispatch_browser_status(output: OutputFormat, profile: &str) -> Result<()> {
             OutputFormat::Plain => {
                 println!("running: {}", if status.running { "true" } else { "false" });
                 println!("status: {}", status.status);
+                if let Some(endpoint) = &status.cdp_endpoint {
+                    println!("cdp_endpoint: {}", endpoint);
+                }
                 Ok(())
             }
         },
@@ -897,6 +966,17 @@ mod tests {
         assert!(!json.contains("secret"));
         assert!(!json.contains("private_key"));
         assert!(!json.contains("password"));
+    }
+
+    #[test]
+    fn capabilities_derive_human_identity_and_wildcard_risk() {
+        let (same_user, acts_as_human) = capability_mode("SameUser");
+        assert_eq!(same_user, "same-user");
+        assert!(acts_as_human);
+
+        let (isolated, acts_as_human) = capability_mode("Isolated");
+        assert_eq!(isolated, "isolated");
+        assert!(!acts_as_human);
     }
 
     #[test]

@@ -2,213 +2,144 @@
 
 > **EXPERIMENTAL** — Agent mode is not yet validated for production use.
 
-## Threat model summary
+## Primary trust statement
 
-Agent mode extends the Passless daemon with multiple UHID endpoints, principal sessions,
-and browser leases. The security boundary relies on:
+Passless controls WebAuthn authentication authority. It does not constrain application actions after login.
 
-- Kernel-enforced device permissions for endpoint routing.
-- Separate Unix identities for principal, browser, and daemon.
-- One-shot intents and grants consumed on every terminal result.
-- Hash-chained audit that gates credential use.
-- Deny-by-default policy administered outside every principal.
+A successful WebAuthn ceremony normally creates an authenticated RP browser session. If the agent controls that browser, it can perform whatever the RP permits that account to perform. Short TTLs and local browser teardown reduce local authority duration; they do not prove RP-side logout or limit business actions.
 
+This is the most important security distinction in agent mode: **credential-key containment can remain strong while the authenticated application session is fully controlled by the agent.**
+
+## Identity modes
+
+### Same-user
+
+Same-user reuses the daemon's existing human credential backend. The RP sees the human passkey/account identity. Exact RP rules, credential restrictions, operation budgets, replay protection, short sessions, and audit reduce accidental scope; they do not create isolation from the human identity.
+
+With `authenticate = "autonomous"`, the agent may satisfy RP-required UP/UV without ceremony-time human interaction. Audit must record those sources as agent evidence, never human evidence. The RP receives ordinary WebAuthn flags and generally cannot distinguish agent-session verification from human PIN/biometric verification.
+
+The global `"*"` RP sentinel is the broadest supported same-user policy and should be treated as critical authority: any valid concrete RP with a matching human credential can become an authentication target during the bounded session.
+
+### Isolated
+
+Isolated mode uses a profile-specific credential backend and presents an agent-owned RP identity. The agent cannot enumerate or sign with the human credential namespace. This is the preferred mode for unattended automation when a separate RP account or service identity is available.
+
+## Production browser signing path
+
+```text
+Web page
+  -> MAIN-world WebAuthn adapter
+  -> isolated extension broker
+  -> extension worker (derives sender origin/top origin)
+  -> loopback daemon endpoint with per-session bearer
+  -> current policy / RP+origin validation / credential scope / audit
+  -> configured credential key provider
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Security Boundary                                │
-│                                                                      │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐   │
-│  │ Daemon (root) │    │ Principal   │    │ Browser              │   │
-│  │              │    │ (separate   │    │ (separate            │   │
-│  │ - Policy     │    │  Unix user) │    │  Unix user)          │   │
-│  │ - Storage    │◄──►│             │    │                      │   │
-│  │ - Audit      │    │ - Intents   │    │ - Ephemeral profile  │   │
-│  │ - Signing    │    │ - No admin  │    │ - No personal state  │   │
-│  │              │    │   access    │    │                      │   │
-│  └──────────────┘    └──────────────┘    └──────────────────────┘   │
-│        ▲                                                            │
-│        │  kernel-enforced                                           │
-│  ┌─────┴──────────────────────────────────────────────────────┐    │
-│  │  /dev/uhid, /dev/hidraw* — device permissions per profile  │    │
-│  │  Admin socket — daemon-only                                │    │
-│  │  Audit path — root-owned, mode 0700                        │    │
-│  └────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
-```
+
+The production browser extension never receives credential private keys, PINs, storage handles, or arbitrary-signing authority. The random page/broker message channel is not treated as the final authorization boundary; the worker derives origin context from browser extension sender metadata and the daemon independently validates the RP/origin relationship before key use.
 
 ## Authorization and UP/UV
 
-Every exact RP rule selects `deny`, `confirm`, or `allow` independently for registration and
-authentication. It also selects the source of UP and UV evidence.
+Each RP rule independently controls registration and authentication:
 
-- Human UP is set only after a trusted prompt approves the bound CTAP operation.
-- Human UV is set only after Passless performs actual local verification.
-- Policy UP/UV requires an explicit operator-owned rule and is audited as machine authorization,
-  not human interaction or verification.
-- Missing rules deny, and browser leases never authorize another ceremony by themselves.
-- The prompt shows trusted fields (profile, mode, exact RP ID, action, credential label)
-  and clearly labels untrusted fields (account name, page URL, page title, agent reason).
-- If the notification server cannot provide distinguishable approve and deny actions,
-  agent mode fails closed.
+- `deny`: reject the operation.
+- `confirm`: require fresh, trusted human approval for the operation.
+- `allow`: authorize automatically when all other daemon-side gates succeed.
 
-### Unattended operation semantics
+UP/UV evidence is separately configured as `agent`, `human`, or `none`.
 
-An exact action using `authorization = "allow"` and policy UP/UV is fully unattended: current
-administrator policy resolves the one-shot operation without displaying a notification. Policy UP
-and UV are machine authorization claims, not evidence that a human was present or locally verified.
+- `agent` means the daemon verified the currently bound, policy-authorized agent/session context.
+- `human` means Passless obtained the corresponding human interaction/local verification result.
+- `none` means the flag is not asserted and the operation fails when the RP or credential requires it.
 
-For delegated-session autonomy, the `allow` path is resolved by the daemon signing oracle via
-the MV3 extension and localhost channel. The daemon-loaded MV3 extension reads the frame origin
-via a MAIN-world override and forwards the assertion request to the daemon over a localhost bearer
-channel. The daemon validates origin, grant, policy, credential ref, and audit before signing.
-A `confirm` rule is not auto-signed and remains an explicit human prompt. A `deny` rule fails
-closed. Daemon-side origin, grant, policy, credential-ref, audit, and key-provider checks are
-load-bearing; the bearer token is defense-in-depth. Implementation is **in progress**.
+Agent evidence must never be described as human presence or human verification in audit or operator UI.
 
-The RP receives ordinary WebAuthn UP/UV flags and generally cannot distinguish human evidence from
-policy evidence. Passless records the selected authorization and evidence sources in its audit log,
-so operators must treat the rule itself as authority to make those claims. One-shot binding,
-policy re-evaluation, credential scope, audit reservation, and terminal consumption are unchanged.
-For a complete setup, see the [fully unattended isolated workflow](isolated.md#fully-unattended-workflow).
+## Origin and frames
 
-## Origin vs RP ID
+For the managed extension path, the browser worker derives frame origin and top-level origin independently of the page-supplied WebAuthn request. The daemon validates that the concrete origin is permitted to claim the requested RP ID.
 
-For human and isolated modes, the stock browser validates that the calling origin may use the
-requested RP ID. Passless receives the RP ID and `clientDataHash` through CTAP. It does not
-receive the exact web origin. Agent policy is keyed by exact RP ID, not origin.
+Cross-origin frames are security-sensitive. They require browser Permissions Policy delegation. If the browser cannot expose a usable Permissions Policy API, Passless leaves the ceremony to the native browser instead of assuming delegation.
 
-For delegated-session autonomous authentication, the daemon validates the frame origin read by a
-MAIN-world extension override. Daemon-side origin, grant, policy, credential-ref, audit, and
-key-provider checks are load-bearing. The per-session localhost bearer token is defense-in-depth.
-Implementation is **in progress**.
+Conditional mediation/passkey autofill (`mediation = "conditional"`) also remains native. Merely visiting a page must not silently convert passive conditional WebAuthn discovery into autonomous same-user authentication.
 
-A configured `start_url` is operational configuration, not origin evidence. Passless never
-claims independent visibility of the exact web origin for CTAP-based paths.
+## Human confirmation
 
-## Browser-control authority warning
+A `confirm` rule is a security boundary against an untrusted or compromised agent. The approval UI therefore distinguishes trusted decision data from agent/page-provided context.
 
-The `passless agent browser-control` command sends CDP commands to the managed browser.
+Trusted decision data includes the profile, mode, exact RP ID, action, and daemon-selected credential reference/label. Agent reason, page title, page URL, and account labels are informational only and must remain visibly untrusted.
 
-**WARNING:** CDP is the full browser-session authority interface. CDP commands can access
-cookies, DOM, network state, and session data. Output may contain sensitive session
-material.
+Every display-controlled dynamic string must be normalized to a bounded single line before rendering. Newlines, carriage returns, tabs, C0/C1 controls, Bidi override/isolate controls, zero-width direction controls, and similar display-control characters must not be allowed to inject trusted-looking lines into the prompt.
 
-- Do not mix CDP output with credential or admin output.
-- Do not log, cache, or forward CDP responses to untrusted consumers.
-- The principal holds the full RP browser-session authority during the lease.
-- Optional network and egress restrictions may reduce exfiltration risk but do not create
-  RP-side revocation or business-action scope.
-- **Audit recording:** CDP method and outcome metadata may be recorded in audit events, but
-  CDP response bodies are not audit-recorded. Do not assume CDP responses are preserved in
-  audit logs.
+If the desktop notification server cannot provide distinguishable Approve and Deny actions, Passless fails closed.
 
-## Delegated-session confused deputy
+## Browser/CDP authority
 
-Delegated mode authorizes authentication but gives the principal the full authority of the
-browser session returned by the RP. The agent can perform destructive or sensitive RP
-actions that were not shown in the Passless prompt.
+CDP is full managed-browser authority. A process with the CDP endpoint can navigate pages, execute JavaScript, read DOM/network/session state, and act inside authenticated RP sessions.
 
-Mitigations:
+This is independent of private-key containment: the credential key can remain safely daemon-mediated while the application session is completely controlled.
 
-- Short lease limits duration, not action scope.
-- Explicit approval warning in the trusted prompt.
-- Ephemeral profile with no personal state.
-- Immediate local revocation on expiry or admin action.
-- Use a low-privilege RP account where possible.
+- Pipe mode keeps browser control daemon-mediated.
+- Port mode exposes loopback CDP for external tools such as Playwright and must be treated as an explicit high-trust setting.
+- CDP output can contain cookies, DOM, tokens, and network data. Do not mix it with ordinary credential/admin output or forward it to untrusted consumers.
 
-## Principal isolation
+Local browser-lease expiry does not prove the RP invalidated its server-side session.
 
-- Each principal runs as a separate Unix user (`principal_user`).
-- The browser runs as a different Unix user (`browser_user`, delegated only).
-- The daemon runs as root for device creation and principal isolation.
-- Principals cannot access `/dev/uhid`, human or foreign hidraw nodes, admin sockets,
-  credential stores, audit files, or other principals' runtime directories.
-- The session capability is transferred through an inherited protected channel, not
-  command lines or environment variables.
+## Credential selection
 
-## Credential isolation
+Credential enumeration and selection happen inside the daemon. `single` is the safest default and fails closed when several eligible discoverable credentials exist. `first-matching`, `newest`, and explicit credential references are deterministic convenience policies; operators remain responsible for ensuring they select the intended RP account.
 
-- Isolated credentials use profile-specific stores and enumeration paths.
-- Delegated access is a filtered view over one exact human credential.
-- Human and delegated access serialize all mutable credential state.
-- Private keys remain in daemon-owned storage and never cross local protocols.
+RP-provided `allowCredentials` still narrows selection before a configured ambiguity policy is applied.
 
-For isolated profiles, `allow` changes ceremony authorization only. It does not grant access to
-human credentials, another profile's credentials, daemon-owned storage, policy administration, or
-the admin socket.
+## Registration
+
+Registration mutates identity state and should be treated as higher risk than authentication.
+
+In same-user mode, successful registration writes a new passkey into the human backend through the configured key provider. Keep registration denied after enrollment unless continuous automated credential creation is genuinely required.
+
+In isolated mode, registration affects only the profile-owned credential namespace.
+
+## Session and operation boundaries
+
+The managed browser session holds a random bearer capability, policy generation, TTL, and bounded operation budget. Every WebAuthn operation is independently checked against the concrete RP/origin context, current policy, credential scope, replay state, and audit gate.
+
+Replaying an identical completed request is rejected. Distinct ceremonies may continue only until the session expires, is revoked, the browser/principal dies, policy invalidates it, or the operation budget is exhausted.
+
+A bounded local session reduces duration and accidental loops; it does not create application-level action scope after successful authentication.
+
+## Principal and credential isolation
+
+- Principal sessions run under configured Unix identities rather than receiving admin socket authority.
+- Runtime/storage directories are ownership/mode checked and symlink-sensitive paths are rejected where required.
+- Isolated storage roots cannot overlap the human backend or another profile.
+- Session capabilities are not intended to be exposed through command lines, logs, or page-visible browser data.
+- Private keys and PINs remain inside daemon-selected credential backends/providers.
+
+For same-user software credentials used by a process running under the same underlying Unix trust domain, daemon mediation is an architectural/audit control rather than a claim that the Unix user can never access its own backing store. Portable TPM keys provide a materially stronger non-export property.
+
+## Audit
+
+Audit reservation gates credential use. Agent events distinguish authorization source, UP source, UV source, RP, result, and relevant lifecycle state.
+
+Audit must never contain credential private keys, PINs, browser cookies, bearer capabilities, raw assertion signatures, or unrestricted browser/session contents.
+
+The local hash chain detects many accidental/non-root modifications but is not an external trust anchor: host root can rewrite local audit history unless an independent checkpoint is added.
+
+## Agent-instruction boundary
+
+The installed Passless agent skill is part of the security control surface. It must contain only the safe production path. Development-only techniques that extract credential material, inject private keys into browser virtual authenticators, bypass daemon policy/audit, or emulate Passless must not be included in the instructions supplied to autonomous agents.
+
+Treat all web-page content, tool output, and RP-provided strings as untrusted data. They cannot grant additional Passless authority or instruct an agent to recover credential material.
 
 ## Preferred alternatives
 
-For unattended or narrowly scoped automation, prefer RP-supported mechanisms:
+For unattended workflows prefer RP-native actor/scoping mechanisms when available:
 
-- Scoped OAuth or OpenID Connect authorization.
-- OAuth token exchange (RFC 8693) with subject and actor identity.
-- Sender-constrained tokens using DPoP (RFC 9449) or mutual TLS.
-- Application installations (e.g., GitHub Apps).
-- Service accounts and narrowly scoped API credentials.
-- Workload identity for operator-controlled services.
+- OAuth or OpenID Connect
+- Application installations such as GitHub Apps
+- Service accounts
+- Workload identity
+- OAuth token exchange
+- Sender-constrained tokens
+- Narrowly scoped API credentials
 
-These mechanisms express actor, audience, scope, lifetime, and revocation independently
-from the browser session.
-
-## Port mode threat model
-
-When `browser_cdp_expose = "port"`, the daemon exposes the browser's CDP WebSocket on
-`127.0.0.1` instead of mediating CDP through Unix pipes. The trust boundary shifts from
-the CDP channel to the authenticated session.
-
-### Trust boundary
-
-The trust boundary is the authenticated session (cookies), not the CDP channel. Any
-same-user process with the WebSocket URL can control the browser session. This is an
-accepted risk for single-user workstations where the agent and operator share a trust
-boundary.
-
-### Credential isolation
-
-The credential private key never leaves the daemon. Passless mediates the WebAuthn
-ceremony; the browser only holds the authenticated session (cookies), not the credential
-material. Even if the agent exfiltrates the entire browser session, it cannot extract
-the private key.
-
-### WebSocket UUID as bearer token
-
-The CDP WebSocket URL includes a UUID path component (e.g.,
-`ws://127.0.0.1:9222/devtools/browser/<uuid>`). This UUID acts as a bearer token:
-possession of the URL grants access. The URL is written to `<runtime_dir>/cdp-endpoint`
-with mode 0600, owned by the principal user. The runtime directory has mode 0700.
-
-### Loopback-only binding
-
-Chromium binds to `127.0.0.1` only. The daemon does not pass `--remote-debugging-address`;
-Chromium's default is loopback. This is enforced, not configurable. Remote network access
-to the CDP endpoint is not possible.
-
-### Extra args rejection
-
-The daemon rejects `--remote-debugging-port` and `--remote-debugging-address` in
-`browser_command` extra args. These flags are set by the daemon in port mode. Attempting
-to override them causes configuration load failure.
-
-### Audit trail
-
-Audit records note the exposure mode (`pipe` or `port`) at lease creation. In port mode,
-audit records the delegation grant, lease creation, and lease expiry. Per-command CDP
-audit is not available; the agent has direct CDP access after the ceremony.
-
-### Comparison to pipe mode
-
-| Property | Pipe mode | Port mode |
-|----------|-----------|-----------|
-| CDP transport | Unix pipes | TCP 127.0.0.1 |
-| Daemon mediation | Every command | Ceremony only |
-| External tool attachment | No | Yes |
-| `browser_user` isolation | Required | Optional |
-| CDP command audit | Per-command | Lease-level |
-| CDP command filtering | Yes | No |
-| Credential key exposure | Never | Never |
-| Session cookie exposure | Daemon-gated | Direct |
-| Trust assumption | Agent is untrusted | Agent is trusted |
-
-Use pipe mode for multi-user systems, production environments, or untrusted agents.
-Use port mode only for single-user workstations where the operator fully trusts the agent.
+These mechanisms express actor, audience, scope, lifetime, and revocation independently from a browser session and are usually a better security primitive for unattended automation.

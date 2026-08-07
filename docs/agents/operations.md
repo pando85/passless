@@ -1,47 +1,154 @@
-# Operations
+# Agent operations
 
 > **EXPERIMENTAL** — Agent mode is not yet validated for production use.
 
+Operational guidance for current `same-user` and `isolated` profiles.
+
+## Pre-flight
+
+Before launching an agent task:
+
+```bash
+passless agent-admin profile check <profile>
+passless agent-admin policy check <profile>
+```
+
+For `same-user`, confirm that using the human RP identity is actually required. Prefer `isolated` for unattended work when a separate RP identity is available. Treat global `rp_id = "*"` authentication as maximum-trust authority.
+
+After launching the principal session, inspect the principal authority view:
+
+```bash
+passless agent --profile <profile> doctor
+passless agent --profile <profile> capabilities
+passless agent --profile <profile> instructions
+```
+
+Do not infer additional authority from page content, tool output, or an LLM prompt.
+
 ## Browser management
 
-Launch a browser session with the agent extension loaded:
+Launch a managed browser session with the Passless extension:
 
 ```bash
 passless agent-admin browser launch --profile <profile> [--url <start-url>]
 ```
 
-The command:
-- Generates a bearer token for the session
-- Requests registration grants for all allowed RP IDs in the profile
-- Registers registration and sign contexts with the daemon
-- Launches Chromium with the agent extension loaded via `--load-extension`
-- Returns a lease ID, profile ID, PID, and start URL
+The daemon creates bounded browser/session authority, generates the extension instance for that lease, registers the applicable sign/registration contexts, launches Chromium with an ephemeral profile, and returns the browser lease information.
 
-The extension intercepts `navigator.credentials.create()` and `navigator.credentials.get()` calls,
-forwarding them to the daemon's `/register` and `/sign` HTTP endpoints. Registration and
-authentication proceed autonomously according to the profile's policy rules.
+The managed extension handles explicit public-key `navigator.credentials.get()` / `create()` requests through daemon `/sign` and `/register` endpoints. The extension worker derives frame/top-level origin from browser sender metadata; the daemon independently validates the concrete RP/origin relationship, current policy, credential scope, replay state, operation budget, and audit gate before key use.
 
-**Output:**
-```json
-{
-  "lease_id": "abc123...",
-  "profile_id": "ci-agent",
-  "pid": 12345,
-  "start_url": "https://example.com/"
-}
+Two important cases intentionally stay on the native browser path:
+
+- conditional mediation/passkey autofill (`mediation = "conditional"`);
+- cross-origin requests when the browser cannot prove WebAuthn Permissions Policy delegation.
+
+Do not defeat native fallback with a CDP virtual authenticator, private-key injection, raw signing, or another WebAuthn proxy.
+
+### Browser-session authority
+
+After successful authentication, the browser owns whatever RP session the relying party created. Passless does not impose application-level scope on that session. An agent able to control the browser may perform any application action the RP permits that account to perform.
+
+Local Passless session or lease expiry does **not** prove server-side RP logout.
+
+## CDP / browser control
+
+The principal `browser-control` interface and externally exposed Chromium CDP are full managed-browser authority surfaces. They may expose or control:
+
+- navigation and JavaScript execution;
+- DOM and rendered page data;
+- network requests/responses;
+- cookies, local/session storage, and authenticated session state;
+- application actions available to the logged-in account.
+
+The CLI warns before printing raw browser-control responses. Do not mix those responses with ordinary credential/admin output or send them to untrusted consumers.
+
+### Pipe mode
+
+`browser_cdp_expose = "pipe"` keeps CDP daemon-mediated and should be preferred when external tooling does not need to attach directly.
+
+### Port mode
+
+`browser_cdp_expose = "port"` exposes a loopback endpoint for Playwright or other local automation. A local process that obtains the endpoint can control the authenticated browser session even though credential private keys remain safely daemon-mediated.
+
+Check the current endpoint from inside the principal session:
+
+```bash
+passless agent --profile <profile> browser-status
 ```
 
-**Notes:**
-- The browser runs with a dedicated user data directory under `/run/user/<uid>/passless/browser/`
-- The extension is generated per-lease with the daemon's port and bearer token baked in
-- Registration contexts are created for all RP IDs allowed by the profile's rules
-- Sign contexts are created if credentials exist in storage for the profile
-- Browser leases expire after the configured TTL (default 1 hour)
+Plain output includes `cdp_endpoint` when one is available.
+
+## Session and operation bounds
+
+A short-lived agent/browser session is the reusable authority envelope for one task. WebAuthn operations within it remain individually checked.
+
+Important bounds include:
+
+- profile and principal binding;
+- policy generation;
+- browser/extension binding;
+- maximum session TTL;
+- shared `max_operations` budget;
+- exact or global RP policy;
+- credential scope;
+- replay detection.
+
+An identical completed request body is rejected as `replayed_operation`. Once the shared budget is exhausted, further operations fail with `operation_budget_exhausted`. Treat both as security-terminal conditions for the relevant operation/session rather than retry loops.
+
+## Same-user operations
+
+`same-user` uses the daemon's human credential backend and RP identity.
+
+Operational rules:
+
+- prefer exact RP rules;
+- keep registration denied after enrollment;
+- use explicit credential references when account identity matters;
+- keep TTL and operation count small;
+- treat an autonomous `"*"` rule as critical authority;
+- remember that successful login creates a human-account browser session outside Passless application-level control.
+
+A portable TPM can prevent key export while still allowing the daemon to exercise the key for an authorized same-user operation. Software credentials under the same Unix trust domain do not provide the same non-export guarantee.
+
+## Isolated operations
+
+`isolated` uses profile-owned storage/key/verification state and presents a separate RP credential identity. It is the preferred unattended mode when the RP can support a separate automation account or service identity.
+
+Isolated storage/PIN roots must not overlap the human backend, another profile, or the agent audit root.
+
+Revoke an isolated credential when it should no longer be usable:
+
+```bash
+passless agent-admin credential revoke <credential-ref> --confirm
+```
+
+RP-side deletion/revocation may also be required because local credential deletion cannot revoke a server-side account/session by itself.
+
+## Registration / enrollment
+
+Registration mutates identity state.
+
+- Same-user registration writes a new credential into the human backend.
+- Isolated registration writes into the profile-owned namespace.
+- Global `"*"` registration is not allowed; registration policy is exact-RP.
+
+For same-user profiles, enable registration only for an intentional enrollment window and disable it afterwards unless continuous automated credential creation is genuinely required.
+
+## Human confirmation
+
+A supervised rule uses the trusted local approval path. The notification renderer:
+
+- labels profile/mode/RP/action/credential decision fields as trusted;
+- normalizes dynamic display text to a single bounded line;
+- strips control and Bidi/zero-width direction characters;
+- separates page/agent text under an explicit `UNTRUSTED` informational section;
+- fails closed when the desktop notification service cannot provide distinguishable Approve and Deny actions.
+
+The minimum review-delay guard may reject an implausibly fast approval. Do not work around this by passing approval/PIN material through stdin, environment variables, page text, or chat.
 
 ## Audit
 
-Audit events are hash-chained, owner-only, append-oriented JSONL records. They cover
-authorization, credential use, browser leases, denials, policy changes, and degradation.
+Agent audit events are hash-chained, owner-only, append-oriented JSONL records covering authorization, evidence, credential use/creation, browser leases, policy changes, denials, and degraded state.
 
 ```bash
 passless agent-admin audit status
@@ -50,17 +157,18 @@ passless agent-admin audit export --format json
 passless agent-admin audit export --format csv
 ```
 
-- `verify` checks hash-chain integrity across rotations.
-- `export` writes non-secret events to a temporary path and reports the location.
-- A terminal audit write failure puts agent support in persistent degraded mode until
-  an administrator repairs and acknowledges it.
-- Human operations remain available during agent audit degradation.
+- `verify` checks local chain integrity across rotations.
+- `export` writes non-secret records to a temporary path.
+- Required audit reservation occurs before credential use/creation.
+- A terminal audit write failure moves agent support into degraded/fail-closed behavior.
+- Agent-derived UP/UV must be distinguishable from human evidence in audit.
+- Audit must not contain private keys, PINs, bearer capabilities, cookies, or raw assertion signatures.
 
-### Reviewing unattended profiles
+The local chain is not externally anchored. A host-root attacker capable of rewriting daemon state can also rewrite local audit history.
 
-For profiles with `authorization = "allow"`, review audit records for policy-authorized UP/UV,
-credential creation and use, denials, policy generation changes, and unexpected RP IDs. Verify the
-hash chain regularly and after every policy or registration change:
+### Routine review
+
+For autonomous or same-user profiles, periodically review:
 
 ```bash
 passless agent-admin audit verify
@@ -68,186 +176,118 @@ passless agent-admin profile show <profile>
 passless agent-admin policy show <profile>
 ```
 
-Audit records distinguish `policy` evidence from `human` evidence and exclude credential private
-keys and other secret material. The first release does not externally anchor the local hash chain;
-a host root capable of replacing daemon state can also rewrite local audit history.
+Look for unexpected RPs, unexpected registration, repeated denials, policy-generation changes, and abnormal browser/session lifecycle events.
 
 ## Disable and revoke
 
-Disable a profile without deleting credentials:
+Disable a profile immediately:
 
 ```bash
 passless agent-admin profile disable <profile>
 ```
 
-Revoke an isolated credential:
-
-```bash
-passless agent-admin credential revoke <credential-ref> --confirm
-```
-
-Revoke an active delegation or session:
+Revoke active session/delegation authority represented by the current admin API:
 
 ```bash
 passless agent-admin delegation revoke <grant-id> --confirm
 passless agent-admin session revoke <session-id> --confirm
 ```
 
+The `delegation` command name remains part of the authorization/grant administration API; it does **not** mean that the removed `delegated-session` identity mode still exists.
+
+For compromise response also terminate managed browsers and use the RP's own session-revocation controls when server-side sessions may survive local teardown.
+
 ## Rollback
 
 To disable all agent functionality:
 
-1. Disable every profile:
-   ```bash
-   passless agent-admin profile disable <profile>
-   ```
-2. Revoke all active sessions and delegations.
-3. Terminate managed browsers and quarantine profiles that fail cleanup.
-4. Set `enabled = false` in configuration or stop the daemon.
+1. Disable every profile.
+2. Revoke active session/grant authority.
+3. Terminate managed browsers and quarantine runtime state that cannot be verified/cleaned safely.
+4. Set `[agents].enabled = false` and restart/stop the daemon as appropriate.
+5. Revoke RP-side sessions or credentials separately when required.
 
-Human credentials and configuration are not affected.
-
-For an unattended isolated profile, changing registration to an all-`none` `deny` rule and
-restarting the daemon closes enrollment without deleting existing isolated credentials. Disabling
-the profile is the immediate stop mechanism for both registration and authentication.
-
-## Uninstall
-
-1. Stop the daemon and disable the systemd service.
-2. Remove agent configuration from the TOML file.
-3. Remove agent storage roots, audit path, and runtime directories.
-4. Remove udev rules and tmpfiles configuration.
-5. Remove principal and browser Unix users.
-
-Agent data and human data are fully independent. Removing agent data does not require
-migrating human credentials.
+Disabling agent support does not by itself delete human credentials.
 
 ## Recovery
 
-### Quarantined browser profiles
+### Stale or quarantined browser runtime
 
-A profile whose cleanup did not complete is quarantined. The administrator must inspect
-and remove it manually:
-
-```bash
-sudo ls -la /var/run/passless-browser/
-sudo rm -rf /var/run/passless-browser/<quarantined-profile>
-```
-
-### Audit discontinuity
-
-If `audit verify` reports a hash-chain break:
-
-1. Do not acknowledge the discontinuity until the cause is known.
-2. Preserve the existing audit files.
-3. Investigate the gap using wall-clock timestamps and event sequence numbers.
-4. After resolution, the daemon continues appending from the last valid record.
-
-### Daemon restart
-
-On restart, the daemon:
-
-- Recovers daemon-owned runtime manifests.
-- Terminates verified orphan browser scopes (PID plus process-start identity match).
-- Destroys all agent endpoints.
-- Loses all in-memory intents and grants.
-- Requires new authorization for all subsequent operations.
-
-## Kernel requirements
-
-| Feature | Required for | Notes |
-|---|---|---|
-| UHID (`uhid` module) | Human, isolated, and confirm-policy modes | Virtual HID device creation |
-| hidraw | Browser access to agent endpoints | Per-profile group policy via udev |
-| pidfd / `close_range` | Principal session management | Clean process tree teardown |
-| `SOCK_SEQPACKET` | Admin and principal IPC | Versioned local contracts |
-| Namespaces / cgroups | Principal isolation | Separate UID, device policy, filesystem policy |
-
-**Supported kernel range:** Minimum supported kernel is the oldest distribution kernel providing
-all of the above.
-
-## Browser support
-
-**Browser requirements:**
-
-- Stock browser with WebAuthn support for human and isolated-mode ceremonies.
-- Ability to access hidraw nodes via udev group policy (human and isolated modes).
-- Ephemeral profile support (no personal sync, extensions, or saved state).
-- Delegated-session autonomous authentication loads a daemon-generated MV3 extension via
-  `--load-extension`. Implementation is **in progress**.
-
-**Known limitations:**
-
-- Fresh ephemeral profiles may require federated or cross-site login for some RPs, which broadens practical session authority.
-- Browser-control (CDP) output may contain session state; treat it as full-session authority.
-- Local lease expiry does not guarantee RP-side session invalidation.
-
-## Browser and endpoint status
-
-Check the status of a profile's endpoint and browser lease:
+Run:
 
 ```bash
 passless agent-admin profile check <profile>
-passless agent-admin profile show <profile>
 ```
 
-The `profile check` command reports:
+Passless validates runtime ownership/mode and process identity. Inspect quarantined state before manual deletion; do not reuse a stale browser profile whose process identity is not trusted.
 
-- `endpoint_state`: the current endpoint lifecycle state (`creating`, `ready`, `active`, `draining`, `destroyed`, `failed`).
-- `browser_lease_state`: the current browser lease state (if active), including remaining lifetime.
-- `policy_generation`: the current policy generation number.
-- `audit_gate_healthy`: whether the audit subsystem is operational.
-- Per-check diagnostics for enabled state, device identity, storage, and principal isolation.
+### Audit discontinuity
 
-The `profile show` command reports:
+If `audit verify` reports a break:
 
-- Active grants, active sessions, and pending intents.
-- Policy generation and mode.
+1. stop relying on the audit trail until investigated;
+2. preserve the files;
+3. identify sequence/hash gaps and storage failures;
+4. repair the audit path before further agent credential use.
 
-Use these commands to verify endpoint readiness before launching a principal session and to diagnose browser lease or endpoint lifecycle issues.
+### Daemon restart
+
+Agent session capabilities and operation state are intentionally in-memory/short-lived. After restart, re-run profile pre-flight and establish fresh authorization. Do not attempt to reuse old session material.
+
+## Kernel requirements
+
+The exact required primitives depend on the active path, but supported Linux deployments may use:
+
+| Feature | Used for |
+|---|---|
+| UHID / hidraw | Human and isolated compatibility/native authenticator endpoints |
+| `pidfd`, `close_range`, `/proc` process identity | Principal/browser process lifecycle and FD hygiene |
+| `SOCK_SEQPACKET` | Local admin/principal IPC |
+| Unix ownership/mode checks | Runtime, storage, audit, and browser roots |
+| namespaces / cgroups where configured | Principal/process isolation |
+
+Use `profile check` on the deployment host instead of assuming that kernel/distribution support is sufficient from version numbers alone.
+
+## Browser support and limitations
+
+The production autonomous managed-browser path currently targets Chromium-compatible extension behavior.
+
+Known limitations include:
+
+- the MAIN-world adapter supports a bounded subset of WebAuthn semantics rather than promising perfect native API equivalence;
+- unsupported/ambiguous operations should remain native or fail explicitly, not silently degrade to raw signing;
+- conditional mediation remains native;
+- cross-origin extension handling depends on verifiable Permissions Policy delegation;
+- some RPs may depend on native `PublicKeyCredential` object identity or unsupported extension/attestation behavior;
+- fresh ephemeral profiles may require federated/cross-site login, broadening practical browser-session authority;
+- CDP output may contain sensitive session state;
+- local lease expiry does not revoke RP-side sessions;
+- host-root/kernel compromise remains outside the local daemon isolation model.
+
+For unattended automation, prefer RP-native OAuth, application installations, service accounts, workload identity, or narrowly scoped credentials where they are available.
 
 ## Skill installation
 
-Install the bundled `passless-agent` Agent Skill for coding agents:
+Install the bundled safe production `passless-agent` skill:
 
 ```bash
 passless agent-admin install [auto|opencode|claude|pi] [--scope user|project] [--force]
 ```
 
-**Native skill paths by target:**
+The shipped skill deliberately excludes development-only private-key extraction, virtual-authenticator injection, raw-signing, and daemon-bypass recipes.
 
-| Target | User scope | Project scope |
-|---|---|---|
-| `opencode` | `~/.config/opencode/skills/passless-agent/SKILL.md` | `.opencode/skills/passless-agent/SKILL.md` |
-| `claude` | `~/.claude/skills/passless-agent/SKILL.md` | `.claude/skills/passless-agent/SKILL.md` |
-| `pi` | `~/.pi/agent/skills/passless-agent/SKILL.md` | `.pi/skills/passless-agent/SKILL.md` |
-
-- `auto` detects installed agents by checking user config directories, project directories, and `PATH`.
-- `--scope user` installs to the user's home directory; `--scope project` installs to the project root.
-- `--force` replaces an existing different skill.
-- Installation does not enable an agent profile or grant authentication authority.
+Installation does not enable a profile or grant authentication authority.
 
 ## Contrib examples
 
-Example systemd, tmpfiles, udev, and sysusers configurations are provided in `contrib/`:
+Example systemd, tmpfiles, udev, modules-load, and sysusers configuration lives under `contrib/`. These files are deployment starting points, not policy defaults. Review paths, Unix identities, device access, and browser-runtime ownership for the mode actually being deployed.
 
-- `contrib/systemd/passless-agent.service` — systemd service for the agent daemon (runs as root).
-- `contrib/systemd/passless.service` — systemd user service for the human authenticator.
-- `contrib/tmpfiles/passless-agent.conf` — tmpfiles configuration for agent runtime directories.
-- `contrib/udev/70-passless-agent.rules` — udev rules for agent hidraw node permissions (per-profile browser UID).
-- `contrib/udev/90-passless.rules` — udev rule for human `/dev/uhid` access (fido group).
-- `contrib/modules-load.d/fido.conf` — kernel module autoload for `uhid`.
-- `contrib/sysusers.d/passless.conf` — sysusers configuration for the `fido` group.
+## Related documentation
 
-**Important:** These are examples. Review and adapt them for your distribution and security policy before use. The agent udev rule (`70-passless-agent.rules`) requires placeholder replacement with your profile's device identity and browser UID.
-
-## Known limitations
-
-- Linux only. No remote principals or non-Unix isolation in the first release.
-- Delegated mode does not create a new RP-visible agent identity.
-- Local lease expiry does not guarantee RP-side session invalidation.
-- For human and isolated modes, Passless sees the CTAP RP ID but not the exact web origin.
-  Delegated-session autonomous authentication validates frame origin in the daemon.
-- Browser-control (CDP) output may contain session state; treat it as full-session authority.
-- Host root and kernel compromise are outside the threat model.
-- RP-supported OAuth, workload identity, and service accounts are preferred for unattended use.
+- [Agent overview](README.md)
+- [Configuration](configuration.md)
+- [Security model](security.md)
+- [Same-user mode](same-user.md)
+- [Isolated mode](isolated.md)
+- [Troubleshooting](troubleshooting.md)
+- [Audit](audit.md)

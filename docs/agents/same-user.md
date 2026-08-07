@@ -6,12 +6,14 @@
 
 This is a trust mode, not an isolation mode. An autonomous same-user agent can authenticate as the human account to every RP and credential permitted by its profile while its session is active. Exact RP rules, credential selectors, TTLs, operation budgets, replay protection, and audit bound that authority; they do not turn the agent into a separate identity.
 
+**Security consequence:** after a successful login, the managed browser holds the human RP session. Passless does not restrict which repository, account, purchase, message, settings change, token creation, or other application action that authenticated session may perform.
+
 ## Minimal autonomous profile
 
 ```toml
 [agents]
 enabled = true
-audit_path = "/var/lib/passless-agent/audit/events.jsonl"
+audit_path = "/var/lib/passless-agent/audit"
 
 [agents.profiles.opencode]
 mode = "same-user"
@@ -46,18 +48,18 @@ authenticate = {
 
 ## Credential scope
 
-Omitting `credential_refs` permits discovery of human credentials matching an allowed RP. Narrow the profile to explicit non-secret credential references when practical:
+Omitting `credential_refs` permits daemon-side discovery of human credentials matching the concrete RP. Narrow the profile to explicit non-secret credential references when practical:
 
 ```toml
 credential_refs = ["<credential-ref-hex>"]
 credential_selection = "credential:<credential-ref-hex>"
 ```
 
-Other selection policies are `single`, `first-matching`, and `newest`. `single` fails closed when more than one eligible credential exists.
+Other selection policies are `single`, `first-matching`, and `newest`. `single` fails closed when more than one eligible credential exists and is the safest default when account ambiguity is possible.
 
 ### Catch-all authentication
 
-A `same-user` profile can deliberately authorize authentication to any valid concrete WebAuthn RP by using the global `"*"` rule. This is the broadest same-user authority and should only be used when the agent is trusted to act as the human user across sites.
+A `same-user` profile can deliberately authorize authentication to any valid concrete WebAuthn RP by using the global `"*"` rule. This is the broadest same-user authority and should only be used when the agent is trusted to act as the human user across sites. Treat autonomous catch-all authentication as **CRITICAL** authority during profile review.
 
 ```toml
 [agents.profiles.opencode]
@@ -67,7 +69,7 @@ browser_command = ["chromium"]
 browser_runtime_root = "/run/passless-agent/opencode"
 max_session_ttl = 600
 max_operations = 32
-credential_selection = "newest"
+credential_selection = "single"
 # credential_refs intentionally omitted
 
 [[agents.profiles.opencode.rules]]
@@ -80,7 +82,7 @@ The `"*"` value is a policy sentinel, not a WebAuthn RP ID. Every ceremony still
 
 Catch-all scope is intentionally limited to `same-user` authentication: `credential_refs` must be omitted, wildcard registration is denied, and isolated profiles cannot use it. Exact rules may coexist with `"*"` and take precedence, which allows a broad autonomous default with supervised or denied exceptions.
 
-When several discoverable credentials exist for the same RP, use a deterministic selection policy such as `newest`; an RP-provided `allowCredentials` list still constrains selection first. Prefer explicit RP rules whenever the broader authority is unnecessary.
+Prefer explicit RP rules whenever the broader authority is unnecessary. Deterministic selectors such as `newest` avoid nondeterminism but do not necessarily express the operator's intended account; use explicit credential scoping where account identity matters.
 
 ## Registration
 
@@ -93,17 +95,27 @@ register = "autonomous"
 authenticate = "autonomous"
 ```
 
-Disable autonomous registration after enrollment when it is no longer needed.
+Registration mutates human identity state. Disable autonomous registration after enrollment when it is no longer needed.
 
 ## Session and operation bounds
 
-A browser session receives a random bearer capability, a TTL, and a shared `max_operations` budget covering both registration and authentication. Every WebAuthn request is independently validated against the current policy, exact RP, caller origin, top origin, credential scope, and replay digest. Repeating the same operation body is rejected; distinct operations may continue until the shared budget or session expires.
+A browser session receives a random bearer capability, a TTL, and a shared `max_operations` budget covering both registration and authentication. Every WebAuthn request is independently validated against the current policy, concrete RP, caller origin, top origin, credential scope, and replay digest. Repeating the same operation body is rejected; distinct operations may continue until the shared budget or session expires.
+
+These controls limit duration and accidental/replayed ceremony authority. They do not restrict the application actions available after an RP session has been created.
 
 Human verification can be required by using `user_verification = "human"`. `human_verification_prompt = "always"` prompts whenever that provider is selected; `"when-required"` prompts only when the RP or credential requires UV. Human-derived evidence is never synthesized from an agent rule.
 
 ## Browser path
 
-The daemon launches a stock browser with the Passless MV3 extension. A MAIN-world script intercepts `navigator.credentials.create()` and `navigator.credentials.get()`, while the service worker forwards a bounded request to the loopback daemon. The daemon validates and signs; the extension never receives private keys, PINs, storage handles, or arbitrary-signing authority.
+The daemon launches a managed browser with the Passless MV3 extension. A MAIN-world script intercepts explicit `navigator.credentials.create()` and `navigator.credentials.get()` operations, while conditional-mediation passkey autofill remains native. The service worker derives browser origin context and forwards a bounded request to the loopback daemon. The daemon validates and signs; the extension never receives private keys, PINs, storage handles, or arbitrary-signing authority.
+
+For cross-origin frames, Passless only takes the autonomous path when browser Permissions Policy delegation can be verified. Otherwise the request remains on the native browser path.
+
+## CDP and browser automation
+
+CDP is full browser-session authority. Exposing CDP over a loopback port makes integration with Playwright and other browser automation convenient, but a process that obtains that endpoint can act throughout the authenticated managed-browser session even though credential private keys remain in the daemon.
+
+Use port exposure only when that level of browser-session trust is intentional.
 
 ## Operational checks
 
@@ -118,6 +130,7 @@ Inside the principal session:
 ```bash
 passless agent --profile opencode doctor
 passless agent --profile opencode capabilities
+passless agent --profile opencode instructions
 ```
 
 Review [security.md](security.md), [operations.md](operations.md), and [audit.md](audit.md) before deployment.

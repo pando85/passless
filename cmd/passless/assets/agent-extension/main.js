@@ -65,7 +65,10 @@
   function policyAllowsWebAuthn(feature) {
     if (window.top === window.self) return true;
     var policy = document.permissionsPolicy || document.featurePolicy;
-    if (!policy || typeof policy.allowsFeature !== "function") return true;
+    // Cross-origin autonomous authentication is security-sensitive. If the
+    // browser cannot prove that WebAuthn was delegated to this frame, leave
+    // the request to the native browser instead of assuming permission.
+    if (!policy || typeof policy.allowsFeature !== "function") return false;
     return policy.allowsFeature(feature);
   }
 
@@ -332,6 +335,9 @@
   }
 
   credentials.get = function(options) {
+    // Conditional mediation is passive passkey autofill. Do not turn merely
+    // visiting a page into an autonomous same-user login; keep it native.
+    if (options && options.mediation === "conditional") return originalGet(options);
     if (!options || !options.publicKey || !policyAllowsWebAuthn("publickey-credentials-get")) return originalGet(options);
     var request;
     try {
