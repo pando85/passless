@@ -160,6 +160,69 @@ fn run_with_service_and_lock<
     run_with_service_inner(service, uhid, shutdown, Some(operation_lock))
 }
 
+#[cfg(feature = "agent")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_agent_runtime(
+    human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+    human_pin_storage: Arc<Mutex<Box<dyn PinStorage>>>,
+    human_operation_lock: Arc<Mutex<()>>,
+    human_key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
+    agent_config: passless_core::agent::AgentConfig,
+    security_config: passless_core::config::SecurityConfig,
+    pin_config: passless_core::config::PinConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let shutdown_for_runtime = shutdown.clone();
+    match std::thread::Builder::new()
+        .name("agent-runtime-bootstrap".to_string())
+        .spawn(move || {
+            match agent::runtime::AgentRuntime::start(
+                human_storage,
+                human_pin_storage,
+                human_operation_lock,
+                human_key_provider,
+                &agent_config,
+                security_config,
+                pin_config,
+                shutdown_for_runtime.clone(),
+            ) {
+                Ok(runtime) => {
+                    while !shutdown_for_runtime.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    runtime.shutdown();
+                }
+                Err(e) => {
+                    warn!(
+                        "Agent subsystem failed to start: {}; human path remains available",
+                        e
+                    );
+                }
+            }
+        }) {
+        Ok(handle) => {
+            debug!("Agent runtime initialization started in background");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to start agent initialization thread: {}; human path remains available",
+                e
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
+fn join_agent_runtime(handle: Option<std::thread::JoinHandle<()>>) {
+    if let Some(handle) = handle
+        && handle.join().is_err()
+    {
+        warn!("Agent runtime thread panicked during shutdown");
+    }
+}
+
 fn run_with_service_inner<
     S: CredentialStorage + 'static,
     P: PinStorage + 'static,
@@ -495,30 +558,19 @@ fn run() -> Result<()> {
                         pin_config.clone(),
                     )?;
 
-                    let agent_runtime = match agent::runtime::AgentRuntime::start(
+                    let agent_runtime = spawn_agent_runtime(
                         shared_storage.clone(),
                         pin_storage.clone(),
                         operation_lock.clone(),
                         Arc::new(SoftwareCredentialKeyProvider),
-                        &config.agents,
+                        config.agents.clone(),
                         security_config,
                         pin_config,
                         shutdown.clone(),
-                    ) {
-                        Ok(rt) => Some(rt),
-                        Err(e) => {
-                            warn!(
-                                "Agent subsystem failed to start: {}; human path remains available",
-                                e
-                            );
-                            None
-                        }
-                    };
+                    );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
-                    if let Some(rt) = agent_runtime {
-                        rt.shutdown();
-                    }
+                    join_agent_runtime(agent_runtime);
                     endpoint_manager.cancel_all();
                     let _ = endpoint_manager.shutdown_all(None);
                     result
@@ -549,30 +601,19 @@ fn run() -> Result<()> {
                         pin_config.clone(),
                     )?;
 
-                    let agent_runtime = match agent::runtime::AgentRuntime::start(
+                    let agent_runtime = spawn_agent_runtime(
                         shared_storage.clone(),
                         pin_storage.clone(),
                         operation_lock.clone(),
                         Arc::new(SoftwareCredentialKeyProvider),
-                        &config.agents,
+                        config.agents.clone(),
                         security_config,
                         pin_config,
                         shutdown.clone(),
-                    ) {
-                        Ok(rt) => Some(rt),
-                        Err(e) => {
-                            warn!(
-                                "Agent subsystem failed to start: {}; human path remains available",
-                                e
-                            );
-                            None
-                        }
-                    };
+                    );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
-                    if let Some(rt) = agent_runtime {
-                        rt.shutdown();
-                    }
+                    join_agent_runtime(agent_runtime);
                     endpoint_manager.cancel_all();
                     let _ = endpoint_manager.shutdown_all(None);
                     result
@@ -608,31 +649,20 @@ fn run() -> Result<()> {
                             pin_config.clone(),
                         )?;
 
-                        let agent_runtime = match agent::runtime::AgentRuntime::start(
+                        let agent_runtime = spawn_agent_runtime(
                             shared_storage.clone(),
                             pin_storage.clone(),
                             operation_lock.clone(),
                             agent_key_provider,
-                            &config.agents,
+                            config.agents.clone(),
                             security_config,
                             pin_config,
                             shutdown.clone(),
-                        ) {
-                            Ok(rt) => Some(rt),
-                            Err(e) => {
-                                warn!(
-                                    "Agent subsystem failed to start: {}; human path remains available",
-                                    e
-                                );
-                                None
-                            }
-                        };
+                        );
 
                         let result =
                             run_with_service_and_lock(service, uhid, shutdown, operation_lock);
-                        if let Some(rt) = agent_runtime {
-                            rt.shutdown();
-                        }
+                        join_agent_runtime(agent_runtime);
                         endpoint_manager.cancel_all();
                         let _ = endpoint_manager.shutdown_all(None);
                         result
@@ -654,31 +684,20 @@ fn run() -> Result<()> {
                             pin_config.clone(),
                         )?;
 
-                        let agent_runtime = match agent::runtime::AgentRuntime::start(
+                        let agent_runtime = spawn_agent_runtime(
                             shared_storage.clone(),
                             pin_storage.clone(),
                             operation_lock.clone(),
                             Arc::new(SoftwareCredentialKeyProvider),
-                            &config.agents,
+                            config.agents.clone(),
                             security_config,
                             pin_config,
                             shutdown.clone(),
-                        ) {
-                            Ok(rt) => Some(rt),
-                            Err(e) => {
-                                warn!(
-                                    "Agent subsystem failed to start: {}; human path remains available",
-                                    e
-                                );
-                                None
-                            }
-                        };
+                        );
 
                         let result =
                             run_with_service_and_lock(service, uhid, shutdown, operation_lock);
-                        if let Some(rt) = agent_runtime {
-                            rt.shutdown();
-                        }
+                        join_agent_runtime(agent_runtime);
                         endpoint_manager.cancel_all();
                         let _ = endpoint_manager.shutdown_all(None);
                         result
