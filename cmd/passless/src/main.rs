@@ -161,6 +161,7 @@ fn run_with_service_and_lock<
 }
 
 #[cfg(feature = "agent")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_runtime(
     human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     human_pin_storage: Arc<Mutex<Box<dyn PinStorage>>>,
@@ -198,8 +199,7 @@ fn spawn_agent_runtime(
                     );
                 }
             }
-        })
-    {
+        }) {
         Ok(handle) => {
             debug!("Agent runtime initialization started in background");
             Some(handle)
