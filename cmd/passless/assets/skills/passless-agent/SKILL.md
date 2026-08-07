@@ -1,8 +1,8 @@
 ---
 name: passless-agent
-description: Use Passless agent authentication safely through native WebAuthn and explicit exact-RP ceremony policy.
+description: Use Passless agent authentication safely through native WebAuthn and explicit exact-RP ceremony policy. Includes Playwright MCP integration for high-level browser automation with passkey support.
 license: GPL-3.0
-compatibility: Requires Linux, Passless agent support, and a configured isolated or delegated-session profile.
+compatibility: Requires Linux, Passless agent support, and a configured same-user or isolated profile.
 metadata:
   project: passless
   repository: https://github.com/pando85/passless
@@ -30,10 +30,7 @@ Use Passless only through its agent commands and the stock browser session it la
    passless agent --profile <profile> intent create register --rp <rp-id> --reason "<reason>"
    passless agent --profile <profile> intent create authenticate --rp <rp-id> --credential <credential-ref-hex> --reason "<reason>"
    ```
-6. For a delegated-session profile, request one delegation for the exact RP ID and credential reference:
-   ```
-   passless agent --profile <profile> delegation request --rp <rp-id> --credential <credential-ref-hex> --session-ttl <seconds> --reason "<reason>"
-   ```
+6. For a same-user profile, the agent uses the human credential backend directly. No intent creation is needed for authentication — the daemon enforces policy on each WebAuthn call.
 7. Follow the matched action policy. A `confirm` rule requires the human to approve or deny the trusted Passless prompt. An `allow` rule resolves the operation without a notification using policy UP/UV. Never ask the human to disclose a PIN or approval capability in chat. Never read PINs or confirmation from stdin.
 7b. For fully autonomous browser automation (no native credential selection dialog), the production path is the daemon-backed MAIN-world override described below. The CDP virtual authenticator workflow is legacy/test-only and must not be used for production.
 8. Treat denial, expiry, cancellation, policy changes, and endpoint teardown as terminal. Create a new request rather than replaying one.
@@ -42,9 +39,9 @@ Use Passless only through its agent commands and the stock browser session it la
 ## Local documentation
 
 When a Passless source checkout is available, start with `docs/agents/README.md`. Use
-`docs/agents/isolated.md` for agent-owned credentials, `docs/agents/delegated-session.md` for human
-credential delegation, `docs/agents/security.md` for authority boundaries, and
-`docs/agents/operations.md` for audit and revocation. Search locally with:
+`docs/agents/same-user.md` for same-user mode, `docs/agents/isolated.md` for agent-owned credentials,
+`docs/agents/security.md` for authority boundaries, and `docs/agents/operations.md` for audit and revocation.
+Search locally with:
 
 ```
 rg --files docs/agents docs/decisions docs/plans
@@ -67,6 +64,116 @@ passless agent --profile <profile> browser-control --request-file /path/to/cdp-r
 - Do not mix CDP output with credential or admin output.
 - Do not log, cache, or forward CDP responses.
 - The principal holds full RP browser-session authority during the lease.
+
+## Playwright MCP Integration
+
+Passless can be combined with Playwright MCP for high-level browser automation while maintaining passkey authentication. The passless-managed browser exposes CDP on a configurable port, which Playwright can connect to.
+
+### Architecture
+
+```
+Playwright MCP (high-level API)
+    ↓ connectOverCDP
+Chromium with passless extension (CDP port 9222)
+    ↓
+WebAuthn intercepted → passless daemon signs → authenticated
+```
+
+### Configuration
+
+The passless profile must expose CDP on a TCP port:
+
+```toml
+[agents.profiles.coding]
+browser_cdp_expose = "port"
+browser_cdp_port = 9222
+```
+
+### Connecting Playwright to Passless Browser
+
+Instead of launching a new browser, connect to the passless-managed one:
+
+```javascript
+import { chromium } from 'playwright';
+
+// Connect to passless-managed browser
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+const contexts = browser.contexts();
+const context = contexts[0];
+const pages = context.pages();
+const page = pages[0] || await context.newPage();
+
+// Use Playwright's high-level API
+await page.goto('https://tea.millaguie.net/user/login');
+await page.click('.signin-passkey');
+// WebAuthn is handled by passless extension automatically
+```
+
+### Helper Script for Agent Sessions
+
+When using passless with Playwright MCP, follow this pattern:
+
+1. **Check if browser is running:**
+   ```bash
+   passless agent run --profile <profile> -- /usr/bin/bash -c '
+     passless agent --profile <profile> browser-status
+   '
+   ```
+
+2. **Launch browser if not running:**
+   ```bash
+   passless agent-admin browser launch --profile <profile>
+   ```
+
+3. **Get CDP endpoint:**
+   The CDP endpoint is `http://127.0.0.1:<browser_cdp_port>` (default: 9222)
+
+4. **Connect Playwright and automate:**
+   Use the Playwright MCP tools or direct Playwright API to control the browser.
+
+### Benefits of Playwright Integration
+
+| Feature | Raw CDP (websocat) | Playwright MCP |
+|---------|-------------------|----------------|
+| Navigation | Manual JSON-RPC | `page.goto()` |
+| Clicking | Manual DOM queries | `page.click()` |
+| Auto-wait | Manual polling | Built-in |
+| Selectors | CSS/XPath only | Text, role, testid |
+| Screenshots | Manual CDP calls | `page.screenshot()` |
+| WebAuthn | Passless extension | Passless extension |
+
+### Security Model Preserved
+
+When using Playwright MCP with passless:
+- The passless extension still intercepts all WebAuthn calls
+- The daemon still enforces RP policy, credential refs, TTL, and audit
+- Private keys never leave the daemon
+- Playwright only controls navigation and DOM interaction, not authentication
+
+### Example: Login to Gitea with Passkey
+
+```bash
+# 1. Launch passless browser
+passless agent-admin browser launch --profile coding
+
+# 2. Use Playwright MCP to connect and automate
+# (In opencode with Playwright MCP configured)
+```
+
+```javascript
+// Connect to passless browser
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+const page = browser.contexts()[0].pages()[0];
+
+// Navigate and login
+await page.goto('https://tea.millaguie.net/user/login');
+await page.click('.signin-passkey');
+// Passless extension handles WebAuthn, page is now authenticated
+
+// Verify login
+await page.waitForURL('**/');
+console.log(await page.title()); // "Dashboard - ..."
+```
 
 ## Daemon-backed WebAuthn override (production path)
 

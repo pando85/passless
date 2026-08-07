@@ -499,6 +499,7 @@ fn run() -> Result<()> {
                         shared_storage.clone(),
                         pin_storage.clone(),
                         operation_lock.clone(),
+                        Arc::new(SoftwareCredentialKeyProvider),
                         &config.agents,
                         security_config,
                         pin_config,
@@ -552,6 +553,7 @@ fn run() -> Result<()> {
                         shared_storage.clone(),
                         pin_storage.clone(),
                         operation_lock.clone(),
+                        Arc::new(SoftwareCredentialKeyProvider),
                         &config.agents,
                         security_config,
                         pin_config,
@@ -584,12 +586,20 @@ fn run() -> Result<()> {
                     if portable {
                         use storage::tpm::portable::build_portable_bundle;
 
-                        let (provider, storage, pin_storage) =
-                            build_portable_bundle(path.into(), Some(tcti), allow_storage_creation)?;
+                        let (provider, storage, pin_storage) = build_portable_bundle(
+                            path.clone().into(),
+                            Some(tcti.clone()),
+                            allow_storage_creation,
+                        )?;
                         let boxed: Box<dyn CredentialStorage> = Box::new(storage);
                         let shared_storage = Arc::new(Mutex::new(boxed));
                         let pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>> =
                             Arc::new(Mutex::new(Box::new(pin_storage)));
+                        let agent_key_provider: Arc<dyn CredentialKeyProvider + Send + Sync> =
+                            Arc::new(storage::tpm::portable::TpmCredentialKeyProvider::new(
+                                path.clone().into(),
+                                Some(tcti.clone()),
+                            )?);
                         let service = AuthenticatorService::with_shared_storage_and_key_provider(
                             shared_storage.clone(),
                             Some(pin_storage.clone()),
@@ -602,6 +612,7 @@ fn run() -> Result<()> {
                             shared_storage.clone(),
                             pin_storage.clone(),
                             operation_lock.clone(),
+                            agent_key_provider,
                             &config.agents,
                             security_config,
                             pin_config,
@@ -647,6 +658,7 @@ fn run() -> Result<()> {
                             shared_storage.clone(),
                             pin_storage.clone(),
                             operation_lock.clone(),
+                            Arc::new(SoftwareCredentialKeyProvider),
                             &config.agents,
                             security_config,
                             pin_config,
@@ -782,8 +794,11 @@ fn run() -> Result<()> {
                 if portable {
                     use storage::tpm::portable::build_portable_bundle;
 
-                    let (provider, storage, pin_storage) =
-                        build_portable_bundle(path.into(), Some(tcti), allow_storage_creation)?;
+                    let (provider, storage, pin_storage) = build_portable_bundle(
+                        path.clone().into(),
+                        Some(tcti.clone()),
+                        allow_storage_creation,
+                    )?;
                     let pin_storage = Arc::new(Mutex::new(pin_storage));
                     let service = AuthenticatorService::with_pin_storage_and_key_provider(
                         storage,

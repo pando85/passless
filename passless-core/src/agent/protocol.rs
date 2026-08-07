@@ -151,6 +151,7 @@ pub enum ErrorCode {
     Forbidden,
     NotFound,
     Conflict,
+    InteractionRequired,
     Internal,
     VersionMismatch,
     MessageTooLarge,
@@ -165,6 +166,7 @@ impl fmt::Display for ErrorCode {
             Self::Forbidden => write!(f, "forbidden"),
             Self::NotFound => write!(f, "not_found"),
             Self::Conflict => write!(f, "conflict"),
+            Self::InteractionRequired => write!(f, "interaction_required"),
             Self::Internal => write!(f, "internal"),
             Self::VersionMismatch => write!(f, "version_mismatch"),
             Self::MessageTooLarge => write!(f, "message_too_large"),
@@ -538,6 +540,8 @@ const MAX_ALLOW_CREDENTIALS: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct RegisterCredentialRequest {
     pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_origin: Option<String>,
     pub rp_id: String,
     pub challenge_b64u: String,
     pub user_id_b64u: String,
@@ -547,6 +551,8 @@ pub struct RegisterCredentialRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rp_name: Option<String>,
     pub exclude_credentials: Vec<String>,
+    #[serde(default)]
+    pub pub_key_cred_params: Vec<i32>,
     pub user_verification: bool,
     pub cross_origin: bool,
 }
@@ -555,6 +561,7 @@ pub struct RegisterCredentialRequest {
 #[serde(deny_unknown_fields)]
 pub struct RegisterCredentialResponse {
     pub credential_id_b64u: String,
+    pub public_key_algorithm: i32,
     pub authenticator_data_b64u: String,
     pub attestation_object_b64u: String,
     pub client_data_json_b64u: String,
@@ -564,6 +571,8 @@ pub struct RegisterCredentialResponse {
 #[serde(deny_unknown_fields)]
 pub struct SignAssertionRequest {
     pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_origin: Option<String>,
     pub rp_id: String,
     pub challenge_b64u: String,
     #[serde(default)]
@@ -1318,6 +1327,9 @@ impl Validate for PrincipalRequest {
             }
             Self::SignAssertion(req) => {
                 check_str(&req.origin, "origin", MAX_ORIGIN_LEN, &mut errors);
+                if let Some(ref top_origin) = req.top_origin {
+                    check_str(top_origin, "top_origin", MAX_ORIGIN_LEN, &mut errors);
+                }
                 check_str(&req.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
                 check_str(
                     &req.challenge_b64u,
@@ -1349,6 +1361,9 @@ impl Validate for RegisterCredentialRequest {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = Vec::new();
         check_str(&self.origin, "origin", MAX_REG_ORIGIN_LEN, &mut errors);
+        if let Some(ref top_origin) = self.top_origin {
+            check_str(top_origin, "top_origin", MAX_REG_ORIGIN_LEN, &mut errors);
+        }
         check_str(&self.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
         check_str(
             &self.challenge_b64u,
@@ -1374,6 +1389,12 @@ impl Validate for RegisterCredentialRequest {
         }
         if let Some(ref name) = self.rp_name {
             check_str(name, "rp_name", MAX_DISPLAY_NAME_LEN, &mut errors);
+        }
+        if self.pub_key_cred_params.is_empty() {
+            errors.push("pub_key_cred_params: must contain at least one algorithm".into());
+        }
+        if self.pub_key_cred_params.len() > 16 {
+            errors.push("pub_key_cred_params: exceeds maximum count 16".into());
         }
         if self.exclude_credentials.len() > MAX_REG_EXCLUDE_CREDENTIALS {
             errors.push(format!(
@@ -1804,6 +1825,7 @@ mod tests {
             ErrorCode::Forbidden,
             ErrorCode::NotFound,
             ErrorCode::Conflict,
+            ErrorCode::InteractionRequired,
             ErrorCode::Internal,
             ErrorCode::VersionMismatch,
             ErrorCode::MessageTooLarge,
@@ -2973,6 +2995,7 @@ mod tests {
     fn valid_sign_request() -> SignAssertionRequest {
         SignAssertionRequest {
             origin: "https://example.com".to_string(),
+            top_origin: None,
             rp_id: "example.com".to_string(),
             challenge_b64u: "dGVzdA".to_string(),
             allow_credentials: vec![],

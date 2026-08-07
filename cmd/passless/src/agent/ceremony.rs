@@ -1578,7 +1578,7 @@ impl<H: CommandHandler> AgentCeremonyHandler<H> {
                 intent_action.clone(),
                 interaction_gen,
                 ceremony_policy.user_presence != UserPresenceSource::None,
-                ceremony_policy.user_verification == UserVerificationSource::Policy,
+                ceremony_policy.user_verification == UserVerificationSource::Agent,
                 Duration::from_secs(60),
             );
             Some(InteractionTokenGuard::new(manager.clone()))
@@ -4052,6 +4052,10 @@ mod tests {
             profiles.insert(
                 "test".to_string(),
                 AgentProfileConfig {
+                    max_operations: 64,
+                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                    human_verification_prompt:
+                        passless_core::agent::config::HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
                     principal_user: "test-user".to_string(),
                     rp_ids: vec!["example.com".to_string()],
@@ -4998,6 +5002,11 @@ mod tests {
                 profiles.insert(
                     "test".to_string(),
                     AgentProfileConfig {
+                        max_operations: 64,
+                        credential_selection:
+                            passless_core::agent::config::CredentialSelection::Single,
+                        human_verification_prompt:
+                            passless_core::agent::config::HumanVerificationPrompt::Always,
                         mode: AgentMode::Isolated,
                         principal_user: "test-user".to_string(),
                         rp_ids: vec!["example.com".to_string()],
@@ -5036,8 +5045,8 @@ mod tests {
                     rp_id: "example.com".to_string(),
                     register: AgentCeremonyPolicy {
                         authorization: AgentAuthorization::Allow,
-                        user_presence: UserPresenceSource::Policy,
-                        user_verification: UserVerificationSource::Policy,
+                        user_presence: UserPresenceSource::Agent,
+                        user_verification: UserVerificationSource::Agent,
                     },
                     authenticate: AgentCeremonyPolicy::deny(),
                 }];
@@ -5650,6 +5659,11 @@ mod tests {
                 profiles.insert(
                     "test".to_string(),
                     AgentProfileConfig {
+                        max_operations: 64,
+                        credential_selection:
+                            passless_core::agent::config::CredentialSelection::Single,
+                        human_verification_prompt:
+                            passless_core::agent::config::HumanVerificationPrompt::Always,
                         mode: AgentMode::Isolated,
                         principal_user: "test-user".to_string(),
                         rp_ids: vec!["example.com".to_string()],

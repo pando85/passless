@@ -451,6 +451,13 @@ pub fn build_profile_diagnostic_report(
         require_uv,
     } = params;
     let endpoint_state = match mode {
+        AgentMode::SameUser => {
+            if endpoint_has_id {
+                EndpointDiagnosticState::Ready
+            } else {
+                EndpointDiagnosticState::Unavailable
+            }
+        }
         AgentMode::Isolated => {
             if endpoint_has_id {
                 EndpointDiagnosticState::Ready

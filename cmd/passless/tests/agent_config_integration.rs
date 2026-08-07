@@ -21,6 +21,9 @@ fn minimal_device() -> DeviceIdentity {
 
 fn isolated_profile() -> AgentProfileConfig {
     AgentProfileConfig {
+        max_operations: 64,
+        credential_selection: passless_core::agent::config::CredentialSelection::Single,
+        human_verification_prompt: passless_core::agent::config::HumanVerificationPrompt::Always,
         mode: AgentMode::Isolated,
         principal_user: "testuser".into(),
         rp_ids: vec!["example.com".into()],

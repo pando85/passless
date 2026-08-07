@@ -313,7 +313,7 @@ stage_uninstall_rehearsal() {
     local profile_ids=()
     IFS=',' read -ra profile_ids <<< "$profile_ids_csv"
     if [[ ${#profile_ids[@]} -lt 2 ]]; then
-        add_check "PREREQ-07" "profile_set" "skip" "isolated and delegated profile IDs are required"
+        add_check "PREREQ-07" "profile_set" "skip" "isolated and same-user profile IDs are required"
         jq -n --argjson checks "$checks_json" \
             '{violations:0,checks:$checks,status:"skipped"}' > "$report_file"
         # shellcheck disable=SC2034

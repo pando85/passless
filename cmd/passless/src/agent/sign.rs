@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +9,7 @@ use std::time::Duration;
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
+use passless_core::agent::config::CredentialSelection;
 use passless_core::agent::protocol::{
     ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, RegisterCredentialRequest,
     SignAssertionRequest, SignAssertionResponse,
@@ -95,8 +96,13 @@ fn json_escape_string(s: &str) -> String {
     out
 }
 
-pub fn build_client_data_json(origin: &str, challenge_b64u: &str, cross_origin: bool) -> Vec<u8> {
-    let mut cdj = String::with_capacity(128);
+pub fn build_client_data_json(
+    origin: &str,
+    challenge_b64u: &str,
+    cross_origin: bool,
+    top_origin: Option<&str>,
+) -> Vec<u8> {
+    let mut cdj = String::with_capacity(160);
     cdj.push_str("{\"type\":\"webauthn.get\",\"challenge\":\"");
     cdj.push_str(challenge_b64u);
     cdj.push_str("\",\"origin\":\"");
@@ -104,6 +110,11 @@ pub fn build_client_data_json(origin: &str, challenge_b64u: &str, cross_origin: 
     cdj.push('"');
     if cross_origin {
         cdj.push_str(",\"crossOrigin\":true");
+        if let Some(top_origin) = top_origin {
+            cdj.push_str(",\"topOrigin\":\"");
+            cdj.push_str(&json_escape_string(top_origin));
+            cdj.push('"');
+        }
     }
     cdj.push('}');
     cdj.into_bytes()
@@ -176,11 +187,32 @@ pub fn verify_origin_structural(origin: &str, rp_id: &str) -> bool {
         Some(p) => p,
         None => return false,
     };
-    let normalized_rp = rp_id.trim().to_ascii_lowercase();
-    if parsed.port.is_some() {
+    let normalized_rp = rp_id.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized_rp.is_empty() {
         return false;
     }
-    parsed.host == normalized_rp
+    parsed.host == normalized_rp || parsed.host.ends_with(&format!(".{normalized_rp}"))
+}
+
+pub fn verify_origin_context(
+    origin: &str,
+    top_origin: Option<&str>,
+    cross_origin: bool,
+    rp_id: &str,
+) -> bool {
+    if !verify_origin_structural(origin, rp_id) {
+        return false;
+    }
+    if cross_origin {
+        return top_origin.and_then(parse_origin).is_some();
+    }
+    match top_origin {
+        Some(top) => parse_origin(top).is_some_and(|parsed| {
+            parse_origin(origin)
+                .is_some_and(|frame| parsed.host == frame.host && parsed.port == frame.port)
+        }),
+        None => true,
+    }
 }
 
 fn normalize_rp_id(raw: &str) -> String {
@@ -207,21 +239,77 @@ pub fn generate_bearer_token() -> Result<String, String> {
 }
 
 #[derive(Clone)]
+struct RequestBudget {
+    used_requests: Arc<Mutex<HashSet<[u8; 32]>>>,
+    max_requests: usize,
+}
+
+impl RequestBudget {
+    fn claim(&self, body: &[u8]) -> RequestClaim {
+        claim_request_digest(&self.used_requests, self.max_requests, body)
+    }
+}
+
+#[derive(Clone)]
 pub struct LeaseEntry {
     pub context: SignContext,
     pub handler: Arc<SignHandler>,
     pub lease_id: Option<String>,
+    request_budget: RequestBudget,
+}
+
+impl LeaseEntry {
+    fn claim_request(&self, body: &[u8]) -> RequestClaim {
+        self.request_budget.claim(body)
+    }
 }
 
 pub struct SignContextRegistry {
     entries: Mutex<HashMap<String, LeaseEntry>>,
     registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
+    request_budgets: Mutex<HashMap<String, RequestBudget>>,
 }
 
 #[derive(Clone)]
 pub struct RegistrationLeaseEntry {
     pub context: RegisterContext,
     pub handler: Arc<RegisterHandler>,
+    request_budget: RequestBudget,
+}
+
+impl RegistrationLeaseEntry {
+    fn claim_request(&self, body: &[u8]) -> RequestClaim {
+        self.request_budget.claim(body)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestClaim {
+    Claimed,
+    Replayed,
+    Exhausted,
+    Unavailable,
+}
+
+fn claim_request_digest(
+    registry: &Mutex<HashSet<[u8; 32]>>,
+    max_requests: usize,
+    body: &[u8],
+) -> RequestClaim {
+    let hash = Sha256::digest(body);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&hash);
+    let Ok(mut used) = registry.lock() else {
+        return RequestClaim::Unavailable;
+    };
+    if used.contains(&digest) {
+        return RequestClaim::Replayed;
+    }
+    if used.len() >= max_requests {
+        return RequestClaim::Exhausted;
+    }
+    used.insert(digest);
+    RequestClaim::Claimed
 }
 
 impl SignContextRegistry {
@@ -229,7 +317,27 @@ impl SignContextRegistry {
         Self {
             entries: Mutex::new(HashMap::new()),
             registration_entries: Mutex::new(HashMap::new()),
+            request_budgets: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn request_budget(&self, token: &str, max_requests: usize) -> Result<RequestBudget, String> {
+        let mut budgets = self
+            .request_budgets
+            .lock()
+            .map_err(|_| "registry lock poisoned")?;
+        if let Some(existing) = budgets.get(token) {
+            if existing.max_requests != max_requests {
+                return Err("operation budget mismatch".into());
+            }
+            return Ok(existing.clone());
+        }
+        let budget = RequestBudget {
+            used_requests: Arc::new(Mutex::new(HashSet::new())),
+            max_requests,
+        };
+        budgets.insert(token.to_string(), budget.clone());
+        Ok(budget)
     }
 
     pub fn register_pending_registration(
@@ -238,6 +346,8 @@ impl SignContextRegistry {
         context: RegisterContext,
         handler: Arc<RegisterHandler>,
     ) -> Result<(), String> {
+        let max_requests = usize::from(context.profile_config.max_operations);
+        let request_budget = self.request_budget(&token, max_requests)?;
         let mut map = self
             .registration_entries
             .lock()
@@ -245,7 +355,14 @@ impl SignContextRegistry {
         if map.contains_key(&token) {
             return Err("duplicate token".into());
         }
-        map.insert(token, RegistrationLeaseEntry { context, handler });
+        map.insert(
+            token,
+            RegistrationLeaseEntry {
+                context,
+                handler,
+                request_budget,
+            },
+        );
         Ok(())
     }
 
@@ -263,11 +380,13 @@ impl SignContextRegistry {
     }
 
     pub fn revoke_registration(&self, token: &str) -> bool {
-        let mut map = match self.registration_entries.lock() {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        map.remove(token).is_some()
+        let removed = self
+            .registration_entries
+            .lock()
+            .map(|mut map| map.remove(token).is_some())
+            .unwrap_or(false);
+        self.cleanup_request_budget(token);
+        removed
     }
 
     pub fn register_pending(
@@ -276,6 +395,8 @@ impl SignContextRegistry {
         context: SignContext,
         handler: Arc<SignHandler>,
     ) -> Result<(), String> {
+        let max_requests = usize::from(context.profile_config.max_operations);
+        let request_budget = self.request_budget(&token, max_requests)?;
         let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
         if map.contains_key(&token) {
             return Err("duplicate token".into());
@@ -286,9 +407,29 @@ impl SignContextRegistry {
                 context,
                 handler,
                 lease_id: None,
+                request_budget,
             },
         );
         Ok(())
+    }
+
+    fn cleanup_request_budget(&self, token: &str) {
+        let sign_active = self
+            .entries
+            .lock()
+            .map(|map| map.contains_key(token))
+            .unwrap_or(true);
+        let registration_active = self
+            .registration_entries
+            .lock()
+            .map(|map| map.contains_key(token))
+            .unwrap_or(true);
+        if !sign_active
+            && !registration_active
+            && let Ok(mut budgets) = self.request_budgets.lock()
+        {
+            budgets.remove(token);
+        }
     }
 
     pub fn bind_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
@@ -324,11 +465,13 @@ impl SignContextRegistry {
     }
 
     pub fn revoke(&self, token: &str) -> bool {
-        let mut map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        map.remove(token).is_some()
+        let removed = self
+            .entries
+            .lock()
+            .map(|mut map| map.remove(token).is_some())
+            .unwrap_or(false);
+        self.cleanup_request_budget(token);
+        removed
     }
 
     pub fn revoke_by_lease(&self, lease_id: &str) -> usize {
@@ -342,8 +485,12 @@ impl SignContextRegistry {
             .map(|(k, _)| k.clone())
             .collect();
         let count = keys.len();
-        for k in keys {
-            map.remove(&k);
+        for k in &keys {
+            map.remove(k);
+        }
+        drop(map);
+        for key in keys {
+            self.cleanup_request_budget(&key);
         }
         count
     }
@@ -351,6 +498,12 @@ impl SignContextRegistry {
     pub fn revoke_all(&self) {
         if let Ok(mut map) = self.entries.lock() {
             map.clear();
+        }
+        if let Ok(mut map) = self.registration_entries.lock() {
+            map.clear();
+        }
+        if let Ok(mut budgets) = self.request_budgets.lock() {
+            budgets.clear();
         }
     }
 
@@ -639,6 +792,29 @@ fn handle_http_connection(
                     send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
                     return Ok(());
                 }
+                match reg_entry.claim_request(&body) {
+                    RequestClaim::Claimed => {}
+                    RequestClaim::Replayed => {
+                        send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
+                        return Ok(());
+                    }
+                    RequestClaim::Exhausted => {
+                        send_sign_error(
+                            &mut stream,
+                            "429 Too Many Requests",
+                            "operation_budget_exhausted",
+                        );
+                        return Ok(());
+                    }
+                    RequestClaim::Unavailable => {
+                        send_sign_error(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "operation_registry_unavailable",
+                        );
+                        return Ok(());
+                    }
+                }
                 let req: RegisterCredentialRequest = match serde_json::from_slice(&body) {
                     Ok(r) => r,
                     Err(_) => {
@@ -659,6 +835,9 @@ fn handle_http_connection(
                             ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
                             ErrorCode::NotFound => ("404 Not Found", "not_found"),
                             ErrorCode::Conflict => ("409 Conflict", "conflict"),
+                            ErrorCode::InteractionRequired => {
+                                ("409 Conflict", "human_interaction_required")
+                            }
                             _ => ("500 Internal Server Error", "internal_error"),
                         };
                         send_sign_error(&mut stream, status, code);
@@ -720,6 +899,29 @@ fn handle_http_connection(
         send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
         return Ok(());
     }
+    match entry.claim_request(&body) {
+        RequestClaim::Claimed => {}
+        RequestClaim::Replayed => {
+            send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
+            return Ok(());
+        }
+        RequestClaim::Exhausted => {
+            send_sign_error(
+                &mut stream,
+                "429 Too Many Requests",
+                "operation_budget_exhausted",
+            );
+            return Ok(());
+        }
+        RequestClaim::Unavailable => {
+            send_sign_error(
+                &mut stream,
+                "500 Internal Server Error",
+                "operation_registry_unavailable",
+            );
+            return Ok(());
+        }
+    }
     let req: SignAssertionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => {
@@ -739,6 +941,8 @@ fn handle_http_connection(
                 ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
                 ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
                 ErrorCode::NotFound => ("404 Not Found", "not_found"),
+                ErrorCode::Conflict => ("409 Conflict", "conflict"),
+                ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
                 _ => ("500 Internal Server Error", "internal_error"),
             };
             send_sign_error(&mut stream, status, code);
@@ -765,6 +969,17 @@ pub struct SignHandler {
 }
 
 impl SignHandler {
+    fn record_policy_deny(&self, ctx: &SignContext, rp_id: &str, reason: PolicyDenyReason) {
+        let deny_event = PolicyDenyBuilder::new(
+            ctx.profile_id.clone(),
+            AuditAction::Authenticate,
+            rp_id,
+            reason,
+        )
+        .build();
+        let _ = self.audit_gate.record(deny_event);
+    }
+
     pub fn sign(
         &self,
         ctx: &SignContext,
@@ -772,7 +987,12 @@ impl SignHandler {
     ) -> Result<PrincipalResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
 
-        if !verify_origin_structural(&req.origin, &normalized_rp) {
+        if !verify_origin_context(
+            &req.origin,
+            req.top_origin.as_deref(),
+            req.cross_origin,
+            &normalized_rp,
+        ) {
             let deny_event = PolicyDenyBuilder::new(
                 ctx.profile_id.clone(),
                 AuditAction::Authenticate,
@@ -870,15 +1090,7 @@ impl SignHandler {
         let ceremony_policy = ctx
             .profile_config
             .rule_for_rp(&normalized_rp)
-            .and_then(|rule| {
-                if rule.authenticate.authorization
-                    == passless_core::agent::AgentAuthorization::Allow
-                {
-                    Some(rule.authenticate)
-                } else {
-                    None
-                }
-            })
+            .map(|rule| rule.authenticate)
             .ok_or_else(|| {
                 let deny_event = PolicyDenyBuilder::new(
                     ctx.profile_id.clone(),
@@ -895,21 +1107,62 @@ impl SignHandler {
                 )
             })?;
 
-        let resolved_cred_ref = grant_snapshot.credential_refs.first().ok_or_else(|| {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
+        match ceremony_policy.authorization {
+            passless_core::agent::AgentAuthorization::Deny => {
+                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
+                return Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "RP policy denies signing",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+            passless_core::agent::AgentAuthorization::Confirm => {
+                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
+                return Err(ProtocolError::new(
+                    ErrorCode::InteractionRequired,
+                    "human confirmation is required by policy",
+                    RecommendedAction::Retry,
+                ));
+            }
+            passless_core::agent::AgentAuthorization::Allow => {}
+        }
+
+        let human_uv_required = ceremony_policy.user_verification
+            == passless_core::agent::UserVerificationSource::Human
+            && (req.user_verification
+                || self.security_config.always_uv
+                || ctx.profile_config.human_verification_prompt
+                    == passless_core::agent::HumanVerificationPrompt::Always);
+        if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
+            || human_uv_required
+        {
+            self.record_policy_deny(
+                ctx,
                 &normalized_rp,
-                PolicyDenyReason::CredentialNotMatch,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            ProtocolError::new(
+                if human_uv_required {
+                    PolicyDenyReason::UvRequired
+                } else {
+                    PolicyDenyReason::ActionNotAllowed
+                },
+            );
+            return Err(ProtocolError::new(
+                ErrorCode::InteractionRequired,
+                "human WebAuthn verification is required by policy",
+                RecommendedAction::Retry,
+            ));
+        }
+
+        let up = ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Agent;
+        let uv = ceremony_policy.user_verification
+            == passless_core::agent::UserVerificationSource::Agent;
+        if (req.user_verification || self.security_config.always_uv) && !uv {
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
+            return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                "no credential in active grant",
+                "user verification is required but the configured evidence source is none",
                 RecommendedAction::FixRequest,
-            )
-        })?;
+            ));
+        }
 
         let mut storage = self.human_storage.lock().map_err(|_| {
             ProtocolError::new(
@@ -919,26 +1172,67 @@ impl SignHandler {
             )
         })?;
 
-        let cred_id = Self::resolve_credential_id(&mut storage, resolved_cred_ref, &normalized_rp)?;
+        let credential_scope = if grant_snapshot.credential_refs.is_empty() {
+            let mut discovered = Vec::new();
+            if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::None) {
+                loop {
+                    if credential.rp.id.eq_ignore_ascii_case(&normalized_rp) {
+                        discovered.push(CredentialRef::with_default_domain(&credential.id));
+                    }
+                    match storage.read_next() {
+                        Ok(next) => credential = next,
+                        Err(_) => break,
+                    }
+                }
+            }
+            discovered
+        } else {
+            grant_snapshot.credential_refs.clone()
+        };
 
-        if !req.allow_credentials.is_empty() {
-            let cred_id_b64u = b64u_encode(&cred_id);
-            if !req.allow_credentials.contains(&cred_id_b64u) {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
-                    PolicyDenyReason::AllowCredentialsMismatch,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "credential not in allow_credentials",
-                    RecommendedAction::FixRequest,
-                ));
+        let mut candidates = Vec::new();
+        for credential_ref in &credential_scope {
+            if let Ok(credential_id) =
+                Self::resolve_credential_id(&mut storage, credential_ref, &normalized_rp)
+            {
+                let encoded_id = b64u_encode(&credential_id);
+                if !req.allow_credentials.is_empty() && !req.allow_credentials.contains(&encoded_id)
+                {
+                    continue;
+                }
+                if let Ok(credential) = storage.read(&credential_id) {
+                    if credential.extensions.cred_protect == Some(2)
+                        && !uv
+                        && req.allow_credentials.is_empty()
+                    {
+                        continue;
+                    }
+                    candidates.push((credential_id, credential_ref.clone(), credential.created));
+                }
             }
         }
+
+        if candidates.is_empty() && !req.allow_credentials.is_empty() {
+            self.record_policy_deny(
+                ctx,
+                &normalized_rp,
+                PolicyDenyReason::AllowCredentialsMismatch,
+            );
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "allowCredentials does not contain a permitted credential",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let cred_id = Self::select_credential(
+            candidates,
+            &req.allow_credentials,
+            &ctx.profile_config.credential_selection,
+        )
+        .inspect_err(|_| {
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::CredentialNotMatch);
+        })?;
 
         let allow_event = PolicyAllowBuilder::new(
             ctx.profile_id.clone(),
@@ -966,6 +1260,14 @@ impl SignHandler {
                 RecommendedAction::FixRequest,
             )
         })?;
+        if cred.extensions.cred_protect == Some(3) && !uv {
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "credential protection policy requires user verification",
+                RecommendedAction::FixRequest,
+            ));
+        }
 
         let new_sign_count =
             if self.security_config.constant_signature_counter || !cred.discoverable {
@@ -1012,16 +1314,16 @@ impl SignHandler {
         }
 
         let backup_flags = cred.backup_state.flags();
-        let up = ceremony_policy.user_presence != passless_core::agent::UserPresenceSource::None;
-        let uv = req.user_verification
-            || ceremony_policy.user_verification
-                != passless_core::agent::UserVerificationSource::None;
 
         let authenticator_data =
             build_authenticator_data(&normalized_rp, up, uv, backup_flags, new_sign_count);
 
-        let client_data_json =
-            build_client_data_json(&req.origin, &req.challenge_b64u, req.cross_origin);
+        let client_data_json = build_client_data_json(
+            &req.origin,
+            &req.challenge_b64u,
+            req.cross_origin,
+            req.top_origin.as_deref(),
+        );
         let client_data_hash = Sha256::digest(&client_data_json);
 
         let sig_input = [&authenticator_data[..], &client_data_hash[..]].concat();
@@ -1045,6 +1347,59 @@ impl SignHandler {
                 client_data_json_b64u: b64u_encode(&client_data_json),
             },
         ))
+    }
+
+    fn select_credential(
+        mut candidates: Vec<(Vec<u8>, CredentialRef, i64)>,
+        allow_credentials: &[String],
+        selection: &CredentialSelection,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        if candidates.is_empty() {
+            return Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                "no permitted credential matches this WebAuthn request",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        if !allow_credentials.is_empty() {
+            for allowed in allow_credentials {
+                if let Some(index) = candidates
+                    .iter()
+                    .position(|(id, _, _)| b64u_encode(id) == *allowed)
+                {
+                    return Ok(candidates.swap_remove(index).0);
+                }
+            }
+        }
+
+        match selection {
+            CredentialSelection::Credential(reference) => candidates
+                .into_iter()
+                .find(|(_, candidate_ref, _)| candidate_ref == reference)
+                .map(|(id, _, _)| id)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::NotFound,
+                        "configured credential does not match this WebAuthn request",
+                        RecommendedAction::FixRequest,
+                    )
+                }),
+            CredentialSelection::Single if candidates.len() != 1 => Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "multiple discoverable credentials match; configure credential_selection",
+                RecommendedAction::FixRequest,
+            )),
+            CredentialSelection::Single => Ok(candidates.remove(0).0),
+            CredentialSelection::FirstMatching => {
+                candidates.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(candidates.remove(0).0)
+            }
+            CredentialSelection::Newest => {
+                candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                Ok(candidates.remove(0).0)
+            }
+        }
     }
 
     fn resolve_credential_id(
@@ -1085,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_client_data_json_no_cross_origin() {
-        let cdj = build_client_data_json("https://example.com", "dGVzdA", false);
+        let cdj = build_client_data_json("https://example.com", "dGVzdA", false, None);
         let expected =
             br#"{"type":"webauthn.get","challenge":"dGVzdA","origin":"https://example.com"}"#;
         assert_eq!(cdj, expected);
@@ -1093,21 +1448,26 @@ mod tests {
 
     #[test]
     fn test_client_data_json_with_cross_origin() {
-        let cdj = build_client_data_json("https://example.com", "dGVzdA", true);
-        let expected = br#"{"type":"webauthn.get","challenge":"dGVzdA","origin":"https://example.com","crossOrigin":true}"#;
+        let cdj = build_client_data_json(
+            "https://example.com",
+            "dGVzdA",
+            true,
+            Some("https://top.example"),
+        );
+        let expected = br#"{"type":"webauthn.get","challenge":"dGVzdA","origin":"https://example.com","crossOrigin":true,"topOrigin":"https://top.example"}"#;
         assert_eq!(cdj, expected);
     }
 
     #[test]
     fn test_client_data_json_cross_origin_false_omitted() {
-        let cdj = build_client_data_json("https://example.com", "dGVzdA", false);
+        let cdj = build_client_data_json("https://example.com", "dGVzdA", false, None);
         let s = std::str::from_utf8(&cdj).unwrap();
         assert!(!s.contains("crossOrigin"));
     }
 
     #[test]
     fn test_client_data_json_escaping() {
-        let cdj = build_client_data_json("https://ex\"ample.com", "dGVzdA", false);
+        let cdj = build_client_data_json("https://ex\"ample.com", "dGVzdA", false, None);
         let s = std::str::from_utf8(&cdj).unwrap();
         assert!(s.contains("ex\\\"ample.com"));
     }
@@ -1159,9 +1519,33 @@ mod tests {
     }
 
     #[test]
-    fn test_origin_verification_rejects_port() {
-        assert!(!verify_origin_structural(
+    fn test_origin_verification_accepts_port() {
+        assert!(verify_origin_structural(
             "https://example.com:8443",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_origin_verification_accepts_rp_subdomain_origin() {
+        assert!(verify_origin_structural(
+            "https://login.example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_cross_origin_requires_top_origin() {
+        assert!(!verify_origin_context(
+            "https://login.example.com",
+            None,
+            true,
+            "example.com"
+        ));
+        assert!(verify_origin_context(
+            "https://login.example.com",
+            Some("https://portal.example.net"),
+            true,
             "example.com"
         ));
     }
@@ -1393,6 +1777,20 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_request_budget_is_shared_for_one_bearer() {
+        let registry = SignContextRegistry::new();
+        let token = generate_bearer_token().unwrap();
+        let first = registry.request_budget(&token, 2).unwrap();
+        let second = registry.request_budget(&token, 2).unwrap();
+
+        assert_eq!(first.claim(b"register-operation"), RequestClaim::Claimed);
+        assert_eq!(second.claim(b"register-operation"), RequestClaim::Replayed);
+        assert_eq!(second.claim(b"sign-operation"), RequestClaim::Claimed);
+        assert_eq!(first.claim(b"third-operation"), RequestClaim::Exhausted);
+        assert!(registry.request_budget(&token, 3).is_err());
+    }
+
+    #[test]
     fn test_registry_unknown_token() {
         let registry = SignContextRegistry::new();
         assert!(registry.lookup_bound("nonexistent").is_none());
@@ -1549,6 +1947,7 @@ mod tests {
         let handle = server.serve(registry);
         let body = serde_json::to_vec(&SignAssertionRequest {
             origin: "https://example.com".to_string(),
+            top_origin: None,
             rp_id: "example.com".to_string(),
             challenge_b64u: "dGVzdA".to_string(),
             allow_credentials: vec![],
@@ -1885,6 +2284,7 @@ mod tests {
         let handle = server.serve(registry);
         let body = serde_json::to_vec(&SignAssertionRequest {
             origin: "https://example.com".to_string(),
+            top_origin: None,
             rp_id: "example.com".to_string(),
             challenge_b64u: "dGVzdA".to_string(),
             allow_credentials: vec![],
@@ -2216,6 +2616,10 @@ mod tests {
                     as Box<dyn CredentialStorage>));
 
                 let profile_config = AgentProfileConfig {
+                    max_operations: 64,
+                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                    human_verification_prompt:
+                        passless_core::agent::config::HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
                     principal_user: String::new(),
                     rp_ids: vec!["example.com".to_string()],
@@ -2230,8 +2634,8 @@ mod tests {
                         register: AgentCeremonyPolicy::deny(),
                         authenticate: AgentCeremonyPolicy {
                             authorization: AgentAuthorization::Allow,
-                            user_presence: UserPresenceSource::Policy,
-                            user_verification: UserVerificationSource::Policy,
+                            user_presence: UserPresenceSource::Agent,
+                            user_verification: UserVerificationSource::Agent,
                         },
                     }],
                     device: DeviceIdentity {
@@ -2333,6 +2737,7 @@ mod tests {
             fn make_req(&self) -> SignAssertionRequest {
                 SignAssertionRequest {
                     origin: "https://example.com".to_string(),
+                    top_origin: None,
                     rp_id: "example.com".to_string(),
                     challenge_b64u: "dGVzdA".to_string(),
                     allow_credentials: vec![],
@@ -2369,6 +2774,58 @@ mod tests {
             let ctx = f.make_ctx();
             let req = f.make_req();
             let result = handler.sign(&ctx, &req);
+            assert!(result.is_ok());
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn dynamic_grant_discovers_credential_created_after_approval() {
+            let f = TestFixture::new(true);
+            f.storage.lock().unwrap().delete(&[1u8; 32]).unwrap();
+
+            let grant_request = f
+                .policy_runtime
+                .admin_request_dynamic_grant(GrantRequestParams {
+                    profile_id: f.profile_id.clone(),
+                    session_id: passless_core::agent::PrincipalSessionId::new(),
+                    endpoint_id: passless_core::agent::EndpointId::new(),
+                    principal_digest: [0u8; 32],
+                    rp_ids: vec!["example.com".to_string()],
+                    credentials: vec![],
+                    requested_ttl_secs: 300,
+                })
+                .unwrap();
+            let dynamic_grant_id = f
+                .policy_runtime
+                .admin_approve_grant(&grant_request, &intent::admin_authority())
+                .unwrap();
+
+            let new_credential_id = vec![2u8; 32];
+            let generated = SoftwareCredentialKeyProvider.generate(-7).unwrap();
+            get_write_counting_storage(&f.storage).add_cred(soft_fido2::Credential {
+                id: new_credential_id.clone(),
+                rp: RelyingParty::new("example.com".into()),
+                user: User::new(vec![4, 5, 6]),
+                sign_count: 0,
+                alg: -7,
+                key: generated.key,
+                created: 1,
+                discoverable: true,
+                backup_state: CredentialBackupState::NotEligible,
+                extensions: soft_fido2::Extensions::default(),
+            });
+
+            let mut profile_config = f.profile_config.clone();
+            profile_config.credential_refs = None;
+            let ctx = SignContext {
+                profile_id: f.profile_id.clone(),
+                active_grant_id: dynamic_grant_id,
+                profile_config,
+            };
+            let mut req = f.make_req();
+            req.allow_credentials = vec![b64u_encode(&new_credential_id)];
+
+            let result = f.make_handler().sign(&ctx, &req);
             assert!(result.is_ok());
             assert_eq!(f.key_provider.sign_calls(), 1);
         }
@@ -2544,6 +3001,7 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     let req = SignAssertionRequest {
                         origin: "https://example.com".to_string(),
+                        top_origin: None,
                         rp_id: "example.com".to_string(),
                         challenge_b64u: "dGVzdA".to_string(),
                         allow_credentials: vec![],
@@ -2755,6 +3213,10 @@ mod tests {
                     grant_rp_ids.iter().map(|s| s.to_string()).collect();
 
                 let profile_config = AgentProfileConfig {
+                    max_operations: 64,
+                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
+                    human_verification_prompt:
+                        passless_core::agent::config::HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
                     principal_user: String::new(),
                     rp_ids: rp_id_strings.clone(),
@@ -2849,8 +3311,8 @@ mod tests {
                     register: AgentCeremonyPolicy::deny(),
                     authenticate: AgentCeremonyPolicy {
                         authorization: AgentAuthorization::Allow,
-                        user_presence: UserPresenceSource::Policy,
-                        user_verification: UserVerificationSource::Policy,
+                        user_presence: UserPresenceSource::Agent,
+                        user_verification: UserVerificationSource::Agent,
                     },
                 };
                 Self::new(vec![rule], vec!["example.com"])
@@ -2878,6 +3340,7 @@ mod tests {
             fn make_req(&self) -> SignAssertionRequest {
                 SignAssertionRequest {
                     origin: "https://example.com".to_string(),
+                    top_origin: None,
                     rp_id: "example.com".to_string(),
                     challenge_b64u: "dGVzdA".to_string(),
                     allow_credentials: vec![],
@@ -2893,8 +3356,8 @@ mod tests {
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
                     authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Policy,
-                    user_verification: UserVerificationSource::Policy,
+                    user_presence: UserPresenceSource::Agent,
+                    user_verification: UserVerificationSource::Agent,
                 },
             }
         }
@@ -3070,8 +3533,8 @@ mod tests {
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
                     authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Policy,
-                    user_verification: UserVerificationSource::Policy,
+                    user_presence: UserPresenceSource::Agent,
+                    user_verification: UserVerificationSource::Agent,
                 },
             };
             let mut f = AuditTestFixture::new(vec![rule], vec!["example.com"]);
@@ -3259,6 +3722,7 @@ mod tests {
         ) -> Vec<u8> {
             serde_json::to_vec(&SignAssertionRequest {
                 origin: origin.to_string(),
+                top_origin: None,
                 rp_id: rp_id.to_string(),
                 challenge_b64u: challenge.to_string(),
                 allow_credentials,
@@ -3504,7 +3968,7 @@ mod tests {
         }
 
         #[test]
-        fn http_replay_attack_same_challenge() {
+        fn http_replay_attack_same_challenge_is_rejected() {
             let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
             let body = sign_request_body(
                 "https://example.com",
@@ -3516,10 +3980,7 @@ mod tests {
             let req = format_sign_request(&token, &body);
             let resp1 = http_request(addr, &req, &body);
             assert!(resp1.contains("200 OK"));
-            let resp2 = http_request(addr, &req, &body);
-            assert!(resp2.contains("200 OK"));
             let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
-            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
             let auth1 = parsed1
                 .get("sign_assertion_result")
                 .unwrap()
@@ -3527,32 +3988,12 @@ mod tests {
                 .unwrap()
                 .as_str()
                 .unwrap();
-            let auth2 = parsed2
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            let counter1 = extract_counter(auth1);
-            let counter2 = extract_counter(auth2);
-            assert_eq!(counter1, 1);
-            assert_eq!(counter2, 2);
-            let sig1 = parsed1
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("signature_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            let sig2 = parsed2
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("signature_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            assert_ne!(sig1, sig2);
+            assert_eq!(extract_counter(auth1), 1);
+
+            let resp2 = http_request(addr, &req, &body);
+            assert!(resp2.contains("409 Conflict"));
+            assert!(http_body(&resp2).contains("replayed_operation"));
+
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();
         }

@@ -219,6 +219,42 @@ pub fn create_storage_bundle(config: AgentStorageConfig) -> Result<AgentStorageB
     create_storage_bundle_with_options(config, false)
 }
 
+/// Resolve the signing provider that belongs to an agent storage backend.
+///
+/// Portable TPM storage must never silently fall back to the software provider.
+/// A fresh provider instance uses the same provisioned TPM parent and keeps its
+/// own TPM context, while the backend operation lock serializes credential use.
+pub fn key_provider_for_config(
+    config: &AgentStorageConfig,
+) -> Result<Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>> {
+    match config {
+        #[cfg(feature = "tpm")]
+        AgentStorageConfig::Tpm {
+            path,
+            tcti,
+            portable: true,
+            ..
+        } => {
+            let tcti = if tcti.is_empty() {
+                None
+            } else {
+                Some(tcti.clone())
+            };
+            let provider =
+                crate::storage::tpm::portable::TpmCredentialKeyProvider::new(path.clone(), tcti)
+                    .map_err(|e| {
+                        Error::Storage(format!(
+                            "failed to create portable TPM key provider at {}: {:?}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+            Ok(Arc::new(provider))
+        }
+        _ => Ok(Arc::new(soft_fido2::SoftwareCredentialKeyProvider)),
+    }
+}
+
 pub fn create_storage_bundle_with_options(
     config: AgentStorageConfig,
     allow_create_without_prompt: bool,
@@ -620,6 +656,10 @@ mod tests {
         use passless_core::agent::{AgentMode, DeviceIdentity};
 
         let profile = AgentProfileConfig {
+            max_operations: 64,
+            credential_selection: passless_core::agent::config::CredentialSelection::Single,
+            human_verification_prompt:
+                passless_core::agent::config::HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: "test-user".to_string(),
             rp_ids: vec!["example.com".to_string()],
@@ -664,6 +704,10 @@ mod tests {
         use passless_core::agent::{AgentMode, DeviceIdentity};
 
         let profile = AgentProfileConfig {
+            max_operations: 64,
+            credential_selection: passless_core::agent::config::CredentialSelection::Single,
+            human_verification_prompt:
+                passless_core::agent::config::HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: "test-user".to_string(),
             rp_ids: vec!["example.com".to_string()],

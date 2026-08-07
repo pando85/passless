@@ -157,6 +157,10 @@ pub struct CredentialSet {
 }
 
 impl CredentialSet {
+    fn empty() -> Self {
+        Self { sorted: Vec::new() }
+    }
+
     pub fn new(mut creds: Vec<CredentialRef>) -> Result<Self, GrantError> {
         if creds.is_empty() {
             return Err(GrantError::EmptyCredentialSet);
@@ -315,6 +319,7 @@ pub struct GrantRequest {
     pub rp_ids: Vec<String>,
     pub credentials: Vec<CredentialRef>,
     pub requested_ttl_secs: u64,
+    pub allow_empty_credentials: bool,
     pub resolved: bool,
     pub resolved_grant_id: Option<GrantId>,
 }
@@ -490,11 +495,30 @@ impl GrantRegistry {
         &mut self,
         params: GrantRequestParams,
     ) -> Result<GrantRequestId, GrantError> {
+        self.request_grant_inner(params, false)
+    }
+
+    pub fn request_dynamic_grant(
+        &mut self,
+        params: GrantRequestParams,
+    ) -> Result<GrantRequestId, GrantError> {
+        self.request_grant_inner(params, true)
+    }
+
+    fn request_grant_inner(
+        &mut self,
+        params: GrantRequestParams,
+        allow_empty_credentials: bool,
+    ) -> Result<GrantRequestId, GrantError> {
         self.check_clock()?;
 
         validate_rp_ids(&params.rp_ids)?;
 
-        let cred_set = CredentialSet::new(params.credentials)?;
+        let cred_set = if allow_empty_credentials && params.credentials.is_empty() {
+            CredentialSet::empty()
+        } else {
+            CredentialSet::new(params.credentials)?
+        };
 
         if params.requested_ttl_secs == 0 {
             return Err(GrantError::TtlZero);
@@ -515,6 +539,7 @@ impl GrantRegistry {
             rp_ids: params.rp_ids,
             credentials: cred_set.sorted,
             requested_ttl_secs: params.requested_ttl_secs,
+            allow_empty_credentials,
             resolved: false,
             resolved_grant_id: None,
         };
@@ -551,7 +576,11 @@ impl GrantRegistry {
         }
 
         let validated_rps = validate_rp_ids(&request.rp_ids)?;
-        let cred_set = CredentialSet::new(request.credentials.clone())?;
+        let cred_set = if request.allow_empty_credentials && request.credentials.is_empty() {
+            CredentialSet::empty()
+        } else {
+            CredentialSet::new(request.credentials.clone())?
+        };
         let ttl = clamp_ttl(request.requested_ttl_secs, self.max_ttl_secs);
         let now = self.clock.monotonic_secs();
 

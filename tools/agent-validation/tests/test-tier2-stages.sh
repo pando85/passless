@@ -459,7 +459,7 @@ test_tier2_no_skip_stage_in_tier2() {
 }
 
 test_browser_lease_requires_semantics() {
-    log_test "browser-lease requires live one-shot and exact lifecycle tests"
+    log_test "browser-lease requires live bounded-session and exact lifecycle tests"
 
     if grep -q 'agent-ceremonies-results.json' "${STAGES_DIR}/browser-lease.sh"; then
         log_pass "browser-lease requires live ceremony evidence"
@@ -489,10 +489,10 @@ test_agent_ceremonies_requires_explicit_config() {
         log_fail "agent-ceremonies does not require AV_ISOLATED_PROFILE_ID"
     fi
 
-    if grep -q "AV_DELEGATED_PROFILE_ID" "${STAGES_DIR}/agent-ceremonies.sh"; then
-        log_pass "agent-ceremonies requires AV_DELEGATED_PROFILE_ID"
+    if grep -q "AV_SAME_USER_PROFILE_ID" "${STAGES_DIR}/agent-ceremonies.sh"; then
+        log_pass "agent-ceremonies requires AV_SAME_USER_PROFILE_ID"
     else
-        log_fail "agent-ceremonies does not require AV_DELEGATED_PROFILE_ID"
+        log_fail "agent-ceremonies does not require AV_SAME_USER_PROFILE_ID"
     fi
 
     if grep -q "AV_RP_URL" "${STAGES_DIR}/agent-ceremonies.sh"; then
@@ -519,7 +519,7 @@ test_agent_ceremonies_uses_intents() {
 }
 
 test_agent_ceremonies_uses_delegation() {
-    log_test "agent-ceremonies uses delegation for delegated flow"
+    log_test "agent-ceremonies uses delegation grants for same-user flow"
 
     if grep -q "delegation request" "${VALIDATION_DIR}/browser/principal-driver.sh"; then
         log_pass "agent-ceremonies uses delegation request"

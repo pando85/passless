@@ -455,7 +455,7 @@ test_stage_dry_run_always_skips() {
     source "${STAGES_DIR}/uninstall-rehearsal.sh"
 
     export AV_UNINSTALL_PASSLESS_BIN="/usr/bin/passless"
-    export AV_UNINSTALL_PROFILE_IDS="test-isolated,test-delegated"
+    export AV_UNINSTALL_PROFILE_IDS="test-isolated,test-same-user"
     export AV_UNINSTALL_HUMAN_STORE="/tmp/human-store"
     export AV_UNINSTALL_STORE_FORMAT="local-json"
     export AV_UNINSTALL_RP_URL="http://127.0.0.1:8443"
@@ -502,7 +502,7 @@ test_stage_skips_with_unsupported_format() {
     source "${STAGES_DIR}/uninstall-rehearsal.sh"
 
     export AV_UNINSTALL_PASSLESS_BIN="/usr/bin/passless"
-    export AV_UNINSTALL_PROFILE_IDS="test-isolated,test-delegated"
+    export AV_UNINSTALL_PROFILE_IDS="test-isolated,test-same-user"
     export AV_UNINSTALL_HUMAN_STORE="${TEST_TMP_DIR}/some-store"
     export AV_UNINSTALL_STORE_FORMAT="tpm"
     export AV_UNINSTALL_RP_URL="http://127.0.0.1:8443"

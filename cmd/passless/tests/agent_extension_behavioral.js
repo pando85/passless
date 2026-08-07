@@ -1245,7 +1245,11 @@ test("worker: derives origin and cross_origin from sender.url", async function()
     };
 
     const listener = sandbox._listeners[0];
-    const sender = { url: "https://sub.example.com/page" };
+    const sender = {
+      url: "https://sub.example.com/page",
+      tab: { url: "https://sub.example.com/top" },
+      frameId: 0,
+    };
     listener(
       {
         source: "passless-agent-broker",
@@ -1265,10 +1269,11 @@ test("worker: derives origin and cross_origin from sender.url", async function()
   assert.strictEqual(sandbox._fetchCalls.length, 1);
   const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
   assert.strictEqual(body.origin, "https://sub.example.com");
+  assert.strictEqual(body.top_origin, "https://sub.example.com");
   assert.strictEqual(body.cross_origin, false);
 });
 
-test("worker: computes cross_origin=true for unrelated domain", async function() {
+test("worker: computes cross_origin=true for a cross-origin subframe", async function() {
   const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
     sandbox._fetchResponse = {
       ok: true,
@@ -1276,7 +1281,11 @@ test("worker: computes cross_origin=true for unrelated domain", async function()
     };
 
     const listener = sandbox._listeners[0];
-    const sender = { url: "https://evil.com/page" };
+    const sender = {
+      url: "https://evil.com/page",
+      tab: { url: "https://example.com/top" },
+      frameId: 7,
+    };
     listener(
       {
         source: "passless-agent-broker",
@@ -1294,6 +1303,8 @@ test("worker: computes cross_origin=true for unrelated domain", async function()
 
   await flushPromises();
   const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
+  assert.strictEqual(body.origin, "https://evil.com");
+  assert.strictEqual(body.top_origin, "https://example.com");
   assert.strictEqual(body.cross_origin, true);
 });
 
