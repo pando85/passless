@@ -1,6 +1,6 @@
 # Same-user mode
 
-> **EXPERIMENTAL** — Same-user mode deliberately gives the configured agent bounded authority to act as the human user for exact relying parties. Review the policy and verification evidence before enabling it.
+> **EXPERIMENTAL** — Same-user mode deliberately gives the configured agent bounded authority to act as the human user for its configured relying-party scope. Review the policy and verification evidence before enabling it.
 
 `same-user` uses the daemon's existing human credential backend. It does not copy, reopen, or export passkey material. Registration and authentication are performed by the daemon through the same storage, key provider, operation lock, signature counters, and local-verification services used by the human authenticator.
 
@@ -54,6 +54,33 @@ credential_selection = "credential:<credential-ref-hex>"
 ```
 
 Other selection policies are `single`, `first-matching`, and `newest`. `single` fails closed when more than one eligible credential exists.
+
+### Catch-all authentication
+
+A `same-user` profile can deliberately authorize authentication to any valid concrete WebAuthn RP by using the global `"*"` rule. This is the broadest same-user authority and should only be used when the agent is trusted to act as the human user across sites.
+
+```toml
+[agents.profiles.opencode]
+mode = "same-user"
+principal_user = "passless-opencode"
+browser_command = ["chromium"]
+browser_runtime_root = "/run/passless-agent/opencode"
+max_session_ttl = 600
+max_operations = 32
+credential_selection = "newest"
+# credential_refs intentionally omitted
+
+[[agents.profiles.opencode.rules]]
+rp_id = "*"
+authenticate = "autonomous"
+register = "deny"
+```
+
+The `"*"` value is a policy sentinel, not a WebAuthn RP ID. Every ceremony still carries and validates its concrete RP and origin, and dynamic discovery only considers human credentials whose stored RP matches that concrete ceremony RP. Partial wildcards such as `"*.example.com"` are rejected.
+
+Catch-all scope is intentionally limited to `same-user` authentication: `credential_refs` must be omitted, wildcard registration is denied, and isolated profiles cannot use it. Exact rules may coexist with `"*"` and take precedence, which allows a broad autonomous default with supervised or denied exceptions.
+
+When several discoverable credentials exist for the same RP, use a deterministic selection policy such as `newest`; an RP-provided `allowCredentials` list still constrains selection first. Prefer explicit RP rules whenever the broader authority is unnecessary.
 
 ## Registration
 

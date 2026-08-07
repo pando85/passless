@@ -9,7 +9,7 @@ use std::time::Duration;
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
-use passless_core::agent::config::CredentialSelection;
+use passless_core::agent::config::{ANY_RP_ID, CredentialSelection};
 use passless_core::agent::protocol::{
     ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, RegisterCredentialRequest,
     SignAssertionRequest, SignAssertionResponse,
@@ -1067,11 +1067,10 @@ impl SignHandler {
             ));
         }
 
-        if !grant_snapshot
-            .rp_ids
-            .iter()
-            .any(|id| normalize_rp_id(id) == normalized_rp)
-        {
+        if !grant_snapshot.rp_ids.iter().any(|id| {
+            let scope_rp = normalize_rp_id(id);
+            scope_rp == normalized_rp || scope_rp == ANY_RP_ID
+        }) {
             let deny_event = PolicyDenyBuilder::new(
                 ctx.profile_id.clone(),
                 AuditAction::Authenticate,

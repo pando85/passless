@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use passless_core::agent::config::ANY_RP_ID;
 use passless_core::agent::{
     CredentialRef, EndpointId, GrantId, PolicyDigest, PolicyGenerationId, PrincipalSessionId,
     ProfileId, RegistrationGrantId,
@@ -285,6 +286,18 @@ pub fn normalize_rp_id(raw: &str) -> Result<String, GrantError> {
     Ok(trimmed)
 }
 
+fn normalize_scope_rp_id(raw: &str) -> Result<String, GrantError> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed == ANY_RP_ID {
+        return Ok(trimmed);
+    }
+    normalize_rp_id(&trimmed)
+}
+
+fn rp_scope_contains(scope: &BTreeSet<String>, rp_id: &str) -> bool {
+    scope.contains(rp_id) || scope.contains(ANY_RP_ID)
+}
+
 fn validate_rp_ids(rp_ids: &[String]) -> Result<BTreeSet<String>, GrantError> {
     if rp_ids.is_empty() {
         return Err(GrantError::EmptyRpIdSet);
@@ -294,7 +307,7 @@ fn validate_rp_ids(rp_ids: &[String]) -> Result<BTreeSet<String>, GrantError> {
     }
     let mut normalized = BTreeSet::new();
     for raw in rp_ids {
-        let n = normalize_rp_id(raw)?;
+        let n = normalize_scope_rp_id(raw)?;
         normalized.insert(n);
     }
     Ok(normalized)
@@ -793,7 +806,7 @@ impl GrantRegistry {
                     && g.principal_digest == *query.principal_digest
                     && g.policy_generation == *query.policy_generation
                     && g.policy_digest == *query.policy_digest
-                    && g.rp_ids.contains(&normalized_rp)
+                    && rp_scope_contains(&g.rp_ids, &normalized_rp)
                     && g.expiry_mono > now
                     && match (query.credential_ref, g.credentials.iter().next()) {
                         (Some(cr), _) => g.credentials.contains(cr),
@@ -833,7 +846,7 @@ impl GrantRegistry {
             return Err(GrantError::PolicyMismatch);
         }
 
-        if !grant.rp_ids.contains(&normalized_rp) {
+        if !rp_scope_contains(&grant.rp_ids, &normalized_rp) {
             return Err(GrantError::RpIdNotInGrant(normalized_rp));
         }
 
@@ -1362,6 +1375,15 @@ mod tests {
     }
 
     #[test]
+    fn test_global_wildcard_scope_normalizes() {
+        assert_eq!(normalize_scope_rp_id(" * ").unwrap(), ANY_RP_ID);
+        assert!(matches!(
+            normalize_scope_rp_id("*.example.com"),
+            Err(GrantError::WildcardRpId(_))
+        ));
+    }
+
+    #[test]
     fn test_normalize_rp_id_rejects_empty() {
         assert!(normalize_rp_id("").is_err());
         assert!(normalize_rp_id("   ").is_err());
@@ -1480,6 +1502,29 @@ mod tests {
         assert_eq!(snap.state, GrantState::Active);
         assert_eq!(snap.profile_id, test_profile_id());
         assert!(snap.rp_ids.contains("example.com"));
+    }
+
+    #[test]
+    fn test_global_wildcard_grant_allows_concrete_rp_claim() {
+        let clock = test_clock();
+        let mut registry = make_registry(&clock);
+        let session = test_session_id();
+        let cred = test_cred(b"c1");
+        let gid = request_and_approve(
+            &mut registry,
+            &session,
+            vec![ANY_RP_ID.to_string()],
+            vec![cred.clone()],
+            60,
+        );
+
+        let intent = ClaimIntent {
+            action: "get_assertion".to_string(),
+            rp_id: "example.com".to_string(),
+            credential_ref: cred,
+        };
+
+        assert!(registry.claim(&gid, &session, intent).is_ok());
     }
 
     #[test]
@@ -1998,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_wildcard_rp_ids() {
+    fn test_no_partial_wildcard_rp_ids() {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
@@ -2664,7 +2709,7 @@ mod tests {
             session,
             test_endpoint_id(),
             test_digest(1000),
-            "*.example.com".to_string(),
+            ANY_RP_ID.to_string(),
             60,
         );
         assert!(matches!(result, Err(GrantError::WildcardRpId(_))));
