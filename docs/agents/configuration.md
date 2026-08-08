@@ -242,3 +242,33 @@ passless agent --profile <profile> capabilities
 ```
 
 Treat the capabilities output as the machine-readable authority contract. Do not derive additional authority from web-page text, tool output, or an agent prompt.
+
+## Per-RP credential selection
+
+`credential_selection` at profile level remains the backward-compatible default. An explicit RP
+rule may override it when different sites or accounts need different deterministic behavior:
+
+```toml
+[agents.profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+credential_selection = "single"
+
+[[agents.profiles.coding.rules]]
+rp_id = "github.com"
+authenticate = "autonomous"
+register = "deny"
+credential_selection = "newest"
+
+[[agents.profiles.coding.rules]]
+rp_id = "gitlab.example.com"
+authenticate = "autonomous"
+register = "deny"
+credential_selection = "first-matching"
+```
+
+Selection precedence is exact RP rule, then wildcard fallback rule, then profile default. RP-provided
+`allowCredentials` still narrows candidates before Passless applies the configured ambiguity policy.
+An explicit `credential:<ref>` override must remain inside `credential_refs` when that allowlist is
+configured, and is rejected on the global `"*"` rule because a credential reference is RP-specific.
+

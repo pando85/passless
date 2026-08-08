@@ -1224,14 +1224,18 @@ impl SignHandler {
             ));
         }
 
-        let cred_id = Self::select_credential(
-            candidates,
-            &req.allow_credentials,
-            &ctx.profile_config.credential_selection,
-        )
-        .inspect_err(|_| {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::CredentialNotMatch);
-        })?;
+        let credential_selection = ctx
+            .profile_config
+            .credential_selection_for_rp(&normalized_rp);
+        let cred_id =
+            Self::select_credential(candidates, &req.allow_credentials, &credential_selection)
+                .inspect_err(|_| {
+                    self.record_policy_deny(
+                        ctx,
+                        &normalized_rp,
+                        PolicyDenyReason::CredentialNotMatch,
+                    );
+                })?;
 
         let allow_event = PolicyAllowBuilder::new(
             ctx.profile_id.clone(),
@@ -2629,6 +2633,7 @@ mod tests {
                     storage: None,
                     registration_allowed: false,
                     rules: vec![AgentRpRule {
+                        credential_selection: None,
                         rp_id: "example.com".to_string(),
                         register: AgentCeremonyPolicy::deny(),
                         authenticate: AgentCeremonyPolicy {
@@ -3306,6 +3311,7 @@ mod tests {
 
             fn default_allow() -> Self {
                 let rule = AgentRpRule {
+                    credential_selection: None,
                     rp_id: "example.com".to_string(),
                     register: AgentCeremonyPolicy::deny(),
                     authenticate: AgentCeremonyPolicy {
@@ -3351,6 +3357,7 @@ mod tests {
 
         fn allow_rule(rp_id: &str) -> AgentRpRule {
             AgentRpRule {
+                credential_selection: None,
                 rp_id: rp_id.to_string(),
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
@@ -3363,6 +3370,7 @@ mod tests {
 
         fn confirm_rule(rp_id: &str) -> AgentRpRule {
             AgentRpRule {
+                credential_selection: None,
                 rp_id: rp_id.to_string(),
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
@@ -3375,6 +3383,7 @@ mod tests {
 
         fn deny_rule(rp_id: &str) -> AgentRpRule {
             AgentRpRule {
+                credential_selection: None,
                 rp_id: rp_id.to_string(),
                 register: AgentCeremonyPolicy {
                     authorization: AgentAuthorization::Confirm,
@@ -3528,6 +3537,7 @@ mod tests {
         #[test]
         fn counter_increments_in_monotonic_mode_response() {
             let rule = AgentRpRule {
+                credential_selection: None,
                 rp_id: "example.com".to_string(),
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
