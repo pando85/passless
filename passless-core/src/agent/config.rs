@@ -877,6 +877,14 @@ pub struct AgentConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_path: Option<PathBuf>,
+
+    /// Profile IDs for which the operator explicitly accepts same-user catch-all RP authority.
+    #[serde(default)]
+    pub acknowledge_global_same_user: Vec<String>,
+
+    /// Profile IDs for which the operator explicitly accepts writes to the human credential backend.
+    #[serde(default)]
+    pub acknowledge_same_user_registration: Vec<String>,
 }
 
 impl AgentConfig {
@@ -891,12 +899,57 @@ impl AgentConfig {
             ));
         }
 
+        for acknowledged in self
+            .acknowledge_global_same_user
+            .iter()
+            .chain(self.acknowledge_same_user_registration.iter())
+        {
+            if !self.profiles.contains_key(acknowledged) {
+                return Err(Error::Config(format!(
+                    "agents dangerous-profile acknowledgement references unknown profile '{}'",
+                    acknowledged,
+                )));
+            }
+        }
+
         let mut validated_profiles: Vec<(ProfileId, &AgentProfileConfig)> = Vec::new();
 
         for (name, profile) in &self.profiles {
             let pid = ProfileId::new(name.as_str())
                 .map_err(|e| Error::Config(format!("invalid profile id '{}': {}", name, e)))?;
             profile.validate(&pid)?;
+
+            let global_same_user = profile.mode == AgentMode::SameUser
+                && profile.effective_rules().iter().any(|rule| {
+                    normalize_rp_id(&rule.rp_id) == ANY_RP_ID
+                        && rule.authenticate.authorization != AgentAuthorization::Deny
+                });
+            if global_same_user
+                && !self
+                    .acknowledge_global_same_user
+                    .iter()
+                    .any(|ack| ack == name)
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': global same-user authentication requires explicit operator acknowledgement; add '{}' to agents.acknowledge_global_same_user",
+                    name, name,
+                )));
+            }
+
+            let human_backend_registration =
+                profile.mode == AgentMode::SameUser && profile.allows_registration();
+            if human_backend_registration
+                && !self
+                    .acknowledge_same_user_registration
+                    .iter()
+                    .any(|ack| ack == name)
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': same-user registration mutates the human credential backend and requires explicit operator acknowledgement; add '{}' to agents.acknowledge_same_user_registration",
+                    name, name,
+                )));
+            }
+
             validated_profiles.push((pid, profile));
         }
 
@@ -3088,5 +3141,77 @@ portable = true
             }
             other => panic!("expected Tpm storage, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn global_same_user_requires_operator_acknowledgement() {
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit"
+
+[profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.coding.rules]]
+rp_id = "*"
+authenticate = "autonomous"
+register = "deny"
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        let err = cfg.validate(None).unwrap_err().to_string();
+        assert!(err.contains("acknowledge_global_same_user"));
+    }
+
+    #[test]
+    fn global_same_user_accepts_operator_acknowledgement() {
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit"
+acknowledge_global_same_user = ["coding"]
+
+[profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.coding.rules]]
+rp_id = "*"
+authenticate = "autonomous"
+register = "deny"
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        cfg.validate(None).unwrap();
+    }
+
+    #[test]
+    fn same_user_registration_requires_operator_acknowledgement() {
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit"
+
+[profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.coding.rules]]
+rp_id = "example.com"
+authenticate = "deny"
+register = "supervised"
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        let err = cfg.validate(None).unwrap_err().to_string();
+        assert!(err.contains("acknowledge_same_user_registration"));
+    }
+
+    #[test]
+    fn dangerous_acknowledgement_rejects_unknown_profile() {
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit"
+acknowledge_global_same_user = ["missing"]
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        let err = cfg.validate(None).unwrap_err().to_string();
+        assert!(err.contains("unknown profile 'missing'"));
     }
 }
