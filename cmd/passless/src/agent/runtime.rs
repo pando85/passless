@@ -4677,7 +4677,7 @@ impl AgentRuntime {
             .max_session_ttl
             .map(|ttl| ttl.as_secs())
             .unwrap_or(300);
-        let enrollment_ceiling = profile_ttl.min(300).max(1);
+        let enrollment_ceiling = profile_ttl.clamp(1, 300);
         let requested = if max_session_ttl == 0 {
             enrollment_ceiling
         } else {
