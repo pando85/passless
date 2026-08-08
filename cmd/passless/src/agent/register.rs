@@ -1074,13 +1074,14 @@ mod tests {
     fn test_register_rejects_invalid_grant_id() {
         let f = RegisterTestFixture::new();
         let handler = f.make_handler();
-        let mut registration_grants = HashMap::new();
-        registration_grants.insert("example.com".to_string(), RegistrationGrantId::new());
-        let ctx = RegisterContext {
-            profile_id: f.profile_id.clone(),
-            registration_grants,
-            profile_config: f.profile_config.clone(),
-        };
+        let grant = f
+            .policy_runtime
+            .active_registration_grant(&f.profile_id, "example.com")
+            .unwrap();
+        f.policy_runtime
+            .consume_registration_grant(&f.profile_id, &grant.grant_id)
+            .unwrap();
+        let ctx = f.make_ctx();
         let req = f.make_req();
 
         let result = handler.register(&ctx, &req);
@@ -1247,6 +1248,11 @@ mod tests {
     #[test]
     fn test_register_concurrent_requests_serialized() {
         let f = Arc::new(RegisterTestFixture::new());
+        for _ in 0..3 {
+            f.policy_runtime
+                .request_registration_grant(f.profile_id.clone(), "example.com".to_string(), 300)
+                .unwrap();
+        }
         let handler = Arc::new(f.make_handler());
         let mut handles = Vec::new();
 

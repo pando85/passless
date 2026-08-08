@@ -156,4 +156,3 @@ registration remains forbidden.
 
 This separates repeatable authentication authority from exceptional mutation of the human
 credential namespace. Keep the static registration rule denied when enrollment is not needed.
-
