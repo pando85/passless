@@ -271,4 +271,3 @@ Selection precedence is exact RP rule, then wildcard fallback rule, then profile
 `allowCredentials` still narrows candidates before Passless applies the configured ambiguity policy.
 An explicit `credential:<ref>` override must remain inside `credential_refs` when that allowlist is
 configured, and is rejected on the global `"*"` rule because a credential reference is RP-specific.
-
