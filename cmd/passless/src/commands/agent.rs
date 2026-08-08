@@ -197,13 +197,22 @@ fn dispatch_capabilities(output: OutputFormat, profile: &str) -> Result<()> {
             OutputFormat::Plain => {
                 println!("profile: {}", authority.profile_id);
                 println!("mode: {}", authority.mode);
-                println!("credential_namespace: {}", authority.identity.credential_namespace);
+                println!(
+                    "credential_namespace: {}",
+                    authority.identity.credential_namespace
+                );
                 println!("rp_identity: {}", authority.identity.rp_identity);
                 println!("acts_as_human: {}", authority.identity.acts_as_human);
                 println!("policy_generation: {}", authority.policy_generation);
                 println!("credential_selection: {}", authority.credentials.selection);
-                println!("dynamic_credential_scope: {}", authority.credentials.dynamic_per_rp);
-                println!("max_session_ttl_secs: {}", authority.session.max_session_ttl_secs);
+                println!(
+                    "dynamic_credential_scope: {}",
+                    authority.credentials.dynamic_per_rp
+                );
+                println!(
+                    "max_session_ttl_secs: {}",
+                    authority.session.max_session_ttl_secs
+                );
                 println!(
                     "principal_remaining_ttl_secs: {}",
                     authority.session.principal_remaining_ttl_secs

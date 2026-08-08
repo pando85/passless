@@ -2157,9 +2157,10 @@ impl AgentRuntime {
         let autonomous_authentication = rules.iter().any(|rule| {
             rule.authenticate.authorization == passless_core::agent::AgentAuthorization::Allow
         });
-        let human_backend_registration = acts_as_human && rules.iter().any(|rule| {
-            rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
-        });
+        let human_backend_registration = acts_as_human
+            && rules.iter().any(|rule| {
+                rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
+            });
         let direct_cdp = profile.profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
         let ambiguous_selection = matches!(
             profile.profile_config.credential_selection,
