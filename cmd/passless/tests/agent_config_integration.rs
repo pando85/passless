@@ -141,6 +141,8 @@ fn agent_config_disabled_skips_validation() {
         enabled: false,
         profiles: BTreeMap::new(),
         audit_path: None,
+        acknowledge_global_same_user: vec![],
+        acknowledge_same_user_registration: vec![],
     };
     assert!(config.validate(None).is_ok());
 }
@@ -151,6 +153,8 @@ fn agent_config_enabled_requires_audit_path() {
         enabled: true,
         profiles: BTreeMap::new(),
         audit_path: None,
+        acknowledge_global_same_user: vec![],
+        acknowledge_same_user_registration: vec![],
     };
     let err = config.validate(None).unwrap_err();
     assert!(err.to_string().contains("audit_path"));
@@ -179,6 +183,8 @@ fn agent_config_detects_overlapping_storage_paths() {
         enabled: true,
         profiles,
         audit_path: Some(PathBuf::from("/tmp/agent-overlap/audit")),
+        acknowledge_global_same_user: vec![],
+        acknowledge_same_user_registration: vec![],
     };
     let err = config.validate(None).unwrap_err();
     assert!(err.to_string().contains("overlap"));
@@ -205,6 +211,8 @@ fn agent_config_detects_device_identity_collision() {
         enabled: true,
         profiles,
         audit_path: Some(PathBuf::from("/tmp/collision-test/audit")),
+        acknowledge_global_same_user: vec![],
+        acknowledge_same_user_registration: vec![],
     };
     let err = config.validate(None).unwrap_err();
     assert!(err.to_string().contains("device identity collides"));
@@ -224,6 +232,8 @@ fn agent_config_detects_overlap_with_human_backend() {
         enabled: true,
         profiles,
         audit_path: Some(PathBuf::from("/tmp/human-overlap/audit")),
+        acknowledge_global_same_user: vec![],
+        acknowledge_same_user_registration: vec![],
     };
 
     let human_path = std::path::Path::new("/tmp/human-overlap");
