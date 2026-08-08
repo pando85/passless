@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use passless_core::agent::protocol::{
-    DelegationState, IntentAction, IntentState, PrincipalCredentialSummary,
+    AuthorityRisk, DelegationState, IntentAction, IntentState, PrincipalCredentialSummary,
 };
 use passless_core::{
     AgentCommand, AgentCredentialAction, AgentDelegationAction, AgentIntentAction,
@@ -151,98 +151,100 @@ fn dispatch_doctor(output: OutputFormat, profile: &str) -> Result<()> {
     }
 }
 
-fn capability_mode(mode: &str) -> (&'static str, bool) {
-    match mode {
-        "same-user" | "same_user" | "SameUser" => ("same-user", true),
-        "isolated" | "Isolated" => ("isolated", false),
-        _ => ("unknown", false),
+fn authority_risk_message(risk: AuthorityRisk) -> (&'static str, &'static str, &'static str) {
+    match risk {
+        AuthorityRisk::HumanIdentity => (
+            "high",
+            "human_identity",
+            "same-user exercises the human credential/RP identity; application actions are unconstrained after login",
+        ),
+        AuthorityRisk::GlobalRpScope => (
+            "critical",
+            "global_rp_scope",
+            "global RP scope '*' permits authentication to any valid RP with a matching credential",
+        ),
+        AuthorityRisk::AutonomousAuthentication => (
+            "high",
+            "autonomous_authentication",
+            "at least one RP rule permits authentication without ceremony-time human approval",
+        ),
+        AuthorityRisk::HumanBackendRegistration => (
+            "high",
+            "human_backend_registration",
+            "registration can mutate the human credential backend",
+        ),
+        AuthorityRisk::DirectCdpPort => (
+            "high",
+            "direct_cdp_port",
+            "loopback CDP port grants direct full managed-browser authority",
+        ),
+        AuthorityRisk::AmbiguousCredentialSelection => (
+            "medium",
+            "ambiguous_credential_selection",
+            "profile may choose among multiple eligible credentials without requiring a single candidate",
+        ),
     }
 }
 
 fn dispatch_capabilities(output: OutputFormat, profile: &str) -> Result<()> {
     let mut client = connect_principal(profile)?;
     let resp = client
-        .request(passless_core::agent::PrincipalRequest::Capabilities)
+        .request(passless_core::agent::PrincipalRequest::Authority)
         .map_err(client_error_to_result)?;
     match resp {
-        passless_core::agent::PrincipalResponse::Capabilities(caps) => {
-            let (canonical_mode, acts_as_human) = capability_mode(&caps.mode);
-            let wildcard_rp_scope = caps.allowed_rp_ids.iter().any(|rp| rp.trim() == "*");
-            let credential_namespace = if acts_as_human { "human" } else { "isolated" };
-            let rp_identity = if acts_as_human { "human" } else { "agent" };
-            let mut security_warnings = Vec::new();
-            if acts_as_human {
-                security_warnings.push(
-                    "HIGH: same-user exercises the human credential/RP identity; after login Passless does not constrain application actions",
+        passless_core::agent::PrincipalResponse::Authority(authority) => match output {
+            OutputFormat::Json => output_json(&authority),
+            OutputFormat::Plain => {
+                println!("profile: {}", authority.profile_id);
+                println!("mode: {}", authority.mode);
+                println!("credential_namespace: {}", authority.identity.credential_namespace);
+                println!("rp_identity: {}", authority.identity.rp_identity);
+                println!("acts_as_human: {}", authority.identity.acts_as_human);
+                println!("policy_generation: {}", authority.policy_generation);
+                println!("credential_selection: {}", authority.credentials.selection);
+                println!("dynamic_credential_scope: {}", authority.credentials.dynamic_per_rp);
+                println!("max_session_ttl_secs: {}", authority.session.max_session_ttl_secs);
+                println!(
+                    "principal_remaining_ttl_secs: {}",
+                    authority.session.principal_remaining_ttl_secs
                 );
-            }
-            if wildcard_rp_scope {
-                security_warnings.push(
-                    "CRITICAL: global RP scope '*' permits authentication to any valid RP with a matching credential",
-                );
-            }
-            if acts_as_human && caps.registration_allowed {
-                security_warnings.push(
-                    "HIGH: registration is enabled for a profile that uses the human credential backend",
-                );
-            }
-
-            #[derive(Serialize)]
-            struct CapabilitiesOutput<'a> {
-                profile_id: &'a str,
-                mode: &'a str,
-                allowed_rp_ids: &'a [String],
-                registration_allowed: bool,
-                credential_namespace: &'a str,
-                rp_identity: &'a str,
-                acts_as_human: bool,
-                wildcard_rp_scope: bool,
-                security_warnings: &'a [&'static str],
-            }
-
-            let view = CapabilitiesOutput {
-                profile_id: &caps.profile_id,
-                mode: canonical_mode,
-                allowed_rp_ids: &caps.allowed_rp_ids,
-                registration_allowed: caps.registration_allowed,
-                credential_namespace,
-                rp_identity,
-                acts_as_human,
-                wildcard_rp_scope,
-                security_warnings: &security_warnings,
-            };
-
-            match output {
-                OutputFormat::Json => output_json(&view),
-                OutputFormat::Plain => {
-                    println!("profile: {}", view.profile_id);
-                    println!("mode: {}", view.mode);
-                    println!("credential_namespace: {}", view.credential_namespace);
-                    println!("rp_identity: {}", view.rp_identity);
-                    println!("acts_as_human: {}", view.acts_as_human);
-                    println!("wildcard_rp_scope: {}", view.wildcard_rp_scope);
-                    println!(
-                        "registration_allowed: {}",
-                        if view.registration_allowed {
-                            "true"
-                        } else {
-                            "false"
-                        }
-                    );
-                    println!("allowed_rp_ids:");
-                    for rp in view.allowed_rp_ids {
-                        println!("  - {}", rp);
-                    }
-                    if !view.security_warnings.is_empty() {
-                        println!("security_warnings:");
-                        for warning in view.security_warnings {
-                            println!("  - {}", warning);
-                        }
-                    }
-                    Ok(())
+                println!("max_operations: {}", authority.session.max_operations);
+                if let Some(used) = authority.session.operations_used {
+                    println!("operations_used: {}", used);
                 }
+                if let Some(remaining) = authority.session.operations_remaining {
+                    println!("operations_remaining: {}", remaining);
+                }
+                println!("browser_active: {}", authority.browser.active);
+                println!("cdp_exposure: {}", authority.browser.cdp_exposure);
+                println!(
+                    "full_session_authority: {}",
+                    authority.browser.full_session_authority
+                );
+                println!("rp_rules:");
+                for rule in &authority.rp_rules {
+                    println!(
+                        "  - {}: authenticate={} up={} uv={}; register={} up={} uv={}{}",
+                        rule.rp_id,
+                        rule.authenticate.authorization,
+                        rule.authenticate.user_presence,
+                        rule.authenticate.user_verification,
+                        rule.register.authorization,
+                        rule.register.user_presence,
+                        rule.register.user_verification,
+                        if rule.wildcard { " [wildcard]" } else { "" },
+                    );
+                }
+                if !authority.risk_flags.is_empty() {
+                    println!("risk_flags:");
+                    for risk in authority.risk_flags {
+                        let (severity, code, message) = authority_risk_message(risk);
+                        println!("  - {}: {}: {}", severity, code, message);
+                    }
+                }
+                Ok(())
             }
-        }
+        },
         _ => Err(Error::Other("unexpected response".to_string())),
     }
 }
@@ -969,14 +971,10 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_derive_human_identity_and_wildcard_risk() {
-        let (same_user, acts_as_human) = capability_mode("SameUser");
-        assert_eq!(same_user, "same-user");
-        assert!(acts_as_human);
-
-        let (isolated, acts_as_human) = capability_mode("Isolated");
-        assert_eq!(isolated, "isolated");
-        assert!(!acts_as_human);
+    fn authority_risk_messages_are_stable() {
+        let (severity, code, _) = authority_risk_message(AuthorityRisk::GlobalRpScope);
+        assert_eq!(severity, "critical");
+        assert_eq!(code, "global_rp_scope");
     }
 
     #[test]

@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use log::{debug, info};
 
 use passless_core::agent::protocol::{
-    AdminRequest, AdminResponse, DoctorResponse, ErrorCode, PeerCred, PrincipalCapabilities,
-    PrincipalInstructions, PrincipalLaunchedResponse, PrincipalRequest, PrincipalResponse,
-    PrincipalWaitResponse, ProtocolError, RecommendedAction,
+    AdminRequest, AdminResponse, AuthorityBrowser, AuthorityCeremony, AuthorityCredentialScope,
+    AuthorityIdentity, AuthorityRisk, AuthorityRpRule, AuthoritySession, DoctorResponse,
+    EffectiveAuthority, ErrorCode, PeerCred, PrincipalCapabilities, PrincipalInstructions,
+    PrincipalLaunchedResponse, PrincipalRequest, PrincipalResponse, PrincipalWaitResponse,
+    ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, DaemonStatus, EndpointId,
@@ -2139,6 +2141,144 @@ impl AgentRuntime {
 
     fn revoke_sign_context_for_lease(&self, lease_id: &BrowserLeaseId) {
         self.sign_registry.revoke_by_lease(lease_id.as_str());
+    }
+
+    fn build_effective_authority(
+        &self,
+        profile_id: &ProfileId,
+        profile: &ProfileRuntime,
+        managed: &ManagedPrincipalSession,
+    ) -> EffectiveAuthority {
+        let acts_as_human = profile.mode == AgentMode::SameUser;
+        let rules = profile.profile_config.effective_rules();
+        let wildcard = rules
+            .iter()
+            .any(|rule| rule.rp_id.trim() == passless_core::agent::config::ANY_RP_ID);
+        let autonomous_authentication = rules.iter().any(|rule| {
+            rule.authenticate.authorization == passless_core::agent::AgentAuthorization::Allow
+        });
+        let human_backend_registration = acts_as_human && rules.iter().any(|rule| {
+            rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
+        });
+        let direct_cdp = profile.profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
+        let ambiguous_selection = matches!(
+            profile.profile_config.credential_selection,
+            passless_core::agent::config::CredentialSelection::FirstMatching
+                | passless_core::agent::config::CredentialSelection::Newest
+        );
+
+        let mut risk_flags = Vec::new();
+        if acts_as_human {
+            risk_flags.push(AuthorityRisk::HumanIdentity);
+        }
+        if wildcard {
+            risk_flags.push(AuthorityRisk::GlobalRpScope);
+        }
+        if autonomous_authentication {
+            risk_flags.push(AuthorityRisk::AutonomousAuthentication);
+        }
+        if human_backend_registration {
+            risk_flags.push(AuthorityRisk::HumanBackendRegistration);
+        }
+        if direct_cdp {
+            risk_flags.push(AuthorityRisk::DirectCdpPort);
+        }
+        if ambiguous_selection {
+            risk_flags.push(AuthorityRisk::AmbiguousCredentialSelection);
+        }
+
+        let active_lease = profile
+            .active_browser
+            .lock()
+            .ok()
+            .and_then(|active| active.as_ref().map(|lease| lease.lease_id.clone()))
+            .or_else(|| {
+                profile.current_pending.lock().ok().and_then(|pending| {
+                    pending
+                        .as_ref()
+                        .and_then(|pending| pending.browser_lease_id.clone())
+                })
+            });
+        let budget = active_lease.as_ref().and_then(|lease_id| {
+            self.sign_registry
+                .budget_snapshot_for_lease(lease_id.as_str())
+        });
+        let (operations_used, operations_remaining) = budget
+            .map(|(used, max)| {
+                (
+                    Some(u16::try_from(used).unwrap_or(u16::MAX)),
+                    Some(u16::try_from(max.saturating_sub(used)).unwrap_or(u16::MAX)),
+                )
+            })
+            .unwrap_or((None, None));
+
+        let selection = serde_json::to_value(&profile.profile_config.credential_selection)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".to_string());
+        let generation = self.policy_runtime.current_generation();
+
+        EffectiveAuthority {
+            profile_id: profile_id.to_string(),
+            mode: profile.mode.to_string(),
+            identity: AuthorityIdentity {
+                acts_as_human,
+                credential_namespace: if acts_as_human { "human" } else { "isolated" }.into(),
+                rp_identity: if acts_as_human { "human" } else { "agent" }.into(),
+            },
+            policy_generation: generation.generation_id.as_str().to_string(),
+            rp_rules: rules
+                .into_iter()
+                .map(|rule| AuthorityRpRule {
+                    wildcard: rule.rp_id.trim() == passless_core::agent::config::ANY_RP_ID,
+                    rp_id: rule.rp_id,
+                    authenticate: AuthorityCeremony {
+                        authorization: rule.authenticate.authorization.to_string(),
+                        user_presence: rule.authenticate.user_presence.to_string(),
+                        user_verification: rule.authenticate.user_verification.to_string(),
+                    },
+                    register: AuthorityCeremony {
+                        authorization: rule.register.authorization.to_string(),
+                        user_presence: rule.register.user_presence.to_string(),
+                        user_verification: rule.register.user_verification.to_string(),
+                    },
+                })
+                .collect(),
+            credentials: AuthorityCredentialScope {
+                dynamic_per_rp: profile.profile_config.credential_refs.is_none(),
+                configured_reference_count: profile
+                    .profile_config
+                    .credential_refs
+                    .as_ref()
+                    .map_or(0, |refs| refs.len() as u32),
+                selection,
+            },
+            session: AuthoritySession {
+                max_session_ttl_secs: profile
+                    .profile_config
+                    .max_session_ttl
+                    .map(|ttl| ttl.as_secs())
+                    .unwrap_or(300),
+                principal_remaining_ttl_secs: managed
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs(),
+                max_operations: profile.profile_config.max_operations,
+                operations_used,
+                operations_remaining,
+            },
+            browser: AuthorityBrowser {
+                active: active_lease.is_some(),
+                cdp_exposure: profile
+                    .profile_config
+                    .browser_cdp_expose
+                    .unwrap_or(CdpExposeMode::Pipe)
+                    .to_string(),
+                direct_cdp,
+                full_session_authority: active_lease.is_some(),
+            },
+            risk_flags,
+        }
     }
 
     fn handle_launch_principal(
@@ -5222,6 +5362,9 @@ impl PrincipalHandler for AgentRuntime {
                     registration_allowed: profile.profile_config.allows_registration(),
                 }))
             }
+            PrincipalRequest::Authority => Ok(PrincipalResponse::Authority(
+                self.build_effective_authority(&profile_id, profile, managed),
+            )),
             PrincipalRequest::Instructions => {
                 let mode_str = format!("{:?}", profile.mode);
                 Ok(PrincipalResponse::Instructions(PrincipalInstructions {
