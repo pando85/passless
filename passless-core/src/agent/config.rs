@@ -1389,6 +1389,7 @@ register = "deny"
         let toml_str = r#"
 enabled = true
 audit_path = "/tmp/passless-agent-audit.jsonl"
+acknowledge_global_same_user = ["opencode"]
 
 [profiles.opencode]
 mode = "same-user"
