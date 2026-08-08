@@ -1019,7 +1019,7 @@ mod tests {
     fn test_prompt_sanitizer_truncates_utf8_on_character_boundaries() {
         let value = "é".repeat(MAX_UNTRUSTED_LEN);
         let sanitized = sanitize_prompt_text(&value, MAX_UNTRUSTED_LEN - 1);
-        assert!(sanitized.len() <= MAX_UNTRUSTED_LEN - 1);
+        assert!(sanitized.len() < MAX_UNTRUSTED_LEN);
         assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
     }
 

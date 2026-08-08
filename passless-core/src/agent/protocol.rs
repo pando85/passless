@@ -1063,7 +1063,7 @@ pub enum PrincipalResponseFrame {
     Ok {
         v: ProtocolVersion,
         seq: u64,
-        action: PrincipalResponse,
+        action: Box<PrincipalResponse>,
     },
     Error {
         v: ProtocolVersion,
@@ -1178,7 +1178,7 @@ impl PrincipalResponseFrame {
         Self::Ok {
             v: CURRENT_VERSION,
             seq,
-            action,
+            action: Box::new(action),
         }
     }
 
