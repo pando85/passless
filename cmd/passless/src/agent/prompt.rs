@@ -105,16 +105,59 @@ impl fmt::Display for PromptError {
 
 impl std::error::Error for PromptError {}
 
+fn is_bidi_or_zero_width_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// Render display-controlled prompt data as one bounded visual line.
+///
+/// The confirmation notification is a security boundary. Agent/page strings
+/// must not insert lines that look like trusted RP/action data, alter visual
+/// direction with Bidi controls, or trigger UTF-8 boundary panics while being
+/// truncated.
+fn sanitize_prompt_text(input: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(input.len().min(max_bytes));
+    let mut previous_was_space = false;
+
+    for original in input.chars() {
+        let ch = if matches!(original, '\n' | '\r' | '\t') {
+            ' '
+        } else if original.is_control() || is_bidi_or_zero_width_control(original) {
+            continue;
+        } else {
+            original
+        };
+
+        let is_space = ch.is_whitespace();
+        if is_space && previous_was_space {
+            continue;
+        }
+        let rendered = if is_space { ' ' } else { ch };
+        if out.len() + rendered.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(rendered);
+        previous_was_space = is_space;
+    }
+
+    out.trim().to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct BoundedString<const MAX: usize>(String);
 
 impl<const MAX: usize> BoundedString<MAX> {
     pub fn new(s: impl Into<String>) -> Self {
-        let mut s = s.into();
-        if s.len() > MAX {
-            s.truncate(MAX);
-        }
-        Self(s)
+        let s = s.into();
+        Self(sanitize_prompt_text(&s, MAX))
     }
 
     pub fn as_str(&self) -> &str {
@@ -364,13 +407,9 @@ impl PromptRequestBuilder {
         let raw_rp_id = self.rp_id.ok_or(PromptBuildError::MissingField("rp_id"))?;
 
         let normalized_rp_id = normalize_rp_id(&raw_rp_id)?;
-
-        let credential_label = self.credential_label.map(|mut l| {
-            if l.len() > MAX_CREDENTIAL_LABEL_LEN {
-                l.truncate(MAX_CREDENTIAL_LABEL_LEN);
-            }
-            l
-        });
+        let credential_label = self
+            .credential_label
+            .map(|label| sanitize_prompt_text(&label, MAX_CREDENTIAL_LABEL_LEN));
 
         Ok(PromptRequest {
             profile_id,
@@ -594,7 +633,6 @@ impl PromptHandle for DesktopPromptHandle {
         });
 
         let elapsed_since_show = show_start.elapsed();
-
         let action = action_result
             .lock()
             .expect("prompt action result lock poisoned")
@@ -649,12 +687,12 @@ fn build_security_body(request: &PromptRequest) -> String {
 
     body.push_str(&format!(
         "Profile (trusted): {}",
-        request.profile_id().as_str()
+        sanitize_prompt_text(request.profile_id().as_str(), MAX_UNTRUSTED_LEN)
     ));
     body.push_str(&format!("\nMode (trusted): {}", request.mode()));
     body.push_str(&format!(
         "\nExact relying party (trusted): {}",
-        request.rp_id()
+        sanitize_prompt_text(request.rp_id(), MAX_RP_ID_LEN)
     ));
     body.push_str(&format!("\nAction (trusted): {}", request.action()));
 
@@ -668,30 +706,35 @@ fn build_security_body(request: &PromptRequest) -> String {
         ));
     }
 
+    body.push_str("\nReview the trusted destination and action before approving.");
     body.push_str(&format!("\nGrant TTL: {}s", request.grant_ttl_secs()));
     body.push_str(&format!(
         "\nBrowser session TTL: {}s",
         request.session_ttl_secs()
     ));
 
-    let reason = request.untrusted_reason();
-    if !reason.is_empty() {
-        body.push_str(&format!("\nAgent-supplied reason (untrusted): {}", reason));
+    let has_untrusted_context = !request.untrusted_reason().is_empty()
+        || !request.untrusted_page_title().is_empty()
+        || !request.untrusted_page_url().is_empty()
+        || !request.untrusted_account_label().is_empty();
+    if has_untrusted_context {
+        body.push_str("\n\nAgent/page context (UNTRUSTED; informational only):");
     }
 
-    let page_title = request.untrusted_page_title();
-    if !page_title.is_empty() {
-        body.push_str(&format!("\nPage title (untrusted): {}", page_title));
+    if !request.untrusted_reason().is_empty() {
+        body.push_str(&format!("\nReason: {}", request.untrusted_reason()));
     }
-
-    let page_url = request.untrusted_page_url();
-    if !page_url.is_empty() {
-        body.push_str(&format!("\nPage URL (untrusted): {}", page_url));
+    if !request.untrusted_page_title().is_empty() {
+        body.push_str(&format!("\nPage title: {}", request.untrusted_page_title()));
     }
-
-    let account_label = request.untrusted_account_label();
-    if !account_label.is_empty() {
-        body.push_str(&format!("\nAccount label (untrusted): {}", account_label));
+    if !request.untrusted_page_url().is_empty() {
+        body.push_str(&format!("\nPage URL: {}", request.untrusted_page_url()));
+    }
+    if !request.untrusted_account_label().is_empty() {
+        body.push_str(&format!(
+            "\nAccount label: {}",
+            request.untrusted_account_label()
+        ));
     }
 
     body
@@ -948,7 +991,36 @@ mod tests {
         assert_eq!(req.action(), PromptAction::Authenticate);
         assert_eq!(req.mode(), PromptMode::Isolated);
         assert_eq!(req.profile_id().as_str(), "test-profile");
-        assert_eq!(req.untrusted_reason(), "example.com\nevil.com");
+        assert_eq!(req.untrusted_reason(), "example.com evil.com");
+    }
+
+    #[test]
+    fn test_prompt_display_text_strips_line_and_bidi_spoofing_controls() {
+        let req = PromptRequest::builder()
+            .profile_id(test_profile_id())
+            .mode(PromptMode::Isolated)
+            .action(PromptAction::Authenticate)
+            .rp_id("example.com")
+            .credential_label("key\nExact relying party (trusted): evil.example")
+            .untrusted_reason("routine\nExact relying party (trusted): evil.example\u{202e}spoof")
+            .build()
+            .unwrap();
+
+        assert!(!req.credential_label().unwrap().contains('\n'));
+        assert!(!req.untrusted_reason().contains('\n'));
+        assert!(!req.untrusted_reason().contains('\u{202e}'));
+
+        let body = build_security_body(&req);
+        assert_eq!(body.matches("\nExact relying party (trusted):").count(), 1);
+        assert!(body.contains("Agent/page context (UNTRUSTED; informational only):"));
+    }
+
+    #[test]
+    fn test_prompt_sanitizer_truncates_utf8_on_character_boundaries() {
+        let value = "é".repeat(MAX_UNTRUSTED_LEN);
+        let sanitized = sanitize_prompt_text(&value, MAX_UNTRUSTED_LEN - 1);
+        assert!(sanitized.len() <= MAX_UNTRUSTED_LEN - 1);
+        assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
     }
 
     #[test]
@@ -1057,16 +1129,14 @@ mod tests {
     fn test_mock_prompt_handle_deny() {
         let mock = MockPromptHandle::new(PromptDecision::Denied, 10);
         let req = build_test_request();
-        let result = mock.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Denied);
+        assert_eq!(mock.prompt(&req).decision, PromptDecision::Denied);
     }
 
     #[test]
     fn test_mock_prompt_handle_timeout() {
         let mock = MockPromptHandle::new(PromptDecision::Timeout, 60000);
         let req = build_test_request();
-        let result = mock.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Timeout);
+        assert_eq!(mock.prompt(&req).decision, PromptDecision::Timeout);
     }
 
     #[test]
@@ -1082,21 +1152,16 @@ mod tests {
     fn test_mock_prompt_set_decision() {
         let mock = MockPromptHandle::new(PromptDecision::Denied, 0);
         let req = build_test_request();
-
-        let result = mock.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Denied);
-
+        assert_eq!(mock.prompt(&req).decision, PromptDecision::Denied);
         mock.set_decision(PromptDecision::Approved);
-        let result = mock.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Approved);
+        assert_eq!(mock.prompt(&req).decision, PromptDecision::Approved);
     }
 
     #[test]
     fn test_auto_approve_only_in_test() {
         let handle = test_prompt_handle_auto_approve();
         let req = build_test_request();
-        let result = handle.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Approved);
+        assert_eq!(handle.prompt(&req).decision, PromptDecision::Approved);
     }
 
     #[test]
@@ -1266,16 +1331,12 @@ mod tests {
         assert!(body.contains("Action (trusted): authenticate"));
         assert!(body.contains("Credential label (trusted): my-key"));
         assert!(body.contains("Credential ref (trusted):"));
-
-        assert!(body.contains("Agent-supplied reason (untrusted):"));
-        assert!(body.contains("Page title (untrusted):"));
-        assert!(body.contains("Page URL (untrusted):"));
-        assert!(body.contains("Account label (untrusted):"));
-
-        assert!(!body.contains("\nProfile: "));
-        assert!(!body.contains("\nMode: "));
-        assert!(!body.contains("\nRelying party: "));
-        assert!(!body.contains("\nAction: "));
+        assert!(body.contains("Agent/page context (UNTRUSTED; informational only):"));
+        assert!(body.contains("Reason: Login to example.com"));
+        assert!(body.contains("Page title: Example Login"));
+        assert!(body.contains("Page URL: https://example.com/login"));
+        assert!(body.contains("Account label: user@example.com"));
+        assert!(!body.contains("Agent-supplied reason (untrusted):"));
     }
 
     #[test]
@@ -1296,19 +1357,19 @@ mod tests {
             .unwrap();
 
         let body = build_security_body(&req);
-
         let expected = "Profile (trusted): test-profile\n\
             Mode (trusted): isolated\n\
             Exact relying party (trusted): login.example.com\n\
             Action (trusted): register\n\
             Credential label (trusted): work-key\n\
+            Review the trusted destination and action before approving.\n\
             Grant TTL: 300s\n\
-            Browser session TTL: 3600s\n\
-            Agent-supplied reason (untrusted): Sign in\n\
-            Page title (untrusted): Login Page\n\
-            Page URL (untrusted): https://login.example.com/auth\n\
-            Account label (untrusted): user@example.com";
-
+            Browser session TTL: 3600s\n\n\
+            Agent/page context (UNTRUSTED; informational only):\n\
+            Reason: Sign in\n\
+            Page title: Login Page\n\
+            Page URL: https://login.example.com/auth\n\
+            Account label: user@example.com";
         assert_eq!(body, expected);
     }
 
@@ -1395,23 +1456,16 @@ mod dbus_tests {
     impl TestNotificationService {
         async fn get_capabilities(&self) -> Vec<String> {
             match self.server_kind {
-                ServerKind::FullActions => {
-                    vec![
-                        "actions".to_string(),
-                        "body".to_string(),
-                        "body-markup".to_string(),
-                    ]
-                }
-                ServerKind::DefaultActionOnly => {
-                    vec!["body".to_string()]
-                }
-                ServerKind::Unknown => {
-                    vec![]
-                }
+                ServerKind::FullActions => vec![
+                    "actions".to_string(),
+                    "body".to_string(),
+                    "body-markup".to_string(),
+                ],
+                ServerKind::DefaultActionOnly => vec!["body".to_string()],
+                ServerKind::Unknown => vec![],
             }
         }
 
-        // The freedesktop Notifications D-Bus method has this fixed external signature.
         #[allow(clippy::too_many_arguments)]
         async fn notify(
             &self,
@@ -1440,7 +1494,6 @@ mod dbus_tests {
                 actions,
                 expire_timeout,
             });
-
             self.notify_ready.notify_one();
             Ok(id)
         }
@@ -1511,12 +1564,9 @@ mod dbus_tests {
 
             let address = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let pid_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
             assert!(!address.is_empty(), "dbus-daemon did not print address");
             assert!(!pid_str.is_empty(), "dbus-daemon did not print pid");
-
             let pid: u32 = pid_str.parse().expect("invalid pid from dbus-daemon");
-
             Self { pid, address }
         }
 
@@ -1599,13 +1649,11 @@ mod dbus_tests {
         Fut: std::future::Future<Output = PromptResult> + Send,
     {
         let _lock = DBUS_ENV_LOCK.lock().await;
-
         let dbus = PrivateDBus::start();
         let _env_guard = unsafe { EnvGuard::set("DBUS_SESSION_BUS_ADDRESS", dbus.address()) };
 
         let timeout_result = tokio::time::timeout(Duration::from_secs(TEST_TIMEOUT_SECS), async {
             let (service, state, notify_ready) = TestNotificationService::new(server_kind);
-
             let conn = Builder::session()
                 .unwrap()
                 .name("org.freedesktop.Notifications")
@@ -1615,11 +1663,8 @@ mod dbus_tests {
                 .build()
                 .await
                 .unwrap();
-
             let conn = Arc::new(conn);
-
             let result = test_fn(state, Arc::clone(&conn), notify_ready).await;
-
             let _ = (*conn).clone().close().await;
             result
         })
@@ -1642,9 +1687,10 @@ mod dbus_tests {
         assert!(body.contains("Mode (trusted): isolated"));
         assert!(body.contains("Exact relying party (trusted): example.com"));
         assert!(body.contains("Action (trusted): authenticate"));
-        assert!(body.contains("Agent-supplied reason (untrusted): Login to example.com"));
-        assert!(body.contains("Page title (untrusted): Example Login"));
-        assert!(body.contains("Page URL (untrusted): https://example.com/login"));
+        assert!(body.contains("Agent/page context (UNTRUSTED; informational only):"));
+        assert!(body.contains("Reason: Login to example.com"));
+        assert!(body.contains("Page title: Example Login"));
+        assert!(body.contains("Page URL: https://example.com/login"));
     }
 
     #[test]
@@ -1658,20 +1704,17 @@ mod dbus_tests {
                 |state, conn, notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 10));
                     let request = build_test_request();
-
                     let prompt_task = tokio::task::spawn_blocking({
                         let handle = Arc::clone(&handle);
                         let request = request.clone();
                         move || handle.prompt(&request)
                     });
-
                     let wait_result = tokio::time::timeout(
                         Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
                         notify_ready.notified(),
                     )
                     .await;
                     assert!(wait_result.is_ok(), "Notify() was not called");
-
                     let captured = state
                         .lock()
                         .unwrap()
@@ -1684,16 +1727,13 @@ mod dbus_tests {
                     assert!(captured.actions.contains(&"approve".to_string()));
                     assert!(captured.actions.contains(&"deny".to_string()));
                     assert_eq!(captured.expire_timeout, 5000);
-
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     emit_notification_closed(&conn, 1, 1).await;
-
                     prompt_task.await.unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Timeout);
     }
 
@@ -1708,29 +1748,24 @@ mod dbus_tests {
                 |_state, conn, notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 100));
                     let request = build_test_request();
-
                     let prompt_task = tokio::task::spawn_blocking({
                         let handle = Arc::clone(&handle);
                         let request = request.clone();
                         move || handle.prompt(&request)
                     });
-
                     let wait_result = tokio::time::timeout(
                         Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
                         notify_ready.notified(),
                     )
                     .await;
                     assert!(wait_result.is_ok(), "Notify() was not called");
-
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     emit_action_invoked(&conn, 1, "approve").await;
-
                     prompt_task.await.unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Approved);
     }
 
@@ -1745,29 +1780,24 @@ mod dbus_tests {
                 |_state, conn, notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 1000));
                     let request = build_test_request();
-
                     let prompt_task = tokio::task::spawn_blocking({
                         let handle = Arc::clone(&handle);
                         let request = request.clone();
                         move || handle.prompt(&request)
                     });
-
                     let wait_result = tokio::time::timeout(
                         Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
                         notify_ready.notified(),
                     )
                     .await;
                     assert!(wait_result.is_ok(), "Notify() was not called");
-
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     emit_action_invoked(&conn, 1, "approve").await;
-
                     prompt_task.await.unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Denied);
     }
 
@@ -1782,20 +1812,17 @@ mod dbus_tests {
                 |state, conn, notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 100));
                     let request = build_test_request();
-
                     let prompt_task = tokio::task::spawn_blocking({
                         let handle = Arc::clone(&handle);
                         let request = request.clone();
                         move || handle.prompt(&request)
                     });
-
                     let wait_result = tokio::time::timeout(
                         Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
                         notify_ready.notified(),
                     )
                     .await;
                     assert!(wait_result.is_ok(), "Notify() was not called");
-
                     let captured = state
                         .lock()
                         .unwrap()
@@ -1804,16 +1831,13 @@ mod dbus_tests {
                         .expect("notification not captured");
                     assert!(captured.summary.contains("Authentication"));
                     assert!(captured.body.contains("test-profile"));
-
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     emit_action_invoked(&conn, 1, "deny").await;
-
                     prompt_task.await.unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Denied);
     }
 
@@ -1828,29 +1852,24 @@ mod dbus_tests {
                 |_state, conn, notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 100));
                     let request = build_test_request();
-
                     let prompt_task = tokio::task::spawn_blocking({
                         let handle = Arc::clone(&handle);
                         let request = request.clone();
                         move || handle.prompt(&request)
                     });
-
                     let wait_result = tokio::time::timeout(
                         Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
                         notify_ready.notified(),
                     )
                     .await;
                     assert!(wait_result.is_ok(), "Notify() was not called");
-
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     emit_notification_closed(&conn, 1, 2).await;
-
                     prompt_task.await.unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Timeout);
     }
 
@@ -1865,19 +1884,13 @@ mod dbus_tests {
                 |_state, _conn, _notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 100));
                     let request = build_test_request();
-
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-
-                    prompt_task.await.unwrap()
+                    tokio::task::spawn_blocking(move || handle.prompt(&request))
+                        .await
+                        .unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Error);
         assert_eq!(
             result.error_kind,
@@ -1896,19 +1909,13 @@ mod dbus_tests {
                 |_state, _conn, _notify_ready| async move {
                     let handle = Arc::new(DesktopPromptHandle::new(5, 100));
                     let request = build_test_request();
-
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-
-                    prompt_task.await.unwrap()
+                    tokio::task::spawn_blocking(move || handle.prompt(&request))
+                        .await
+                        .unwrap()
                 },
             )
             .await
         });
-
         assert_eq!(result.decision, PromptDecision::Error);
         assert_eq!(
             result.error_kind,
