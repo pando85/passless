@@ -1845,6 +1845,8 @@ verbose = false
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/agent-audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("collides"));
@@ -1891,6 +1893,8 @@ verbose = false
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/agent-audit-roots")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("overlap"));
@@ -1941,6 +1945,8 @@ verbose = false
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(Some(human_path.as_path())).unwrap_err();
         assert!(err.to_string().contains("overlaps with human"));
@@ -2109,6 +2115,8 @@ product_id = 2
             enabled: true,
             profiles: BTreeMap::new(),
             audit_path: None,
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("audit_path"));
@@ -2120,6 +2128,8 @@ product_id = 2
             enabled: false,
             profiles: BTreeMap::new(),
             audit_path: None,
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         assert!(config.validate(None).is_ok());
     }
@@ -2165,6 +2175,8 @@ product_id = 2
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/overlap-audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("myprofile.storage.credential"));
@@ -2346,6 +2358,8 @@ backend_type = "local"
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("overlap"));
@@ -2406,6 +2420,8 @@ backend_type = "local"
             enabled: true,
             profiles,
             audit_path: Some(audit_link),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("overlap"));
@@ -2458,6 +2474,8 @@ backend_type = "local"
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(Some(human_link.as_path())).unwrap_err();
         assert!(err.to_string().contains("overlaps with human"));
@@ -2840,6 +2858,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("overlap"));
@@ -2951,6 +2971,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("overlap"));
@@ -2999,6 +3021,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             enabled: true,
             profiles,
             audit_path: Some(audit),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
         };
         let err = config.validate(None).unwrap_err();
         assert!(err.to_string().contains("overlap"));

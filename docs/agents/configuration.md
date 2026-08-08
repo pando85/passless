@@ -266,4 +266,3 @@ acknowledge_same_user_registration = ["enrollment"]
 
 These are deliberate friction gates for dangerous configuration. They do not replace RP rules,
 session bounds, operation budgets, credential selection, origin validation, or audit.
-
