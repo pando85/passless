@@ -1100,7 +1100,7 @@ pub enum AdminDelegationAction {
         #[arg(long)]
         confirm: bool,
     },
-    /// Request a new registration
+    /// Create an exact-RP, short-lived, one-shot registration enrollment grant
     RequestRegistration {
         /// Profile identifier
         #[arg(long, value_name = "PROFILE")]
@@ -1108,7 +1108,7 @@ pub enum AdminDelegationAction {
         /// Relying party ID
         #[arg(long, value_name = "RP_ID")]
         rp: String,
-        /// Session TTL in seconds
+        /// Enrollment grant TTL in seconds (clamped to profile TTL and 300 seconds)
         #[arg(long, value_name = "SECONDS")]
         session_ttl: u64,
         /// Reason for the registration

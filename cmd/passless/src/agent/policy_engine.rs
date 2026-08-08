@@ -866,6 +866,7 @@ impl PolicyRuntime {
         &self,
         profile_id: ProfileId,
         rp_id: String,
+        ttl_secs: u64,
     ) -> Result<passless_core::agent::RegistrationGrantId, super::grant::GrantError> {
         let profile_key = profile_id.as_str().to_string();
         let mut reg_grants = self.registration_grants.lock().unwrap();
@@ -877,7 +878,46 @@ impl PolicyRuntime {
         let session_id = passless_core::agent::PrincipalSessionId::new();
         let endpoint_id = passless_core::agent::EndpointId::new();
 
-        registry.request_registration(profile_id, session_id, endpoint_id, [0u8; 32], rp_id, 300)
+        registry.request_registration(
+            profile_id,
+            session_id,
+            endpoint_id,
+            [0u8; 32],
+            rp_id,
+            ttl_secs,
+        )
+    }
+
+    pub fn active_registration_grant(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+    ) -> Option<super::grant::RegistrationGrantSnapshot> {
+        let normalized = super::grant::normalize_rp_id(rp_id).ok()?;
+        let now = self.clock.monotonic_secs();
+        let reg_grants = self.registration_grants.lock().ok()?;
+        let registry = reg_grants.get(profile_id.as_str())?;
+        registry
+            .list_all_snapshots()
+            .into_iter()
+            .filter(|grant| {
+                grant.state == super::grant::GrantState::Active
+                    && grant.rp_id == normalized
+                    && grant.expiry_mono > now
+            })
+            .max_by_key(|grant| grant.issued_at_mono)
+    }
+
+    pub fn consume_registration_grant(
+        &self,
+        profile_id: &ProfileId,
+        grant_id: &passless_core::agent::RegistrationGrantId,
+    ) -> Result<(), super::grant::GrantError> {
+        let reg_grants = self.registration_grants.lock().unwrap();
+        let registry = reg_grants
+            .get(profile_id.as_str())
+            .ok_or_else(|| super::grant::GrantError::RegistrationGrantNotFound(grant_id.clone()))?;
+        registry.revoke_registration(grant_id)
     }
 
     pub fn resolve_registration_grant(

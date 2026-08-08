@@ -4624,46 +4624,77 @@ impl AgentRuntime {
         max_session_ttl: u64,
         _reason: Option<&str>,
     ) -> Result<AdminResponse, ProtocolError> {
-        let _profile = self.profiles.get(profile_id).ok_or_else(|| {
+        let profile = self.profiles.get(profile_id).ok_or_else(|| {
             ProtocolError::new(
                 ErrorCode::NotFound,
                 format!("profile '{}' not found", profile_id),
                 RecommendedAction::FixRequest,
             )
         })?;
-
-        let (outcome, reason_code) = self
-            .policy_runtime
-            .authorize_registration(profile_id, rp_id);
-        if outcome == super::policy_engine::Outcome::Deny {
+        if !profile.enabled.load(Ordering::Acquire) {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                format!(
-                    "registration denied for profile '{}' and rp '{}': {}",
-                    profile_id, rp_id, reason_code
-                ),
+                format!("profile '{}' is disabled", profile_id),
                 RecommendedAction::FixRequest,
             ));
         }
 
-        let ttl = if max_session_ttl == 0 {
-            300
+        let normalized_rp = passless_core::agent::config::validate_rp_id(rp_id).map_err(|e| {
+            ProtocolError::new(
+                ErrorCode::BadRequest,
+                format!("invalid registration RP ID: {}", e),
+                RecommendedAction::FixRequest,
+            )
+        })?;
+        if normalized_rp == passless_core::agent::config::ANY_RP_ID {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "registration enrollment requires an exact RP ID",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let rule = profile
+            .profile_config
+            .rule_for_rp(&normalized_rp)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "registration RP has no configured rule",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+        if rule.register.authorization == passless_core::agent::AgentAuthorization::Deny {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "registration policy denies enrollment for RP",
+                RecommendedAction::FixRequest,
+            ));
+        }
+
+        let profile_ttl = profile
+            .profile_config
+            .max_session_ttl
+            .map(|ttl| ttl.as_secs())
+            .unwrap_or(300);
+        let enrollment_ceiling = profile_ttl.min(300).max(1);
+        let requested = if max_session_ttl == 0 {
+            enrollment_ceiling
         } else {
             max_session_ttl
         };
+        let ttl = requested.min(enrollment_ceiling).max(1);
 
         let reg_grant_id = self
             .policy_runtime
-            .request_registration_grant(profile_id.clone(), rp_id.to_string())
+            .request_registration_grant(profile_id.clone(), normalized_rp, ttl)
             .map_err(|e| {
                 ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to request registration grant: {}", e),
-                    RecommendedAction::Retry,
+                    ErrorCode::Forbidden,
+                    format!("failed to create registration enrollment grant: {}", e),
+                    RecommendedAction::FixRequest,
                 )
             })?;
-
-        let _ = ttl;
 
         Ok(AdminResponse::RegistrationGranted {
             registration_grant_id: reg_grant_id,
@@ -4760,31 +4791,9 @@ impl AgentRuntime {
             )
         })?;
 
-        // Request registration grants for all allowed RP IDs
-        let mut registration_grants = std::collections::HashMap::new();
-        for rp_id in &config.rp_ids {
-            let registration_allowed = profile_config.rule_for_rp(rp_id).is_some_and(|rule| {
-                rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
-            });
-            if !registration_allowed {
-                continue;
-            }
-
-            match self
-                .policy_runtime
-                .request_registration_grant(profile_id.clone(), rp_id.clone())
-            {
-                Ok(grant_id) => {
-                    registration_grants.insert(rp_id.clone(), grant_id);
-                }
-                Err(e) => {
-                    debug!(
-                        "failed to request registration grant for rp={}: {}",
-                        rp_id, e
-                    );
-                }
-            }
-        }
+        // Registration is never granted implicitly by browser launch. The operator must mint an
+        // exact-RP, short-lived enrollment grant through the admin request path.
+        let registration_grants = std::collections::HashMap::new();
 
         // Create registration context and handler
         let register_ctx = super::register::RegisterContext {

@@ -739,7 +739,11 @@ fn handle_http_connection(
         }
     };
     let is_register = path == "/register";
-    let entry = match registry.lookup_bound(token) {
+    let entry = match if is_register {
+        None
+    } else {
+        registry.lookup_bound(token)
+    } {
         Some(e) => e,
         None => {
             if is_register {

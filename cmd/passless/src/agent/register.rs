@@ -80,25 +80,7 @@ impl RegisterHandler {
 
         let grant_snapshot = self
             .policy_runtime
-            .resolve_registration_grant(
-                &ctx.profile_id,
-                ctx.registration_grants.get(&normalized_rp).ok_or_else(|| {
-                    let deny_event = PolicyDenyBuilder::new(
-                        ctx.profile_id.clone(),
-                        AuditAction::Register,
-                        &normalized_rp,
-                        PolicyDenyReason::GrantNotFound,
-                    )
-                    .build();
-                    let _ = self.audit_gate.record(deny_event);
-                    ProtocolError::new(
-                        ErrorCode::Forbidden,
-                        "registration grant not found for RP",
-                        RecommendedAction::FixRequest,
-                    )
-                })?,
-                &normalized_rp,
-            )
+            .active_registration_grant(&ctx.profile_id, &normalized_rp)
             .ok_or_else(|| {
                 let deny_event = PolicyDenyBuilder::new(
                     ctx.profile_id.clone(),
@@ -250,6 +232,16 @@ impl RegisterHandler {
                 RecommendedAction::Retry,
             )
         })?;
+
+        self.policy_runtime
+            .consume_registration_grant(&ctx.profile_id, &grant_snapshot.grant_id)
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "registration enrollment grant was already consumed",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
 
         let algorithm = req
             .pub_key_cred_params
@@ -719,7 +711,7 @@ mod tests {
             registration_grants.insert(
                 "example.com".to_string(),
                 policy_runtime
-                    .request_registration_grant(profile_id.clone(), "example.com".to_string())
+                    .request_registration_grant(profile_id.clone(), "example.com".to_string(), 300)
                     .unwrap(),
             );
 
@@ -854,7 +846,7 @@ mod tests {
         registration_grants.insert(
             "example.com".to_string(),
             policy_runtime
-                .request_registration_grant(profile_id.clone(), "example.com".to_string())
+                .request_registration_grant(profile_id.clone(), "example.com".to_string(), 300)
                 .unwrap(),
         );
 

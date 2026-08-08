@@ -134,3 +134,26 @@ passless agent --profile opencode instructions
 ```
 
 Review [security.md](security.md), [operations.md](operations.md), and [audit.md](audit.md) before deployment.
+
+## Ephemeral enrollment grants
+
+A same-user registration rule makes an exact RP eligible for enrollment; browser launch does not
+mint registration authority. Before a `navigator.credentials.create()` ceremony, the operator must
+create a short-lived exact-RP grant:
+
+```bash
+passless agent-admin delegation request-registration \
+  --profile <profile> \
+  --rp <rp-id> \
+  --session-ttl 300 \
+  --reason "enroll passkey"
+```
+
+The requested TTL is clamped to the profile session limit and to at most five minutes. The grant is
+one-shot: the registration service consumes it after policy/audit checks and before key generation
+or credential storage. A failed ceremony after consumption requires a fresh grant. Wildcard
+registration remains forbidden.
+
+This separates repeatable authentication authority from exceptional mutation of the human
+credential namespace. Keep the static registration rule denied when enrollment is not needed.
+
