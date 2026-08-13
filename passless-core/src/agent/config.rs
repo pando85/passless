@@ -324,6 +324,8 @@ pub struct AgentRpRule {
     pub rp_id: String,
     pub register: AgentCeremonyPolicy,
     pub authenticate: AgentCeremonyPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_selection: Option<CredentialSelection>,
 }
 
 fn default_gpg_backend() -> String {
@@ -656,6 +658,7 @@ impl AgentProfileConfig {
         self.rp_ids
             .iter()
             .map(|rp_id| AgentRpRule {
+                credential_selection: None,
                 rp_id: rp_id.clone(),
                 register: if self.registration_allowed {
                     AgentCeremonyPolicy::legacy_confirm(self.require_uv)
@@ -690,6 +693,12 @@ impl AgentProfileConfig {
         rules
             .into_iter()
             .find(|rule| normalize_rp_id(&rule.rp_id) == ANY_RP_ID)
+    }
+
+    pub fn credential_selection_for_rp(&self, rp_id: &str) -> CredentialSelection {
+        self.rule_for_rp(rp_id)
+            .and_then(|rule| rule.credential_selection)
+            .unwrap_or_else(|| self.credential_selection.clone())
     }
 
     pub fn allows_registration(&self) -> bool {
@@ -760,6 +769,17 @@ impl AgentProfileConfig {
                 .validate(profile_id, &rule.rp_id, "registration")?;
             rule.authenticate
                 .validate(profile_id, &rule.rp_id, "authentication")?;
+            if let Some(CredentialSelection::Credential(reference)) = &rule.credential_selection
+                && self
+                    .credential_refs
+                    .as_ref()
+                    .is_some_and(|refs| !refs.contains(reference))
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': credential_selection reference for RP '{}' must be included in credential_refs",
+                    profile_id, rule.rp_id,
+                )));
+            }
         }
 
         if let Some(wildcard_rule) = effective_rules
@@ -787,6 +807,15 @@ impl AgentProfileConfig {
             if wildcard_rule.register.authorization != AgentAuthorization::Deny {
                 return Err(Error::Config(format!(
                     "agent profile '{}': wildcard RP scope '*' must deny registration",
+                    profile_id
+                )));
+            }
+            if matches!(
+                &wildcard_rule.credential_selection,
+                Some(CredentialSelection::Credential(_))
+            ) {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': wildcard RP scope '*' cannot select one RP-specific credential reference",
                     profile_id
                 )));
             }
@@ -1546,6 +1575,7 @@ register = "deny"
         profile.registration_allowed = false;
         profile.require_uv = false;
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: policy(
                 AgentAuthorization::Allow,
@@ -1569,6 +1599,7 @@ register = "deny"
     fn test_explicit_policy_rejects_legacy_fields() {
         let mut profile = make_isolated_profile();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: AgentCeremonyPolicy::deny(),
@@ -1618,6 +1649,7 @@ register = "deny"
         profile.registration_allowed = false;
         profile.require_uv = false;
         let rule = AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: policy(
@@ -3238,5 +3270,159 @@ acknowledge_global_same_user = ["missing"]
         let cfg: AgentConfig = toml::from_str(raw).unwrap();
         let err = cfg.validate(None).unwrap_err().to_string();
         assert!(err.contains("unknown profile 'missing'"));
+    }
+
+    #[test]
+    fn credential_selection_for_rp_uses_exact_rule_override() {
+        let mut profile = make_isolated_profile();
+        profile.credential_selection = CredentialSelection::Single;
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.rules = vec![AgentRpRule {
+            rp_id: "github.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::autonomous(),
+            credential_selection: Some(CredentialSelection::Newest),
+        }];
+        assert_eq!(
+            profile.credential_selection_for_rp("github.com"),
+            CredentialSelection::Newest
+        );
+    }
+
+    #[test]
+    fn credential_selection_for_rp_uses_wildcard_fallback() {
+        let mut profile = make_isolated_profile();
+        profile.credential_selection = CredentialSelection::Single;
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.mode = AgentMode::SameUser;
+        profile.rules = vec![AgentRpRule {
+            rp_id: "*".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::autonomous(),
+            credential_selection: Some(CredentialSelection::FirstMatching),
+        }];
+        assert_eq!(
+            profile.credential_selection_for_rp("any-rp.com"),
+            CredentialSelection::FirstMatching
+        );
+    }
+
+    #[test]
+    fn credential_selection_for_rp_exact_beats_wildcard() {
+        let mut profile = make_isolated_profile();
+        profile.credential_selection = CredentialSelection::Single;
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.mode = AgentMode::SameUser;
+        profile.rules = vec![
+            AgentRpRule {
+                rp_id: "*".to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy::autonomous(),
+                credential_selection: Some(CredentialSelection::FirstMatching),
+            },
+            AgentRpRule {
+                rp_id: "github.com".to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy::autonomous(),
+                credential_selection: Some(CredentialSelection::Newest),
+            },
+        ];
+        assert_eq!(
+            profile.credential_selection_for_rp("github.com"),
+            CredentialSelection::Newest
+        );
+        assert_eq!(
+            profile.credential_selection_for_rp("other.com"),
+            CredentialSelection::FirstMatching
+        );
+    }
+
+    #[test]
+    fn credential_selection_for_rp_falls_back_to_profile_default() {
+        let mut profile = make_isolated_profile();
+        profile.credential_selection = CredentialSelection::Newest;
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.rules = vec![AgentRpRule {
+            rp_id: "github.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::autonomous(),
+            credential_selection: None,
+        }];
+        assert_eq!(
+            profile.credential_selection_for_rp("github.com"),
+            CredentialSelection::Newest
+        );
+    }
+
+    #[test]
+    fn rule_credential_ref_must_be_in_credential_refs() {
+        let cred_ref = CredentialRef::with_default_domain(b"test-cred");
+        let mut profile = make_isolated_profile();
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.credential_refs = Some(vec![cred_ref.clone()]);
+        profile.rules = vec![AgentRpRule {
+            rp_id: "github.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::autonomous(),
+            credential_selection: Some(CredentialSelection::Credential(cred_ref)),
+        }];
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn rule_credential_ref_rejected_when_not_in_credential_refs() {
+        let cred_ref = CredentialRef::with_default_domain(b"test-cred");
+        let other_ref = CredentialRef::with_default_domain(b"other-cred");
+        let mut profile = make_isolated_profile();
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.credential_refs = Some(vec![cred_ref]);
+        profile.rules = vec![AgentRpRule {
+            rp_id: "github.com".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::autonomous(),
+            credential_selection: Some(CredentialSelection::Credential(other_ref)),
+        }];
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be included in credential_refs")
+        );
+    }
+
+    #[test]
+    fn wildcard_rule_cannot_use_credential_ref() {
+        let cred_ref = CredentialRef::with_default_domain(b"test-cred");
+        let mut profile = make_isolated_profile();
+        profile.rp_ids.clear();
+        profile.registration_allowed = false;
+        profile.require_uv = false;
+        profile.mode = AgentMode::SameUser;
+        profile.rules = vec![AgentRpRule {
+            rp_id: "*".to_string(),
+            register: AgentCeremonyPolicy::deny(),
+            authenticate: AgentCeremonyPolicy::autonomous(),
+            credential_selection: Some(CredentialSelection::Credential(cred_ref)),
+        }];
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot select one RP-specific credential reference")
+        );
     }
 }

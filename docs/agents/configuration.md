@@ -98,6 +98,44 @@ A same-user agent is trusted to act as the human RP identity within policy. Pass
 
 Omitting `credential_refs` permits daemon-side discovery of credentials matching the concrete RP. Set explicit references when practical. `single` is the safest selection default because it fails closed when several eligible discoverable credentials remain.
 
+### Per-RP credential selection
+
+Each RP rule can override the profile-level `credential_selection` policy. This is useful when different relying parties require different selection strategies.
+
+```toml
+[agents.profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+credential_selection = "single"
+
+[[agents.profiles.coding.rules]]
+rp_id = "github.com"
+authenticate = "autonomous"
+register = "deny"
+credential_selection = "newest"
+
+[[agents.profiles.coding.rules]]
+rp_id = "gitlab.example.com"
+authenticate = "autonomous"
+register = "deny"
+credential_selection = "first-matching"
+```
+
+Selection precedence is:
+
+1. Exact RP rule override
+2. Wildcard fallback rule override
+3. Profile-level default
+
+The RP's `allowCredentials` list still narrows candidates before Passless applies the configured ambiguity policy.
+
+**Security constraints:**
+
+- Explicit `credential:<ref>` rule overrides must reference credentials included in the profile's `credential_refs` allowlist when configured
+- The global `"*"` wildcard rule cannot pin a single `credential:<ref>` because credential references are RP-specific
+- Missing per-rule selectors preserve the profile-level behavior
+- Exact RP rules override wildcard fallback rules
+
 ### Global RP scope
 
 The special exact value `"*"` is accepted only for same-user authentication and is deliberately high risk:
