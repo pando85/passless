@@ -321,9 +321,12 @@ impl AgentCeremonyPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRpRule {
+            credential_selection: None,
     pub rp_id: String,
     pub register: AgentCeremonyPolicy,
     pub authenticate: AgentCeremonyPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_selection: Option<CredentialSelection>,
 }
 
 fn default_gpg_backend() -> String {
@@ -656,6 +659,7 @@ impl AgentProfileConfig {
         self.rp_ids
             .iter()
             .map(|rp_id| AgentRpRule {
+                credential_selection: None,
                 rp_id: rp_id.clone(),
                 register: if self.registration_allowed {
                     AgentCeremonyPolicy::legacy_confirm(self.require_uv)
@@ -690,6 +694,12 @@ impl AgentProfileConfig {
         rules
             .into_iter()
             .find(|rule| normalize_rp_id(&rule.rp_id) == ANY_RP_ID)
+    }
+
+    pub fn credential_selection_for_rp(&self, rp_id: &str) -> CredentialSelection {
+        self.rule_for_rp(rp_id)
+            .and_then(|rule| rule.credential_selection)
+            .unwrap_or_else(|| self.credential_selection.clone())
     }
 
     pub fn allows_registration(&self) -> bool {
@@ -760,6 +770,17 @@ impl AgentProfileConfig {
                 .validate(profile_id, &rule.rp_id, "registration")?;
             rule.authenticate
                 .validate(profile_id, &rule.rp_id, "authentication")?;
+            if let Some(CredentialSelection::Credential(reference)) = &rule.credential_selection
+                && self
+                    .credential_refs
+                    .as_ref()
+                    .is_some_and(|refs| !refs.contains(reference))
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': credential_selection reference for RP '{}' must be included in credential_refs",
+                    profile_id, rule.rp_id,
+                )));
+            }
         }
 
         if let Some(wildcard_rule) = effective_rules
@@ -787,6 +808,15 @@ impl AgentProfileConfig {
             if wildcard_rule.register.authorization != AgentAuthorization::Deny {
                 return Err(Error::Config(format!(
                     "agent profile '{}': wildcard RP scope '*' must deny registration",
+                    profile_id
+                )));
+            }
+            if matches!(
+                &wildcard_rule.credential_selection,
+                Some(CredentialSelection::Credential(_))
+            ) {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': wildcard RP scope '*' cannot select one RP-specific credential reference",
                     profile_id
                 )));
             }
@@ -1546,6 +1576,7 @@ register = "deny"
         profile.registration_allowed = false;
         profile.require_uv = false;
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: policy(
                 AgentAuthorization::Allow,
@@ -1569,6 +1600,7 @@ register = "deny"
     fn test_explicit_policy_rejects_legacy_fields() {
         let mut profile = make_isolated_profile();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: AgentCeremonyPolicy::deny(),
@@ -1618,6 +1650,7 @@ register = "deny"
         profile.registration_allowed = false;
         profile.require_uv = false;
         let rule = AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: policy(

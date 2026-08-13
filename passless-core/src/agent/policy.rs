@@ -1019,6 +1019,7 @@ mod tests {
     fn test_rule_decision_changes_policy_digest() {
         let mut confirm = test_policy();
         confirm.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: AgentCeremonyPolicy {

@@ -2455,6 +2455,7 @@ mod tests {
         let mut config = make_isolated_config("rules", vec![], false);
         let profile = config.profiles.get_mut("rules").unwrap();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: AgentCeremonyPolicy {
@@ -2492,11 +2493,13 @@ mod tests {
         profile.storage = None;
         profile.rules = vec![
             AgentRpRule {
+                credential_selection: None,
                 rp_id: ANY_RP_ID.to_string(),
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy::autonomous(),
             },
             AgentRpRule {
+                credential_selection: None,
                 rp_id: "bank.example.com".to_string(),
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy::supervised(),
@@ -4204,6 +4207,7 @@ mod tests {
         let mut config = make_isolated_config("reg-test", vec!["example.com"], true);
         let profile = config.profiles.get_mut("reg-test").unwrap();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy {
                 authorization: AgentAuthorization::Allow,
@@ -4226,6 +4230,7 @@ mod tests {
         let mut config = make_isolated_config("reg-deny", vec!["example.com"], true);
         let profile = config.profiles.get_mut("reg-deny").unwrap();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy::deny(),
             authenticate: AgentCeremonyPolicy {
@@ -4272,6 +4277,7 @@ mod tests {
         let mut config = make_isolated_config("reg-norp", vec!["example.com"], true);
         let profile = config.profiles.get_mut("reg-norp").unwrap();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy {
                 authorization: AgentAuthorization::Allow,
@@ -4294,6 +4300,7 @@ mod tests {
         let mut config = make_isolated_config("reg-norm", vec!["example.com"], true);
         let profile = config.profiles.get_mut("reg-norm").unwrap();
         profile.rules = vec![AgentRpRule {
+            credential_selection: None,
             rp_id: "example.com".to_string(),
             register: AgentCeremonyPolicy {
                 authorization: AgentAuthorization::Allow,

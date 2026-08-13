@@ -634,6 +634,7 @@ mod tests {
             storage: None,
             registration_allowed: true,
             rules: vec![AgentRpRule {
+            credential_selection: None,
                 rp_id: "example.com".to_string(),
                 register: AgentCeremonyPolicy {
                     authorization: AgentAuthorization::Allow,
@@ -788,6 +789,7 @@ mod tests {
             storage: None,
             registration_allowed: true,
             rules: vec![AgentRpRule {
+            credential_selection: None,
                 rp_id: "example.com".to_string(),
                 register: AgentCeremonyPolicy::deny(),
                 authenticate: AgentCeremonyPolicy {
