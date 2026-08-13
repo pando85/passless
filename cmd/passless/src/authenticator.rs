@@ -622,12 +622,6 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
 #[derive(Debug, Clone, Copy)]
 struct BuiltInUvPolicy;
 
-impl BuiltInUvPolicy {
-    fn runtime_state(self) -> BuiltInUvState {
-        BuiltInUvState::Configured
-    }
-}
-
 /// Main authenticator service
 ///
 /// This service orchestrates the FIDO2 authenticator:
@@ -652,6 +646,8 @@ pub struct AuthenticatorService<
     credential_backup_supported: bool,
     /// Prepared bundles awaiting durable client-side persistence confirmation.
     pending_backups: HashMap<Vec<u8>, [u8; 32]>,
+    /// PIN storage for checking whether a PIN is configured
+    pin_storage: Option<Arc<Mutex<P>>>,
 }
 
 impl<S: CredentialStorage + 'static> AuthenticatorService<S, (), SoftwareCredentialKeyProvider> {
@@ -914,6 +910,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
             pending_backups: HashMap::new(),
+            pin_storage,
         };
         service.refresh_built_in_uv_state()?;
         Ok(service)
@@ -950,6 +947,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
             pending_backups: HashMap::new(),
+            pin_storage,
         })
     }
 }
@@ -1196,6 +1194,7 @@ impl<
             credential_backup_enabled: false,
             credential_backup_supported: false,
             pending_backups: HashMap::new(),
+            pin_storage,
         };
         service.refresh_built_in_uv_state()?;
         Ok(service)
@@ -1227,16 +1226,30 @@ impl<
             credential_backup_enabled: false,
             credential_backup_supported: false,
             pending_backups: HashMap::new(),
+            pin_storage,
         })
     }
 
     fn refresh_built_in_uv_state(&mut self) -> Result<()> {
-        let Some(policy) = self.built_in_uv_policy else {
+        let Some(_policy) = self.built_in_uv_policy else {
             return Ok(());
         };
 
-        self.authenticator
-            .set_built_in_uv_state(policy.runtime_state())
+        let pin_configured = self
+            .pin_storage
+            .as_ref()
+            .and_then(|ps| ps.lock().ok())
+            .and_then(|ps| ps.load_pin_state().ok())
+            .map(|state| state.pin_hash.is_some())
+            .unwrap_or(false);
+
+        let state = if pin_configured {
+            BuiltInUvState::SupportedNotConfigured
+        } else {
+            BuiltInUvState::Configured
+        };
+
+        self.authenticator.set_built_in_uv_state(state)
     }
 
     fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
@@ -1719,11 +1732,6 @@ mod tests {
             None => None,
             other => panic!("expected boolean uv option, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_built_in_uv_policy_always_configured() {
-        assert_eq!(BuiltInUvPolicy.runtime_state(), BuiltInUvState::Configured);
     }
 
     #[test]
