@@ -2670,6 +2670,8 @@ mod tests {
                     enabled: true,
                     profiles,
                     audit_path: Some(audit_path),
+                    acknowledge_global_same_user: vec![],
+                    acknowledge_same_user_registration: vec![],
                 };
 
                 let clock = Arc::new(MockClock::new());
@@ -3259,6 +3261,8 @@ mod tests {
                     enabled: true,
                     profiles,
                     audit_path: Some(audit_path.clone()),
+                    acknowledge_global_same_user: vec![],
+                    acknowledge_same_user_registration: vec![],
                 };
 
                 let clock = Arc::new(MockClock::new());

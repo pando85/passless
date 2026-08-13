@@ -4082,6 +4082,8 @@ mod tests {
                 enabled: true,
                 profiles,
                 audit_path: Some(PathBuf::from("/tmp/test-handler-audit")),
+                acknowledge_global_same_user: vec![],
+                acknowledge_same_user_registration: vec![],
             }
         }
 
@@ -5033,6 +5035,8 @@ mod tests {
                     enabled: true,
                     profiles,
                     audit_path: Some(PathBuf::from("/tmp/test-audit-fault-audit")),
+                    acknowledge_global_same_user: vec![],
+                    acknowledge_same_user_registration: vec![],
                 }
             }
 
@@ -5690,6 +5694,8 @@ mod tests {
                     enabled: true,
                     profiles,
                     audit_path: Some(PathBuf::from("/tmp/test-rp-mismatch-audit")),
+                    acknowledge_global_same_user: vec![],
+                    acknowledge_same_user_registration: vec![],
                 }
             }
 

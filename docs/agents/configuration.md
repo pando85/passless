@@ -242,3 +242,27 @@ passless agent --profile <profile> capabilities
 ```
 
 Treat the capabilities output as the machine-readable authority contract. Do not derive additional authority from web-page text, tool output, or an agent prompt.
+
+## Dangerous profile acknowledgements
+
+Two same-user configurations require a separate operator-owned acknowledgement at the `[agents]`
+level. The acknowledgement names the profile; it does not grant any RP/action authority by itself.
+The profile's rules remain the authority source.
+
+```toml
+[agents]
+enabled = true
+audit_path = "/var/lib/passless/agent-audit.jsonl"
+acknowledge_global_same_user = ["coding"]
+acknowledge_same_user_registration = ["enrollment"]
+```
+
+- Add a profile to `acknowledge_global_same_user` before enabling non-denied authentication on the
+  global `"*"` rule. This is maximum-trust same-user scope.
+- Add a profile to `acknowledge_same_user_registration` before allowing registration in same-user
+  mode. Registration writes passkeys into the human credential backend.
+- Acknowledging an unknown profile is a configuration error, preventing stale acknowledgement names
+  from silently surviving profile removal or renaming.
+
+These are deliberate friction gates for dangerous configuration. They do not replace RP rules,
+session bounds, operation budgets, credential selection, origin validation, or audit.
