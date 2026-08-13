@@ -80,25 +80,7 @@ impl RegisterHandler {
 
         let grant_snapshot = self
             .policy_runtime
-            .resolve_registration_grant(
-                &ctx.profile_id,
-                ctx.registration_grants.get(&normalized_rp).ok_or_else(|| {
-                    let deny_event = PolicyDenyBuilder::new(
-                        ctx.profile_id.clone(),
-                        AuditAction::Register,
-                        &normalized_rp,
-                        PolicyDenyReason::GrantNotFound,
-                    )
-                    .build();
-                    let _ = self.audit_gate.record(deny_event);
-                    ProtocolError::new(
-                        ErrorCode::Forbidden,
-                        "registration grant not found for RP",
-                        RecommendedAction::FixRequest,
-                    )
-                })?,
-                &normalized_rp,
-            )
+            .active_registration_grant(&ctx.profile_id, &normalized_rp)
             .ok_or_else(|| {
                 let deny_event = PolicyDenyBuilder::new(
                     ctx.profile_id.clone(),
@@ -250,6 +232,16 @@ impl RegisterHandler {
                 RecommendedAction::Retry,
             )
         })?;
+
+        self.policy_runtime
+            .consume_registration_grant(&ctx.profile_id, &grant_snapshot.grant_id)
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "registration enrollment grant was already consumed",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
 
         let algorithm = req
             .pub_key_cred_params
@@ -721,7 +713,7 @@ mod tests {
             registration_grants.insert(
                 "example.com".to_string(),
                 policy_runtime
-                    .request_registration_grant(profile_id.clone(), "example.com".to_string())
+                    .request_registration_grant(profile_id.clone(), "example.com".to_string(), 300)
                     .unwrap(),
             );
 
@@ -858,7 +850,7 @@ mod tests {
         registration_grants.insert(
             "example.com".to_string(),
             policy_runtime
-                .request_registration_grant(profile_id.clone(), "example.com".to_string())
+                .request_registration_grant(profile_id.clone(), "example.com".to_string(), 300)
                 .unwrap(),
         );
 
@@ -1086,13 +1078,14 @@ mod tests {
     fn test_register_rejects_invalid_grant_id() {
         let f = RegisterTestFixture::new();
         let handler = f.make_handler();
-        let mut registration_grants = HashMap::new();
-        registration_grants.insert("example.com".to_string(), RegistrationGrantId::new());
-        let ctx = RegisterContext {
-            profile_id: f.profile_id.clone(),
-            registration_grants,
-            profile_config: f.profile_config.clone(),
-        };
+        let grant = f
+            .policy_runtime
+            .active_registration_grant(&f.profile_id, "example.com")
+            .unwrap();
+        f.policy_runtime
+            .consume_registration_grant(&f.profile_id, &grant.grant_id)
+            .unwrap();
+        let ctx = f.make_ctx();
         let req = f.make_req();
 
         let result = handler.register(&ctx, &req);
@@ -1259,6 +1252,11 @@ mod tests {
     #[test]
     fn test_register_concurrent_requests_serialized() {
         let f = Arc::new(RegisterTestFixture::new());
+        for _ in 0..3 {
+            f.policy_runtime
+                .request_registration_grant(f.profile_id.clone(), "example.com".to_string(), 300)
+                .unwrap();
+        }
         let handler = Arc::new(f.make_handler());
         let mut handles = Vec::new();
 
