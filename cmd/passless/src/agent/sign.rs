@@ -515,6 +515,18 @@ impl SignContextRegistry {
         self.len() == 0
     }
 
+    pub fn budget_snapshot_for_lease(&self, lease_id: &str) -> Option<(usize, usize)> {
+        let budget = {
+            let map = self.entries.lock().ok()?;
+            let entry = map
+                .values()
+                .find(|entry| entry.lease_id.as_deref() == Some(lease_id))?;
+            entry.request_budget.clone()
+        };
+        let used = budget.used_requests.lock().ok()?.len();
+        Some((used, budget.max_requests))
+    }
+
     #[cfg(test)]
     pub fn all_entries(&self) -> Vec<LeaseEntry> {
         let map = match self.entries.lock() {

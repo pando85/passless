@@ -296,7 +296,7 @@ fn extract_admin_response(frame: ResponseFrame) -> Result<AdminResponse, ClientE
 
 fn extract_principal_response(frame: ResponseFrame) -> Result<PrincipalResponse, ClientError> {
     match frame {
-        ResponseFrame::Principal(PrincipalResponseFrame::Ok { action, .. }) => Ok(action),
+        ResponseFrame::Principal(PrincipalResponseFrame::Ok { action, .. }) => Ok(*action),
         ResponseFrame::Principal(PrincipalResponseFrame::Error { error, .. }) => {
             Err(ClientError::Protocol(error))
         }

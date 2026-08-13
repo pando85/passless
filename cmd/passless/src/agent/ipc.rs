@@ -1379,7 +1379,7 @@ mod tests {
         assert_eq!(response.role(), Role::Principal);
         match response {
             ResponseFrame::Principal(PrincipalResponseFrame::Ok { action, .. }) => {
-                assert_eq!(action, PrincipalResponse::Pong);
+                assert_eq!(*action, PrincipalResponse::Pong);
             }
             _ => panic!("expected Principal Ok"),
         }

@@ -16,7 +16,7 @@ const MAX_ARGV_COUNT: usize = 64;
 const MAX_CDP_REQUEST_LEN: usize = 8 * 1024;
 const MAX_CDP_TIMEOUT_MS: u32 = 30_000;
 
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 const MAX_RP_ID_LEN: usize = 253;
 const MAX_PROFILE_ID_LEN: usize = 128;
@@ -439,6 +439,7 @@ pub enum PrincipalRequest {
     Ping,
     Status,
     Capabilities,
+    Authority,
     Instructions,
     Doctor,
     CreateIntent {
@@ -505,6 +506,7 @@ pub enum PrincipalResponse {
     Pong,
     Status(DaemonStatus),
     Capabilities(PrincipalCapabilities),
+    Authority(EffectiveAuthority),
     Instructions(PrincipalInstructions),
     Doctor(DoctorResponse),
     IntentCreated {
@@ -600,6 +602,85 @@ pub struct PrincipalCapabilities {
     pub mode: String,
     pub allowed_rp_ids: Vec<String>,
     pub registration_allowed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveAuthority {
+    pub profile_id: String,
+    pub mode: String,
+    pub identity: AuthorityIdentity,
+    pub policy_generation: String,
+    pub rp_rules: Vec<AuthorityRpRule>,
+    pub credentials: AuthorityCredentialScope,
+    pub session: AuthoritySession,
+    pub browser: AuthorityBrowser,
+    pub risk_flags: Vec<AuthorityRisk>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityIdentity {
+    pub acts_as_human: bool,
+    pub credential_namespace: String,
+    pub rp_identity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityRpRule {
+    pub rp_id: String,
+    pub wildcard: bool,
+    pub authenticate: AuthorityCeremony,
+    pub register: AuthorityCeremony,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityCeremony {
+    pub authorization: String,
+    pub user_presence: String,
+    pub user_verification: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityCredentialScope {
+    pub dynamic_per_rp: bool,
+    pub configured_reference_count: u32,
+    pub selection: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySession {
+    pub max_session_ttl_secs: u64,
+    pub principal_remaining_ttl_secs: u64,
+    pub max_operations: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operations_used: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operations_remaining: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityBrowser {
+    pub active: bool,
+    pub cdp_exposure: String,
+    pub direct_cdp: bool,
+    pub full_session_authority: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityRisk {
+    HumanIdentity,
+    GlobalRpScope,
+    AutonomousAuthentication,
+    HumanBackendRegistration,
+    DirectCdpPort,
+    AmbiguousCredentialSelection,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -982,7 +1063,7 @@ pub enum PrincipalResponseFrame {
     Ok {
         v: ProtocolVersion,
         seq: u64,
-        action: PrincipalResponse,
+        action: Box<PrincipalResponse>,
     },
     Error {
         v: ProtocolVersion,
@@ -1097,7 +1178,7 @@ impl PrincipalResponseFrame {
         Self::Ok {
             v: CURRENT_VERSION,
             seq,
-            action,
+            action: Box::new(action),
         }
     }
 
@@ -1258,6 +1339,7 @@ impl Validate for PrincipalRequest {
             Self::Ping
             | Self::Status
             | Self::Capabilities
+            | Self::Authority
             | Self::Instructions
             | Self::Doctor
             | Self::BrowserStatus
@@ -1748,9 +1830,9 @@ mod tests {
     }
 
     #[test]
-    fn version_current_is_1_0() {
+    fn version_current_is_1_1() {
         assert_eq!(CURRENT_VERSION.major, 1);
-        assert_eq!(CURRENT_VERSION.minor, 0);
+        assert_eq!(CURRENT_VERSION.minor, 1);
     }
 
     #[test]
@@ -1770,7 +1852,7 @@ mod tests {
     fn version_negotiate_higher_minor_clamped() {
         let offer = ProtocolVersion::new(1, 5);
         let negotiated = ProtocolVersion::negotiate(offer).unwrap();
-        assert_eq!(negotiated, ProtocolVersion::new(1, 0));
+        assert_eq!(negotiated, ProtocolVersion::new(1, 1));
     }
 
     #[test]
@@ -1790,7 +1872,7 @@ mod tests {
 
     #[test]
     fn version_display() {
-        assert_eq!(CURRENT_VERSION.to_string(), "1.0");
+        assert_eq!(CURRENT_VERSION.to_string(), "1.1");
         assert_eq!(ProtocolVersion::new(2, 3).to_string(), "2.3");
     }
 
@@ -2028,6 +2110,16 @@ mod tests {
         let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
             3,
             PrincipalRequest::Capabilities,
+            test_capability_proof(),
+        ));
+        assert_eq!(json_roundtrip(&frame), frame);
+    }
+
+    #[test]
+    fn principal_authority_request_roundtrip() {
+        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
+            4,
+            PrincipalRequest::Authority,
             test_capability_proof(),
         ));
         assert_eq!(json_roundtrip(&frame), frame);
