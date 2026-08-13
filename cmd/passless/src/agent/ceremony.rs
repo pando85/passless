@@ -5046,7 +5046,7 @@ mod tests {
                 profile.rp_ids.clear();
                 profile.registration_allowed = false;
                 profile.rules = vec![AgentRpRule {
-            credential_selection: None,
+                    credential_selection: None,
                     rp_id: "example.com".to_string(),
                     register: AgentCeremonyPolicy {
                         authorization: AgentAuthorization::Allow,
