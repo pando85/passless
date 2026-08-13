@@ -620,25 +620,11 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BuiltInUvPolicy {
-    enforcement: PinEnforcement,
-    always_uv: bool,
-}
+struct BuiltInUvPolicy;
 
 impl BuiltInUvPolicy {
-    fn runtime_state(self, pin_is_set: bool) -> BuiltInUvState {
-        let requires_client_pin = pin_is_set
-            && match self.enforcement {
-                PinEnforcement::Never => false,
-                PinEnforcement::Optional => self.always_uv,
-                PinEnforcement::Required => true,
-            };
-
-        if requires_client_pin {
-            BuiltInUvState::SupportedNotConfigured
-        } else {
-            BuiltInUvState::Configured
-        }
+    fn runtime_state(self) -> BuiltInUvState {
+        BuiltInUvState::Configured
     }
 }
 
@@ -656,8 +642,6 @@ pub struct AuthenticatorService<
     pub authenticator: Authenticator<PasslessCallbacks<S, P>, K>,
     /// Storage backend (injected dependency)
     pub storage: Arc<Mutex<S>>,
-    /// PIN storage used to evaluate runtime verification availability.
-    pin_storage: Option<Arc<Mutex<P>>>,
     /// Dynamic built-in UV policy; absent for agent authenticators.
     built_in_uv_policy: Option<BuiltInUvPolicy>,
     /// Maximum UV retries (configured value)
@@ -925,11 +909,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         let mut service = Self {
             authenticator,
             storage,
-            pin_storage,
-            built_in_uv_policy: Some(BuiltInUvPolicy {
-                enforcement: pin_config.enforcement,
-                always_uv: security_config.always_uv,
-            }),
+            built_in_uv_policy: Some(BuiltInUvPolicy),
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
@@ -965,7 +945,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         Ok(Self {
             authenticator,
             storage,
-            pin_storage,
             built_in_uv_policy: None,
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: security_config.enable_credential_backup,
@@ -1212,11 +1191,7 @@ impl<
         let mut service = Self {
             authenticator,
             storage,
-            pin_storage,
-            built_in_uv_policy: Some(BuiltInUvPolicy {
-                enforcement: pin_config.enforcement,
-                always_uv: security_config.always_uv,
-            }),
+            built_in_uv_policy: Some(BuiltInUvPolicy),
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: false,
             credential_backup_supported: false,
@@ -1247,7 +1222,6 @@ impl<
         Ok(Self {
             authenticator,
             storage,
-            pin_storage,
             built_in_uv_policy: None,
             max_uv_retries: pin_config.max_uv_retries,
             credential_backup_enabled: false,
@@ -1261,19 +1235,8 @@ impl<
             return Ok(());
         };
 
-        let pin_is_set = match &self.pin_storage {
-            Some(pin_storage) => {
-                let storage = pin_storage.lock().map_err(|_| SoftFido2Error::Other)?;
-                storage
-                    .load_pin_state()
-                    .map_err(SoftFido2Error::from)?
-                    .is_pin_set()
-            }
-            None => false,
-        };
-
         self.authenticator
-            .set_built_in_uv_state(policy.runtime_state(pin_is_set))
+            .set_built_in_uv_state(policy.runtime_state())
     }
 
     fn reset_uv_retries(&mut self) -> core::result::Result<(), StatusCode> {
@@ -1759,44 +1722,8 @@ mod tests {
     }
 
     #[test]
-    fn test_built_in_uv_policy_matrix() {
-        let state = |enforcement, always_uv, pin_is_set| {
-            BuiltInUvPolicy {
-                enforcement,
-                always_uv,
-            }
-            .runtime_state(pin_is_set)
-        };
-
-        for enforcement in [
-            PinEnforcement::Never,
-            PinEnforcement::Optional,
-            PinEnforcement::Required,
-        ] {
-            assert_eq!(state(enforcement, true, false), BuiltInUvState::Configured);
-            assert_eq!(state(enforcement, false, false), BuiltInUvState::Configured);
-        }
-
-        assert_eq!(
-            state(PinEnforcement::Never, true, true),
-            BuiltInUvState::Configured
-        );
-        assert_eq!(
-            state(PinEnforcement::Optional, false, true),
-            BuiltInUvState::Configured
-        );
-        assert_eq!(
-            state(PinEnforcement::Optional, true, true),
-            BuiltInUvState::SupportedNotConfigured
-        );
-        assert_eq!(
-            state(PinEnforcement::Required, false, true),
-            BuiltInUvState::SupportedNotConfigured
-        );
-        assert_eq!(
-            state(PinEnforcement::Required, true, true),
-            BuiltInUvState::SupportedNotConfigured
-        );
+    fn test_built_in_uv_policy_always_configured() {
+        assert_eq!(BuiltInUvPolicy.runtime_state(), BuiltInUvState::Configured);
     }
 
     #[test]

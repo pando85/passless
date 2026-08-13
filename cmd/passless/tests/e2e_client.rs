@@ -816,9 +816,12 @@ fn get_uv_token_with_pin(
     let mut encapsulation =
         soft_fido2::PinUvAuthEncapsulation::new(transport, soft_fido2::PinProtocol::V2)?;
     // Permission: 0x01 = makeCredential, 0x02 = getAssertion
+    // RP ID is required for makeCredential/getAssertion permissions per CTAP 2.1
     let token = encapsulation.get_pin_uv_auth_token_using_pin_with_permissions(
-        transport, pin, 0x03, // makeCredential | getAssertion
-        None,
+        transport,
+        pin,
+        0x03, // makeCredential | getAssertion
+        Some("example.com"),
     )?;
     Ok(token)
 }
@@ -1023,8 +1026,9 @@ fn test_pin_enforcement_required_blocks_without_pin() {
     set_pin(&mut transport, "1234").expect("Failed to set PIN");
     println!("   ✓ PIN set");
 
-    // With enforcement=optional (default) and always_uv=false (default),
-    // notification fallback should be used
+    // With enforcement=optional (default) and always_uv=true (default),
+    // PIN should be required when PIN is set. However, in E2E test mode
+    // with PASSLESS_E2E_AUTO_ACCEPT_UV=1, notification fallback is used.
     // We test this by attempting a registration (which should work via notification fallback
     // in E2E test mode with PASSLESS_E2E_AUTO_ACCEPT_UV=1)
     println!("\n📝 Testing registration with PIN set (enforcement=optional)...");
