@@ -12,9 +12,11 @@ Restart=on-failure
 RestartSec=5s
 
 # Security hardening
-# The application already handles its own memory locking and core dump prevention
-# but we can add additional systemd protections
-NoNewPrivileges=true
+# Do not impose NoNewPrivileges on the whole daemon process tree: trusted
+# same-user CDP port launches may need Chromium to establish its own sandbox
+# during exec. Principal and isolated browser children still apply
+# PR_SET_NO_NEW_PRIVS themselves before exec.
+NoNewPrivileges=false
 LimitMEMLOCK=2M
 
 # Logging

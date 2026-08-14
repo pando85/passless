@@ -371,6 +371,7 @@ pub enum LaunchError {
     RuntimeRootInvalid(String),
     HardeningFailed(String),
     CdpDiscoveryTimeout,
+    BrowserExitedBeforeCdp(String),
     InvalidArg(String),
     EndpointFileWriteFailed(String, String),
     ExtensionSetupFailed(String),
@@ -397,7 +398,10 @@ impl fmt::Display for LaunchError {
                 write!(f, "browser hardening failed: {}", msg)
             }
             LaunchError::CdpDiscoveryTimeout => {
-                write!(f, "timed out waiting for DevToolsActivePort file")
+                write!(f, "timed out waiting for browser CDP endpoint")
+            }
+            LaunchError::BrowserExitedBeforeCdp(status) => {
+                write!(f, "browser exited before CDP became ready: {}", status)
             }
             LaunchError::InvalidArg(msg) => {
                 write!(f, "invalid browser argument: {}", msg)
@@ -644,18 +648,28 @@ impl BrowserProcessManager {
         let is_port_mode = config.cdp_expose == CdpExposeMode::Port;
 
         let (cdp_pipes, mut child, cdp_endpoint_url) = if is_port_mode {
-            let child = spawn_browser_port_mode(config, &profile_dir)?;
+            let mut child = spawn_browser_port_mode(config, &profile_dir)?;
             let discovered = if config.cdp_port > 0 {
-                wait_for_cdp_port(config.cdp_port, Duration::from_secs(30))?
+                wait_for_cdp_port(&mut child, config.cdp_port, Duration::from_secs(30))
             } else {
-                discover_cdp_endpoint(&profile_dir, Duration::from_secs(30))?
+                discover_cdp_endpoint_with_child(&mut child, &profile_dir, Duration::from_secs(30))
             };
-            write_cdp_endpoint(
+            let discovered = match discovered {
+                Ok(discovered) => discovered,
+                Err(err) => {
+                    terminate_failed_browser_spawn(&mut child);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = write_cdp_endpoint(
                 &runtime_dir,
                 &discovered,
                 config.target_uid,
                 config.target_gid,
-            )?;
+            ) {
+                terminate_failed_browser_spawn(&mut child);
+                return Err(err);
+            }
             (None, child, Some(discovered))
         } else {
             let cdp =
@@ -1912,6 +1926,12 @@ fn spawn_browser_unhardened(
         .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
 }
 
+fn is_trusted_same_user_port_launch(config: &BrowserConfig) -> bool {
+    config.daemon_uid != 0
+        && config.target_uid == config.daemon_uid
+        && config.target_gid == config.daemon_gid
+}
+
 fn spawn_browser_port_mode(
     config: &BrowserConfig,
     profile_dir: &Path,
@@ -1921,16 +1941,55 @@ fn spawn_browser_port_mode(
         .validate()
         .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
 
+    let trusted_same_user = is_trusted_same_user_port_launch(config);
     let mut cmd = build_browser_command(config, profile_dir)?;
+    // Port mode is explicitly the trusted-browser exposure mode. Preserve
+    // Chromium's startup diagnostics in the daemon journal so sandbox/display
+    // failures are actionable instead of looking like a CDP timeout.
+    cmd.stderr(Stdio::inherit());
 
     unsafe {
-        cmd.pre_exec(move || setup.apply(&[0, 1, 2]));
+        cmd.pre_exec(move || {
+            if trusted_same_user {
+                // Do not set PR_SET_NO_NEW_PRIVS before exec in trusted
+                // same-user mode. Chromium may need its setuid sandbox helper
+                // during startup. Keep a dedicated session/process group so
+                // lifecycle cleanup can still terminate the complete browser.
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            } else {
+                setup.apply(&[0, 1, 2])
+            }
+        });
     }
 
     cmd.spawn()
         .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
 }
 
+fn ensure_browser_running(child: &mut Child) -> Result<(), LaunchError> {
+    match child.try_wait() {
+        Ok(Some(status)) => Err(LaunchError::BrowserExitedBeforeCdp(status.to_string())),
+        Ok(None) => Ok(()),
+        Err(e) => Err(LaunchError::SpawnFailed(format!(
+            "failed to query browser process during CDP discovery: {}",
+            e
+        ))),
+    }
+}
+
+fn terminate_failed_browser_spawn(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    signal_process_group(child.id(), libc::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
 pub(crate) fn discover_cdp_endpoint(
     profile_dir: &Path,
     timeout: Duration,
@@ -1953,13 +2012,42 @@ pub(crate) fn discover_cdp_endpoint(
     }
 }
 
-fn wait_for_cdp_port(port: u16, timeout: Duration) -> Result<String, LaunchError> {
+fn discover_cdp_endpoint_with_child(
+    child: &mut Child,
+    profile_dir: &Path,
+    timeout: Duration,
+) -> Result<String, LaunchError> {
+    let port_file = profile_dir.join("DevToolsActivePort");
+    let deadline = Instant::now() + timeout;
+    loop {
+        ensure_browser_running(child)?;
+        if let Ok(content) = fs::read_to_string(&port_file) {
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() >= 2 {
+                let port = lines[0].trim();
+                let ws_path = lines[1].trim();
+                return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(LaunchError::CdpDiscoveryTimeout);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_cdp_port(
+    child: &mut Child,
+    port: u16,
+    timeout: Duration,
+) -> Result<String, LaunchError> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
     let deadline = Instant::now() + timeout;
     let addr = format!("127.0.0.1:{}", port);
     loop {
+        ensure_browser_running(child)?;
         if let Ok(mut stream) =
             TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
         {
@@ -3466,6 +3554,10 @@ mod tests {
 
         let e = LaunchError::RuntimeRootInvalid("bad root".to_string());
         assert!(e.to_string().contains("bad root"));
+
+        let e = LaunchError::BrowserExitedBeforeCdp("exit status: 1".to_string());
+        assert!(e.to_string().contains("exited before CDP"));
+        assert!(e.to_string().contains("exit status: 1"));
     }
 
     #[test]
@@ -4156,6 +4248,26 @@ mod tests {
         assert_eq!(setup.target_gid, config.target_gid);
         assert_eq!(setup.daemon_uid, config.daemon_uid);
         assert_eq!(setup.daemon_gid, config.daemon_gid);
+    }
+
+    #[test]
+    fn test_trusted_same_user_port_launch_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.cdp_expose = CdpExposeMode::Port;
+        config.daemon_uid = 1000;
+        config.daemon_gid = 1000;
+        config.target_uid = 1000;
+        config.target_gid = 1000;
+        assert!(is_trusted_same_user_port_launch(&config));
+
+        config.target_uid = 1001;
+        assert!(!is_trusted_same_user_port_launch(&config));
+
+        config.target_uid = 0;
+        config.target_gid = 1000;
+        config.daemon_uid = 0;
+        assert!(!is_trusted_same_user_port_launch(&config));
     }
 
     #[test]
@@ -5261,6 +5373,33 @@ mod tests {
 
         let result = discover_cdp_endpoint(&nonexistent, Duration::from_millis(100));
         assert!(matches!(result, Err(LaunchError::CdpDiscoveryTimeout)));
+    }
+
+    #[test]
+    fn test_discover_cdp_endpoint_detects_browser_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_dir = dir.path().join("profile");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let mut child = Command::new("/bin/false").spawn().unwrap();
+
+        let result =
+            discover_cdp_endpoint_with_child(&mut child, &profile_dir, Duration::from_secs(5));
+        assert!(matches!(
+            result,
+            Err(LaunchError::BrowserExitedBeforeCdp(_))
+        ));
+    }
+
+    #[test]
+    fn test_wait_for_cdp_port_detects_browser_exit() {
+        let mut child = Command::new("/bin/false").spawn().unwrap();
+        let started = Instant::now();
+        let result = wait_for_cdp_port(&mut child, 0, Duration::from_secs(5));
+        assert!(matches!(
+            result,
+            Err(LaunchError::BrowserExitedBeforeCdp(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
