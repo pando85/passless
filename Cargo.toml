@@ -12,15 +12,15 @@ resolver = "2"
 [workspace.package]
 authors = ["Pando85 <pando855@gmail.com>"]
 edition = "2024"
-version = "0.15.1"
+version = "0.16.0"
 license-file = "./LICENSE"
 homepage = "https://github.com/pando85/passless"
 repository = "https://github.com/pando85/passless"
 [workspace.dependencies]
 # Workspace crates
-passless-core = { path = "./passless-core", version = "0.15.1" }
-passless-config-doc = { path = "./passless-config-doc", version = "0.15.1" }
-passless-uhid = { path = "./passless-uhid", version = "0.15.1" }
+passless-core = { path = "./passless-core", version = "0.16.0" }
+passless-config-doc = { path = "./passless-config-doc", version = "0.16.0" }
+passless-uhid = { path = "./passless-uhid", version = "0.16.0" }
 
 soft-fido2 = "0.17.0"
 soft-fido2-ctap = "0.17.0"

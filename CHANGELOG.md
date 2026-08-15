@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.16.0](https://github.com/pando85/passless/tree/v0.16.0) - 2026-08-15
+
+### Added
+
+- agent: Expose effective authority (#409) ([0b00240](https://github.com/pando85/passless/commit/0b00240ea78078796f0acb5997081289a8a0191e))
+- agent: Make same-user enrollment ephemeral (#411) ([af94914](https://github.com/pando85/passless/commit/af9491440ab8f6a0806ec95013bf4c146b9e8b4d))
+- agent: Support per-RP credential selection (#415) ([f8f1ec2](https://github.com/pando85/passless/commit/f8f1ec299a2f56e1fc81863de37ea68f903c5957))
+- Implement unified same-user and isolated agent modes (#402) ([a6facff](https://github.com/pando85/passless/commit/a6facff70fdeb9b2d1c43cb83cc7eec59e6ca9e7))
+- Add same-user catch-all RP authentication (#407) ([7cf04e1](https://github.com/pando85/passless/commit/7cf04e1886c777e6e1aef85d54beb05497fb708d))
+
+### Fixed
+
+- agent: Harden security boundaries and usability (#408) ([ec3a750](https://github.com/pando85/passless/commit/ec3a7506f446806ce0f2e0268b5400c6b9417d25))
+- agent: Require dangerous profile acknowledgements (#410) ([86f3bb9](https://github.com/pando85/passless/commit/86f3bb91532abb42c086806d5c4162541f4ecc50))
+- agent: Restore same-user Chromium port launches (#418) ([001f17a](https://github.com/pando85/passless/commit/001f17a1d081ad42f8c1cd7815af8fd8a798869f))
+- Initialize agent runtime in the background (#406) ([3736c2c](https://github.com/pando85/passless/commit/3736c2c2bb83f26fb1a3e0d2a2feffddb35cd315))
+- Resolve PIN UV token E2E test failures (#416) ([cca6c38](https://github.com/pando85/passless/commit/cca6c38b89acef2ea14863bec946922400c45a0f))
+
+### Build
+
+- deps: Update Rust crate clap_complete to v4.6.9 (#403) ([c1508a5](https://github.com/pando85/passless/commit/c1508a5a20a208b487ff474adbc22b76237c6878))
+- deps: Update Rust crate clap to v4.6.6 (#404) ([584998e](https://github.com/pando85/passless/commit/584998e39f75192bfb7f6f119e9af3811e8bcd0a))
+- deps: Update actions/upload-artifact action to v7 (#405) ([92778a1](https://github.com/pando85/passless/commit/92778a19a79d79cd86333985ae1c911ef3c0ffc4))
+- deps: Update Rust crate thiserror to v2.0.20 (#413) ([9d08056](https://github.com/pando85/passless/commit/9d0805660c1bb262eb222086c794568d0b9293b9))
+- deps: Update Rust crate zbus to v5.19.0 (#414) ([9722c14](https://github.com/pando85/passless/commit/9722c14339c6266d079c34a9fd9ada63a02a7936))
+- deps: Update clechasseur/rs-clippy-check action to v6.0.7 (#419) ([4a96ec0](https://github.com/pando85/passless/commit/4a96ec03d3df98e1673823168de4d4a894eeb1cb))
+- deps: Update Rust crate psl to v2.1.224 (#420) ([7a75450](https://github.com/pando85/passless/commit/7a754501f46c1c820421fb36195f1d8473052f31))
+
 ## [v0.15.1](https://github.com/pando85/passless/tree/v0.15.1) - 2026-08-05
 
 ### Fixed
