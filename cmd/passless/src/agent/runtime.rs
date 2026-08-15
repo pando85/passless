@@ -4944,7 +4944,7 @@ impl AgentRuntime {
         };
 
         let register_handler = Arc::new(super::register::RegisterHandler {
-            human_storage: profile.backend.credential_storage.clone(),
+            credential_storage: profile.backend.credential_storage.clone(),
             policy_runtime: self.policy_runtime.clone(),
             audit_gate: self.audit_gate.clone(),
             key_provider: profile.backend.key_provider.clone(),
@@ -5061,7 +5061,7 @@ impl AgentRuntime {
                                 profile_config: profile_config.clone(),
                             };
                             let sign_handler = Arc::new(super::sign::SignHandler {
-                                human_storage: profile.backend.credential_storage.clone(),
+                                credential_storage: profile.backend.credential_storage.clone(),
                                 policy_runtime: self.policy_runtime.clone(),
                                 audit_gate: self.audit_gate.clone(),
                                 security_config: profile.endpoint_spec.security_config.clone(),

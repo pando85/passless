@@ -976,7 +976,7 @@ pub struct SignContext {
 
 #[derive(Clone)]
 pub struct SignHandler {
-    pub human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+    pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub policy_runtime: Arc<PolicyRuntime>,
     pub audit_gate: Arc<AuditGate>,
     pub security_config: SecurityConfig,
@@ -1179,7 +1179,7 @@ impl SignHandler {
             ));
         }
 
-        let mut storage = self.human_storage.lock().map_err(|_| {
+        let mut storage = self.credential_storage.lock().map_err(|_| {
             ProtocolError::new(
                 ErrorCode::Internal,
                 "storage lock poisoned",
@@ -2739,7 +2739,7 @@ mod tests {
 
             pub fn make_handler(&self) -> SignHandler {
                 SignHandler {
-                    human_storage: self.storage.clone(),
+                    credential_storage: self.storage.clone(),
                     policy_runtime: self.policy_runtime.clone(),
                     audit_gate: self.audit_gate.clone(),
                     security_config: self.security_config.clone(),
@@ -3345,7 +3345,7 @@ mod tests {
 
             fn make_handler(&self) -> SignHandler {
                 SignHandler {
-                    human_storage: self.storage.clone(),
+                    credential_storage: self.storage.clone(),
                     policy_runtime: self.policy_runtime.clone(),
                     audit_gate: self.audit_gate.clone(),
                     security_config: self.security_config.clone(),
