@@ -33,7 +33,7 @@ pub struct RegisterContext {
 }
 
 pub struct RegisterHandler {
-    pub human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+    pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub policy_runtime: Arc<PolicyRuntime>,
     pub audit_gate: Arc<AuditGate>,
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
@@ -186,7 +186,7 @@ impl RegisterHandler {
             )
         })?;
 
-        let mut storage = self.human_storage.lock().map_err(|_| {
+        let mut storage = self.credential_storage.lock().map_err(|_| {
             ProtocolError::new(
                 ErrorCode::Internal,
                 "storage lock poisoned",
@@ -738,7 +738,7 @@ mod tests {
 
         fn make_handler(&self) -> RegisterHandler {
             RegisterHandler {
-                human_storage: self.storage.clone(),
+                credential_storage: self.storage.clone(),
                 policy_runtime: self.policy_runtime.clone(),
                 audit_gate: self.audit_gate.clone(),
                 key_provider: self.key_provider.clone(),
