@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.17.0](https://github.com/pando85/passless/tree/v0.17.0) - 2026-08-16
+
+### Added
+
+- Improve Playwright MCP browser integration (#423) ([06eec5e](https://github.com/pando85/passless/commit/06eec5e4b834997b7f1a4c9b113d5379204c1545))
+
+### Testing
+
+- Make browser lease tests deterministic (#424) ([6cc76c0](https://github.com/pando85/passless/commit/6cc76c00f97358134dbe38e8dd52455446af61a8))
+
 ## [v0.16.0](https://github.com/pando85/passless/tree/v0.16.0) - 2026-08-15
 
 ### Added
