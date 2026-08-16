@@ -3194,4 +3194,34 @@ mod tests {
         let json = r#"{"origin":"https://example.com","rp_id":"example.com","challenge_b64u":"dGVzdA","allow_credentials":[],"user_verification":false,"cross_origin":false,"extra":"bad"}"#;
         assert!(serde_json::from_str::<SignAssertionRequest>(json).is_err());
     }
+
+    #[test]
+    fn browser_launched_response_serializes_without_cdp_endpoint_when_none() {
+        let resp = BrowserLaunchedResponse {
+            lease_id: "lease-123".into(),
+            profile_id: "test-profile".into(),
+            pid: 1234,
+            start_url: Some("https://example.com".into()),
+            cdp_endpoint: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("cdp_endpoint"));
+        let decoded: BrowserLaunchedResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn browser_launched_response_serializes_with_cdp_endpoint_when_some() {
+        let resp = BrowserLaunchedResponse {
+            lease_id: "lease-456".into(),
+            profile_id: "test-profile".into(),
+            pid: 5678,
+            start_url: None,
+            cdp_endpoint: Some("http://127.0.0.1:9222".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("cdp_endpoint"));
+        let decoded: BrowserLaunchedResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, resp);
+    }
 }
