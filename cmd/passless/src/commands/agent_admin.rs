@@ -780,6 +780,9 @@ fn dispatch_browser(output: OutputFormat, action: &AdminBrowserAction) -> Result
                         if let Some(ref url) = info.start_url {
                             println!("start_url: {}", url);
                         }
+                        if let Some(ref endpoint) = info.cdp_endpoint {
+                            println!("cdp_endpoint: {}", endpoint);
+                        }
                         Ok(())
                     }
                 },

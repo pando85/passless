@@ -499,6 +499,7 @@ pub struct BrowserLease {
     pub cdp_read_buf: Vec<u8>,
     pub child_reaped: bool,
     pub cdp_endpoint: Option<String>,
+    pub start_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -513,6 +514,7 @@ pub struct LeaseSnapshot {
     pub pid: u32,
     #[allow(dead_code)]
     pub ttl_remaining_secs: u64,
+    pub start_url: Option<String>,
 }
 
 pub struct BrowserProcessManager {
@@ -739,6 +741,7 @@ impl BrowserProcessManager {
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
             child_reaped: false,
             cdp_endpoint: cdp_endpoint_url,
+            start_url: config.start_url.clone(),
         };
 
         if let Some(mut consumed) = consumed_pipes {
@@ -1033,12 +1036,43 @@ impl BrowserProcessManager {
             state: lease.state,
             pid: lease.manifest.pid,
             ttl_remaining_secs: remaining,
+            start_url: lease.start_url.clone(),
         })
     }
 
     pub fn list_snapshots(&self) -> Vec<LeaseSnapshot> {
         let ids: Vec<BrowserLeaseId> = self.leases.keys().cloned().collect();
         ids.iter().filter_map(|id| self.snapshot(id)).collect()
+    }
+
+    pub fn find_live_lease_for_profile(&mut self, profile_id: &ProfileId) -> Option<LeaseSnapshot> {
+        let lease_ids: Vec<BrowserLeaseId> = self.leases.keys().cloned().collect();
+        for id in lease_ids {
+            let lease = self.leases.get_mut(&id)?;
+            if &lease.profile_id == profile_id
+                && matches!(
+                    lease.state,
+                    LeaseState::Active | LeaseState::AuthenticationPending
+                )
+            {
+                if let Some(ref mut child) = lease.child {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            lease.child_reaped = true;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            continue;
+                        }
+                    }
+                }
+                if let Some(snapshot) = self.snapshot(&id) {
+                    return Some(snapshot);
+                }
+            }
+        }
+        None
     }
 
     pub fn check_expired(&mut self) -> Vec<BrowserLeaseId> {
@@ -3430,6 +3464,147 @@ mod tests {
             .launch(&config, test_endpoint_id(), test_profile_id())
             .unwrap();
         assert_eq!(mgr.list_snapshots().len(), 2);
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_returns_active_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+        config.executable = std::path::PathBuf::from("/bin/sleep");
+        config.extra_args = vec!["60".to_string()];
+
+        let lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(snapshot.is_some());
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.id, lease_id);
+        assert_eq!(snapshot.profile_id, test_profile_id());
+        assert!(matches!(
+            snapshot.state,
+            LeaseState::Active | LeaseState::AuthenticationPending
+        ));
+
+        mgr.terminate(&lease_id).ok();
+        mgr.cleanup(&lease_id).ok();
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_returns_none_for_different_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+        config.executable = std::path::PathBuf::from("/bin/sleep");
+        config.extra_args = vec!["60".to_string()];
+
+        let _lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let other_profile = ProfileId::new("other-profile").unwrap();
+        let snapshot = mgr.find_live_lease_for_profile(&other_profile);
+        assert!(snapshot.is_none());
+
+        mgr.terminate(&_lease_id).ok();
+        mgr.cleanup(&_lease_id).ok();
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_skips_terminal_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+        mgr.revoke(&lease_id).unwrap();
+
+        let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_skips_exited_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+        config.executable = std::path::PathBuf::from("/bin/true");
+        config.start_url = None;
+        config.extra_args = vec![];
+
+        let _lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_reuses_sleeping_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+        config.executable = std::path::PathBuf::from("/bin/sleep");
+        config.start_url = None;
+        config.extra_args = vec!["60".to_string()];
+
+        let lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().id, lease_id);
+
+        mgr.terminate(&lease_id).ok();
+        mgr.cleanup(&lease_id).ok();
+    }
+
+    #[test]
+    fn test_idempotent_launch_reuses_existing_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let mut config = test_config(dir.path());
+        config.executable = std::path::PathBuf::from("/bin/sleep");
+        config.start_url = Some("https://example.com".to_string());
+        config.extra_args = vec!["60".to_string()];
+
+        let first_lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let first_snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(first_snapshot.is_some());
+        let first_snapshot = first_snapshot.unwrap();
+        assert_eq!(first_snapshot.id, first_lease_id);
+        assert_eq!(
+            first_snapshot.start_url,
+            Some("https://example.com".to_string())
+        );
+
+        let second_snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(second_snapshot.is_some());
+        let second_snapshot = second_snapshot.unwrap();
+        assert_eq!(second_snapshot.id, first_lease_id);
+        assert_eq!(second_snapshot.pid, first_snapshot.pid);
+
+        assert_eq!(mgr.lease_count(), 1);
+
+        mgr.terminate(&first_lease_id).ok();
+        mgr.cleanup(&first_lease_id).ok();
     }
 
     #[test]

@@ -4923,6 +4923,22 @@ impl AgentRuntime {
             )
         })?;
 
+        if let Some(existing_snapshot) = browser_manager.find_live_lease_for_profile(profile_id) {
+            let cdp_endpoint = browser_manager
+                .lease_cdp_endpoint(&existing_snapshot.id)
+                .flatten();
+
+            return Ok(AdminResponse::BrowserLaunched(
+                passless_core::agent::protocol::BrowserLaunchedResponse {
+                    lease_id: existing_snapshot.id.to_string(),
+                    profile_id: profile_id.to_string(),
+                    pid: existing_snapshot.pid,
+                    start_url: existing_snapshot.start_url,
+                    cdp_endpoint,
+                },
+            ));
+        }
+
         // Generate bearer token for this browser session
         let bearer_token = super::sign::generate_bearer_token().map_err(|e| {
             ProtocolError::new(
@@ -5102,12 +5118,15 @@ impl AgentRuntime {
             );
         }
 
+        let cdp_endpoint = browser_manager.lease_cdp_endpoint(&lease_id).flatten();
+
         Ok(AdminResponse::BrowserLaunched(
             passless_core::agent::protocol::BrowserLaunchedResponse {
                 lease_id: lease_id.to_string(),
                 profile_id: profile_id.to_string(),
                 pid,
                 start_url: config.start_url,
+                cdp_endpoint,
             },
         ))
     }
