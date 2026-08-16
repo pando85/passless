@@ -267,6 +267,37 @@ impl ChildSpawner for TestSpawner {
     }
 }
 
+#[cfg(test)]
+pub struct DirectExecSpawner;
+
+#[cfg(test)]
+impl ChildSpawner for DirectExecSpawner {
+    fn spawn_browser(
+        &self,
+        config: &BrowserConfig,
+        _profile_dir: &Path,
+        _cdp: &CdpPipes,
+    ) -> Result<Child, LaunchError> {
+        let mut cmd = Command::new(&config.executable);
+        for arg in &config.extra_args {
+            cmd.arg(arg);
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+    }
+}
+
 impl BrowserConfig {
     pub fn hardening(&self) -> HardenedChildSetup {
         HardenedChildSetup {
@@ -3470,7 +3501,8 @@ mod tests {
     fn test_find_live_lease_for_profile_returns_active_lease() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = std::path::PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
@@ -3497,7 +3529,8 @@ mod tests {
     fn test_find_live_lease_for_profile_returns_none_for_different_profile() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = std::path::PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
@@ -3554,7 +3587,8 @@ mod tests {
     fn test_find_live_lease_for_profile_reuses_sleeping_child() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = std::path::PathBuf::from("/bin/sleep");
         config.start_url = None;
@@ -3576,7 +3610,8 @@ mod tests {
     fn test_idempotent_launch_reuses_existing_lease() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = std::path::PathBuf::from("/bin/sleep");
         config.start_url = Some("https://example.com".to_string());
@@ -4026,7 +4061,8 @@ mod tests {
     fn test_long_lived_child_stays_alive() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
@@ -4052,7 +4088,8 @@ mod tests {
     fn test_child_in_separate_process_group() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
@@ -4109,7 +4146,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["5".to_string()];
@@ -4195,7 +4233,8 @@ mod tests {
     fn test_pid_mismatch_cleanup_quarantines() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
@@ -6435,7 +6474,8 @@ mod tests {
     fn test_extension_cleanup_removes_worker_token() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
 
         let metadata = AgentEndpointMetadata {
@@ -6469,7 +6509,8 @@ mod tests {
     fn test_extension_quarantine_contains_worker_token_on_cleanup_failure() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
-        let mut mgr = BrowserProcessManager::new(clock);
+        let spawner: Arc<dyn ChildSpawner> = Arc::new(DirectExecSpawner);
+        let mut mgr = BrowserProcessManager::with_spawner(clock, spawner);
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
