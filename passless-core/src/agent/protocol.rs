@@ -839,6 +839,8 @@ pub struct BrowserLaunchedResponse {
     pub profile_id: String,
     pub pid: u32,
     pub start_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

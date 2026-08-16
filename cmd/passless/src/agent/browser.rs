@@ -499,6 +499,7 @@ pub struct BrowserLease {
     pub cdp_read_buf: Vec<u8>,
     pub child_reaped: bool,
     pub cdp_endpoint: Option<String>,
+    pub start_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -513,6 +514,7 @@ pub struct LeaseSnapshot {
     pub pid: u32,
     #[allow(dead_code)]
     pub ttl_remaining_secs: u64,
+    pub start_url: Option<String>,
 }
 
 pub struct BrowserProcessManager {
@@ -739,6 +741,7 @@ impl BrowserProcessManager {
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
             child_reaped: false,
             cdp_endpoint: cdp_endpoint_url,
+            start_url: config.start_url.clone(),
         };
 
         if let Some(mut consumed) = consumed_pipes {
@@ -1033,12 +1036,28 @@ impl BrowserProcessManager {
             state: lease.state,
             pid: lease.manifest.pid,
             ttl_remaining_secs: remaining,
+            start_url: lease.start_url.clone(),
         })
     }
 
     pub fn list_snapshots(&self) -> Vec<LeaseSnapshot> {
         let ids: Vec<BrowserLeaseId> = self.leases.keys().cloned().collect();
         ids.iter().filter_map(|id| self.snapshot(id)).collect()
+    }
+
+    pub fn find_live_lease_for_profile(&self, profile_id: &ProfileId) -> Option<LeaseSnapshot> {
+        for (id, lease) in &self.leases {
+            if &lease.profile_id == profile_id
+                && matches!(
+                    lease.state,
+                    LeaseState::Active | LeaseState::AuthenticationPending
+                )
+                && let Some(snapshot) = self.snapshot(id)
+            {
+                return Some(snapshot);
+            }
+        }
+        None
     }
 
     pub fn check_expired(&mut self) -> Vec<BrowserLeaseId> {
@@ -3430,6 +3449,60 @@ mod tests {
             .launch(&config, test_endpoint_id(), test_profile_id())
             .unwrap();
         assert_eq!(mgr.list_snapshots().len(), 2);
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_returns_active_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(snapshot.is_some());
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.id, lease_id);
+        assert_eq!(snapshot.profile_id, test_profile_id());
+        assert!(matches!(
+            snapshot.state,
+            LeaseState::Active | LeaseState::AuthenticationPending
+        ));
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_returns_none_for_different_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let _lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+
+        let other_profile = ProfileId::new("other-profile").unwrap();
+        let snapshot = mgr.find_live_lease_for_profile(&other_profile);
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn test_find_live_lease_for_profile_skips_terminal_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = test_clock();
+        let mut mgr = BrowserProcessManager::new(clock);
+        let config = test_config(dir.path());
+
+        let lease_id = mgr
+            .launch(&config, test_endpoint_id(), test_profile_id())
+            .unwrap();
+        mgr.revoke(&lease_id).unwrap();
+
+        let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
+        assert!(snapshot.is_none());
     }
 
     #[test]
