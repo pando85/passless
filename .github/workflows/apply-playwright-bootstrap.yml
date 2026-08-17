@@ -1,0 +1,32 @@
+name: Apply Playwright bootstrap integration
+
+on:
+  push:
+    branches:
+      - feat/playwright-mcp-lazy-bootstrap
+    paths:
+      - .github/workflows/apply-playwright-bootstrap.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/playwright-mcp-lazy-bootstrap
+          fetch-depth: 0
+      - name: Apply checked source transformations
+        run: python3 .github/scripts/apply_playwright_bootstrap.py
+      - name: Commit integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add passless-core/src/agent/protocol.rs passless-core/src/config.rs \
+                  cmd/passless/src/agent/runtime.rs cmd/passless/src/agent/runtime/browser_ensure.rs \
+                  cmd/passless/src/commands/agent.rs
+          git diff --cached --check
+          git commit -m "feat(agent): wire lazy Playwright browser bootstrap"
+          git push origin HEAD:feat/playwright-mcp-lazy-bootstrap
