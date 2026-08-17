@@ -15,8 +15,9 @@ const MAX_ARGV_LEN: usize = 256;
 const MAX_ARGV_COUNT: usize = 64;
 const MAX_CDP_REQUEST_LEN: usize = 8 * 1024;
 const MAX_CDP_TIMEOUT_MS: u32 = 30_000;
+const MAX_START_URL_LEN: usize = 2048;
 
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
 
 const MAX_RP_ID_LEN: usize = 253;
 const MAX_PROFILE_ID_LEN: usize = 128;
@@ -485,6 +486,10 @@ pub enum PrincipalRequest {
         profile_id: ProfileId,
     },
     BrowserStatus,
+    EnsureBrowser {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start_url: Option<String>,
+    },
     EndpointStatus,
     BrowserControl {
         request_json: String,
@@ -527,6 +532,7 @@ pub enum PrincipalResponse {
     DelegationCancelled,
     CredentialList(PrincipalCredentialList),
     BrowserStatus(BrowserStatusResponse),
+    BrowserEnsured(BrowserStatusResponse),
     EndpointStatus(EndpointStatusResponse),
     BrowserControl {
         messages: Vec<String>,
@@ -1385,6 +1391,11 @@ impl Validate for PrincipalRequest {
             | Self::WaitDelegation { .. }
             | Self::CancelDelegation { .. } => {}
             Self::ListCredentials { .. } => {}
+            Self::EnsureBrowser { start_url } => {
+                if let Some(url) = start_url {
+                    check_str(url, "start_url", MAX_START_URL_LEN, &mut errors);
+                }
+            }
             Self::BrowserControl {
                 request_json,
                 timeout_ms,

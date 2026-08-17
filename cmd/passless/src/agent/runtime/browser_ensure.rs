@@ -6,10 +6,10 @@ use passless_core::agent::config::CdpExposeMode;
 use passless_core::agent::protocol::{
     BrowserStatusResponse, ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction,
 };
-use passless_core::agent::{PrincipalSessionId, ProfileId};
+use passless_core::agent::{BrowserLeaseId, PrincipalSessionId, ProfileId};
 
 use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime};
-use crate::agent::browser::{BrowserConfig, BrowserLeaseId, LeaseState};
+use crate::agent::browser::{BrowserConfig, LeaseState};
 use crate::agent::intent::ProcessIdentityDigest;
 use crate::storage::CredentialFilter;
 

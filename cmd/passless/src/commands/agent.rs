@@ -101,6 +101,10 @@ fn connect_admin() -> Result<AdminClient> {
 
 pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentCommand) -> Result<()> {
     match action {
+        AgentCommand::PlaywrightMcp {
+            profile: playwright_profile,
+            command,
+        } => dispatch_playwright_mcp(output, playwright_profile, command),
         AgentCommand::Run {
             profile: run_profile,
             command,
@@ -123,8 +127,33 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
                     request_file,
                     timeout_ms,
                 } => dispatch_browser_control(output, profile, request, request_file, *timeout_ms),
-                AgentCommand::Run { .. } => unreachable!(),
+                AgentCommand::PlaywrightMcp { .. } | AgentCommand::Run { .. } => unreachable!(),
             }
+        }
+    }
+}
+
+fn dispatch_playwright_mcp(
+    output: OutputFormat,
+    profile: &str,
+    command: &[PathBuf],
+) -> Result<()> {
+    match super::playwright_mcp::try_run_as_principal(profile, command)? {
+        Some(()) => Ok(()),
+        None => {
+            let current_exe = std::env::current_exe().map_err(|e| {
+                Error::Other(format!("failed to resolve passless executable: {e}"))
+            })?;
+            let mut wrapper_command = vec![
+                current_exe,
+                PathBuf::from("agent"),
+                PathBuf::from("playwright-mcp"),
+                PathBuf::from("--profile"),
+                PathBuf::from(profile),
+                PathBuf::from("--"),
+            ];
+            wrapper_command.extend(command.iter().cloned());
+            dispatch_run(output, profile, &wrapper_command)
         }
     }
 }
