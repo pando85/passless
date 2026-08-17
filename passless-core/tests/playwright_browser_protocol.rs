@@ -1,7 +1,7 @@
 #![cfg(feature = "agent")]
 
 use passless_core::agent::protocol::{
-    BrowserStatusResponse, PrincipalRequest, PrincipalResponse, Validate, CURRENT_VERSION,
+    BrowserStatusResponse, CURRENT_VERSION, PrincipalRequest, PrincipalResponse, Validate,
 };
 
 #[test]

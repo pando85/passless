@@ -188,13 +188,7 @@ where
     }
 
     match request.path.as_str() {
-        "/healthz" => write_json(
-            &mut stream,
-            200,
-            "OK",
-            r#"{"status":"ok"}"#,
-            &[],
-        ),
+        "/healthz" => write_json(&mut stream, 200, "OK", r#"{"status":"ok"}"#, &[]),
         "/json/version" | "/json/version/" => {
             let Some(auth) = request.header("authorization") else {
                 return unauthorized(&mut stream);
@@ -358,11 +352,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, RequestError> {
             return Err(RequestError::Invalid);
         }
         let (name, value) = line.split_once(':').ok_or(RequestError::Invalid)?;
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err(RequestError::Invalid);
         }
         let value = value.trim();
@@ -407,9 +397,7 @@ fn valid_loopback_ws_endpoint(endpoint: &str) -> bool {
     if let Some(port) = authority.strip_prefix("localhost:") {
         return port.parse::<u16>().is_ok_and(|port| port != 0);
     }
-    if let Some(port) = authority
-        .strip_prefix("[::1]:")
-    {
+    if let Some(port) = authority.strip_prefix("[::1]:") {
         return port.parse::<u16>().is_ok_and(|port| port != 0);
     }
     false

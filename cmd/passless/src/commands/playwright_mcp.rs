@@ -41,10 +41,8 @@ fn run_as_principal(profile: &str, command: &[PathBuf]) -> Result<()> {
     let token = crate::agent::sign::generate_bearer_token()
         .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))?;
     let profile_owned = profile.to_string();
-    let bootstrap = CdpBootstrap::start(token.clone(), move || {
-        ensure_browser(&profile_owned)
-    })
-    .map_err(|e| Error::Other(e.to_string()))?;
+    let bootstrap = CdpBootstrap::start(token.clone(), move || ensure_browser(&profile_owned))
+        .map_err(|e| Error::Other(e.to_string()))?;
 
     let endpoint = bootstrap.endpoint();
     let mut child_command = Command::new(executable);
@@ -90,20 +88,23 @@ fn run_as_principal(profile: &str, command: &[PathBuf]) -> Result<()> {
             "Playwright MCP exited with code {code}"
         )))
     } else {
-        Err(Error::Other("Playwright MCP terminated by signal".to_string()))
+        Err(Error::Other(
+            "Playwright MCP terminated by signal".to_string(),
+        ))
     }
 }
 
 fn ensure_browser(profile: &str) -> std::result::Result<String, String> {
     let base = resolve_runtime_base().map_err(|e| e.to_string())?;
-    let mut client = PrincipalClient::connect_launched(&base, profile).map_err(|e| e.to_string())?;
+    let mut client =
+        PrincipalClient::connect_launched(&base, profile).map_err(|e| e.to_string())?;
     let response = client
         .request(PrincipalRequest::EnsureBrowser { start_url: None })
         .map_err(|e| e.to_string())?;
     match response {
-        PrincipalResponse::BrowserEnsured(status) => status.cdp_endpoint.ok_or_else(|| {
-            "agent ensured a browser but returned no CDP endpoint".to_string()
-        }),
+        PrincipalResponse::BrowserEnsured(status) => status
+            .cdp_endpoint
+            .ok_or_else(|| "agent ensured a browser but returned no CDP endpoint".to_string()),
         _ => Err("agent returned an unexpected EnsureBrowser response".to_string()),
     }
 }

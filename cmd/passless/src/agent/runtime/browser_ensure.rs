@@ -31,7 +31,12 @@ impl AgentRuntime {
         start_url: Option<&str>,
         profile: &Arc<ProfileRuntime>,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        if profile.profile_config.browser_cdp_expose.unwrap_or_default() != CdpExposeMode::Port {
+        if profile
+            .profile_config
+            .browser_cdp_expose
+            .unwrap_or_default()
+            != CdpExposeMode::Port
+        {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "Playwright browser discovery requires browser_cdp_expose = 'port' (trusted agents only)",
@@ -89,15 +94,21 @@ impl AgentRuntime {
 
         if let Some(active) = active_lease {
             if let Some(snapshot) = browser_manager.snapshot(&active.lease_id)
-                && matches!(snapshot.state, LeaseState::Active | LeaseState::AuthenticationPending)
-                && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&active.lease_id).flatten()
+                && matches!(
+                    snapshot.state,
+                    LeaseState::Active | LeaseState::AuthenticationPending
+                )
+                && let Some(endpoint) = browser_manager
+                    .lease_cdp_endpoint(&active.lease_id)
+                    .flatten()
             {
                 return Ok(browser_ensured(snapshot.state.to_string(), endpoint));
             }
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
             // before allowing a replacement browser to be created.
-            self.sign_registry.revoke_by_lease(&active.lease_id.to_string());
+            self.sign_registry
+                .revoke_by_lease(&active.lease_id.to_string());
             let _ = browser_manager.revoke(&active.lease_id);
             let _ = browser_manager.terminate(&active.lease_id);
             let _ = browser_manager.cleanup(&active.lease_id);
@@ -113,7 +124,10 @@ impl AgentRuntime {
 
         // Do not silently adopt an admin-launched or otherwise unowned lease. A CDP port is full
         // browser authority, so ownership ambiguity is a hard conflict rather than a reuse hint.
-        if browser_manager.find_live_lease_for_profile(profile_id).is_some() {
+        if browser_manager
+            .find_live_lease_for_profile(profile_id)
+            .is_some()
+        {
             return Err(ProtocolError::new(
                 ErrorCode::Conflict,
                 "a live browser exists for the profile but is not owned by this principal session",
@@ -121,19 +135,24 @@ impl AgentRuntime {
             ));
         }
 
-        let endpoint_id = profile.endpoint_id.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "endpoint lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?.clone().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                format!("profile '{}' has no active endpoint", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
+        let endpoint_id = profile
+            .endpoint_id
+            .lock()
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "endpoint lock poisoned",
+                    RecommendedAction::Abort,
+                )
+            })?
+            .clone()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::NotFound,
+                    format!("profile '{}' has no active endpoint", profile_id),
+                    RecommendedAction::FixRequest,
+                )
+            })?;
 
         let profile_config = &profile.profile_config;
         let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
@@ -151,12 +170,15 @@ impl AgentRuntime {
             ));
         }
 
-        let runtime_root = profile_config.browser_runtime_root.clone().unwrap_or_else(|| {
-            dirs::runtime_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("passless")
-                .join("browser")
-        });
+        let runtime_root = profile_config
+            .browser_runtime_root
+            .clone()
+            .unwrap_or_else(|| {
+                dirs::runtime_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join("passless")
+                    .join("browser")
+            });
         let rp_ids = if !profile_config.rp_ids.is_empty() {
             profile_config.rp_ids.clone()
         } else {
@@ -357,14 +379,14 @@ impl AgentRuntime {
                 key_provider: profile.backend.key_provider.clone(),
                 operation_lock: profile.backend.operation_lock.clone(),
             });
-            if let Err(e) = self
-                .sign_registry
-                .register_pending(bearer_token.to_string(), sign_ctx, sign_handler)
-            {
-                let _ = self.policy_runtime.admin_revoke_grant(
-                    &grant_id,
-                    &crate::agent::intent::admin_authority(),
-                );
+            if let Err(e) = self.sign_registry.register_pending(
+                bearer_token.to_string(),
+                sign_ctx,
+                sign_handler,
+            ) {
+                let _ = self
+                    .policy_runtime
+                    .admin_revoke_grant(&grant_id, &crate::agent::intent::admin_authority());
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to register browser sign context: {e}"),
@@ -376,10 +398,9 @@ impl AgentRuntime {
                 .bind_lease(bearer_token, lease_id.to_string())
             {
                 self.sign_registry.revoke(bearer_token);
-                let _ = self.policy_runtime.admin_revoke_grant(
-                    &grant_id,
-                    &crate::agent::intent::admin_authority(),
-                );
+                let _ = self
+                    .policy_runtime
+                    .admin_revoke_grant(&grant_id, &crate::agent::intent::admin_authority());
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to bind browser sign context: {e}"),
