@@ -39,8 +39,7 @@ const NONCE_SIZE: usize = 12;
 const WRAPPING_KEY_SIZE: usize = 32;
 const MAX_WRAPPING_KEY_FILE_SIZE: usize = 128;
 const PASSLESS_AAGUID: [u8; 16] = [
-    0x66, 0x69, 0x64, 0x6f, 0x2e, 0x70, 0x61, 0x73, 0x73, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x72,
-    0x73,
+    0x66, 0x69, 0x64, 0x6f, 0x2e, 0x70, 0x61, 0x73, 0x73, 0x6c, 0x65, 0x73, 0x73, 0x2e, 0x72, 0x73,
 ];
 
 #[derive(Debug)]
@@ -235,9 +234,8 @@ fn encrypt_credential_with_key(
         },
         credential: portable,
     };
-    let plaintext = Zeroizing::new(
-        serde_cbor::to_vec(&envelope).map_err(|_| BackupError::InvalidBundle)?,
-    );
+    let plaintext =
+        Zeroizing::new(serde_cbor::to_vec(&envelope).map_err(|_| BackupError::InvalidBundle)?);
     if plaintext.len() > MAX_BACKUP_BUNDLE_SIZE {
         return Err(BackupError::TooLarge);
     }
@@ -362,7 +360,9 @@ fn load_wrapping_key(recipient: &str) -> Result<Zeroizing<[u8; WRAPPING_KEY_SIZE
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|_| BackupError::CryptoUnavailable)?;
-    let metadata = file.metadata().map_err(|_| BackupError::CryptoUnavailable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| BackupError::CryptoUnavailable)?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0
@@ -500,7 +500,8 @@ mod tests {
     #[test]
     fn encrypted_round_trip_preserves_complete_credential_source() {
         let original = credential(CredentialBackupState::BackedUp);
-        let bundle = encrypt_credential_with_key(&original, "backup-main", &test_key(0x11)).unwrap();
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x11)).unwrap();
         let outer = decode_bundle(&bundle).unwrap();
         assert_eq!(outer.recipient, "backup-main");
         assert_eq!(outer.version, BACKUP_FORMAT_VERSION);
@@ -511,7 +512,11 @@ mod tests {
         assert_eq!(restored.backup_state, CredentialBackupState::BackedUp);
         assert_eq!(restored.extensions.cred_protect, Some(3));
         assert_eq!(
-            restored.extensions.cred_random.as_ref().map(SecBytes::as_slice),
+            restored
+                .extensions
+                .cred_random
+                .as_ref()
+                .map(SecBytes::as_slice),
             Some([0x4a; 32].as_slice())
         );
     }
@@ -519,7 +524,8 @@ mod tests {
     #[test]
     fn bundle_does_not_expose_private_key_plaintext() {
         let original = credential(CredentialBackupState::BackedUp);
-        let bundle = encrypt_credential_with_key(&original, "backup-main", &test_key(0x22)).unwrap();
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x22)).unwrap();
         assert!(!bundle.windows(32).any(|window| window == [0x9d; 32]));
         assert!(!bundle.windows(32).any(|window| window == [0x4a; 32]));
     }
@@ -527,7 +533,8 @@ mod tests {
     #[test]
     fn tampered_ciphertext_is_rejected() {
         let original = credential(CredentialBackupState::BackedUp);
-        let bundle = encrypt_credential_with_key(&original, "backup-main", &test_key(0x33)).unwrap();
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x33)).unwrap();
         let mut outer = decode_bundle(&bundle).unwrap();
         outer.ciphertext[0] ^= 0x80;
         assert!(matches!(
@@ -539,7 +546,8 @@ mod tests {
     #[test]
     fn wrong_wrapping_key_is_rejected() {
         let original = credential(CredentialBackupState::BackedUp);
-        let bundle = encrypt_credential_with_key(&original, "backup-main", &test_key(0x44)).unwrap();
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x44)).unwrap();
         let outer = decode_bundle(&bundle).unwrap();
         assert!(matches!(
             decrypt_bundle_with_key(outer, &test_key(0x45)),
@@ -550,7 +558,8 @@ mod tests {
     #[test]
     fn recipient_metadata_is_authenticated() {
         let original = credential(CredentialBackupState::BackedUp);
-        let bundle = encrypt_credential_with_key(&original, "backup-main", &test_key(0x55)).unwrap();
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x55)).unwrap();
         let mut outer = decode_bundle(&bundle).unwrap();
         outer.recipient = "backup-other".to_string();
         assert!(matches!(
@@ -571,7 +580,8 @@ mod tests {
     #[test]
     fn eligible_state_remains_eligible_in_portable_source() {
         let original = credential(CredentialBackupState::Eligible);
-        let bundle = encrypt_credential_with_key(&original, "backup-main", &test_key(0x77)).unwrap();
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x77)).unwrap();
         let outer = decode_bundle(&bundle).unwrap();
         let restored = decrypt_bundle_with_key(outer, &test_key(0x77)).unwrap();
         assert_eq!(restored.backup_state, CredentialBackupState::Eligible);
