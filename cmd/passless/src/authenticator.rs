@@ -1390,13 +1390,14 @@ impl<
                         }
                     }
                 };
-                credential.backup_state = match backup_state_for_export(credential.backup_state) {
+                let export_state = match backup_state_for_export(credential.backup_state) {
                     Ok(state) => state,
                     Err(error) => {
                         response.push(Self::backup_error_status(error) as u8);
                         return;
                     }
                 };
+                credential.backup_state = export_state;
                 let bundle = match encrypt_credential(&credential, &recipient) {
                     Ok(bundle) => bundle,
                     Err(error) => {

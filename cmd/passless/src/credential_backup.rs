@@ -595,6 +595,23 @@ mod tests {
     }
 
     #[test]
+    fn handler_must_check_backup_eligibility_before_mutating_state() {
+        let original = credential(CredentialBackupState::NotEligible);
+        assert!(!original.backup_state.is_eligible());
+
+        let mut mutated = original.clone();
+        mutated.backup_state = CredentialBackupState::BackedUp;
+        let portable = PortableCredentialV1::from_credential(&mutated).unwrap();
+        assert!(portable.backup_eligible);
+
+        let portable_from_original = PortableCredentialV1::from_credential(&original);
+        assert!(matches!(
+            portable_from_original,
+            Err(BackupError::UnsupportedCredential)
+        ));
+    }
+
+    #[test]
     fn eligible_state_remains_eligible_in_portable_source() {
         let original = credential(CredentialBackupState::Eligible);
         let bundle =
