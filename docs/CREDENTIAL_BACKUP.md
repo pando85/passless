@@ -1,147 +1,177 @@
 # Credential Backup
 
-Passless uses the word "backup" for two related but distinct things. This page covers both and
-explains how they interact:
+Passless uses the word "backup" for two related but distinct things:
 
-1. **Backup eligibility** — a WebAuthn credential property (the `BE`/`BS` flags) that tells a
-   relying party whether a credential may be backed up or is multi-device. Controlled by the
-   `enable_credential_backup` option.
-2. **Encrypted backup & restore** — the Passless feature that exports a single software credential
-   as an opaque OpenPGP bundle (`passless client backup` / `passless client restore`).
+1. **Backup eligibility** — the WebAuthn `BE`/`BS` credential state.
+2. **Encrypted backup and restore** — Passless vendor commands that export one software credential as an opaque encrypted bundle and restore it later.
 
-## Backup eligibility (BE / BS flags)
+The encrypted export path is disabled by default and never sends plaintext credential key material to the client process.
 
-Every WebAuthn registration and assertion carries an authenticator-data flags byte. Two bits
-describe backup status:
+## Backup eligibility (BE / BS)
+
+Every registration and assertion includes authenticator-data flags describing credential backup state:
 
 | Bit | Name | Meaning |
 |-----|------|---------|
-| `0x08` | BE (Backup Eligible) | The credential *may* be backed up / synced (a multi-device credential). |
-| `0x10` | BS (Backup State) | The credential *is currently* backed up. |
+| `0x08` | BE (Backup Eligible) | The credential may be backed up. |
+| `0x10` | BS (Backup State) | The credential is currently backed up. |
 
-`BS` is only meaningful when `BE` is set. A credential that is not backup-eligible reports
-`BE=0, BS=0` (a single-device credential).
+Valid states are:
 
-### The `enable_credential_backup` option
+- `BE=0, BS=0` — single-device / not backup eligible.
+- `BE=1, BS=0` — backup eligible, not yet backed up.
+- `BE=1, BS=1` — backup eligible and backed up.
+
+`BE=0, BS=1` is invalid.
+
+### Enabling backup eligibility
 
 ```toml
 [security]
-# Default: false
 enable_credential_backup = true
 ```
 
-This single option controls two behaviors:
+The option is `false` by default. It does two things:
 
-- It enables the encrypted backup/restore vendor commands described below.
-- It sets the backup eligibility assigned to **newly registered** credentials:
-  - `false` (default) → `NotEligible` → new credentials report `BE=0`.
-  - `true` → `Eligible` → new credentials report `BE=1`.
+- enables Passless backup/restore vendor commands;
+- makes **newly registered** software credentials backup eligible (`BE=1`).
 
-It is also available as the `--enable-credential-backup` flag or the
-`PASSLESS_ENABLE_CREDENTIAL_BACKUP` environment variable.
+Existing credentials are not migrated. In particular, a credential created with `BE=0` is not exportable: Passless refuses the backup instead of changing its BE bit after registration. This is required because WebAuthn backup eligibility is invariant for a credential's lifetime and strict relying parties can reject a credential whose BE value changes.
 
-> [!IMPORTANT]
-> `enable_credential_backup` only affects credentials registered **after** it is set. Changing it
-> does **not** migrate credentials that already exist; each credential keeps the backup state it was
-> created with. See [Pitfalls and troubleshooting](#pitfalls-and-troubleshooting).
+The same setting is available as `--enable-credential-backup` and `PASSLESS_ENABLE_CREDENTIAL_BACKUP`.
 
-### Why this matters: strict relying parties
+## Security model
 
-The WebAuthn Level 3 specification requires that a credential's **BE flag never changes** over its
-lifetime — a change can indicate cloning or state corruption. Strict relying parties enforce this
-and **reject authentication** when the BE flag at assertion time differs from the value recorded at
-registration. Kanidm is one such RP (it fails with `CredentialBackupEligibilityInconsistent`).
+Backup/restore uses Passless vendor CTAP commands (`0x43` and `0x44`) and the normal credential-management PIN/UV authorization path. The CLI additionally requires an explicit acknowledgement flag for export and restore.
 
-So if a credential was registered reporting `BE=1` and later asserts `BE=0` (or vice versa), a
-strict RP denies the login even though the key material is unchanged. Lenient RPs ignore the flag
-and are unaffected.
+The important boundary is the running authenticator:
 
-## Encrypted backup & restore
+- credential plaintext, private signing key, `credRandom`, RP/user metadata and counters are serialized only inside the authenticator process;
+- the complete portable credential source is encrypted **in-process with AES-256-GCM**;
+- the client receives only the encrypted bundle plus a digest token used by the two-phase durable-backup commit;
+- recipient identifier, format version and cipher suite are authenticated as AEAD associated data;
+- bundle ciphertext contains an explicit, versioned credential-source schema rather than the Rust `soft_fido2::Credential` serialization;
+- private credential key material and wrapping keys are never placed in command-line arguments, temporary files, logs, or CTAP IPC messages;
+- decrypted plaintext and loaded wrapping-key buffers are zeroized after use;
+- TPM/non-exportable credential providers are rejected.
 
-Passless can export a single **software-backed** credential as an OpenPGP-encrypted bundle and
-restore it later, on the same or another machine. The plaintext credential is serialized and
-encrypted entirely inside the running authenticator process; the client only ever handles opaque
-ciphertext.
+A successful export is two-phase. Passless first prepares the encrypted bundle. The client writes it with mode `0600`, fsyncs it, atomically renames it into place and fsyncs the parent directory. Only then does the client send a commit token back to the authenticator. The source credential changes from `BE=1, BS=0` to `BE=1, BS=1` only after that commit succeeds.
 
-### Prerequisites
+## Wrapping keys
 
-- `enable_credential_backup = true` — the backup/restore commands are disabled otherwise.
-- The Passless authenticator service must be **running**. Backup and restore are vendor CTAP
-  commands processed by the authenticator and require user verification.
-- A working `gpg` binary on `PATH`.
-- For backup: a valid OpenPGP recipient (key ID, fingerprint, or email) present in your GPG
-  keyring. For restore: the matching private key.
-- The credential must be **software-backed**. TPM-resident / non-exportable credentials cannot be
-  exported and are rejected.
+`--recipient` identifies an **authenticator-local wrapping key**, not secret key material. The same key must be provisioned on every Passless authenticator that should be able to restore the bundle.
 
-### Back up a credential
+By default keys live under:
+
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/passless/credential-backup-keys/
+```
+
+The directory can be overridden with `PASSLESS_CREDENTIAL_BACKUP_KEY_DIR`.
+
+For recipient `home-backup`, Passless reads:
+
+```text
+.../credential-backup-keys/home-backup.key
+```
+
+Recipient identifiers may contain ASCII letters, digits, `@`, `.`, `_`, `-`, and `+`, but no path separators or traversal components.
+
+A key file must:
+
+- be a regular file owned by the Passless user;
+- not be a symlink;
+- have no group/other permission bits (normally mode `0600`);
+- contain either exactly 32 raw random bytes or 64 hexadecimal characters representing 32 bytes.
+
+Example provisioning:
 
 ```bash
-# Find the credential ID
+install -d -m 700 ~/.config/passless/credential-backup-keys
+umask 077
+head -c 32 /dev/urandom > ~/.config/passless/credential-backup-keys/home-backup.key
+chmod 600 ~/.config/passless/credential-backup-keys/home-backup.key
+```
+
+Copy that key to the corresponding protected key directory on the restore target using a secure out-of-band channel. Treat it as a high-value secret: possession of the wrapping key plus a backup bundle is sufficient to recover the exported passkey.
+
+## Back up a credential
+
+First enable backup before registering the credential, so it is created with `BE=1`.
+
+```bash
 passless client list --domain example.com
 
-# Export it to an encrypted bundle
 passless client backup <CREDENTIAL_ID> \
-  --recipient you@example.com \
-  --output-file example.com-passkey.gpg \
+  --recipient home-backup \
+  --output-file example.com-passkey.pbackup \
   --yes-i-understand-this-exports-a-passkey
 ```
 
-- `<CREDENTIAL_ID>` is the credential ID in hexadecimal (from `passless client list` or `show`).
-- `--recipient` is the OpenPGP recipient (key ID, fingerprint, or email).
-- `--output-file` is where the encrypted bundle is written.
-- The confirmation flag is required to acknowledge that a passkey is being exported.
+Requirements:
 
-You will be prompted for user verification (desktop notification or PIN). A successful backup also
-marks the credential as backed up (`BS=1`).
+- the Passless authenticator service is running;
+- `enable_credential_backup = true`;
+- the credential is software-backed and already backup eligible;
+- the selected wrapping-key file exists and passes ownership/permission checks;
+- user verification or PIN authorization succeeds.
 
-### Restore a credential
+Passless refuses to overwrite an existing output file.
+
+## Restore a credential
+
+Provision the same wrapping key on the target authenticator, enable credential backup there, then run:
 
 ```bash
-passless client restore example.com-passkey.gpg \
-  --yes-i-understand-this-restores-a-passkey
-
-# To overwrite an existing credential with the same ID:
-passless client restore example.com-passkey.gpg --replace \
+passless client restore example.com-passkey.pbackup \
   --yes-i-understand-this-restores-a-passkey
 ```
 
-- The positional `<PATH>` is the bundle to restore.
-- `--replace` overwrites an existing credential with the same ID; without it, restoring over an
-  existing ID fails.
-- Restore decrypts with your GPG private key (you may be prompted for its passphrase).
+If a credential with the same ID already exists, restore fails by default. Replacement must be explicit:
 
-### Bundle format and security
+```bash
+passless client restore example.com-passkey.pbackup \
+  --replace \
+  --yes-i-understand-this-restores-a-passkey
+```
 
-The bundle is standard OpenPGP ciphertext wrapping a small CBOR envelope
-(`passless-credential-backup`, format version 1). Plaintext credential material exists only inside
-the authenticator process and is zeroized after use; bundles are capped at 64 KiB. Treat a bundle as
-sensitive: anyone holding the recipient private key can recover the passkey.
+A restored credential remains backup eligible and is marked backed up (`BE=1, BS=1`). Restore preserves the credential ID, RP and user data, signing key, algorithm, sign counter, discoverability, `credProtect`, `credRandom`, creation timestamp and backup eligibility.
 
-## Pitfalls and troubleshooting
+Tampered bundles, malformed metadata, unsupported versions and the wrong wrapping key fail before credential installation.
 
-### "Credential backup eligibility has changed" — a strict RP suddenly rejects a credential
+## Bundle format
 
-This is the BE-consistency check described above: the BE flag the authenticator now reports differs
-from what the RP stored at registration. The credential still works at lenient RPs.
+The current outer bundle format is version 2. It is CBOR with non-secret metadata and AEAD ciphertext:
 
-The most common cause is **running more than one Passless version against the same credential
-store**. The backup state is stored per credential. A Passless build that predates this field does
-not write it, so when a newer build reads that credential the field falls back to its default
-(`NotEligible`, `BE=0`). If the RP had recorded `BE=1`, the next assertion is rejected.
+```text
+magic      = "passless-credential-backup"
+version    = 2
+cipher     = "AES-256-GCM"
+recipient  = wrapping-key identifier
+nonce      = 96-bit random nonce
+ciphertext = encrypted portable credential source + GCM tag
+```
 
-**Fix:** re-register the credential at the affected RP. The new registration records the current BE
-value and the mismatch is resolved permanently.
+`magic`, `version`, `cipher`, and `recipient` are authenticated as associated data. The encrypted payload contains its own format version, Passless source AAGUID/version metadata, and a stable credential-source schema.
 
-To avoid recurrence:
+Bundles are capped at 64 KiB.
 
-- Run a single Passless version against a given store; do not alternate old and new binaries.
-- Keep `enable_credential_backup` stable. Flipping it does not touch existing credentials, so it
-  creates a mix of `BE=0` and `BE=1` credentials over time.
-- If you intentionally change your backup posture, re-register the affected credentials at strict
-  RPs (such as Kanidm) afterwards.
+### Draft v1 / OpenPGP bundles
 
-### Backup is rejected as unsupported
+The earlier implementation merged in PR #383 used an external `gpg` subprocess and serialized the internal `soft_fido2::Credential` representation directly. That draft format is intentionally **not accepted** by format v2: accepting it would reintroduce the plaintext-IPC boundary that this format removes.
 
-Only software-backed credentials can be exported. Credentials whose keys live in a TPM (the portable
-TPM backend) are non-exportable by design and cannot be backed up with this feature.
+If you created a v1 bundle, restore it with a pre-v2 Passless build in a controlled environment and immediately re-export the credential using format v2. Unsupported/legacy input otherwise fails closed as an invalid bundle.
+
+## Failure behavior
+
+Common failures are deliberate and fail closed:
+
+- backup feature disabled → vendor command is unsupported;
+- non-exportable/TPM credential → export rejected;
+- credential has `BE=0` → export rejected without changing BE;
+- missing/insecure wrapping-key file → crypto unavailable/invalid input;
+- wrong wrapping key → authenticated decryption failure;
+- modified ciphertext or recipient metadata → authenticated decryption failure;
+- malformed/unknown bundle version → invalid bundle;
+- restore ID collision without `--replace` → collision error;
+- output path already exists → client refuses overwrite.
