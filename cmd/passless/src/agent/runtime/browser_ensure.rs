@@ -106,7 +106,7 @@ impl AgentRuntime {
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
             // before allowing a replacement browser to be created.
-            self.sign_registry.revoke_by_lease(&lease_id.to_string());
+            self.sign_registry.revoke_by_lease(lease_id.as_ref());
             let _ = browser_manager.revoke(&lease_id);
             let _ = browser_manager.terminate(&lease_id);
             let _ = browser_manager.cleanup(&lease_id);
@@ -272,7 +272,7 @@ impl AgentRuntime {
         if result.is_err() {
             self.sign_registry.revoke(&bearer_token);
             self.sign_registry.revoke_registration(&bearer_token);
-            self.sign_registry.revoke_by_lease(&lease_id.to_string());
+            self.sign_registry.revoke_by_lease(lease_id.as_ref());
             let _ = browser_manager.revoke(&lease_id);
             let _ = browser_manager.terminate(&lease_id);
             let _ = browser_manager.cleanup(&lease_id);
