@@ -108,6 +108,8 @@ struct PortableCredentialV1 {
     created: i64,
     discoverable: bool,
     cred_protect: Option<u8>,
+    #[serde(default)]
+    hmac_secret: Option<bool>,
     cred_random: Option<SecBytes>,
     backup_eligible: bool,
     backed_up: bool,
@@ -131,6 +133,7 @@ impl PortableCredentialV1 {
             created: credential.created,
             discoverable: credential.discoverable,
             cred_protect: credential.extensions.cred_protect,
+            hmac_secret: credential.extensions.hmac_secret,
             cred_random: credential.extensions.cred_random.clone(),
             backup_eligible: credential.backup_state.is_eligible(),
             backed_up: credential.backup_state.is_backed_up(),
@@ -144,8 +147,6 @@ impl PortableCredentialV1 {
         } else {
             CredentialBackupState::Eligible
         };
-        let has_cred_random = self.cred_random.is_some();
-
         Ok(Credential {
             id: self.id,
             rp: RelyingParty {
@@ -169,7 +170,7 @@ impl PortableCredentialV1 {
             backup_state,
             extensions: Extensions {
                 cred_protect: self.cred_protect,
-                hmac_secret: has_cred_random.then_some(true),
+                hmac_secret: self.hmac_secret,
                 cred_random: self.cred_random,
             },
         })
@@ -519,6 +520,22 @@ mod tests {
                 .map(SecBytes::as_slice),
             Some([0x4a; 32].as_slice())
         );
+    }
+
+    #[test]
+    fn round_trip_preserves_hmac_secret_state_independently_of_cred_random() {
+        let mut original = credential(CredentialBackupState::BackedUp);
+        original.extensions.hmac_secret = None;
+        assert!(original.extensions.cred_random.is_some());
+
+        let bundle =
+            encrypt_credential_with_key(&original, "backup-main", &test_key(0x12)).unwrap();
+        let outer = decode_bundle(&bundle).unwrap();
+        let restored = decrypt_bundle_with_key(outer, &test_key(0x12)).unwrap();
+
+        assert_eq!(restored.extensions.hmac_secret, None);
+        assert!(restored.extensions.cred_random.is_some());
+        assert_eq!(restored, original);
     }
 
     #[test]
