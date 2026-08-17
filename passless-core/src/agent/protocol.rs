@@ -1843,9 +1843,9 @@ mod tests {
     }
 
     #[test]
-    fn version_current_is_1_1() {
+    fn version_current_is_1_2() {
         assert_eq!(CURRENT_VERSION.major, 1);
-        assert_eq!(CURRENT_VERSION.minor, 1);
+        assert_eq!(CURRENT_VERSION.minor, 2);
     }
 
     #[test]
@@ -1865,7 +1865,7 @@ mod tests {
     fn version_negotiate_higher_minor_clamped() {
         let offer = ProtocolVersion::new(1, 5);
         let negotiated = ProtocolVersion::negotiate(offer).unwrap();
-        assert_eq!(negotiated, ProtocolVersion::new(1, 1));
+        assert_eq!(negotiated, ProtocolVersion::new(1, 2));
     }
 
     #[test]
@@ -1885,7 +1885,7 @@ mod tests {
 
     #[test]
     fn version_display() {
-        assert_eq!(CURRENT_VERSION.to_string(), "1.1");
+        assert_eq!(CURRENT_VERSION.to_string(), "1.2");
         assert_eq!(ProtocolVersion::new(2, 3).to_string(), "2.3");
     }
 
@@ -2764,7 +2764,7 @@ mod tests {
 
     #[test]
     fn response_rejects_unknown_status() {
-        let json = r#"{"role":"admin","status":"maybe","v":{"major":1,"minor":0},"seq":1,"action":"pong"}"#;
+        let json = r#"{"role":"admin","status":"maybe","v":{"major":1,"minor":0},"seq":1,"action":"ping"}"#;
         assert!(serde_json::from_str::<ResponseFrame>(json).is_err());
     }
 
