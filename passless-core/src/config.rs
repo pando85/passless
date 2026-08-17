@@ -1242,12 +1242,12 @@ pub enum ClientAction {
         #[arg(short = 'n', long = "display-name", value_name = "NAME")]
         display_name: Option<String>,
     },
-    /// Export one software-backed credential as an opaque OpenPGP bundle.
+    /// Export one software-backed credential as an opaque encrypted bundle.
     Backup {
         /// Credential ID in hexadecimal format
         #[arg(value_name = "CREDENTIAL_ID")]
         credential_id: String,
-        /// OpenPGP recipient key ID, fingerprint, or email
+        /// Authenticator-local credential-backup wrapping-key identifier
         #[arg(long, value_name = "RECIPIENT")]
         recipient: String,
         /// Destination bundle path

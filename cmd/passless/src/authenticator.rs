@@ -45,6 +45,15 @@ fn error_status_byte(error: SoftFido2Error) -> u8 {
     }
 }
 
+fn backup_state_for_export(
+    source: CredentialBackupState,
+) -> core::result::Result<CredentialBackupState, BackupError> {
+    if !source.is_eligible() {
+        return Err(BackupError::UnsupportedCredential);
+    }
+    Ok(CredentialBackupState::BackedUp)
+}
+
 /// Classification of UV retry count transitions for diagnostic logging
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UvRetryTransition {
@@ -1381,7 +1390,13 @@ impl<
                         }
                     }
                 };
-                credential.backup_state = CredentialBackupState::BackedUp;
+                credential.backup_state = match backup_state_for_export(credential.backup_state) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        response.push(Self::backup_error_status(error) as u8);
+                        return;
+                    }
+                };
                 let bundle = match encrypt_credential(&credential, &recipient) {
                     Ok(bundle) => bundle,
                     Err(error) => {
@@ -1732,6 +1747,22 @@ mod tests {
             None => None,
             other => panic!("expected boolean uv option, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_backup_state_for_export_preserves_be_invariant() {
+        assert!(matches!(
+            backup_state_for_export(CredentialBackupState::NotEligible),
+            Err(BackupError::UnsupportedCredential)
+        ));
+        assert_eq!(
+            backup_state_for_export(CredentialBackupState::Eligible).unwrap(),
+            CredentialBackupState::BackedUp
+        );
+        assert_eq!(
+            backup_state_for_export(CredentialBackupState::BackedUp).unwrap(),
+            CredentialBackupState::BackedUp
+        );
     }
 
     #[test]
