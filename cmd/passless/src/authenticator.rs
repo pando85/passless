@@ -2155,4 +2155,70 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_not_eligible_credential_rejected_and_state_unchanged() {
+        use soft_fido2::CredentialKey;
+        use soft_fido2_ctap::SecBytes;
+
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let credential_dir = temp_dir.path().join("credentials");
+        std::fs::create_dir_all(&credential_dir).expect("create credential directory");
+        let mut storage =
+            LocalStorageAdapter::new(credential_dir).expect("create credential storage");
+
+        let credential_id = vec![0x01, 0x02, 0x03];
+        let credential = Credential {
+            id: credential_id.clone(),
+            rp: soft_fido2::RelyingParty {
+                id: "example.com".to_string(),
+                name: Some("Example".to_string()),
+            },
+            user: soft_fido2::User {
+                id: vec![0x04, 0x05, 0x06],
+                name: Some("alice".to_string()),
+                display_name: Some("Alice".to_string()),
+            },
+            sign_count: 0,
+            alg: -7,
+            key: CredentialKey::software(SecBytes::from_slice(&[0x9d; 32])),
+            created: 123,
+            discoverable: true,
+            backup_state: CredentialBackupState::NotEligible,
+            extensions: soft_fido2::Extensions {
+                cred_protect: None,
+                hmac_secret: None,
+                cred_random: None,
+            },
+        };
+
+        let cred_ref = CredentialRef {
+            id: &credential.id,
+            rp_id: &credential.rp.id,
+            rp_name: credential.rp.name.as_deref(),
+            user_id: &credential.user.id,
+            user_name: credential.user.name.as_deref(),
+            user_display_name: credential.user.display_name.as_deref(),
+            sign_count: &credential.sign_count,
+            alg: &credential.alg,
+            key: &credential.key,
+            created: &credential.created,
+            discoverable: &credential.discoverable,
+            cred_protect: credential.extensions.cred_protect.as_ref(),
+            backup_state: &credential.backup_state,
+            cred_random: credential.extensions.cred_random.as_ref(),
+        };
+        storage.write(cred_ref).expect("write credential");
+
+        let loaded = storage.read(&credential_id).expect("read credential");
+        assert_eq!(loaded.backup_state, CredentialBackupState::NotEligible);
+
+        assert!(matches!(
+            backup_state_for_export(loaded.backup_state),
+            Err(BackupError::UnsupportedCredential)
+        ));
+
+        let reloaded = storage.read(&credential_id).expect("re-read credential");
+        assert_eq!(reloaded.backup_state, CredentialBackupState::NotEligible);
+    }
 }
