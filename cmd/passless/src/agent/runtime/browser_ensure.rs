@@ -29,7 +29,7 @@ impl AgentRuntime {
         session_id: &PrincipalSessionId,
         process_digest: &ProcessIdentityDigest,
         start_url: Option<&str>,
-        profile: &Arc<ProfileRuntime>,
+        profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
         if profile
             .profile_config
@@ -80,7 +80,7 @@ impl AgentRuntime {
             )
         })?;
 
-        let active_lease = profile
+        let active_lease_id = profile
             .active_browser
             .lock()
             .map_err(|_| {
@@ -90,29 +90,27 @@ impl AgentRuntime {
                     RecommendedAction::Abort,
                 )
             })?
-            .clone();
+            .as_ref()
+            .map(|active| active.lease_id.clone());
 
-        if let Some(active) = active_lease {
-            if let Some(snapshot) = browser_manager.snapshot(&active.lease_id)
+        if let Some(lease_id) = active_lease_id {
+            if let Some(snapshot) = browser_manager.snapshot(&lease_id)
                 && matches!(
                     snapshot.state,
                     LeaseState::Active | LeaseState::AuthenticationPending
                 )
-                && let Some(endpoint) = browser_manager
-                    .lease_cdp_endpoint(&active.lease_id)
-                    .flatten()
+                && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
             {
                 return Ok(browser_ensured(snapshot.state.to_string(), endpoint));
             }
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
             // before allowing a replacement browser to be created.
-            self.sign_registry
-                .revoke_by_lease(&active.lease_id.to_string());
-            let _ = browser_manager.revoke(&active.lease_id);
-            let _ = browser_manager.terminate(&active.lease_id);
-            let _ = browser_manager.cleanup(&active.lease_id);
-            browser_manager.remove(&active.lease_id);
+            self.sign_registry.revoke_by_lease(&lease_id.to_string());
+            let _ = browser_manager.revoke(&lease_id);
+            let _ = browser_manager.terminate(&lease_id);
+            let _ = browser_manager.cleanup(&lease_id);
+            browser_manager.remove(&lease_id);
             *profile.active_browser.lock().map_err(|_| {
                 ProtocolError::new(
                     ErrorCode::Internal,
@@ -289,7 +287,7 @@ impl AgentRuntime {
         profile_id: &ProfileId,
         session_id: &PrincipalSessionId,
         process_digest: &ProcessIdentityDigest,
-        profile: &Arc<ProfileRuntime>,
+        profile: &ProfileRuntime,
         config: &BrowserConfig,
         endpoint_id: &passless_core::agent::EndpointId,
         bearer_token: &str,
