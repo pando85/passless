@@ -7,6 +7,10 @@ use passless_core::agent::protocol::{
     BrowserStatusResponse, ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{BrowserLeaseId, PrincipalSessionId, ProfileId};
+use soft_fido2_ctap::key_provider::{
+    CredentialKey, CredentialKeyError, CredentialKeyProvider, CredentialKeyProviderId,
+    GeneratedCredentialKey,
+};
 
 use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime};
 use crate::agent::browser::{BrowserConfig, LeaseState};
@@ -16,6 +20,72 @@ use crate::storage::CredentialFilter;
 const BROWSER_TTL: Duration = Duration::from_secs(3600);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ACTIVE_TTL_SECS: u64 = 86_400;
+
+struct AssertionActivatingKeyProvider {
+    inner: Arc<dyn CredentialKeyProvider + Send + Sync>,
+    browser_manager: Arc<std::sync::Mutex<crate::agent::browser::BrowserProcessManager>>,
+    lease_id: BrowserLeaseId,
+    active_ttl: Duration,
+}
+
+impl CredentialKeyProvider for AssertionActivatingKeyProvider {
+    fn provider_id(&self) -> CredentialKeyProviderId {
+        self.inner.provider_id()
+    }
+
+    fn supports_algorithm(&self, algorithm: i32) -> bool {
+        self.inner.supports_algorithm(algorithm)
+    }
+
+    fn generate(
+        &self,
+        algorithm: i32,
+    ) -> core::result::Result<GeneratedCredentialKey, CredentialKeyError> {
+        self.inner.generate(algorithm)
+    }
+
+    fn sign(
+        &self,
+        key: &CredentialKey,
+        algorithm: i32,
+        message: &[u8],
+    ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
+        let signature = self.inner.sign(key, algorithm, message)?;
+
+        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
+            CredentialKeyError::TransientFailure("browser manager lock poisoned".to_string())
+        })?;
+        let state = browser_manager
+            .snapshot(&self.lease_id)
+            .ok_or_else(|| {
+                CredentialKeyError::TransientFailure("browser lease not found".to_string())
+            })?
+            .state;
+        match state {
+            LeaseState::AuthenticationPending => {
+                browser_manager
+                    .activate_after_assertion(&self.lease_id, self.active_ttl)
+                    .map_err(|e| {
+                        CredentialKeyError::TransientFailure(format!(
+                            "failed to activate browser lease after assertion: {e}"
+                        ))
+                    })?;
+            }
+            LeaseState::Active => {}
+            current => {
+                return Err(CredentialKeyError::TransientFailure(format!(
+                    "browser lease cannot activate after assertion from state {current}"
+                )));
+            }
+        }
+
+        Ok(signature)
+    }
+
+    fn delete(&self, key: &CredentialKey) -> core::result::Result<(), CredentialKeyError> {
+        self.inner.delete(key)
+    }
+}
 
 impl AgentRuntime {
     /// Ensure that the verified principal owns a live trusted-port browser.
@@ -369,12 +439,24 @@ impl AgentRuntime {
                 active_grant_id: grant_id.clone(),
                 profile_config: profile_config.clone(),
             };
+            let active_ttl = profile_config
+                .max_session_ttl
+                .as_ref()
+                .map(|ttl| ttl.as_secs())
+                .unwrap_or(300)
+                .clamp(1, MAX_ACTIVE_TTL_SECS);
+            let key_provider = Arc::new(AssertionActivatingKeyProvider {
+                inner: profile.backend.key_provider.clone(),
+                browser_manager: self.browser_manager.clone(),
+                lease_id: lease_id.clone(),
+                active_ttl: Duration::from_secs(active_ttl),
+            });
             let sign_handler = Arc::new(crate::agent::sign::SignHandler {
                 credential_storage: profile.backend.credential_storage.clone(),
                 policy_runtime: self.policy_runtime.clone(),
                 audit_gate: self.audit_gate.clone(),
                 security_config: profile.endpoint_spec.security_config.clone(),
-                key_provider: profile.backend.key_provider.clone(),
+                key_provider,
                 operation_lock: profile.backend.operation_lock.clone(),
             });
             if let Err(e) = self.sign_registry.register_pending(
@@ -407,22 +489,6 @@ impl AgentRuntime {
             }
         }
 
-        let active_ttl = profile_config
-            .max_session_ttl
-            .as_ref()
-            .map(|ttl| ttl.as_secs())
-            .unwrap_or(300)
-            .clamp(1, MAX_ACTIVE_TTL_SECS);
-        browser_manager
-            .activate_after_assertion(lease_id, Duration::from_secs(active_ttl))
-            .map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to activate browser lease: {e}"),
-                    RecommendedAction::Abort,
-                )
-            })?;
-
         let endpoint = browser_manager
             .lease_cdp_endpoint(lease_id)
             .flatten()
@@ -445,7 +511,10 @@ impl AgentRuntime {
             session_id: session_id.clone(),
         });
 
-        Ok(browser_ensured("active".to_string(), endpoint))
+        Ok(browser_ensured(
+            LeaseState::AuthenticationPending.to_string(),
+            endpoint,
+        ))
     }
 }
 
