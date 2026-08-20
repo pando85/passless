@@ -1348,6 +1348,9 @@ pub enum AgentCommand {
         /// Profile to bind the Playwright session to
         #[arg(long, value_name = "PROFILE")]
         profile: String,
+        /// Start URL to open in the managed browser
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
         /// Absolute Playwright MCP executable and arguments
         #[arg(last = true, required = true)]
         command: Vec<std::path::PathBuf>,

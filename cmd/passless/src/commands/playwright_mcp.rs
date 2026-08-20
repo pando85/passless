@@ -14,16 +14,20 @@ use crate::agent::client::{ClientError, PrincipalClient, resolve_runtime_base};
 /// the current executable through the normal `agent run` path. Any other capability error is
 /// considered fatal rather than falling back to admin, which prevents recursion or privilege
 /// escalation when fd 3 exists but is malformed.
-pub fn try_run_as_principal(profile: &str, command: &[PathBuf]) -> Result<Option<()>> {
+pub fn try_run_as_principal(
+    profile: &str,
+    url: Option<&str>,
+    command: &[PathBuf],
+) -> Result<Option<()>> {
     let base = resolve_runtime_base().map_err(client_error)?;
     match PrincipalClient::connect_launched(&base, profile) {
-        Ok(_) => run_as_principal(profile, command).map(Some),
+        Ok(_) => run_as_principal(profile, url, command).map(Some),
         Err(ClientError::NoControlFd) => Ok(None),
         Err(e) => Err(client_error(e)),
     }
 }
 
-fn run_as_principal(profile: &str, command: &[PathBuf]) -> Result<()> {
+fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Result<()> {
     if command.is_empty() {
         return Err(Error::Other(
             "playwright-mcp requires an executable after '--'".to_string(),
@@ -41,8 +45,11 @@ fn run_as_principal(profile: &str, command: &[PathBuf]) -> Result<()> {
     let token = crate::agent::sign::generate_bearer_token()
         .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))?;
     let profile_owned = profile.to_string();
-    let bootstrap = CdpBootstrap::start(token.clone(), move || ensure_browser(&profile_owned))
-        .map_err(|e| Error::Other(e.to_string()))?;
+    let start_url = url.map(ToOwned::to_owned);
+    let bootstrap = CdpBootstrap::start(token.clone(), move || {
+        ensure_browser(&profile_owned, start_url.as_deref())
+    })
+    .map_err(|e| Error::Other(e.to_string()))?;
 
     let endpoint = bootstrap.endpoint();
     let mut child_command = Command::new(executable);
@@ -94,12 +101,14 @@ fn run_as_principal(profile: &str, command: &[PathBuf]) -> Result<()> {
     }
 }
 
-fn ensure_browser(profile: &str) -> std::result::Result<String, String> {
+fn ensure_browser(profile: &str, start_url: Option<&str>) -> std::result::Result<String, String> {
     let base = resolve_runtime_base().map_err(|e| e.to_string())?;
     let mut client =
         PrincipalClient::connect_launched(&base, profile).map_err(|e| e.to_string())?;
     let response = client
-        .request(PrincipalRequest::EnsureBrowser { start_url: None })
+        .request(PrincipalRequest::EnsureBrowser {
+            start_url: start_url.map(ToOwned::to_owned),
+        })
         .map_err(|e| e.to_string())?;
     match response {
         PrincipalResponse::BrowserEnsured(status) => status
