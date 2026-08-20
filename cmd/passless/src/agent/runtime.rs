@@ -2361,6 +2361,9 @@ impl AgentRuntime {
             ));
         }
 
+        // Reap exited/expired principals before applying the configured live-session limit.
+        self.reap_expired_sessions();
+
         let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
             ProtocolError::new(
                 ErrorCode::Internal,
@@ -2375,6 +2378,17 @@ impl AgentRuntime {
                 RecommendedAction::Abort,
             )
         })?;
+        let limit = usize::from(profile.profile_config.max_concurrent_sessions);
+        if sessions.len() >= limit {
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "profile '{}' reached max_concurrent_sessions ({})",
+                    profile_id, limit
+                ),
+                RecommendedAction::RetryWithBackoff,
+            ));
+        }
 
         let program = validate_principal_executable(&command[0], self.daemon_uid)?;
         let args = if command.len() > 1 {
@@ -5730,7 +5744,8 @@ mod tests {
     #[test]
     fn pending_to_active_atomic_transition() {
         let pending_mutex: Mutex<Option<PendingRuntime>> = Mutex::new(None);
-        let active_mutex: Mutex<Option<ActiveBrowserLease>> = Mutex::new(None);
+        let active_mutex: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>> =
+            Mutex::new(HashMap::new());
 
         let lease_id = BrowserLeaseId::new();
         let session_id = PrincipalSessionId::new();
@@ -5745,30 +5760,35 @@ mod tests {
         });
 
         assert!(pending_mutex.lock().unwrap().is_some());
-        assert!(active_mutex.lock().unwrap().is_none());
+        assert!(active_mutex.lock().unwrap().is_empty());
 
-        let taken = pending_mutex.lock().unwrap().take();
-        *active_mutex.lock().unwrap() = taken.map(|p| ActiveBrowserLease {
-            lease_id: p.browser_lease_id.unwrap(),
-            session_id: p.session_id,
-        });
+        let pending = pending_mutex.lock().unwrap().take().unwrap();
+        active_mutex.lock().unwrap().insert(
+            pending.session_id.clone(),
+            ActiveBrowserLease {
+                lease_id: pending.browser_lease_id.unwrap(),
+                session_id: pending.session_id,
+            },
+        );
 
         assert!(pending_mutex.lock().unwrap().is_none());
         let active = active_mutex.lock().unwrap();
-        assert!(active.is_some());
-        let active = active.as_ref().unwrap();
+        let active = active.get(&session_id).unwrap();
         assert_eq!(active.lease_id, lease_id);
         assert_eq!(active.session_id, session_id);
     }
 
     #[test]
-    fn cleanup_clears_both_pending_and_active() {
+    fn cleanup_clears_both_pending_and_active_for_one_session() {
         let pending_mutex: Mutex<Option<PendingRuntime>> = Mutex::new(None);
-        let active_mutex: Mutex<Option<ActiveBrowserLease>> = Mutex::new(None);
+        let active_mutex: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>> =
+            Mutex::new(HashMap::new());
 
         let lease_id_pending = BrowserLeaseId::new();
         let lease_id_active = BrowserLeaseId::new();
         let session_id = PrincipalSessionId::new();
+        let other_session_id = PrincipalSessionId::new();
+        let other_lease_id = BrowserLeaseId::new();
 
         *pending_mutex.lock().unwrap() = Some(PendingRuntime {
             request_id: PendingRequestId::new(),
@@ -5778,19 +5798,38 @@ mod tests {
             clamped_session_ttl_secs: 60,
         });
 
-        *active_mutex.lock().unwrap() = Some(ActiveBrowserLease {
-            lease_id: lease_id_active.clone(),
-            session_id: session_id.clone(),
-        });
+        {
+            let mut active = active_mutex.lock().unwrap();
+            active.insert(
+                session_id.clone(),
+                ActiveBrowserLease {
+                    lease_id: lease_id_active.clone(),
+                    session_id: session_id.clone(),
+                },
+            );
+            active.insert(
+                other_session_id.clone(),
+                ActiveBrowserLease {
+                    lease_id: other_lease_id.clone(),
+                    session_id: other_session_id.clone(),
+                },
+            );
+        }
 
         assert!(pending_mutex.lock().unwrap().is_some());
-        assert!(active_mutex.lock().unwrap().is_some());
+        assert_eq!(active_mutex.lock().unwrap().len(), 2);
 
         *pending_mutex.lock().unwrap() = None;
-        *active_mutex.lock().unwrap() = None;
+        active_mutex.lock().unwrap().remove(&session_id);
 
         assert!(pending_mutex.lock().unwrap().is_none());
-        assert!(active_mutex.lock().unwrap().is_none());
+        let active = active_mutex.lock().unwrap();
+        assert!(!active.contains_key(&session_id));
+        assert_eq!(
+            active.get(&other_session_id).unwrap().lease_id,
+            other_lease_id,
+            "cleaning one session must not remove another session's browser"
+        );
     }
 
     #[test]
@@ -5880,6 +5919,7 @@ mod tests {
             mode: AgentMode::Isolated,
             profile_config: passless_core::agent::AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: passless_core::agent::config::CredentialSelection::Single,
                 human_verification_prompt:
                     passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -6123,6 +6163,7 @@ mod tests {
                 "test-isolated".to_string(),
                 passless_core::agent::AgentProfileConfig {
                     max_operations: 64,
+                    max_concurrent_sessions: 1,
                     credential_selection: passless_core::agent::config::CredentialSelection::Single,
                     human_verification_prompt:
                         passless_core::agent::config::HumanVerificationPrompt::Always,

@@ -30,9 +30,15 @@ pub const ANY_RP_ID: &str = "*";
 
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
 const MAX_OPERATIONS: u16 = 4096;
+const DEFAULT_MAX_CONCURRENT_SESSIONS: u16 = 1;
+const MAX_CONCURRENT_SESSIONS: u16 = 64;
 
 fn default_max_operations() -> u16 {
     DEFAULT_MAX_OPERATIONS
+}
+
+fn default_max_concurrent_sessions() -> u16 {
+    DEFAULT_MAX_CONCURRENT_SESSIONS
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -619,6 +625,9 @@ pub struct AgentProfileConfig {
     pub max_session_ttl: Option<BoundedDuration>,
     #[serde(default = "default_max_operations")]
     pub max_operations: u16,
+    /// Maximum number of live principal runtime sessions allowed for this profile.
+    #[serde(default = "default_max_concurrent_sessions")]
+    pub max_concurrent_sessions: u16,
     #[serde(default)]
     pub credential_selection: CredentialSelection,
     #[serde(default)]
@@ -731,6 +740,23 @@ impl AgentProfileConfig {
             return Err(Error::Config(format!(
                 "agent profile '{}': max_operations must be between 1 and {}",
                 profile_id, MAX_OPERATIONS
+            )));
+        }
+        if self.max_concurrent_sessions == 0
+            || self.max_concurrent_sessions > MAX_CONCURRENT_SESSIONS
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': max_concurrent_sessions must be between 1 and {}",
+                profile_id, MAX_CONCURRENT_SESSIONS
+            )));
+        }
+        if self.max_concurrent_sessions > 1
+            && self.browser_cdp_expose == Some(CdpExposeMode::Port)
+            && self.browser_cdp_port.unwrap_or(0) != 0
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': browser_cdp_port must be 0 (or omitted) when max_concurrent_sessions > 1 in port mode",
+                profile_id
             )));
         }
         if let CredentialSelection::Credential(reference) = &self.credential_selection
@@ -1509,6 +1535,7 @@ register = "deny"
     fn make_isolated_profile() -> AgentProfileConfig {
         AgentProfileConfig {
             max_operations: 64,
+            max_concurrent_sessions: 1,
             credential_selection: CredentialSelection::Single,
             human_verification_prompt: HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
@@ -1822,6 +1849,7 @@ verbose = false
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -1850,6 +1878,7 @@ verbose = false
             "b".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -1892,6 +1921,7 @@ verbose = false
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -1944,6 +1974,7 @@ verbose = false
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2174,6 +2205,7 @@ product_id = 2
             "myprofile".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2224,6 +2256,7 @@ product_id = 2
                 name.to_string(),
                 AgentProfileConfig {
                     max_operations: 64,
+                    max_concurrent_sessions: 1,
                     credential_selection: CredentialSelection::Single,
                     human_verification_prompt: HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
@@ -2357,6 +2390,7 @@ backend_type = "local"
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2419,6 +2453,7 @@ backend_type = "local"
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2473,6 +2508,7 @@ backend_type = "local"
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2823,6 +2859,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2857,6 +2894,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             "b".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2936,6 +2974,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2970,6 +3009,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             "b".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -3020,6 +3060,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             "a".to_string(),
             AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,

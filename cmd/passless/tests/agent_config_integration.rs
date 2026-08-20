@@ -22,6 +22,7 @@ fn minimal_device() -> DeviceIdentity {
 fn isolated_profile() -> AgentProfileConfig {
     AgentProfileConfig {
         max_operations: 64,
+        max_concurrent_sessions: 1,
         credential_selection: passless_core::agent::config::CredentialSelection::Single,
         human_verification_prompt: passless_core::agent::config::HumanVerificationPrompt::Always,
         mode: AgentMode::Isolated,
@@ -45,6 +46,36 @@ fn isolated_profile() -> AgentProfileConfig {
         browser_cdp_expose: None,
         browser_cdp_port: None,
     }
+}
+
+#[test]
+fn max_concurrent_sessions_zero_rejected() {
+    let mut profile = isolated_profile();
+    profile.max_concurrent_sessions = 0;
+    let pid = passless_core::agent::ProfileId::new("test").unwrap();
+    let err = profile.validate(&pid).unwrap_err();
+    assert!(err.to_string().contains("max_concurrent_sessions"));
+}
+
+#[test]
+fn concurrent_port_mode_rejects_fixed_cdp_port() {
+    let mut profile = isolated_profile();
+    profile.max_concurrent_sessions = 2;
+    profile.browser_cdp_expose = Some(passless_core::agent::config::CdpExposeMode::Port);
+    profile.browser_cdp_port = Some(9222);
+    let pid = passless_core::agent::ProfileId::new("test").unwrap();
+    let err = profile.validate(&pid).unwrap_err();
+    assert!(err.to_string().contains("browser_cdp_port must be 0"));
+}
+
+#[test]
+fn concurrent_port_mode_accepts_ephemeral_cdp_port() {
+    let mut profile = isolated_profile();
+    profile.max_concurrent_sessions = 2;
+    profile.browser_cdp_expose = Some(passless_core::agent::config::CdpExposeMode::Port);
+    profile.browser_cdp_port = Some(0);
+    let pid = passless_core::agent::ProfileId::new("test").unwrap();
+    assert!(profile.validate(&pid).is_ok());
 }
 
 #[test]

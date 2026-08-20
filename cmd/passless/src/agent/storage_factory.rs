@@ -657,6 +657,7 @@ mod tests {
 
         let profile = AgentProfileConfig {
             max_operations: 64,
+            max_concurrent_sessions: 1,
             credential_selection: passless_core::agent::config::CredentialSelection::Single,
             human_verification_prompt:
                 passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -705,6 +706,7 @@ mod tests {
 
         let profile = AgentProfileConfig {
             max_operations: 64,
+            max_concurrent_sessions: 1,
             credential_selection: passless_core::agent::config::CredentialSelection::Single,
             human_verification_prompt:
                 passless_core::agent::config::HumanVerificationPrompt::Always,
