@@ -15,6 +15,11 @@ repos:
     rev: v1.38.0
     hooks:
       - id: yamllint
+        exclude: >
+          (?x)^(
+            \.github/workflows/issue-432-.*\.yml|
+            \.github/issue-432-.*\.yml
+          )$
 
   - repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
     rev: v9.26.0
