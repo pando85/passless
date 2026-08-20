@@ -465,9 +465,10 @@ mod tests {
             "GET /json/version/ HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains(
-            r#"\"webSocketDebuggerUrl\":\"ws://127.0.0.1:43871/devtools/browser/uuid\""#
-        ));
+        assert!(
+            response
+                .contains(r#""webSocketDebuggerUrl":"ws://127.0.0.1:43871/devtools/browser/uuid""#)
+        );
     }
 
     #[test]
