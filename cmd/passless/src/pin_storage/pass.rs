@@ -5,6 +5,7 @@ use crate::pin_storage::{
 };
 use crate::storage::pass::GpgBackend;
 use crate::storage::pass::gpg_id;
+use crate::storage::pass::sync::PassGitSync;
 use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
@@ -14,10 +15,11 @@ use std::sync::RwLock;
 
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
-use prs_lib::{Ciphertext, Plaintext, Store};
+use prs_lib::{Ciphertext, Plaintext};
 
 const PIN_CONFIG_ENTRY: &str = "pin_state";
-const PIN_RETRIES_ENTRY: &str = "pin_retries";
+const PIN_RETRIES_ENTRY: &str = "pin_retries.local";
+const LEGACY_PIN_RETRIES_ENTRY: &str = "pin_retries";
 
 /// Tracked state for conflict detection
 #[derive(Debug, Clone)]
@@ -37,6 +39,7 @@ pub struct PassPinStorage {
     store_path: PathBuf,
     fido2_path: PathBuf,
     gpg_backend: GpgBackend,
+    sync: PassGitSync,
     /// Last known config state for change detection (for git sync optimization)
     last_config: RwLock<Option<SerializablePinConfig>>,
     /// Last synced config state for conflict detection
@@ -44,20 +47,36 @@ pub struct PassPinStorage {
 }
 
 impl PassPinStorage {
-    /// Create a new Pass PIN storage
+    /// Create a new Pass PIN storage with automatic Git synchronization.
     pub fn new(store_path: PathBuf, fido2_path: PathBuf, gpg_backend: GpgBackend) -> Self {
+        let sync = PassGitSync::new(store_path.clone(), true);
+        Self::new_with_sync(store_path, fido2_path, gpg_backend, sync)
+    }
+
+    /// Create PIN storage sharing the credential backend's operation coordinator.
+    pub fn new_with_sync(
+        store_path: PathBuf,
+        fido2_path: PathBuf,
+        gpg_backend: GpgBackend,
+        sync: PassGitSync,
+    ) -> Self {
         debug!(
             "Pass PIN storage: store={}, path={}",
             store_path.display(),
             fido2_path.display()
         );
-        Self {
+        let storage = Self {
             store_path,
             fido2_path,
             gpg_backend,
+            sync,
             last_config: RwLock::new(None),
             last_synced: RwLock::new(None),
-        }
+        };
+        storage
+            .sync
+            .ensure_local_only_path(&storage.get_retries_path());
+        storage
     }
 
     fn get_config_path(&self) -> PathBuf {
@@ -86,53 +105,6 @@ impl PassPinStorage {
 
     fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
         gpg_id::resolve_recipients_for_target(&self.store_path, target)
-    }
-
-    fn sync_prepare(&self) -> Result<()> {
-        debug!("Preparing password store sync for PIN config");
-
-        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
-            debug!("Failed to open store for sync: {:?}", e);
-            Error::Storage(format!("Failed to open store for sync: {:?}", e))
-        })?;
-
-        let sync = store.sync();
-
-        match sync.prepare() {
-            Ok(()) => {
-                debug!("Successfully prepared store sync (pulled if remote configured)");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to prepare store sync: {:?}", e);
-                Ok(())
-            }
-        }
-    }
-
-    fn sync_finalize(&self, message: &str) -> Result<()> {
-        debug!("Finalizing password store sync: {}", message);
-
-        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
-            debug!("Failed to open store for sync: {:?}", e);
-            Error::Storage(format!("Failed to open store for sync: {:?}", e))
-        })?;
-
-        let sync = store.sync();
-
-        match sync.finalize(message) {
-            Ok(()) => {
-                debug!(
-                    "Successfully finalized store sync (committed and pushed if remote configured)"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                debug!("Failed to finalize store sync: {:?}", e);
-                warn!("Failed to finalize store sync: {:?}", e);
-                Ok(())
-            }
-        }
     }
 
     fn load_config(&self) -> std::result::Result<SerializablePinConfig, soft_fido2::StatusCode> {
@@ -233,21 +205,13 @@ impl PassPinStorage {
                 soft_fido2::StatusCode::Other
             })?;
 
-        let relative_path = path
-            .strip_prefix(&self.store_path)
-            .unwrap_or(&path)
-            .display();
-        let commit_message = format!("Update PIN configuration: {}.", relative_path);
-        self.sync_finalize(&commit_message).map_err(|e| {
-            warn!("Failed to sync PIN config: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
+        self.sync.mark_dirty("Update Passless PIN configuration.");
 
         *self.last_config.write().map_err(|e| {
             warn!("Failed to acquire config lock: {:?}", e);
             soft_fido2::StatusCode::Other
         })? = Some(config.clone());
-        debug!("PIN config saved and synced successfully");
+        debug!("PIN config saved successfully; Git finalization deferred to operation end");
         Ok(())
     }
 
@@ -316,10 +280,7 @@ impl PassPinStorage {
             return Ok(None);
         };
 
-        // Pull latest from remote to check for conflicts
-        if let Err(e) = self.sync_prepare() {
-            warn!("Failed to prepare sync for conflict check: {:?}", e);
-        }
+        // The operation coordinator already pulled before synchronized state was accessed.
 
         // Load remote config after pull
         let remote_config = self.load_config()?;
@@ -390,10 +351,7 @@ impl PassPinStorage {
 
 impl PinStorage for PassPinStorage {
     fn load_pin_state(&self) -> std::result::Result<soft_fido2::PinState, soft_fido2::StatusCode> {
-        // Pull latest changes from git remote if configured
-        if let Err(e) = self.sync_prepare() {
-            warn!("Failed to prepare sync for PIN config: {:?}", e);
-        }
+        self.sync.prepare_if_needed();
 
         let config = self.load_config()?;
         let retries = self.load_retries()?;

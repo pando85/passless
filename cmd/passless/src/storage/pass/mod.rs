@@ -2,6 +2,7 @@
 
 pub mod gpg_id;
 pub mod init;
+pub mod sync;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
@@ -141,9 +142,6 @@ impl PassStorageAdapter {
             iteration_entries: Default::default(),
         };
 
-        // Pull latest changes from git remote if configured
-        adapter.sync_prepare()?;
-
         // Load indexes by scanning directory structure (no decryption!)
         adapter.indexes = load_credential_paths(&adapter.get_fido2_path(), "gpg")
             .map_err(|e| Error::Storage(format!("Failed to load credential paths: {}", e)))?;
@@ -154,29 +152,6 @@ impl PassStorageAdapter {
     /// Get the FIDO path within the password store
     fn get_fido2_path(&self) -> PathBuf {
         self.store_path.join(&self.path)
-    }
-
-    /// Prepare the store for changes (pulls from git remote if configured)
-    fn sync_prepare(&self) -> Result<()> {
-        debug!("Preparing password store sync");
-
-        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
-            debug!("Failed to open store for sync: {:?}", e);
-            Error::Storage(format!("Failed to open store for sync: {:?}", e))
-        })?;
-
-        let sync = store.sync();
-
-        match sync.prepare() {
-            Ok(()) => {
-                debug!("Successfully prepared store sync (pulled if remote configured)");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to prepare store sync: {:?}", e);
-                Ok(())
-            }
-        }
     }
 
     /// Finalize changes to the store (commits and pushes to git remote if configured)
@@ -355,14 +330,6 @@ impl PassStorageAdapter {
         let path_info = CredentialPathInfo::new(rp_id, cred.id.to_vec(), "gpg".to_string());
         update_indexes_on_write(&mut self.indexes, path_info);
 
-        // Commit and push changes to git remote if configured
-        let relative_path = path
-            .strip_prefix(&self.store_path)
-            .unwrap_or(&path)
-            .display();
-        let commit_message = format!("Add generated password for {}.", relative_path);
-        self.sync_finalize(&commit_message)?;
-
         Ok(())
     }
 
@@ -398,14 +365,6 @@ impl PassStorageAdapter {
         update_indexes_on_delete(&mut self.indexes, id);
 
         debug!("Successfully deleted credential");
-
-        // Commit and push changes to git remote if configured
-        let relative_path = path
-            .strip_prefix(&self.store_path)
-            .unwrap_or(&path)
-            .display();
-        let commit_message = format!("Remove {} from store.", relative_path);
-        self.sync_finalize(&commit_message)?;
 
         Ok(())
     }
