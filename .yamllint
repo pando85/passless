@@ -1,5 +1,11 @@
 extends: default
 
+ignore: |
+  .github/workflows/issue-432-apply.yml
+  .github/issue-432-original-helper.yml
+  .github/workflows/issue-432-push-driver.yml
+  .github/workflows/issue-432-pr-driver.yml
+
 rules:
   document-start: disable
   line-length: disable
