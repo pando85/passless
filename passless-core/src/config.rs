@@ -1343,6 +1343,18 @@ pub enum AgentCommand {
         #[arg(long, value_name = "MS", default_value = "5000")]
         timeout_ms: u32,
     },
+    /// Run Playwright MCP with lazy access to the profile's trusted CDP browser
+    PlaywrightMcp {
+        /// Profile to bind the Playwright session to
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Start URL to open in the managed browser
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Absolute Playwright MCP executable and arguments
+        #[arg(last = true, required = true)]
+        command: Vec<std::path::PathBuf>,
+    },
     /// Launch a detached principal session
     Run {
         /// Profile to launch

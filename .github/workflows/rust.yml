@@ -17,11 +17,10 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install stable toolchain
-        id: toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - run: rustup override set ${{steps.toolchain.outputs.name}}
-      - run: rustup component add rustfmt
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup override set stable
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
@@ -39,17 +38,14 @@ jobs:
       - name: Install udev and tss2 for TPM support
         run: sudo apt-get install -y libudev-dev libtss2-dev
 
-
       - name: Install stable toolchain
-        id: toolchain
-        uses: dtolnay/rust-toolchain@stable
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup override set stable
 
-      - run: rustup override set ${{steps.toolchain.outputs.name}}
-      - run: rustup component add clippy
-
-      - uses: clechasseur/rs-clippy-check@v6.0.7
-        with:
-          args: --all-features -- --deny warnings
+      - name: Run cargo clippy
+        run: cargo clippy --all-features -- --deny warnings
 
   agent-validation:
     name: Agent validation (deterministic)
@@ -65,14 +61,15 @@ jobs:
           sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
 
       - name: Install Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Run deterministic agent validation
         run: make test-agent-validation
@@ -96,14 +93,12 @@ jobs:
       - name: Install udev and tss2
         run: sudo apt-get install -y libudev-dev libtss2-dev
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: ${{ matrix.job.target }}
-          override: true
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+          rustup target add ${{ matrix.job.target }}
 
       - name: Build
         shell: bash
@@ -112,6 +107,46 @@ jobs:
       - name: Run tests
         shell: bash
         run: cargo test --verbose
+
+      - name: Extract crate information
+        shell: bash
+        run: |
+          echo "PROJECT_NAME=passless" >> $GITHUB_ENV
+          echo "PROJECT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | head -n1)" >> $GITHUB_ENV
+
+      - name: Make release
+        shell: bash
+        run: |
+          export CARGO_TARGET=${{ matrix.job.target }}
+          export PKG_BASE_NAME=${PROJECT_NAME}-${PROJECT_VERSION}-${CARGO_TARGET}
+          make release
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {target: x86_64-unknown-linux-gnu, os: ubuntu-22.04}
+          - {target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm}
+    name: Release ${{ matrix.job.target }} (${{ matrix.job.os }})
+    runs-on: ${{ matrix.job.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update apt
+        run: sudo apt update
+
+      - name: Install udev and tss2
+        run: sudo apt-get install -y libudev-dev libtss2-dev
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+          rustup target add ${{ matrix.job.target }}
 
       - name: Extract crate information
         shell: bash
@@ -129,18 +164,13 @@ jobs:
           echo "PKG_BASE_NAME=${PKG_BASE_NAME}" >> $GITHUB_OUTPUT
 
       - name: Generate SHA256 hash
-        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            shasum -a 256 ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz > ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
-          else
-            sha256sum ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz > ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
-          fi
+          sha256sum ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz > ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
           cat ${{ steps.package.outputs.PKG_BASE_NAME }}.tar.gz.sha256
 
       - name: Publish crates
-        if: startsWith(github.ref, 'refs/tags/') && matrix.job.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.job.target == 'x86_64-unknown-linux-gnu'
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         shell: bash
@@ -149,7 +179,6 @@ jobs:
           make publish || true
 
       - name: Get Changelog Entry
-        if: startsWith(github.ref, 'refs/tags/')
         id: changelog_reader
         uses: mindsers/changelog-reader-action@v2.4.0
         with:
@@ -157,7 +186,6 @@ jobs:
           path: ./CHANGELOG.md
 
       - name: Prepare release files list
-        if: startsWith(github.ref, 'refs/tags/')
         id: release_files
         shell: bash
         run: |
@@ -173,7 +201,6 @@ jobs:
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           body: ${{ steps.changelog_reader.outputs.changes }}
           prerelease: ${{ steps.changelog_reader.outputs.status == 'prereleased' }}

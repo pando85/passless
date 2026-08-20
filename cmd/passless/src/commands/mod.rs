@@ -4,6 +4,8 @@ pub mod agent;
 pub mod agent_admin;
 pub mod client;
 pub mod custom;
+#[cfg(feature = "agent")]
+pub mod playwright_mcp;
 #[cfg(feature = "tpm")]
 pub mod tpm;
 #[cfg(feature = "tpm")]

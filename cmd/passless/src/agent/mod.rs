@@ -2,6 +2,7 @@ pub mod audit;
 pub mod audit_events;
 pub mod backend;
 pub mod browser;
+pub mod cdp_bootstrap;
 pub mod ceremony;
 #[cfg(test)]
 pub mod ceremony_observer;

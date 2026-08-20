@@ -58,6 +58,8 @@ use crate::worker::{WorkerConfig, WorkerHooks};
 #[cfg(feature = "agent")]
 use passless_uhid::RawUhidDevice;
 
+mod browser_ensure;
+
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WORKERS: usize = 16;
 const MAX_COMPLETED_SESSIONS: usize = 256;
@@ -5502,6 +5504,13 @@ impl PrincipalHandler for AgentRuntime {
                 profile_id: _req_profile_id,
             } => self.handle_list_credentials(&profile_id, profile),
             PrincipalRequest::BrowserStatus => self.handle_browser_status(&profile_id, profile),
+            PrincipalRequest::EnsureBrowser { start_url } => self.handle_ensure_browser(
+                &profile_id,
+                &managed.session_id,
+                &managed.process_digest,
+                start_url.as_deref(),
+                profile,
+            ),
             PrincipalRequest::EndpointStatus => {
                 let current_eid = profile.endpoint_id.lock().unwrap().clone();
                 match current_eid {
