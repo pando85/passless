@@ -4,18 +4,21 @@ on:
   push:
     branches:
       - feat/session-scoped-browser-isolation
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: ${{ !contains(github.event.head_commit.message, '[session-bootstrap]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: feat/session-scoped-browser-isolation
 
       - name: Decode deterministic transform
         shell: bash
