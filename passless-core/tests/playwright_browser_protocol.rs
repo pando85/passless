@@ -5,6 +5,7 @@ mod tests {
     };
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn protocol_minor_version_covers_ensure_browser() {
         assert_eq!(CURRENT_VERSION.major, 1);
         assert!(CURRENT_VERSION.minor >= 2);
