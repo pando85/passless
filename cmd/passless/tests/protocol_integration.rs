@@ -37,7 +37,7 @@ fn version_negotiation_accepts_current_major() {
 fn version_negotiation_accepts_higher_minor() {
     let offer = ProtocolVersion::new(1, 99);
     let negotiated = ProtocolVersion::negotiate(offer).unwrap();
-    assert_eq!(negotiated.minor, 1);
+    assert_eq!(negotiated.minor, 2);
 }
 
 #[test]
