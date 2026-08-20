@@ -9,6 +9,16 @@ python3 <<'PY'
           if old_helper not in script:
               raise SystemExit('could not locate original replace_exact helper')
           script = script.replace(old_helper, new_helper, 1)
+          ctor_guard = "if old_ctor not in text:\n    raise SystemExit('pin pass: ctor not found')\ntext = text.replace(old_ctor, new_ctor, 1)"
+          ctor_rewrite = "p.write_text(text)\nreplace_exact(str(p), old_ctor, new_ctor)\ntext = p.read_text()"
+          if ctor_guard not in script:
+              raise SystemExit('could not locate PIN constructor guard')
+          script = script.replace(ctor_guard, ctor_rewrite, 1)
+          changed_guard = "if old_changed not in text:\n    raise SystemExit('pin pass: config_changed block not found')\ntext = text.replace(old_changed, new_changed, 1)"
+          changed_rewrite = "p.write_text(text)\nreplace_exact(str(p), old_changed, new_changed)\ntext = p.read_text()"
+          if changed_guard not in script:
+              raise SystemExit('could not locate PIN config_changed guard')
+          script = script.replace(changed_guard, changed_rewrite, 1)
           exec(compile(script, '/tmp/original-issue-432-implementation.py', 'exec'))
           pin_path = Path('cmd/passless/src/pin_storage/pass.rs')
           pin_text = pin_path.read_text()
