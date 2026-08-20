@@ -47,12 +47,6 @@ pub struct PassPinStorage {
 }
 
 impl PassPinStorage {
-    /// Create a new Pass PIN storage with automatic Git synchronization.
-    pub fn new(store_path: PathBuf, fido2_path: PathBuf, gpg_backend: GpgBackend) -> Self {
-        let sync = PassGitSync::new(store_path.clone(), true);
-        Self::new_with_sync(store_path, fido2_path, gpg_backend, sync)
-    }
-
     /// Create PIN storage sharing the credential backend's operation coordinator.
     pub fn new_with_sync(
         store_path: PathBuf,
