@@ -27,6 +27,47 @@ jobs:
           start = next(i for i, line in enumerate(source) if line.strip() == "python3 <<'PY'") + 1
           end = next(i for i in range(start, len(source)) if source[i].strip() == 'PY')
           script = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[start:end]) + '\n'
+
+          old_helper = '''def replace_exact(path, old, new, count=1):
+    p = Path(path)
+    text = p.read_text()
+    found = text.count(old)
+    if found != count:
+        raise SystemExit(f"{path}: expected {count} occurrences, found {found}: {old[:100]!r}")
+    p.write_text(text.replace(old, new, count))
+'''
+          new_helper = '''def replace_exact(path, old, new, count=1):
+    p = Path(path)
+    text = p.read_text()
+    found = text.count(old)
+    if found == count:
+        p.write_text(text.replace(old, new, count))
+        return
+
+    # YAML block indentation can alter leading whitespace inside multiline
+    # literals. Fall back to a line-normalized match while still requiring
+    # exactly the expected number of occurrences.
+    target = [line.strip() for line in old.splitlines()]
+    lines = text.splitlines(keepends=True)
+    width = len(target)
+    matches = []
+    for index in range(0, len(lines) - width + 1):
+        if [line.strip() for line in lines[index:index + width]] == target:
+            matches.append(index)
+    if len(matches) != count:
+        raise SystemExit(
+            f"{path}: expected {count} normalized occurrences, found {len(matches)}: {old[:100]!r}"
+        )
+    for index in reversed(matches):
+        replacement = new
+        if replacement and not replacement.endswith("\\n"):
+            replacement += "\\n"
+        lines[index:index + width] = [replacement]
+    p.write_text(''.join(lines))
+'''
+          if old_helper not in script:
+              raise SystemExit('could not locate replace_exact helper')
+          script = script.replace(old_helper, new_helper, 1)
           Path('/tmp/apply-432.py').write_text(script)
           PY
           python3 /tmp/apply-432.py
