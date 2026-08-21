@@ -979,7 +979,7 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
                     Err(Error::Other(format!("child exited with code {}", code)))
                 }
             } else {
-                Ok(())
+                Err(Error::Other("terminated by signal".to_string()))
             }
         }
         _ => Err(Error::Other("unexpected response".to_string())),
