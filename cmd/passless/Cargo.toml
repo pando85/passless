@@ -45,6 +45,7 @@ notify-rust.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 ctrlc.workspace = true
+signal-hook.workspace = true
 clap.workspace = true
 zeroize.workspace = true
 hex.workspace = true

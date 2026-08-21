@@ -916,34 +916,30 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
                 eprintln!("profile_id: {}", launched.profile_id);
             }
 
-            let ctrlc_session_id = session_id.clone();
-            let ctrlc_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let ctrlc_flag_clone = ctrlc_flag.clone();
+            let terminate_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminate_flag_clone = terminate_flag.clone();
 
-            ctrlc::set_handler(move || {
-                if ctrlc_flag_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::process::exit(130);
-                }
-                ctrlc_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-
-                match connect_admin() {
-                    Ok(mut terminate_client) => {
-                        let _ = terminate_client.request(AdminRequest::RevokeSession {
-                            session_id: ctrlc_session_id.clone(),
-                        });
-                    }
-                    Err(_) => {
-                        std::process::exit(130);
-                    }
+            ctrlc::set_handler({
+                let flag = terminate_flag_clone.clone();
+                move || {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             })
             .map_err(|e| Error::Other(format!("failed to set Ctrl+C handler: {}", e)))?;
+
+            signal_hook::flag::register(libc::SIGTERM, terminate_flag_clone)
+                .map_err(|e| Error::Other(format!("failed to register SIGTERM handler: {}", e)))?;
 
             let mut exit_code: Option<i32> = None;
             let mut signal: Option<i32> = None;
 
             loop {
-                if ctrlc_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                if terminate_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Ok(mut client) = connect_admin() {
+                        let _ = client.request(AdminRequest::RevokeSession {
+                            session_id: session_id.clone(),
+                        });
+                    }
                     break;
                 }
 
