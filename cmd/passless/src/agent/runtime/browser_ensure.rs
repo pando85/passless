@@ -122,26 +122,6 @@ impl AgentRuntime {
             )
         })?;
 
-        // Fast path: a browser explicitly owned by this principal session is still alive.
-        {
-            let current = profile.active_browser.lock().map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "active browser lock poisoned",
-                    RecommendedAction::Abort,
-                )
-            })?;
-            if let Some(active) = current.as_ref()
-                && active.session_id != *session_id
-            {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "profile browser is owned by another principal session",
-                    RecommendedAction::RetryWithBackoff,
-                ));
-            }
-        }
-
         let mut browser_manager = self.browser_manager.lock().map_err(|_| {
             ProtocolError::new(
                 ErrorCode::Internal,
@@ -160,7 +140,7 @@ impl AgentRuntime {
                     RecommendedAction::Abort,
                 )
             })?
-            .as_ref()
+            .get(session_id)
             .map(|active| active.lease_id.clone());
 
         if let Some(lease_id) = active_lease_id {
@@ -181,27 +161,21 @@ impl AgentRuntime {
             let _ = browser_manager.terminate(&lease_id);
             let _ = browser_manager.cleanup(&lease_id);
             browser_manager.remove(&lease_id);
-            *profile.active_browser.lock().map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "active browser lock poisoned",
-                    RecommendedAction::Abort,
-                )
-            })? = None;
+            profile
+                .active_browser
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "active browser lock poisoned",
+                        RecommendedAction::Abort,
+                    )
+                })?
+                .remove(session_id);
         }
 
-        // Do not silently adopt an admin-launched or otherwise unowned lease. A CDP port is full
-        // browser authority, so ownership ambiguity is a hard conflict rather than a reuse hint.
-        if browser_manager
-            .find_live_lease_for_profile(profile_id)
-            .is_some()
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::Conflict,
-                "a live browser exists for the profile but is not owned by this principal session",
-                RecommendedAction::RetryWithBackoff,
-            ));
-        }
+        // Other sessions (and admin-launched browsers) may have live leases for the same
+        // authority profile. They are intentionally outside this principal's ownership namespace.
 
         let endpoint_id = profile
             .endpoint_id
@@ -500,16 +474,23 @@ impl AgentRuntime {
                 )
             })?;
 
-        *profile.active_browser.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "active browser lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })? = Some(ActiveBrowserLease {
-            lease_id: lease_id.clone(),
-            session_id: session_id.clone(),
-        });
+        profile
+            .active_browser
+            .lock()
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "active browser lock poisoned",
+                    RecommendedAction::Abort,
+                )
+            })?
+            .insert(
+                session_id.clone(),
+                ActiveBrowserLease {
+                    lease_id: lease_id.clone(),
+                    session_id: session_id.clone(),
+                },
+            );
 
         Ok(browser_ensured(
             LeaseState::AuthenticationPending.to_string(),

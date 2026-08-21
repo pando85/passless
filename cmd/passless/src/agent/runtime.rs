@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
@@ -193,7 +193,7 @@ pub struct ProfileRuntime {
     pub mode: AgentMode,
     pub profile_config: AgentProfileConfig,
     pub current_pending: Mutex<Option<PendingRuntime>>,
-    pub active_browser: Mutex<Option<ActiveBrowserLease>>,
+    pub active_browser: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>>,
     pub daemon_uid: u32,
     pub daemon_gid: u32,
     pub browser_uid: Option<u32>,
@@ -518,7 +518,7 @@ pub struct AgentRuntime {
     policy_runtime: Arc<PolicyRuntime>,
     browser_manager: Arc<Mutex<BrowserProcessManager>>,
     profiles: BTreeMap<ProfileId, ProfileRuntime>,
-    managed_sessions: BTreeMap<ProfileId, Mutex<Option<ManagedPrincipalSession>>>,
+    managed_sessions: BTreeMap<ProfileId, Mutex<Vec<ManagedPrincipalSession>>>,
     completed_sessions: Mutex<BTreeMap<String, CompletedSession>>,
     event_rx: Mutex<EndpointEventReceiver>,
     shutdown: Arc<AtomicBool>,
@@ -1151,7 +1151,7 @@ impl AgentRuntime {
                             mode: profile.mode,
                             profile_config: profile.clone(),
                             current_pending: Mutex::new(None),
-                            active_browser: Mutex::new(None),
+                            active_browser: Mutex::new(HashMap::new()),
                             daemon_uid,
                             daemon_gid,
                             browser_uid,
@@ -1187,7 +1187,7 @@ impl AgentRuntime {
 
         let mut managed_sessions = BTreeMap::new();
         for profile_id in profiles.keys() {
-            managed_sessions.insert(profile_id.clone(), Mutex::new(None));
+            managed_sessions.insert(profile_id.clone(), Mutex::new(Vec::new()));
         }
 
         let runtime = Arc::new(Self {
@@ -1769,12 +1769,9 @@ impl AgentRuntime {
                         }
                         {
                             let mut active = profile.active_browser.lock().unwrap();
-                            if let Some(ref lease) = *active
-                                && lease.lease_id == info.lease_id
-                            {
-                                *active = None;
-                                cleared = true;
-                            }
+                            let before = active.len();
+                            active.retain(|_, lease| lease.lease_id != info.lease_id);
+                            cleared |= active.len() != before;
                         }
                         if cleared {
                             let cleanup_result = browser_mgr.cleanup(&info.lease_id);
@@ -1849,12 +1846,9 @@ impl AgentRuntime {
                         }
                         {
                             let mut active = profile.active_browser.lock().unwrap();
-                            if let Some(ref lease) = *active
-                                && lease.lease_id == *lease_id
-                            {
-                                *active = None;
-                                cleared = true;
-                            }
+                            let before = active.len();
+                            active.retain(|_, lease| lease.lease_id != *lease_id);
+                            cleared |= active.len() != before;
                         }
                         if cleared {
                             let cleanup_result = browser_mgr.cleanup(lease_id);
@@ -2025,8 +2019,6 @@ impl AgentRuntime {
                     }
                 }
 
-                let active_session = self.get_session_id_for_profile(&profile_id);
-
                 let pending_snapshot = {
                     let current = profile.current_pending.lock().unwrap();
                     current.as_ref().map(|p| {
@@ -2045,9 +2037,8 @@ impl AgentRuntime {
                         None => return,
                     };
 
-                match active_session {
-                    Some(ref sid) if *sid == session_id => {}
-                    _ => return,
+                if !self.has_session(&profile_id, &session_id) {
+                    return;
                 }
 
                 let status = match self
@@ -2085,14 +2076,62 @@ impl AgentRuntime {
         }
     }
 
-    fn get_session_id_for_profile(&self, profile_id: &ProfileId) -> Option<PrincipalSessionId> {
-        if let Some(slot) = self.managed_sessions.get(profile_id) {
-            let s = slot.lock().unwrap();
-            if let Some(ref managed) = *s {
-                return Some(managed.session_id.clone());
-            }
+    fn has_session(&self, profile_id: &ProfileId, session_id: &PrincipalSessionId) -> bool {
+        self.managed_sessions.get(profile_id).is_some_and(|slot| {
+            slot.lock()
+                .map(|sessions| {
+                    sessions
+                        .iter()
+                        .any(|managed| managed.session_id == *session_id)
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn active_session_count(&self, profile_id: &ProfileId) -> usize {
+        self.managed_sessions
+            .get(profile_id)
+            .and_then(|slot| slot.lock().ok().map(|sessions| sessions.len()))
+            .unwrap_or(0)
+    }
+
+    fn cleanup_browser_for_session(
+        &self,
+        profile: &ProfileRuntime,
+        session_id: &PrincipalSessionId,
+    ) {
+        let active = profile
+            .active_browser
+            .lock()
+            .ok()
+            .and_then(|mut active| active.remove(session_id));
+        if let Some(active) = active {
+            self.revoke_sign_context_for_lease(&active.lease_id);
+            let mut browser_mgr = self.browser_manager.lock().unwrap();
+            let _ = browser_mgr.revoke(&active.lease_id);
+            let _ = browser_mgr.terminate(&active.lease_id);
+            let _ = browser_mgr.cleanup(&active.lease_id);
+            browser_mgr.remove(&active.lease_id);
         }
-        None
+    }
+
+    fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime) {
+        let leases: Vec<BrowserLeaseId> = profile
+            .active_browser
+            .lock()
+            .map(|mut active| active.drain().map(|(_, lease)| lease.lease_id).collect())
+            .unwrap_or_default();
+        if leases.is_empty() {
+            return;
+        }
+        let mut browser_mgr = self.browser_manager.lock().unwrap();
+        for lease_id in leases {
+            self.revoke_sign_context_for_lease(&lease_id);
+            let _ = browser_mgr.revoke(&lease_id);
+            let _ = browser_mgr.terminate(&lease_id);
+            let _ = browser_mgr.cleanup(&lease_id);
+            browser_mgr.remove(&lease_id);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -2194,12 +2233,20 @@ impl AgentRuntime {
             .active_browser
             .lock()
             .ok()
-            .and_then(|active| active.as_ref().map(|lease| lease.lease_id.clone()))
+            .and_then(|active| {
+                active
+                    .get(&managed.session_id)
+                    .map(|lease| lease.lease_id.clone())
+            })
             .or_else(|| {
                 profile.current_pending.lock().ok().and_then(|pending| {
-                    pending
-                        .as_ref()
-                        .and_then(|pending| pending.browser_lease_id.clone())
+                    pending.as_ref().and_then(|pending| {
+                        if pending.session_id == managed.session_id {
+                            pending.browser_lease_id.clone()
+                        } else {
+                            None
+                        }
+                    })
                 })
             });
         let budget = active_lease.as_ref().and_then(|lease_id| {
@@ -2306,50 +2353,40 @@ impl AgentRuntime {
             ));
         }
 
-        let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                format!("no session slot for profile '{}'", profile_id),
-                RecommendedAction::Abort,
-            )
-        })?;
-
-        {
-            let existing = session_slot.lock().unwrap();
-            if let Some(ref session) = *existing
-                && session.session.child.id() != 0
-            {
-                let exited;
-                let pid = session.session.child.id() as i32;
-                let proc_root = &session.session.proc_root;
-                if let Ok(start_time) = super::launcher::read_proc_start_time(pid, proc_root) {
-                    if start_time == session.session.identity.start_time {
-                        return Err(ProtocolError::new(
-                            ErrorCode::Conflict,
-                            format!(
-                                "profile '{}' already has an active session (pid {})",
-                                profile_id, pid
-                            ),
-                            RecommendedAction::RetryWithBackoff,
-                        ));
-                    }
-                    exited = true;
-                } else {
-                    exited = true;
-                }
-                if exited {
-                    drop(existing);
-                    let mut slot = session_slot.lock().unwrap();
-                    *slot = None;
-                }
-            }
-        }
-
         if command.is_empty() {
             return Err(ProtocolError::new(
                 ErrorCode::BadRequest,
                 "command must not be empty",
                 RecommendedAction::FixRequest,
+            ));
+        }
+
+        // Reap exited/expired principals before applying the configured live-session limit.
+        self.reap_expired_sessions();
+
+        let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("no session collection for profile '{}'", profile_id),
+                RecommendedAction::Abort,
+            )
+        })?;
+        let mut sessions = session_slot.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "managed session lock poisoned",
+                RecommendedAction::Abort,
+            )
+        })?;
+        let limit = usize::from(profile.profile_config.max_concurrent_sessions);
+        if sessions.len() >= limit {
+            return Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "profile '{}' reached max_concurrent_sessions ({})",
+                    profile_id, limit
+                ),
+                RecommendedAction::RetryWithBackoff,
             ));
         }
 
@@ -2435,22 +2472,19 @@ impl AgentRuntime {
             },
         );
 
-        let managed = ManagedPrincipalSession {
+        sessions.push(ManagedPrincipalSession {
             session_id: session_id.clone(),
             profile_id: profile_id.clone(),
             session,
             process_digest,
             created_at: now,
             deadline,
-        };
+        });
 
         info!(
             "Launched principal session {} for profile {} (pid {})",
             session_id, profile_id, pid
         );
-
-        let mut slot = session_slot.lock().unwrap();
-        *slot = Some(managed);
 
         Ok(AdminResponse::PrincipalLaunched(
             PrincipalLaunchedResponse {
@@ -2468,28 +2502,37 @@ impl AgentRuntime {
         let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
             ProtocolError::new(
                 ErrorCode::NotFound,
-                format!("no session slot for profile '{}'", profile_id),
+                format!("no session collection for profile '{}'", profile_id),
                 RecommendedAction::FixRequest,
             )
         })?;
-
-        let mut slot = session_slot.lock().unwrap();
-        if slot.is_none() {
+        let mut sessions = session_slot.lock().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "managed session lock poisoned",
+                RecommendedAction::Abort,
+            )
+        })?;
+        if sessions.is_empty() {
             return Err(ProtocolError::new(
                 ErrorCode::NotFound,
                 format!("no active session for profile '{}'", profile_id),
                 RecommendedAction::FixRequest,
             ));
         }
+        let terminating = std::mem::take(&mut *sessions);
+        drop(sessions);
 
-        let taken = slot.take();
-        if let Some(mut managed) = taken {
+        for mut managed in terminating {
             info!(
                 "Terminating principal session {} for profile {} (pid {})",
                 managed.session_id,
                 profile_id,
                 managed.session.child.id()
             );
+            if let Some(profile) = self.profiles.get(profile_id) {
+                self.cleanup_browser_for_session(profile, &managed.session_id);
+            }
             let exit_status = managed.session.terminate(TERMINATE_TIMEOUT);
             let (exit_code, signal) = match exit_status {
                 Some(status) => {
@@ -2501,13 +2544,16 @@ impl AgentRuntime {
                 }
                 None => (None, None),
             };
-            let completed = CompletedSession {
-                exit_code,
-                signal,
-                completed_at: Instant::now(),
-            };
             let mut completed_map = self.completed_sessions.lock().unwrap();
-            completed_map.insert(managed.session_id.to_string(), completed);
+            Self::prune_completed_before_insert(&mut completed_map);
+            completed_map.insert(
+                managed.session_id.to_string(),
+                CompletedSession {
+                    exit_code,
+                    signal,
+                    completed_at: Instant::now(),
+                },
+            );
         }
 
         Ok(AdminResponse::PrincipalTerminated)
@@ -2522,37 +2568,43 @@ impl AgentRuntime {
         let deadline = Instant::now() + timeout;
 
         loop {
-            let mut found_slot = None;
-            for session_slot in self.managed_sessions.values() {
-                let mut slot = session_slot.lock().unwrap();
-                if let Some(ref mut managed) = *slot
-                    && managed.session_id == *session_id
+            let mut found = false;
+            for (profile_id, session_slot) in &self.managed_sessions {
+                let mut sessions = session_slot.lock().unwrap();
+                if let Some(pos) = sessions
+                    .iter()
+                    .position(|managed| managed.session_id == *session_id)
                 {
-                    match managed.session.child.try_wait() {
+                    found = true;
+                    match sessions[pos].session.child.try_wait() {
                         Ok(Some(status)) => {
+                            let managed = sessions.remove(pos);
+                            drop(sessions);
                             let (exit_code, signal) = if let Some(code) = status.code() {
                                 (Some(code), None)
                             } else {
                                 (None, status.signal())
                             };
-                            let completed = CompletedSession {
-                                exit_code,
-                                signal,
-                                completed_at: Instant::now(),
-                            };
+                            if let Some(profile) = self.profiles.get(profile_id) {
+                                self.cleanup_browser_for_session(profile, session_id);
+                            }
                             let mut completed_map = self.completed_sessions.lock().unwrap();
                             Self::prune_completed_before_insert(&mut completed_map);
-                            completed_map.insert(session_id.to_string(), completed);
-                            *slot = None;
+                            completed_map.insert(
+                                managed.session_id.to_string(),
+                                CompletedSession {
+                                    exit_code,
+                                    signal,
+                                    completed_at: Instant::now(),
+                                },
+                            );
                             return Ok(AdminResponse::PrincipalWait(PrincipalWaitResponse {
                                 running: false,
                                 exit_code,
                                 signal,
                             }));
                         }
-                        Ok(None) => {
-                            found_slot = Some(true);
-                        }
+                        Ok(None) => {}
                         Err(e) => {
                             return Err(ProtocolError::new(
                                 ErrorCode::Internal,
@@ -2561,10 +2613,11 @@ impl AgentRuntime {
                             ));
                         }
                     }
+                    break;
                 }
             }
 
-            if found_slot.is_none() {
+            if !found {
                 let mut completed_map = self.completed_sessions.lock().unwrap();
                 if let Some(completed) = completed_map.remove(&session_id.to_string()) {
                     return Ok(AdminResponse::PrincipalWait(PrincipalWaitResponse {
@@ -2627,20 +2680,21 @@ impl AgentRuntime {
         )> = Vec::new();
 
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut slot = session_slot.lock().unwrap();
-            if let Some(ref mut managed) = *slot {
-                let should_reap = if now >= managed.deadline {
+            let mut sessions = session_slot.lock().unwrap();
+            let mut index = 0;
+            while index < sessions.len() {
+                let should_reap = if now >= sessions[index].deadline {
                     debug!(
                         "Session {} for profile {} expired, reaping",
-                        managed.session_id, profile_id
+                        sessions[index].session_id, profile_id
                     );
                     true
                 } else {
-                    match managed.session.child.try_wait() {
+                    match sessions[index].session.child.try_wait() {
                         Ok(Some(_)) => {
                             debug!(
                                 "Session {} for profile {} exited, reaping",
-                                managed.session_id, profile_id
+                                sessions[index].session_id, profile_id
                             );
                             true
                         }
@@ -2650,9 +2704,11 @@ impl AgentRuntime {
                 };
 
                 if should_reap {
-                    let mut taken = slot.take().unwrap();
+                    let mut taken = sessions.remove(index);
                     let exit_status = taken.session.child.try_wait().ok().flatten();
                     to_reap.push((profile_id.clone(), taken.session_id.clone(), exit_status));
+                } else {
+                    index += 1;
                 }
             }
         }
@@ -2668,30 +2724,37 @@ impl AgentRuntime {
                 }
                 None => (None, None),
             };
-            let completed = CompletedSession {
-                exit_code,
-                signal,
-                completed_at: Instant::now(),
-            };
             {
                 let mut completed_map = self.completed_sessions.lock().unwrap();
                 Self::prune_completed_before_insert(&mut completed_map);
-                completed_map.insert(session_id.to_string(), completed);
+                completed_map.insert(
+                    session_id.to_string(),
+                    CompletedSession {
+                        exit_code,
+                        signal,
+                        completed_at: Instant::now(),
+                    },
+                );
             }
 
             if let Some(profile) = self.profiles.get(&profile_id) {
                 let pending_action = {
                     let mut current = profile.current_pending.lock().unwrap();
-                    let action = current.as_ref().map(|p| {
-                        (
-                            p.request_id.clone(),
-                            p.session_id.clone(),
-                            p.prep_generation,
-                            p.browser_lease_id.clone(),
-                        )
-                    });
-                    *current = None;
-                    action
+                    if current
+                        .as_ref()
+                        .is_some_and(|pending| pending.session_id == session_id)
+                    {
+                        current.take().map(|pending| {
+                            (
+                                pending.request_id,
+                                pending.session_id,
+                                pending.prep_generation,
+                                pending.browser_lease_id,
+                            )
+                        })
+                    } else {
+                        None
+                    }
                 };
                 if let Some((request_id, sid, prep_gen, lease_id)) = pending_action {
                     let _ = self
@@ -2707,20 +2770,7 @@ impl AgentRuntime {
                         browser_mgr.remove(lid);
                     }
                 }
-                let active_action = {
-                    let mut active = profile.active_browser.lock().unwrap();
-                    let action = active.as_ref().map(|l| l.lease_id.clone());
-                    *active = None;
-                    action
-                };
-                if let Some(lease_id) = active_action {
-                    self.revoke_sign_context_for_lease(&lease_id);
-                    let mut browser_mgr = self.browser_manager.lock().unwrap();
-                    let _ = browser_mgr.revoke(&lease_id);
-                    let _ = browser_mgr.terminate(&lease_id);
-                    let _ = browser_mgr.cleanup(&lease_id);
-                    browser_mgr.remove(&lease_id);
-                }
+                self.cleanup_browser_for_session(profile, &session_id);
             }
         }
     }
@@ -2781,12 +2831,15 @@ impl AgentRuntime {
 
     fn shutdown_all_sessions(&self) {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut slot = session_slot.lock().unwrap();
-            if let Some(managed) = slot.take() {
+            let mut sessions = session_slot.lock().unwrap();
+            for managed in sessions.drain(..) {
                 info!(
                     "Shutting down principal session {} for profile {}",
                     managed.session_id, profile_id
                 );
+                if let Some(profile) = self.profiles.get(profile_id) {
+                    self.cleanup_browser_for_session(profile, &managed.session_id);
+                }
                 drop(managed.session);
             }
         }
@@ -3316,18 +3369,25 @@ impl AgentRuntime {
     fn handle_browser_status(
         &self,
         _profile_id: &ProfileId,
+        session_id: &PrincipalSessionId,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let lease_id = {
-            let active = profile.active_browser.lock().unwrap();
-            if let Some(ref lease) = *active {
-                Some(lease.lease_id.clone())
-            } else {
-                drop(active);
+        let lease_id = profile
+            .active_browser
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|lease| lease.lease_id.clone())
+            .or_else(|| {
                 let current = profile.current_pending.lock().unwrap();
-                current.as_ref().and_then(|p| p.browser_lease_id.clone())
-            }
-        };
+                current.as_ref().and_then(|pending| {
+                    if pending.session_id == *session_id {
+                        pending.browser_lease_id.clone()
+                    } else {
+                        None
+                    }
+                })
+            });
 
         if let Some(lease_id) = lease_id {
             let browser_mgr = self.browser_manager.lock().unwrap();
@@ -3360,69 +3420,29 @@ impl AgentRuntime {
         timeout_ms: u32,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let lease_id = {
-            let active = profile.active_browser.lock().unwrap();
-            if let Some(ref lease) = *active {
-                if lease.session_id != *session_id {
-                    let cdp_method = extract_cdp_method_for_audit(request_json);
-                    let outcome = super::audit_events::BrowserControlOutcome::Denied;
-                    if let Some(ref lid) = active.as_ref().map(|l| l.lease_id.clone()) {
-                        let _ = self.audit_gate.record(
-                            super::audit_events::BrowserControlRequestBuilder::new(
-                                profile_id.clone(),
-                                lid.clone(),
-                                &cdp_method,
-                                outcome,
-                            )
-                            .build(),
-                        );
-                    }
-                    return Err(ProtocolError::new(
-                        ErrorCode::Unauthorized,
-                        "session_id does not match active browser lease",
-                        RecommendedAction::Abort,
-                    ));
-                }
-                lease.lease_id.clone()
-            } else {
-                drop(active);
+        let lease_id = profile
+            .active_browser
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|lease| lease.lease_id.clone())
+            .or_else(|| {
                 let current = profile.current_pending.lock().unwrap();
-                let pending = current.as_ref().ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::Forbidden,
-                        "no active browser lease for this profile",
-                        RecommendedAction::FixRequest,
-                    )
-                })?;
-                if pending.session_id != *session_id {
-                    let cdp_method = extract_cdp_method_for_audit(request_json);
-                    let outcome = super::audit_events::BrowserControlOutcome::Denied;
-                    if let Some(ref lid) = pending.browser_lease_id {
-                        let _ = self.audit_gate.record(
-                            super::audit_events::BrowserControlRequestBuilder::new(
-                                profile_id.clone(),
-                                lid.clone(),
-                                &cdp_method,
-                                outcome,
-                            )
-                            .build(),
-                        );
+                current.as_ref().and_then(|pending| {
+                    if pending.session_id == *session_id {
+                        pending.browser_lease_id.clone()
+                    } else {
+                        None
                     }
-                    return Err(ProtocolError::new(
-                        ErrorCode::Unauthorized,
-                        "session_id does not match pending browser lease",
-                        RecommendedAction::Abort,
-                    ));
-                }
-                pending.browser_lease_id.clone().ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::Forbidden,
-                        "no browser lease associated with current session",
-                        RecommendedAction::FixRequest,
-                    )
-                })?
-            }
-        };
+                })
+            })
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "no browser lease associated with this principal session",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
 
         let cdp_method = extract_cdp_method_for_audit(request_json);
 
@@ -3622,11 +3642,8 @@ impl AgentRuntime {
         let pending_intents = self
             .policy_runtime
             .pending_intent_count_for_profile(profile_id);
-        let active_sessions = if self.get_session_id_for_profile(profile_id).is_some() {
-            1
-        } else {
-            0
-        };
+        let active_sessions =
+            u32::try_from(self.active_session_count(profile_id)).unwrap_or(u32::MAX);
 
         let mode_str = format!("{:?}", profile.mode);
         Ok(AdminResponse::ProfileInfo(
@@ -3665,7 +3682,7 @@ impl AgentRuntime {
 
         let browser_lease_state = {
             let active = profile.active_browser.lock().unwrap();
-            active.as_ref().map(|_| "active".to_string())
+            (!active.is_empty()).then(|| "active".to_string())
         };
 
         let generation = self.policy_runtime.current_generation();
@@ -3822,21 +3839,11 @@ impl AgentRuntime {
             }
         }
 
-        {
-            let mut active = profile.active_browser.lock().unwrap();
-            if let Some(ref lease) = *active {
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
-                let _ = browser_mgr.revoke(&lease.lease_id);
-                let _ = browser_mgr.terminate(&lease.lease_id);
-                let _ = browser_mgr.cleanup(&lease.lease_id);
-                browser_mgr.remove(&lease.lease_id);
-            }
-            *active = None;
-        }
+        self.cleanup_all_browsers_for_profile(profile);
 
         if let Some(session_slot) = self.managed_sessions.get(profile_id) {
-            let mut slot = session_slot.lock().unwrap();
-            if let Some(managed) = slot.take() {
+            let mut sessions = session_slot.lock().unwrap();
+            for managed in sessions.drain(..) {
                 info!(
                     "Disabling profile '{}' terminates session {} (pid {})",
                     profile_id,
@@ -3941,15 +3948,7 @@ impl AgentRuntime {
                 *current = None;
             }
             drop(current);
-            let mut active = profile.active_browser.lock().unwrap();
-            if let Some(ref lease) = *active {
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
-                let _ = browser_mgr.revoke(&lease.lease_id);
-                let _ = browser_mgr.terminate(&lease.lease_id);
-                let _ = browser_mgr.cleanup(&lease.lease_id);
-                browser_mgr.remove(&lease.lease_id);
-            }
-            *active = None;
+            self.cleanup_all_browsers_for_profile(profile);
             let _ = pid;
         }
 
@@ -4142,15 +4141,7 @@ impl AgentRuntime {
                 *current = None;
             }
             drop(current);
-            let mut active = profile.active_browser.lock().unwrap();
-            if let Some(ref lease) = *active {
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
-                let _ = browser_mgr.revoke(&lease.lease_id);
-                let _ = browser_mgr.terminate(&lease.lease_id);
-                let _ = browser_mgr.cleanup(&lease.lease_id);
-                browser_mgr.remove(&lease.lease_id);
-            }
-            *active = None;
+            self.cleanup_all_browsers_for_profile(profile);
         }
 
         let revoke_event =
@@ -4467,15 +4458,7 @@ impl AgentRuntime {
                 *current = None;
             }
             drop(current);
-            let mut active = profile.active_browser.lock().unwrap();
-            if let Some(ref lease) = *active {
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
-                let _ = browser_mgr.revoke(&lease.lease_id);
-                let _ = browser_mgr.terminate(&lease.lease_id);
-                let _ = browser_mgr.cleanup(&lease.lease_id);
-                browser_mgr.remove(&lease.lease_id);
-            }
-            *active = None;
+            self.cleanup_all_browsers_for_profile(profile);
         }
 
         Ok(AdminResponse::GrantRevoked)
@@ -4490,18 +4473,23 @@ impl AgentRuntime {
             .unwrap_or_default()
             .as_secs();
 
-        let mut sessions = Vec::new();
+        let mut sessions_out = Vec::new();
         for (profile_id, session_slot) in &self.managed_sessions {
             if let Some(filter) = profile_filter
                 && profile_id != filter
             {
                 continue;
             }
-            let slot = session_slot.lock().unwrap();
-            if let Some(ref managed) = *slot {
+            let sessions = session_slot.lock().unwrap();
+            for managed in sessions.iter() {
                 let created_at = wall_now.saturating_sub(managed.created_at.elapsed().as_secs());
-                let expires_at = wall_now.saturating_sub(managed.deadline.elapsed().as_secs());
-                sessions.push(passless_core::agent::SessionInfo {
+                let expires_at = wall_now.saturating_add(
+                    managed
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_secs(),
+                );
+                sessions_out.push(passless_core::agent::SessionInfo {
                     session_id: managed.session_id.clone(),
                     profile_id: profile_id.to_string(),
                     pid: managed.session.child.id(),
@@ -4511,9 +4499,12 @@ impl AgentRuntime {
             }
         }
 
-        let total = sessions.len() as u32;
+        let total = sessions_out.len() as u32;
         Ok(AdminResponse::SessionList(
-            passless_core::agent::SessionList { sessions, total },
+            passless_core::agent::SessionList {
+                sessions: sessions_out,
+                total,
+            },
         ))
     }
 
@@ -4527,12 +4518,18 @@ impl AgentRuntime {
             .as_secs();
 
         for (profile_id, session_slot) in &self.managed_sessions {
-            let slot = session_slot.lock().unwrap();
-            if let Some(ref managed) = *slot
-                && managed.session_id == *session_id
+            let sessions = session_slot.lock().unwrap();
+            if let Some(managed) = sessions
+                .iter()
+                .find(|managed| managed.session_id == *session_id)
             {
                 let created_at = wall_now.saturating_sub(managed.created_at.elapsed().as_secs());
-                let expires_at = wall_now.saturating_sub(managed.deadline.elapsed().as_secs());
+                let expires_at = wall_now.saturating_add(
+                    managed
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_secs(),
+                );
                 return Ok(AdminResponse::SessionInfo(
                     passless_core::agent::SessionInfo {
                         session_id: managed.session_id.clone(),
@@ -4557,58 +4554,59 @@ impl AgentRuntime {
         session_id: &PrincipalSessionId,
     ) -> Result<AdminResponse, ProtocolError> {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut slot = session_slot.lock().unwrap();
-            if let Some(ref managed) = *slot
-                && managed.session_id == *session_id
+            let mut sessions = session_slot.lock().unwrap();
+            if let Some(pos) = sessions
+                .iter()
+                .position(|managed| managed.session_id == *session_id)
             {
-                let taken = slot.take();
-                if let Some(managed) = taken {
-                    info!(
-                        "Revoking session {} for profile {} (pid {})",
-                        managed.session_id,
-                        profile_id,
-                        managed.session.child.id()
-                    );
+                let managed = sessions.remove(pos);
+                drop(sessions);
+                info!(
+                    "Revoking session {} for profile {} (pid {})",
+                    managed.session_id,
+                    profile_id,
+                    managed.session.child.id()
+                );
 
-                    let revoke_event = super::audit_events::AdminSessionRevokeBuilder::new(
-                        session_id.clone(),
-                        profile_id.clone(),
-                    )
-                    .build();
-                    let _ = self.audit_gate.record(revoke_event);
+                let revoke_event = super::audit_events::AdminSessionRevokeBuilder::new(
+                    session_id.clone(),
+                    profile_id.clone(),
+                )
+                .build();
+                let _ = self.audit_gate.record(revoke_event);
 
-                    if let Some(profile) = self.profiles.get(profile_id) {
+                if let Some(profile) = self.profiles.get(profile_id) {
+                    let pending = {
                         let mut current = profile.current_pending.lock().unwrap();
-                        if let Some(ref pending) = *current {
-                            let _ = self
-                                .policy_runtime
-                                .principal_cancel_pending(&pending.request_id, &pending.session_id);
-                            profile
-                                .preparation_slot
-                                .clear_matching(pending.prep_generation);
-                            if let Some(ref lease_id) = pending.browser_lease_id {
-                                let mut browser_mgr = self.browser_manager.lock().unwrap();
-                                let _ = browser_mgr.revoke(lease_id);
-                                let _ = browser_mgr.terminate(lease_id);
-                                let _ = browser_mgr.cleanup(lease_id);
-                                browser_mgr.remove(lease_id);
-                            }
-                            *current = None;
+                        if current
+                            .as_ref()
+                            .is_some_and(|pending| pending.session_id == *session_id)
+                        {
+                            current.take()
+                        } else {
+                            None
                         }
-                        drop(current);
-                        let mut active = profile.active_browser.lock().unwrap();
-                        if let Some(ref lease) = *active {
+                    };
+                    if let Some(pending) = pending {
+                        let _ = self
+                            .policy_runtime
+                            .principal_cancel_pending(&pending.request_id, &pending.session_id);
+                        profile
+                            .preparation_slot
+                            .clear_matching(pending.prep_generation);
+                        if let Some(ref lease_id) = pending.browser_lease_id {
+                            self.revoke_sign_context_for_lease(lease_id);
                             let mut browser_mgr = self.browser_manager.lock().unwrap();
-                            let _ = browser_mgr.revoke(&lease.lease_id);
-                            let _ = browser_mgr.terminate(&lease.lease_id);
-                            let _ = browser_mgr.cleanup(&lease.lease_id);
-                            browser_mgr.remove(&lease.lease_id);
+                            let _ = browser_mgr.revoke(lease_id);
+                            let _ = browser_mgr.terminate(lease_id);
+                            let _ = browser_mgr.cleanup(lease_id);
+                            browser_mgr.remove(lease_id);
                         }
-                        *active = None;
                     }
-
-                    drop(managed.session);
+                    self.cleanup_browser_for_session(profile, session_id);
                 }
+
+                drop(managed.session);
                 return Ok(AdminResponse::SessionRevoked);
             }
         }
@@ -4711,13 +4709,23 @@ impl AgentRuntime {
         })?;
 
         let managed_guard = session_slot.lock().unwrap();
-        let managed = managed_guard.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::Conflict,
-                "no active principal session for this profile; launch one first with `passless agent run`",
-                RecommendedAction::FixRequest,
-            )
-        })?;
+        let managed = match managed_guard.as_slice() {
+            [managed] => managed,
+            [] => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "no active principal session for this profile; launch one first with `passless agent run`",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+            _ => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "multiple principal sessions are active; issue this request from the target principal session",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        };
 
         let _lifecycle = profile.lifecycle_lock.lock().unwrap();
         {
@@ -5310,26 +5318,20 @@ impl PrincipalHandler for AgentRuntime {
             )
         })?;
 
-        let slot = session_slot.lock().unwrap();
-        let managed = slot.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::Unauthorized,
-                format!("no active session for profile '{}'", profile_id),
-                RecommendedAction::Abort,
-            )
-        })?;
+        let sessions = session_slot.lock().unwrap();
+        let supplied_capability = SessionCapability::from_bytes(*capability_proof.as_bytes());
+        let managed = sessions
+            .iter()
+            .find(|managed| managed.session.capability.verify(&supplied_capability))
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "capability proof does not match an active principal session",
+                    RecommendedAction::Abort,
+                )
+            })?;
 
         let session = &managed.session;
-        if !session
-            .capability
-            .verify(&SessionCapability::from_bytes(*capability_proof.as_bytes()))
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::Unauthorized,
-                "capability proof verification failed",
-                RecommendedAction::Abort,
-            ));
-        }
 
         let proc_root = &session.proc_root;
         let peer_pid = cred.pid;
@@ -5503,7 +5505,9 @@ impl PrincipalHandler for AgentRuntime {
             PrincipalRequest::ListCredentials {
                 profile_id: _req_profile_id,
             } => self.handle_list_credentials(&profile_id, profile),
-            PrincipalRequest::BrowserStatus => self.handle_browser_status(&profile_id, profile),
+            PrincipalRequest::BrowserStatus => {
+                self.handle_browser_status(&profile_id, &managed.session_id, profile)
+            }
             PrincipalRequest::EnsureBrowser { start_url } => self.handle_ensure_browser(
                 &profile_id,
                 &managed.session_id,
@@ -5740,7 +5744,8 @@ mod tests {
     #[test]
     fn pending_to_active_atomic_transition() {
         let pending_mutex: Mutex<Option<PendingRuntime>> = Mutex::new(None);
-        let active_mutex: Mutex<Option<ActiveBrowserLease>> = Mutex::new(None);
+        let active_mutex: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>> =
+            Mutex::new(HashMap::new());
 
         let lease_id = BrowserLeaseId::new();
         let session_id = PrincipalSessionId::new();
@@ -5755,30 +5760,35 @@ mod tests {
         });
 
         assert!(pending_mutex.lock().unwrap().is_some());
-        assert!(active_mutex.lock().unwrap().is_none());
+        assert!(active_mutex.lock().unwrap().is_empty());
 
-        let taken = pending_mutex.lock().unwrap().take();
-        *active_mutex.lock().unwrap() = taken.map(|p| ActiveBrowserLease {
-            lease_id: p.browser_lease_id.unwrap(),
-            session_id: p.session_id,
-        });
+        let pending = pending_mutex.lock().unwrap().take().unwrap();
+        active_mutex.lock().unwrap().insert(
+            pending.session_id.clone(),
+            ActiveBrowserLease {
+                lease_id: pending.browser_lease_id.unwrap(),
+                session_id: pending.session_id,
+            },
+        );
 
         assert!(pending_mutex.lock().unwrap().is_none());
         let active = active_mutex.lock().unwrap();
-        assert!(active.is_some());
-        let active = active.as_ref().unwrap();
+        let active = active.get(&session_id).unwrap();
         assert_eq!(active.lease_id, lease_id);
         assert_eq!(active.session_id, session_id);
     }
 
     #[test]
-    fn cleanup_clears_both_pending_and_active() {
+    fn cleanup_clears_both_pending_and_active_for_one_session() {
         let pending_mutex: Mutex<Option<PendingRuntime>> = Mutex::new(None);
-        let active_mutex: Mutex<Option<ActiveBrowserLease>> = Mutex::new(None);
+        let active_mutex: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>> =
+            Mutex::new(HashMap::new());
 
         let lease_id_pending = BrowserLeaseId::new();
         let lease_id_active = BrowserLeaseId::new();
         let session_id = PrincipalSessionId::new();
+        let other_session_id = PrincipalSessionId::new();
+        let other_lease_id = BrowserLeaseId::new();
 
         *pending_mutex.lock().unwrap() = Some(PendingRuntime {
             request_id: PendingRequestId::new(),
@@ -5788,19 +5798,38 @@ mod tests {
             clamped_session_ttl_secs: 60,
         });
 
-        *active_mutex.lock().unwrap() = Some(ActiveBrowserLease {
-            lease_id: lease_id_active.clone(),
-            session_id: session_id.clone(),
-        });
+        {
+            let mut active = active_mutex.lock().unwrap();
+            active.insert(
+                session_id.clone(),
+                ActiveBrowserLease {
+                    lease_id: lease_id_active.clone(),
+                    session_id: session_id.clone(),
+                },
+            );
+            active.insert(
+                other_session_id.clone(),
+                ActiveBrowserLease {
+                    lease_id: other_lease_id.clone(),
+                    session_id: other_session_id.clone(),
+                },
+            );
+        }
 
         assert!(pending_mutex.lock().unwrap().is_some());
-        assert!(active_mutex.lock().unwrap().is_some());
+        assert_eq!(active_mutex.lock().unwrap().len(), 2);
 
         *pending_mutex.lock().unwrap() = None;
-        *active_mutex.lock().unwrap() = None;
+        active_mutex.lock().unwrap().remove(&session_id);
 
         assert!(pending_mutex.lock().unwrap().is_none());
-        assert!(active_mutex.lock().unwrap().is_none());
+        let active = active_mutex.lock().unwrap();
+        assert!(!active.contains_key(&session_id));
+        assert_eq!(
+            active.get(&other_session_id).unwrap().lease_id,
+            other_lease_id,
+            "cleaning one session must not remove another session's browser"
+        );
     }
 
     #[test]
@@ -5890,6 +5919,7 @@ mod tests {
             mode: AgentMode::Isolated,
             profile_config: passless_core::agent::AgentProfileConfig {
                 max_operations: 64,
+                max_concurrent_sessions: 1,
                 credential_selection: passless_core::agent::config::CredentialSelection::Single,
                 human_verification_prompt:
                     passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -6133,6 +6163,7 @@ mod tests {
                 "test-isolated".to_string(),
                 passless_core::agent::AgentProfileConfig {
                     max_operations: 64,
+                    max_concurrent_sessions: 1,
                     credential_selection: passless_core::agent::config::CredentialSelection::Single,
                     human_verification_prompt:
                         passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -6242,7 +6273,7 @@ mod tests {
             mode: AgentMode::Isolated,
             profile_config: agent_config.profiles.get("test-isolated").unwrap().clone(),
             current_pending: Mutex::new(None),
-            active_browser: Mutex::new(None),
+            active_browser: Mutex::new(HashMap::new()),
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             browser_uid: None,
@@ -6256,7 +6287,7 @@ mod tests {
         profiles.insert(profile_id.clone(), profile_runtime);
 
         let mut managed_sessions = std::collections::BTreeMap::new();
-        managed_sessions.insert(profile_id.clone(), Mutex::new(None));
+        managed_sessions.insert(profile_id.clone(), Mutex::new(Vec::new()));
 
         let sign_registry = Arc::new(SignContextRegistry::new());
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));

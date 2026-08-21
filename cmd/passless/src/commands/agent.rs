@@ -14,10 +14,7 @@ use serde::Serialize;
 use crate::agent::client::resolve_runtime_base;
 use crate::agent::client::{AdminClient, ClientError, PrincipalClient, WaitTarget, wait_with_poll};
 
-use passless_core::agent::protocol::AdminResponse;
-
-#[cfg(test)]
-use passless_core::agent::protocol::AdminRequest;
+use passless_core::agent::protocol::{AdminRequest, AdminResponse};
 
 const ENVELOPE_VERSION: &str = "1";
 
@@ -919,7 +916,7 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
                 eprintln!("profile_id: {}", launched.profile_id);
             }
 
-            let ctrlc_profile = profile.to_string();
+            let ctrlc_session_id = session_id.clone();
             let ctrlc_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let ctrlc_flag_clone = ctrlc_flag.clone();
 
@@ -931,9 +928,9 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
 
                 match connect_admin() {
                     Ok(mut terminate_client) => {
-                        if let Ok(pid) = parse_profile_id(&ctrlc_profile) {
-                            let _ = terminate_client.terminate_principal(&pid);
-                        }
+                        let _ = terminate_client.request(AdminRequest::RevokeSession {
+                            session_id: ctrlc_session_id.clone(),
+                        });
                     }
                     Err(_) => {
                         std::process::exit(130);
