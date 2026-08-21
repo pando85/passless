@@ -432,13 +432,21 @@ fn run() -> Result<()> {
         log::LevelFilter::Info
     };
 
-    let env = Env::default()
-        .filter("PASSLESS_LOG_LEVEL")
-        .write_style("PASSLESS_LOG_STYLE");
-    Builder::from_env(env)
-        .filter_level(log::LevelFilter::Debug)
-        .format_timestamp_millis()
-        .init();
+    if systemd_journal_logger::connected_to_journal() {
+        systemd_journal_logger::JournalLog::new()
+            .unwrap()
+            .with_syslog_identifier("passless".to_string())
+            .install()
+            .unwrap();
+    } else {
+        let env = Env::default()
+            .filter("PASSLESS_LOG_LEVEL")
+            .write_style("PASSLESS_LOG_STYLE");
+        Builder::from_env(env)
+            .filter_level(log::LevelFilter::Debug)
+            .format_timestamp_millis()
+            .init();
+    }
     log::set_max_level(log_level);
 
     // Load config: CLI args + config file + defaults (CLI takes precedence)

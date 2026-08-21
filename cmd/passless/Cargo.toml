@@ -34,6 +34,7 @@ soft-fido2-transport.workspace = true
 soft-fido2-ctap.workspace = true
 log.workspace = true
 env_logger.workspace = true
+systemd-journal-logger.workspace = true
 sha2.workspace = true
 serde_cbor.workspace = true
 serde.workspace = true
