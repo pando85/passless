@@ -1,4 +1,5 @@
 use crate::storage::index::load_credential_paths;
+use crate::storage::pass::sync::PassGitSync;
 use crate::storage::pass::{GpgBackend, PassStorageAdapter as InnerPassStorageAdapter};
 use crate::storage::{CredentialFilter, CredentialStorage};
 use git2::{Oid, Repository};
@@ -34,6 +35,7 @@ pub struct PassStorageAdapter {
     gpg_backend: GpgBackend,
     allow_create_without_prompt: bool,
     indexed_generation: RepositoryGeneration,
+    sync: PassGitSync,
 }
 
 impl PassStorageAdapter {
@@ -43,6 +45,22 @@ impl PassStorageAdapter {
         gpg_backend: GpgBackend,
         allow_create_without_prompt: bool,
     ) -> Result<Self> {
+        Self::new_with_options_and_git_sync(
+            store_path,
+            path,
+            gpg_backend,
+            allow_create_without_prompt,
+            true,
+        )
+    }
+
+    pub fn new_with_options_and_git_sync(
+        store_path: PathBuf,
+        path: PathBuf,
+        gpg_backend: GpgBackend,
+        allow_create_without_prompt: bool,
+        git_sync: bool,
+    ) -> Result<Self> {
         let inner = InnerPassStorageAdapter::new_with_options(
             store_path.clone(),
             path.clone(),
@@ -50,15 +68,29 @@ impl PassStorageAdapter {
             allow_create_without_prompt,
         )?;
         let indexed_generation = repository_generation(&store_path, &path);
+        let sync = PassGitSync::new(store_path.clone(), git_sync);
 
-        Ok(Self {
+        let mut adapter = Self {
             inner,
             store_path,
             path,
             gpg_backend,
             allow_create_without_prompt,
             indexed_generation,
-        })
+            sync,
+        };
+
+        adapter.sync.prepare_startup();
+        let generation = repository_generation(&adapter.store_path, &adapter.path);
+        if generation != adapter.indexed_generation {
+            adapter.reload_from_repository(generation)?;
+        }
+
+        Ok(adapter)
+    }
+
+    pub fn sync_handle(&self) -> PassGitSync {
+        self.sync.clone()
     }
 
     fn reload_from_repository(&mut self, generation: RepositoryGeneration) -> Result<()> {
@@ -87,11 +119,17 @@ impl PassStorageAdapter {
         Ok(())
     }
 
+    fn prepare_for_access(&mut self) -> Result<()> {
+        self.sync.prepare_if_needed();
+        self.refresh_if_repository_changed()
+    }
+
     fn record_current_generation(&mut self) {
         self.indexed_generation = repository_generation(&self.store_path, &self.path);
     }
 
     fn current_credential_count(&self) -> usize {
+        self.sync.prepare_if_needed();
         let generation = repository_generation(&self.store_path, &self.path);
         if generation == self.indexed_generation {
             return self.inner.count_credentials();
@@ -132,23 +170,56 @@ impl CredentialStorage for PassStorageAdapter {
     }
 
     fn write(&mut self, cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
-        self.refresh_if_repository_changed()
-            .map_err(soft_fido2::Error::from)?;
+        let implicit = self.sync.begin_implicit_operation();
+        if let Err(error) = self.prepare_for_access() {
+            if implicit {
+                self.sync.end_operation();
+            }
+            return Err(soft_fido2::Error::from(error));
+        }
+
         let result = self.inner.write(cred);
         if result.is_ok() {
+            self.sync.mark_dirty("Update Passless credential state.");
+            self.record_current_generation();
+        }
+        if implicit {
+            self.sync.end_operation();
             self.record_current_generation();
         }
         result
     }
 
     fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
-        self.refresh_if_repository_changed()
-            .map_err(soft_fido2::Error::from)?;
+        let implicit = self.sync.begin_implicit_operation();
+        if let Err(error) = self.prepare_for_access() {
+            if implicit {
+                self.sync.end_operation();
+            }
+            return Err(soft_fido2::Error::from(error));
+        }
+
         let result = self.inner.delete(id);
         if result.is_ok() {
+            self.sync.mark_dirty("Update Passless credential state.");
+            self.record_current_generation();
+        }
+        if implicit {
+            self.sync.end_operation();
             self.record_current_generation();
         }
         result
+    }
+
+    fn begin_operation(&mut self) -> soft_fido2::Result<()> {
+        self.sync.begin_operation();
+        Ok(())
+    }
+
+    fn end_operation(&mut self) -> soft_fido2::Result<()> {
+        self.sync.end_operation();
+        self.record_current_generation();
+        Ok(())
     }
 
     fn count_credentials(&self) -> usize {

@@ -71,6 +71,18 @@ pub trait CredentialStorage: Send + Sync {
         false
     }
 
+    /// Begin a logical authenticator operation.
+    ///
+    /// Backends may use this boundary to batch persistence/synchronization work.
+    fn begin_operation(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// End a logical authenticator operation.
+    fn end_operation(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Cleanup expired cache entries (if caching is supported)
     ///
     /// This method should be called periodically to ensure cached credentials
@@ -113,6 +125,14 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn disable_user_verification(&self) -> bool {
         (**self).disable_user_verification()
+    }
+
+    fn begin_operation(&mut self) -> Result<()> {
+        (**self).begin_operation()
+    }
+
+    fn end_operation(&mut self) -> Result<()> {
+        (**self).end_operation()
     }
 
     fn cleanup_expired_cache(&mut self) {

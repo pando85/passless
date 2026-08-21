@@ -91,6 +91,19 @@ pub struct PassBackendConfig {
     #[serde(default)]
     #[default("gnupg-bin".to_string())]
     pub gpg_backend: String,
+
+    /// Automatically synchronize password-store Git around Passless operations
+    #[arg(
+        long = "pass-git-sync",
+        env = "PASSLESS_PASS_GIT_SYNC",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub git_sync: bool,
 }
 
 /// Compute default TPM storage path

@@ -5,6 +5,7 @@ use crate::pin_storage::{
 };
 use crate::storage::pass::GpgBackend;
 use crate::storage::pass::gpg_id;
+use crate::storage::pass::sync::PassGitSync;
 use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
@@ -14,10 +15,11 @@ use std::sync::RwLock;
 
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
-use prs_lib::{Ciphertext, Plaintext, Store};
+use prs_lib::{Ciphertext, Plaintext};
 
 const PIN_CONFIG_ENTRY: &str = "pin_state";
-const PIN_RETRIES_ENTRY: &str = "pin_retries";
+const PIN_RETRIES_ENTRY: &str = "pin_retries.local";
+const LEGACY_PIN_RETRIES_ENTRY: &str = "pin_retries";
 
 /// Tracked state for conflict detection
 #[derive(Debug, Clone)]
@@ -32,11 +34,12 @@ struct SyncedConfig {
 ///
 /// Stores PIN state as two GPG-encrypted entries in the password store:
 /// - `pin_state.gpg`: PIN config (hash, min length, version) - synced to git
-/// - `pin_retries.gpg`: Retry counters (retries, uv_retries, locked_until) - local only
+/// - `pin_retries.local.gpg`: Retry counters (retries, uv_retries, locked_until) - local only
 pub struct PassPinStorage {
     store_path: PathBuf,
     fido2_path: PathBuf,
     gpg_backend: GpgBackend,
+    sync: PassGitSync,
     /// Last known config state for change detection (for git sync optimization)
     last_config: RwLock<Option<SerializablePinConfig>>,
     /// Last synced config state for conflict detection
@@ -44,20 +47,30 @@ pub struct PassPinStorage {
 }
 
 impl PassPinStorage {
-    /// Create a new Pass PIN storage
-    pub fn new(store_path: PathBuf, fido2_path: PathBuf, gpg_backend: GpgBackend) -> Self {
+    /// Create PIN storage sharing the credential backend's operation coordinator.
+    pub fn new_with_sync(
+        store_path: PathBuf,
+        fido2_path: PathBuf,
+        gpg_backend: GpgBackend,
+        sync: PassGitSync,
+    ) -> Self {
         debug!(
             "Pass PIN storage: store={}, path={}",
             store_path.display(),
             fido2_path.display()
         );
-        Self {
+        let storage = Self {
             store_path,
             fido2_path,
             gpg_backend,
+            sync,
             last_config: RwLock::new(None),
             last_synced: RwLock::new(None),
-        }
+        };
+        storage
+            .sync
+            .ensure_local_only_path(&storage.get_retries_path());
+        storage
     }
 
     fn get_config_path(&self) -> PathBuf {
@@ -70,6 +83,12 @@ impl PassPinStorage {
         self.store_path
             .join(&self.fido2_path)
             .join(format!("{}.gpg", PIN_RETRIES_ENTRY))
+    }
+
+    fn get_legacy_retries_path(&self) -> PathBuf {
+        self.store_path
+            .join(&self.fido2_path)
+            .join(format!("{}.gpg", LEGACY_PIN_RETRIES_ENTRY))
     }
 
     fn create_crypto_context(&self) -> Result<prs_lib::crypto::Context> {
@@ -86,53 +105,6 @@ impl PassPinStorage {
 
     fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
         gpg_id::resolve_recipients_for_target(&self.store_path, target)
-    }
-
-    fn sync_prepare(&self) -> Result<()> {
-        debug!("Preparing password store sync for PIN config");
-
-        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
-            debug!("Failed to open store for sync: {:?}", e);
-            Error::Storage(format!("Failed to open store for sync: {:?}", e))
-        })?;
-
-        let sync = store.sync();
-
-        match sync.prepare() {
-            Ok(()) => {
-                debug!("Successfully prepared store sync (pulled if remote configured)");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to prepare store sync: {:?}", e);
-                Ok(())
-            }
-        }
-    }
-
-    fn sync_finalize(&self, message: &str) -> Result<()> {
-        debug!("Finalizing password store sync: {}", message);
-
-        let store = Store::open(self.store_path.to_string_lossy().as_ref()).map_err(|e| {
-            debug!("Failed to open store for sync: {:?}", e);
-            Error::Storage(format!("Failed to open store for sync: {:?}", e))
-        })?;
-
-        let sync = store.sync();
-
-        match sync.finalize(message) {
-            Ok(()) => {
-                debug!(
-                    "Successfully finalized store sync (committed and pushed if remote configured)"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                debug!("Failed to finalize store sync: {:?}", e);
-                warn!("Failed to finalize store sync: {:?}", e);
-                Ok(())
-            }
-        }
     }
 
     fn load_config(&self) -> std::result::Result<SerializablePinConfig, soft_fido2::StatusCode> {
@@ -170,12 +142,17 @@ impl PassPinStorage {
     fn load_retries(&self) -> std::result::Result<SerializablePinRetries, soft_fido2::StatusCode> {
         debug!("Loading PIN retries from pass store");
 
-        let path = self.get_retries_path();
-
-        if !path.exists() {
+        let local_path = self.get_retries_path();
+        let legacy_path = self.get_legacy_retries_path();
+        let path = if local_path.exists() {
+            local_path
+        } else if legacy_path.exists() {
+            debug!("Loading legacy PIN retries; next save will migrate them to local-only storage");
+            legacy_path
+        } else {
             debug!("PIN retries entry does not exist, returning default state");
             return Ok(SerializablePinRetries::default());
-        }
+        };
 
         let encrypted_data = std::fs::read(&path).map_err(|e| {
             warn!("Failed to read PIN retries entry: {}", e);
@@ -204,6 +181,7 @@ impl PassPinStorage {
         config: &SerializablePinConfig,
     ) -> std::result::Result<(), soft_fido2::StatusCode> {
         debug!("Saving PIN config to pass store");
+        self.sync.prepare_if_needed();
 
         let bytes = config.to_json_bytes()?;
 
@@ -233,21 +211,13 @@ impl PassPinStorage {
                 soft_fido2::StatusCode::Other
             })?;
 
-        let relative_path = path
-            .strip_prefix(&self.store_path)
-            .unwrap_or(&path)
-            .display();
-        let commit_message = format!("Update PIN configuration: {}.", relative_path);
-        self.sync_finalize(&commit_message).map_err(|e| {
-            warn!("Failed to sync PIN config: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
+        self.sync.mark_dirty("Update Passless PIN configuration.");
 
         *self.last_config.write().map_err(|e| {
             warn!("Failed to acquire config lock: {:?}", e);
             soft_fido2::StatusCode::Other
         })? = Some(config.clone());
-        debug!("PIN config saved and synced successfully");
+        debug!("PIN config saved successfully; Git finalization deferred to operation end");
         Ok(())
     }
 
@@ -295,7 +265,13 @@ impl PassPinStorage {
             Err(_) => return true,
         };
         match last.as_ref() {
-            Some(old) => old != new_config,
+            Some(old) => {
+                old.pin_hash != new_config.pin_hash
+                    || old.min_pin_length != new_config.min_pin_length
+                    || old.force_pin_change != new_config.force_pin_change
+                    || old.credential_wrapping_generation
+                        != new_config.credential_wrapping_generation
+            }
             None => true,
         }
     }
@@ -316,10 +292,7 @@ impl PassPinStorage {
             return Ok(None);
         };
 
-        // Pull latest from remote to check for conflicts
-        if let Err(e) = self.sync_prepare() {
-            warn!("Failed to prepare sync for conflict check: {:?}", e);
-        }
+        self.sync.prepare_if_needed();
 
         // Load remote config after pull
         let remote_config = self.load_config()?;
@@ -390,10 +363,7 @@ impl PassPinStorage {
 
 impl PinStorage for PassPinStorage {
     fn load_pin_state(&self) -> std::result::Result<soft_fido2::PinState, soft_fido2::StatusCode> {
-        // Pull latest changes from git remote if configured
-        if let Err(e) = self.sync_prepare() {
-            warn!("Failed to prepare sync for PIN config: {:?}", e);
-        }
+        self.sync.prepare_if_needed();
 
         let config = self.load_config()?;
         let retries = self.load_retries()?;
@@ -490,5 +460,43 @@ impl PinStorage for PassPinStorage {
         self.save_retries(&new_retries)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> SerializablePinConfig {
+        SerializablePinConfig {
+            pin_hash: Some(vec![1; 32]),
+            min_pin_length: 4,
+            version: 1,
+            force_pin_change: false,
+            credential_wrapping_generation: 0,
+            modified_at: Some(1),
+        }
+    }
+
+    #[test]
+    fn retry_state_version_and_timestamp_churn_do_not_change_synced_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync = PassGitSync::new(temp.path().to_path_buf(), false);
+        let storage = PassPinStorage::new_with_sync(
+            temp.path().to_path_buf(),
+            PathBuf::from("fido2"),
+            GpgBackend::GnupgBin,
+            sync,
+        );
+
+        *storage.last_config.write().unwrap() = Some(config());
+        let mut retry_only = config();
+        retry_only.version = 2;
+        retry_only.modified_at = Some(2);
+
+        assert!(!storage.config_changed(&retry_only));
+
+        retry_only.force_pin_change = true;
+        assert!(storage.config_changed(&retry_only));
     }
 }

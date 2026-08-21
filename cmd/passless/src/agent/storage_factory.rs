@@ -313,8 +313,13 @@ pub fn create_storage_bundle_with_options(
                 ))
             })?;
 
-            let pin_storage =
-                crate::pin_storage::PassPinStorage::new(store_path.clone(), pin_path.clone(), gpg);
+            let pass_sync = cred_storage.sync_handle();
+            let pin_storage = crate::pin_storage::PassPinStorage::new_with_sync(
+                store_path.clone(),
+                pin_path.clone(),
+                gpg,
+                pass_sync,
+            );
 
             Ok(AgentStorageBundle {
                 credential_storage: Arc::new(Mutex::new(Box::new(cred_storage))),

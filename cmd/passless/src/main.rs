@@ -122,8 +122,31 @@ impl<
             soft_fido2_transport::Error::Other("Failed to lock service".to_string())
         })?;
 
+        {
+            let mut storage = service.storage.lock().map_err(|e| {
+                error!("Failed to lock storage while beginning operation: {}", e);
+                soft_fido2_transport::Error::Other("Failed to begin storage operation".to_string())
+            })?;
+            storage.begin_operation().map_err(|e| {
+                error!("Failed to begin storage operation: {:?}", e);
+                soft_fido2_transport::Error::Other("Failed to begin storage operation".to_string())
+            })?;
+        }
+
         let mut response = Vec::new();
-        service.handle(data, &mut response).map_err(|e| {
+        let command_result = service.handle(data, &mut response);
+
+        {
+            let mut storage = service.storage.lock().map_err(|e| {
+                error!("Failed to lock storage while ending operation: {}", e);
+                soft_fido2_transport::Error::Other("Failed to end storage operation".to_string())
+            })?;
+            if let Err(e) = storage.end_operation() {
+                warn!("Failed to end storage operation: {:?}", e);
+            }
+        }
+
+        command_result.map_err(|e| {
             error!("CTAP command failed: {:?}", e);
             soft_fido2_transport::Error::Other("Command failed".to_string())
         })?;
@@ -451,6 +474,8 @@ fn run() -> Result<()> {
         e
     })?;
 
+    let pass_git_sync = config.pass.git_sync;
+
     #[cfg(feature = "agent")]
     let agent_enabled = config.agents.enabled;
     #[cfg(not(feature = "agent"))]
@@ -581,16 +606,22 @@ fn run() -> Result<()> {
                     gpg_backend,
                 } => {
                     let gpg_backend = gpg_backend.parse::<storage::pass::GpgBackend>()?;
-                    let storage = PassStorageAdapter::new_with_options(
+                    let storage = PassStorageAdapter::new_with_options_and_git_sync(
                         store_path.clone().into(),
                         path.clone().into(),
                         gpg_backend,
                         allow_storage_creation,
+                        pass_git_sync,
                     )?;
+                    let pass_sync = storage.sync_handle();
                     let boxed: Box<dyn CredentialStorage> = Box::new(storage);
                     let shared_storage = Arc::new(Mutex::new(boxed));
-                    let pin_storage_inner =
-                        PassPinStorage::new(store_path.into(), path.into(), gpg_backend);
+                    let pin_storage_inner = PassPinStorage::new_with_sync(
+                        store_path.into(),
+                        path.into(),
+                        gpg_backend,
+                        pass_sync,
+                    );
                     let boxed_pin: Box<dyn crate::pin_storage::PinStorage> =
                         Box::new(pin_storage_inner);
                     let pin_storage = Arc::new(Mutex::new(boxed_pin));
@@ -788,13 +819,20 @@ fn run() -> Result<()> {
                 gpg_backend,
             } => {
                 let gpg_backend = gpg_backend.parse::<storage::pass::GpgBackend>()?;
-                let storage = PassStorageAdapter::new_with_options(
+                let storage = PassStorageAdapter::new_with_options_and_git_sync(
                     store_path.clone().into(),
                     path.clone().into(),
                     gpg_backend,
                     allow_storage_creation,
+                    pass_git_sync,
                 )?;
-                let pin_storage = PassPinStorage::new(store_path.into(), path.into(), gpg_backend);
+                let pass_sync = storage.sync_handle();
+                let pin_storage = PassPinStorage::new_with_sync(
+                    store_path.into(),
+                    path.into(),
+                    gpg_backend,
+                    pass_sync,
+                );
                 let pin_storage = Arc::new(Mutex::new(pin_storage));
                 let service = AuthenticatorService::with_pin_storage(
                     storage,
