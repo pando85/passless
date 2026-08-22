@@ -432,12 +432,20 @@ fn run() -> Result<()> {
         log::LevelFilter::Info
     };
 
-    if systemd_journal_logger::connected_to_journal() {
-        systemd_journal_logger::JournalLog::new()
-            .unwrap()
-            .with_syslog_identifier("passless".to_string())
+    // Use syslog when running as systemd service
+    if systemd_journal_logger::connected_to_journal()
+        && let Ok(journal) = systemd_journal_logger::JournalLog::new()
+    {
+        // Assume only the agent is run as root
+        let syslog_identifier = if nix::unistd::Uid::effective().is_root() {
+            "passless-agent"
+        } else {
+            "passless"
+        };
+        journal
+            .with_syslog_identifier(syslog_identifier.to_string())
             .install()
-            .unwrap();
+            .expect("Logger was already installed.");
     } else {
         let env = Env::default()
             .filter("PASSLESS_LOG_LEVEL")
