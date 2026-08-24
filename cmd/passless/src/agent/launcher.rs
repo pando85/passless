@@ -696,6 +696,10 @@ impl HardenedChildSetup {
             return Err(io::Error::last_os_error());
         }
 
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
         if !self.same_user() {
             if unsafe { libc::setgroups(0, std::ptr::null()) } < 0 {
                 return Err(io::Error::last_os_error());

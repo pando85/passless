@@ -490,6 +490,7 @@ pub struct ManagedPrincipalSession {
     pub process_digest: super::intent::ProcessIdentityDigest,
     pub created_at: Instant,
     pub deadline: Instant,
+    pub client_pid: i32,
 }
 
 impl std::fmt::Debug for ManagedPrincipalSession {
@@ -501,6 +502,7 @@ impl std::fmt::Debug for ManagedPrincipalSession {
             .field("process_digest", &self.process_digest)
             .field("created_at", &self.created_at)
             .field("deadline", &self.deadline)
+            .field("client_pid", &self.client_pid)
             .finish()
     }
 }
@@ -2335,6 +2337,7 @@ impl AgentRuntime {
         &self,
         profile_id: &ProfileId,
         command: &[String],
+        cred: &PeerCred,
         ctx: &super::ipc::AdminRequestContext,
     ) -> Result<AdminResponse, ProtocolError> {
         let profile = self.profiles.get(profile_id).ok_or_else(|| {
@@ -2457,7 +2460,12 @@ impl AgentRuntime {
         let pid = session.child.id();
         let session_id = PrincipalSessionId::new();
         let now = Instant::now();
-        let deadline = now + Duration::from_secs(3600);
+        let ttl_secs = profile
+            .profile_config
+            .max_session_ttl
+            .map(|ttl| ttl.as_secs())
+            .unwrap_or(3600);
+        let deadline = now + Duration::from_secs(ttl_secs);
 
         let process_digest = super::intent::ProcessIdentityDigest::compute_from_session_identity(
             &super::intent::SessionIdentityParams {
@@ -2479,6 +2487,7 @@ impl AgentRuntime {
             process_digest,
             created_at: now,
             deadline,
+            client_pid: cred.pid,
         });
 
         info!(
@@ -2646,6 +2655,11 @@ impl AgentRuntime {
         }
     }
 
+    fn is_pid_alive(pid: i32) -> bool {
+        let stat_path = format!("/proc/{}/stat", pid);
+        std::fs::metadata(&stat_path).is_ok()
+    }
+
     fn prune_completed_before_insert(
         map: &mut std::collections::BTreeMap<String, CompletedSession>,
     ) {
@@ -2687,6 +2701,12 @@ impl AgentRuntime {
                     debug!(
                         "Session {} for profile {} expired, reaping",
                         sessions[index].session_id, profile_id
+                    );
+                    true
+                } else if !Self::is_pid_alive(sessions[index].client_pid) {
+                    debug!(
+                        "Session {} for profile {} orphaned (client pid {} dead), reaping",
+                        sessions[index].session_id, profile_id, sessions[index].client_pid
                     );
                     true
                 } else {
@@ -5189,7 +5209,7 @@ impl AdminHandler for AgentRuntime {
             AdminRequest::LaunchPrincipal {
                 profile_id,
                 command,
-            } => self.handle_launch_principal(profile_id, command, ctx),
+            } => self.handle_launch_principal(profile_id, command, cred, ctx),
             AdminRequest::TerminatePrincipal { profile_id } => {
                 self.handle_terminate_principal(profile_id)
             }

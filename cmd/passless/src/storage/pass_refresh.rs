@@ -39,6 +39,7 @@ pub struct PassStorageAdapter {
 }
 
 impl PassStorageAdapter {
+    #[allow(dead_code)]
     pub fn new_with_options(
         store_path: PathBuf,
         path: PathBuf,
