@@ -45,7 +45,7 @@ notify-rust = "4.11"
 aes-gcm = "0.11"
 rand = "0.8"
 ctrlc = "3.4"
-signal-hook = "0.3"
+signal-hook = "0.4"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
 shadow-rs = "2.0"
