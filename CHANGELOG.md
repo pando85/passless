@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.18.0](https://github.com/pando85/passless/tree/v0.18.0) - 2026-08-25
+
+### Added
+
+- agent: Add lazy Playwright MCP browser bootstrap (#428) ([620a0b7](https://github.com/pando85/passless/commit/620a0b756da2c73fb56d6250242198f57de7ac04))
+- agent: Isolate browser leases per principal session (#435) ([c1e92e7](https://github.com/pando85/passless/commit/c1e92e735c8e6cab823991df89ad1041b3fbe59e))
+- Use systemd-journal-logger when running as systemd service (#437) ([0014c6a](https://github.com/pando85/passless/commit/0014c6ae56175a8d6bf7bb5047294bbe81846e49))
+
+### Fixed
+
+- agent: Handle SIGTERM and detect orphaned sessions (#438) ([005f8ab](https://github.com/pando85/passless/commit/005f8abbead20431a22f199cf898664867b7b2b6))
+- logging: Preserve filters with journald (#443) ([a651052](https://github.com/pando85/passless/commit/a6510522759caff1d9265100f3ae760e981125f5))
+- pass: Batch Git sync per operation (#434) ([e57a763](https://github.com/pando85/passless/commit/e57a7638b6326c05543867e05f7b67bcb18a2863))
+- Complete encrypted credential backup (#426) ([08b88ae](https://github.com/pando85/passless/commit/08b88aeecd811afa16ab8f2304f0117cc9e232d7))
+
+### Build
+
+- deps: Update Rust crate darling to v0.24.1 (#431) ([c11b040](https://github.com/pando85/passless/commit/c11b040c841da137dcb82342c9e86c5e5ea80e35))
+- deps: Update Rust crate psl to v2.1.225 (#430) ([eca06a7](https://github.com/pando85/passless/commit/eca06a715686f7392c79a175a0a9c6e7b82c5944))
+- deps: Update Rust crate psl to v2.1.226 (#436) ([dc56364](https://github.com/pando85/passless/commit/dc56364c4a82b99c493ae7cd3f38dffaf9bbe8a5))
+- deps: Update Rust crate aes-gcm to v0.11.1 (#439) ([b9188e5](https://github.com/pando85/passless/commit/b9188e5d4db6ce10c9859847905b6a2c39a12e46))
+- deps: Update Rust crate log to v0.4.34 (#440) ([3be059e](https://github.com/pando85/passless/commit/3be059e3a11c23c6d9d2ea07c6fb239638b0d737))
+- deps: Update Rust crate syn to v3.0.4 (#441) ([814da19](https://github.com/pando85/passless/commit/814da19732cbc6416e0fe508e5d9a4fe4d99ce27))
+- deps: Update Rust crate signal-hook to 0.4 (#442) ([5dbdd08](https://github.com/pando85/passless/commit/5dbdd0830fcf6ab0133e4b80341a8b7a1bbbd7ca))
+
 ## [v0.17.0](https://github.com/pando85/passless/tree/v0.17.0) - 2026-08-16
 
 ### Added
