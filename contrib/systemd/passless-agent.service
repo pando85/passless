@@ -46,6 +46,7 @@ PrivateDevices=false
 # node. Never grant /dev/uhid to principals or browser users.
 
 # Logging
+Environment=PASSLESS_SYSLOG_IDENTIFIER=passless-agent
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=passless-agent

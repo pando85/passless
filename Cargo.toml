@@ -41,7 +41,7 @@ dirs = "6.0"
 prs-lib = "0.5"
 serde_json = "1.0"
 libc = "0.2"
-nix = { version = "0.31", features = ["resource", "fs", "signal", "process", "dir", "user"] }
+nix = { version = "0.31", features = ["resource", "fs", "signal", "process", "dir"] }
 notify-rust = "4.11"
 aes-gcm = "0.11"
 rand = "0.8"
