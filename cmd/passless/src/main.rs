@@ -4,6 +4,7 @@ mod authenticator;
 mod commands;
 mod credential_backup;
 mod instance_lock;
+mod logging;
 mod notification;
 mod pin_storage;
 mod storage;
@@ -26,7 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use authenticator::AuthenticatorService;
 use clap::Parser;
 use commands::custom::register_yubikey_credential_mgmt;
-use env_logger::{Builder, Env};
 use log::{debug, error, info, warn};
 #[cfg(feature = "tpm")]
 use pin_storage::TpmPinStorage;
@@ -431,31 +431,7 @@ fn run() -> Result<()> {
     } else {
         log::LevelFilter::Info
     };
-
-    // Use syslog when running as systemd service
-    if systemd_journal_logger::connected_to_journal()
-        && let Ok(journal) = systemd_journal_logger::JournalLog::new()
-    {
-        // Assume only the agent is run as root
-        let syslog_identifier = if nix::unistd::Uid::effective().is_root() {
-            "passless-agent"
-        } else {
-            "passless"
-        };
-        journal
-            .with_syslog_identifier(syslog_identifier.to_string())
-            .install()
-            .expect("Logger was already installed.");
-    } else {
-        let env = Env::default()
-            .filter("PASSLESS_LOG_LEVEL")
-            .write_style("PASSLESS_LOG_STYLE");
-        Builder::from_env(env)
-            .filter_level(log::LevelFilter::Debug)
-            .format_timestamp_millis()
-            .init();
-    }
-    log::set_max_level(log_level);
+    logging::init(log_level);
 
     // Load config: CLI args + config file + defaults (CLI takes precedence)
     let config = AppConfig::load(&mut args).inspect_err(|e| {
