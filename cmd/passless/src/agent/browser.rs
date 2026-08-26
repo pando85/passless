@@ -678,9 +678,12 @@ impl BrowserProcessManager {
                     .map(|p| p.join("sign-proxy"))
                     .unwrap_or_else(|| PathBuf::from("sign-proxy"));
                 if sign_proxy.exists() {
-                    if let Err(e) =
-                        install_native_messaging_manifest(&ext_dir, &config.executable, &sign_proxy)
-                    {
+                    if let Err(e) = install_native_messaging_manifest(
+                        &ext_dir,
+                        &config.executable,
+                        &sign_proxy,
+                        Some(&profile_dir),
+                    ) {
                         log::warn!("failed to install native messaging manifest: {}", e);
                     }
                 } else {
@@ -1843,19 +1846,8 @@ pub fn install_native_messaging_manifest(
     ext_dir: &Path,
     browser_exec: &Path,
     sign_proxy_path: &Path,
+    profile_dir: Option<&Path>,
 ) -> Result<PathBuf, LaunchError> {
-    let hosts_dir = native_messaging_hosts_dir(browser_exec).ok_or_else(|| {
-        LaunchError::ExtensionSetupFailed(
-            "cannot determine native messaging hosts directory".into(),
-        )
-    })?;
-    fs::create_dir_all(&hosts_dir).map_err(|e| {
-        LaunchError::ExtensionSetupFailed(format!(
-            "create native messaging dir {}: {}",
-            hosts_dir.display(),
-            e
-        ))
-    })?;
     let ext_id = compute_extension_id(ext_dir);
     let manifest = serde_json::json!({
         "name": NATIVE_MESSAGING_HOST_NAME,
@@ -1864,6 +1856,31 @@ pub fn install_native_messaging_manifest(
         "type": "stdio",
         "allowed_origins": [format!("chrome-extension://{}/", ext_id)]
     });
+
+    let hosts_dir = if let Some(profile_dir) = profile_dir {
+        profile_dir.join("NativeMessagingHosts")
+    } else {
+        native_messaging_hosts_dir(browser_exec).ok_or_else(|| {
+            LaunchError::ExtensionSetupFailed(
+                "cannot determine native messaging hosts directory".into(),
+            )
+        })?
+    };
+
+    write_native_messaging_manifest(&hosts_dir, &manifest)
+}
+
+fn write_native_messaging_manifest(
+    hosts_dir: &Path,
+    manifest: &serde_json::Value,
+) -> Result<PathBuf, LaunchError> {
+    fs::create_dir_all(hosts_dir).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "create native messaging dir {}: {}",
+            hosts_dir.display(),
+            e
+        ))
+    })?;
     let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
     let file = fs::OpenOptions::new()
         .write(true)
@@ -1874,7 +1891,7 @@ pub fn install_native_messaging_manifest(
         .map_err(|e| {
             LaunchError::ExtensionSetupFailed(format!("create native messaging manifest: {}", e))
         })?;
-    serde_json::to_writer_pretty(&file, &manifest).map_err(|e| {
+    serde_json::to_writer_pretty(&file, manifest).map_err(|e| {
         LaunchError::ExtensionSetupFailed(format!("write native messaging manifest: {}", e))
     })?;
     Ok(manifest_path)

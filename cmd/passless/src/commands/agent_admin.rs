@@ -120,7 +120,7 @@ pub fn install_native_messaging(browser: &str, ext_dir: &Path, sign_proxy: &Path
     };
 
     let browser_exec = PathBuf::from(browser);
-    let manifest_path = install_native_messaging_manifest(ext_dir, &browser_exec, sign_proxy)
+    let manifest_path = install_native_messaging_manifest(ext_dir, &browser_exec, sign_proxy, None)
         .map_err(|e| Error::Other(e.to_string()))?;
 
     let ext_id = compute_extension_id(ext_dir);
