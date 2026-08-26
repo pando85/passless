@@ -20,6 +20,11 @@ name = "agent-prompt-probe"
 path = "src/bin/agent-prompt-probe.rs"
 required-features = ["agent-validation"]
 
+[[bin]]
+name = "sign-proxy"
+path = "src/bin/sign-proxy.rs"
+required-features = ["agent"]
+
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]

@@ -1,4 +1,4 @@
-(function(port, bearer) {
+(function(socketPath, bearer) {
   "use strict";
 
   var MAX_REQUEST_BYTES = 16384;
@@ -11,6 +11,8 @@
   var MAX_USER_NAME_LEN = 256;
   var MAX_USER_ID_B64U_LEN = 128;
   var MAX_ALGORITHMS = 16;
+
+  var NATIVE_HOST = "rs.passless.sign_proxy";
 
   function parseHttpsOrigin(url) {
     if (typeof url !== "string") return null;
@@ -84,38 +86,43 @@
       return false;
     }
 
-    fetch("http://127.0.0.1:" + port + path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + bearer
-      },
+    var message = {
+      path: path,
+      bearer: bearer,
+      socket_path: socketPath,
       body: body
-    }).then(function(response) {
-      return response.json().catch(function() {
-        return { error: "invalid_daemon_response" };
-      }).then(function(payload) {
-        return { ok: response.ok, payload: payload };
-      });
-    }).then(function(result) {
-      if (!result.ok) {
-        var code = result.payload && typeof result.payload.error === "string"
-          ? result.payload.error
-          : "request_denied";
+    };
+
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, message, function(response) {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, type: type, error: "transport_error" });
+        return;
+      }
+      if (!response || typeof response !== "object") {
+        sendResponse({ ok: false, type: type, error: "invalid_daemon_response" });
+        return;
+      }
+      if (response.error) {
         sendResponse({
           ok: false,
           type: type,
-          error: code,
-          fallback: code === "human_interaction_required"
+          error: response.error,
+          fallback: response.error === "human_interaction_required"
         });
         return;
       }
-      if (!result.payload || typeof result.payload !== "object" || !result.payload[responseField]) {
-        throw new Error("malformed daemon response");
+      var payload;
+      try {
+        payload = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
+      } catch (error) {
+        sendResponse({ ok: false, type: type, error: "invalid_daemon_response" });
+        return;
       }
-      sendResponse({ ok: true, response: result.payload[responseField], type: type });
-    }).catch(function() {
-      sendResponse({ ok: false, type: type, error: "transport_error" });
+      if (!payload || typeof payload !== "object" || !payload[responseField]) {
+        sendResponse({ ok: false, type: type, error: "invalid_daemon_response" });
+        return;
+      }
+      sendResponse({ ok: true, response: payload[responseField], type: type });
     });
     return true;
   }
@@ -179,4 +186,4 @@
     }
     return handleGetRequest(req, origins, sendResponse);
   });
-})(__PASSLESS_PORT__, __PASSLESS_BEARER__);
+})(__PASSLESS_SOCKET_PATH__, __PASSLESS_BEARER__);

@@ -19,10 +19,11 @@ function renderBroker(channel) {
   return readTemplate("broker.js").replace(/__PASSLESS_CHANNEL__/g, channel);
 }
 
-function renderWorker(port, bearer) {
+function renderWorker(socketPath, bearer) {
   const bearerLiteral = JSON.stringify(bearer);
+  const socketPathLiteral = JSON.stringify(socketPath);
   return readTemplate("worker.js")
-    .replace(/__PASSLESS_PORT__/g, String(port))
+    .replace(/__PASSLESS_SOCKET_PATH__/g, socketPathLiteral)
     .replace(/__PASSLESS_BEARER__/g, bearerLiteral);
 }
 
@@ -200,32 +201,32 @@ function runBrokerTest(channel, setupFn) {
   return sandbox;
 }
 
-function runWorkerTest(port, bearer, setupFn) {
+function runWorkerTest(socketPath, bearer, setupFn) {
   const sandbox = {
     _listeners: [],
     _sendResponses: [],
-    _fetchCalls: [],
+    _nativeMessageCalls: [],
   };
 
   const chromeObj = {
     runtime: {
       id: "test-extension-id",
+      lastError: null,
       onMessage: {
         addListener: function(fn) {
           sandbox._listeners.push(fn);
         },
       },
+      sendNativeMessage: function(host, message, callback) {
+        sandbox._nativeMessageCalls.push({ host, message, callback });
+        if (sandbox._nativeMessageResponse) {
+          callback(sandbox._nativeMessageResponse);
+        }
+      },
     },
   };
 
   sandbox.chrome = chromeObj;
-  sandbox.fetch = function(url, opts) {
-    sandbox._fetchCalls.push({ url, opts });
-    if (sandbox._fetchResponse) {
-      return Promise.resolve(sandbox._fetchResponse);
-    }
-    return new Promise(function() {});
-  };
   sandbox.URL = URL;
   sandbox.Array = Array;
   sandbox.Object = Object;
@@ -238,7 +239,7 @@ function runWorkerTest(port, bearer, setupFn) {
   sandbox.Promise = Promise;
 
   const ctx = vm.createContext(sandbox);
-  const code = renderWorker(port, bearer);
+  const code = renderWorker(socketPath || "/tmp/test/sock", bearer);
   vm.runInContext(code, ctx);
 
   if (setupFn) setupFn(sandbox);
@@ -1136,7 +1137,7 @@ test("broker: rejects credential id that is not a string", async function() {
 // ======================== WORKER.JS BEHAVIORAL TESTS ========================
 
 test("worker: validates sender.url must be valid URL", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
     const listener = sandbox._listeners[0];
     assert.ok(listener);
 
@@ -1162,7 +1163,7 @@ test("worker: validates sender.url must be valid URL", async function() {
 });
 
 test("worker: validates sender.url must be https:", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
     const listener = sandbox._listeners[0];
 
     let response = null;
@@ -1186,7 +1187,7 @@ test("worker: validates sender.url must be https:", async function() {
 });
 
 test("worker: validates sender.id against chrome.runtime.id", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
     const listener = sandbox._listeners[0];
 
     let response = null;
@@ -1210,8 +1211,8 @@ test("worker: validates sender.id against chrome.runtime.id", async function() {
 });
 
 test("worker: accepts matching sender.id", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
-    sandbox._fetchResponse = {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
+    sandbox._nativeMessageResponse = {
       ok: true,
       json: function() { return Promise.resolve({ sign_assertion_result: { credential_id_b64u: "abc" } }); },
     };
@@ -1234,12 +1235,12 @@ test("worker: accepts matching sender.id", async function() {
   });
 
   await flushPromises();
-  assert.strictEqual(sandbox._fetchCalls.length, 1);
+  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
 });
 
 test("worker: derives origin and cross_origin from sender.url", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
-    sandbox._fetchResponse = {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
+    sandbox._nativeMessageResponse = {
       ok: true,
       json: function() { return Promise.resolve({}); },
     };
@@ -1266,16 +1267,16 @@ test("worker: derives origin and cross_origin from sender.url", async function()
   });
 
   await flushPromises();
-  assert.strictEqual(sandbox._fetchCalls.length, 1);
-  const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
+  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
+  const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
   assert.strictEqual(body.origin, "https://sub.example.com");
   assert.strictEqual(body.top_origin, "https://sub.example.com");
   assert.strictEqual(body.cross_origin, false);
 });
 
 test("worker: computes cross_origin=true for a cross-origin subframe", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
-    sandbox._fetchResponse = {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
+    sandbox._nativeMessageResponse = {
       ok: true,
       json: function() { return Promise.resolve({}); },
     };
@@ -1302,15 +1303,15 @@ test("worker: computes cross_origin=true for a cross-origin subframe", async fun
   });
 
   await flushPromises();
-  const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
+  const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
   assert.strictEqual(body.origin, "https://evil.com");
   assert.strictEqual(body.top_origin, "https://example.com");
   assert.strictEqual(body.cross_origin, true);
 });
 
 test("worker: constructs fresh request object (not passthrough)", async function() {
-  const sandbox = runWorkerTest(12345, "testtoken", function(sandbox) {
-    sandbox._fetchResponse = {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
+    sandbox._nativeMessageResponse = {
       ok: true,
       json: function() { return Promise.resolve({}); },
     };
@@ -1332,19 +1333,16 @@ test("worker: constructs fresh request object (not passthrough)", async function
   });
 
   await flushPromises();
-  const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
+  const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
   assert.strictEqual(body.extra_field, undefined);
   assert.ok(body.origin);
   assert.ok(typeof body.cross_origin === "boolean");
 });
 
-test("worker: sends bearer token in Authorization header", async function() {
+test("worker: sends bearer token in native message", async function() {
   const bearerToken = "my-secret-bearer-token";
-  const sandbox = runWorkerTest(12345, bearerToken, function(sandbox) {
-    sandbox._fetchResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({}); },
-    };
+  const sandbox = runWorkerTest("/tmp/test/sock", bearerToken, function(sandbox) {
+    sandbox._nativeMessageResponse = { body: "{}" };
 
     const listener = sandbox._listeners[0];
     const sender = { url: "https://example.com/page" };
@@ -1364,18 +1362,14 @@ test("worker: sends bearer token in Authorization header", async function() {
   });
 
   await flushPromises();
-  assert.strictEqual(sandbox._fetchCalls.length, 1);
-  const headers = sandbox._fetchCalls[0].opts.headers;
-  assert.strictEqual(headers["Authorization"], "Bearer " + bearerToken);
+  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
+  assert.strictEqual(sandbox._nativeMessageCalls[0].message.bearer, bearerToken);
 });
 
 test("worker: bearer token with special characters is safely injected", async function() {
   const bearerToken = 'tok"en\\with\nspecial\u00e9';
-  const sandbox = runWorkerTest(12345, bearerToken, function(sandbox) {
-    sandbox._fetchResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({}); },
-    };
+  const sandbox = runWorkerTest("/tmp/test/sock", bearerToken, function(sandbox) {
+    sandbox._nativeMessageResponse = { body: "{}" };
 
     const listener = sandbox._listeners[0];
     const sender = { url: "https://example.com/page" };
@@ -1395,17 +1389,13 @@ test("worker: bearer token with special characters is safely injected", async fu
   });
 
   await flushPromises();
-  assert.strictEqual(sandbox._fetchCalls.length, 1);
-  const headers = sandbox._fetchCalls[0].opts.headers;
-  assert.strictEqual(headers["Authorization"], "Bearer " + bearerToken);
+  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
+  assert.strictEqual(sandbox._nativeMessageCalls[0].message.bearer, bearerToken);
 });
 
-test("worker: fetches correct URL with port", async function() {
-  const sandbox = runWorkerTest(54321, "tok", function(sandbox) {
-    sandbox._fetchResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({}); },
-    };
+test("worker: sends correct socket path in native message", async function() {
+  const sandbox = runWorkerTest("/var/run/passless/sign/sock", "tok", function(sandbox) {
+    sandbox._nativeMessageResponse = { body: "{}" };
 
     const listener = sandbox._listeners[0];
     const sender = { url: "https://example.com/page" };
@@ -1425,11 +1415,12 @@ test("worker: fetches correct URL with port", async function() {
   });
 
   await flushPromises();
-  assert.strictEqual(sandbox._fetchCalls[0].url, "http://127.0.0.1:54321/sign");
+  assert.strictEqual(sandbox._nativeMessageCalls[0].message.socket_path, "/var/run/passless/sign/sock");
+  assert.strictEqual(sandbox._nativeMessageCalls[0].message.path, "/sign");
 });
 
 test("worker: rejects rp_id exceeding MAX_RP_ID_LEN", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const sender = { url: "https://example.com/page" };
@@ -1452,7 +1443,7 @@ test("worker: rejects rp_id exceeding MAX_RP_ID_LEN", async function() {
 });
 
 test("worker: rejects challenge_b64u exceeding MAX_CHALLENGE_B64U_LEN", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const sender = { url: "https://example.com/page" };
@@ -1475,7 +1466,7 @@ test("worker: rejects challenge_b64u exceeding MAX_CHALLENGE_B64U_LEN", async fu
 });
 
 test("worker: rejects allow_credentials exceeding MAX_ALLOW_CREDENTIALS", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const creds = [];
@@ -1502,7 +1493,7 @@ test("worker: rejects allow_credentials exceeding MAX_ALLOW_CREDENTIALS", async 
 });
 
 test("worker: rejects invalid user_verification", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const sender = { url: "https://example.com/page" };
@@ -1526,8 +1517,8 @@ test("worker: rejects invalid user_verification", async function() {
 
 test("worker: accepts all valid user_verification values", async function() {
   for (const uv of ["required", "preferred", "discouraged"]) {
-    const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
-      sandbox._fetchResponse = {
+    const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
+      sandbox._nativeMessageResponse = {
         ok: true,
         json: function() { return Promise.resolve({}); },
       };
@@ -1550,17 +1541,17 @@ test("worker: accepts all valid user_verification values", async function() {
     });
 
     await flushPromises();
-    assert.strictEqual(sandbox._fetchCalls.length, 1, "should fetch for uv=" + uv);
-    const body = JSON.parse(sandbox._fetchCalls[0].opts.body);
+    assert.strictEqual(sandbox._nativeMessageCalls.length, 1, "should send native message for uv=" + uv);
+    const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
     assert.strictEqual(body.user_verification, uv === "required");
   }
 });
 
 test("worker: malformed daemon response results in ok:false", async function() {
   let asyncResponse = null;
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
-    sandbox._fetchResponse = {
-      ok: false,
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
+    sandbox._nativeMessageResponse = {
+      error: "invalid_daemon_response",
     };
 
     const listener = sandbox._listeners[0];
@@ -1585,11 +1576,13 @@ test("worker: malformed daemon response results in ok:false", async function() {
   assert.strictEqual(asyncResponse.ok, false);
 });
 
-test("worker: fetch error results in ok:false", async function() {
+test("worker: native messaging error results in ok:false", async function() {
   let asyncResponse = null;
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
-    sandbox.fetch = function() {
-      return Promise.reject(new Error("network error"));
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
+    sandbox.chrome.runtime.sendNativeMessage = function(host, message, callback) {
+      sandbox.chrome.runtime.lastError = { message: "host not found" };
+      callback(null);
+      sandbox.chrome.runtime.lastError = null;
     };
 
     const listener = sandbox._listeners[0];
@@ -1617,7 +1610,7 @@ test("worker: fetch error results in ok:false", async function() {
 });
 
 test("worker: rejects request body exceeding MAX_REQUEST_BYTES", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const bigCreds = [];
@@ -1644,7 +1637,7 @@ test("worker: rejects request body exceeding MAX_REQUEST_BYTES", async function(
 });
 
 test("worker: rejects message from wrong source", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let called = false;
     const sender = { url: "https://example.com/page" };
@@ -1667,7 +1660,7 @@ test("worker: rejects message from wrong source", async function() {
 });
 
 test("worker: rejects message without request", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let called = false;
     const sender = { url: "https://example.com/page" };
@@ -1682,7 +1675,7 @@ test("worker: rejects message without request", async function() {
 });
 
 test("worker: rejects credential id exceeding MAX_CREDENTIAL_ID_B64U_LEN", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const sender = { url: "https://example.com/page" };
@@ -1705,7 +1698,7 @@ test("worker: rejects credential id exceeding MAX_CREDENTIAL_ID_B64U_LEN", async
 });
 
 test("worker: rejects credential id that is not a string", async function() {
-  const sandbox = runWorkerTest(12345, "tok", function(sandbox) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
     const listener = sandbox._listeners[0];
     let response = null;
     const sender = { url: "https://example.com/page" };
@@ -1731,7 +1724,7 @@ test("worker: rejects credential id that is not a string", async function() {
 
 test("bearer: generated worker JS parses with special-character token", async function() {
   const token = 'tok"with\\special\nchars\u00e9';
-  const rendered = renderWorker(12345, token);
+  const rendered = renderWorker("/tmp/test/sock", token);
   const sandbox = { chrome: { runtime: { id: "x", onMessage: { addListener: function() {} } } } };
   const ctx = vm.createContext(sandbox);
   vm.runInContext(rendered, ctx);

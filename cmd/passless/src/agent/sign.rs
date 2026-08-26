@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -544,8 +546,8 @@ impl Default for SignContextRegistry {
 }
 
 pub struct SignHttpServer {
-    listener: TcpListener,
-    addr: SocketAddr,
+    listener: Option<UnixListener>,
+    socket_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -554,37 +556,37 @@ const MAX_HTTP_HEADER_SIZE: usize = 8192;
 const MAX_CONNECTIONS: usize = 8;
 
 impl SignHttpServer {
-    pub fn bind(shutdown: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn bind(socket_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self, String> {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create socket directory: {}", e))?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("set socket dir permissions: {}", e))?;
+        }
+        let _ = std::fs::remove_file(&socket_path);
         let listener =
-            TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {}", e))?;
-        listener
-            .set_nonblocking(false)
-            .map_err(|e| format!("set_nonblocking failed: {}", e))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| format!("local_addr failed: {}", e))?;
+            UnixListener::bind(&socket_path).map_err(|e| format!("bind failed: {}", e))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("set socket permissions: {}", e))?;
         Ok(Self {
-            listener,
-            addr,
+            listener: Some(listener),
+            socket_path,
             shutdown,
         })
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub fn port(&self) -> u16 {
-        self.addr.port()
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    pub fn serve(self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
+    pub fn serve(mut self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
         let shutdown = self.shutdown.clone();
-        let listener = self.listener;
+        let listener = self.listener.take().expect("listener already taken");
+        let socket_path = self.socket_path.clone();
         thread::spawn(move || {
             listener.set_nonblocking(true).expect("set_nonblocking");
             let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -617,11 +619,20 @@ impl SignHttpServer {
                     }
                 }
             }
+            let _ = std::fs::remove_file(&socket_path);
         })
     }
 }
 
-fn send_http_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>) {
+impl Drop for SignHttpServer {
+    fn drop(&mut self) {
+        if self.listener.is_some() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+}
+
+fn send_http_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
     let content_length = body.map(|b| b.len()).unwrap_or(0);
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -633,18 +644,16 @@ fn send_http_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>)
     }
 }
 
-fn send_http_error(stream: &mut TcpStream, status: &str, code: &str) {
+fn send_http_error(stream: &mut UnixStream, status: &str, code: &str) {
     let body = format!("{{\"error\":\"{}\"}}", code);
     send_http_response(stream, status, Some(body.as_bytes()));
 }
 
-const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\n";
-
-fn send_sign_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>) {
+fn send_sign_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
     let content_length = body.map(|b| b.len()).unwrap_or(0);
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
-        status, content_length, CORS_HEADERS
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        status, content_length
     );
     let _ = stream.write_all(header.as_bytes());
     if let Some(body) = body {
@@ -652,21 +661,13 @@ fn send_sign_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>)
     }
 }
 
-fn send_sign_error(stream: &mut TcpStream, status: &str, code: &str) {
+fn send_sign_error(stream: &mut UnixStream, status: &str, code: &str) {
     let body = format!("{{\"error\":\"{}\"}}", code);
     send_sign_response(stream, status, Some(body.as_bytes()));
 }
 
-fn send_preflight_response(stream: &mut TcpStream) {
-    let response = format!(
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n{}\r\n",
-        CORS_HEADERS
-    );
-    let _ = stream.write_all(response.as_bytes());
-}
-
 fn handle_http_connection(
-    mut stream: TcpStream,
+    mut stream: UnixStream,
     registry: &SignContextRegistry,
 ) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -699,10 +700,6 @@ fn handle_http_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("no method")?;
     let path = parts.next().ok_or("no path")?;
-    if method == "OPTIONS" && (path == "/sign" || path == "/register") {
-        send_preflight_response(&mut stream);
-        return Ok(());
-    }
     if method != "POST" || (path != "/sign" && path != "/register") {
         send_http_error(&mut stream, "404 Not Found", "not_found");
         return Ok(());
@@ -1684,10 +1681,16 @@ mod tests {
     }
 
     #[test]
-    fn test_http_server_binds_loopback() {
+    fn test_http_server_binds_unix_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        assert!(server.addr().ip().is_loopback());
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
+        assert!(server.socket_path().exists());
+        let meta = std::fs::metadata(server.socket_path()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        drop(server);
         shutdown.store(true, Ordering::Release);
     }
 
@@ -1902,14 +1905,14 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_endpoint_metadata_contains_sign_port_and_bearer() {
+    fn test_agent_endpoint_metadata_contains_sign_socket_path_and_bearer() {
         use crate::agent::browser::AgentEndpointMetadata;
         let token = generate_bearer_token().unwrap();
         let metadata = AgentEndpointMetadata {
-            port: 12345,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: token.clone(),
         };
-        assert_eq!(metadata.port, 12345);
+        assert_eq!(metadata.socket_path, "/tmp/test/sock");
         assert_eq!(metadata.bearer_token, token);
     }
 
@@ -1951,9 +1954,10 @@ mod tests {
 
     #[test]
     fn test_http_valid_bound_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -1979,7 +1983,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -1995,9 +1999,10 @@ mod tests {
 
     #[test]
     fn test_http_unknown_bearer_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let body = b"{}";
@@ -2005,7 +2010,7 @@ mod tests {
             "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer unknown_token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2021,9 +2026,10 @@ mod tests {
 
     #[test]
     fn test_http_unbound_bearer_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2039,7 +2045,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2055,9 +2061,10 @@ mod tests {
 
     #[test]
     fn test_http_revoked_bearer_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2077,7 +2084,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2093,9 +2100,10 @@ mod tests {
 
     #[test]
     fn test_http_missing_bearer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let body = b"{}";
@@ -2103,7 +2111,7 @@ mod tests {
             "POST /sign HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2119,9 +2127,10 @@ mod tests {
 
     #[test]
     fn test_http_wrong_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2136,7 +2145,7 @@ mod tests {
             "GET /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
             token
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2151,9 +2160,10 @@ mod tests {
 
     #[test]
     fn test_http_wrong_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2168,7 +2178,7 @@ mod tests {
             "POST /other HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
             token
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2183,16 +2193,20 @@ mod tests {
 
     #[test]
     fn test_listener_loopback_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        assert!(server.addr().ip().is_loopback());
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
+        assert!(server.socket_path().starts_with(dir.path()));
         shutdown.store(true, Ordering::Release);
     }
 
     #[test]
     fn test_shutdown_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let server = SignHttpServer::bind(sock_path, shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         shutdown.store(true, Ordering::Release);
@@ -2209,40 +2223,15 @@ mod tests {
     }
 
     #[test]
-    fn test_http_options_sign_preflight() {
+    fn test_http_options_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let request = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("204 No Content"));
-        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
-        assert!(resp_str.contains("Access-Control-Allow-Methods: POST"));
-        assert!(resp_str.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
-        assert!(!resp_str.contains("Access-Control-Allow-Credentials"));
-        assert!(!resp_str.contains("evil.example.com"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_options_wrong_path_404() {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let request = "OPTIONS /other HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2251,16 +2240,16 @@ mod tests {
         let n = stream.read(&mut resp_buf).unwrap();
         let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp_str.contains("404"));
-        assert!(!resp_str.contains("Access-Control"));
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
-    fn test_http_post_error_has_cors_no_reflected_origin() {
+    fn test_http_post_error_no_cors_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let body = b"{}";
@@ -2268,7 +2257,7 @@ mod tests {
             "POST /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2278,17 +2267,17 @@ mod tests {
         let n = stream.read(&mut resp_buf).unwrap();
         let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp_str.contains("401"));
-        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
-        assert!(!resp_str.contains("attacker.example.com"));
+        assert!(!resp_str.contains("Access-Control"));
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
-    fn test_http_success_has_cors() {
+    fn test_http_success_no_cors_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2316,7 +2305,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2326,18 +2315,17 @@ mod tests {
         let n = stream.read(&mut resp_buf).unwrap();
         let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp_str.contains("200 OK"));
-        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
-        assert!(resp_str.contains("Access-Control-Allow-Methods: POST"));
-        assert!(resp_str.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
+        assert!(!resp_str.contains("Access-Control"));
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
     fn test_http_unbound_bearer_same_401_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2353,7 +2341,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -3688,13 +3676,12 @@ mod tests {
         use super::*;
 
         use std::io::{Read, Write};
-        use std::net::{SocketAddr, TcpStream};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
-        fn http_request(addr: SocketAddr, request: &str, body: &[u8]) -> String {
-            let mut stream = TcpStream::connect(addr).unwrap();
+        fn http_request(sock_path: &Path, request: &str, body: &[u8]) -> String {
+            let mut stream = UnixStream::connect(sock_path).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -3720,15 +3707,17 @@ mod tests {
             constant_counter: bool,
         ) -> (
             Arc<AtomicBool>,
-            SocketAddr,
+            tempfile::TempDir,
+            std::path::PathBuf,
             Arc<SignContextRegistry>,
             String,
             TestFixture,
             thread::JoinHandle<()>,
         ) {
+            let dir = tempfile::tempdir().unwrap();
+            let sock_path = dir.path().join("sock");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-            let addr = server.addr();
+            let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
             let registry = Arc::new(SignContextRegistry::new());
             let token = generate_bearer_token().unwrap();
             let f = TestFixture::new(constant_counter);
@@ -3741,7 +3730,7 @@ mod tests {
                 .bind_lease(&token, "lease-integ".to_string())
                 .unwrap();
             let handle = server.serve(registry.clone());
-            (shutdown, addr, registry, token, f, handle)
+            (shutdown, dir, sock_path, registry, token, f, handle)
         }
 
         fn sign_request_body(
@@ -3779,7 +3768,7 @@ mod tests {
 
         #[test]
         fn http_sign_full_response_structure() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3788,7 +3777,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("200 OK"));
             let body_str = http_body(&resp);
             let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
@@ -3804,16 +3793,7 @@ mod tests {
 
         #[test]
         fn http_auth_preflight_then_sign() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
-            let preflight = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
-            let preflight_resp = http_request(addr, preflight, b"");
-            assert!(preflight_resp.contains("204 No Content"));
-            assert!(preflight_resp.contains("Access-Control-Allow-Origin: *"));
-            assert!(preflight_resp.contains("Access-Control-Allow-Methods: POST"));
-            assert!(
-                preflight_resp
-                    .contains("Access-Control-Allow-Headers: Authorization, Content-Type")
-            );
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3822,23 +3802,19 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let sign_resp = http_request(addr, &req, &body);
+            let sign_resp = http_request(&sock_path, &req, &body);
             assert!(sign_resp.contains("200 OK"));
-            assert!(sign_resp.contains("Access-Control-Allow-Origin: *"));
-            assert!(sign_resp.contains("Access-Control-Allow-Methods: POST"));
-            assert!(
-                sign_resp.contains("Access-Control-Allow-Headers: Authorization, Content-Type")
-            );
+            assert!(!sign_resp.contains("Access-Control"));
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();
         }
 
         #[test]
         fn http_policy_deny_returns_403() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3848,7 +3824,7 @@ mod tests {
 
         #[test]
         fn http_grant_ttl_enforced() {
-            let (shutdown, addr, _registry, token, f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, f, handle) = setup_bound(true);
             f.clock.advance(Duration::from_secs(301));
             let body = sign_request_body(
                 "https://example.com",
@@ -3858,7 +3834,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3868,7 +3844,7 @@ mod tests {
 
         #[test]
         fn http_credential_ref_enforced() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3877,7 +3853,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("200 OK"));
             let body_str = http_body(&resp);
             let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
@@ -3891,7 +3867,7 @@ mod tests {
 
         #[test]
         fn http_counter_increment_monotonic() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
             let body1 = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3900,7 +3876,7 @@ mod tests {
                 false,
             );
             let req1 = format_sign_request(&token, &body1);
-            let resp1 = http_request(addr, &req1, &body1);
+            let resp1 = http_request(&sock_path, &req1, &body1);
             assert!(resp1.contains("200 OK"));
             let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
             let inner1 = parsed1.get("sign_assertion_result").unwrap();
@@ -3918,7 +3894,7 @@ mod tests {
                 false,
             );
             let req2 = format_sign_request(&token, &body2);
-            let resp2 = http_request(addr, &req2, &body2);
+            let resp2 = http_request(&sock_path, &req2, &body2);
             assert!(resp2.contains("200 OK"));
             let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
             let inner2 = parsed2.get("sign_assertion_result").unwrap();
@@ -3936,14 +3912,14 @@ mod tests {
 
         #[test]
         fn http_content_type_validation() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = b"{}";
             let req = format!(
                 "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
                 token,
                 body.len()
             );
-            let resp = http_request(addr, &req, body);
+            let resp = http_request(&sock_path, &req, body);
             assert!(resp.contains("415"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("unsupported_content_type"));
@@ -3953,11 +3929,11 @@ mod tests {
 
         #[test]
         fn http_origin_mismatch_denied() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body =
                 sign_request_body("https://evil.com", "example.com", "dGVzdA", vec![], false);
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3967,10 +3943,10 @@ mod tests {
 
         #[test]
         fn http_wrong_rp_id_denied() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3980,7 +3956,7 @@ mod tests {
 
         #[test]
         fn http_unauthorized_credential_denied() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let wrong_cred = b64u_encode(b"wrong_credential_id_bytes_1234567");
             let body = sign_request_body(
                 "https://example.com",
@@ -3990,7 +3966,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -4000,7 +3976,7 @@ mod tests {
 
         #[test]
         fn http_replay_attack_same_challenge_is_rejected() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -4009,7 +3985,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp1 = http_request(addr, &req, &body);
+            let resp1 = http_request(&sock_path, &req, &body);
             assert!(resp1.contains("200 OK"));
             let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
             let auth1 = parsed1
@@ -4021,7 +3997,7 @@ mod tests {
                 .unwrap();
             assert_eq!(extract_counter(auth1), 1);
 
-            let resp2 = http_request(addr, &req, &body);
+            let resp2 = http_request(&sock_path, &req, &body);
             assert!(resp2.contains("409 Conflict"));
             assert!(http_body(&resp2).contains("replayed_operation"));
 
@@ -4031,10 +4007,10 @@ mod tests {
 
         #[test]
         fn http_invalid_json_body() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = b"{invalid json!!";
             let req = format_sign_request(&token, body);
-            let resp = http_request(addr, &req, body);
+            let resp = http_request(&sock_path, &req, body);
             assert!(resp.contains("400"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("invalid_json"));
@@ -4044,12 +4020,12 @@ mod tests {
 
         #[test]
         fn http_body_too_large() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let req = format!(
                 "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n",
                 token
             );
-            let resp = http_request(addr, &req, b"");
+            let resp = http_request(&sock_path, &req, b"");
             assert!(resp.contains("413"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("body_too_large"));
@@ -4059,7 +4035,7 @@ mod tests {
 
         #[test]
         fn http_bearer_not_prefix_match() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let prefix = &token[..10];
             let body = sign_request_body(
                 "https://example.com",
@@ -4069,7 +4045,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(prefix, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("401"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("invalid_bearer"));
@@ -4079,7 +4055,7 @@ mod tests {
 
         #[test]
         fn http_wrong_auth_scheme() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -4092,7 +4068,7 @@ mod tests {
                 token,
                 body.len()
             );
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("401"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("invalid_authorization_scheme"));
@@ -4102,7 +4078,7 @@ mod tests {
 
         #[test]
         fn http_cross_origin_theft_attempt() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://attacker.com",
                 "example.com",
@@ -4111,7 +4087,7 @@ mod tests {
                 true,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));

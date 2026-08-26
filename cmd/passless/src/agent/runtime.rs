@@ -535,7 +535,7 @@ pub struct AgentRuntime {
     sign_server_shutdown: Arc<AtomicBool>,
     sign_server_handle: Mutex<Option<JoinHandle<()>>>,
     #[allow(dead_code)]
-    sign_port: u16,
+    sign_socket_path: std::path::PathBuf,
 }
 
 impl AgentRuntime {
@@ -973,11 +973,21 @@ impl AgentRuntime {
 
         let sign_registry = Arc::new(SignContextRegistry::new());
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));
-        let sign_server = SignHttpServer::bind(sign_server_shutdown.clone()).map_err(|e| {
-            RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e))
-        })?;
-        let sign_port = sign_server.port();
-        info!("Sign HTTP server listening on 127.0.0.1:{}", sign_port);
+        let sign_socket_base = dirs::runtime_dir()
+            .or_else(|| {
+                let uid = unsafe { libc::getuid() };
+                Some(PathBuf::from(format!("/tmp/passless-agent-{}", uid)))
+            })
+            .ok_or_else(|| RuntimeError::Config("cannot resolve runtime directory".into()))?;
+        let sign_socket_path = sign_socket_base.join("agent").join("sign").join("sock");
+        let sign_server =
+            SignHttpServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone()).map_err(
+                |e| RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e)),
+            )?;
+        info!(
+            "Sign HTTP server listening on {}",
+            sign_socket_path.display()
+        );
         let sign_server_handle = sign_server.serve(sign_registry.clone());
 
         let endpoint_manager = Mutex::new(EndpointManager::new(
@@ -1213,7 +1223,7 @@ impl AgentRuntime {
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
-            sign_port,
+            sign_socket_path,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -5032,7 +5042,7 @@ impl AgentRuntime {
             })?;
 
         let metadata = super::browser::AgentEndpointMetadata {
-            port: self.sign_port,
+            socket_path: self.sign_socket_path.to_string_lossy().into_owned(),
             bearer_token: bearer_token.clone(),
         };
 
@@ -6333,9 +6343,13 @@ mod tests {
 
         let sign_registry = Arc::new(SignContextRegistry::new());
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));
+        let sign_socket_path = std::env::temp_dir()
+            .join("passless-test")
+            .join(format!("sign-{}", std::process::id()))
+            .join("sock");
         let sign_server =
-            SignHttpServer::bind(sign_server_shutdown.clone()).expect("bind sign server");
-        let sign_port = sign_server.port();
+            SignHttpServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone())
+                .expect("bind sign server");
         let sign_server_handle = sign_server.serve(sign_registry.clone());
 
         let runtime = Arc::new(AgentRuntime {
@@ -6364,7 +6378,7 @@ mod tests {
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
-            sign_port,
+            sign_socket_path,
         });
 
         let profile = runtime.profiles.get(&profile_id).unwrap();
