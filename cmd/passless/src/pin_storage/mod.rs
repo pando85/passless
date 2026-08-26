@@ -272,6 +272,10 @@ pub trait PinStorage: Send + Sync {
 
     /// Save PIN state to storage
     fn save_pin_state(&self, state: &PinState) -> Result<(), StatusCode>;
+
+    fn is_pin_configured(&self) -> Result<bool, StatusCode> {
+        Ok(self.load_pin_state()?.pin_hash.is_some())
+    }
 }
 
 /// No-op PIN storage implementation
@@ -292,5 +296,9 @@ impl PinStorage for Box<dyn PinStorage> {
 
     fn save_pin_state(&self, state: &PinState) -> Result<(), StatusCode> {
         (**self).save_pin_state(state)
+    }
+
+    fn is_pin_configured(&self) -> Result<bool, StatusCode> {
+        (**self).is_pin_configured()
     }
 }

@@ -362,6 +362,20 @@ impl PassPinStorage {
 }
 
 impl PinStorage for PassPinStorage {
+    fn is_pin_configured(&self) -> std::result::Result<bool, soft_fido2::StatusCode> {
+        let cached = self.last_config.read().map_err(|e| {
+            warn!("Failed to acquire config lock: {:?}", e);
+            soft_fido2::StatusCode::Other
+        })?;
+
+        if let Some(config) = cached.as_ref() {
+            return Ok(config.is_pin_set());
+        }
+        drop(cached);
+
+        Ok(self.load_pin_state()?.pin_hash.is_some())
+    }
+
     fn load_pin_state(&self) -> std::result::Result<soft_fido2::PinState, soft_fido2::StatusCode> {
         self.sync.prepare_if_needed();
 
@@ -476,6 +490,32 @@ mod tests {
             credential_wrapping_generation: 0,
             modified_at: Some(1),
         }
+    }
+
+    #[test]
+    fn cached_pin_configuration_avoids_storage_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync = PassGitSync::new(temp.path().to_path_buf(), false);
+        let storage = PassPinStorage::new_with_sync(
+            temp.path().to_path_buf(),
+            PathBuf::from("fido2"),
+            GpgBackend::GnupgBin,
+            sync,
+        );
+
+        *storage.last_config.write().unwrap() = Some(config());
+
+        assert!(storage.is_pin_configured().unwrap());
+
+        storage
+            .last_config
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .pin_hash = None;
+
+        assert!(!storage.is_pin_configured().unwrap());
     }
 
     #[test]
