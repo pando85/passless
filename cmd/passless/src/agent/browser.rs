@@ -6388,12 +6388,18 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_has_no_host_permissions() {
+    fn test_manifest_has_host_permissions() {
         let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
         let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
+        let host_permissions = parsed
+            .get("host_permissions")
+            .expect("host_permissions must be present for content scripts");
+        let arr = host_permissions
+            .as_array()
+            .expect("host_permissions must be an array");
         assert!(
-            parsed.get("host_permissions").is_none(),
-            "host_permissions must not be present (Unix socket transport)"
+            arr.iter().any(|v| v.as_str() == Some("https://*/*")),
+            "host_permissions must include https://*/*"
         );
     }
 
