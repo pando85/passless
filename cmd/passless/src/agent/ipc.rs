@@ -700,7 +700,7 @@ impl IpcServer {
         &self,
         client_fd: OwnedFd,
         handler: &A,
-    ) -> Result<(), IpcError> {
+    ) -> Result<Option<libc::pid_t>, IpcError> {
         self.handle_one_admin_inner(client_fd, handler)
     }
 
@@ -708,7 +708,7 @@ impl IpcServer {
         &self,
         client_fd: OwnedFd,
         handler: &A,
-    ) -> Result<(), IpcError> {
+    ) -> Result<Option<libc::pid_t>, IpcError> {
         let _guard = self
             .conn_counter
             .try_acquire()
@@ -838,16 +838,23 @@ impl IpcServer {
 
         match handler.handle_admin(&admin_frame.action, &_cred, &ctx) {
             Ok(response_action) => {
+                let child_pid =
+                    if let AdminResponse::PrincipalLaunched(ref launched) = response_action {
+                        Some(launched.pid as libc::pid_t)
+                    } else {
+                        None
+                    };
                 let response =
                     ResponseFrame::Admin(AdminResponseFrame::ok(admin_frame.seq, response_action));
                 send_response(raw_fd, &response)?;
+                return Ok(child_pid);
             }
             Err(pe) => {
                 let _ = send_error_responses(raw_fd, Role::Admin, admin_frame.seq, pe);
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     pub fn handle_one_principal<P: PrincipalHandler>(
