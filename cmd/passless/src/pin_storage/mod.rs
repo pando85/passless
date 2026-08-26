@@ -273,6 +273,10 @@ pub trait PinStorage: Send + Sync {
     /// Save PIN state to storage
     fn save_pin_state(&self, state: &PinState) -> Result<(), StatusCode>;
 
+    /// Check if PIN is configured without triggering storage sync
+    ///
+    /// Default implementation loads the full state. Backends with expensive sync
+    /// operations should override this to check cached state first.
     fn is_pin_configured(&self) -> Result<bool, StatusCode> {
         Ok(self.load_pin_state()?.pin_hash.is_some())
     }
