@@ -1805,9 +1805,9 @@ fn generate_agent_extension(
     Ok(ext_dir)
 }
 
-const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
+pub const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
 
-fn compute_extension_id(ext_dir: &Path) -> String {
+pub fn compute_extension_id(ext_dir: &Path) -> String {
     use sha2::Digest;
     let abs_path = ext_dir
         .canonicalize()
@@ -1816,7 +1816,11 @@ fn compute_extension_id(ext_dir: &Path) -> String {
     let hash = sha2::Sha256::digest(path_str.as_bytes());
     hash.iter()
         .take(16)
-        .map(|b| (b'a' + (b % 16)) as char)
+        .flat_map(|b| {
+            let high = (b >> 4) & 0x0F;
+            let low = b & 0x0F;
+            [(b'a' + high) as char, (b'a' + low) as char]
+        })
         .collect()
 }
 
@@ -1835,7 +1839,7 @@ fn native_messaging_hosts_dir(browser_exec: &Path) -> Option<PathBuf> {
     config_dir.map(|d| d.join("NativeMessagingHosts"))
 }
 
-fn install_native_messaging_manifest(
+pub fn install_native_messaging_manifest(
     ext_dir: &Path,
     browser_exec: &Path,
     sign_proxy_path: &Path,
