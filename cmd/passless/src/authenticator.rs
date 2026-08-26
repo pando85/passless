@@ -1248,8 +1248,7 @@ impl<
             .pin_storage
             .as_ref()
             .and_then(|ps| ps.lock().ok())
-            .and_then(|ps| ps.load_pin_state().ok())
-            .map(|state| state.pin_hash.is_some())
+            .and_then(|ps| ps.is_pin_configured().ok())
             .unwrap_or(false);
 
         let state = if pin_configured {
