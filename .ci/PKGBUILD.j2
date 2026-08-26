@@ -53,6 +53,8 @@ check() {
 package() {
     cd "$srcdir/passless"
     install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/passless"
+    install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/sign-proxy"
+    install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/agent-prompt-probe"
 
     # Install shell completions
     local _completion_dir="$(find target/release/build/passless-rs-*/out/completions -type d 2>/dev/null | head -1)"

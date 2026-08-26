@@ -23,6 +23,8 @@ sha256sums=('{{ checksum }}'
 
 package() {
 	install -Dm755 passless "${pkgdir}/usr/bin/passless"
+	install -Dm755 sign-proxy "${pkgdir}/usr/bin/sign-proxy"
+	install -Dm755 agent-prompt-probe "${pkgdir}/usr/bin/agent-prompt-probe"
 
 	# Install shell completions
 	if [ -f "passless.bash" ]; then
