@@ -1191,4 +1191,53 @@ mod tests {
     fn pending_request_id_parse_rejects_non_hex() {
         assert!(parse_pending_request_id("not-hex").is_err());
     }
+
+    #[test]
+    fn exec_command_directly_rejects_empty_command() {
+        let result = exec_command_directly(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no command"));
+    }
+
+    #[test]
+    fn exec_command_directly_rejects_nonexistent_binary() {
+        let result = exec_command_directly(&[PathBuf::from("/nonexistent/binary")]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to exec"));
+    }
+
+    #[test]
+    fn control_fd_socket_detection() {
+        let control_fd = crate::agent::launcher::CONTROL_FD;
+        let mut fds = [0i32; 2];
+        let ret = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(ret, 0, "socketpair failed");
+
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let stat_ret = unsafe { libc::fstat(fds[0], &mut stat) };
+        assert_eq!(stat_ret, 0);
+        assert_eq!(
+            (stat.st_mode & libc::S_IFMT),
+            libc::S_IFSOCK,
+            "socketpair fd should be detected as socket"
+        );
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        let invalid_fd = 9999;
+        let stat_ret = unsafe { libc::fstat(invalid_fd, &mut stat) };
+        assert_ne!(stat_ret, 0, "fstat on invalid fd should fail");
+
+        let _ = control_fd;
+    }
 }

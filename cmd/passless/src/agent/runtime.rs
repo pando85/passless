@@ -1939,7 +1939,11 @@ impl AgentRuntime {
                         loop {
                             let ret = unsafe { libc::kill(child_pid, 0) };
                             if ret != 0 {
-                                break;
+                                let errno = std::io::Error::last_os_error();
+                                if errno.raw_os_error() == Some(libc::ESRCH) {
+                                    break;
+                                }
+                                debug!("kill({}, 0) failed: {}", child_pid, errno);
                             }
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
