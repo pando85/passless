@@ -2,6 +2,9 @@
   "manifest_version": 3,
   "name": "passless-agent",
   "version": "1.0.0",
+  "permissions": [
+    "nativeMessaging"
+  ],
   "background": {
     "service_worker": "worker.js"
   },

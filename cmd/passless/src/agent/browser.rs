@@ -20,6 +20,7 @@ use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json;
 
 use super::launcher::{
     DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NPROC, HardenedChildSetup,
@@ -665,12 +666,30 @@ impl BrowserProcessManager {
         })?;
 
         if let Some(metadata) = agent_endpoint {
-            let _ext_dir = generate_agent_extension(
+            let ext_dir = generate_agent_extension(
                 &runtime_dir,
                 metadata,
                 config.target_uid,
                 config.target_gid,
             )?;
+            if let Ok(current_exe) = std::env::current_exe() {
+                let sign_proxy = current_exe
+                    .parent()
+                    .map(|p| p.join("sign-proxy"))
+                    .unwrap_or_else(|| PathBuf::from("sign-proxy"));
+                if sign_proxy.exists() {
+                    if let Err(e) =
+                        install_native_messaging_manifest(&ext_dir, &config.executable, &sign_proxy)
+                    {
+                        log::warn!("failed to install native messaging manifest: {}", e);
+                    }
+                } else {
+                    log::warn!(
+                        "sign-proxy not found at {}, native messaging disabled",
+                        sign_proxy.display()
+                    );
+                }
+            }
         }
 
         let profile_fp = fingerprint_path(&profile_dir).map_err(|e| {
@@ -959,6 +978,8 @@ impl BrowserProcessManager {
     }
 
     pub fn cleanup(&mut self, lease_id: &BrowserLeaseId) -> Result<CleanupSafety, TransitionError> {
+        remove_native_messaging_manifest_from_all();
+
         let entry = self.leases.get(lease_id).ok_or(TransitionError::NotFound)?;
 
         let manifest = &entry.manifest;
@@ -1782,6 +1803,87 @@ fn generate_agent_extension(
     )?;
 
     Ok(ext_dir)
+}
+
+const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
+
+fn compute_extension_id(ext_dir: &Path) -> String {
+    use sha2::Digest;
+    let abs_path = ext_dir
+        .canonicalize()
+        .unwrap_or_else(|_| ext_dir.to_path_buf());
+    let path_str = abs_path.to_string_lossy();
+    let hash = sha2::Sha256::digest(path_str.as_bytes());
+    hash.iter()
+        .take(16)
+        .map(|b| (b'a' + (b % 16)) as char)
+        .collect()
+}
+
+fn native_messaging_hosts_dir(browser_exec: &Path) -> Option<PathBuf> {
+    let exec_name = browser_exec
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let config_dir = if exec_name.contains("google-chrome") || exec_name == "chrome" {
+        dirs::config_dir().map(|d| d.join("google-chrome"))
+    } else if exec_name.contains("chromium") {
+        dirs::config_dir().map(|d| d.join("chromium"))
+    } else {
+        dirs::config_dir().map(|d| d.join("chromium"))
+    };
+    config_dir.map(|d| d.join("NativeMessagingHosts"))
+}
+
+fn install_native_messaging_manifest(
+    ext_dir: &Path,
+    browser_exec: &Path,
+    sign_proxy_path: &Path,
+) -> Result<PathBuf, LaunchError> {
+    let hosts_dir = native_messaging_hosts_dir(browser_exec).ok_or_else(|| {
+        LaunchError::ExtensionSetupFailed(
+            "cannot determine native messaging hosts directory".into(),
+        )
+    })?;
+    fs::create_dir_all(&hosts_dir).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "create native messaging dir {}: {}",
+            hosts_dir.display(),
+            e
+        ))
+    })?;
+    let ext_id = compute_extension_id(ext_dir);
+    let manifest = serde_json::json!({
+        "name": NATIVE_MESSAGING_HOST_NAME,
+        "description": "Passless agent sign proxy",
+        "path": sign_proxy_path,
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{}/", ext_id)]
+    });
+    let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&manifest_path)
+        .map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("create native messaging manifest: {}", e))
+        })?;
+    serde_json::to_writer_pretty(&file, &manifest).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!("write native messaging manifest: {}", e))
+    })?;
+    Ok(manifest_path)
+}
+
+fn remove_native_messaging_manifest_from_all() {
+    if let Some(config_dir) = dirs::config_dir() {
+        for browser_dir in &["chromium", "google-chrome", "google-chrome-beta"] {
+            let hosts_dir = config_dir.join(browser_dir).join("NativeMessagingHosts");
+            let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
+            let _ = fs::remove_file(&manifest_path);
+        }
+    }
 }
 
 pub(crate) fn build_browser_command(
