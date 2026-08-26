@@ -19,6 +19,8 @@ use passless_core::agent::config::{ANY_RP_ID, CdpExposeMode, validate_rp_id};
 use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
 
 use rand::Rng;
+use rsa::RsaPrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json;
 
@@ -46,6 +48,81 @@ pub const CDP_MAX_RESPONSE_TOTAL_BYTES: usize = 64 * 1024;
 pub const CDP_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CDP_MIN_TIMEOUT: Duration = Duration::from_millis(100);
 const CDP_READ_BUF_SIZE: usize = 16 * 1024;
+const EXTENSION_KEY_FILENAME: &str = "extension_key.pem";
+
+fn extension_key_path() -> Result<PathBuf, LaunchError> {
+    dirs::config_dir()
+        .map(|d| d.join("passless").join(EXTENSION_KEY_FILENAME))
+        .ok_or_else(|| {
+            LaunchError::ExtensionSetupFailed("cannot determine config directory".into())
+        })
+}
+
+fn generate_extension_key() -> Result<RsaPrivateKey, LaunchError> {
+    let mut rng = rand::thread_rng();
+    RsaPrivateKey::new(&mut rng, 2048)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("generate RSA key: {}", e)))
+}
+
+fn load_or_create_extension_key() -> Result<RsaPrivateKey, LaunchError> {
+    let key_path = extension_key_path()?;
+
+    if key_path.exists() {
+        let pem_data = fs::read_to_string(&key_path)
+            .map_err(|e| LaunchError::ExtensionSetupFailed(format!("read extension key: {}", e)))?;
+        RsaPrivateKey::from_pkcs8_pem(&pem_data)
+            .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse extension key: {}", e)))
+    } else {
+        let key = generate_extension_key()?;
+        let pem_data = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("encode extension key: {}", e))
+        })?;
+
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                LaunchError::ExtensionSetupFailed(format!("create config directory: {}", e))
+            })?;
+        }
+
+        fs::write(&key_path, pem_data.as_bytes()).map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("write extension key: {}", e))
+        })?;
+
+        Ok(key)
+    }
+}
+
+fn compute_extension_id_from_key(key: &RsaPrivateKey) -> Result<String, LaunchError> {
+    use sha2::Digest;
+
+    let pub_key = key.to_public_key();
+    let pub_key_der = pub_key
+        .to_public_key_der()
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("encode public key: {}", e)))?;
+
+    let hash = sha2::Sha256::digest(pub_key_der.as_bytes());
+    let ext_id: String = hash
+        .iter()
+        .take(16)
+        .flat_map(|b| {
+            let high = (b >> 4) & 0x0F;
+            let low = b & 0x0F;
+            [(b'a' + high) as char, (b'a' + low) as char]
+        })
+        .collect();
+
+    Ok(ext_id)
+}
+
+fn get_public_key_base64(key: &RsaPrivateKey) -> Result<String, LaunchError> {
+    let pub_key = key.to_public_key();
+    let pub_key_der = pub_key
+        .to_public_key_der()
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("encode public key: {}", e)))?;
+
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(pub_key_der.as_bytes()))
+}
 
 fn process_epoch() -> &'static Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -1762,10 +1839,22 @@ fn generate_agent_extension(
     let channel_bytes: [u8; 32] = rand::thread_rng().r#gen();
     let channel: String = channel_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
+    let key = load_or_create_extension_key()?;
+    let pub_key_base64 = get_public_key_base64(&key)?;
+
+    let base_manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../assets/agent-extension/manifest.json"
+    ))
+    .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse base manifest: {}", e)))?;
+    let mut manifest = base_manifest.as_object().cloned().unwrap_or_default();
+    manifest.insert("key".to_string(), serde_json::Value::String(pub_key_base64));
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("serialize manifest: {}", e)))?;
+
     write_extension_file(
         &ext_dir,
         "manifest.json",
-        include_str!("../../assets/agent-extension/manifest.json"),
+        &manifest_json,
         0o644,
         target_uid,
         target_gid,
@@ -1810,21 +1899,13 @@ fn generate_agent_extension(
 
 pub const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
 
-pub fn compute_extension_id(ext_dir: &Path) -> String {
-    use sha2::Digest;
-    let abs_path = ext_dir
-        .canonicalize()
-        .unwrap_or_else(|_| ext_dir.to_path_buf());
-    let path_str = abs_path.to_string_lossy();
-    let hash = sha2::Sha256::digest(path_str.as_bytes());
-    hash.iter()
-        .take(16)
-        .flat_map(|b| {
-            let high = (b >> 4) & 0x0F;
-            let low = b & 0x0F;
-            [(b'a' + high) as char, (b'a' + low) as char]
+pub fn compute_extension_id(_ext_dir: &Path) -> String {
+    load_or_create_extension_key()
+        .and_then(|key| compute_extension_id_from_key(&key))
+        .unwrap_or_else(|e| {
+            log::error!("failed to compute stable extension ID: {}", e);
+            String::new()
         })
-        .collect()
 }
 
 fn native_messaging_hosts_dir(browser_exec: &Path) -> Option<PathBuf> {
