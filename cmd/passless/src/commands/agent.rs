@@ -879,6 +879,14 @@ fn read_cdp_request_file(path: &Path) -> Result<String> {
 }
 
 fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Result<()> {
+    let control_fd = crate::agent::launcher::CONTROL_FD;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(control_fd, &mut stat) } == 0
+        && (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+    {
+        return exec_command_directly(command);
+    }
+
     let mut client = connect_admin()?;
     let argv: Vec<String> = command
         .iter()
@@ -984,6 +992,20 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
         }
         _ => Err(Error::Other("unexpected response".to_string())),
     }
+}
+
+fn exec_command_directly(command: &[PathBuf]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if command.is_empty() {
+        return Err(Error::Other("no command to execute".to_string()));
+    }
+
+    let err = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .exec();
+
+    Err(Error::Other(format!("failed to exec command: {err}")))
 }
 
 #[cfg(test)]

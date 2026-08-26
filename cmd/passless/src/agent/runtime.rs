@@ -1928,8 +1928,26 @@ impl AgentRuntime {
                     }
                 }
                 let _guard = WorkerExitGuard(runtime.clone());
-                if let Err(e) = ipc.handle_one_admin(client_fd, &*runtime) {
-                    debug!("Admin handler error: {}", e);
+                match ipc.handle_one_admin(client_fd, &*runtime) {
+                    Ok(Some(child_pid)) => {
+                        // Keep this thread alive until the child exits.
+                        // PR_SET_PDEATHSIG tracks the parent thread, so if this thread exits
+                        // the kernel delivers SIGTERM to the child.  By waiting here we ensure
+                        // the signal is only delivered when the daemon process itself dies.
+                        // We use kill(pid, 0) to poll without reaping the child, so that
+                        // handle_wait_principal can still reap it.
+                        loop {
+                            let ret = unsafe { libc::kill(child_pid, 0) };
+                            if ret != 0 {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!("Admin handler error: {}", e);
+                    }
                 }
             })
             .map_err(|e| {
