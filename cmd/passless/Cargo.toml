@@ -48,6 +48,7 @@ serde_json.workspace = true
 libc.workspace = true
 nix.workspace = true
 notify-rust.workspace = true
+zbus.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 ctrlc.workspace = true

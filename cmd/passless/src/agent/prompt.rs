@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
@@ -7,6 +6,12 @@ use notify_rust::{Notification, Timeout, Urgency};
 use serde::{Deserialize, Serialize};
 
 use passless_core::agent::{CredentialRef, ProfileId};
+
+#[cfg(test)]
+use std::sync::Mutex;
+
+const NOTIFICATIONS_WELL_KNOWN_NAME: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_IFACE: &str = "org.freedesktop.Notifications";
 
 const MAX_UNTRUSTED_LEN: usize = 256;
 const MAX_RP_ID_LEN: usize = 253;
@@ -498,6 +503,157 @@ pub fn query_server_capabilities() -> ServerCapability {
     }
 }
 
+fn resolve_notification_server_unique_name() -> Result<String, PromptError> {
+    let conn = zbus::blocking::Connection::session().map_err(|e| {
+        warn!(
+            "Prompt: failed to connect to session bus for sender validation: {}",
+            e
+        );
+        PromptError {
+            kind: PromptErrorKind::NotificationUnsupported,
+        }
+    })?;
+
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetNameOwner",
+            &NOTIFICATIONS_WELL_KNOWN_NAME,
+        )
+        .map_err(|e| {
+            warn!(
+                "Prompt: failed to resolve notification server unique name: {}",
+                e
+            );
+            PromptError {
+                kind: PromptErrorKind::NotificationUnsupported,
+            }
+        })?;
+
+    let unique_name: String = reply.body().deserialize().map_err(|e| {
+        warn!("Prompt: failed to deserialize GetNameOwner reply: {}", e);
+        PromptError {
+            kind: PromptErrorKind::InternalError,
+        }
+    })?;
+
+    debug!("Prompt: notification server unique name: {}", unique_name);
+    Ok(unique_name)
+}
+
+enum ValidatedAction {
+    Action(String),
+    Closed,
+}
+
+fn wait_for_validated_action(
+    server_unique_name: &str,
+    notification_id: u32,
+    timeout: Duration,
+) -> ValidatedAction {
+    let conn = match zbus::blocking::Connection::session() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "Prompt: failed to connect to session bus for signal subscription: {}",
+                e
+            );
+            return ValidatedAction::Closed;
+        }
+    };
+
+    let rule = match zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(server_unique_name)
+        .and_then(|b| b.interface(NOTIFICATIONS_IFACE))
+    {
+        Ok(builder) => builder.build(),
+        Err(e) => {
+            warn!("Prompt: failed to build match rule: {}", e);
+            return ValidatedAction::Closed;
+        }
+    };
+
+    let mut iter = match zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(16)) {
+        Ok(iter) => iter,
+        Err(e) => {
+            warn!("Prompt: failed to subscribe to signals: {}", e);
+            return ValidatedAction::Closed;
+        }
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + timeout;
+
+    let server_unique_name_owned = server_unique_name.to_string();
+    let thread = std::thread::spawn(move || {
+        for msg in &mut iter {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let header = msg.header();
+            let sender = match header.sender() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if sender != server_unique_name_owned {
+                debug!(
+                    "Prompt: rejecting signal from unexpected sender: {}",
+                    sender
+                );
+                continue;
+            }
+            let member = match header.member() {
+                Some(m) => m.to_string(),
+                None => continue,
+            };
+            match member.as_str() {
+                "ActionInvoked" => {
+                    let body: Result<(u32, String), _> = msg.body().deserialize();
+                    if let Ok((id, action_key)) = body
+                        && id == notification_id
+                    {
+                        let _ = tx.send(ValidatedAction::Action(action_key));
+                        return;
+                    }
+                }
+                "NotificationClosed" => {
+                    let body: Result<(u32, u32), _> = msg.body().deserialize();
+                    if let Ok((id, _reason)) = body
+                        && id == notification_id
+                    {
+                        let _ = tx.send(ValidatedAction::Closed);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let now = Instant::now();
+    let remaining = if now < deadline {
+        deadline - now
+    } else {
+        Duration::from_millis(0)
+    };
+
+    let result = rx.recv_timeout(remaining);
+
+    drop(rx);
+    drop(conn);
+    let _ = thread.join();
+
+    match result {
+        Ok(action) => action,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ValidatedAction::Closed,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ValidatedAction::Closed,
+    }
+}
+
 pub trait PromptHandle: Send + Sync {
     fn prompt(&self, request: &PromptRequest) -> PromptResult;
 }
@@ -596,11 +752,20 @@ impl PromptHandle for DesktopPromptHandle {
             ServerCapability::FullActions => {}
         }
 
+        let server_unique_name = match resolve_notification_server_unique_name() {
+            Ok(name) => name,
+            Err(e) => {
+                warn!(
+                    "Prompt: failed to resolve notification server unique name: {}",
+                    e
+                );
+                return PromptResult::error(e.kind, start.elapsed().as_millis() as u64);
+            }
+        };
+
         let title = build_security_title(request.action());
         let body = build_security_body(request);
 
-        let action_result = Arc::new(Mutex::new(None));
-        let action_result_clone = Arc::clone(&action_result);
         let show_start = Instant::now();
 
         let mut notification = Notification::new();
@@ -624,20 +789,17 @@ impl PromptHandle for DesktopPromptHandle {
             }
         };
 
-        handle.wait_for_action(|action| {
-            debug!("Prompt: user action received: {}", action);
-            let mut result = action_result_clone
-                .lock()
-                .expect("prompt action result lock poisoned");
-            *result = Some(action.to_string());
-        });
+        let notification_id = handle.id();
+        let timeout_duration = Duration::from_secs(self.timeout_secs);
+
+        let validated_action =
+            wait_for_validated_action(&server_unique_name, notification_id, timeout_duration);
 
         let elapsed_since_show = show_start.elapsed();
-        let action = action_result
-            .lock()
-            .expect("prompt action result lock poisoned")
-            .clone()
-            .unwrap_or_else(|| "__closed".to_string());
+        let action = match validated_action {
+            ValidatedAction::Action(a) => a,
+            ValidatedAction::Closed => "__closed".to_string(),
+        };
 
         let decision = match action.as_str() {
             "approve" => {
