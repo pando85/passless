@@ -623,12 +623,14 @@ pub struct IntentExpireMeta {
 pub struct GrantRequestMeta {
     request_id: String,
     profile_id: ProfileId,
+    rp_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantApproveMeta {
     grant_id: GrantId,
     profile_id: ProfileId,
+    ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1445,13 +1447,15 @@ impl IntentExpireBuilder {
 pub struct GrantRequestBuilder {
     request_id: String,
     profile_id: ProfileId,
+    rp_ids: Vec<String>,
 }
 
 impl GrantRequestBuilder {
-    pub fn new(request_id: &GrantRequestId, profile_id: ProfileId) -> Self {
+    pub fn new(request_id: &GrantRequestId, profile_id: ProfileId, rp_ids: Vec<String>) -> Self {
         Self {
             request_id: request_id.as_str().to_string(),
             profile_id,
+            rp_ids,
         }
     }
 
@@ -1459,6 +1463,7 @@ impl GrantRequestBuilder {
         AuditEvent::new(AuditPayload::GrantRequest(GrantRequestMeta {
             request_id: self.request_id,
             profile_id: self.profile_id,
+            rp_ids: self.rp_ids,
         }))
     }
 }
@@ -1466,13 +1471,15 @@ impl GrantRequestBuilder {
 pub struct GrantApproveBuilder {
     grant_id: GrantId,
     profile_id: ProfileId,
+    ttl_secs: u64,
 }
 
 impl GrantApproveBuilder {
-    pub fn new(grant_id: GrantId, profile_id: ProfileId) -> Self {
+    pub fn new(grant_id: GrantId, profile_id: ProfileId, ttl_secs: u64) -> Self {
         Self {
             grant_id,
             profile_id,
+            ttl_secs,
         }
     }
 
@@ -1480,6 +1487,7 @@ impl GrantApproveBuilder {
         AuditEvent::new(AuditPayload::GrantApprove(GrantApproveMeta {
             grant_id: self.grant_id,
             profile_id: self.profile_id,
+            ttl_secs: self.ttl_secs,
         }))
     }
 }
@@ -2342,8 +2350,8 @@ mod tests {
             IntentClaimBuilder::new(iid.clone()).build(),
             IntentConsumeBuilder::new(iid.clone()).build(),
             IntentExpireBuilder::new(iid.clone()).build(),
-            GrantRequestBuilder::new(&req_id, pid.clone()).build(),
-            GrantApproveBuilder::new(gid.clone(), pid.clone()).build(),
+            GrantRequestBuilder::new(&req_id, pid.clone(), vec!["example.com".to_string()]).build(),
+            GrantApproveBuilder::new(gid.clone(), pid.clone(), 300).build(),
             GrantRevokeBuilder::new(gid.clone()).build(),
             GrantExpireBuilder::new(gid.clone()).build(),
             GrantClaimBuilder::new(gid.clone(), &cer_id).build(),

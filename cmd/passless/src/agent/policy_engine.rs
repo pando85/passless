@@ -11,6 +11,7 @@ use passless_core::agent::{
     PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId,
 };
 
+use super::audit::AuditGate;
 use super::browser::Clock;
 use super::grant::{
     CeremonyId, ClaimIntent, GrantError, GrantRegistry, GrantRequestId, GrantRequestParams,
@@ -630,6 +631,7 @@ pub struct PolicyRuntime {
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
+    audit_gate: Option<Arc<AuditGate>>,
 }
 
 impl PolicyRuntime {
@@ -637,6 +639,7 @@ impl PolicyRuntime {
         config: &AgentConfig,
         clock: Arc<dyn Clock>,
         monotonic_clock: Arc<dyn MonotonicClock>,
+        audit_gate: Option<Arc<AuditGate>>,
     ) -> Result<Self, PolicyRuntimeError> {
         let generation = Self::compile_generation(config, clock.monotonic_secs())?;
         let gen_arc = Arc::new(generation);
@@ -654,6 +657,7 @@ impl PolicyRuntime {
                 snapshot.max_grant_ttl_secs,
                 snapshot.allowed_actions.clone(),
                 snapshot.max_concurrent_grants,
+                audit_gate.clone(),
             );
             grant_registries.insert(snapshot.profile_id.as_str().to_string(), registry);
         }
@@ -666,6 +670,7 @@ impl PolicyRuntime {
             pending: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashMap::new()),
             clock,
+            audit_gate,
         })
     }
 
@@ -1052,6 +1057,7 @@ impl PolicyRuntime {
                 snapshot.max_grant_ttl_secs,
                 snapshot.allowed_actions.clone(),
                 snapshot.max_concurrent_grants,
+                self.audit_gate.clone(),
             );
             new_registries.insert(snapshot.profile_id.as_str().to_string(), registry);
         }
@@ -2399,7 +2405,7 @@ mod tests {
 
     fn make_runtime(config: &AgentConfig) -> (PolicyRuntime, Arc<MockClock>) {
         let clock = test_clock();
-        let runtime = PolicyRuntime::new(config, clock.clone(), clock.clone()).unwrap();
+        let runtime = PolicyRuntime::new(config, clock.clone(), clock.clone(), None).unwrap();
         (runtime, clock)
     }
 

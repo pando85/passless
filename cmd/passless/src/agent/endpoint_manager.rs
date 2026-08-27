@@ -1292,7 +1292,7 @@ mod tests {
         let monotonic_clock: Arc<dyn super::super::intent::MonotonicClock> =
             Arc::new(super::super::intent::SystemClock::new());
         let policy_runtime = Arc::new(
-            PolicyRuntime::new(&agent_config, clock, monotonic_clock)
+            PolicyRuntime::new(&agent_config, clock, monotonic_clock, None)
                 .expect("policy runtime creation"),
         );
 

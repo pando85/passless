@@ -601,9 +601,13 @@ impl AgentRuntime {
         let _ = audit_gate.record(start_event);
 
         let policy_runtime = Arc::new(
-            PolicyRuntime::new(agent_config, clock.clone(), monotonic_clock.clone()).map_err(
-                |e| RuntimeError::Policy(format!("failed to create policy runtime: {}", e)),
-            )?,
+            PolicyRuntime::new(
+                agent_config,
+                clock.clone(),
+                monotonic_clock.clone(),
+                Some(audit_gate.clone()),
+            )
+            .map_err(|e| RuntimeError::Policy(format!("failed to create policy runtime: {}", e)))?,
         );
 
         let browser_manager =
@@ -6015,6 +6019,7 @@ mod tests {
                         &config,
                         clock,
                         monotonic_clock,
+                        None,
                     )
                     .unwrap(),
                 )
@@ -6254,6 +6259,7 @@ mod tests {
                 &agent_config,
                 clock.clone(),
                 monotonic_clock.clone(),
+                None,
             )
             .unwrap(),
         );
