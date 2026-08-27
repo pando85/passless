@@ -2202,7 +2202,7 @@ mod tests {
             panic!("expected WaitFor");
         };
         {
-            let mut guard = InFlightGuard::new(budget.clone(), digest);
+            let guard = InFlightGuard::new(budget.clone(), digest);
             drop(guard);
         }
         let outcome = entry
@@ -3138,7 +3138,8 @@ mod tests {
                 let mono_clock = Arc::new(MockMonoClock::new());
 
                 let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
+                        .unwrap(),
                 );
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
@@ -3563,7 +3564,7 @@ mod tests {
         };
 
         use std::collections::BTreeMap;
-        use std::sync::{Arc, Condvar, Mutex};
+        use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
         const FRAME_MAGIC: u32 = 0x41554449;
@@ -3730,7 +3731,8 @@ mod tests {
                 let mono_clock = Arc::new(MockMonoClock::new());
 
                 let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
+                        .unwrap(),
                 );
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
