@@ -29,6 +29,7 @@ use super::launcher::{
 };
 
 const RUNTIME_DIR_MODE: u32 = 0o700;
+const EXTENSION_DIR_MODE: u32 = 0o755;
 const DEFAULT_SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_TTL_CLAMP_SECS: u64 = 86_400;
@@ -735,10 +736,22 @@ impl BrowserProcessManager {
             .join(format!("lease-{}", lease_id.as_str()));
         let profile_dir = runtime_dir.join("profile");
 
-        create_lease_dir(&runtime_dir, config.target_uid, config.target_gid).map_err(|e| {
+        create_lease_dir(
+            &runtime_dir,
+            RUNTIME_DIR_MODE,
+            config.target_uid,
+            config.target_gid,
+        )
+        .map_err(|e| {
             LaunchError::DirCreationFailed(runtime_dir.display().to_string(), e.to_string())
         })?;
-        create_lease_dir(&profile_dir, config.target_uid, config.target_gid).map_err(|e| {
+        create_lease_dir(
+            &profile_dir,
+            RUNTIME_DIR_MODE,
+            config.target_uid,
+            config.target_gid,
+        )
+        .map_err(|e| {
             LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
         })?;
 
@@ -1582,7 +1595,7 @@ fn validate_runtime_root(path: &Path, expected_uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn create_lease_dir(path: &Path, target_uid: u32, target_gid: u32) -> io::Result<()> {
+fn create_lease_dir(path: &Path, mode: u32, target_uid: u32, target_gid: u32) -> io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("/"));
     let dir_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -1618,7 +1631,7 @@ fn create_lease_dir(path: &Path, target_uid: u32, target_gid: u32) -> io::Result
         ));
     }
 
-    let mkdir_ret = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), RUNTIME_DIR_MODE) };
+    let mkdir_ret = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), mode) };
     if mkdir_ret != 0 {
         let err = io::Error::last_os_error();
         unsafe { libc::close(parent_fd) };
@@ -1833,7 +1846,7 @@ fn generate_agent_extension(
     target_gid: u32,
 ) -> Result<PathBuf, LaunchError> {
     let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
-    create_lease_dir(&ext_dir, target_uid, target_gid)
+    create_lease_dir(&ext_dir, EXTENSION_DIR_MODE, target_uid, target_gid)
         .map_err(|e| LaunchError::ExtensionSetupFailed(format!("extension dir: {}", e)))?;
 
     let channel_bytes: [u8; 32] = rand::thread_rng().r#gen();
@@ -3228,13 +3241,13 @@ mod tests {
         let target = root.join("lease-test");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&target, uid, gid).unwrap();
+        create_lease_dir(&target, RUNTIME_DIR_MODE, uid, gid).unwrap();
         let meta = fs::symlink_metadata(&target).unwrap();
         assert!(meta.is_dir());
         assert_eq!(meta.permissions().mode() & 0o777, RUNTIME_DIR_MODE);
         assert_eq!(meta.uid(), uid);
         assert_eq!(meta.gid(), gid);
-        assert!(create_lease_dir(&target, uid, gid).is_err());
+        assert!(create_lease_dir(&target, RUNTIME_DIR_MODE, uid, gid).is_err());
     }
 
     #[test]
@@ -4485,7 +4498,7 @@ mod tests {
         let lease_dir = root.join("lease-test");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let manifest = BrowserManifest {
             lease_id: "test".to_string(),
@@ -6247,7 +6260,7 @@ mod tests {
         let lease_dir = root.join("lease-ext");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6264,13 +6277,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extension_dir_permissions_are_0700() {
+    fn test_extension_dir_permissions_are_0755() {
         let dir = tempfile::tempdir().unwrap();
         let root = setup_runtime_root(dir.path());
         let lease_dir = root.join("lease-perm");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6278,7 +6291,7 @@ mod tests {
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
         let mode = fs::symlink_metadata(&ext_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        assert_eq!(mode, 0o755);
     }
 
     #[test]
@@ -6288,7 +6301,7 @@ mod tests {
         let lease_dir = root.join("lease-wperm");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6310,7 +6323,7 @@ mod tests {
         let lease_dir = root.join("lease-mperm");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6344,7 +6357,7 @@ mod tests {
         let lease_dir = root.join("lease-noplace");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6378,7 +6391,7 @@ mod tests {
         let lease_dir = root.join("lease-nosec");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6400,7 +6413,7 @@ mod tests {
         let lease_dir = root.join("lease-nometa");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6530,7 +6543,7 @@ mod tests {
         let lease_dir = root.join("lease-nodecheck");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6732,7 +6745,7 @@ mod tests {
         let lease_dir = root.join("lease-bearer-special");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -6759,7 +6772,7 @@ mod tests {
         let lease_dir = root.join("lease-bearer-iso");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
