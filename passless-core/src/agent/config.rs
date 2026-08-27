@@ -908,13 +908,19 @@ impl AgentProfileConfig {
             }
         }
 
-        if let Some(ref url) = self.start_url
-            && url.is_empty()
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': start_url must not be empty",
-                profile_id
-            )));
+        if let Some(ref url) = self.start_url {
+            if url.is_empty() {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': start_url must not be empty",
+                    profile_id
+                )));
+            }
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': start_url must use http or https scheme, got '{}'",
+                    profile_id, url
+                )));
+            }
         }
 
         Ok(())

@@ -114,6 +114,31 @@ pub fn install(target: AgentSkillTarget, scope: AgentSkillScope, force: bool) ->
     Ok(())
 }
 
+pub fn install_native_messaging(browser: &str, ext_dir: &Path, sign_proxy: &Path) -> Result<()> {
+    use crate::agent::browser::{
+        NATIVE_MESSAGING_HOST_NAME, compute_extension_id, install_native_messaging_manifest,
+    };
+
+    let browser_exec = PathBuf::from(browser);
+    let manifest_path = install_native_messaging_manifest(ext_dir, &browser_exec, sign_proxy, None)
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    let ext_id = compute_extension_id(ext_dir);
+    println!(
+        "Installed native messaging manifest at {}",
+        manifest_path.display()
+    );
+    println!("  Host name: {}", NATIVE_MESSAGING_HOST_NAME);
+    println!("  Extension ID: {}", ext_id);
+    println!("  Sign proxy: {}", sign_proxy.display());
+    println!(
+        "\nNote: Ensure the extension is loaded with --load-extension={}",
+        ext_dir.display()
+    );
+
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct AdminEnvelope<T: Serialize> {
     version: &'static str,
@@ -164,6 +189,11 @@ pub fn dispatch_admin(output: OutputFormat, action: &AgentAdminAction) -> Result
             scope,
             force,
         } => install(*target, *scope, *force),
+        AgentAdminAction::InstallNativeMessaging {
+            browser,
+            ext_dir,
+            sign_proxy,
+        } => install_native_messaging(browser, ext_dir, sign_proxy),
         AgentAdminAction::Profile { action } => dispatch_profile(output, action),
         AgentAdminAction::Policy { action } => dispatch_policy(output, action),
         AgentAdminAction::Credential { action } => dispatch_admin_credential(output, action),

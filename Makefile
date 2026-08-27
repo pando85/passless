@@ -82,7 +82,7 @@ release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	cargo vendor
 	tar -czf vendor.tar.gz vendor
 	cargo build --frozen --release --all-features --target ${CARGO_TARGET}
-	tar -czf $(PKG_BASE_NAME).tar.gz -C $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release passless
+	tar -czf $(PKG_BASE_NAME).tar.gz -C $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release passless sign-proxy agent-prompt-probe
 	@# Create completions tarball
 	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build/passless-*/out/completions -type d 2>/dev/null | head -1); \
 	if [ -n "$$COMPLETION_DIR" ]; then \
@@ -94,7 +94,7 @@ release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	else \
 		echo "Warning: Completions directory not found"; \
 	fi
-	@echo Released in $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/passless
+	@echo Released binaries in $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/: passless, sign-proxy, agent-prompt-probe
 
 .PHONY: update-version
 update-version: ## update version from VERSION file in all Cargo.toml manifests
@@ -111,7 +111,7 @@ publish:	## publish crate
 # Installation targets
 .PHONY: install-binary
 install-binary:	## install passless binary to ~/.cargo/bin
-	cargo install --path cmd/passless
+	cargo install --path cmd/passless --features agent
 
 .PHONY: install
 install: install-binary install-sysusers install-udev install-systemd install-modules	## install everything (binary, sysusers, udev, systemd)

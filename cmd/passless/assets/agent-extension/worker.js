@@ -1,4 +1,4 @@
-(function(port, bearer) {
+(function(socketPath, bearer) {
   "use strict";
 
   var MAX_REQUEST_BYTES = 16384;
@@ -11,6 +11,14 @@
   var MAX_USER_NAME_LEN = 256;
   var MAX_USER_ID_B64U_LEN = 128;
   var MAX_ALGORITHMS = 16;
+
+  var NATIVE_HOST = "rs.passless.sign_proxy";
+  var MAX_COMPLETED_REQUESTS = 128;
+  var scope = typeof globalThis !== "undefined" ? globalThis : (typeof self !== "undefined" ? self : this);
+  if (!scope.__passlessPendingRequests) scope.__passlessPendingRequests = new Map();
+  if (!scope.__passlessCompletedRequests) scope.__passlessCompletedRequests = new Map();
+  var pendingRequests = scope.__passlessPendingRequests;
+  var completedRequests = scope.__passlessCompletedRequests;
 
   function parseHttpsOrigin(url) {
     if (typeof url !== "string") return null;
@@ -71,7 +79,21 @@
     return typeof req.user_verification === "boolean";
   }
 
-  function daemonRequest(path, request, sendResponse, responseField, type) {
+  function rememberCompletedRequest(requestId, response) {
+    completedRequests.set(requestId, response);
+    if (completedRequests.size > MAX_COMPLETED_REQUESTS) {
+      completedRequests.delete(completedRequests.keys().next().value);
+    }
+  }
+
+  function completeRequest(requestId, response) {
+    var callbacks = pendingRequests.get(requestId) || [];
+    pendingRequests.delete(requestId);
+    rememberCompletedRequest(requestId, response);
+    for (var i = 0; i < callbacks.length; i++) callbacks[i](response);
+  }
+
+  function daemonRequest(requestId, path, request, sendResponse, responseField, type) {
     var body;
     try {
       body = JSON.stringify(request);
@@ -84,44 +106,59 @@
       return false;
     }
 
-    fetch("http://127.0.0.1:" + port + path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + bearer
-      },
+    if (completedRequests.has(requestId)) {
+      sendResponse(completedRequests.get(requestId));
+      return false;
+    }
+    if (pendingRequests.has(requestId)) {
+      pendingRequests.get(requestId).push(sendResponse);
+      return true;
+    }
+    pendingRequests.set(requestId, [sendResponse]);
+
+    var message = {
+      path: path,
+      bearer: bearer,
+      socket_path: socketPath,
       body: body
-    }).then(function(response) {
-      return response.json().catch(function() {
-        return { error: "invalid_daemon_response" };
-      }).then(function(payload) {
-        return { ok: response.ok, payload: payload };
-      });
-    }).then(function(result) {
-      if (!result.ok) {
-        var code = result.payload && typeof result.payload.error === "string"
-          ? result.payload.error
-          : "request_denied";
-        sendResponse({
+    };
+
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, message, function(response) {
+      if (chrome.runtime.lastError) {
+        completeRequest(requestId, { ok: false, type: type, error: "transport_error" });
+        return;
+      }
+      if (!response || typeof response !== "object") {
+        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
+        return;
+      }
+      if (response.error) {
+        completeRequest(requestId, {
           ok: false,
           type: type,
-          error: code,
-          fallback: code === "human_interaction_required"
+          error: response.error,
+          fallback: response.error === "human_interaction_required"
         });
         return;
       }
-      if (!result.payload || typeof result.payload !== "object" || !result.payload[responseField]) {
-        throw new Error("malformed daemon response");
+      var payload;
+      try {
+        payload = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
+      } catch (error) {
+        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
+        return;
       }
-      sendResponse({ ok: true, response: result.payload[responseField], type: type });
-    }).catch(function() {
-      sendResponse({ ok: false, type: type, error: "transport_error" });
+      if (!payload || typeof payload !== "object" || !payload[responseField]) {
+        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
+        return;
+      }
+      completeRequest(requestId, { ok: true, response: payload[responseField], type: type });
     });
     return true;
   }
 
-  function handleGetRequest(req, origins, sendResponse) {
-    return daemonRequest("/sign", {
+  function handleGetRequest(requestId, req, origins, sendResponse) {
+    return daemonRequest(requestId, "/sign", {
       origin: origins.origin,
       top_origin: origins.top_origin,
       rp_id: req.rp_id,
@@ -132,8 +169,8 @@
     }, sendResponse, "sign_assertion_result", "get");
   }
 
-  function handleCreateRequest(req, origins, sendResponse) {
-    return daemonRequest("/register", {
+  function handleCreateRequest(requestId, req, origins, sendResponse) {
+    return daemonRequest(requestId, "/register", {
       origin: origins.origin,
       top_origin: origins.top_origin,
       rp_id: req.rp_id,
@@ -163,6 +200,11 @@
       return false;
     }
 
+    if (typeof message.request_id !== "string" || message.request_id.length === 0 || message.request_id.length > 128) {
+      sendResponse({ ok: false, error: "invalid_request" });
+      return false;
+    }
+
     var req = message.request;
     var messageType = message.type === "create" ? "create" : "get";
     if (messageType === "create") {
@@ -170,13 +212,13 @@
         sendResponse({ ok: false, type: "create", error: "invalid_request" });
         return false;
       }
-      return handleCreateRequest(req, origins, sendResponse);
+      return handleCreateRequest(message.request_id, req, origins, sendResponse);
     }
 
     if (!validateGetRequest(req)) {
       sendResponse({ ok: false, type: "get", error: "invalid_request" });
       return false;
     }
-    return handleGetRequest(req, origins, sendResponse);
+    return handleGetRequest(message.request_id, req, origins, sendResponse);
   });
-})(__PASSLESS_PORT__, __PASSLESS_BEARER__);
+})(__PASSLESS_SOCKET_PATH__, __PASSLESS_BEARER__);

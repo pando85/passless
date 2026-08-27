@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
@@ -238,15 +240,195 @@ pub fn generate_bearer_token() -> Result<String, String> {
     Ok(b64u_encode(&bytes))
 }
 
+#[derive(Debug, Clone)]
+struct InFlightOutcome {
+    status: &'static str,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum InFlightState {
+    Pending,
+    Resolved(InFlightOutcome),
+}
+
+#[derive(Debug)]
+struct InFlightEntry {
+    state: Mutex<InFlightState>,
+    done: Condvar,
+}
+
+impl InFlightEntry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InFlightState::Pending),
+            done: Condvar::new(),
+        }
+    }
+
+    fn resolve(&self, outcome: InFlightOutcome) {
+        let mut s = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        *s = InFlightState::Resolved(outcome);
+        self.done.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<InFlightOutcome> {
+        let guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+        let (guard, timed_out) = match self
+            .done
+            .wait_timeout_while(guard, timeout, |s| matches!(s, InFlightState::Pending))
+        {
+            Ok(pair) => pair,
+            Err(_) => return None,
+        };
+        if timed_out.timed_out() {
+            return None;
+        }
+        match &*guard {
+            InFlightState::Resolved(o) => Some(o.clone()),
+            InFlightState::Pending => None,
+        }
+    }
+}
+
+// Completed-outcome cache: some relying parties (e.g. Kanidm) submit the same
+// WebAuthn request body more than once for a single user gesture. The first
+// request is signed; an identical follow-up must receive the SAME outcome rather
+// than a `replayed_operation` rejection, otherwise the user-facing ceremony fails.
+//
+// Safety: a cached outcome is returned without re-signing, so the sign counter is
+// incremented exactly once and no new signature is produced. The real replay
+// defence remains the relying party's one-time challenge. After the TTL elapses an
+// identical body is rejected as `Replayed` as before.
+const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(120);
+const MAX_COMPLETED_OUTCOMES: usize = 256;
+
+struct CompletedOutcome {
+    outcome: InFlightOutcome,
+    at: Instant,
+}
+
+struct RequestBudgetInner {
+    used: HashSet<[u8; 32]>,
+    in_flight: HashMap<[u8; 32], Arc<InFlightEntry>>,
+    completed: HashMap<[u8; 32], CompletedOutcome>,
+}
+
 #[derive(Clone)]
 struct RequestBudget {
-    used_requests: Arc<Mutex<HashSet<[u8; 32]>>>,
+    inner: Arc<Mutex<RequestBudgetInner>>,
     max_requests: usize,
 }
 
 impl RequestBudget {
     fn claim(&self, body: &[u8]) -> RequestClaim {
-        claim_request_digest(&self.used_requests, self.max_requests, body)
+        let hash = Sha256::digest(body);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&hash);
+
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return RequestClaim::Unavailable,
+        };
+
+        if inner.used.contains(&digest) {
+            if let Some(entry) = inner.in_flight.get(&digest) {
+                return RequestClaim::WaitFor(entry.clone());
+            }
+            let now = Instant::now();
+            if let Some(completed) = inner.completed.get(&digest)
+                && now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL
+            {
+                return RequestClaim::Cached {
+                    outcome: completed.outcome.clone(),
+                };
+            }
+            return RequestClaim::Replayed;
+        }
+
+        if inner.used.len() >= self.max_requests {
+            return RequestClaim::Exhausted;
+        }
+
+        inner.used.insert(digest);
+        let entry = Arc::new(InFlightEntry::new());
+        inner.in_flight.insert(digest, entry);
+        RequestClaim::Claimed { digest }
+    }
+
+    fn resolve(&self, digest: [u8; 32], outcome: InFlightOutcome) {
+        let entry = {
+            let mut inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let entry = inner.in_flight.remove(&digest);
+            let now = Instant::now();
+            inner
+                .completed
+                .retain(|_, completed| now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL);
+            if inner.completed.len() >= MAX_COMPLETED_OUTCOMES
+                && let Some(oldest) = inner
+                    .completed
+                    .iter()
+                    .min_by_key(|(_, completed)| completed.at)
+                    .map(|(digest, _)| *digest)
+            {
+                inner.completed.remove(&oldest);
+            }
+            inner.completed.insert(
+                digest,
+                CompletedOutcome {
+                    outcome: outcome.clone(),
+                    at: now,
+                },
+            );
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.resolve(outcome);
+        }
+    }
+}
+
+struct InFlightGuard {
+    budget: RequestBudget,
+    digest: [u8; 32],
+    resolved: bool,
+}
+
+impl InFlightGuard {
+    fn new(budget: RequestBudget, digest: [u8; 32]) -> Self {
+        Self {
+            budget,
+            digest,
+            resolved: false,
+        }
+    }
+
+    fn resolve(&mut self, outcome: InFlightOutcome) {
+        self.budget.resolve(self.digest, outcome);
+        self.resolved = true;
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.budget.resolve(
+                self.digest,
+                InFlightOutcome {
+                    status: "500 Internal Server Error",
+                    body: b"{\"error\":\"internal_error\"}".to_vec(),
+                },
+            );
+        }
     }
 }
 
@@ -283,33 +465,14 @@ impl RegistrationLeaseEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum RequestClaim {
-    Claimed,
+    Claimed { digest: [u8; 32] },
     Replayed,
     Exhausted,
     Unavailable,
-}
-
-fn claim_request_digest(
-    registry: &Mutex<HashSet<[u8; 32]>>,
-    max_requests: usize,
-    body: &[u8],
-) -> RequestClaim {
-    let hash = Sha256::digest(body);
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&hash);
-    let Ok(mut used) = registry.lock() else {
-        return RequestClaim::Unavailable;
-    };
-    if used.contains(&digest) {
-        return RequestClaim::Replayed;
-    }
-    if used.len() >= max_requests {
-        return RequestClaim::Exhausted;
-    }
-    used.insert(digest);
-    RequestClaim::Claimed
+    WaitFor(Arc<InFlightEntry>),
+    Cached { outcome: InFlightOutcome },
 }
 
 impl SignContextRegistry {
@@ -333,7 +496,11 @@ impl SignContextRegistry {
             return Ok(existing.clone());
         }
         let budget = RequestBudget {
-            used_requests: Arc::new(Mutex::new(HashSet::new())),
+            inner: Arc::new(Mutex::new(RequestBudgetInner {
+                used: HashSet::new(),
+                in_flight: HashMap::new(),
+                completed: HashMap::new(),
+            })),
             max_requests,
         };
         budgets.insert(token.to_string(), budget.clone());
@@ -523,7 +690,7 @@ impl SignContextRegistry {
                 .find(|entry| entry.lease_id.as_deref() == Some(lease_id))?;
             entry.request_budget.clone()
         };
-        let used = budget.used_requests.lock().ok()?.len();
+        let used = budget.inner.lock().ok()?.used.len();
         Some((used, budget.max_requests))
     }
 
@@ -544,8 +711,8 @@ impl Default for SignContextRegistry {
 }
 
 pub struct SignHttpServer {
-    listener: TcpListener,
-    addr: SocketAddr,
+    listener: Option<UnixListener>,
+    socket_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -554,37 +721,37 @@ const MAX_HTTP_HEADER_SIZE: usize = 8192;
 const MAX_CONNECTIONS: usize = 8;
 
 impl SignHttpServer {
-    pub fn bind(shutdown: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn bind(socket_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self, String> {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create socket directory: {}", e))?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("set socket dir permissions: {}", e))?;
+        }
+        let _ = std::fs::remove_file(&socket_path);
         let listener =
-            TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind failed: {}", e))?;
-        listener
-            .set_nonblocking(false)
-            .map_err(|e| format!("set_nonblocking failed: {}", e))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| format!("local_addr failed: {}", e))?;
+            UnixListener::bind(&socket_path).map_err(|e| format!("bind failed: {}", e))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("set socket permissions: {}", e))?;
         Ok(Self {
-            listener,
-            addr,
+            listener: Some(listener),
+            socket_path,
             shutdown,
         })
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
-    pub fn port(&self) -> u16 {
-        self.addr.port()
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    pub fn serve(self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
+    pub fn serve(mut self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
         let shutdown = self.shutdown.clone();
-        let listener = self.listener;
+        let listener = self.listener.take().expect("listener already taken");
+        let socket_path = self.socket_path.clone();
         thread::spawn(move || {
             listener.set_nonblocking(true).expect("set_nonblocking");
             let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -617,11 +784,20 @@ impl SignHttpServer {
                     }
                 }
             }
+            let _ = std::fs::remove_file(&socket_path);
         })
     }
 }
 
-fn send_http_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>) {
+impl Drop for SignHttpServer {
+    fn drop(&mut self) {
+        if self.listener.is_some() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+}
+
+fn send_http_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
     let content_length = body.map(|b| b.len()).unwrap_or(0);
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -633,18 +809,16 @@ fn send_http_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>)
     }
 }
 
-fn send_http_error(stream: &mut TcpStream, status: &str, code: &str) {
+fn send_http_error(stream: &mut UnixStream, status: &str, code: &str) {
     let body = format!("{{\"error\":\"{}\"}}", code);
     send_http_response(stream, status, Some(body.as_bytes()));
 }
 
-const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\n";
-
-fn send_sign_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>) {
+fn send_sign_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
     let content_length = body.map(|b| b.len()).unwrap_or(0);
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
-        status, content_length, CORS_HEADERS
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        status, content_length
     );
     let _ = stream.write_all(header.as_bytes());
     if let Some(body) = body {
@@ -652,21 +826,13 @@ fn send_sign_response(stream: &mut TcpStream, status: &str, body: Option<&[u8]>)
     }
 }
 
-fn send_sign_error(stream: &mut TcpStream, status: &str, code: &str) {
+fn send_sign_error(stream: &mut UnixStream, status: &str, code: &str) {
     let body = format!("{{\"error\":\"{}\"}}", code);
     send_sign_response(stream, status, Some(body.as_bytes()));
 }
 
-fn send_preflight_response(stream: &mut TcpStream) {
-    let response = format!(
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n{}\r\n",
-        CORS_HEADERS
-    );
-    let _ = stream.write_all(response.as_bytes());
-}
-
 fn handle_http_connection(
-    mut stream: TcpStream,
+    mut stream: UnixStream,
     registry: &SignContextRegistry,
 ) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -699,10 +865,6 @@ fn handle_http_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("no method")?;
     let path = parts.next().ok_or("no path")?;
-    if method == "OPTIONS" && (path == "/sign" || path == "/register") {
-        send_preflight_response(&mut stream);
-        return Ok(());
-    }
     if method != "POST" || (path != "/sign" && path != "/register") {
         send_http_error(&mut stream, "404 Not Found", "not_found");
         return Ok(());
@@ -809,7 +971,35 @@ fn handle_http_connection(
                     return Ok(());
                 }
                 match reg_entry.claim_request(&body) {
-                    RequestClaim::Claimed => {}
+                    RequestClaim::Claimed { digest } => {
+                        let mut guard =
+                            InFlightGuard::new(reg_entry.request_budget.clone(), digest);
+                        let outcome = handle_register_body(&mut stream, &reg_entry, &body)?;
+                        guard.resolve(outcome);
+                    }
+                    RequestClaim::WaitFor(in_flight) => {
+                        match in_flight.wait(Duration::from_secs(30)) {
+                            Some(outcome) => {
+                                send_sign_response(
+                                    &mut stream,
+                                    outcome.status,
+                                    Some(&outcome.body),
+                                );
+                            }
+                            None => {
+                                send_sign_error(
+                                    &mut stream,
+                                    "500 Internal Server Error",
+                                    "operation_timeout",
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+                    RequestClaim::Cached { outcome } => {
+                        send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
+                        return Ok(());
+                    }
                     RequestClaim::Replayed => {
                         send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
                         return Ok(());
@@ -829,34 +1019,6 @@ fn handle_http_connection(
                             "operation_registry_unavailable",
                         );
                         return Ok(());
-                    }
-                }
-                let req: RegisterCredentialRequest = match serde_json::from_slice(&body) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        send_sign_error(&mut stream, "400 Bad Request", "invalid_json");
-                        return Ok(());
-                    }
-                };
-                match reg_entry.handler.register(&reg_entry.context, &req) {
-                    Ok(resp) => {
-                        let resp_body = serde_json::to_vec(&resp)
-                            .map_err(|e| format!("json serialize: {}", e))?;
-                        send_sign_response(&mut stream, "200 OK", Some(&resp_body));
-                    }
-                    Err(e) => {
-                        let (status, code) = match e.code {
-                            ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-                            ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-                            ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-                            ErrorCode::NotFound => ("404 Not Found", "not_found"),
-                            ErrorCode::Conflict => ("409 Conflict", "conflict"),
-                            ErrorCode::InteractionRequired => {
-                                ("409 Conflict", "human_interaction_required")
-                            }
-                            _ => ("500 Internal Server Error", "internal_error"),
-                        };
-                        send_sign_error(&mut stream, status, code);
                     }
                 }
                 return Ok(());
@@ -916,7 +1078,30 @@ fn handle_http_connection(
         return Ok(());
     }
     match entry.claim_request(&body) {
-        RequestClaim::Claimed => {}
+        RequestClaim::Claimed { digest } => {
+            let mut guard = InFlightGuard::new(entry.request_budget.clone(), digest);
+            let outcome = handle_sign_body(&mut stream, &entry, &body)?;
+            guard.resolve(outcome);
+        }
+        RequestClaim::WaitFor(in_flight) => {
+            match in_flight.wait(Duration::from_secs(30)) {
+                Some(outcome) => {
+                    send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
+                }
+                None => {
+                    send_sign_error(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "operation_timeout",
+                    );
+                }
+            }
+            return Ok(());
+        }
+        RequestClaim::Cached { outcome } => {
+            send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
+            return Ok(());
+        }
         RequestClaim::Replayed => {
             send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
             return Ok(());
@@ -938,33 +1123,97 @@ fn handle_http_connection(
             return Ok(());
         }
     }
-    let req: SignAssertionRequest = match serde_json::from_slice(&body) {
+    Ok(())
+}
+
+fn handle_sign_body(
+    stream: &mut UnixStream,
+    entry: &LeaseEntry,
+    body: &[u8],
+) -> Result<InFlightOutcome, String> {
+    let req: SignAssertionRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => {
-            send_sign_error(&mut stream, "400 Bad Request", "invalid_json");
-            return Ok(());
+            let outcome = InFlightOutcome {
+                status: "400 Bad Request",
+                body: b"{\"error\":\"invalid_json\"}".to_vec(),
+            };
+            send_sign_response(stream, outcome.status, Some(&outcome.body));
+            return Ok(outcome);
         }
     };
-    match entry.handler.sign(&entry.context, &req) {
+    let outcome = match entry.handler.sign(&entry.context, &req) {
         Ok(resp) => {
             let resp_body =
                 serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
-            send_sign_response(&mut stream, "200 OK", Some(&resp_body));
+            send_sign_response(stream, "200 OK", Some(&resp_body));
+            InFlightOutcome {
+                status: "200 OK",
+                body: resp_body,
+            }
         }
         Err(e) => {
-            let (status, code) = match e.code {
-                ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-                ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-                ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-                ErrorCode::NotFound => ("404 Not Found", "not_found"),
-                ErrorCode::Conflict => ("409 Conflict", "conflict"),
-                ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
-                _ => ("500 Internal Server Error", "internal_error"),
-            };
-            send_sign_error(&mut stream, status, code);
+            let (status, code) = error_status_code(e.code);
+            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
+            send_sign_response(stream, status, Some(&err_body));
+            InFlightOutcome {
+                status,
+                body: err_body,
+            }
         }
+    };
+    Ok(outcome)
+}
+
+fn handle_register_body(
+    stream: &mut UnixStream,
+    reg_entry: &RegistrationLeaseEntry,
+    body: &[u8],
+) -> Result<InFlightOutcome, String> {
+    let req: RegisterCredentialRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => {
+            let outcome = InFlightOutcome {
+                status: "400 Bad Request",
+                body: b"{\"error\":\"invalid_json\"}".to_vec(),
+            };
+            send_sign_response(stream, outcome.status, Some(&outcome.body));
+            return Ok(outcome);
+        }
+    };
+    let outcome = match reg_entry.handler.register(&reg_entry.context, &req) {
+        Ok(resp) => {
+            let resp_body =
+                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
+            send_sign_response(stream, "200 OK", Some(&resp_body));
+            InFlightOutcome {
+                status: "200 OK",
+                body: resp_body,
+            }
+        }
+        Err(e) => {
+            let (status, code) = error_status_code(e.code);
+            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
+            send_sign_response(stream, status, Some(&err_body));
+            InFlightOutcome {
+                status,
+                body: err_body,
+            }
+        }
+    };
+    Ok(outcome)
+}
+
+fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
+    match code {
+        ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
+        ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
+        ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
+        ErrorCode::NotFound => ("404 Not Found", "not_found"),
+        ErrorCode::Conflict => ("409 Conflict", "conflict"),
+        ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
+        _ => ("500 Internal Server Error", "internal_error"),
     }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -1684,10 +1933,16 @@ mod tests {
     }
 
     #[test]
-    fn test_http_server_binds_loopback() {
+    fn test_http_server_binds_unix_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        assert!(server.addr().ip().is_loopback());
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
+        assert!(server.socket_path().exists());
+        let meta = std::fs::metadata(server.socket_path()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        drop(server);
         shutdown.store(true, Ordering::Release);
     }
 
@@ -1802,11 +2057,221 @@ mod tests {
         let first = registry.request_budget(&token, 2).unwrap();
         let second = registry.request_budget(&token, 2).unwrap();
 
-        assert_eq!(first.claim(b"register-operation"), RequestClaim::Claimed);
-        assert_eq!(second.claim(b"register-operation"), RequestClaim::Replayed);
-        assert_eq!(second.claim(b"sign-operation"), RequestClaim::Claimed);
-        assert_eq!(first.claim(b"third-operation"), RequestClaim::Exhausted);
+        assert!(matches!(
+            first.claim(b"register-operation"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            second.claim(b"register-operation"),
+            RequestClaim::WaitFor(_)
+        ));
+        assert!(matches!(
+            second.claim(b"sign-operation"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            first.claim(b"third-operation"),
+            RequestClaim::Exhausted
+        ));
         assert!(registry.request_budget(&token, 3).is_err());
+    }
+
+    fn make_budget(max_requests: usize) -> RequestBudget {
+        RequestBudget {
+            inner: Arc::new(Mutex::new(RequestBudgetInner {
+                used: HashSet::new(),
+                in_flight: HashMap::new(),
+                completed: HashMap::new(),
+            })),
+            max_requests,
+        }
+    }
+
+    #[test]
+    fn test_claim_duplicate_in_flight_returns_wait_for() {
+        let budget = make_budget(5);
+        let body = b"identical-request-body";
+        let first = budget.claim(body);
+        assert!(matches!(first, RequestClaim::Claimed { .. }));
+        let second = budget.claim(body);
+        assert!(matches!(second, RequestClaim::WaitFor(_)));
+
+        let RequestClaim::Claimed { digest } = first else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"result".to_vec(),
+            },
+        );
+
+        let third = budget.claim(body);
+        assert!(matches!(third, RequestClaim::Cached { .. }));
+    }
+
+    #[test]
+    fn test_completed_expired_returns_replayed() {
+        let budget = make_budget(5);
+        let body = b"expired-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"ok".to_vec(),
+            },
+        );
+        {
+            let mut inner = budget.inner.lock().unwrap();
+            if let Some(completed) = inner.completed.get_mut(&digest) {
+                completed.at = Instant::now() - COMPLETED_OUTCOME_TTL - Duration::from_secs(1);
+            }
+        }
+        assert!(matches!(budget.claim(body), RequestClaim::Replayed));
+    }
+
+    #[test]
+    fn test_claim_different_bodies_both_claimed() {
+        let budget = make_budget(5);
+        assert!(matches!(
+            budget.claim(b"body-a"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            budget.claim(b"body-b"),
+            RequestClaim::Claimed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_claim_budget_exhausted() {
+        let budget = make_budget(2);
+        assert!(matches!(budget.claim(b"one"), RequestClaim::Claimed { .. }));
+        assert!(matches!(budget.claim(b"two"), RequestClaim::Claimed { .. }));
+        assert!(matches!(budget.claim(b"three"), RequestClaim::Exhausted));
+    }
+
+    #[test]
+    fn test_in_flight_waiter_receives_resolved_outcome() {
+        let budget = make_budget(5);
+        let body = b"shared-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
+            panic!("expected WaitFor");
+        };
+
+        let waiter = std::thread::spawn(move || entry.wait(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(50));
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "403 Forbidden",
+                body: b"{\"error\":\"forbidden\"}".to_vec(),
+            },
+        );
+        let outcome = waiter.join().unwrap().expect("waiter should resolve");
+        assert_eq!(outcome.status, "403 Forbidden");
+        assert_eq!(outcome.body, b"{\"error\":\"forbidden\"}");
+    }
+
+    #[test]
+    fn test_in_flight_waiter_timeout_returns_none() {
+        let budget = make_budget(5);
+        let body = b"timeout-body";
+        assert!(matches!(budget.claim(body), RequestClaim::Claimed { .. }));
+        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
+            panic!("expected WaitFor");
+        };
+        assert!(entry.wait(Duration::from_millis(50)).is_none());
+    }
+
+    #[test]
+    fn test_in_flight_guard_drop_resolves_waiters() {
+        let budget = make_budget(5);
+        let body = b"guard-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
+            panic!("expected WaitFor");
+        };
+        {
+            let guard = InFlightGuard::new(budget.clone(), digest);
+            drop(guard);
+        }
+        let outcome = entry
+            .wait(Duration::from_secs(5))
+            .expect("resolved by drop");
+        assert_eq!(outcome.status, "500 Internal Server Error");
+    }
+
+    #[test]
+    fn test_completed_duplicate_within_ttl_returns_cached() {
+        let budget = make_budget(5);
+        let body = b"cached-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"cached-result".to_vec(),
+            },
+        );
+        let RequestClaim::Cached { outcome } = budget.claim(body) else {
+            panic!("expected Cached");
+        };
+        assert_eq!(outcome.status, "200 OK");
+        assert_eq!(outcome.body, b"cached-result");
+    }
+
+    #[test]
+    fn test_completed_cache_does_not_consume_extra_budget() {
+        let budget = make_budget(2);
+        let body = b"budget-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"ok".to_vec(),
+            },
+        );
+        assert!(matches!(budget.claim(body), RequestClaim::Cached { .. }));
+        assert!(matches!(
+            budget.claim(b"other"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(budget.claim(b"third"), RequestClaim::Exhausted));
+    }
+
+    #[test]
+    fn test_completed_cache_bounded_size() {
+        let budget = make_budget(MAX_COMPLETED_OUTCOMES + 8);
+        for i in 0..MAX_COMPLETED_OUTCOMES + 4 {
+            let body = format!("body-{}", i);
+            let RequestClaim::Claimed { digest } = budget.claim(body.as_bytes()) else {
+                panic!("expected Claimed");
+            };
+            budget.resolve(
+                digest,
+                InFlightOutcome {
+                    status: "200 OK",
+                    body: b"ok".to_vec(),
+                },
+            );
+        }
+        let used = budget.inner.lock().unwrap().completed.len();
+        assert!(used <= MAX_COMPLETED_OUTCOMES);
     }
 
     #[test]
@@ -1902,14 +2367,14 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_endpoint_metadata_contains_sign_port_and_bearer() {
+    fn test_agent_endpoint_metadata_contains_sign_socket_path_and_bearer() {
         use crate::agent::browser::AgentEndpointMetadata;
         let token = generate_bearer_token().unwrap();
         let metadata = AgentEndpointMetadata {
-            port: 12345,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: token.clone(),
         };
-        assert_eq!(metadata.port, 12345);
+        assert_eq!(metadata.socket_path, "/tmp/test/sock");
         assert_eq!(metadata.bearer_token, token);
     }
 
@@ -1951,9 +2416,10 @@ mod tests {
 
     #[test]
     fn test_http_valid_bound_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -1979,7 +2445,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -1995,9 +2461,10 @@ mod tests {
 
     #[test]
     fn test_http_unknown_bearer_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let body = b"{}";
@@ -2005,7 +2472,7 @@ mod tests {
             "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer unknown_token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2021,9 +2488,10 @@ mod tests {
 
     #[test]
     fn test_http_unbound_bearer_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2039,7 +2507,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2055,9 +2523,10 @@ mod tests {
 
     #[test]
     fn test_http_revoked_bearer_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2077,7 +2546,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2093,9 +2562,10 @@ mod tests {
 
     #[test]
     fn test_http_missing_bearer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let body = b"{}";
@@ -2103,7 +2573,7 @@ mod tests {
             "POST /sign HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2119,9 +2589,10 @@ mod tests {
 
     #[test]
     fn test_http_wrong_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2136,7 +2607,7 @@ mod tests {
             "GET /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
             token
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2151,9 +2622,10 @@ mod tests {
 
     #[test]
     fn test_http_wrong_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2168,7 +2640,7 @@ mod tests {
             "POST /other HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
             token
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2183,16 +2655,20 @@ mod tests {
 
     #[test]
     fn test_listener_loopback_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        assert!(server.addr().ip().is_loopback());
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
+        assert!(server.socket_path().starts_with(dir.path()));
         shutdown.store(true, Ordering::Release);
     }
 
     #[test]
     fn test_shutdown_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
+        let server = SignHttpServer::bind(sock_path, shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         shutdown.store(true, Ordering::Release);
@@ -2209,40 +2685,15 @@ mod tests {
     }
 
     #[test]
-    fn test_http_options_sign_preflight() {
+    fn test_http_options_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let request = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("204 No Content"));
-        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
-        assert!(resp_str.contains("Access-Control-Allow-Methods: POST"));
-        assert!(resp_str.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
-        assert!(!resp_str.contains("Access-Control-Allow-Credentials"));
-        assert!(!resp_str.contains("evil.example.com"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_options_wrong_path_404() {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let request = "OPTIONS /other HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2251,16 +2702,16 @@ mod tests {
         let n = stream.read(&mut resp_buf).unwrap();
         let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp_str.contains("404"));
-        assert!(!resp_str.contains("Access-Control"));
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
-    fn test_http_post_error_has_cors_no_reflected_origin() {
+    fn test_http_post_error_no_cors_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let handle = server.serve(registry);
         let body = b"{}";
@@ -2268,7 +2719,7 @@ mod tests {
             "POST /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2278,17 +2729,17 @@ mod tests {
         let n = stream.read(&mut resp_buf).unwrap();
         let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp_str.contains("401"));
-        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
-        assert!(!resp_str.contains("attacker.example.com"));
+        assert!(!resp_str.contains("Access-Control"));
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
-    fn test_http_success_has_cors() {
+    fn test_http_success_no_cors_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2316,7 +2767,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2326,18 +2777,17 @@ mod tests {
         let n = stream.read(&mut resp_buf).unwrap();
         let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
         assert!(resp_str.contains("200 OK"));
-        assert!(resp_str.contains("Access-Control-Allow-Origin: *"));
-        assert!(resp_str.contains("Access-Control-Allow-Methods: POST"));
-        assert!(resp_str.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
+        assert!(!resp_str.contains("Access-Control"));
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap();
     }
 
     #[test]
     fn test_http_unbound_bearer_same_401_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("sock");
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-        let addr = server.addr();
+        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
         let registry = Arc::new(SignContextRegistry::new());
         let token = generate_bearer_token().unwrap();
         let f = sign_handler_tests::TestFixture::new(true);
@@ -2353,7 +2803,7 @@ mod tests {
             token,
             body.len()
         );
-        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -2688,7 +3138,8 @@ mod tests {
                 let mono_clock = Arc::new(MockMonoClock::new());
 
                 let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
+                        .unwrap(),
                 );
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
@@ -3280,7 +3731,8 @@ mod tests {
                 let mono_clock = Arc::new(MockMonoClock::new());
 
                 let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
+                        .unwrap(),
                 );
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
@@ -3688,13 +4140,12 @@ mod tests {
         use super::*;
 
         use std::io::{Read, Write};
-        use std::net::{SocketAddr, TcpStream};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
-        fn http_request(addr: SocketAddr, request: &str, body: &[u8]) -> String {
-            let mut stream = TcpStream::connect(addr).unwrap();
+        fn http_request(sock_path: &Path, request: &str, body: &[u8]) -> String {
+            let mut stream = UnixStream::connect(sock_path).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -3720,15 +4171,17 @@ mod tests {
             constant_counter: bool,
         ) -> (
             Arc<AtomicBool>,
-            SocketAddr,
+            tempfile::TempDir,
+            std::path::PathBuf,
             Arc<SignContextRegistry>,
             String,
             TestFixture,
             thread::JoinHandle<()>,
         ) {
+            let dir = tempfile::tempdir().unwrap();
+            let sock_path = dir.path().join("sock");
             let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(shutdown.clone()).unwrap();
-            let addr = server.addr();
+            let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
             let registry = Arc::new(SignContextRegistry::new());
             let token = generate_bearer_token().unwrap();
             let f = TestFixture::new(constant_counter);
@@ -3741,7 +4194,7 @@ mod tests {
                 .bind_lease(&token, "lease-integ".to_string())
                 .unwrap();
             let handle = server.serve(registry.clone());
-            (shutdown, addr, registry, token, f, handle)
+            (shutdown, dir, sock_path, registry, token, f, handle)
         }
 
         fn sign_request_body(
@@ -3779,7 +4232,7 @@ mod tests {
 
         #[test]
         fn http_sign_full_response_structure() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3788,7 +4241,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("200 OK"));
             let body_str = http_body(&resp);
             let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
@@ -3804,16 +4257,7 @@ mod tests {
 
         #[test]
         fn http_auth_preflight_then_sign() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
-            let preflight = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
-            let preflight_resp = http_request(addr, preflight, b"");
-            assert!(preflight_resp.contains("204 No Content"));
-            assert!(preflight_resp.contains("Access-Control-Allow-Origin: *"));
-            assert!(preflight_resp.contains("Access-Control-Allow-Methods: POST"));
-            assert!(
-                preflight_resp
-                    .contains("Access-Control-Allow-Headers: Authorization, Content-Type")
-            );
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3822,23 +4266,19 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let sign_resp = http_request(addr, &req, &body);
+            let sign_resp = http_request(&sock_path, &req, &body);
             assert!(sign_resp.contains("200 OK"));
-            assert!(sign_resp.contains("Access-Control-Allow-Origin: *"));
-            assert!(sign_resp.contains("Access-Control-Allow-Methods: POST"));
-            assert!(
-                sign_resp.contains("Access-Control-Allow-Headers: Authorization, Content-Type")
-            );
+            assert!(!sign_resp.contains("Access-Control"));
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();
         }
 
         #[test]
         fn http_policy_deny_returns_403() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3848,7 +4288,7 @@ mod tests {
 
         #[test]
         fn http_grant_ttl_enforced() {
-            let (shutdown, addr, _registry, token, f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, f, handle) = setup_bound(true);
             f.clock.advance(Duration::from_secs(301));
             let body = sign_request_body(
                 "https://example.com",
@@ -3858,7 +4298,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3868,7 +4308,7 @@ mod tests {
 
         #[test]
         fn http_credential_ref_enforced() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3877,7 +4317,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("200 OK"));
             let body_str = http_body(&resp);
             let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
@@ -3891,7 +4331,7 @@ mod tests {
 
         #[test]
         fn http_counter_increment_monotonic() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
             let body1 = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -3900,7 +4340,7 @@ mod tests {
                 false,
             );
             let req1 = format_sign_request(&token, &body1);
-            let resp1 = http_request(addr, &req1, &body1);
+            let resp1 = http_request(&sock_path, &req1, &body1);
             assert!(resp1.contains("200 OK"));
             let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
             let inner1 = parsed1.get("sign_assertion_result").unwrap();
@@ -3918,7 +4358,7 @@ mod tests {
                 false,
             );
             let req2 = format_sign_request(&token, &body2);
-            let resp2 = http_request(addr, &req2, &body2);
+            let resp2 = http_request(&sock_path, &req2, &body2);
             assert!(resp2.contains("200 OK"));
             let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
             let inner2 = parsed2.get("sign_assertion_result").unwrap();
@@ -3936,14 +4376,14 @@ mod tests {
 
         #[test]
         fn http_content_type_validation() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = b"{}";
             let req = format!(
                 "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
                 token,
                 body.len()
             );
-            let resp = http_request(addr, &req, body);
+            let resp = http_request(&sock_path, &req, body);
             assert!(resp.contains("415"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("unsupported_content_type"));
@@ -3953,11 +4393,11 @@ mod tests {
 
         #[test]
         fn http_origin_mismatch_denied() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body =
                 sign_request_body("https://evil.com", "example.com", "dGVzdA", vec![], false);
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3967,10 +4407,10 @@ mod tests {
 
         #[test]
         fn http_wrong_rp_id_denied() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3980,7 +4420,7 @@ mod tests {
 
         #[test]
         fn http_unauthorized_credential_denied() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let wrong_cred = b64u_encode(b"wrong_credential_id_bytes_1234567");
             let body = sign_request_body(
                 "https://example.com",
@@ -3990,7 +4430,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));
@@ -3999,8 +4439,8 @@ mod tests {
         }
 
         #[test]
-        fn http_replay_attack_same_challenge_is_rejected() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(false);
+        fn http_duplicate_request_within_ttl_returns_cached_assertion() {
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -4009,7 +4449,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(&token, &body);
-            let resp1 = http_request(addr, &req, &body);
+            let resp1 = http_request(&sock_path, &req, &body);
             assert!(resp1.contains("200 OK"));
             let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
             let auth1 = parsed1
@@ -4018,12 +4458,25 @@ mod tests {
                 .get("authenticator_data_b64u")
                 .unwrap()
                 .as_str()
-                .unwrap();
-            assert_eq!(extract_counter(auth1), 1);
+                .unwrap()
+                .to_string();
+            assert_eq!(extract_counter(&auth1), 1);
 
-            let resp2 = http_request(addr, &req, &body);
-            assert!(resp2.contains("409 Conflict"));
-            assert!(http_body(&resp2).contains("replayed_operation"));
+            // An identical request within the completed-outcome TTL returns the
+            // same cached assertion instead of being re-signed. The counter is not
+            // incremented again, so no new signature is produced (idempotent).
+            let resp2 = http_request(&sock_path, &req, &body);
+            assert!(resp2.contains("200 OK"));
+            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
+            let auth2 = parsed2
+                .get("sign_assertion_result")
+                .unwrap()
+                .get("authenticator_data_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            assert_eq!(auth2, auth1);
+            assert_eq!(extract_counter(auth2), 1);
 
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();
@@ -4031,10 +4484,10 @@ mod tests {
 
         #[test]
         fn http_invalid_json_body() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = b"{invalid json!!";
             let req = format_sign_request(&token, body);
-            let resp = http_request(addr, &req, body);
+            let resp = http_request(&sock_path, &req, body);
             assert!(resp.contains("400"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("invalid_json"));
@@ -4044,12 +4497,12 @@ mod tests {
 
         #[test]
         fn http_body_too_large() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let req = format!(
                 "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n",
                 token
             );
-            let resp = http_request(addr, &req, b"");
+            let resp = http_request(&sock_path, &req, b"");
             assert!(resp.contains("413"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("body_too_large"));
@@ -4059,7 +4512,7 @@ mod tests {
 
         #[test]
         fn http_bearer_not_prefix_match() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let prefix = &token[..10];
             let body = sign_request_body(
                 "https://example.com",
@@ -4069,7 +4522,7 @@ mod tests {
                 false,
             );
             let req = format_sign_request(prefix, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("401"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("invalid_bearer"));
@@ -4079,7 +4532,7 @@ mod tests {
 
         #[test]
         fn http_wrong_auth_scheme() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://example.com",
                 "example.com",
@@ -4092,7 +4545,7 @@ mod tests {
                 token,
                 body.len()
             );
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("401"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("invalid_authorization_scheme"));
@@ -4102,7 +4555,7 @@ mod tests {
 
         #[test]
         fn http_cross_origin_theft_attempt() {
-            let (shutdown, addr, _registry, token, _f, handle) = setup_bound(true);
+            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
             let body = sign_request_body(
                 "https://attacker.com",
                 "example.com",
@@ -4111,7 +4564,7 @@ mod tests {
                 true,
             );
             let req = format_sign_request(&token, &body);
-            let resp = http_request(addr, &req, &body);
+            let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
             assert!(body_str.contains("forbidden"));

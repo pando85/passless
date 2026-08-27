@@ -7,7 +7,7 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -19,13 +19,18 @@ use passless_core::agent::config::{ANY_RP_ID, CdpExposeMode, validate_rp_id};
 use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
 
 use rand::Rng;
+use rsa::RsaPrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
+use serde_json;
 
 use super::launcher::{
     DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NPROC, HardenedChildSetup,
+    close_range_preserving,
 };
 
 const RUNTIME_DIR_MODE: u32 = 0o700;
+const EXTENSION_DIR_MODE: u32 = 0o755;
 const DEFAULT_SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_TTL_CLAMP_SECS: u64 = 86_400;
@@ -45,6 +50,81 @@ pub const CDP_MAX_RESPONSE_TOTAL_BYTES: usize = 64 * 1024;
 pub const CDP_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CDP_MIN_TIMEOUT: Duration = Duration::from_millis(100);
 const CDP_READ_BUF_SIZE: usize = 16 * 1024;
+const EXTENSION_KEY_FILENAME: &str = "extension_key.pem";
+
+fn extension_key_path() -> Result<PathBuf, LaunchError> {
+    dirs::config_dir()
+        .map(|d| d.join("passless").join(EXTENSION_KEY_FILENAME))
+        .ok_or_else(|| {
+            LaunchError::ExtensionSetupFailed("cannot determine config directory".into())
+        })
+}
+
+fn generate_extension_key() -> Result<RsaPrivateKey, LaunchError> {
+    let mut rng = rand::thread_rng();
+    RsaPrivateKey::new(&mut rng, 2048)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("generate RSA key: {}", e)))
+}
+
+fn load_or_create_extension_key() -> Result<RsaPrivateKey, LaunchError> {
+    let key_path = extension_key_path()?;
+
+    if key_path.exists() {
+        let pem_data = fs::read_to_string(&key_path)
+            .map_err(|e| LaunchError::ExtensionSetupFailed(format!("read extension key: {}", e)))?;
+        RsaPrivateKey::from_pkcs8_pem(&pem_data)
+            .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse extension key: {}", e)))
+    } else {
+        let key = generate_extension_key()?;
+        let pem_data = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("encode extension key: {}", e))
+        })?;
+
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                LaunchError::ExtensionSetupFailed(format!("create config directory: {}", e))
+            })?;
+        }
+
+        fs::write(&key_path, pem_data.as_bytes()).map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("write extension key: {}", e))
+        })?;
+
+        Ok(key)
+    }
+}
+
+fn compute_extension_id_from_key(key: &RsaPrivateKey) -> Result<String, LaunchError> {
+    use sha2::Digest;
+
+    let pub_key = key.to_public_key();
+    let pub_key_der = pub_key
+        .to_public_key_der()
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("encode public key: {}", e)))?;
+
+    let hash = sha2::Sha256::digest(pub_key_der.as_bytes());
+    let ext_id: String = hash
+        .iter()
+        .take(16)
+        .flat_map(|b| {
+            let high = (b >> 4) & 0x0F;
+            let low = b & 0x0F;
+            [(b'a' + high) as char, (b'a' + low) as char]
+        })
+        .collect();
+
+    Ok(ext_id)
+}
+
+fn get_public_key_base64(key: &RsaPrivateKey) -> Result<String, LaunchError> {
+    let pub_key = key.to_public_key();
+    let pub_key_der = pub_key
+        .to_public_key_der()
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("encode public key: {}", e)))?;
+
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(pub_key_der.as_bytes()))
+}
 
 fn process_epoch() -> &'static Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -188,7 +268,7 @@ pub struct BrowserManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEndpointMetadata {
-    pub port: u16,
+    pub socket_path: String,
     pub bearer_token: String,
 }
 
@@ -406,6 +486,7 @@ pub enum LaunchError {
     InvalidArg(String),
     EndpointFileWriteFailed(String, String),
     ExtensionSetupFailed(String),
+    InvalidCdpEndpoint(String),
 }
 
 impl fmt::Display for LaunchError {
@@ -442,6 +523,9 @@ impl fmt::Display for LaunchError {
             }
             LaunchError::ExtensionSetupFailed(msg) => {
                 write!(f, "extension setup failed: {}", msg)
+            }
+            LaunchError::InvalidCdpEndpoint(msg) => {
+                write!(f, "invalid CDP endpoint: {}", msg)
             }
         }
     }
@@ -653,20 +737,53 @@ impl BrowserProcessManager {
             .join(format!("lease-{}", lease_id.as_str()));
         let profile_dir = runtime_dir.join("profile");
 
-        create_lease_dir(&runtime_dir, config.target_uid, config.target_gid).map_err(|e| {
+        create_lease_dir(
+            &runtime_dir,
+            RUNTIME_DIR_MODE,
+            config.target_uid,
+            config.target_gid,
+        )
+        .map_err(|e| {
             LaunchError::DirCreationFailed(runtime_dir.display().to_string(), e.to_string())
         })?;
-        create_lease_dir(&profile_dir, config.target_uid, config.target_gid).map_err(|e| {
+        create_lease_dir(
+            &profile_dir,
+            RUNTIME_DIR_MODE,
+            config.target_uid,
+            config.target_gid,
+        )
+        .map_err(|e| {
             LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
         })?;
 
         if let Some(metadata) = agent_endpoint {
-            let _ext_dir = generate_agent_extension(
+            let ext_dir = generate_agent_extension(
                 &runtime_dir,
                 metadata,
                 config.target_uid,
                 config.target_gid,
             )?;
+            if let Ok(current_exe) = std::env::current_exe() {
+                let sign_proxy = current_exe
+                    .parent()
+                    .map(|p| p.join("sign-proxy"))
+                    .unwrap_or_else(|| PathBuf::from("sign-proxy"));
+                if sign_proxy.exists() {
+                    if let Err(e) = install_native_messaging_manifest(
+                        &ext_dir,
+                        &config.executable,
+                        &sign_proxy,
+                        Some(&profile_dir),
+                    ) {
+                        log::warn!("failed to install native messaging manifest: {}", e);
+                    }
+                } else {
+                    log::warn!(
+                        "sign-proxy not found at {}, native messaging disabled",
+                        sign_proxy.display()
+                    );
+                }
+            }
         }
 
         let profile_fp = fingerprint_path(&profile_dir).map_err(|e| {
@@ -955,6 +1072,8 @@ impl BrowserProcessManager {
     }
 
     pub fn cleanup(&mut self, lease_id: &BrowserLeaseId) -> Result<CleanupSafety, TransitionError> {
+        remove_native_messaging_manifest_from_all();
+
         let entry = self.leases.get(lease_id).ok_or(TransitionError::NotFound)?;
 
         let manifest = &entry.manifest;
@@ -1477,7 +1596,7 @@ fn validate_runtime_root(path: &Path, expected_uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn create_lease_dir(path: &Path, target_uid: u32, target_gid: u32) -> io::Result<()> {
+fn create_lease_dir(path: &Path, mode: u32, target_uid: u32, target_gid: u32) -> io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("/"));
     let dir_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -1513,7 +1632,7 @@ fn create_lease_dir(path: &Path, target_uid: u32, target_gid: u32) -> io::Result
         ));
     }
 
-    let mkdir_ret = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), RUNTIME_DIR_MODE) };
+    let mkdir_ret = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), mode) };
     if mkdir_ret != 0 {
         let err = io::Error::last_os_error();
         unsafe { libc::close(parent_fd) };
@@ -1684,9 +1803,10 @@ fn render_channel_script(template: &str, channel: &str) -> String {
 
 fn render_worker_script(template: &str, channel: &str, metadata: &AgentEndpointMetadata) -> String {
     let bearer_literal = serde_json::to_string(&metadata.bearer_token).unwrap();
+    let socket_path_literal = serde_json::to_string(&metadata.socket_path).unwrap();
     template
         .replace("__PASSLESS_CHANNEL__", channel)
-        .replace("__PASSLESS_PORT__", &metadata.port.to_string())
+        .replace("__PASSLESS_SOCKET_PATH__", &socket_path_literal)
         .replace("__PASSLESS_BEARER__", &bearer_literal)
 }
 
@@ -1699,10 +1819,16 @@ fn write_extension_file(
     target_gid: u32,
 ) -> Result<(), LaunchError> {
     let path = dir.join(name);
-    fs::write(&path, content)
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&path)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("create {}: {}", name, e)))?;
+    (&file)
+        .write_all(content.as_bytes())
         .map_err(|e| LaunchError::ExtensionSetupFailed(format!("write {}: {}", name, e)))?;
-    let file = fs::File::open(&path)
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("open {}: {}", name, e)))?;
     let ret = unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) };
     if ret != 0 {
         return Err(LaunchError::ExtensionSetupFailed(format!(
@@ -1711,9 +1837,6 @@ fn write_extension_file(
             io::Error::last_os_error()
         )));
     }
-    drop(file);
-    fs::set_permissions(&path, fs::Permissions::from_mode(mode))
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("chmod {}: {}", name, e)))?;
     Ok(())
 }
 
@@ -1724,16 +1847,28 @@ fn generate_agent_extension(
     target_gid: u32,
 ) -> Result<PathBuf, LaunchError> {
     let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
-    create_lease_dir(&ext_dir, target_uid, target_gid)
+    create_lease_dir(&ext_dir, EXTENSION_DIR_MODE, target_uid, target_gid)
         .map_err(|e| LaunchError::ExtensionSetupFailed(format!("extension dir: {}", e)))?;
 
     let channel_bytes: [u8; 32] = rand::thread_rng().r#gen();
     let channel: String = channel_bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
+    let key = load_or_create_extension_key()?;
+    let pub_key_base64 = get_public_key_base64(&key)?;
+
+    let base_manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../assets/agent-extension/manifest.json"
+    ))
+    .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse base manifest: {}", e)))?;
+    let mut manifest = base_manifest.as_object().cloned().unwrap_or_default();
+    manifest.insert("key".to_string(), serde_json::Value::String(pub_key_base64));
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("serialize manifest: {}", e)))?;
+
     write_extension_file(
         &ext_dir,
         "manifest.json",
-        include_str!("../../assets/agent-extension/manifest.json"),
+        &manifest_json,
         0o644,
         target_uid,
         target_gid,
@@ -1774,6 +1909,97 @@ fn generate_agent_extension(
     )?;
 
     Ok(ext_dir)
+}
+
+pub const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
+
+pub fn compute_extension_id(_ext_dir: &Path) -> String {
+    load_or_create_extension_key()
+        .and_then(|key| compute_extension_id_from_key(&key))
+        .unwrap_or_else(|e| {
+            log::error!("failed to compute stable extension ID: {}", e);
+            String::new()
+        })
+}
+
+fn native_messaging_hosts_dir(browser_exec: &Path) -> Option<PathBuf> {
+    let exec_name = browser_exec
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let config_dir = if exec_name.contains("google-chrome") || exec_name == "chrome" {
+        dirs::config_dir().map(|d| d.join("google-chrome"))
+    } else if exec_name.contains("chromium") {
+        dirs::config_dir().map(|d| d.join("chromium"))
+    } else {
+        dirs::config_dir().map(|d| d.join("chromium"))
+    };
+    config_dir.map(|d| d.join("NativeMessagingHosts"))
+}
+
+pub fn install_native_messaging_manifest(
+    ext_dir: &Path,
+    browser_exec: &Path,
+    sign_proxy_path: &Path,
+    profile_dir: Option<&Path>,
+) -> Result<PathBuf, LaunchError> {
+    let ext_id = compute_extension_id(ext_dir);
+    let manifest = serde_json::json!({
+        "name": NATIVE_MESSAGING_HOST_NAME,
+        "description": "Passless agent sign proxy",
+        "path": sign_proxy_path,
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{}/", ext_id)]
+    });
+
+    let hosts_dir = if let Some(profile_dir) = profile_dir {
+        profile_dir.join("NativeMessagingHosts")
+    } else {
+        native_messaging_hosts_dir(browser_exec).ok_or_else(|| {
+            LaunchError::ExtensionSetupFailed(
+                "cannot determine native messaging hosts directory".into(),
+            )
+        })?
+    };
+
+    write_native_messaging_manifest(&hosts_dir, &manifest)
+}
+
+fn write_native_messaging_manifest(
+    hosts_dir: &Path,
+    manifest: &serde_json::Value,
+) -> Result<PathBuf, LaunchError> {
+    fs::create_dir_all(hosts_dir).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "create native messaging dir {}: {}",
+            hosts_dir.display(),
+            e
+        ))
+    })?;
+    let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&manifest_path)
+        .map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("create native messaging manifest: {}", e))
+        })?;
+    serde_json::to_writer_pretty(&file, manifest).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!("write native messaging manifest: {}", e))
+    })?;
+    Ok(manifest_path)
+}
+
+fn remove_native_messaging_manifest_from_all() {
+    if let Some(config_dir) = dirs::config_dir() {
+        for browser_dir in &["chromium", "google-chrome", "google-chrome-beta"] {
+            let hosts_dir = config_dir.join(browser_dir).join("NativeMessagingHosts");
+            let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
+            let _ = fs::remove_file(&manifest_path);
+        }
+    }
 }
 
 pub(crate) fn build_browser_command(
@@ -2016,13 +2242,25 @@ fn spawn_browser_port_mode(
     unsafe {
         cmd.pre_exec(move || {
             if trusted_same_user {
-                // Do not set PR_SET_NO_NEW_PRIVS before exec in trusted
-                // same-user mode. Chromium may need its setuid sandbox helper
-                // during startup. Keep a dedicated session/process group so
-                // lifecycle cleanup can still terminate the complete browser.
+                // Close inherited FDs (sockets, audit files, UHID, etc.) but
+                // preserve stdio. Port mode uses TCP, not inherited pipes.
+                if close_range_preserving(&[0, 1, 2]).is_err() {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Dedicated session/process group for lifecycle cleanup.
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
+
+                // Reap browser if daemon dies.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Do not set PR_SET_NO_NEW_PRIVS before exec in trusted
+                // same-user mode. Chromium may need its setuid sandbox helper
+                // during startup.
                 Ok(())
             } else {
                 setup.apply(&[0, 1, 2])
@@ -2067,7 +2305,21 @@ pub(crate) fn discover_cdp_endpoint(
             if lines.len() >= 2 {
                 let port = lines[0].trim();
                 let ws_path = lines[1].trim();
-                return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+                let port_num: u16 = port.parse().map_err(|_| {
+                    LaunchError::InvalidCdpEndpoint(format!("invalid port '{}'", port))
+                })?;
+                if port_num == 0 {
+                    return Err(LaunchError::InvalidCdpEndpoint("port must not be 0".into()));
+                }
+                if !ws_path.starts_with("/devtools/browser/") {
+                    return Err(LaunchError::InvalidCdpEndpoint(format!(
+                        "invalid devtools path '{}'",
+                        ws_path
+                    )));
+                }
+                let url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+                validate_loopback_ws_url(&url)?;
+                return Ok(url);
             }
         }
         if Instant::now() >= deadline {
@@ -2091,7 +2343,21 @@ fn discover_cdp_endpoint_with_child(
             if lines.len() >= 2 {
                 let port = lines[0].trim();
                 let ws_path = lines[1].trim();
-                return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+                let port_num: u16 = port.parse().map_err(|_| {
+                    LaunchError::InvalidCdpEndpoint(format!("invalid port '{}'", port))
+                })?;
+                if port_num == 0 {
+                    return Err(LaunchError::InvalidCdpEndpoint("port must not be 0".into()));
+                }
+                if !ws_path.starts_with("/devtools/browser/") {
+                    return Err(LaunchError::InvalidCdpEndpoint(format!(
+                        "invalid devtools path '{}'",
+                        ws_path
+                    )));
+                }
+                let url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+                validate_loopback_ws_url(&url)?;
+                return Ok(url);
             }
         }
         if Instant::now() >= deadline {
@@ -2155,6 +2421,53 @@ fn wait_for_cdp_port(
     }
 }
 
+fn validate_loopback_ws_url(url: &str) -> Result<(), LaunchError> {
+    let rest = url
+        .strip_prefix("ws://")
+        .ok_or_else(|| LaunchError::InvalidCdpEndpoint("scheme must be ws://".into()))?;
+
+    let (host_port, path) = rest
+        .split_once('/')
+        .ok_or_else(|| LaunchError::InvalidCdpEndpoint("missing path after host".into()))?;
+
+    let (host, port_str) = if host_port.starts_with('[') {
+        let bracket_end = host_port
+            .find(']')
+            .ok_or_else(|| LaunchError::InvalidCdpEndpoint("malformed IPv6 address".into()))?;
+        let host = &host_port[1..bracket_end];
+        let port_str = &host_port[bracket_end + 1..];
+        let port_str = port_str.strip_prefix(':').unwrap_or(port_str);
+        (host, port_str)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .ok_or_else(|| LaunchError::InvalidCdpEndpoint("missing port".into()))?
+    };
+
+    if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+        return Err(LaunchError::InvalidCdpEndpoint(format!(
+            "host must be loopback, got '{}'",
+            host
+        )));
+    }
+
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| LaunchError::InvalidCdpEndpoint(format!("invalid port '{}'", port_str)))?;
+    if port == 0 {
+        return Err(LaunchError::InvalidCdpEndpoint("port must not be 0".into()));
+    }
+
+    if !path.starts_with("devtools/browser/") {
+        return Err(LaunchError::InvalidCdpEndpoint(format!(
+            "path must start with /devtools/browser/, got '/{}'",
+            path
+        )));
+    }
+
+    Ok(())
+}
+
 fn extract_web_socket_debugger_url(http_response: &str) -> Option<String> {
     let key = "webSocketDebuggerUrl";
     let key_pos = http_response.find(key)?;
@@ -2162,7 +2475,9 @@ fn extract_web_socket_debugger_url(http_response: &str) -> Option<String> {
     let ws_start = after_key.find("ws://")?;
     let value = &after_key[ws_start..];
     let end = value.find('"').unwrap_or(value.len());
-    Some(value[..end].to_string())
+    let url = &value[..end];
+    validate_loopback_ws_url(url).ok()?;
+    Some(url.to_string())
 }
 
 fn write_cdp_endpoint(
@@ -2172,14 +2487,18 @@ fn write_cdp_endpoint(
     target_gid: u32,
 ) -> Result<(), LaunchError> {
     let path = runtime_dir.join("cdp-endpoint");
-    fs::write(&path, url).map_err(|e| {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| {
+            LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
+        })?;
+    (&file).write_all(url.as_bytes()).map_err(|e| {
         LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
     })?;
-
-    let file = fs::File::open(&path).map_err(|e| {
-        LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
-    })?;
-    use std::os::unix::io::AsRawFd;
     let ret = unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) };
     if ret != 0 {
         return Err(LaunchError::EndpointFileWriteFailed(
@@ -2187,10 +2506,6 @@ fn write_cdp_endpoint(
             io::Error::last_os_error().to_string(),
         ));
     }
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(&path, perms).map_err(|e| {
-        LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
-    })?;
     Ok(())
 }
 
@@ -2425,23 +2740,32 @@ fn path_to_cstring(path: &Path) -> io::Result<CString> {
 
 fn write_manifest_atomic(dir: &Path, manifest: &BrowserManifest) -> Result<(), LaunchError> {
     let manifest_path = dir.join(MANIFEST_FILENAME);
-    let tmp_name = format!(".{}.tmp.{}", MANIFEST_FILENAME, std::process::id());
+    let tmp_name = format!(
+        ".{}.tmp.{:016x}",
+        MANIFEST_FILENAME,
+        rand::thread_rng().r#gen::<u64>()
+    );
     let tmp_path = dir.join(&tmp_name);
 
     let manifest_json = serde_json::to_string_pretty(manifest).map_err(|e| {
         LaunchError::ManifestWriteFailed(manifest_path.display().to_string(), e.to_string())
     })?;
 
-    fs::write(&tmp_path, &manifest_json).map_err(|e| {
-        LaunchError::ManifestWriteFailed(tmp_path.display().to_string(), e.to_string())
-    })?;
-
-    let tmp_file = fs::File::open(&tmp_path).map_err(|e| {
-        LaunchError::ManifestWriteFailed(tmp_path.display().to_string(), e.to_string())
-    })?;
+    let tmp_file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .map_err(|e| {
+            LaunchError::ManifestWriteFailed(tmp_path.display().to_string(), e.to_string())
+        })?;
+    (&tmp_file)
+        .write_all(manifest_json.as_bytes())
+        .map_err(|e| {
+            LaunchError::ManifestWriteFailed(tmp_path.display().to_string(), e.to_string())
+        })?;
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
         let ret = unsafe { libc::fsync(tmp_file.as_raw_fd()) };
         if ret != 0 {
             let _ = fs::remove_file(&tmp_path);
@@ -2624,7 +2948,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::default(),
-            cdp_port: 0,
+            cdp_port: 9222,
         }
     }
 
@@ -2930,13 +3254,13 @@ mod tests {
         let target = root.join("lease-test");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&target, uid, gid).unwrap();
+        create_lease_dir(&target, RUNTIME_DIR_MODE, uid, gid).unwrap();
         let meta = fs::symlink_metadata(&target).unwrap();
         assert!(meta.is_dir());
         assert_eq!(meta.permissions().mode() & 0o777, RUNTIME_DIR_MODE);
         assert_eq!(meta.uid(), uid);
         assert_eq!(meta.gid(), gid);
-        assert!(create_lease_dir(&target, uid, gid).is_err());
+        assert!(create_lease_dir(&target, RUNTIME_DIR_MODE, uid, gid).is_err());
     }
 
     #[test]
@@ -4187,7 +4511,7 @@ mod tests {
         let lease_dir = root.join("lease-test");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let manifest = BrowserManifest {
             lease_id: "test".to_string(),
@@ -4327,7 +4651,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::default(),
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -4356,7 +4680,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::default(),
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -5632,7 +5956,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let cmd = build_browser_command(&config, dir.path()).unwrap();
@@ -5703,7 +6027,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let result = build_browser_command(&config, dir.path());
@@ -5726,7 +6050,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let result = build_browser_command(&config, dir.path());
@@ -5749,7 +6073,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let result = build_browser_command(&config, dir.path());
@@ -5770,7 +6094,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         }
     }
 
@@ -5873,7 +6197,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
         assert!(build_browser_command(&config, dir.path()).is_ok());
     }
@@ -5888,18 +6212,17 @@ mod tests {
 
     #[test]
     fn test_render_worker_script_replaces_all_placeholders() {
-        let template =
-            r#"(function(p,b){})("__PASSLESS_CHANNEL__",__PASSLESS_PORT__,__PASSLESS_BEARER__);"#;
+        let template = r#"(function(s,b){})("__PASSLESS_CHANNEL__",__PASSLESS_SOCKET_PATH__,__PASSLESS_BEARER__);"#;
         let metadata = AgentEndpointMetadata {
-            port: 54321,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "secrettoken".to_string(),
         };
         let result = render_worker_script(template, "chan123", &metadata);
         assert!(result.contains("chan123"));
-        assert!(result.contains("54321"));
+        assert!(result.contains("/tmp/test/sock"));
         assert!(result.contains("secrettoken"));
         assert!(!result.contains("__PASSLESS_CHANNEL__"));
-        assert!(!result.contains("__PASSLESS_PORT__"));
+        assert!(!result.contains("__PASSLESS_SOCKET_PATH__"));
         assert!(!result.contains("__PASSLESS_BEARER__"));
     }
 
@@ -5909,7 +6232,7 @@ mod tests {
             include_str!("../../assets/agent-extension/main.js"),
             "testchannel",
         );
-        assert!(!rendered.contains("__PASSLESS_PORT__"));
+        assert!(!rendered.contains("__PASSLESS_SOCKET_PATH__"));
         assert!(!rendered.contains("__PASSLESS_BEARER__"));
         assert!(rendered.contains("testchannel"));
         assert!(!rendered.contains("__PASSLESS_CHANNEL__"));
@@ -5921,7 +6244,7 @@ mod tests {
             include_str!("../../assets/agent-extension/broker.js"),
             "testchannel",
         );
-        assert!(!rendered.contains("__PASSLESS_PORT__"));
+        assert!(!rendered.contains("__PASSLESS_SOCKET_PATH__"));
         assert!(!rendered.contains("__PASSLESS_BEARER__"));
         assert!(rendered.contains("testchannel"));
     }
@@ -5929,7 +6252,7 @@ mod tests {
     #[test]
     fn test_render_worker_script_contains_endpoint_secrets() {
         let metadata = AgentEndpointMetadata {
-            port: 60000,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "beartoken99".to_string(),
         };
         let rendered = render_worker_script(
@@ -5937,9 +6260,9 @@ mod tests {
             "wchan",
             &metadata,
         );
-        assert!(rendered.contains("60000"));
+        assert!(rendered.contains("/tmp/test/sock"));
         assert!(rendered.contains("beartoken99"));
-        assert!(!rendered.contains("__PASSLESS_PORT__"));
+        assert!(!rendered.contains("__PASSLESS_SOCKET_PATH__"));
         assert!(!rendered.contains("__PASSLESS_BEARER__"));
     }
 
@@ -5950,10 +6273,10 @@ mod tests {
         let lease_dir = root.join("lease-ext");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "deadbeef".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -5967,21 +6290,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extension_dir_permissions_are_0700() {
+    fn test_extension_dir_permissions_are_0755() {
         let dir = tempfile::tempdir().unwrap();
         let root = setup_runtime_root(dir.path());
         let lease_dir = root.join("lease-perm");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
         let mode = fs::symlink_metadata(&ext_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        assert_eq!(mode, 0o755);
     }
 
     #[test]
@@ -5991,10 +6314,10 @@ mod tests {
         let lease_dir = root.join("lease-wperm");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6013,10 +6336,10 @@ mod tests {
         let lease_dir = root.join("lease-mperm");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6047,10 +6370,10 @@ mod tests {
         let lease_dir = root.join("lease-noplace");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6081,10 +6404,10 @@ mod tests {
         let lease_dir = root.join("lease-nosec");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "supersecretbearer".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6103,10 +6426,10 @@ mod tests {
         let lease_dir = root.join("lease-nometa");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6172,13 +6495,18 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_has_loopback_host_permission() {
+    fn test_manifest_has_host_permissions() {
         let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
         let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
-        let hosts = parsed["host_permissions"].as_array().unwrap();
+        let host_permissions = parsed
+            .get("host_permissions")
+            .expect("host_permissions must be present for content scripts");
+        let arr = host_permissions
+            .as_array()
+            .expect("host_permissions must be an array");
         assert!(
-            hosts.iter().any(|h| h == "http://127.0.0.1/*"),
-            "host_permissions must include http://127.0.0.1/*"
+            arr.iter().any(|v| v.as_str() == Some("https://*/*")),
+            "host_permissions must include https://*/*"
         );
     }
 
@@ -6228,10 +6556,10 @@ mod tests {
         let lease_dir = root.join("lease-nodecheck");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6295,7 +6623,7 @@ mod tests {
         let config = test_config(dir.path());
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "deadbeef".to_string(),
         };
         let lease_id = mgr
@@ -6317,7 +6645,7 @@ mod tests {
         assert!(ext_dir.join("worker.js").exists());
 
         let worker_content = fs::read_to_string(ext_dir.join("worker.js")).unwrap();
-        assert!(worker_content.contains("55555"));
+        assert!(worker_content.contains("/tmp/test/sock"));
         assert!(worker_content.contains("deadbeef"));
     }
 
@@ -6329,7 +6657,7 @@ mod tests {
         let config = test_config(dir.path());
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let lease_id = mgr
@@ -6362,7 +6690,7 @@ mod tests {
         let config = test_config(dir.path());
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok".to_string(),
         };
         let lease_id = mgr
@@ -6430,10 +6758,10 @@ mod tests {
         let lease_dir = root.join("lease-bearer-special");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "tok\"en\\with\nspecial\u{00e9}".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6457,10 +6785,10 @@ mod tests {
         let lease_dir = root.join("lease-bearer-iso");
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, uid, gid).unwrap();
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "supersecretbearertoken".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
@@ -6479,7 +6807,7 @@ mod tests {
         let mut config = test_config(dir.path());
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "cleanup-test-token-xyz".to_string(),
         };
         config.executable = PathBuf::from("/bin/sleep");
@@ -6516,7 +6844,7 @@ mod tests {
         config.extra_args = vec!["60".to_string()];
 
         let metadata = AgentEndpointMetadata {
-            port: 55555,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "quarantine-token-abc".to_string(),
         };
         let lease_id = mgr
@@ -6582,7 +6910,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let cmd = build_browser_command(&config, &profile_dir).unwrap();
@@ -6613,7 +6941,7 @@ mod tests {
             daemon_uid: 0,
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 0,
+            cdp_port: 9222,
         };
 
         let cmd = build_browser_command(&config, &profile_dir).unwrap();
@@ -6628,7 +6956,7 @@ mod tests {
     #[test]
     fn test_agent_endpoint_metadata_serde_roundtrip() {
         let metadata = AgentEndpointMetadata {
-            port: 50000,
+            socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "abc123".to_string(),
         };
         let json = serde_json::to_string(&metadata).unwrap();

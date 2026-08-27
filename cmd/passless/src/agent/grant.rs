@@ -9,6 +9,8 @@ use passless_core::agent::{
     ProfileId, RegistrationGrantId,
 };
 
+use super::audit::AuditGate;
+use super::audit_events::{GrantApproveBuilder, GrantRequestBuilder};
 use super::browser::Clock;
 use super::intent::AdminAuthority;
 
@@ -469,6 +471,7 @@ pub struct GrantRegistry {
     allowed_actions: BTreeSet<String>,
     max_concurrent_grants: u64,
     last_seen_mono: u64,
+    audit_sink: Option<Arc<AuditGate>>,
 }
 
 impl GrantRegistry {
@@ -479,6 +482,7 @@ impl GrantRegistry {
         max_ttl_secs: u64,
         allowed_actions: BTreeSet<String>,
         max_concurrent_grants: u64,
+        audit_sink: Option<Arc<AuditGate>>,
     ) -> Self {
         Self {
             grants: HashMap::new(),
@@ -491,6 +495,7 @@ impl GrantRegistry {
             allowed_actions,
             max_concurrent_grants,
             last_seen_mono: 0,
+            audit_sink,
         }
     }
 
@@ -544,6 +549,8 @@ impl GrantRegistry {
         }
 
         let request_id = GrantRequestId::new();
+        let audit_profile_id = params.profile_id.clone();
+        let audit_rp_ids = params.rp_ids.clone();
         let request = GrantRequest {
             profile_id: params.profile_id,
             session_id: params.session_id,
@@ -558,6 +565,13 @@ impl GrantRegistry {
         };
 
         self.pending_requests.insert(request_id.clone(), request);
+
+        if let Some(ref sink) = self.audit_sink {
+            let event =
+                GrantRequestBuilder::new(&request_id, audit_profile_id, audit_rp_ids).build();
+            let _ = sink.record(event);
+        }
+
         Ok(request_id)
     }
 
@@ -596,11 +610,12 @@ impl GrantRegistry {
         };
         let ttl = clamp_ttl(request.requested_ttl_secs, self.max_ttl_secs);
         let now = self.clock.monotonic_secs();
+        let profile_id = request.profile_id.clone();
 
         let grant_id = GrantId::new();
         let grant = Grant {
             id: grant_id.clone(),
-            profile_id: request.profile_id.clone(),
+            profile_id: profile_id.clone(),
             session_id: request.session_id.clone(),
             endpoint_id: request.endpoint_id.clone(),
             principal_digest: request.principal_digest,
@@ -618,6 +633,11 @@ impl GrantRegistry {
         if let Some(req) = self.pending_requests.get_mut(request_id) {
             req.resolved = true;
             req.resolved_grant_id = Some(grant_id.clone());
+        }
+
+        if let Some(ref sink) = self.audit_sink {
+            let event = GrantApproveBuilder::new(grant_id.clone(), profile_id, ttl).build();
+            let _ = sink.record(event);
         }
 
         Ok(grant_id)
@@ -1321,6 +1341,7 @@ mod tests {
             300,
             test_actions(),
             10,
+            None,
         )
     }
 
@@ -1834,6 +1855,7 @@ mod tests {
             300,
             test_actions(),
             10,
+            None,
         );
 
         let authority = super::super::intent::admin_authority();
@@ -2875,5 +2897,49 @@ mod tests {
 
         let snapshots = registry.list_all_snapshots();
         assert_eq!(snapshots.len(), 2);
+    }
+
+    #[test]
+    fn test_grant_request_and_approve_emit_audit_records() {
+        use super::super::audit::AuditGate;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let audit_dir = temp.path().join("audit");
+        let gate = Arc::new(AuditGate::open(&audit_dir).unwrap());
+
+        let clock = test_clock();
+        let mut registry = GrantRegistry::new(
+            clock.clone(),
+            test_policy_gen(),
+            test_policy_digest(),
+            300,
+            test_actions(),
+            10,
+            Some(gate.clone()),
+        );
+
+        let session = test_session_id();
+        let authority = super::super::intent::admin_authority();
+
+        let req_id = registry
+            .request_dynamic_grant(GrantRequestParams {
+                profile_id: test_profile_id(),
+                session_id: session.clone(),
+                endpoint_id: test_endpoint_id(),
+                principal_digest: test_digest(1000),
+                rp_ids: vec!["example.com".to_string()],
+                credentials: vec![],
+                requested_ttl_secs: 60,
+            })
+            .unwrap();
+
+        let _gid = registry.approve_grant(&req_id, &authority).unwrap();
+
+        let entry_count = gate.verify_all().unwrap();
+        assert_eq!(
+            entry_count, 2,
+            "expected 2 audit records (request + approve)"
+        );
     }
 }

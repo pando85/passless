@@ -4103,7 +4103,7 @@ mod tests {
             let clock = Arc::new(MockClock::new());
             let config = make_isolated_config(true);
             let runtime =
-                Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap());
 
             let audit_dir = format!("/tmp/test-handler-audit-{}", suffix);
             let _ = std::fs::remove_dir_all(&audit_dir);
@@ -5065,8 +5065,9 @@ mod tests {
             ) -> (Arc<PolicyRuntime>, Arc<AuditGate>) {
                 let clock = Arc::new(MockClock::new());
                 let config = make_isolated_config();
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 (runtime, audit)
             }
 
@@ -5290,8 +5291,9 @@ mod tests {
 
                 let clock = Arc::new(MockClock::new());
                 let config = make_isolated_config();
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let endpoint_id = EndpointId::new();
@@ -5370,8 +5372,9 @@ mod tests {
                 let audit = Arc::new(AuditGate::open(&audit_dir).unwrap());
                 let config = make_isolated_config();
                 let clock = Arc::new(MockClock::new());
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let session_id = PrincipalSessionId::new();
@@ -5461,8 +5464,9 @@ mod tests {
                 let audit = Arc::new(AuditGate::open(&audit_dir).unwrap());
                 let config = make_allow_config();
                 let clock = Arc::new(MockClock::new());
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let session_id = PrincipalSessionId::new();
@@ -5550,8 +5554,9 @@ mod tests {
                 let audit = Arc::new(AuditGate::open(&audit_dir).unwrap());
                 let config = make_isolated_config();
                 let clock = Arc::new(MockClock::new());
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let endpoint_id = EndpointId::new();
@@ -5727,8 +5732,9 @@ mod tests {
                 let audit = Arc::new(crate::agent::audit::AuditGate::open(&audit_dir).unwrap());
                 let clock = Arc::new(MockClock::new());
                 let config = make_config();
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let endpoint_id = EndpointId::new();
@@ -5886,8 +5892,9 @@ mod tests {
                 let audit = Arc::new(crate::agent::audit::AuditGate::open(&audit_dir).unwrap());
                 let clock = Arc::new(MockClock::new());
                 let config = make_config();
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let endpoint_id = EndpointId::new();
@@ -5954,8 +5961,9 @@ mod tests {
                 let audit = Arc::new(crate::agent::audit::AuditGate::open(&audit_dir).unwrap());
                 let clock = Arc::new(MockClock::new());
                 let config = make_config();
-                let runtime =
-                    Arc::new(PolicyRuntime::new(&config, clock.clone(), clock.clone()).unwrap());
+                let runtime = Arc::new(
+                    PolicyRuntime::new(&config, clock.clone(), clock.clone(), None).unwrap(),
+                );
                 let generation = runtime.current_generation();
                 let profile_id = ProfileId::new("test").unwrap();
                 let endpoint_id = EndpointId::new();

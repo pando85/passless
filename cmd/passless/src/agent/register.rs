@@ -708,7 +708,7 @@ mod tests {
             let mono_clock = Arc::new(MockMonoClock::new());
 
             let policy_runtime = Arc::new(
-                PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap(),
+                PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None).unwrap(),
             );
 
             let mut registration_grants = HashMap::new();
@@ -847,8 +847,9 @@ mod tests {
         let clock = Arc::new(MockClock::new());
         let mono_clock = Arc::new(MockMonoClock::new());
 
-        let policy_runtime =
-            Arc::new(PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone()).unwrap());
+        let policy_runtime = Arc::new(
+            PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None).unwrap(),
+        );
 
         let mut registration_grants = HashMap::new();
         registration_grants.insert(

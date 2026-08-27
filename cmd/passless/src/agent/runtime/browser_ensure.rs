@@ -281,7 +281,7 @@ impl AgentRuntime {
             })?;
 
         let metadata = crate::agent::browser::AgentEndpointMetadata {
-            port: self.sign_port,
+            socket_path: self.sign_socket_path.to_string_lossy().into_owned(),
             bearer_token: bearer_token.clone(),
         };
         let lease_id = match browser_manager.launch_pending_with_agent_endpoint(
