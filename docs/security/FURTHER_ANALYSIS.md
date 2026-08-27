@@ -18,6 +18,13 @@ Each issue is analyzed with current state, attack scenarios, proposed solutions,
 
 ### C-1: Same-User Port-Mode Browser Spawns with Zero Hardening
 
+> **Status: Accepted — by design.** Superseded by
+> [ADR 0008](../decisions/0008-same-user-trust-boundary.md). In same-user mode the browser
+> and daemon share a UID, so no kernel boundary exists regardless of spawn-time hardening;
+> the security controls live in the policy layer. The analysis below is kept for
+> historical context but its severity framing no longer applies. Residual items (FD
+> hygiene, PDEATHSIG, rlimits) are resilience follow-ups, not security fixes.
+
 **File:** `cmd/passless/src/agent/browser.rs:1998-2035`
 
 **Current State:**
@@ -75,6 +82,13 @@ When `PR_SET_NO_NEW_PRIVS` is set, the setuid sandbox helper cannot elevate priv
 
 ### C-2: Daemon Runs as Root with NoNewPrivileges=false and Full /dev Access
 
+> **Status: Open — re-scoped to root multi-principal deployment only.** See
+> [ADR 0009](../decisions/0009-daemon-hardening-scope.md). Same-user deployments are out
+> of scope (daemon is unprivileged there; trust boundary is the session per ADR 0008).
+> Open items are an implementation backlog for the isolated mode: C-2a additive systemd
+> directives, C-2b evaluated directives (`CapabilityBoundingSet`, `SystemCallFilter`),
+> and the deferred question of running with a bounded capability set instead of root.
+
 **File:** `contrib/systemd/passless-agent.service:37,42`
 
 **Current State:**
@@ -131,6 +145,12 @@ If the daemon process itself is compromised (e.g., through a vulnerability in CT
 
 ### H-2: No Namespace Isolation for Browser Processes
 
+> **Status: Open — re-scoped to isolated (cross-user) deployment mode only.** See
+> [ADR 0010](../decisions/0010-namespace-isolation-scope.md). Out of scope for same-user
+> mode (ADR 0008). Deferred backlog: mount namespace first with bind-mount allowlist,
+> PID namespace as stretch, network namespace only in pipe mode (port mode incompatible).
+> Terminology: `AgentMode::Isolated` means credential isolation, not OS namespaces.
+
 **File:** `cmd/passless/src/agent/browser.rs:1869-1912, 2000-2035`
 
 **Current State:**
@@ -163,6 +183,12 @@ The architecture documentation describes namespace isolation as a design goal, b
 
 ### H-3: No seccomp-BPF Filter on Any Spawned Process
 
+> **Status: Open — re-scoped to isolated (cross-user) mode only.** See
+> [ADR 0011](../decisions/0011-seccomp-scope.md). Out of scope for same-user mode
+> (ADR 0008). Deferred backlog: H-3a principal-process seccomp blacklist (early,
+> maintainable — our own binary), H-3b browser chrome seccomp (deferred, requires
+> per-version syscall profiling; Chromium version fragility risk).
+
 **File:** `cmd/passless/src/agent/browser.rs:1880-1907, launcher.rs:690-756`
 
 **Current State:**
@@ -193,6 +219,12 @@ A compromised browser or principal process has access to the full kernel syscall
 ## Priority 2: Authorization Model
 
 ### C-3: Self-Approval of Authentication Grants
+
+> **Status: Accepted (approval mechanism) / Open backlog (audit).** See
+> [ADR 0012](../decisions/0012-grant-audit-and-notification-approval-integrity.md). Self-approval within
+> configured policy is the designed autonomous behavior (ADR 0001/0007); the
+> `AdminAuthority` seal is cosmetic and accepted as such. Open item: grant
+> request/approval are not audited in production despite builders existing — backlog fix.
 
 **File:** `cmd/passless/src/agent/runtime/browser_ensure.rs:398-409`
 
@@ -251,6 +283,13 @@ The current design relies on the assumption that the initial verification steps 
 ---
 
 ### H-1: D-Bus Notification Action Injection
+
+> **Status: Open backlog — in scope for same-user mode.** See
+> [ADR 0012](../decisions/0012-grant-audit-and-notification-approval-integrity.md). Injection collapses
+> the human/agent distinction that `authorization="confirm"` relies on, so ADR 0008's
+> trust-boundary reasoning does not exempt it. Planned fix: raw zbus signal handling that
+> validates the `ActionInvoked` sender against the notification server's bus name
+> (notify-rust 4.x `wait_for_action` does not expose the sender).
 
 **File:** `cmd/passless/src/agent/prompt.rs:616-633`
 
