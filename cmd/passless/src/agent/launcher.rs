@@ -756,7 +756,7 @@ impl HardenedChildSetup {
     }
 }
 
-unsafe fn close_range_preserving(preserved: &[RawFd]) -> Result<(), io::Error> {
+pub(crate) unsafe fn close_range_preserving(preserved: &[RawFd]) -> Result<(), io::Error> {
     let mut sorted: Vec<RawFd> = preserved.to_vec();
     sorted.sort_unstable();
     sorted.dedup();

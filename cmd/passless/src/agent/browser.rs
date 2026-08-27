@@ -26,6 +26,7 @@ use serde_json;
 
 use super::launcher::{
     DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NPROC, HardenedChildSetup,
+    close_range_preserving,
 };
 
 const RUNTIME_DIR_MODE: u32 = 0o700;
@@ -2241,13 +2242,25 @@ fn spawn_browser_port_mode(
     unsafe {
         cmd.pre_exec(move || {
             if trusted_same_user {
-                // Do not set PR_SET_NO_NEW_PRIVS before exec in trusted
-                // same-user mode. Chromium may need its setuid sandbox helper
-                // during startup. Keep a dedicated session/process group so
-                // lifecycle cleanup can still terminate the complete browser.
+                // Close inherited FDs (sockets, audit files, UHID, etc.) but
+                // preserve stdio. Port mode uses TCP, not inherited pipes.
+                if close_range_preserving(&[0, 1, 2]).is_err() {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Dedicated session/process group for lifecycle cleanup.
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
+
+                // Reap browser if daemon dies.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Do not set PR_SET_NO_NEW_PRIVS before exec in trusted
+                // same-user mode. Chromium may need its setuid sandbox helper
+                // during startup.
                 Ok(())
             } else {
                 setup.apply(&[0, 1, 2])
