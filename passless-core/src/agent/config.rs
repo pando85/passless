@@ -30,7 +30,7 @@ pub const ANY_RP_ID: &str = "*";
 
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
 const MAX_OPERATIONS: u16 = 4096;
-const DEFAULT_MAX_CONCURRENT_SESSIONS: u16 = 1;
+const DEFAULT_MAX_CONCURRENT_SESSIONS: u16 = MAX_CONCURRENT_SESSIONS;
 const MAX_CONCURRENT_SESSIONS: u16 = 64;
 
 fn default_max_operations() -> u16 {
