@@ -11,6 +11,16 @@
   var MAX_USER_NAME_LEN = 256;
   var MAX_USER_ID_B64U_LEN = 128;
   var MAX_ALGORITHMS = 16;
+  var marker = document.documentElement;
+  if (marker && marker.hasAttribute("data-passless-agent-broker")) return;
+  if (marker) marker.setAttribute("data-passless-agent-broker", "");
+  var initialized = window.__passlessAgentBrokerChannels;
+  if (!(initialized instanceof Set)) {
+    initialized = new Set();
+    window.__passlessAgentBrokerChannels = initialized;
+  }
+  if (initialized.has(channel)) return;
+  initialized.add(channel);
 
   function isValidGetRequest(req) {
     if (!req || typeof req !== "object") return false;
@@ -74,6 +84,7 @@
 
     chrome.runtime.sendMessage({
       source: "passless-agent-broker",
+      request_id: message.id,
       type: messageType,
       request: message.request
     }, function(response) {

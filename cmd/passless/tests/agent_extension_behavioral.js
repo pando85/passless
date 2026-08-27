@@ -150,6 +150,12 @@ function runMainTest(channel, setupFn) {
   return sandbox;
 }
 
+function runBrokerCode(sandbox, channel) {
+  const ctx = vm.createContext(sandbox);
+  const code = renderBroker(channel);
+  vm.runInContext(code, ctx);
+}
+
 function runBrokerTest(channel, setupFn) {
   const sandbox = {
     _chromeSendResponse: null,
@@ -181,10 +187,18 @@ function runBrokerTest(channel, setupFn) {
     },
   };
 
+  const documentElement = {
+    _attributes: new Set(),
+    hasAttribute: function(name) { return this._attributes.has(name); },
+    setAttribute: function(name) { this._attributes.add(name); },
+  };
+  sandbox._windowListeners = windowListeners;
   sandbox.window = windowObj;
+  sandbox.document = { documentElement: documentElement };
   sandbox.chrome = chromeObj;
   sandbox.location = { origin: "https://example.com" };
   sandbox.Array = Array;
+  sandbox.Set = Set;
   sandbox.Object = Object;
   sandbox.String = String;
   sandbox.Boolean = Boolean;
@@ -192,9 +206,7 @@ function runBrokerTest(channel, setupFn) {
   sandbox.JSON = JSON;
   sandbox.TypeError = TypeError;
 
-  const ctx = vm.createContext(sandbox);
-  const code = renderBroker(channel);
-  vm.runInContext(code, ctx);
+  runBrokerCode(sandbox, channel);
 
   if (setupFn) setupFn(sandbox, windowListeners);
 
@@ -529,6 +541,7 @@ test("main: constructs Gitea-compatible credential from daemon response", async 
       messageHandler,
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         channel: ch,
         id: requestId,
         ok: true,
@@ -572,6 +585,7 @@ test("main: malformed daemon response becomes NotAllowedError", async function()
       messageHandler,
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         channel: ch,
         id: requestId,
         ok: true,
@@ -608,6 +622,7 @@ test("main: broker ok=false becomes NotAllowedError", async function() {
       messageHandler,
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         channel: ch,
         id: requestId,
         ok: false,
@@ -643,6 +658,7 @@ test("main: ignores messages from wrong source", async function() {
       messageHandler,
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         channel: ch,
         id: requestId,
         ok: true,
@@ -682,6 +698,7 @@ test("main: ignores messages with wrong channel", async function() {
       messageHandler,
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         channel: "wrong-channel",
         id: requestId,
         ok: true,
@@ -724,6 +741,7 @@ test("main: fresh object construction for each credential response", async funct
         messageHandler,
         {
           source: "passless-agent-broker",
+        request_id: "request-1",
           channel: ch,
           id: requestId,
           ok: true,
@@ -867,6 +885,37 @@ test("broker: forwards valid request to chrome.runtime.sendMessage", async funct
   assert.strictEqual(sandbox._chromeSendMessage.request.rp_id, "example.com");
 });
 
+test("broker: ignores duplicate injection for the same channel", async function() {
+  const ch = "broker-duplicate";
+  let sendCount = 0;
+  const sandbox = runBrokerTest(ch, function(sandbox) {
+    sandbox.chrome.runtime.sendMessage = function(message, callback) {
+      sendCount++;
+      callback({ ok: true, response: { data: "test" } });
+    };
+  });
+
+  runBrokerCode(sandbox, ch);
+
+  simulateMessage(
+    sandbox._windowListeners.message,
+    {
+      source: "passless-agent-main",
+      channel: ch,
+      id: "req-1",
+      request: {
+        rp_id: "example.com",
+        challenge_b64u: b64url(makeChallenge(32)),
+        allow_credentials: [],
+        user_verification: false,
+      },
+    },
+    sandbox.window,
+    "https://example.com"
+  );
+
+  assert.strictEqual(sendCount, 1);
+});
 test("broker: rejects message from wrong source", async function() {
   const ch = "broker-ch2";
   const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
@@ -1146,6 +1195,7 @@ test("worker: validates sender.url must be valid URL", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1171,6 +1221,7 @@ test("worker: validates sender.url must be https:", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1195,6 +1246,7 @@ test("worker: validates sender.id against chrome.runtime.id", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1222,6 +1274,7 @@ test("worker: accepts matching sender.id", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1238,6 +1291,33 @@ test("worker: accepts matching sender.id", async function() {
   assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
 });
 
+test("worker: coalesces duplicate request IDs", async function() {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken");
+  const listener = sandbox._listeners[0];
+  const sender = { url: "https://example.com/page", id: "test-extension-id" };
+  const message = {
+    source: "passless-agent-broker",
+    request_id: "duplicate-request",
+    request: {
+      rp_id: "example.com",
+      challenge_b64u: "aaa",
+      allow_credentials: [],
+      user_verification: false,
+    },
+  };
+  const responses = [];
+
+  assert.strictEqual(listener(message, sender, function(response) { responses.push(response); }), true);
+  assert.strictEqual(listener(message, sender, function(response) { responses.push(response); }), true);
+  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
+
+  sandbox._nativeMessageCalls[0].callback({
+    body: JSON.stringify({ sign_assertion_result: { credential_id_b64u: "abc" } }),
+  });
+
+  assert.strictEqual(responses.length, 2);
+  assert.deepStrictEqual(responses[0], responses[1]);
+});
 test("worker: derives origin and cross_origin from sender.url", async function() {
   const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
     sandbox._nativeMessageResponse = {
@@ -1254,6 +1334,7 @@ test("worker: derives origin and cross_origin from sender.url", async function()
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1290,6 +1371,7 @@ test("worker: computes cross_origin=true for a cross-origin subframe", async fun
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1326,7 +1408,8 @@ test("worker: constructs fresh request object (not passthrough)", async function
     };
     const sender = { url: "https://example.com/page" };
     listener(
-      { source: "passless-agent-broker", request: originalRequest },
+      { source: "passless-agent-broker",
+        request_id: "request-1", request: originalRequest },
       sender,
       function() {}
     );
@@ -1349,6 +1432,7 @@ test("worker: sends bearer token in native message", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1376,6 +1460,7 @@ test("worker: bearer token with special characters is safely injected", async fu
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1402,6 +1487,7 @@ test("worker: sends correct socket path in native message", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1427,6 +1513,7 @@ test("worker: rejects rp_id exceeding MAX_RP_ID_LEN", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "x".repeat(254),
           challenge_b64u: "aaa",
@@ -1450,6 +1537,7 @@ test("worker: rejects challenge_b64u exceeding MAX_CHALLENGE_B64U_LEN", async fu
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "x".repeat(2049),
@@ -1477,6 +1565,7 @@ test("worker: rejects allow_credentials exceeding MAX_ALLOW_CREDENTIALS", async 
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1500,6 +1589,7 @@ test("worker: rejects invalid user_verification", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1528,6 +1618,7 @@ test("worker: accepts all valid user_verification values", async function() {
       listener(
         {
           source: "passless-agent-broker",
+        request_id: "request-1",
           request: {
             rp_id: "example.com",
             challenge_b64u: "aaa",
@@ -1559,6 +1650,7 @@ test("worker: malformed daemon response results in ok:false", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1590,6 +1682,7 @@ test("worker: native messaging error results in ok:false", async function() {
     const result = listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1621,6 +1714,7 @@ test("worker: rejects request body exceeding MAX_REQUEST_BYTES", async function(
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "x".repeat(2048),
@@ -1682,6 +1776,7 @@ test("worker: rejects credential id exceeding MAX_CREDENTIAL_ID_B64U_LEN", async
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",
@@ -1705,6 +1800,7 @@ test("worker: rejects credential id that is not a string", async function() {
     listener(
       {
         source: "passless-agent-broker",
+        request_id: "request-1",
         request: {
           rp_id: "example.com",
           challenge_b64u: "aaa",

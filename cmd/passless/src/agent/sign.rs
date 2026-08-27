@@ -4,9 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
@@ -240,15 +240,195 @@ pub fn generate_bearer_token() -> Result<String, String> {
     Ok(b64u_encode(&bytes))
 }
 
+#[derive(Debug, Clone)]
+struct InFlightOutcome {
+    status: &'static str,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum InFlightState {
+    Pending,
+    Resolved(InFlightOutcome),
+}
+
+#[derive(Debug)]
+struct InFlightEntry {
+    state: Mutex<InFlightState>,
+    done: Condvar,
+}
+
+impl InFlightEntry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InFlightState::Pending),
+            done: Condvar::new(),
+        }
+    }
+
+    fn resolve(&self, outcome: InFlightOutcome) {
+        let mut s = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        *s = InFlightState::Resolved(outcome);
+        self.done.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> Option<InFlightOutcome> {
+        let guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+        let (guard, timed_out) = match self
+            .done
+            .wait_timeout_while(guard, timeout, |s| matches!(s, InFlightState::Pending))
+        {
+            Ok(pair) => pair,
+            Err(_) => return None,
+        };
+        if timed_out.timed_out() {
+            return None;
+        }
+        match &*guard {
+            InFlightState::Resolved(o) => Some(o.clone()),
+            InFlightState::Pending => None,
+        }
+    }
+}
+
+// Completed-outcome cache: some relying parties (e.g. Kanidm) submit the same
+// WebAuthn request body more than once for a single user gesture. The first
+// request is signed; an identical follow-up must receive the SAME outcome rather
+// than a `replayed_operation` rejection, otherwise the user-facing ceremony fails.
+//
+// Safety: a cached outcome is returned without re-signing, so the sign counter is
+// incremented exactly once and no new signature is produced. The real replay
+// defence remains the relying party's one-time challenge. After the TTL elapses an
+// identical body is rejected as `Replayed` as before.
+const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(120);
+const MAX_COMPLETED_OUTCOMES: usize = 256;
+
+struct CompletedOutcome {
+    outcome: InFlightOutcome,
+    at: Instant,
+}
+
+struct RequestBudgetInner {
+    used: HashSet<[u8; 32]>,
+    in_flight: HashMap<[u8; 32], Arc<InFlightEntry>>,
+    completed: HashMap<[u8; 32], CompletedOutcome>,
+}
+
 #[derive(Clone)]
 struct RequestBudget {
-    used_requests: Arc<Mutex<HashSet<[u8; 32]>>>,
+    inner: Arc<Mutex<RequestBudgetInner>>,
     max_requests: usize,
 }
 
 impl RequestBudget {
     fn claim(&self, body: &[u8]) -> RequestClaim {
-        claim_request_digest(&self.used_requests, self.max_requests, body)
+        let hash = Sha256::digest(body);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&hash);
+
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return RequestClaim::Unavailable,
+        };
+
+        if inner.used.contains(&digest) {
+            if let Some(entry) = inner.in_flight.get(&digest) {
+                return RequestClaim::WaitFor(entry.clone());
+            }
+            let now = Instant::now();
+            if let Some(completed) = inner.completed.get(&digest)
+                && now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL
+            {
+                return RequestClaim::Cached {
+                    outcome: completed.outcome.clone(),
+                };
+            }
+            return RequestClaim::Replayed;
+        }
+
+        if inner.used.len() >= self.max_requests {
+            return RequestClaim::Exhausted;
+        }
+
+        inner.used.insert(digest);
+        let entry = Arc::new(InFlightEntry::new());
+        inner.in_flight.insert(digest, entry);
+        RequestClaim::Claimed { digest }
+    }
+
+    fn resolve(&self, digest: [u8; 32], outcome: InFlightOutcome) {
+        let entry = {
+            let mut inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let entry = inner.in_flight.remove(&digest);
+            let now = Instant::now();
+            inner
+                .completed
+                .retain(|_, completed| now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL);
+            if inner.completed.len() >= MAX_COMPLETED_OUTCOMES
+                && let Some(oldest) = inner
+                    .completed
+                    .iter()
+                    .min_by_key(|(_, completed)| completed.at)
+                    .map(|(digest, _)| *digest)
+            {
+                inner.completed.remove(&oldest);
+            }
+            inner.completed.insert(
+                digest,
+                CompletedOutcome {
+                    outcome: outcome.clone(),
+                    at: now,
+                },
+            );
+            entry
+        };
+        if let Some(entry) = entry {
+            entry.resolve(outcome);
+        }
+    }
+}
+
+struct InFlightGuard {
+    budget: RequestBudget,
+    digest: [u8; 32],
+    resolved: bool,
+}
+
+impl InFlightGuard {
+    fn new(budget: RequestBudget, digest: [u8; 32]) -> Self {
+        Self {
+            budget,
+            digest,
+            resolved: false,
+        }
+    }
+
+    fn resolve(&mut self, outcome: InFlightOutcome) {
+        self.budget.resolve(self.digest, outcome);
+        self.resolved = true;
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.budget.resolve(
+                self.digest,
+                InFlightOutcome {
+                    status: "500 Internal Server Error",
+                    body: b"{\"error\":\"internal_error\"}".to_vec(),
+                },
+            );
+        }
     }
 }
 
@@ -285,33 +465,14 @@ impl RegistrationLeaseEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum RequestClaim {
-    Claimed,
+    Claimed { digest: [u8; 32] },
     Replayed,
     Exhausted,
     Unavailable,
-}
-
-fn claim_request_digest(
-    registry: &Mutex<HashSet<[u8; 32]>>,
-    max_requests: usize,
-    body: &[u8],
-) -> RequestClaim {
-    let hash = Sha256::digest(body);
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&hash);
-    let Ok(mut used) = registry.lock() else {
-        return RequestClaim::Unavailable;
-    };
-    if used.contains(&digest) {
-        return RequestClaim::Replayed;
-    }
-    if used.len() >= max_requests {
-        return RequestClaim::Exhausted;
-    }
-    used.insert(digest);
-    RequestClaim::Claimed
+    WaitFor(Arc<InFlightEntry>),
+    Cached { outcome: InFlightOutcome },
 }
 
 impl SignContextRegistry {
@@ -335,7 +496,11 @@ impl SignContextRegistry {
             return Ok(existing.clone());
         }
         let budget = RequestBudget {
-            used_requests: Arc::new(Mutex::new(HashSet::new())),
+            inner: Arc::new(Mutex::new(RequestBudgetInner {
+                used: HashSet::new(),
+                in_flight: HashMap::new(),
+                completed: HashMap::new(),
+            })),
             max_requests,
         };
         budgets.insert(token.to_string(), budget.clone());
@@ -525,7 +690,7 @@ impl SignContextRegistry {
                 .find(|entry| entry.lease_id.as_deref() == Some(lease_id))?;
             entry.request_budget.clone()
         };
-        let used = budget.used_requests.lock().ok()?.len();
+        let used = budget.inner.lock().ok()?.used.len();
         Some((used, budget.max_requests))
     }
 
@@ -806,7 +971,35 @@ fn handle_http_connection(
                     return Ok(());
                 }
                 match reg_entry.claim_request(&body) {
-                    RequestClaim::Claimed => {}
+                    RequestClaim::Claimed { digest } => {
+                        let mut guard =
+                            InFlightGuard::new(reg_entry.request_budget.clone(), digest);
+                        let outcome = handle_register_body(&mut stream, &reg_entry, &body)?;
+                        guard.resolve(outcome);
+                    }
+                    RequestClaim::WaitFor(in_flight) => {
+                        match in_flight.wait(Duration::from_secs(30)) {
+                            Some(outcome) => {
+                                send_sign_response(
+                                    &mut stream,
+                                    outcome.status,
+                                    Some(&outcome.body),
+                                );
+                            }
+                            None => {
+                                send_sign_error(
+                                    &mut stream,
+                                    "500 Internal Server Error",
+                                    "operation_timeout",
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+                    RequestClaim::Cached { outcome } => {
+                        send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
+                        return Ok(());
+                    }
                     RequestClaim::Replayed => {
                         send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
                         return Ok(());
@@ -826,34 +1019,6 @@ fn handle_http_connection(
                             "operation_registry_unavailable",
                         );
                         return Ok(());
-                    }
-                }
-                let req: RegisterCredentialRequest = match serde_json::from_slice(&body) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        send_sign_error(&mut stream, "400 Bad Request", "invalid_json");
-                        return Ok(());
-                    }
-                };
-                match reg_entry.handler.register(&reg_entry.context, &req) {
-                    Ok(resp) => {
-                        let resp_body = serde_json::to_vec(&resp)
-                            .map_err(|e| format!("json serialize: {}", e))?;
-                        send_sign_response(&mut stream, "200 OK", Some(&resp_body));
-                    }
-                    Err(e) => {
-                        let (status, code) = match e.code {
-                            ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-                            ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-                            ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-                            ErrorCode::NotFound => ("404 Not Found", "not_found"),
-                            ErrorCode::Conflict => ("409 Conflict", "conflict"),
-                            ErrorCode::InteractionRequired => {
-                                ("409 Conflict", "human_interaction_required")
-                            }
-                            _ => ("500 Internal Server Error", "internal_error"),
-                        };
-                        send_sign_error(&mut stream, status, code);
                     }
                 }
                 return Ok(());
@@ -913,7 +1078,30 @@ fn handle_http_connection(
         return Ok(());
     }
     match entry.claim_request(&body) {
-        RequestClaim::Claimed => {}
+        RequestClaim::Claimed { digest } => {
+            let mut guard = InFlightGuard::new(entry.request_budget.clone(), digest);
+            let outcome = handle_sign_body(&mut stream, &entry, &body)?;
+            guard.resolve(outcome);
+        }
+        RequestClaim::WaitFor(in_flight) => {
+            match in_flight.wait(Duration::from_secs(30)) {
+                Some(outcome) => {
+                    send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
+                }
+                None => {
+                    send_sign_error(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "operation_timeout",
+                    );
+                }
+            }
+            return Ok(());
+        }
+        RequestClaim::Cached { outcome } => {
+            send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
+            return Ok(());
+        }
         RequestClaim::Replayed => {
             send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
             return Ok(());
@@ -935,33 +1123,97 @@ fn handle_http_connection(
             return Ok(());
         }
     }
-    let req: SignAssertionRequest = match serde_json::from_slice(&body) {
+    Ok(())
+}
+
+fn handle_sign_body(
+    stream: &mut UnixStream,
+    entry: &LeaseEntry,
+    body: &[u8],
+) -> Result<InFlightOutcome, String> {
+    let req: SignAssertionRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => {
-            send_sign_error(&mut stream, "400 Bad Request", "invalid_json");
-            return Ok(());
+            let outcome = InFlightOutcome {
+                status: "400 Bad Request",
+                body: b"{\"error\":\"invalid_json\"}".to_vec(),
+            };
+            send_sign_response(stream, outcome.status, Some(&outcome.body));
+            return Ok(outcome);
         }
     };
-    match entry.handler.sign(&entry.context, &req) {
+    let outcome = match entry.handler.sign(&entry.context, &req) {
         Ok(resp) => {
             let resp_body =
                 serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
-            send_sign_response(&mut stream, "200 OK", Some(&resp_body));
+            send_sign_response(stream, "200 OK", Some(&resp_body));
+            InFlightOutcome {
+                status: "200 OK",
+                body: resp_body,
+            }
         }
         Err(e) => {
-            let (status, code) = match e.code {
-                ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-                ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-                ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-                ErrorCode::NotFound => ("404 Not Found", "not_found"),
-                ErrorCode::Conflict => ("409 Conflict", "conflict"),
-                ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
-                _ => ("500 Internal Server Error", "internal_error"),
-            };
-            send_sign_error(&mut stream, status, code);
+            let (status, code) = error_status_code(e.code);
+            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
+            send_sign_response(stream, status, Some(&err_body));
+            InFlightOutcome {
+                status,
+                body: err_body,
+            }
         }
+    };
+    Ok(outcome)
+}
+
+fn handle_register_body(
+    stream: &mut UnixStream,
+    reg_entry: &RegistrationLeaseEntry,
+    body: &[u8],
+) -> Result<InFlightOutcome, String> {
+    let req: RegisterCredentialRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => {
+            let outcome = InFlightOutcome {
+                status: "400 Bad Request",
+                body: b"{\"error\":\"invalid_json\"}".to_vec(),
+            };
+            send_sign_response(stream, outcome.status, Some(&outcome.body));
+            return Ok(outcome);
+        }
+    };
+    let outcome = match reg_entry.handler.register(&reg_entry.context, &req) {
+        Ok(resp) => {
+            let resp_body =
+                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
+            send_sign_response(stream, "200 OK", Some(&resp_body));
+            InFlightOutcome {
+                status: "200 OK",
+                body: resp_body,
+            }
+        }
+        Err(e) => {
+            let (status, code) = error_status_code(e.code);
+            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
+            send_sign_response(stream, status, Some(&err_body));
+            InFlightOutcome {
+                status,
+                body: err_body,
+            }
+        }
+    };
+    Ok(outcome)
+}
+
+fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
+    match code {
+        ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
+        ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
+        ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
+        ErrorCode::NotFound => ("404 Not Found", "not_found"),
+        ErrorCode::Conflict => ("409 Conflict", "conflict"),
+        ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
+        _ => ("500 Internal Server Error", "internal_error"),
     }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -1805,11 +2057,221 @@ mod tests {
         let first = registry.request_budget(&token, 2).unwrap();
         let second = registry.request_budget(&token, 2).unwrap();
 
-        assert_eq!(first.claim(b"register-operation"), RequestClaim::Claimed);
-        assert_eq!(second.claim(b"register-operation"), RequestClaim::Replayed);
-        assert_eq!(second.claim(b"sign-operation"), RequestClaim::Claimed);
-        assert_eq!(first.claim(b"third-operation"), RequestClaim::Exhausted);
+        assert!(matches!(
+            first.claim(b"register-operation"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            second.claim(b"register-operation"),
+            RequestClaim::WaitFor(_)
+        ));
+        assert!(matches!(
+            second.claim(b"sign-operation"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            first.claim(b"third-operation"),
+            RequestClaim::Exhausted
+        ));
         assert!(registry.request_budget(&token, 3).is_err());
+    }
+
+    fn make_budget(max_requests: usize) -> RequestBudget {
+        RequestBudget {
+            inner: Arc::new(Mutex::new(RequestBudgetInner {
+                used: HashSet::new(),
+                in_flight: HashMap::new(),
+                completed: HashMap::new(),
+            })),
+            max_requests,
+        }
+    }
+
+    #[test]
+    fn test_claim_duplicate_in_flight_returns_wait_for() {
+        let budget = make_budget(5);
+        let body = b"identical-request-body";
+        let first = budget.claim(body);
+        assert!(matches!(first, RequestClaim::Claimed { .. }));
+        let second = budget.claim(body);
+        assert!(matches!(second, RequestClaim::WaitFor(_)));
+
+        let RequestClaim::Claimed { digest } = first else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"result".to_vec(),
+            },
+        );
+
+        let third = budget.claim(body);
+        assert!(matches!(third, RequestClaim::Cached { .. }));
+    }
+
+    #[test]
+    fn test_completed_expired_returns_replayed() {
+        let budget = make_budget(5);
+        let body = b"expired-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"ok".to_vec(),
+            },
+        );
+        {
+            let mut inner = budget.inner.lock().unwrap();
+            if let Some(completed) = inner.completed.get_mut(&digest) {
+                completed.at = Instant::now() - COMPLETED_OUTCOME_TTL - Duration::from_secs(1);
+            }
+        }
+        assert!(matches!(budget.claim(body), RequestClaim::Replayed));
+    }
+
+    #[test]
+    fn test_claim_different_bodies_both_claimed() {
+        let budget = make_budget(5);
+        assert!(matches!(
+            budget.claim(b"body-a"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            budget.claim(b"body-b"),
+            RequestClaim::Claimed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_claim_budget_exhausted() {
+        let budget = make_budget(2);
+        assert!(matches!(budget.claim(b"one"), RequestClaim::Claimed { .. }));
+        assert!(matches!(budget.claim(b"two"), RequestClaim::Claimed { .. }));
+        assert!(matches!(budget.claim(b"three"), RequestClaim::Exhausted));
+    }
+
+    #[test]
+    fn test_in_flight_waiter_receives_resolved_outcome() {
+        let budget = make_budget(5);
+        let body = b"shared-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
+            panic!("expected WaitFor");
+        };
+
+        let waiter = std::thread::spawn(move || entry.wait(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(50));
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "403 Forbidden",
+                body: b"{\"error\":\"forbidden\"}".to_vec(),
+            },
+        );
+        let outcome = waiter.join().unwrap().expect("waiter should resolve");
+        assert_eq!(outcome.status, "403 Forbidden");
+        assert_eq!(outcome.body, b"{\"error\":\"forbidden\"}");
+    }
+
+    #[test]
+    fn test_in_flight_waiter_timeout_returns_none() {
+        let budget = make_budget(5);
+        let body = b"timeout-body";
+        assert!(matches!(budget.claim(body), RequestClaim::Claimed { .. }));
+        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
+            panic!("expected WaitFor");
+        };
+        assert!(entry.wait(Duration::from_millis(50)).is_none());
+    }
+
+    #[test]
+    fn test_in_flight_guard_drop_resolves_waiters() {
+        let budget = make_budget(5);
+        let body = b"guard-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
+            panic!("expected WaitFor");
+        };
+        {
+            let mut guard = InFlightGuard::new(budget.clone(), digest);
+            drop(guard);
+        }
+        let outcome = entry
+            .wait(Duration::from_secs(5))
+            .expect("resolved by drop");
+        assert_eq!(outcome.status, "500 Internal Server Error");
+    }
+
+    #[test]
+    fn test_completed_duplicate_within_ttl_returns_cached() {
+        let budget = make_budget(5);
+        let body = b"cached-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"cached-result".to_vec(),
+            },
+        );
+        let RequestClaim::Cached { outcome } = budget.claim(body) else {
+            panic!("expected Cached");
+        };
+        assert_eq!(outcome.status, "200 OK");
+        assert_eq!(outcome.body, b"cached-result");
+    }
+
+    #[test]
+    fn test_completed_cache_does_not_consume_extra_budget() {
+        let budget = make_budget(2);
+        let body = b"budget-body";
+        let RequestClaim::Claimed { digest } = budget.claim(body) else {
+            panic!("expected Claimed");
+        };
+        budget.resolve(
+            digest,
+            InFlightOutcome {
+                status: "200 OK",
+                body: b"ok".to_vec(),
+            },
+        );
+        assert!(matches!(budget.claim(body), RequestClaim::Cached { .. }));
+        assert!(matches!(
+            budget.claim(b"other"),
+            RequestClaim::Claimed { .. }
+        ));
+        assert!(matches!(budget.claim(b"third"), RequestClaim::Exhausted));
+    }
+
+    #[test]
+    fn test_completed_cache_bounded_size() {
+        let budget = make_budget(MAX_COMPLETED_OUTCOMES + 8);
+        for i in 0..MAX_COMPLETED_OUTCOMES + 4 {
+            let body = format!("body-{}", i);
+            let RequestClaim::Claimed { digest } = budget.claim(body.as_bytes()) else {
+                panic!("expected Claimed");
+            };
+            budget.resolve(
+                digest,
+                InFlightOutcome {
+                    status: "200 OK",
+                    body: b"ok".to_vec(),
+                },
+            );
+        }
+        let used = budget.inner.lock().unwrap().completed.len();
+        assert!(used <= MAX_COMPLETED_OUTCOMES);
     }
 
     #[test]
@@ -3101,7 +3563,7 @@ mod tests {
         };
 
         use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Condvar, Mutex};
         use std::time::Duration;
 
         const FRAME_MAGIC: u32 = 0x41554449;
@@ -3975,7 +4437,7 @@ mod tests {
         }
 
         #[test]
-        fn http_replay_attack_same_challenge_is_rejected() {
+        fn http_duplicate_request_within_ttl_returns_cached_assertion() {
             let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
             let body = sign_request_body(
                 "https://example.com",
@@ -3994,12 +4456,25 @@ mod tests {
                 .get("authenticator_data_b64u")
                 .unwrap()
                 .as_str()
-                .unwrap();
-            assert_eq!(extract_counter(auth1), 1);
+                .unwrap()
+                .to_string();
+            assert_eq!(extract_counter(&auth1), 1);
 
+            // An identical request within the completed-outcome TTL returns the
+            // same cached assertion instead of being re-signed. The counter is not
+            // incremented again, so no new signature is produced (idempotent).
             let resp2 = http_request(&sock_path, &req, &body);
-            assert!(resp2.contains("409 Conflict"));
-            assert!(http_body(&resp2).contains("replayed_operation"));
+            assert!(resp2.contains("200 OK"));
+            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
+            let auth2 = parsed2
+                .get("sign_assertion_result")
+                .unwrap()
+                .get("authenticator_data_b64u")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            assert_eq!(auth2, auth1);
+            assert_eq!(extract_counter(auth2), 1);
 
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();

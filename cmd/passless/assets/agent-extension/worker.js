@@ -13,6 +13,12 @@
   var MAX_ALGORITHMS = 16;
 
   var NATIVE_HOST = "rs.passless.sign_proxy";
+  var MAX_COMPLETED_REQUESTS = 128;
+  var scope = typeof globalThis !== "undefined" ? globalThis : (typeof self !== "undefined" ? self : this);
+  if (!scope.__passlessPendingRequests) scope.__passlessPendingRequests = new Map();
+  if (!scope.__passlessCompletedRequests) scope.__passlessCompletedRequests = new Map();
+  var pendingRequests = scope.__passlessPendingRequests;
+  var completedRequests = scope.__passlessCompletedRequests;
 
   function parseHttpsOrigin(url) {
     if (typeof url !== "string") return null;
@@ -73,7 +79,21 @@
     return typeof req.user_verification === "boolean";
   }
 
-  function daemonRequest(path, request, sendResponse, responseField, type) {
+  function rememberCompletedRequest(requestId, response) {
+    completedRequests.set(requestId, response);
+    if (completedRequests.size > MAX_COMPLETED_REQUESTS) {
+      completedRequests.delete(completedRequests.keys().next().value);
+    }
+  }
+
+  function completeRequest(requestId, response) {
+    var callbacks = pendingRequests.get(requestId) || [];
+    pendingRequests.delete(requestId);
+    rememberCompletedRequest(requestId, response);
+    for (var i = 0; i < callbacks.length; i++) callbacks[i](response);
+  }
+
+  function daemonRequest(requestId, path, request, sendResponse, responseField, type) {
     var body;
     try {
       body = JSON.stringify(request);
@@ -86,6 +106,16 @@
       return false;
     }
 
+    if (completedRequests.has(requestId)) {
+      sendResponse(completedRequests.get(requestId));
+      return false;
+    }
+    if (pendingRequests.has(requestId)) {
+      pendingRequests.get(requestId).push(sendResponse);
+      return true;
+    }
+    pendingRequests.set(requestId, [sendResponse]);
+
     var message = {
       path: path,
       bearer: bearer,
@@ -95,15 +125,15 @@
 
     chrome.runtime.sendNativeMessage(NATIVE_HOST, message, function(response) {
       if (chrome.runtime.lastError) {
-        sendResponse({ ok: false, type: type, error: "transport_error" });
+        completeRequest(requestId, { ok: false, type: type, error: "transport_error" });
         return;
       }
       if (!response || typeof response !== "object") {
-        sendResponse({ ok: false, type: type, error: "invalid_daemon_response" });
+        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
         return;
       }
       if (response.error) {
-        sendResponse({
+        completeRequest(requestId, {
           ok: false,
           type: type,
           error: response.error,
@@ -115,20 +145,20 @@
       try {
         payload = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
       } catch (error) {
-        sendResponse({ ok: false, type: type, error: "invalid_daemon_response" });
+        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
         return;
       }
       if (!payload || typeof payload !== "object" || !payload[responseField]) {
-        sendResponse({ ok: false, type: type, error: "invalid_daemon_response" });
+        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
         return;
       }
-      sendResponse({ ok: true, response: payload[responseField], type: type });
+      completeRequest(requestId, { ok: true, response: payload[responseField], type: type });
     });
     return true;
   }
 
-  function handleGetRequest(req, origins, sendResponse) {
-    return daemonRequest("/sign", {
+  function handleGetRequest(requestId, req, origins, sendResponse) {
+    return daemonRequest(requestId, "/sign", {
       origin: origins.origin,
       top_origin: origins.top_origin,
       rp_id: req.rp_id,
@@ -139,8 +169,8 @@
     }, sendResponse, "sign_assertion_result", "get");
   }
 
-  function handleCreateRequest(req, origins, sendResponse) {
-    return daemonRequest("/register", {
+  function handleCreateRequest(requestId, req, origins, sendResponse) {
+    return daemonRequest(requestId, "/register", {
       origin: origins.origin,
       top_origin: origins.top_origin,
       rp_id: req.rp_id,
@@ -170,6 +200,11 @@
       return false;
     }
 
+    if (typeof message.request_id !== "string" || message.request_id.length === 0 || message.request_id.length > 128) {
+      sendResponse({ ok: false, error: "invalid_request" });
+      return false;
+    }
+
     var req = message.request;
     var messageType = message.type === "create" ? "create" : "get";
     if (messageType === "create") {
@@ -177,13 +212,13 @@
         sendResponse({ ok: false, type: "create", error: "invalid_request" });
         return false;
       }
-      return handleCreateRequest(req, origins, sendResponse);
+      return handleCreateRequest(message.request_id, req, origins, sendResponse);
     }
 
     if (!validateGetRequest(req)) {
       sendResponse({ ok: false, type: "get", error: "invalid_request" });
       return false;
     }
-    return handleGetRequest(req, origins, sendResponse);
+    return handleGetRequest(message.request_id, req, origins, sendResponse);
   });
 })(__PASSLESS_SOCKET_PATH__, __PASSLESS_BEARER__);
