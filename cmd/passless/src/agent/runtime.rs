@@ -1844,6 +1844,15 @@ impl AgentRuntime {
                             active.retain(|_, lease| lease.lease_id != info.lease_id);
                             cleared |= active.len() != before;
                         }
+                        {
+                            let mut shared = profile.shared_browsers.lock().unwrap();
+                            if let Some(lease) = shared.get(&profile.profile_id)
+                                && lease.lease_id == info.lease_id
+                            {
+                                shared.remove(&profile.profile_id);
+                                cleared = true;
+                            }
+                        }
                         if cleared {
                             let cleanup_result = browser_mgr.cleanup(&info.lease_id);
                             let _ = self.audit_gate.record(
@@ -1920,6 +1929,15 @@ impl AgentRuntime {
                             let before = active.len();
                             active.retain(|_, lease| lease.lease_id != *lease_id);
                             cleared |= active.len() != before;
+                        }
+                        {
+                            let mut shared = profile.shared_browsers.lock().unwrap();
+                            if let Some(lease) = shared.get(&profile.profile_id)
+                                && lease.lease_id == *lease_id
+                            {
+                                shared.remove(&profile.profile_id);
+                                cleared = true;
+                            }
                         }
                         if cleared {
                             let cleanup_result = browser_mgr.cleanup(lease_id);
@@ -5090,6 +5108,7 @@ impl AgentRuntime {
                 .browser_cdp_expose
                 .unwrap_or(CdpExposeMode::Pipe),
             cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
+            bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
         };
 
         let mut browser_manager = self.browser_manager.lock().map_err(|_| {
@@ -6667,6 +6686,67 @@ mod tests {
         );
         let removed = cleanup_all_shared_for_profile(&mut shared, &profile_id);
         assert_eq!(removed, Some(lease_id));
+        assert!(!shared.contains_key(&profile_id));
+    }
+
+    #[test]
+    fn test_shared_browser_stale_exit_cleanup_matches_lease_id() {
+        let profile_id = ProfileId::new("test-stale-exit").unwrap();
+        let old_lease_id = BrowserLeaseId::new();
+        let new_lease_id = BrowserLeaseId::new();
+
+        let mut shared = std::collections::HashMap::new();
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: new_lease_id.clone(),
+                ref_count: 1,
+                attached_sessions: std::collections::HashSet::new(),
+            },
+        );
+
+        let stale_exit_lease_id = old_lease_id.clone();
+        let mut cleared = false;
+        if let Some(lease) = shared.get(&profile_id)
+            && lease.lease_id == stale_exit_lease_id
+        {
+            shared.remove(&profile_id);
+            cleared = true;
+        }
+
+        assert!(!cleared, "stale exit should not remove replacement lease");
+        assert!(
+            shared.contains_key(&profile_id),
+            "replacement lease should survive"
+        );
+        assert_eq!(shared[&profile_id].lease_id, new_lease_id);
+    }
+
+    #[test]
+    fn test_shared_browser_stale_exit_cleanup_removes_matching() {
+        let profile_id = ProfileId::new("test-stale-match").unwrap();
+        let lease_id = BrowserLeaseId::new();
+
+        let mut shared = std::collections::HashMap::new();
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: lease_id.clone(),
+                ref_count: 1,
+                attached_sessions: std::collections::HashSet::new(),
+            },
+        );
+
+        let exit_lease_id = lease_id.clone();
+        let mut cleared = false;
+        if let Some(lease) = shared.get(&profile_id)
+            && lease.lease_id == exit_lease_id
+        {
+            shared.remove(&profile_id);
+            cleared = true;
+        }
+
+        assert!(cleared, "matching lease should be removed on exit");
         assert!(!shared.contains_key(&profile_id));
     }
 }

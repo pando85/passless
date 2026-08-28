@@ -653,6 +653,7 @@ pub struct HardenedChildSetup {
     pub rlimit_nproc: u64,
     pub rlimit_core: u64,
     pub rlimit_as: u64,
+    pub bind_parent_death: bool,
 }
 
 impl HardenedChildSetup {
@@ -696,7 +697,9 @@ impl HardenedChildSetup {
             return Err(io::Error::last_os_error());
         }
 
-        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } < 0 {
+        if self.bind_parent_death
+            && unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } < 0
+        {
             return Err(io::Error::last_os_error());
         }
 
@@ -925,6 +928,7 @@ impl SpawnConfig {
             rlimit_nproc: self.rlimit_nproc,
             rlimit_core: self.rlimit_core,
             rlimit_as: self.rlimit_as,
+            bind_parent_death: true,
         }
     }
 }
@@ -2266,6 +2270,7 @@ mod tests {
             rlimit_nproc: DEFAULT_RLIMIT_NPROC,
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
         };
         let err = setup.validate().unwrap_err();
         assert!(matches!(err, LauncherError::SameUserFallback));
@@ -2282,6 +2287,7 @@ mod tests {
             rlimit_nproc: DEFAULT_RLIMIT_NPROC,
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
         };
         let err = setup.validate().unwrap_err();
         assert!(matches!(err, LauncherError::IdentityMismatch { .. }));
@@ -2299,6 +2305,7 @@ mod tests {
             rlimit_nproc: DEFAULT_RLIMIT_NPROC,
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
         };
         let err = setup.validate().unwrap_err();
         assert!(matches!(err, LauncherError::PrivilegeInsufficient { .. }));
@@ -2315,6 +2322,7 @@ mod tests {
             rlimit_nproc: DEFAULT_RLIMIT_NPROC,
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
         };
         assert!(setup.validate().is_ok());
     }
