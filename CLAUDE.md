@@ -358,6 +358,7 @@ This project uses **Conventional Commits** enforced by commitlint.
   - `test`: Adding or updating tests
   - `chore`: Maintenance tasks
   - `build`: Build system changes
+  - `ci`: CI/CD pipeline changes
   - `revert`: Reverting a previous commit
   - `release`: Release-related commits
 
