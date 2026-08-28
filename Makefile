@@ -164,14 +164,14 @@ install-sysusers:	## install sysusers configuration (requires sudo)
 .PHONY: uninstall-sysusers
 uninstall-sysusers:	## uninstall sysusers configuration (requires sudo)
 	@echo "Removing sysusers configuration (requires sudo)..."
-	@sudo rm -f /etc/udev/rules.d/90-passless.rules
+	@sudo rm -f /usr/lib/sysusers.d/passless.conf
 	@echo "Sysusers configuration removed."
 	@echo "Note: The 'fido' group still exists and must be removed manually if desired."
 
 .PHONY: install-modules
 install-modules:	## install modules-load configuration (requires sudo)
 	@echo "Installing modules-load configuration (requires sudo)..."
-	@sudo cp contrib/modules-load.d/fido.conf /usr/lib/modules-load.d/fido.conf
+	@sudo cp contrib/modules-load.d/fido.conf /etc/modules-load.d/
 	@echo "Modules-load configuration installed."
 
 .PHONY: uninstall-modules
