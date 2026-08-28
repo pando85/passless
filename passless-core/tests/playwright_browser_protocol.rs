@@ -53,6 +53,7 @@ mod tests {
                 "ws://127.0.0.1:43871/devtools/browser/00000000-0000-0000-0000-000000000000"
                     .to_string(),
             ),
+            shared_browser_context: None,
         });
 
         let json = serde_json::to_string(&response).unwrap();

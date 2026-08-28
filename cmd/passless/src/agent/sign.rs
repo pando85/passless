@@ -2856,7 +2856,7 @@ mod tests {
         use crate::storage::{CredentialFilter, CredentialStorage};
         use passless_core::agent::{
             AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+            AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
         };
         use passless_core::config::SecurityConfig;
         use soft_fido2::{
@@ -3087,6 +3087,7 @@ mod tests {
                 let profile_config = AgentProfileConfig {
                     max_operations: 64,
                     max_concurrent_sessions: 1,
+                    browser_scope: BrowserScope::Session,
                     credential_selection: passless_core::agent::config::CredentialSelection::Single,
                     human_verification_prompt:
                         passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -3554,7 +3555,7 @@ mod tests {
 
         use passless_core::agent::{
             AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+            AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
         };
         use passless_core::config::SecurityConfig;
 
@@ -3689,6 +3690,7 @@ mod tests {
                 let profile_config = AgentProfileConfig {
                     max_operations: 64,
                     max_concurrent_sessions: 1,
+                    browser_scope: BrowserScope::Session,
                     credential_selection: passless_core::agent::config::CredentialSelection::Single,
                     human_verification_prompt:
                         passless_core::agent::config::HumanVerificationPrompt::Always,

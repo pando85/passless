@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use passless_core::agent::{
-    AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration,
+    AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration, BrowserScope,
     DeviceIdentity, validate_rp_id,
 };
 
@@ -23,6 +23,7 @@ fn isolated_profile() -> AgentProfileConfig {
     AgentProfileConfig {
         max_operations: 64,
         max_concurrent_sessions: 1,
+        browser_scope: BrowserScope::Session,
         credential_selection: passless_core::agent::config::CredentialSelection::Single,
         human_verification_prompt: passless_core::agent::config::HumanVerificationPrompt::Always,
         mode: AgentMode::Isolated,

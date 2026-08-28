@@ -2285,7 +2285,7 @@ mod tests {
     use super::*;
     use passless_core::agent::{
         AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-        AgentRpRule, AgentStorageConfig, CredentialRef, DeviceIdentity, ProfileId,
+        AgentRpRule, AgentStorageConfig, BrowserScope, CredentialRef, DeviceIdentity, ProfileId,
         UserPresenceSource, UserVerificationSource,
     };
     use std::collections::BTreeMap;
@@ -2365,6 +2365,7 @@ mod tests {
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: passless_core::agent::config::CredentialSelection::Single,
                 human_verification_prompt:
                     passless_core::agent::config::HumanVerificationPrompt::Always,
