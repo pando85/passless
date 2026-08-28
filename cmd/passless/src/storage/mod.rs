@@ -37,6 +37,14 @@ pub enum CredentialFilter {
     ByHash([u8; 32]),
 }
 
+/// Relying-party metadata that can be discovered without loading secret credential data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelyingPartyMetadata {
+    pub id: String,
+    pub name: Option<String>,
+    pub credential_count: usize,
+}
+
 /// Trait defining the storage interface for credentials
 ///
 /// Any storage backend must implement this trait.
@@ -55,6 +63,41 @@ pub trait CredentialStorage: Send + Sync {
 
     /// Delete a credential by ID
     fn delete(&mut self, id: &[u8]) -> Result<()>;
+
+    /// Enumerate relying parties.
+    ///
+    /// Backends with an index should override this method so discovery does not
+    /// require loading or decrypting every credential. The compatibility default
+    /// preserves the historical behavior for backends without metadata indexes.
+    fn list_relying_parties(&mut self) -> Result<Vec<RelyingPartyMetadata>> {
+        let mut credentials = Vec::new();
+        if let Ok(first) = self.read_first(CredentialFilter::None) {
+            credentials.push(first);
+            while let Ok(credential) = self.read_next() {
+                credentials.push(credential);
+            }
+        }
+
+        let mut by_rp: std::collections::HashMap<String, (Option<String>, usize)> =
+            std::collections::HashMap::new();
+        for credential in credentials {
+            let entry = by_rp
+                .entry(credential.rp.id.clone())
+                .or_insert((credential.rp.name.clone(), 0));
+            entry.1 += 1;
+        }
+
+        let mut result: Vec<_> = by_rp
+            .into_iter()
+            .map(|(id, (name, credential_count))| RelyingPartyMetadata {
+                id,
+                name,
+                credential_count,
+            })
+            .collect();
+        result.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(result)
+    }
 
     /// Count total number of stored credentials
     fn count_credentials(&self) -> usize;
@@ -117,6 +160,10 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn delete(&mut self, id: &[u8]) -> Result<()> {
         (**self).delete(id)
+    }
+
+    fn list_relying_parties(&mut self) -> Result<Vec<RelyingPartyMetadata>> {
+        (**self).list_relying_parties()
     }
 
     fn count_credentials(&self) -> usize {

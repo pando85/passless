@@ -1,7 +1,7 @@
 use crate::storage::index::load_credential_paths;
 use crate::storage::pass::sync::PassGitSync;
 use crate::storage::pass::{GpgBackend, PassStorageAdapter as InnerPassStorageAdapter};
-use crate::storage::{CredentialFilter, CredentialStorage};
+use crate::storage::{CredentialFilter, CredentialStorage, RelyingPartyMetadata};
 use git2::{Oid, Repository};
 use log::{debug, warn};
 use passless_core::error::Result;
@@ -221,6 +221,12 @@ impl CredentialStorage for PassStorageAdapter {
         self.sync.end_operation();
         self.record_current_generation();
         Ok(())
+    }
+
+    fn list_relying_parties(&mut self) -> soft_fido2::Result<Vec<RelyingPartyMetadata>> {
+        self.refresh_if_repository_changed()
+            .map_err(soft_fido2::Error::from)?;
+        self.inner.list_relying_parties()
     }
 
     fn count_credentials(&self) -> usize {

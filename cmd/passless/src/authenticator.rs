@@ -549,30 +549,10 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         };
 
-        let filter = CredentialFilter::None;
-        let mut all_credentials = Vec::new();
-
-        if let Ok(first_cred) = storage.read_first(filter) {
-            all_credentials.push(first_cred);
-
-            while let Ok(cred) = storage.read_next() {
-                all_credentials.push(cred);
-            }
-        }
-
-        use std::collections::HashMap;
-        let mut rp_map: HashMap<String, (Option<String>, usize)> = HashMap::new();
-
-        for cred in all_credentials {
-            let entry = rp_map
-                .entry(cred.rp.id.clone())
-                .or_insert((cred.rp.name.clone(), 0));
-            entry.1 += 1;
-        }
-
-        let result: Vec<(String, Option<String>, usize)> = rp_map
+        let result: Vec<_> = storage
+            .list_relying_parties()?
             .into_iter()
-            .map(|(rp_id, (rp_name, count))| (rp_id, rp_name, count))
+            .map(|metadata| (metadata.id, metadata.name, metadata.credential_count))
             .collect();
 
         debug!("Found {} relying parties", result.len());

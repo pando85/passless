@@ -10,18 +10,22 @@ use crate::storage::index::{
     load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
 };
 use crate::storage::rp_id::validate_rp_id_for_storage;
-use crate::storage::{CredentialFilter, CredentialStorage};
+use crate::storage::{CredentialFilter, CredentialStorage, RelyingPartyMetadata};
 use crate::util::{bytes_to_hex, create_secure_dir_all};
 use passless_core::error::{Error, Result};
 
+use std::collections::HashMap;
 use std::fmt::Display;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use core::fmt;
 use log::{debug, error, info, warn};
 use prs_lib::crypto::IsContext;
 use prs_lib::{Ciphertext, Plaintext, Store};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 /// Pass (password-store) storage adapter
@@ -36,6 +40,20 @@ pub struct PassStorageAdapter {
     cache: CredentialCache,
     iteration_index: usize,
     iteration_entries: Vec<PathBuf>,
+    // Runtime-only hint telling GnuPG which secret key successfully decrypted
+    // credentials under an effective .gpg-id policy. Never persisted.
+    decryption_affinity: HashMap<GpgRecipientPolicyId, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GpgRecipientPolicyId {
+    path: PathBuf,
+    content_digest: [u8; 32],
+}
+
+struct GpgDecryptOutput {
+    plaintext: Zeroizing<Vec<u8>>,
+    decryption_key: Option<String>,
 }
 
 /// GPG backend selection for encryption/decryption
@@ -140,6 +158,7 @@ impl PassStorageAdapter {
             cache: Default::default(),
             iteration_index: Default::default(),
             iteration_entries: Default::default(),
+            decryption_affinity: HashMap::new(),
         };
 
         // Load indexes by scanning directory structure (no decryption!)
@@ -196,6 +215,66 @@ impl PassStorageAdapter {
         })
     }
 
+    fn recipient_policy_id_for_target(&self, target: &Path) -> Result<GpgRecipientPolicyId> {
+        let (path, content) = self.find_nearest_gpg_id(target)?;
+        let content_digest: [u8; 32] = Sha256::digest(content.as_bytes()).into();
+        Ok(GpgRecipientPolicyId {
+            path,
+            content_digest,
+        })
+    }
+
+    fn remember_decryption_key(&mut self, policy: GpgRecipientPolicyId, key: String) {
+        // Bound stale policy entries when the same .gpg-id file changes.
+        self.decryption_affinity
+            .retain(|existing, _| existing.path != policy.path || existing == &policy);
+        self.decryption_affinity.insert(policy, key);
+    }
+
+    fn decrypt_gnupg_with_affinity_using(
+        &mut self,
+        target: &Path,
+        ciphertext: &[u8],
+        binary: &Path,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        // Missing .gpg-id must not make an already-encrypted credential unreadable;
+        // it only disables the optimization for that read.
+        let policy = self.recipient_policy_id_for_target(target).ok();
+        let preferred = policy
+            .as_ref()
+            .and_then(|policy| self.decryption_affinity.get(policy))
+            .cloned();
+
+        let first = decrypt_with_gnupg_binary(binary, ciphertext, preferred.as_deref());
+        let output = match first {
+            Ok(output) => output,
+            Err(error) if preferred.is_some() => {
+                debug!(
+                    "Preferred GPG decryption key failed; retrying normal selection: {:?}",
+                    error
+                );
+                if let Some(policy) = &policy {
+                    self.decryption_affinity.remove(policy);
+                }
+                decrypt_with_gnupg_binary(binary, ciphertext, None)?
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let (Some(policy), Some(key)) = (policy, output.decryption_key.clone()) {
+            self.remember_decryption_key(policy, key);
+        }
+        Ok(output.plaintext)
+    }
+
+    fn decrypt_gnupg_with_affinity(
+        &mut self,
+        target: &Path,
+        ciphertext: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.decrypt_gnupg_with_affinity_using(target, ciphertext, Path::new("gpg"))
+    }
+
     /// Read a credential from a specific file path
     /// Uses time-limited cache to avoid redundant GPG decryption
     fn read_credential_from_path(&mut self, path: &Path) -> Result<soft_fido2::Credential> {
@@ -225,20 +304,23 @@ impl PassStorageAdapter {
             Error::Storage(format!("Failed to read file: {}", e))
         })?;
 
-        // Create crypto context
-        let mut context = self.create_crypto_context()?;
-
-        // Decrypt the data
-        let ciphertext = Ciphertext::from(encrypted_data);
-        let plaintext = context.decrypt(ciphertext).map_err(|e| {
-            error!("Failed to decrypt credential: {:?}", e);
-            Error::Storage(format!("Failed to decrypt credential: {:?}", e))
-        })?;
+        let plaintext = match self.gpg_backend {
+            GpgBackend::GnupgBin => self.decrypt_gnupg_with_affinity(path, &encrypted_data)?,
+            GpgBackend::Gpgme => {
+                let mut context = self.create_crypto_context()?;
+                let ciphertext = Ciphertext::from(encrypted_data);
+                let plaintext = context.decrypt(ciphertext).map_err(|e| {
+                    error!("Failed to decrypt credential: {:?}", e);
+                    Error::Storage(format!("Failed to decrypt credential: {:?}", e))
+                })?;
+                Zeroizing::new(plaintext.unsecure_ref().to_vec())
+            }
+        };
 
         debug!("Successfully decrypted credential");
 
         // Parse credential from decrypted bytes
-        let credential: soft_fido2::Credential = Credential::from_bytes(plaintext.unsecure_ref())
+        let credential: soft_fido2::Credential = Credential::from_bytes(plaintext.as_slice())
             .map(|cred| cred.to_soft_fido2())
             .map_err(|e| {
                 error!("Failed to parse credential from {:?}: {:?}", path, e);
@@ -532,6 +614,63 @@ impl PassStorageAdapter {
     }
 }
 
+fn decrypt_with_gnupg_binary(
+    binary: &Path,
+    ciphertext: &[u8],
+    preferred_secret_key: Option<&str>,
+) -> Result<GpgDecryptOutput> {
+    let mut command = Command::new(binary);
+    command.arg("--quiet").arg("--status-fd").arg("2");
+    if let Some(key) = preferred_secret_key {
+        command.arg("--try-secret-key").arg(key);
+    }
+    command
+        .arg("--decrypt")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| {
+        Error::Storage(format!("Failed to invoke GPG for decryption: {}", error))
+    })?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Storage("Failed to open GPG stdin for decryption".to_string()))?;
+        stdin.write_all(ciphertext).map_err(|error| {
+            Error::Storage(format!("Failed to write ciphertext to GPG: {}", error))
+        })?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| Error::Storage(format!("Failed to wait for GPG decryption: {}", error)))?;
+    let status = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        debug!("GPG decryption failed: {}", status.trim());
+        return Err(Error::Storage(format!(
+            "GPG decryption failed with status {}",
+            output.status
+        )));
+    }
+
+    Ok(GpgDecryptOutput {
+        plaintext: Zeroizing::new(output.stdout),
+        decryption_key: parse_gpg_decryption_key(&status),
+    })
+}
+
+fn parse_gpg_decryption_key(status: &str) -> Option<String> {
+    status.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("[GNUPG:]") || fields.next() != Some("DECRYPTION_KEY") {
+            return None;
+        }
+        fields.next().map(str::to_owned)
+    })
+}
+
 /// Extract GPG public-key-encrypted session key IDs from an OpenPGP file by
 /// running `gpg --list-packets --verbose`.
 #[allow(dead_code)]
@@ -668,6 +807,24 @@ impl CredentialStorage for PassStorageAdapter {
         self.delete_credential(id).map_err(Into::into)
     }
 
+    fn list_relying_parties(&mut self) -> soft_fido2::Result<Vec<RelyingPartyMetadata>> {
+        self.cache.evict_expired();
+        let mut result: Vec<_> = self
+            .indexes
+            .rp
+            .iter()
+            .map(|(id, credential_ids)| RelyingPartyMetadata {
+                id: id.clone(),
+                // RP display name is encrypted credential data. Do not decrypt secrets
+                // merely to provide an optional cosmetic field during discovery.
+                name: None,
+                credential_count: credential_ids.len(),
+            })
+            .collect();
+        result.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(result)
+    }
+
     fn count_credentials(&self) -> usize {
         let count = self.indexes.id.len();
         debug!("count_credentials: {}", count);
@@ -703,7 +860,179 @@ mod tests {
             cache: CredentialCache::new(),
             iteration_index: 0,
             iteration_entries: vec![],
+            decryption_affinity: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn metadata_enumeration_uses_path_index_without_decryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fido2 = root.join("fido2");
+        let first_rp = fido2.join("example.com");
+        let second_rp = fido2.join("example.org");
+        fs::create_dir_all(&first_rp).unwrap();
+        fs::create_dir_all(&second_rp).unwrap();
+        // Deliberately invalid ciphertext: this test can only pass if listing
+        // uses path metadata and never attempts GPG decryption.
+        fs::write(first_rp.join("aa.gpg"), b"not gpg").unwrap();
+        fs::write(first_rp.join("bb.gpg"), b"not gpg").unwrap();
+        fs::write(second_rp.join("cc.gpg"), b"not gpg").unwrap();
+
+        let mut adapter = create_adapter(root);
+        adapter.indexes = load_credential_paths(&fido2, "gpg").unwrap();
+        let metadata = adapter.list_relying_parties().unwrap();
+
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].id, "example.com");
+        assert_eq!(metadata[0].name, None);
+        assert_eq!(metadata[0].credential_count, 2);
+        assert_eq!(metadata[1].id, "example.org");
+        assert_eq!(metadata[1].credential_count, 1);
+    }
+
+    #[test]
+    fn parses_gnupg_decryption_key_status() {
+        let fingerprint = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let status = format!("noise\n[GNUPG:] DECRYPTION_KEY {fingerprint} {fingerprint} -\n");
+        assert_eq!(
+            parse_gpg_decryption_key(&status).as_deref(),
+            Some(fingerprint)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gnupg_affinity_reuses_successful_key_for_same_recipient_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const KEY2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target_dir = root.join("fido2/example.com");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(
+            root.join(".gpg-id"),
+            format!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n{KEY2}\n"),
+        )
+        .unwrap();
+
+        let log = dir.path().join("gpg.log");
+        let fake_gpg = dir.path().join("fake-gpg");
+        let script = format!(
+            r#"#!/bin/sh
+preferred=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--try-secret-key" ]; then
+    shift
+    preferred="$1"
+  fi
+  shift
+done
+cat >/dev/null
+if [ -z "$preferred" ]; then
+  echo normal >> '{log}'
+  echo '[GNUPG:] DECRYPTION_KEY {key} {key} -' >&2
+  printf plaintext
+  exit 0
+fi
+echo "preferred:$preferred" >> '{log}'
+if [ "$preferred" = "{key}" ]; then
+  echo '[GNUPG:] DECRYPTION_KEY {key} {key} -' >&2
+  printf plaintext
+  exit 0
+fi
+exit 2
+"#,
+            log = log.display(),
+            key = KEY2,
+        );
+        fs::write(&fake_gpg, script).unwrap();
+        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_gpg, permissions).unwrap();
+
+        let target = target_dir.join("aa.gpg");
+        let mut adapter = create_adapter(root);
+        assert_eq!(
+            adapter
+                .decrypt_gnupg_with_affinity_using(&target, b"ciphertext", &fake_gpg)
+                .unwrap()
+                .as_slice(),
+            b"plaintext"
+        );
+        assert_eq!(
+            adapter
+                .decrypt_gnupg_with_affinity_using(&target, b"ciphertext", &fake_gpg)
+                .unwrap()
+                .as_slice(),
+            b"plaintext"
+        );
+
+        let calls: Vec<_> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            calls,
+            vec!["normal".to_string(), format!("preferred:{KEY2}")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gnupg_affinity_is_invalidated_when_gpg_id_policy_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const KEY2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target_dir = root.join("fido2/example.com");
+        fs::create_dir_all(&target_dir).unwrap();
+        let policy_path = root.join(".gpg-id");
+        fs::write(&policy_path, format!("{KEY2}\n")).unwrap();
+
+        let log = dir.path().join("gpg-policy.log");
+        let fake_gpg = dir.path().join("fake-gpg-policy");
+        let script = format!(
+            r#"#!/bin/sh
+preferred=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--try-secret-key" ]; then shift; preferred="$1"; fi
+  shift
+done
+cat >/dev/null
+if [ -z "$preferred" ]; then echo normal >> '{log}'; else echo "preferred:$preferred" >> '{log}'; fi
+echo '[GNUPG:] DECRYPTION_KEY {key} {key} -' >&2
+printf plaintext
+"#,
+            log = log.display(),
+            key = KEY2,
+        );
+        fs::write(&fake_gpg, script).unwrap();
+        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_gpg, permissions).unwrap();
+
+        let target = target_dir.join("aa.gpg");
+        let mut adapter = create_adapter(root);
+        adapter
+            .decrypt_gnupg_with_affinity_using(&target, b"ciphertext", &fake_gpg)
+            .unwrap();
+        // The effective policy identity includes .gpg-id contents; changing it
+        // forces normal key selection again rather than trusting stale affinity.
+        fs::write(&policy_path, format!("# rotated policy\n{KEY2}\n")).unwrap();
+        adapter
+            .decrypt_gnupg_with_affinity_using(&target, b"ciphertext", &fake_gpg)
+            .unwrap();
+
+        let calls: Vec<_> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(calls, vec!["normal".to_string(), "normal".to_string()]);
     }
 
     // ── parse_gpg_id_content ─────────────────────────────────────────────
