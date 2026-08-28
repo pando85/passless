@@ -6,6 +6,7 @@ repos:
       - id: check-executables-have-shebangs
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
+        exclude: ^fuzz/fuzz_targets/
       - id: detect-private-key
       - id: end-of-file-fixer
       - id: mixed-line-ending
