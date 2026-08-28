@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.0](https://github.com/pando85/passless/tree/v0.19.0) - 2026-08-28
+
+### Added
+
+- Allow profile-scoped shared browser with fixed CDP port and unlimited sessions ([b1bcad2](https://github.com/pando85/passless/commit/b1bcad2bf39735d47185bb0d0eb8bdfc33f91fbd))
+
+### Fixed
+
+- pass: Avoid repeated decryption and GPG key prompts (#454) ([a693a4d](https://github.com/pando85/passless/commit/a693a4d787ead3f4168a79b05abe01e3e5bc1d04))
+- WebAuthn sign hardening — TOCTOU, Unix socket server, replay dedup, same-user batch (#450) ([d371a21](https://github.com/pando85/passless/commit/d371a21399be5aae483c9c686c464cffb86d4e2b))
+- Increase default max_concurrent_sessions to maximum (#451) ([15564a0](https://github.com/pando85/passless/commit/15564a0c227e92b17ac17261c95f49abff2bd834))
+- Shared browser correctness and maintainability improvements ([0e6f542](https://github.com/pando85/passless/commit/0e6f542337afefa96b779cd0b7890372b2ca2e92))
+- Keep profile-scoped browser alive for playwright MCP ([385bc1a](https://github.com/pando85/passless/commit/385bc1a12a03c39dedd823f8c17f77fbad164289))
+- Launch playwright MCP browser lazily on first CDP connection ([9edaf0c](https://github.com/pando85/passless/commit/9edaf0cdf90b6752f73717018b0e81893913876e))
+
+### Build
+
+- deps: Update Rust crate aes to v0.9.3 (#455) ([770dac7](https://github.com/pando85/passless/commit/770dac7d80fd58a4b7e124e8ac57d3748ad2b53e))
+
 ## [v0.18.1](https://github.com/pando85/passless/tree/v0.18.1) - 2026-08-26
 
 ### Fixed
