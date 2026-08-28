@@ -1,8 +1,11 @@
+use std::fs::File;
+use std::io::BufReader;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
 use passless_core::agent::protocol::{PrincipalRequest, PrincipalResponse};
+use passless_core::agent::{AgentConfig, BrowserScope};
 use passless_core::{Error, Result};
 
 use crate::agent::cdp_bootstrap::CdpBootstrap;
@@ -46,8 +49,7 @@ fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Re
         .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))?;
     let profile_owned = profile.to_string();
     let start_url = url.map(ToOwned::to_owned);
-    let (_, shared_browser) =
-        ensure_browser(&profile_owned, start_url.as_deref()).map_err(Error::Other)?;
+    let shared_browser = profile_uses_shared_browser(profile);
     let profile_for_bootstrap = profile_owned.clone();
     let bootstrap = CdpBootstrap::start(token.clone(), move || {
         let (endpoint, _) = ensure_browser(&profile_for_bootstrap, start_url.as_deref())?;
@@ -134,6 +136,32 @@ fn ensure_browser(
         }
         _ => Err("agent returned an unexpected EnsureBrowser response".to_string()),
     }
+}
+
+fn profile_uses_shared_browser(profile: &str) -> bool {
+    load_agent_config()
+        .and_then(|config| config.get_profile(profile).cloned())
+        .is_some_and(|p| p.browser_scope == BrowserScope::Profile)
+}
+
+fn load_agent_config() -> Option<AgentConfig> {
+    let config_path = std::env::var("PASSLESS_CONFIG")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::config_dir().map(|p| p.join("passless/config.toml")))?;
+
+    if !config_path.exists() {
+        return None;
+    }
+
+    let file = File::open(&config_path).ok()?;
+    let reader = BufReader::new(file);
+    let content = std::io::read_to_string(reader).ok()?;
+    let table: toml::Table = toml::from_str(&content).ok()?;
+
+    table
+        .get("agents")
+        .and_then(|v| serde::Deserialize::deserialize(v.clone()).ok())
 }
 
 fn client_error(error: ClientError) -> Error {
