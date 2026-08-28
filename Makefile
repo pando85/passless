@@ -2,6 +2,7 @@ CARGO_TARGET_DIR ?= target
 CARGO_TARGET ?= x86_64-unknown-linux-gnu
 PKG_BASE_NAME ?= passless-${CARGO_TARGET}
 PROJECT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | head -n1)
+AGENT_FUZZ_SMOKE_SECS ?= 10
 
 .DEFAULT: help
 .PHONY: help
@@ -72,6 +73,11 @@ test-e2e-tpm:	## run E2E tests for TPM backend only (requires swtpm)
 .PHONY: test-agent-validation
 test-agent-validation:	## run deterministic agent validation (no privileged or live browser changes)
 	tools/agent-validation/test-deterministic.sh
+
+.PHONY: test-agent-fuzz-smoke
+test-agent-fuzz-smoke:	## run bounded agent protocol fuzz smoke tests (requires cargo-fuzz + nightly)
+	cargo +nightly fuzz run agent_protocol_decode -- -max_total_time=$(AGENT_FUZZ_SMOKE_SECS) -max_len=20000
+	cargo +nightly fuzz run agent_request_validation -- -max_total_time=$(AGENT_FUZZ_SMOKE_SECS) -max_len=20000
 
 .PHONY: update-changelog
 update-changelog:	## automatically update changelog based on commits
@@ -158,14 +164,14 @@ install-sysusers:	## install sysusers configuration (requires sudo)
 .PHONY: uninstall-sysusers
 uninstall-sysusers:	## uninstall sysusers configuration (requires sudo)
 	@echo "Removing sysusers configuration (requires sudo)..."
-	@sudo rm -f /usr/lib/sysusers.d/passless.conf
+	@sudo rm -f /etc/udev/rules.d/90-passless.rules
 	@echo "Sysusers configuration removed."
 	@echo "Note: The 'fido' group still exists and must be removed manually if desired."
 
 .PHONY: install-modules
 install-modules:	## install modules-load configuration (requires sudo)
 	@echo "Installing modules-load configuration (requires sudo)..."
-	@sudo cp contrib/modules-load.d/fido.conf /etc/modules-load.d/
+	@sudo cp contrib/modules-load.d/fido.conf /usr/lib/modules-load.d/fido.conf
 	@echo "Modules-load configuration installed."
 
 .PHONY: uninstall-modules
