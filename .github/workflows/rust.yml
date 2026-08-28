@@ -74,6 +74,24 @@ jobs:
       - name: Run deterministic agent validation
         run: make test-agent-validation
 
+  agent-fuzz:
+    name: Agent protocol fuzz smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install nightly toolchain
+        shell: bash
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+
+      - name: Run bounded fuzz smoke
+        run: make test-agent-fuzz-smoke
+
   build:
     strategy:
       fail-fast: false
