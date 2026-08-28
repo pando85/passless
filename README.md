@@ -13,7 +13,9 @@
 Passless is a software FIDO2 authenticator that emulates hardware security keys. Built with
 [soft-fido2](https://github.com/pando85/soft-fido2), it runs as a virtual UHID device on Linux.
 
-It also includes client capabilities for interacting with any FIDO2 authenticator.
+It also includes client capabilities for interacting with any FIDO2 authenticator. Experimental
+agent mode can broker policy-controlled WebAuthn for explicitly configured local automation without
+exposing credential private keys to the agent.
 
 > [!IMPORTANT]
 >
@@ -41,6 +43,7 @@ accounts or stricter threat models.
 Users should choose the solution that best fits their own security and practicality requirements.
 
 - [Features](#features)
+- [Agent authentication (experimental)](#agent-authentication-experimental)
 - [Android](#android)
 - [Configuration](#configuration)
 - [Installation](#installation)
@@ -63,6 +66,42 @@ Users should choose the solution that best fits their own security and practical
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
 - Encrypted credential [backup and restore](docs/CREDENTIAL_BACKUP.md) (software credentials)
+
+## Agent authentication (experimental)
+
+> [!WARNING]
+>
+> Agent mode is implemented but **not yet validated for production use**. Interfaces,
+> configuration fields, and behavior may change without notice.
+
+Passless can broker WebAuthn authentication for explicitly configured local agents while keeping
+credential private keys inside the Passless daemon and configured backend/key provider. The agent
+receives a bounded authentication capability, not raw signing-key material.
+
+Two identity modes are available:
+
+- **`isolated`** — recommended for unattended automation. The agent has its own credential
+  namespace and RP identity and cannot enumerate or sign with the human credential namespace.
+- **`same-user`** — privileged delegation of the existing human WebAuthn identity. The daemon uses
+  the human credential backend, so an autonomous profile can authenticate as the human within its
+  configured RP and action policy.
+
+For every intercepted ceremony, the daemon re-evaluates the browser-derived origin and RP,
+credential scope, current policy generation, session bounds, operation budget, replay state, and
+audit requirements before credential use.
+
+This boundary controls **authentication authority**, not the actions available after login. Once a
+WebAuthn ceremony succeeds, an agent controlling the managed browser can exercise whatever
+application authority that authenticated RP session provides. Passless is therefore not an
+application-level authorization proxy.
+
+For unattended automation, prefer RP-native scoped mechanisms such as OAuth, application
+installations, service accounts, or workload identity when they are available. Agent mode is most
+useful when a workflow genuinely needs to authenticate through WebAuthn.
+
+See the [agent-mode overview](docs/agents/README.md) for configuration and threat-model guidance,
+and read the [agent security model](docs/agents/security.md) before enabling autonomous
+authentication.
 
 ## Android
 
