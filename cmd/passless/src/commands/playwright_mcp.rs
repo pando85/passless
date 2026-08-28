@@ -46,11 +46,14 @@ fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Re
         .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))?;
     let profile_owned = profile.to_string();
     let start_url = url.map(ToOwned::to_owned);
-    let (endpoint, shared_browser) =
+    let (_, shared_browser) =
         ensure_browser(&profile_owned, start_url.as_deref()).map_err(Error::Other)?;
-    let endpoint_clone = endpoint.clone();
-    let bootstrap = CdpBootstrap::start(token.clone(), move || Ok(endpoint_clone.clone()))
-        .map_err(|e| Error::Other(e.to_string()))?;
+    let profile_for_bootstrap = profile_owned.clone();
+    let bootstrap = CdpBootstrap::start(token.clone(), move || {
+        let (endpoint, _) = ensure_browser(&profile_for_bootstrap, start_url.as_deref())?;
+        Ok(endpoint)
+    })
+    .map_err(|e| Error::Other(e.to_string()))?;
 
     let bootstrap_endpoint = bootstrap.endpoint();
     let mut child_command = Command::new(executable);

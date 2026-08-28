@@ -90,9 +90,9 @@ impl CredentialKeyProvider for AssertionActivatingKeyProvider {
 impl AgentRuntime {
     /// Ensure that the verified principal owns a live trusted-port browser.
     ///
-    /// This is intentionally principal-scoped. It must never adopt a browser lease created by
-    /// an admin command or by another principal session. The lifecycle lock makes concurrent
-    /// Playwright discovery requests single-flight for the profile.
+    /// For session-scoped profiles, each session gets its own browser lease.
+    /// For profile-scoped profiles, sessions on the same profile share a single browser.
+    /// The lifecycle lock makes concurrent Playwright discovery requests single-flight.
     pub(super) fn handle_ensure_browser(
         &self,
         profile_id: &ProfileId,
@@ -152,19 +152,19 @@ impl AgentRuntime {
                     )
                     && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
                 {
-                    profile
-                        .shared_browsers
-                        .lock()
-                        .map_err(|_| {
+                    {
+                        let mut shared = profile.shared_browsers.lock().map_err(|_| {
                             ProtocolError::new(
                                 ErrorCode::Internal,
                                 "shared browser lock poisoned",
                                 RecommendedAction::Abort,
                             )
-                        })?
-                        .get_mut(profile_id)
-                        .unwrap()
-                        .ref_count += 1;
+                        })?;
+                        let lease = shared.get_mut(profile_id).unwrap();
+                        if lease.attach(session_id) {
+                            lease.sync_ref_count();
+                        }
+                    }
                     profile
                         .active_browser
                         .lock()
@@ -567,6 +567,8 @@ impl AgentRuntime {
             );
 
         if profile_config.browser_scope == BrowserScope::Profile {
+            let mut attached = std::collections::HashSet::new();
+            attached.insert(session_id.clone());
             profile
                 .shared_browsers
                 .lock()
@@ -582,6 +584,7 @@ impl AgentRuntime {
                     SharedBrowserLease {
                         lease_id: lease_id.clone(),
                         ref_count: 1,
+                        attached_sessions: attached,
                     },
                 );
         }

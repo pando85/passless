@@ -183,6 +183,54 @@ pub struct ActiveBrowserLease {
 pub struct SharedBrowserLease {
     pub lease_id: BrowserLeaseId,
     pub ref_count: usize,
+    pub attached_sessions: std::collections::HashSet<PrincipalSessionId>,
+}
+
+pub enum SharedDetachOutcome {
+    Keep,
+    Terminate(BrowserLeaseId),
+}
+
+impl SharedBrowserLease {
+    pub fn attach(&mut self, session_id: &PrincipalSessionId) -> bool {
+        self.attached_sessions.insert(session_id.clone())
+    }
+
+    pub fn detach(&mut self, session_id: &PrincipalSessionId) -> bool {
+        self.attached_sessions.remove(session_id)
+    }
+
+    pub fn sync_ref_count(&mut self) {
+        self.ref_count = self.attached_sessions.len();
+    }
+}
+
+fn detach_session_from_shared(
+    shared: &mut HashMap<ProfileId, SharedBrowserLease>,
+    profile_id: &ProfileId,
+    session_id: &PrincipalSessionId,
+) -> SharedDetachOutcome {
+    let Some(lease) = shared.get_mut(profile_id) else {
+        return SharedDetachOutcome::Keep;
+    };
+    if !lease.detach(session_id) {
+        return SharedDetachOutcome::Keep;
+    }
+    lease.sync_ref_count();
+    if lease.ref_count == 0 {
+        let lease_id = lease.lease_id.clone();
+        shared.remove(profile_id);
+        SharedDetachOutcome::Terminate(lease_id)
+    } else {
+        SharedDetachOutcome::Keep
+    }
+}
+
+fn cleanup_all_shared_for_profile(
+    shared: &mut HashMap<ProfileId, SharedBrowserLease>,
+    profile_id: &ProfileId,
+) -> Option<BrowserLeaseId> {
+    shared.remove(profile_id).map(|lease| lease.lease_id)
 }
 
 pub struct ProfileRuntime {
@@ -2145,6 +2193,8 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
         session_id: &PrincipalSessionId,
     ) {
+        let _lifecycle = profile.lifecycle_lock.lock().ok();
+
         let active = profile
             .active_browser
             .lock()
@@ -2152,20 +2202,15 @@ impl AgentRuntime {
             .and_then(|mut active| active.remove(session_id));
 
         if profile.profile_config.browser_scope == BrowserScope::Profile {
+            if active.is_none() {
+                return;
+            }
             let should_terminate = {
                 let mut shared = profile.shared_browsers.lock().ok();
                 if let Some(ref mut shared) = shared {
-                    if let Some(lease) = shared.get_mut(&profile.profile_id) {
-                        lease.ref_count = lease.ref_count.saturating_sub(1);
-                        if lease.ref_count == 0 {
-                            let lease_id = lease.lease_id.clone();
-                            shared.remove(&profile.profile_id);
-                            Some(lease_id)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                    match detach_session_from_shared(shared, &profile.profile_id, session_id) {
+                        SharedDetachOutcome::Terminate(lease_id) => Some(lease_id),
+                        SharedDetachOutcome::Keep => None,
                     }
                 } else {
                     None
@@ -2198,18 +2243,22 @@ impl AgentRuntime {
             .lock()
             .map(|mut active| active.drain().map(|(_, lease)| lease.lease_id).collect())
             .unwrap_or_default();
-        let shared_lease = profile
-            .shared_browsers
-            .lock()
-            .ok()
-            .and_then(|mut shared| shared.remove(&profile.profile_id))
-            .map(|lease| lease.lease_id);
+        let shared_lease = {
+            let mut shared = profile.shared_browsers.lock().ok();
+            if let Some(ref mut shared) = shared {
+                cleanup_all_shared_for_profile(shared, &profile.profile_id)
+            } else {
+                None
+            }
+        };
         if let Some(lease_id) = shared_lease {
             leases.push(lease_id);
         }
         if leases.is_empty() {
             return;
         }
+        let mut seen = std::collections::HashSet::new();
+        leases.retain(|id| seen.insert(id.clone()));
         let mut browser_mgr = self.browser_manager.lock().unwrap();
         for lease_id in leases {
             self.revoke_sign_context_for_lease(&lease_id);
@@ -3499,12 +3548,22 @@ impl AgentRuntime {
             let browser_mgr = self.browser_manager.lock().unwrap();
             if let Some(snapshot) = browser_mgr.snapshot(&lease_id) {
                 let cdp_endpoint = browser_mgr.lease_cdp_endpoint(&lease_id).flatten();
+                let shared_browser_context =
+                    if profile.profile_config.browser_scope == BrowserScope::Profile {
+                        let shared = profile.shared_browsers.lock().ok();
+                        let is_shared = shared
+                            .as_ref()
+                            .is_some_and(|s| s.contains_key(&profile.profile_id));
+                        if is_shared { Some(true) } else { None }
+                    } else {
+                        None
+                    };
                 return Ok(PrincipalResponse::BrowserStatus(
                     passless_core::agent::BrowserStatusResponse {
                         running: !snapshot.state.is_terminal(),
                         status: format!("{}", snapshot.state),
                         cdp_endpoint,
-                        shared_browser_context: None,
+                        shared_browser_context,
                     },
                 ));
             }
@@ -6483,119 +6542,131 @@ mod tests {
     }
 
     #[test]
-    fn shared_browser_lease_refcount_increment_decrement() {
+    fn shared_attach_same_session_twice_keeps_refcount_one() {
         let profile_id = ProfileId::new("test-shared").unwrap();
+        let session = PrincipalSessionId::new();
         let lease_id = BrowserLeaseId::new();
-        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
-
-        shared.insert(
-            profile_id.clone(),
-            SharedBrowserLease {
-                lease_id: lease_id.clone(),
-                ref_count: 1,
-            },
-        );
-
-        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
-
-        shared.get_mut(&profile_id).unwrap().ref_count += 1;
-        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 2);
-
-        shared.get_mut(&profile_id).unwrap().ref_count =
-            shared.get(&profile_id).unwrap().ref_count.saturating_sub(1);
-        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(session.clone());
+        let mut lease = SharedBrowserLease {
+            lease_id,
+            ref_count: 1,
+            attached_sessions: attached,
+        };
+        assert!(!lease.attach(&session));
+        lease.sync_ref_count();
+        assert_eq!(lease.ref_count, 1);
+        assert_eq!(lease.attached_sessions.len(), 1);
+        let _ = profile_id;
     }
 
     #[test]
-    fn shared_browser_lease_removal_at_zero_refcount() {
-        let profile_id = ProfileId::new("test-shared").unwrap();
+    fn shared_two_unique_sessions_refcount_two() {
+        let session_a = PrincipalSessionId::new();
+        let session_b = PrincipalSessionId::new();
         let lease_id = BrowserLeaseId::new();
-        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
-
-        shared.insert(
-            profile_id.clone(),
-            SharedBrowserLease {
-                lease_id: lease_id.clone(),
-                ref_count: 1,
-            },
-        );
-
-        shared.get_mut(&profile_id).unwrap().ref_count =
-            shared.get(&profile_id).unwrap().ref_count.saturating_sub(1);
-        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 0);
-
-        if shared.get(&profile_id).unwrap().ref_count == 0 {
-            shared.remove(&profile_id);
-        }
-
-        assert!(!shared.contains_key(&profile_id));
+        let mut lease = SharedBrowserLease {
+            lease_id,
+            ref_count: 0,
+            attached_sessions: std::collections::HashSet::new(),
+        };
+        assert!(lease.attach(&session_a));
+        assert!(lease.attach(&session_b));
+        lease.sync_ref_count();
+        assert_eq!(lease.ref_count, 2);
     }
 
     #[test]
-    fn shared_browser_lease_one_session_death_does_not_kill_while_refcount_positive() {
+    fn shared_detach_one_keeps_other() {
         let profile_id = ProfileId::new("test-shared").unwrap();
         let session_a = PrincipalSessionId::new();
         let session_b = PrincipalSessionId::new();
         let lease_id = BrowserLeaseId::new();
-
-        let mut active: HashMap<PrincipalSessionId, ActiveBrowserLease> = HashMap::new();
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(session_a.clone());
+        attached.insert(session_b.clone());
+        let lease = SharedBrowserLease {
+            lease_id: lease_id.clone(),
+            ref_count: 2,
+            attached_sessions: attached,
+        };
         let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+        shared.insert(profile_id.clone(), lease);
 
-        active.insert(
-            session_a.clone(),
-            ActiveBrowserLease {
-                lease_id: lease_id.clone(),
-                session_id: session_a.clone(),
-            },
+        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session_a);
+        assert!(matches!(outcome, SharedDetachOutcome::Keep));
+        assert!(shared.contains_key(&profile_id));
+        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
+        assert!(
+            shared
+                .get(&profile_id)
+                .unwrap()
+                .attached_sessions
+                .contains(&session_b)
         );
-        active.insert(
-            session_b.clone(),
-            ActiveBrowserLease {
-                lease_id: lease_id.clone(),
-                session_id: session_b.clone(),
-            },
-        );
+    }
 
+    #[test]
+    fn shared_detach_unattached_session_unchanged() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let session_a = PrincipalSessionId::new();
+        let session_unattached = PrincipalSessionId::new();
+        let lease_id = BrowserLeaseId::new();
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(session_a.clone());
+        let lease = SharedBrowserLease {
+            lease_id: lease_id.clone(),
+            ref_count: 1,
+            attached_sessions: attached,
+        };
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+        shared.insert(profile_id.clone(), lease);
+
+        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session_unattached);
+        assert!(matches!(outcome, SharedDetachOutcome::Keep));
+        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
+    }
+
+    #[test]
+    fn shared_detach_final_triggers_termination() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let session = PrincipalSessionId::new();
+        let lease_id = BrowserLeaseId::new();
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(session.clone());
+        let lease = SharedBrowserLease {
+            lease_id: lease_id.clone(),
+            ref_count: 1,
+            attached_sessions: attached,
+        };
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+        shared.insert(profile_id.clone(), lease);
+
+        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session);
+        assert!(matches!(outcome, SharedDetachOutcome::Terminate(_)));
+        assert!(!shared.contains_key(&profile_id));
+    }
+
+    #[test]
+    fn cleanup_all_deduplicates_shared_lease() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let lease_id = BrowserLeaseId::new();
+        let session_a = PrincipalSessionId::new();
+        let session_b = PrincipalSessionId::new();
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(session_a.clone());
+        attached.insert(session_b.clone());
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
         shared.insert(
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: lease_id.clone(),
                 ref_count: 2,
+                attached_sessions: attached,
             },
         );
-
-        active.remove(&session_a);
-
-        let should_terminate = {
-            if let Some(lease) = shared.get_mut(&profile_id) {
-                lease.ref_count = lease.ref_count.saturating_sub(1);
-                if lease.ref_count == 0 {
-                    shared.remove(&profile_id);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        assert!(
-            !should_terminate,
-            "shared browser should not terminate while ref_count > 0"
-        );
-        assert!(
-            shared.contains_key(&profile_id),
-            "shared browser lease should still exist"
-        );
-        assert_eq!(
-            shared.get(&profile_id).unwrap().ref_count,
-            1,
-            "ref_count should be 1 after one session detaches"
-        );
-        assert!(
-            active.contains_key(&session_b),
-            "other session's active lease should remain"
-        );
+        let removed = cleanup_all_shared_for_profile(&mut shared, &profile_id);
+        assert_eq!(removed, Some(lease_id));
+        assert!(!shared.contains_key(&profile_id));
     }
 }

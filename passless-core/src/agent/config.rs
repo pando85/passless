@@ -796,6 +796,14 @@ impl AgentProfileConfig {
                 )));
             }
         }
+        if self.browser_scope == BrowserScope::Profile
+            && self.max_concurrent_sessions > MAX_CONCURRENT_SESSIONS
+        {
+            return Err(Error::Config(format!(
+                "agent profile '{}': max_concurrent_sessions must be 0 (unlimited) or between 1 and {} for profile browser scope",
+                profile_id, MAX_CONCURRENT_SESSIONS
+            )));
+        }
         if let CredentialSelection::Credential(reference) = &self.credential_selection
             && self
                 .credential_refs
@@ -3630,6 +3638,17 @@ acknowledge_global_same_user = ["missing"]
         profile.browser_cdp_expose = Some(CdpExposeMode::Port);
         profile.browser_cdp_port = Some(9222);
         assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_profile_rejects_max_above_limit() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Profile;
+        profile.max_concurrent_sessions = 65;
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_sessions"));
     }
 
     #[test]
