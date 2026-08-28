@@ -288,6 +288,7 @@ pub struct BrowserConfig {
     pub daemon_gid: u32,
     pub cdp_expose: CdpExposeMode,
     pub cdp_port: u16,
+    pub bind_parent_death: bool,
 }
 
 pub trait ChildSpawner: Send + Sync {
@@ -389,6 +390,7 @@ impl BrowserConfig {
             rlimit_nproc: DEFAULT_RLIMIT_NPROC,
             rlimit_core: DEFAULT_RLIMIT_CORE,
             rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: self.bind_parent_death,
         }
     }
 }
@@ -2010,6 +2012,7 @@ pub(crate) fn build_browser_command(
         if arg.starts_with("--remote-debugging-pipe")
             || arg.starts_with("--remote-debugging-port")
             || arg.starts_with("--remote-debugging-address")
+            || arg.starts_with("--remote-allow-origins")
         {
             return Err(LaunchError::InvalidArg(
                 "remote debugging flags are managed by passless; remove from browser_command"
@@ -2057,6 +2060,7 @@ pub(crate) fn build_browser_command(
         CdpExposeMode::Port => {
             cmd.arg(format!("--remote-debugging-port={}", config.cdp_port));
             cmd.arg("--remote-debugging-address=127.0.0.1");
+            cmd.arg("--remote-allow-origins=*");
         }
     }
 
@@ -2234,33 +2238,27 @@ fn spawn_browser_port_mode(
 
     let trusted_same_user = is_trusted_same_user_port_launch(config);
     let mut cmd = build_browser_command(config, profile_dir)?;
-    // Port mode is explicitly the trusted-browser exposure mode. Preserve
-    // Chromium's startup diagnostics in the daemon journal so sandbox/display
-    // failures are actionable instead of looking like a CDP timeout.
     cmd.stderr(Stdio::inherit());
+
+    let bind_parent_death = config.bind_parent_death;
 
     unsafe {
         cmd.pre_exec(move || {
             if trusted_same_user {
-                // Close inherited FDs (sockets, audit files, UHID, etc.) but
-                // preserve stdio. Port mode uses TCP, not inherited pipes.
                 if close_range_preserving(&[0, 1, 2]).is_err() {
                     return Err(io::Error::last_os_error());
                 }
 
-                // Dedicated session/process group for lifecycle cleanup.
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
 
-                // Reap browser if daemon dies.
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) < 0 {
+                if bind_parent_death
+                    && libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) < 0
+                {
                     return Err(io::Error::last_os_error());
                 }
 
-                // Do not set PR_SET_NO_NEW_PRIVS before exec in trusted
-                // same-user mode. Chromium may need its setuid sandbox helper
-                // during startup.
                 Ok(())
             } else {
                 setup.apply(&[0, 1, 2])
@@ -2949,6 +2947,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::default(),
             cdp_port: 9222,
+            bind_parent_death: true,
         }
     }
 
@@ -4652,6 +4651,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::default(),
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -4681,6 +4681,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::default(),
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -5957,6 +5958,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let cmd = build_browser_command(&config, dir.path()).unwrap();
@@ -5976,6 +5978,7 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("--remote-debugging-address"))
         );
+        assert!(!args.iter().any(|a| a.starts_with("--remote-allow-origins")));
     }
 
     #[test]
@@ -5995,6 +5998,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Port,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let cmd = build_browser_command(&config, dir.path()).unwrap();
@@ -6008,6 +6012,7 @@ mod tests {
             args.iter()
                 .any(|a| a == "--remote-debugging-address=127.0.0.1")
         );
+        assert!(args.iter().any(|a| a == "--remote-allow-origins=*"));
         assert!(!args.iter().any(|a| a == "--remote-debugging-pipe"));
     }
 
@@ -6028,6 +6033,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let result = build_browser_command(&config, dir.path());
@@ -6051,6 +6057,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let result = build_browser_command(&config, dir.path());
@@ -6074,6 +6081,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let result = build_browser_command(&config, dir.path());
@@ -6095,7 +6103,18 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         }
+    }
+
+    #[test]
+    fn test_build_browser_command_rejects_remote_allow_origins_in_extra_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_reject_config(dir.path(), "--remote-allow-origins=*");
+        assert!(matches!(
+            build_browser_command(&config, dir.path()),
+            Err(LaunchError::InvalidArg(_))
+        ));
     }
 
     #[test]
@@ -6198,6 +6217,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
         assert!(build_browser_command(&config, dir.path()).is_ok());
     }
@@ -6911,6 +6931,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let cmd = build_browser_command(&config, &profile_dir).unwrap();
@@ -6942,6 +6963,7 @@ mod tests {
             daemon_gid: 0,
             cdp_expose: CdpExposeMode::Pipe,
             cdp_port: 9222,
+            bind_parent_death: true,
         };
 
         let cmd = build_browser_command(&config, &profile_dir).unwrap();
@@ -6999,5 +7021,91 @@ mod tests {
             "--window-size=800,600"
         ));
         assert!(!is_managed_extension_or_profile_flag("--disable-sync"));
+    }
+
+    #[test]
+    fn test_browser_config_hardening_preserves_bind_parent_death_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.bind_parent_death = true;
+        let setup = config.hardening();
+        assert!(setup.bind_parent_death);
+    }
+
+    #[test]
+    fn test_browser_config_hardening_preserves_bind_parent_death_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.bind_parent_death = false;
+        let setup = config.hardening();
+        assert!(!setup.bind_parent_death);
+    }
+
+    #[test]
+    fn test_child_survives_spawning_thread_exit_without_pdeathsig() {
+        use std::os::unix::process::CommandExt;
+
+        let child = std::thread::spawn(|| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 60");
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.spawn().unwrap()
+        });
+
+        let mut child = child.join().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let exit = child.try_wait().unwrap();
+        assert!(
+            exit.is_none(),
+            "child should survive spawning thread exit when PDEATHSIG is not set"
+        );
+
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn test_child_killed_by_pdeathsig_when_spawning_thread_exits() {
+        use std::os::unix::process::CommandExt;
+
+        let child = std::thread::spawn(|| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 60");
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.spawn().unwrap()
+        });
+
+        let mut child = child.join().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        let exit = child.try_wait().unwrap();
+        assert!(
+            exit.is_some(),
+            "child should be killed by PDEATHSIG when spawning thread exits"
+        );
     }
 }

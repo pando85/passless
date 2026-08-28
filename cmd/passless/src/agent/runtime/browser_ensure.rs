@@ -316,6 +316,7 @@ impl AgentRuntime {
             daemon_gid: profile.daemon_gid,
             cdp_expose: CdpExposeMode::Port,
             cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
+            bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
         };
 
         let bearer_token = crate::agent::sign::generate_bearer_token().map_err(|e| {
