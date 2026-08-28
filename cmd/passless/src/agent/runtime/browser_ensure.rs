@@ -6,13 +6,13 @@ use passless_core::agent::config::CdpExposeMode;
 use passless_core::agent::protocol::{
     BrowserStatusResponse, ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction,
 };
-use passless_core::agent::{BrowserLeaseId, PrincipalSessionId, ProfileId};
+use passless_core::agent::{BrowserLeaseId, BrowserScope, PrincipalSessionId, ProfileId};
 use soft_fido2_ctap::key_provider::{
     CredentialKey, CredentialKeyError, CredentialKeyProvider, CredentialKeyProviderId,
     GeneratedCredentialKey,
 };
 
-use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime};
+use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease};
 use crate::agent::browser::{BrowserConfig, LeaseState};
 use crate::agent::intent::ProcessIdentityDigest;
 use crate::storage::CredentialFilter;
@@ -130,6 +130,80 @@ impl AgentRuntime {
             )
         })?;
 
+        if profile.profile_config.browser_scope == BrowserScope::Profile {
+            let shared_lease_id = profile
+                .shared_browsers
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "shared browser lock poisoned",
+                        RecommendedAction::Abort,
+                    )
+                })?
+                .get(profile_id)
+                .map(|lease| lease.lease_id.clone());
+
+            if let Some(lease_id) = shared_lease_id {
+                if let Some(snapshot) = browser_manager.snapshot(&lease_id)
+                    && matches!(
+                        snapshot.state,
+                        LeaseState::Active | LeaseState::AuthenticationPending
+                    )
+                    && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
+                {
+                    profile
+                        .shared_browsers
+                        .lock()
+                        .map_err(|_| {
+                            ProtocolError::new(
+                                ErrorCode::Internal,
+                                "shared browser lock poisoned",
+                                RecommendedAction::Abort,
+                            )
+                        })?
+                        .get_mut(profile_id)
+                        .unwrap()
+                        .ref_count += 1;
+                    profile
+                        .active_browser
+                        .lock()
+                        .map_err(|_| {
+                            ProtocolError::new(
+                                ErrorCode::Internal,
+                                "active browser lock poisoned",
+                                RecommendedAction::Abort,
+                            )
+                        })?
+                        .insert(
+                            session_id.clone(),
+                            ActiveBrowserLease {
+                                lease_id: lease_id.clone(),
+                                session_id: session_id.clone(),
+                            },
+                        );
+                    return Ok(browser_ensured(snapshot.state.to_string(), endpoint, true));
+                }
+
+                self.sign_registry.revoke_by_lease(lease_id.as_ref());
+                let _ = browser_manager.revoke(&lease_id);
+                let _ = browser_manager.terminate(&lease_id);
+                let _ = browser_manager.cleanup(&lease_id);
+                browser_manager.remove(&lease_id);
+                profile
+                    .shared_browsers
+                    .lock()
+                    .map_err(|_| {
+                        ProtocolError::new(
+                            ErrorCode::Internal,
+                            "shared browser lock poisoned",
+                            RecommendedAction::Abort,
+                        )
+                    })?
+                    .remove(profile_id);
+            }
+        }
+
         let active_lease_id = profile
             .active_browser
             .lock()
@@ -151,7 +225,7 @@ impl AgentRuntime {
                 )
                 && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
             {
-                return Ok(browser_ensured(snapshot.state.to_string(), endpoint));
+                return Ok(browser_ensured(snapshot.state.to_string(), endpoint, false));
             }
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
@@ -492,17 +566,39 @@ impl AgentRuntime {
                 },
             );
 
+        if profile_config.browser_scope == BrowserScope::Profile {
+            profile
+                .shared_browsers
+                .lock()
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "shared browser lock poisoned",
+                        RecommendedAction::Abort,
+                    )
+                })?
+                .insert(
+                    profile_id.clone(),
+                    SharedBrowserLease {
+                        lease_id: lease_id.clone(),
+                        ref_count: 1,
+                    },
+                );
+        }
+
         Ok(browser_ensured(
             LeaseState::AuthenticationPending.to_string(),
             endpoint,
+            profile_config.browser_scope == BrowserScope::Profile,
         ))
     }
 }
 
-fn browser_ensured(status: String, endpoint: String) -> PrincipalResponse {
+fn browser_ensured(status: String, endpoint: String, shared: bool) -> PrincipalResponse {
     PrincipalResponse::BrowserEnsured(BrowserStatusResponse {
         running: true,
         status,
         cdp_endpoint: Some(endpoint),
+        shared_browser_context: if shared { Some(true) } else { None },
     })
 }

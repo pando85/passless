@@ -46,22 +46,30 @@ fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Re
         .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))?;
     let profile_owned = profile.to_string();
     let start_url = url.map(ToOwned::to_owned);
-    let bootstrap = CdpBootstrap::start(token.clone(), move || {
-        ensure_browser(&profile_owned, start_url.as_deref())
-    })
-    .map_err(|e| Error::Other(e.to_string()))?;
+    let (endpoint, shared_browser) =
+        ensure_browser(&profile_owned, start_url.as_deref()).map_err(Error::Other)?;
+    let endpoint_clone = endpoint.clone();
+    let bootstrap = CdpBootstrap::start(token.clone(), move || Ok(endpoint_clone.clone()))
+        .map_err(|e| Error::Other(e.to_string()))?;
 
-    let endpoint = bootstrap.endpoint();
+    let bootstrap_endpoint = bootstrap.endpoint();
     let mut child_command = Command::new(executable);
     child_command.args(command.iter().skip(1));
 
-    // These options are part of Playwright MCP's public CLI. Appending them makes the Passless
-    // endpoint authoritative even if a caller accidentally supplied another CDP endpoint earlier.
+    let has_shared_flag = command.iter().skip(1).any(|arg| {
+        arg.to_str()
+            .is_some_and(|s| s == "--shared-browser-context")
+    });
+
     child_command
         .arg("--cdp-endpoint")
-        .arg(&endpoint)
+        .arg(&bootstrap_endpoint)
         .arg("--cdp-header")
         .arg(format!("Authorization: Bearer {token}"));
+
+    if shared_browser && !has_shared_flag {
+        child_command.arg("--shared-browser-context");
+    }
 
     // The Playwright process needs browser authority, not Passless principal IPC authority.
     // Close the inherited capability fd before exec and arrange for the MCP child to die if the
@@ -101,7 +109,10 @@ fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Re
     }
 }
 
-fn ensure_browser(profile: &str, start_url: Option<&str>) -> std::result::Result<String, String> {
+fn ensure_browser(
+    profile: &str,
+    start_url: Option<&str>,
+) -> std::result::Result<(String, bool), String> {
     let base = resolve_runtime_base().map_err(|e| e.to_string())?;
     let mut client =
         PrincipalClient::connect_launched(&base, profile).map_err(|e| e.to_string())?;
@@ -111,9 +122,13 @@ fn ensure_browser(profile: &str, start_url: Option<&str>) -> std::result::Result
         })
         .map_err(|e| e.to_string())?;
     match response {
-        PrincipalResponse::BrowserEnsured(status) => status
-            .cdp_endpoint
-            .ok_or_else(|| "agent ensured a browser but returned no CDP endpoint".to_string()),
+        PrincipalResponse::BrowserEnsured(status) => {
+            let endpoint = status.cdp_endpoint.ok_or_else(|| {
+                "agent ensured a browser but returned no CDP endpoint".to_string()
+            })?;
+            let shared = status.shared_browser_context.unwrap_or(false);
+            Ok((endpoint, shared))
+        }
         _ => Err("agent returned an unexpected EnsureBrowser response".to_string()),
     }
 }

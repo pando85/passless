@@ -19,8 +19,8 @@ use passless_core::agent::protocol::{
     ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{
-    AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, DaemonStatus, EndpointId,
-    EndpointStatusResponse, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
+    AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, BrowserScope, DaemonStatus,
+    EndpointId, EndpointStatusResponse, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
 };
 use passless_core::config::{PinConfig, SecurityConfig};
 
@@ -180,6 +180,11 @@ pub struct ActiveBrowserLease {
     pub session_id: PrincipalSessionId,
 }
 
+pub struct SharedBrowserLease {
+    pub lease_id: BrowserLeaseId,
+    pub ref_count: usize,
+}
+
 pub struct ProfileRuntime {
     pub profile_name: String,
     pub profile_id: ProfileId,
@@ -194,6 +199,7 @@ pub struct ProfileRuntime {
     pub profile_config: AgentProfileConfig,
     pub current_pending: Mutex<Option<PendingRuntime>>,
     pub active_browser: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>>,
+    pub shared_browsers: Mutex<HashMap<ProfileId, SharedBrowserLease>>,
     pub daemon_uid: u32,
     pub daemon_gid: u32,
     pub browser_uid: Option<u32>,
@@ -1168,6 +1174,7 @@ impl AgentRuntime {
                             profile_config: profile.clone(),
                             current_pending: Mutex::new(None),
                             active_browser: Mutex::new(HashMap::new()),
+                            shared_browsers: Mutex::new(HashMap::new()),
                             daemon_uid,
                             daemon_gid,
                             browser_uid,
@@ -2143,6 +2150,38 @@ impl AgentRuntime {
             .lock()
             .ok()
             .and_then(|mut active| active.remove(session_id));
+
+        if profile.profile_config.browser_scope == BrowserScope::Profile {
+            let should_terminate = {
+                let mut shared = profile.shared_browsers.lock().ok();
+                if let Some(ref mut shared) = shared {
+                    if let Some(lease) = shared.get_mut(&profile.profile_id) {
+                        lease.ref_count = lease.ref_count.saturating_sub(1);
+                        if lease.ref_count == 0 {
+                            let lease_id = lease.lease_id.clone();
+                            shared.remove(&profile.profile_id);
+                            Some(lease_id)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(lease_id) = should_terminate {
+                self.revoke_sign_context_for_lease(&lease_id);
+                let mut browser_mgr = self.browser_manager.lock().unwrap();
+                let _ = browser_mgr.revoke(&lease_id);
+                let _ = browser_mgr.terminate(&lease_id);
+                let _ = browser_mgr.cleanup(&lease_id);
+                browser_mgr.remove(&lease_id);
+            }
+            return;
+        }
+
         if let Some(active) = active {
             self.revoke_sign_context_for_lease(&active.lease_id);
             let mut browser_mgr = self.browser_manager.lock().unwrap();
@@ -2154,11 +2193,20 @@ impl AgentRuntime {
     }
 
     fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime) {
-        let leases: Vec<BrowserLeaseId> = profile
+        let mut leases: Vec<BrowserLeaseId> = profile
             .active_browser
             .lock()
             .map(|mut active| active.drain().map(|(_, lease)| lease.lease_id).collect())
             .unwrap_or_default();
+        let shared_lease = profile
+            .shared_browsers
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.remove(&profile.profile_id))
+            .map(|lease| lease.lease_id);
+        if let Some(lease_id) = shared_lease {
+            leases.push(lease_id);
+        }
         if leases.is_empty() {
             return;
         }
@@ -2418,7 +2466,9 @@ impl AgentRuntime {
             )
         })?;
         let limit = usize::from(profile.profile_config.max_concurrent_sessions);
-        if sessions.len() >= limit {
+        let unlimited = profile.profile_config.browser_scope == BrowserScope::Profile
+            && profile.profile_config.max_concurrent_sessions == 0;
+        if !unlimited && sessions.len() >= limit {
             return Err(ProtocolError::new(
                 ErrorCode::Conflict,
                 format!(
@@ -3454,6 +3504,7 @@ impl AgentRuntime {
                         running: !snapshot.state.is_terminal(),
                         status: format!("{}", snapshot.state),
                         cdp_endpoint,
+                        shared_browser_context: None,
                     },
                 ));
             }
@@ -3464,6 +3515,7 @@ impl AgentRuntime {
                 running: false,
                 status: "no_browser".into(),
                 cdp_endpoint: None,
+                shared_browser_context: None,
             },
         ))
     }
@@ -5976,6 +6028,7 @@ mod tests {
             profile_config: passless_core::agent::AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: passless_core::agent::config::CredentialSelection::Single,
                 human_verification_prompt:
                     passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -6221,6 +6274,7 @@ mod tests {
                 passless_core::agent::AgentProfileConfig {
                     max_operations: 64,
                     max_concurrent_sessions: 1,
+                    browser_scope: BrowserScope::Session,
                     credential_selection: passless_core::agent::config::CredentialSelection::Single,
                     human_verification_prompt:
                         passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -6332,6 +6386,7 @@ mod tests {
             profile_config: agent_config.profiles.get("test-isolated").unwrap().clone(),
             current_pending: Mutex::new(None),
             active_browser: Mutex::new(HashMap::new()),
+            shared_browsers: Mutex::new(HashMap::new()),
             daemon_uid: unsafe { libc::getuid() },
             daemon_gid: unsafe { libc::getgid() },
             browser_uid: None,
@@ -6425,5 +6480,122 @@ mod tests {
             em.cancel_all();
             let _ = em.shutdown_all(Some(Duration::from_secs(1)));
         }
+    }
+
+    #[test]
+    fn shared_browser_lease_refcount_increment_decrement() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let lease_id = BrowserLeaseId::new();
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: lease_id.clone(),
+                ref_count: 1,
+            },
+        );
+
+        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
+
+        shared.get_mut(&profile_id).unwrap().ref_count += 1;
+        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 2);
+
+        shared.get_mut(&profile_id).unwrap().ref_count =
+            shared.get(&profile_id).unwrap().ref_count.saturating_sub(1);
+        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
+    }
+
+    #[test]
+    fn shared_browser_lease_removal_at_zero_refcount() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let lease_id = BrowserLeaseId::new();
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: lease_id.clone(),
+                ref_count: 1,
+            },
+        );
+
+        shared.get_mut(&profile_id).unwrap().ref_count =
+            shared.get(&profile_id).unwrap().ref_count.saturating_sub(1);
+        assert_eq!(shared.get(&profile_id).unwrap().ref_count, 0);
+
+        if shared.get(&profile_id).unwrap().ref_count == 0 {
+            shared.remove(&profile_id);
+        }
+
+        assert!(!shared.contains_key(&profile_id));
+    }
+
+    #[test]
+    fn shared_browser_lease_one_session_death_does_not_kill_while_refcount_positive() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let session_a = PrincipalSessionId::new();
+        let session_b = PrincipalSessionId::new();
+        let lease_id = BrowserLeaseId::new();
+
+        let mut active: HashMap<PrincipalSessionId, ActiveBrowserLease> = HashMap::new();
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+
+        active.insert(
+            session_a.clone(),
+            ActiveBrowserLease {
+                lease_id: lease_id.clone(),
+                session_id: session_a.clone(),
+            },
+        );
+        active.insert(
+            session_b.clone(),
+            ActiveBrowserLease {
+                lease_id: lease_id.clone(),
+                session_id: session_b.clone(),
+            },
+        );
+
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: lease_id.clone(),
+                ref_count: 2,
+            },
+        );
+
+        active.remove(&session_a);
+
+        let should_terminate = {
+            if let Some(lease) = shared.get_mut(&profile_id) {
+                lease.ref_count = lease.ref_count.saturating_sub(1);
+                if lease.ref_count == 0 {
+                    shared.remove(&profile_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        assert!(
+            !should_terminate,
+            "shared browser should not terminate while ref_count > 0"
+        );
+        assert!(
+            shared.contains_key(&profile_id),
+            "shared browser lease should still exist"
+        );
+        assert_eq!(
+            shared.get(&profile_id).unwrap().ref_count,
+            1,
+            "ref_count should be 1 after one session detaches"
+        );
+        assert!(
+            active.contains_key(&session_b),
+            "other session's active lease should remain"
+        );
     }
 }

@@ -161,6 +161,38 @@ impl std::str::FromStr for CdpExposeMode {
     }
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserScope {
+    #[default]
+    Session,
+    Profile,
+}
+
+impl fmt::Display for BrowserScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Session => f.write_str("session"),
+            Self::Profile => f.write_str("profile"),
+        }
+    }
+}
+
+impl std::str::FromStr for BrowserScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "session" => Ok(BrowserScope::Session),
+            "profile" => Ok(BrowserScope::Profile),
+            _ => Err(format!(
+                "Invalid browser scope '{}'. Must be: session, profile",
+                s
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentAuthorization {
@@ -626,8 +658,11 @@ pub struct AgentProfileConfig {
     #[serde(default = "default_max_operations")]
     pub max_operations: u16,
     /// Maximum number of live principal runtime sessions allowed for this profile.
+    /// A value of 0 means unlimited and is only valid when browser_scope is "profile".
     #[serde(default = "default_max_concurrent_sessions")]
     pub max_concurrent_sessions: u16,
+    #[serde(default)]
+    pub browser_scope: BrowserScope,
     #[serde(default)]
     pub credential_selection: CredentialSelection,
     #[serde(default)]
@@ -742,22 +777,24 @@ impl AgentProfileConfig {
                 profile_id, MAX_OPERATIONS
             )));
         }
-        if self.max_concurrent_sessions == 0
-            || self.max_concurrent_sessions > MAX_CONCURRENT_SESSIONS
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': max_concurrent_sessions must be between 1 and {}",
-                profile_id, MAX_CONCURRENT_SESSIONS
-            )));
-        }
-        if self.max_concurrent_sessions > 1
-            && self.browser_cdp_expose == Some(CdpExposeMode::Port)
-            && self.browser_cdp_port.unwrap_or(0) != 0
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': browser_cdp_port must be 0 (or omitted) when max_concurrent_sessions > 1 in port mode",
-                profile_id
-            )));
+        if self.browser_scope == BrowserScope::Session {
+            if self.max_concurrent_sessions == 0
+                || self.max_concurrent_sessions > MAX_CONCURRENT_SESSIONS
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': max_concurrent_sessions must be between 1 and {} for session browser scope",
+                    profile_id, MAX_CONCURRENT_SESSIONS
+                )));
+            }
+            if self.max_concurrent_sessions > 1
+                && self.browser_cdp_expose == Some(CdpExposeMode::Port)
+                && self.browser_cdp_port.unwrap_or(0) != 0
+            {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': browser_cdp_port must be 0 (or omitted) when max_concurrent_sessions > 1 in port mode with session browser scope",
+                    profile_id
+                )));
+            }
         }
         if let CredentialSelection::Credential(reference) = &self.credential_selection
             && self
@@ -1542,6 +1579,7 @@ register = "deny"
         AgentProfileConfig {
             max_operations: 64,
             max_concurrent_sessions: 1,
+            browser_scope: BrowserScope::Session,
             credential_selection: CredentialSelection::Single,
             human_verification_prompt: HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
@@ -1856,6 +1894,7 @@ verbose = false
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -1885,6 +1924,7 @@ verbose = false
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -1928,6 +1968,7 @@ verbose = false
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -1981,6 +2022,7 @@ verbose = false
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2212,6 +2254,7 @@ product_id = 2
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2263,6 +2306,7 @@ product_id = 2
                 AgentProfileConfig {
                     max_operations: 64,
                     max_concurrent_sessions: 1,
+                    browser_scope: BrowserScope::Session,
                     credential_selection: CredentialSelection::Single,
                     human_verification_prompt: HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
@@ -2397,6 +2441,7 @@ backend_type = "local"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2460,6 +2505,7 @@ backend_type = "local"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2515,6 +2561,7 @@ backend_type = "local"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2866,6 +2913,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2901,6 +2949,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -2981,6 +3030,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -3016,6 +3066,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -3067,6 +3118,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             AgentProfileConfig {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
                 human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
@@ -3471,5 +3523,122 @@ acknowledge_global_same_user = ["missing"]
             err.to_string()
                 .contains("cannot select one RP-specific credential reference")
         );
+    }
+
+    #[test]
+    fn browser_scope_session_rejects_max_zero() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 0;
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_sessions"));
+    }
+
+    #[test]
+    fn browser_scope_session_rejects_max_above_limit() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 65;
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_sessions"));
+    }
+
+    #[test]
+    fn browser_scope_session_accepts_max_one() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 1;
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_session_accepts_max_64() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 64;
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_session_rejects_fixed_port_with_max_gt_1() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 2;
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_cdp_port = Some(9222);
+        let err = profile
+            .validate(&ProfileId::new("test").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("browser_cdp_port"));
+    }
+
+    #[test]
+    fn browser_scope_session_accepts_fixed_port_with_max_1() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 1;
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_cdp_port = Some(9222);
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_session_accepts_ephemeral_port_with_max_gt_1() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Session;
+        profile.max_concurrent_sessions = 4;
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_cdp_port = Some(0);
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_profile_accepts_max_zero() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Profile;
+        profile.max_concurrent_sessions = 0;
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_profile_accepts_max_two() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Profile;
+        profile.max_concurrent_sessions = 2;
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_profile_accepts_fixed_port_with_max_gt_1() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Profile;
+        profile.max_concurrent_sessions = 4;
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_cdp_port = Some(9222);
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_profile_accepts_fixed_port_with_max_zero() {
+        let mut profile = make_isolated_profile();
+        profile.browser_scope = BrowserScope::Profile;
+        profile.max_concurrent_sessions = 0;
+        profile.browser_cdp_expose = Some(CdpExposeMode::Port);
+        profile.browser_cdp_port = Some(9222);
+        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn browser_scope_serde_roundtrip() {
+        let session: BrowserScope = serde_json::from_str("\"session\"").unwrap();
+        assert_eq!(session, BrowserScope::Session);
+        let profile: BrowserScope = serde_json::from_str("\"profile\"").unwrap();
+        assert_eq!(profile, BrowserScope::Profile);
+        let default: BrowserScope = serde_json::from_str("null").unwrap_or_default();
+        assert_eq!(default, BrowserScope::Session);
     }
 }

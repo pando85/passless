@@ -5,8 +5,9 @@ pub mod protocol;
 
 pub use config::{
     AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-    AgentRpRule, AgentStorageConfig, BoundedDuration, CredentialSelection, DeviceIdentity,
-    HumanVerificationPrompt, UserPresenceSource, UserVerificationSource, validate_rp_id,
+    AgentRpRule, AgentStorageConfig, BoundedDuration, BrowserScope, CredentialSelection,
+    DeviceIdentity, HumanVerificationPrompt, UserPresenceSource, UserVerificationSource,
+    validate_rp_id,
 };
 pub use ids::{
     BrowserLeaseId, CredentialRef, EndpointId, GrantId, IdError, IntentId, PendingRequestId,

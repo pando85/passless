@@ -3948,9 +3948,9 @@ mod tests {
         use crate::agent::prompt::AutoApproveHandle;
         use crate::agent::storage::CeremonyScope;
         use passless_core::agent::{
-            AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, CredentialRef,
-            DeviceIdentity, EndpointId, PolicyDigest, PolicyGenerationId, PrincipalSessionId,
-            ProfileId,
+            AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BrowserScope,
+            CredentialRef, DeviceIdentity, EndpointId, PolicyDigest, PolicyGenerationId,
+            PrincipalSessionId, ProfileId,
         };
         use std::collections::BTreeMap;
         use std::path::PathBuf;
@@ -4054,6 +4054,7 @@ mod tests {
                 AgentProfileConfig {
                     max_operations: 64,
                     max_concurrent_sessions: 1,
+                    browser_scope: BrowserScope::Session,
                     credential_selection: passless_core::agent::config::CredentialSelection::Single,
                     human_verification_prompt:
                         passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -4892,8 +4893,9 @@ mod tests {
             use crate::agent::storage::CeremonyScope;
             use passless_core::agent::{
                 AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode,
-                AgentProfileConfig, AgentRpRule, AgentStorageConfig, DeviceIdentity, EndpointId,
-                PrincipalSessionId, ProfileId, UserPresenceSource, UserVerificationSource,
+                AgentProfileConfig, AgentRpRule, AgentStorageConfig, BrowserScope, DeviceIdentity,
+                EndpointId, PrincipalSessionId, ProfileId, UserPresenceSource,
+                UserVerificationSource,
             };
             use std::collections::BTreeMap;
             use std::path::PathBuf;
@@ -5007,6 +5009,7 @@ mod tests {
                     AgentProfileConfig {
                         max_operations: 64,
                         max_concurrent_sessions: 1,
+                        browser_scope: BrowserScope::Session,
                         credential_selection:
                             passless_core::agent::config::CredentialSelection::Single,
                         human_verification_prompt:
@@ -5614,8 +5617,8 @@ mod tests {
             use crate::agent::prompt::AutoApproveHandle;
             use crate::agent::storage::CeremonyScope;
             use passless_core::agent::{
-                AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, CredentialRef,
-                DeviceIdentity, EndpointId, PrincipalSessionId, ProfileId,
+                AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BrowserScope,
+                CredentialRef, DeviceIdentity, EndpointId, PrincipalSessionId, ProfileId,
             };
             use std::collections::BTreeMap;
             use std::path::PathBuf;
@@ -5673,6 +5676,7 @@ mod tests {
                     AgentProfileConfig {
                         max_operations: 64,
                         max_concurrent_sessions: 1,
+                        browser_scope: BrowserScope::Session,
                         credential_selection:
                             passless_core::agent::config::CredentialSelection::Single,
                         human_verification_prompt:

@@ -8,7 +8,7 @@ use passless_core::agent::config::AgentStorageConfig;
 use passless_core::error::{Error, Result};
 
 #[cfg(test)]
-use passless_core::agent::config::AgentProfileConfig;
+use passless_core::agent::config::{AgentProfileConfig, BrowserScope};
 
 use crate::pin_storage::PinStorage;
 use crate::storage::CredentialStorage;
@@ -663,6 +663,7 @@ mod tests {
         let profile = AgentProfileConfig {
             max_operations: 64,
             max_concurrent_sessions: 1,
+            browser_scope: BrowserScope::Session,
             credential_selection: passless_core::agent::config::CredentialSelection::Single,
             human_verification_prompt:
                 passless_core::agent::config::HumanVerificationPrompt::Always,
@@ -712,6 +713,7 @@ mod tests {
         let profile = AgentProfileConfig {
             max_operations: 64,
             max_concurrent_sessions: 1,
+            browser_scope: BrowserScope::Session,
             credential_selection: passless_core::agent::config::CredentialSelection::Single,
             human_verification_prompt:
                 passless_core::agent::config::HumanVerificationPrompt::Always,
