@@ -38,12 +38,17 @@ NoNewPrivileges=false
 # Note: NoNewPrivileges=false is required because the daemon uses setuid to
 # launch principal and browser processes under separate Unix identities.
 
-# Namespaces
+# Namespaces / devices
 PrivateDevices=false
 # PrivateDevices cannot be enabled: Chromium enumerates dynamically created host
 # hidraw nodes after service startup, so static bind mounts are insufficient.
 # The daemon requires /dev/uhid; exact udev identity rules restrict each hidraw
 # node. Never grant /dev/uhid to principals or browser users.
+#
+# RestrictAddressFamilies is intentionally deferred. The restriction is inherited
+# by managed Chromium, which requires AF_INET/AF_INET6 for RP access and may use
+# AF_NETLINK for host network state. Add it only after the browser syscall/socket
+# surface is validated for the supported Chromium configurations.
 
 # Logging
 Environment=PASSLESS_SYSLOG_IDENTIFIER=passless-agent
@@ -55,11 +60,20 @@ SyslogIdentifier=passless-agent
 LimitMEMLOCK=64M
 LimitNOFILE=1024
 
-# Security
+# Security: additive controls that do not interfere with cross-user setuid launch.
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelLogs=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 ProtectKernelModules=true
+LockPersonality=true
+RestrictRealtime=true
 RestrictSUIDSGID=true
+
+# Higher-risk hardening remains deliberately deferred until it is profiled against
+# the root multi-principal browser path: CapabilityBoundingSet, SystemCallFilter,
+# RestrictNamespaces, ProtectProc/ProcSubset, and MemoryDenyWriteExecute.
 
 [Install]
 WantedBy=multi-user.target
