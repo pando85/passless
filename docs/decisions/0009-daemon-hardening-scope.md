@@ -36,31 +36,56 @@ is attempted, and the user unit's weak systemd hardening score is a non-issue.
    unit's `systemd-analyze security` score (9.4 UNSAFE) is accepted as the mode's intent
    — the daemon has no more privilege than the session it serves.
 
-3. **Hardening work is deferred for later implementation**, recorded here as the
-   roadmap for the root deployment:
+3. **Hardening is staged by compatibility risk** for the root deployment:
 
-   - **C-2a — freely additive directives** (no code risk, implement when the root mode
-     is deployed): `ProtectHostname=true`, `ProtectClock=true`,
-     `ProtectKernelLogs=true`, `LockPersonality=true`, `RestrictRealtime=true`,
-     `RestrictAddressFamilies=AF_UNIX` (+ `AF_INET AF_INET6` only if networking is
-     needed by the deployment).
-   - **C-2b — evaluated directives**: `RestrictNamespaces` and `MemoryDenyWriteExecute`
-     (must be tested against browser spawn / JIT), and the high-value pair
-     `CapabilityBoundingSet` (bound to the minimal set the daemon needs, e.g.
-     CAP_SETUID/CAP_SETGID + device access) and `SystemCallFilter` (requires syscall
-     profiling first).
+   - **C-2a — freely additive directives:** `ProtectHostname=true`, `ProtectClock=true`,
+     `ProtectKernelLogs=true`, `LockPersonality=true`, and `RestrictRealtime=true` can
+     be enabled without changing the daemon's continuous cross-user `setuid` model.
+   - **C-2b — evaluated directives:** `RestrictAddressFamilies`, `RestrictNamespaces`,
+     `ProtectProc`/`ProcSubset`, and `MemoryDenyWriteExecute` must be tested against
+     managed Chromium and child supervision. The high-value pair
+     `CapabilityBoundingSet` and `SystemCallFilter` requires an explicit privilege and
+     syscall inventory first.
 
 4. **Open design problem deferred:** whether the daemon can operate with a bounded
    capability set instead of full root (capability dropping post-startup, or a small
    privileged helper for setuid spawn and UHID creation). Deferred because it requires
    an isolation-mode redesign, not a unit-file change.
 
+## Implementation status
+
+The root system unit now enables the low-risk C-2a baseline:
+
+- `ProtectHostname=true`
+- `ProtectClock=true`
+- `ProtectKernelLogs=true`
+- `LockPersonality=true`
+- `RestrictRealtime=true`
+
+It retains the existing `ProtectKernelTunables`, `ProtectControlGroups`,
+`ProtectKernelModules`, and `RestrictSUIDSGID` controls.
+
+`RestrictAddressFamilies` is intentionally **not** included in the baseline. Managed
+Chromium inherits the unit's address-family restriction, needs `AF_INET`/`AF_INET6` for
+RP access, and may use `AF_NETLINK` for host network state. The supported browser modes
+must be exercised before committing to a minimal family list.
+
+Likewise, the unit deliberately keeps:
+
+- `NoNewPrivileges=false` for cross-user child `setuid`/`setgid`;
+- `PrivateDevices=false` for dynamically-created FIDO hidraw visibility;
+- no `CapabilityBoundingSet` or `SystemCallFilter` until the required daemon/launcher
+  privilege and syscall surfaces are measured.
+
+These are residual risks and explicit compatibility decisions, not accidental omissions.
+
 ## Consequences
 
-- C-2 stays open in FURTHER_ANALYSIS.md but is re-scoped: it tracks hardening of the
-  **root multi-principal** deployment only.
-- No code or unit-file changes now; the additive list (C-2a) and evaluation list (C-2b)
-  are the implementation backlog for when the isolated mode is productionized.
+- C-2 stays open in FURTHER_ANALYSIS.md but is re-scoped: it tracks the remaining
+  hardening of the **root multi-principal** deployment only.
+- The low-risk systemd baseline is enabled now; capability bounding, syscall filtering,
+  process visibility, namespace restrictions, and address-family restriction remain
+  implementation/evaluation work.
 - Same-user deployments have no C-2 action items.
 
 ## References
