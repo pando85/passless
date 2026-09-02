@@ -322,20 +322,14 @@ fn run_sync_helper(
     ssh_auth_sock: &OsStr,
 ) -> Result<(), String> {
     let helper_path = sync_helper_path()?;
-    let output = sync_helper_command(
-        &helper_path,
-        store_path,
-        action,
-        message,
-        ssh_auth_sock,
-    )
-    .output()
-    .map_err(|error| {
-        format!(
-            "failed to invoke {}: {error}",
-            helper_path.to_string_lossy()
-        )
-    })?;
+    let output = sync_helper_command(&helper_path, store_path, action, message, ssh_auth_sock)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to invoke {}: {error}",
+                helper_path.to_string_lossy()
+            )
+        })?;
 
     if output.status.success() {
         return Ok(());
@@ -417,7 +411,10 @@ mod tests {
             OsStr::new("/tmp/passless-agent.sock"),
         );
 
-        assert_eq!(command.get_program(), OsStr::new("/usr/bin/passless-git-sync"));
+        assert_eq!(
+            command.get_program(),
+            OsStr::new("/usr/bin/passless-git-sync")
+        );
         assert!(command.get_envs().any(|(key, value)| {
             key == OsStr::new(SSH_AUTH_SOCK_ENV)
                 && value == Some(OsStr::new("/tmp/passless-agent.sock"))
