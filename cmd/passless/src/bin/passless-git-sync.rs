@@ -43,10 +43,7 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn required_arg(
-    args: &mut impl Iterator<Item = OsString>,
-    name: &str,
-) -> Result<OsString, String> {
+fn required_arg(args: &mut impl Iterator<Item = OsString>, name: &str) -> Result<OsString, String> {
     args.next().ok_or_else(|| format!("missing {name}"))
 }
 
@@ -65,7 +62,10 @@ mod tests {
     #[test]
     fn required_arg_rejects_missing_value() {
         let mut args = Vec::<OsString>::new().into_iter();
-        assert_eq!(required_arg(&mut args, "store path").unwrap_err(), "missing store path");
+        assert_eq!(
+            required_arg(&mut args, "store path").unwrap_err(),
+            "missing store path"
+        );
     }
 
     #[test]
