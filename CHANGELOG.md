@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.1](https://github.com/pando85/passless/tree/v0.19.1) - 2026-09-02
+
+### Fixed
+
+- Preserve existing install targets ([15de858](https://github.com/pando85/passless/commit/15de858c2de3fb46ca7222bb58e521353681209c))
+- Add ci to allowed commitlint types ([824f531](https://github.com/pando85/passless/commit/824f53186fd6ccea0423b2345eeb94a052050fb3))
+- Exclude fuzz targets from shebang executable check ([7046326](https://github.com/pando85/passless/commit/7046326f7fea3ed938fa502b74c0da304a123fa6))
+- Make pass Git SSH agent socket explicit (#469) ([767c4d2](https://github.com/pando85/passless/commit/767c4d21523f026f1ffc64910d85bc5c885c1bd7))
+
+### Documentation
+
+- agent: Document protocol fuzzing ([d74dd1a](https://github.com/pando85/passless/commit/d74dd1a7b74d533d76f1a1566271b13f459edc6c))
+- agent: Record daemon hardening baseline ([02d6a15](https://github.com/pando85/passless/commit/02d6a156607e6047600a2d7d83ea435efffd7928))
+- Surface experimental agent authentication ([44ab89e](https://github.com/pando85/passless/commit/44ab89ec3e8a242d341dec08690b9bf3a871ddfe))
+- Record credentialsd integration direction ([1bc81fe](https://github.com/pando85/passless/commit/1bc81fe2aea3b26fd42daa83fe7cb2ffead6e250))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.227 (#470) ([e58035b](https://github.com/pando85/passless/commit/e58035bed1ad77644349c81eba5743080f53c866))
+- deps: Update dependency @simplewebauthn/server to v14 ([e40729d](https://github.com/pando85/passless/commit/e40729dfb1facc1438a21fa3e5f6335e668d12dd))
+- deps: Update Rust crate toml to v1.1.5 (#472) ([db47067](https://github.com/pando85/passless/commit/db470675ef2f7509f8b9d93b0ba6d6a978eed1d3))
+
+### Testing
+
+- agent: Add protocol fuzz workspace ([f25eb05](https://github.com/pando85/passless/commit/f25eb0594caeb203ad78209efea94cf286338734))
+- agent: Fuzz protocol frame decoding ([6302720](https://github.com/pando85/passless/commit/63027200ff2cef27eef8510d2db9754b58465d41))
+- agent: Fuzz request validation ([b7e20c2](https://github.com/pando85/passless/commit/b7e20c2790896cda33f89c410e0455f884623f13))
+- agent: Seed protocol fuzz corpus ([0589d65](https://github.com/pando85/passless/commit/0589d652939ea52b0eac53f1f2a0d71bde1ab2ab))
+- agent: Seed principal protocol corpus ([4838952](https://github.com/pando85/passless/commit/48389527b1e3363ec6c017d78d9fd036861343b0))
+- agent: Seed request-validation corpus ([f724276](https://github.com/pando85/passless/commit/f7242762da49bee9762c51b452d00c9915423908))
+- agent: Seed registration-validation corpus ([35de1d5](https://github.com/pando85/passless/commit/35de1d5329a99fb1f827f8fae583717638e107f7))
+- agent: Add bounded fuzz smoke target ([26cab8a](https://github.com/pando85/passless/commit/26cab8a04176f87d3a1657041b1d4668c96606f4))
+
+### Chore
+
+- Ignore fuzz build artifacts ([17d00d0](https://github.com/pando85/passless/commit/17d00d09aec64f3b1e53f8c8b91bc30db21bbb19))
+
+### Ci
+
+- agent: Run bounded protocol fuzz smoke ([c8b82b0](https://github.com/pando85/passless/commit/c8b82b0f7c94434db3fd07941c53090815731212))
+- Install libudev-dev in agent-fuzz job ([2a5c2e5](https://github.com/pando85/passless/commit/2a5c2e5ac3d3915141903b4fa36ed4bebb204eb4))
+
+### Security
+
+- agent: Add safe root daemon hardening ([6cc5db3](https://github.com/pando85/passless/commit/6cc5db355ff3fb17ccd32b9d727f12875e4d5e1e))
+
 ## [v0.19.0](https://github.com/pando85/passless/tree/v0.19.0) - 2026-08-28
 
 ### Added
