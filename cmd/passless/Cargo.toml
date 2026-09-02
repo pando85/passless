@@ -16,6 +16,10 @@ name = "passless"
 path = "src/main.rs"
 
 [[bin]]
+name = "passless-git-sync"
+path = "src/bin/passless-git-sync.rs"
+
+[[bin]]
 name = "agent-prompt-probe"
 path = "src/bin/agent-prompt-probe.rs"
 required-features = ["agent-validation"]

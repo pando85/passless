@@ -8,9 +8,18 @@
 use git2::Repository;
 use log::{debug, warn};
 use prs_lib::Store;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
+
+const PASS_GIT_SSH_AUTH_SOCK_ENV: &str = "PASSLESS_PASS_GIT_SSH_AUTH_SOCK";
+const SSH_AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
+#[cfg(not(windows))]
+const PASS_GIT_SYNC_HELPER_BIN: &str = "passless-git-sync";
+#[cfg(windows)]
+const PASS_GIT_SYNC_HELPER_BIN: &str = "passless-git-sync.exe";
 
 #[derive(Debug, Clone)]
 pub struct PassGitSync {
@@ -224,6 +233,15 @@ impl PassGitSync {
 
     fn prepare_store(store_path: &Path) -> Result<(), String> {
         debug!("Preparing password-store Git sync");
+        if let Some(ssh_auth_sock) = configured_ssh_auth_sock() {
+            return run_sync_helper(
+                store_path,
+                SyncHelperAction::Prepare,
+                None,
+                ssh_auth_sock.as_os_str(),
+            );
+        }
+
         let store = Store::open(store_path.to_string_lossy().as_ref())
             .map_err(|error| format!("failed to open store: {error:?}"))?;
         store
@@ -234,12 +252,106 @@ impl PassGitSync {
 
     fn finalize_store(store_path: &Path, message: &str) -> Result<(), String> {
         debug!("Finalizing password-store Git sync: {message}");
+        if let Some(ssh_auth_sock) = configured_ssh_auth_sock() {
+            return run_sync_helper(
+                store_path,
+                SyncHelperAction::Finalize,
+                Some(message),
+                ssh_auth_sock.as_os_str(),
+            );
+        }
+
         let store = Store::open(store_path.to_string_lossy().as_ref())
             .map_err(|error| format!("failed to open store: {error:?}"))?;
         store
             .sync()
             .finalize(message)
             .map_err(|error| format!("finalize failed: {error:?}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SyncHelperAction {
+    Prepare,
+    Finalize,
+}
+
+impl SyncHelperAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Finalize => "finalize",
+        }
+    }
+}
+
+fn configured_ssh_auth_sock() -> Option<OsString> {
+    std::env::var_os(PASS_GIT_SSH_AUTH_SOCK_ENV).filter(|value| !value.is_empty())
+}
+
+fn sync_helper_path() -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve Passless executable: {error}"))?;
+    Ok(sync_helper_path_from_exe(&current_exe))
+}
+
+fn sync_helper_path_from_exe(current_exe: &Path) -> PathBuf {
+    current_exe.with_file_name(PASS_GIT_SYNC_HELPER_BIN)
+}
+
+fn sync_helper_command(
+    helper_path: &Path,
+    store_path: &Path,
+    action: SyncHelperAction,
+    message: Option<&str>,
+    ssh_auth_sock: &OsStr,
+) -> Command {
+    let mut command = Command::new(helper_path);
+    command.arg(action.as_str()).arg(store_path);
+    if let Some(message) = message {
+        command.arg(message);
+    }
+    command.env(SSH_AUTH_SOCK_ENV, ssh_auth_sock);
+    command
+}
+
+fn run_sync_helper(
+    store_path: &Path,
+    action: SyncHelperAction,
+    message: Option<&str>,
+    ssh_auth_sock: &OsStr,
+) -> Result<(), String> {
+    let helper_path = sync_helper_path()?;
+    let output = sync_helper_command(&helper_path, store_path, action, message, ssh_auth_sock)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to invoke {}: {error}",
+                helper_path.to_string_lossy()
+            )
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(sync_helper_failure(&helper_path, &output))
+}
+
+fn sync_helper_failure(helper_path: &Path, output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!(
+            "{} exited with {}",
+            helper_path.to_string_lossy(),
+            output.status
+        )
+    } else {
+        format!(
+            "{} exited with {}: {stderr}",
+            helper_path.to_string_lossy(),
+            output.status
+        )
     }
 }
 
@@ -277,6 +389,43 @@ mod tests {
             exclude
                 .lines()
                 .any(|line| line == "/fido2/pin_retries.local.gpg")
+        );
+    }
+
+    #[test]
+    fn helper_is_resolved_next_to_passless_binary() {
+        let current = Path::new("/usr/bin/passless");
+        assert_eq!(
+            sync_helper_path_from_exe(current),
+            Path::new("/usr/bin").join(PASS_GIT_SYNC_HELPER_BIN)
+        );
+    }
+
+    #[test]
+    fn helper_command_scopes_ssh_auth_sock_to_child() {
+        let command = sync_helper_command(
+            Path::new("/usr/bin/passless-git-sync"),
+            Path::new("/tmp/password-store"),
+            SyncHelperAction::Finalize,
+            Some("Update credential"),
+            OsStr::new("/tmp/passless-agent.sock"),
+        );
+
+        assert_eq!(
+            command.get_program(),
+            OsStr::new("/usr/bin/passless-git-sync")
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == OsStr::new(SSH_AUTH_SOCK_ENV)
+                && value == Some(OsStr::new("/tmp/passless-agent.sock"))
+        }));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("finalize"),
+                OsStr::new("/tmp/password-store"),
+                OsStr::new("Update credential"),
+            ]
         );
     }
 }

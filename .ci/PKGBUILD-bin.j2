@@ -23,6 +23,7 @@ sha256sums=('{{ checksum }}'
 
 package() {
 	install -Dm755 passless "${pkgdir}/usr/bin/passless"
+	install -Dm755 passless-git-sync "${pkgdir}/usr/bin/passless-git-sync"
 	install -Dm755 sign-proxy "${pkgdir}/usr/bin/sign-proxy"
 	install -Dm755 agent-prompt-probe "${pkgdir}/usr/bin/agent-prompt-probe"
 
