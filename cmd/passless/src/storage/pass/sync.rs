@@ -10,6 +10,7 @@ use log::{debug, warn};
 use prs_lib::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,7 @@ impl PassGitSync {
 
     fn prepare_store(store_path: &Path) -> Result<(), String> {
         debug!("Preparing password-store Git sync");
+        ensure_ssh_auth_sock();
         let store = Store::open(store_path.to_string_lossy().as_ref())
             .map_err(|error| format!("failed to open store: {error:?}"))?;
         store
@@ -234,6 +236,7 @@ impl PassGitSync {
 
     fn finalize_store(store_path: &Path, message: &str) -> Result<(), String> {
         debug!("Finalizing password-store Git sync: {message}");
+        ensure_ssh_auth_sock();
         let store = Store::open(store_path.to_string_lossy().as_ref())
             .map_err(|error| format!("failed to open store: {error:?}"))?;
         store
@@ -241,6 +244,85 @@ impl PassGitSync {
             .finalize(message)
             .map_err(|error| format!("finalize failed: {error:?}"))
     }
+}
+
+/// Ensure `SSH_AUTH_SOCK` points at a live agent socket before Git sync
+/// shells out. `prs_lib` spawns `git` inheriting the process environment
+/// as-is, so this re-resolves and overwrites it fresh on every prepare/
+/// finalize call rather than trusting whatever passless itself inherited
+/// once at startup (see #467: that snapshot is never refreshed later, even
+/// once the agent becomes available).
+fn ensure_ssh_auth_sock() {
+    let Some(socket) = resolve_ssh_auth_sock() else {
+        return;
+    };
+    // SAFETY: mutating the process environment races with any concurrent
+    // env read/write on another thread. passless's other std::env::var(_os)
+    // call sites (agent runtime dir, E2E test flags, test vendor/product
+    // IDs) are one-time reads of unrelated keys made at startup or from
+    // request handlers that never overlap with a pass Git sync, so this is
+    // safe in practice for passless's current call graph even though the
+    // type system cannot prove it.
+    unsafe {
+        std::env::set_var("SSH_AUTH_SOCK", socket);
+    }
+}
+
+/// Resolve a live SSH agent socket for Git operations against the password
+/// store. Sources are tried in order, each covering a different class of
+/// agent (gpg-agent's SSH support, plain ssh-agent, KeePassXC, 1Password,
+/// ...) without hard-coding a dependency on any single one.
+fn resolve_ssh_auth_sock() -> Option<PathBuf> {
+    systemd_user_environment_ssh_auth_sock()
+        .or_else(inherited_ssh_auth_sock)
+        .or_else(gpg_agent_ssh_socket)
+}
+
+/// Query the systemd user manager's own environment table. Autostart
+/// scripts for ssh-agent, KeePassXC, 1Password, etc. commonly update it
+/// (via `systemctl --user import-environment` or
+/// `dbus-update-activation-environment`) after passless.service has
+/// already started, which is exactly the case a one-time startup snapshot
+/// misses. This is the most distro/agent-agnostic source since it does not
+/// depend on ordering against any specific systemd unit.
+fn systemd_user_environment_ssh_auth_sock() -> Option<PathBuf> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("SSH_AUTH_SOCK="))?;
+    let path = PathBuf::from(value);
+    path.exists().then_some(path)
+}
+
+/// Fall back to whatever passless's own process environment already has,
+/// for setups without a systemd user manager (e.g. run from a login shell).
+fn inherited_ssh_auth_sock() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK")?);
+    path.exists().then_some(path)
+}
+
+/// Fall back to gpg-agent's configured SSH support socket. `gpgconf`
+/// reports the configured path even before the agent has been contacted;
+/// connecting to it triggers systemd socket activation where
+/// `gpg-agent.socket` is managed that way, so this does not require the
+/// agent to already be running.
+fn gpg_agent_ssh_socket() -> Option<PathBuf> {
+    let output = Command::new("gpgconf")
+        .args(["--list-dirs", "agent-ssh-socket"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    path.exists().then_some(path)
 }
 
 #[cfg(test)]
