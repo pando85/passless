@@ -37,7 +37,7 @@ sha2 = "0.11"
 serde_cbor = "0.11.2"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0"
-dirs = "6.0"
+dirs = "7.0"
 prs-lib = "0.5"
 serde_json = "1.0"
 libc = "0.2"
