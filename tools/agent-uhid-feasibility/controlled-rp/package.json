@@ -9,6 +9,6 @@
     "test": "node --test tests/test_server.js"
   },
   "dependencies": {
-    "@simplewebauthn/server": "14.0.0"
+    "@simplewebauthn/server": "14.0.1"
   }
 }
