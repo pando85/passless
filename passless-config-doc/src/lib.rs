@@ -37,6 +37,13 @@ fn is_config_type(ty: &Type) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a type is an Option
+fn is_option_type(ty: &Type) -> bool {
+    get_type_name(ty)
+        .map(|name| name == "Option")
+        .unwrap_or(false)
+}
+
 /// Derive macro to extract doc comments and generate TOML config with comments
 ///
 /// This macro generates `field_docs()` and for AppConfig, also generates
@@ -66,26 +73,39 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
         let doc = extract_doc(&field.attrs);
         let type_name = get_type_name(&field.ty);
         let is_config = is_config_type(&field.ty);
+        let is_option = is_option_type(&field.ty);
 
-        field_info.push((field_name.clone(), doc, is_config, type_name));
+        field_info.push((field_name.clone(), doc, is_config, type_name, is_option));
     }
 
     let field_names: Vec<_> = field_info
         .iter()
-        .map(|(n, _, _, _)| n.to_string())
+        .map(|(n, _, _, _, _)| n.to_string())
         .collect();
-    let field_help: Vec<_> = field_info.iter().map(|(_, d, _, _)| d).collect();
+    let field_help: Vec<_> = field_info.iter().map(|(_, d, _, _, _)| d).collect();
 
     // Build field access expressions for to_toml_fields
     let field_accessors: Vec<_> = field_info
         .iter()
-        .filter(|(_, _, is_config, _)| !is_config)
-        .map(|(field_name, _, _, _)| {
-            quote! {
-                (stringify!(#field_name), match toml::Value::try_from(&self.#field_name) {
-                    Ok(v) => format!("{}", v),
-                    Err(_) => format!("{:?}", self.#field_name),
-                })
+        .filter(|(_, _, is_config, _, _)| !is_config)
+        .map(|(field_name, _, _, _, is_option)| {
+            if *is_option {
+                quote! {
+                    (stringify!(#field_name), match &self.#field_name {
+                        Some(v) => match toml::Value::try_from(v) {
+                            Ok(val) => Some(format!("{}", val)),
+                            Err(_) => Some(format!("{:?}", v)),
+                        },
+                        None => None,
+                    })
+                }
+            } else {
+                quote! {
+                    (stringify!(#field_name), match toml::Value::try_from(&self.#field_name) {
+                        Ok(v) => Some(format!("{}", v)),
+                        Err(_) => Some(format!("{:?}", self.#field_name)),
+                    })
+                }
             }
         })
         .collect();
@@ -106,7 +126,7 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
             }
 
             /// Get field values as TOML-formatted strings
-            pub fn to_toml_fields(&self) -> Vec<(&'static str, String)> {
+            pub fn to_toml_fields(&self) -> Vec<(&'static str, Option<String>)> {
                 vec![
                     #(#field_accessors),*
                 ]
@@ -129,7 +149,7 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
 /// Generate the to_toml_with_comments method for AppConfig
 #[allow(clippy::type_complexity)]
 fn generate_toml_method(
-    fields: &[(syn::Ident, String, bool, Option<String>)],
+    fields: &[(syn::Ident, String, bool, Option<String>, bool)],
 ) -> proc_macro2::TokenStream {
     let mut output_parts = Vec::new();
 
@@ -140,7 +160,7 @@ fn generate_toml_method(
     });
 
     // Process fields
-    for (field_name, doc, is_config, type_name) in fields {
+    for (field_name, doc, is_config, type_name, is_option) in fields {
         let field_name_str = field_name.to_string();
 
         if !is_config {
@@ -152,12 +172,29 @@ fn generate_toml_method(
             }
 
             // Output the value
-            output_parts.push(quote! {
-                output.push_str(&format!("{} = {}\n\n", #field_name_str, match toml::Value::try_from(&self.#field_name) {
-                    Ok(v) => format!("{}", v),
-                    Err(_) => format!("{:?}", self.#field_name),
-                }));
-            });
+            if *is_option {
+                output_parts.push(quote! {
+                    match &self.#field_name {
+                        Some(v) => {
+                            let formatted = match toml::Value::try_from(v) {
+                                Ok(val) => format!("{}", val),
+                                Err(_) => format!("{:?}", v),
+                            };
+                            output.push_str(&format!("{} = {}\n\n", #field_name_str, formatted));
+                        }
+                        None => {
+                            output.push_str(&format!("# {} = <not set>\n\n", #field_name_str));
+                        }
+                    }
+                });
+            } else {
+                output_parts.push(quote! {
+                    output.push_str(&format!("{} = {}\n\n", #field_name_str, match toml::Value::try_from(&self.#field_name) {
+                        Ok(v) => format!("{}", v),
+                        Err(_) => format!("{:?}", self.#field_name),
+                    }));
+                });
+            }
         } else if let Some(type_name) = type_name {
             // Config struct - generate section dynamically
             let type_ident = syn::Ident::new(type_name, proc_macro2::Span::call_site());
@@ -186,7 +223,10 @@ fn generate_toml_method(
 
                     // Find the value for this field
                     if let Some((_, value)) = field_values.iter().find(|(n, _)| *n == *name) {
-                        output.push_str(&format!("{} = {}\n\n", name, value));
+                        match value {
+                            Some(v) => output.push_str(&format!("{} = {}\n\n", name, v)),
+                            None => output.push_str(&format!("# {} = <not set>\n\n", name)),
+                        }
                     }
                 }
             });

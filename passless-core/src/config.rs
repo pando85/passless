@@ -1991,4 +1991,45 @@ mod tests {
         assert!(toml_output.contains("store_path"));
         assert!(toml_output.contains("gpg_backend"));
     }
+
+    #[test]
+    fn test_config_print_produces_valid_toml_without_none_literals() {
+        let mut default_args = Args::parse_from(["passless"]);
+        let config = AppConfig::from(&mut default_args.config);
+        let toml_output = config.to_toml_with_comments();
+
+        for (line_no, line) in toml_output.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("= None"),
+                "Line {} contains invalid TOML 'None' literal: {}",
+                line_no + 1,
+                line
+            );
+        }
+
+        let parse_result: Result<toml::Table, _> = toml_output.parse();
+        assert!(
+            parse_result.is_ok(),
+            "Generated TOML is not valid: {:?}",
+            parse_result.err()
+        );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_config_print_comments_out_none_option_fields() {
+        let mut default_args = Args::parse_from(["passless"]);
+        let config = AppConfig::from(&mut default_args.config);
+        let toml_output = config.to_toml_with_comments();
+
+        assert!(
+            toml_output.contains("# audit_path = <not set>"),
+            "Option::None field 'audit_path' should be commented out, got:\n{}",
+            toml_output
+        );
+    }
 }
