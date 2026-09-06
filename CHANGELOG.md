@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.2](https://github.com/pando85/passless/tree/v0.19.2) - 2026-09-06
+
+### Fixed
+
+- Handle Option::None in ConfigDoc macro to produce valid TOML (#481) ([6e9af6e](https://github.com/pando85/passless/commit/6e9af6ef010bf7572a2cd7a7482300bf5d33116d))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.228 (#474) ([aa6726d](https://github.com/pando85/passless/commit/aa6726df900a0632d77c438cb08d4ff148a354e0))
+- deps: Update Rust crate syn to v3.0.5 (#475) ([8983870](https://github.com/pando85/passless/commit/89838701e9df03c876c42c8c7daf66a0c8e7162c))
+- deps: Update dependency @simplewebauthn/server to v14.0.1 (#476) ([2fdbf97](https://github.com/pando85/passless/commit/2fdbf979ac6844321388dab7a3336ddf8bb3736f))
+- deps: Update Rust crate psl to v2.1.229 (#477) ([c814aa7](https://github.com/pando85/passless/commit/c814aa7ae9d7e66d4b7a409abfc71f6122bd4b03))
+- deps: Update Rust crate psl to v2.1.230 (#479) ([f6f8996](https://github.com/pando85/passless/commit/f6f899679d6432ff58cc20662f36848f46d8c75f))
+
 ## [v0.19.1](https://github.com/pando85/passless/tree/v0.19.1) - 2026-09-02
 
 ### Fixed
