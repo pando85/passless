@@ -402,7 +402,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 1.3.0",
 ]
 
 [[package]]
@@ -670,7 +670,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
 dependencies = [
  "dispatch2",
- "nix 0.31.3",
+ "nix",
  "windows-sys 0.61.2",
 ]
 
@@ -973,7 +973,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1436,7 +1436,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1620,18 +1620,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nix"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]
@@ -1838,7 +1826,7 @@ dependencies = [
  "hex",
  "libc",
  "log",
- "nix 0.31.3",
+ "nix",
  "passless-config-doc",
  "psl",
  "rand 0.8.5",
@@ -1872,7 +1860,7 @@ dependencies = [
  "hmac",
  "libc",
  "log",
- "nix 0.31.3",
+ "nix",
  "notify-rust",
  "p256",
  "passless-config-doc",
@@ -2164,19 +2152,19 @@ dependencies = [
 
 [[package]]
 name = "prs-lib"
-version = "0.5.7"
+version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e096cdbabdd347a5cb6a41fb834a9757995116c2f53cd1a9fc4bfd2ac7f9d62"
+checksum = "32e8a22712c5674247c4ef5f1ed8c2d1f1ef546e2d682a388c324005d1cba1a9"
 dependencies = [
  "anyhow",
  "git-state",
  "lazy_static",
- "nix 0.30.1",
+ "nix",
  "procfs",
  "regex",
  "secstr",
  "shellexpand",
- "shlex",
+ "shlex 2.0.1",
  "thiserror",
  "version-compare",
  "walkdir",
@@ -2386,7 +2374,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2571,6 +2559,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
 name = "signal-hook"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2708,7 +2702,7 @@ dependencies = [
  "hex",
  "hidapi",
  "lazy_static",
- "nix 0.31.3",
+ "nix",
  "smallvec",
 ]
 
@@ -2847,7 +2841,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3279,7 +3273,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
