@@ -16,13 +16,19 @@ use passless_core::error::Result;
 
 use std::path::Path;
 
-/// Initialize password store, prompting user via desktop notifications if needed
+/// Initialize password store, prompting user via desktop notifications if needed.
+///
+/// `store_path` is the password-store / Git repository root. `path` is the
+/// Passless-owned relative scope inside that store. Existing recipient policy
+/// may be inherited from any `.gpg-id` between that scope and `store_path`.
 pub fn ensure_initialized(
     store_path: &Path,
+    path: &Path,
     gpg_backend: GpgBackend,
     allow_create_without_prompt: bool,
 ) -> Result<()> {
-    let init = Uninitialized::new(store_path.to_path_buf(), gpg_backend);
+    let scope_path = store_path.join(path);
+    let init = Uninitialized::new(store_path.to_path_buf(), scope_path, gpg_backend);
 
     match init.check_if_initialized() {
         Ok(init) => init
