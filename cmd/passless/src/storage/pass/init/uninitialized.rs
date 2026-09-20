@@ -3,7 +3,7 @@
 use super::directory_created::DirectoryCreated;
 
 use crate::notification::{YesNoResult, show_info_notification, show_yes_no_notification};
-use crate::storage::pass::GpgBackend;
+use crate::storage::pass::{GpgBackend, gpg_id};
 use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
@@ -14,30 +14,36 @@ use log::{debug, info, warn};
 
 pub struct Uninitialized {
     pub(super) store_path: PathBuf,
+    pub(super) scope_path: PathBuf,
     pub(super) gpg_backend: GpgBackend,
 }
 
 impl Uninitialized {
-    pub fn new(store_path: PathBuf, gpg_backend: GpgBackend) -> Self {
+    pub fn new(store_path: PathBuf, scope_path: PathBuf, gpg_backend: GpgBackend) -> Self {
         Self {
             store_path,
+            scope_path,
             gpg_backend,
         }
     }
 
-    /// Check if already initialized; returns special error if yes (success case)
+    /// Check whether an effective recipient policy already applies to the
+    /// configured Passless scope; returns a special error if yes (success case).
     pub fn check_if_initialized(self) -> Result<Self> {
-        let gpg_id_file = self.store_path.join(".gpg-id");
-
-        if gpg_id_file.exists() {
+        if let Some((gpg_id_file, _)) =
+            gpg_id::find_nearest_gpg_id_for_dir(&self.store_path, &self.scope_path)?
+        {
             debug!(
-                "Password store already initialized at {:?}",
-                self.store_path
+                "Password store scope {:?} already initialized by {:?}",
+                self.scope_path, gpg_id_file
             );
             return Err(Error::Config("ALREADY_INITIALIZED".to_string()));
         }
 
-        info!("Password store not initialized at {:?}", self.store_path);
+        info!(
+            "Password store scope not initialized at {:?}",
+            self.scope_path
+        );
         Ok(self)
     }
 
@@ -46,8 +52,8 @@ impl Uninitialized {
             match show_yes_no_notification(
                 "Password Store Not Initialized",
                 &format!(
-                    "The password store directory does not exist at:\n{}\n\nWould you like to initialize it now?",
-                    self.store_path.display()
+                    "The Passless password-store scope is not initialized at:\n{}\n\nWould you like to initialize it now?",
+                    self.scope_path.display()
                 ),
             ) {
                 Ok(YesNoResult::Accepted) => info!("User agreed to initialize"),
@@ -66,17 +72,18 @@ impl Uninitialized {
             }
         }
 
-        if !self.store_path.exists() {
-            create_secure_dir_all(&self.store_path).map_err(|e| {
-                let msg = format!("Failed to create store directory: {}", e);
+        if !self.scope_path.exists() {
+            create_secure_dir_all(&self.scope_path).map_err(|e| {
+                let msg = format!("Failed to create password store scope: {}", e);
                 let _ = crate::notification::show_error_notification("Initialization Failed", &msg);
                 Error::Storage(msg)
             })?;
-            info!("Created store directory at {:?}", self.store_path);
+            info!("Created password store scope at {:?}", self.scope_path);
         }
 
         Ok(DirectoryCreated {
             store_path: self.store_path,
+            scope_path: self.scope_path,
             gpg_backend: self.gpg_backend,
             allow_create_without_prompt,
         })
