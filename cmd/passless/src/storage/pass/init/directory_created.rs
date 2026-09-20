@@ -16,6 +16,7 @@ use prs_lib::crypto::{self, Config, IsContext, Proto};
 
 pub struct DirectoryCreated {
     pub(super) store_path: PathBuf,
+    pub(super) scope_path: PathBuf,
     pub(super) gpg_backend: GpgBackend,
     pub(super) allow_create_without_prompt: bool,
 }
@@ -26,6 +27,7 @@ impl DirectoryCreated {
 
         Ok(GpgKeySelected {
             store_path: self.store_path,
+            scope_path: self.scope_path,
             fingerprint,
             allow_create_without_prompt: self.allow_create_without_prompt,
         })
