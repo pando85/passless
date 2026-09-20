@@ -139,7 +139,12 @@ impl PassStorageAdapter {
 
         // Ensure the password store is initialized
         // This will prompt the user via notifications if not initialized
-        self::init::ensure_initialized(&store_path, gpg_backend, allow_create_without_prompt)?;
+        self::init::ensure_initialized(
+            &store_path,
+            &path,
+            gpg_backend,
+            allow_create_without_prompt,
+        )?;
 
         if !store_path.exists() {
             return Err(Error::Storage(format!(

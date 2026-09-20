@@ -266,10 +266,6 @@ mod tests {
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join(".gpg-id"), "OTHER\n").unwrap();
 
-        assert!(
-            find_nearest_gpg_id_for_dir(root, &scope)
-                .unwrap()
-                .is_none()
-        );
+        assert!(find_nearest_gpg_id_for_dir(root, &scope).unwrap().is_none());
     }
 }
