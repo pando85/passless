@@ -7,6 +7,7 @@ use crate::notification::{show_error_notification, show_info_notification};
 use passless_core::error::{Error, Result};
 
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -38,7 +39,7 @@ impl StoreInitialized {
 
 fn initialize_git_repo(
     store_path: &PathBuf,
-    gpg_id_path: &PathBuf,
+    gpg_id_path: &Path,
     allow_create_without_prompt: bool,
 ) -> Result<()> {
     let output = Command::new("git")
