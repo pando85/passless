@@ -22,12 +22,40 @@ pub fn find_nearest_gpg_id(store_root: &Path, target: &Path) -> Result<(PathBuf,
         ))
     })?;
 
-    let start_dir = if parent.exists() {
-        parent
+    find_nearest_gpg_id_for_dir(store_root, parent)?.ok_or_else(|| {
+        Error::Storage(format!(
+            "No .gpg-id file found in any parent directory of '{}' up to store root '{}'. \
+             Make sure the password store is initialized with: pass init <gpg-key-id>",
+            target.display(),
+            store_root.display()
+        ))
+    })
+}
+
+/// Find the effective `.gpg-id` for a directory.
+///
+/// The lookup starts at `start_dir` itself and walks towards `store_root`,
+/// matching `pass`'s closest-policy-wins semantics. `Ok(None)` means that no
+/// recipient policy applies to the directory; I/O and containment failures are
+/// returned as errors.
+pub fn find_nearest_gpg_id_for_dir(
+    store_root: &Path,
+    start_dir: &Path,
+) -> Result<Option<(PathBuf, String)>> {
+    if !start_dir.starts_with(store_root) {
+        return Err(Error::Storage(format!(
+            "Directory '{}' is not within store root '{}'",
+            start_dir.display(),
+            store_root.display()
+        )));
+    }
+
+    let start_dir = if start_dir.exists() {
+        start_dir
             .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf())
+            .unwrap_or_else(|_| start_dir.to_path_buf())
     } else {
-        parent.to_path_buf()
+        start_dir.to_path_buf()
     };
 
     let root = if store_root.exists() {
@@ -40,7 +68,7 @@ pub fn find_nearest_gpg_id(store_root: &Path, target: &Path) -> Result<(PathBuf,
 
     if !start_dir.starts_with(&root) {
         return Err(Error::Storage(format!(
-            "Resolved target path '{}' is not within store root '{}'",
+            "Resolved directory '{}' is not within store root '{}'",
             start_dir.display(),
             root.display()
         )));
@@ -55,7 +83,7 @@ pub fn find_nearest_gpg_id(store_root: &Path, target: &Path) -> Result<(PathBuf,
         match std::fs::read_to_string(&gpg_id_path) {
             Ok(content) => {
                 debug!("Found .gpg-id at: {:?}", gpg_id_path);
-                return Ok((gpg_id_path, content));
+                return Ok(Some((gpg_id_path, content)));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -79,12 +107,7 @@ pub fn find_nearest_gpg_id(store_root: &Path, target: &Path) -> Result<(PathBuf,
         }
     }
 
-    Err(Error::Storage(format!(
-        "No .gpg-id file found in any parent directory of '{}' up to store root '{}'. \
-         Make sure the password store is initialized with: pass init <gpg-key-id>",
-        target.display(),
-        store_root.display()
-    )))
+    Ok(None)
 }
 
 /// Resolve GPG recipients for a target file using hierarchical .gpg-id lookup.
@@ -193,4 +216,60 @@ pub fn parse_raw_key_ids(content: &str) -> Vec<String> {
     }
     ids.sort();
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn directory_lookup_prefers_scope_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let scope = root.join("fido2");
+        fs::create_dir_all(&scope).unwrap();
+        fs::write(root.join(".gpg-id"), "ROOT\n").unwrap();
+        fs::write(scope.join(".gpg-id"), "SCOPE\n").unwrap();
+
+        let (path, content) = find_nearest_gpg_id_for_dir(root, &scope)
+            .unwrap()
+            .expect("scope should have an effective policy");
+
+        assert_eq!(path, scope.join(".gpg-id"));
+        assert_eq!(content, "SCOPE\n");
+    }
+
+    #[test]
+    fn directory_lookup_inherits_root_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let scope = root.join("fido2");
+        fs::create_dir_all(&scope).unwrap();
+        fs::write(root.join(".gpg-id"), "ROOT\n").unwrap();
+
+        let (path, content) = find_nearest_gpg_id_for_dir(root, &scope)
+            .unwrap()
+            .expect("root policy should apply to scope");
+
+        assert_eq!(path, root.join(".gpg-id"));
+        assert_eq!(content, "ROOT\n");
+    }
+
+    #[test]
+    fn unrelated_subtree_policy_does_not_initialize_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let scope = root.join("fido2");
+        let other = root.join("personal");
+        fs::create_dir_all(&scope).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(".gpg-id"), "OTHER\n").unwrap();
+
+        assert!(
+            find_nearest_gpg_id_for_dir(root, &scope)
+                .unwrap()
+                .is_none()
+        );
+    }
 }
