@@ -1,0 +1,1 @@
+error: corrupt patch at .github/passless-scope-init.patch:30
