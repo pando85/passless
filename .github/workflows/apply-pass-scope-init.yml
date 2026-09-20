@@ -1,0 +1,32 @@
+name: Apply pass scope initialization patch
+
+on:
+  push:
+    branches: [fix/pass-scope-initialization]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/pass-scope-initialization
+
+      - name: Apply implementation
+        run: |
+          git apply --check .github/passless-scope-init.patch
+          git apply .github/passless-scope-init.patch
+          cargo fmt --all
+          rm .github/passless-scope-init.patch
+          rm .github/workflows/apply-pass-scope-init.yml
+
+      - name: Commit implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(pass): make initialization respect configured scope"
+          git push origin HEAD:fix/pass-scope-initialization
