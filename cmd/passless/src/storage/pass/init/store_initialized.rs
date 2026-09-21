@@ -7,6 +7,7 @@ use crate::notification::{show_error_notification, show_info_notification};
 use passless_core::error::{Error, Result};
 
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -14,6 +15,8 @@ use log::{info, warn};
 
 pub struct StoreInitialized {
     pub(super) store_path: PathBuf,
+    pub(super) scope_path: PathBuf,
+    pub(super) gpg_id_path: PathBuf,
     pub(super) fingerprint: String,
     pub(super) allow_create_without_prompt: bool,
 }
@@ -21,16 +24,24 @@ pub struct StoreInitialized {
 impl StoreInitialized {
     pub fn setup_git(self) -> Result<Complete> {
         info!("Setting up git");
-        initialize_git_repo(&self.store_path, self.allow_create_without_prompt)?;
+        initialize_git_repo(
+            &self.store_path,
+            &self.gpg_id_path,
+            self.allow_create_without_prompt,
+        )?;
         Ok(Complete {
-            store_path: self.store_path,
+            scope_path: self.scope_path,
             fingerprint: self.fingerprint,
             allow_create_without_prompt: self.allow_create_without_prompt,
         })
     }
 }
 
-fn initialize_git_repo(store_path: &PathBuf, allow_create_without_prompt: bool) -> Result<()> {
+fn initialize_git_repo(
+    store_path: &PathBuf,
+    gpg_id_path: &Path,
+    allow_create_without_prompt: bool,
+) -> Result<()> {
     let output = Command::new("git")
         .arg("init")
         .current_dir(store_path)
@@ -57,8 +68,18 @@ fn initialize_git_repo(store_path: &PathBuf, allow_create_without_prompt: bool) 
         "*.gpg diff=gpg\n[attr]binary -diff -merge -text\n",
     );
 
+    let gpg_id_relative = gpg_id_path.strip_prefix(store_path).map_err(|_| {
+        Error::Storage(format!(
+            "GPG policy path '{}' is outside password store root '{}'",
+            gpg_id_path.display(),
+            store_path.display()
+        ))
+    })?;
+
     let _ = Command::new("git")
-        .args(["add", ".gpg-id", ".gitattributes"])
+        .arg("add")
+        .arg(gpg_id_relative)
+        .arg(".gitattributes")
         .current_dir(store_path)
         .output();
 
