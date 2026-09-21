@@ -38,7 +38,7 @@ impl StoreInitialized {
 }
 
 fn initialize_git_repo(
-    store_path: &PathBuf,
+    store_path: &Path,
     gpg_id_path: &Path,
     allow_create_without_prompt: bool,
 ) -> Result<()> {
