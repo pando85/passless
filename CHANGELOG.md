@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.3](https://github.com/pando85/passless/tree/v0.19.3) - 2026-09-21
+
+### Fixed
+
+- pass: Respect scoped .gpg-id during initialization (#499) ([addb647](https://github.com/pando85/passless/commit/addb647545a8a7aa558967a113a688d99a93019a))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.231 (#483) ([b823964](https://github.com/pando85/passless/commit/b82396452609094a8536b4aa8ca351df1537c832))
+- deps: Update Rust crate dirs to v7 (#478) ([db07ee1](https://github.com/pando85/passless/commit/db07ee1a47a1c2b35970ee6796dc0ba73a2a5d54))
+- deps: Update Rust crate prs-lib to v0.5.8 (#485) ([c9a483c](https://github.com/pando85/passless/commit/c9a483cc8343599e981bb06c357c4abc50183caa))
+- deps: Update Rust crate psl to v2.1.232 (#486) ([10c1281](https://github.com/pando85/passless/commit/10c1281918d10ab64ed2e9b90903952d2fbf15bc))
+- deps: Update Rust crate toml to v1.1.6 (#487) ([b1f36f6](https://github.com/pando85/passless/commit/b1f36f66d979709b21a80fd7f1755d7a4678d648))
+- deps: Update dependency @simplewebauthn/server to v14.0.2 (#488) ([88bb0d7](https://github.com/pando85/passless/commit/88bb0d70816417e4c2455d0d5786897a4ff305d0))
+- deps: Update Rust crate clap to v4.6.7 (#489) ([5624f27](https://github.com/pando85/passless/commit/5624f277361fc947b94b58c052274fe4c9e55a76))
+- deps: Update Rust crate clap_complete to v4.6.10 (#490) ([f833181](https://github.com/pando85/passless/commit/f833181d8b067891c3a33af4c8d1f170b9f9c7a8))
+- deps: Update Rust crate prs-lib to v0.5.9 (#492) ([a42e09e](https://github.com/pando85/passless/commit/a42e09eb7bf5707bc065a4f2cd1ff488c98105df))
+- deps: Update Rust crate clap_complete to v4.6.11 (#493) ([1678f33](https://github.com/pando85/passless/commit/1678f333e1aaf2b2d364fc1414d766aa019be0fc))
+- deps: Update Rust crate syn to v3.0.6 (#494) ([317dc5f](https://github.com/pando85/passless/commit/317dc5f9b3ee511a4908b0080fe9cbceb25a2887))
+- deps: Update Rust crate psl to v2.1.233 (#495) ([b4277ad](https://github.com/pando85/passless/commit/b4277adf93db56c83d1fab50c136cc8874200a42))
+- deps: Update Rust crate psl to v2.1.234 (#497) ([79aedbe](https://github.com/pando85/passless/commit/79aedbe8a7aad86586fa6cf21e9ea1fac21a870b))
+- deps: Update pre-commit hook alessandrojcm/commitlint-pre-commit-hook to v9.27.0 (#498) ([0b4000a](https://github.com/pando85/passless/commit/0b4000a6bfd6fd3c3b65c05eaf04ef70d18d24d9))
+- deps: Update Rust crate psl to v2.1.235 (#500) ([50a4455](https://github.com/pando85/passless/commit/50a445537fe948851406d11908a14c0b35b67f1b))
+
 ## [v0.19.2](https://github.com/pando85/passless/tree/v0.19.2) - 2026-09-06
 
 ### Fixed

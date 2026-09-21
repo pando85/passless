@@ -1807,7 +1807,7 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "passless-config-doc"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "passless-core"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "clap",
  "clap-serde-derive",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "passless-rs"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "passless-uhid"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "libc",
  "thiserror",
