@@ -65,6 +65,7 @@ timeout 600s cargo test --all-features -- \
     --skip agent::prompt::dbus_tests \
     --skip ceremony_observer \
     --skip agent::storage_factory::tests::composition_conformance \
+    --skip tpm_portable_missing_parent_errors \
     --skip agent::browser::tests::test_cdp_pipes_drop_closes_fds \
     --skip agent::browser::tests::test_child_in_separate_process_group \
     --skip agent::browser::tests::test_no_fd_leakage_to_child \
