@@ -206,6 +206,37 @@ passless config print > ~/.config/passless/config.toml
 You can then edit this file to customize the storage backend, security settings, and other options.
 Command-line arguments will override settings from the configuration file.
 
+### Headless automatic interaction
+
+By default, Passless uses the desktop notification service when a WebAuthn operation needs local
+user-presence or notification-based user-verification confirmation. A trusted headless deployment
+can explicitly replace those confirmation prompts with automatic approval:
+
+```bash
+PASSLESS_INTERACTION_MODE=automatic passless
+```
+
+For a systemd service, set the same variable in the service environment, for example:
+
+```ini
+Environment=PASSLESS_INTERACTION_MODE=automatic
+```
+
+> [!WARNING]
+>
+> `automatic` deliberately removes the human confirmation boundary for WebAuthn prompts that would
+> otherwise use desktop notifications. It can therefore satisfy user presence and notification-based
+> user verification without a human gesture. Use it only when the host and all processes able to
+> reach the authenticator are inside the intended trust boundary.
+
+The default is `desktop`. An unknown `PASSLESS_INTERACTION_MODE` value is rejected rather than
+falling back to automatic approval. Likewise, an unavailable or broken D-Bus notification service
+never enables automatic approval implicitly.
+
+This setting only changes WebAuthn UP/UV confirmation. General yes/no prompts used for storage
+initialization or key selection remain interactive, and PIN policies that require PIN verification
+are still evaluated before the notification fallback path is reached.
+
 ## Installation
 
 ### Cargo

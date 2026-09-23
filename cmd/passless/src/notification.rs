@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use log::{debug, info, warn};
 use notify_rust::{Notification, Timeout, Urgency};
 
+const INTERACTION_MODE_ENV: &str = "PASSLESS_INTERACTION_MODE";
+
 /// Result of user interaction via notification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationResult {
@@ -25,6 +27,37 @@ enum PromptKind {
     UserPresence,
     UserVerification,
     YesNo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Desktop,
+    Automatic,
+}
+
+fn interaction_mode_from_value(value: Option<&str>) -> Result<InteractionMode, String> {
+    let Some(value) = value else {
+        return Ok(InteractionMode::Desktop);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "desktop" => Ok(InteractionMode::Desktop),
+        "automatic" => Ok(InteractionMode::Automatic),
+        other => Err(format!(
+            "invalid {} value '{}'; expected 'desktop' or 'automatic'",
+            INTERACTION_MODE_ENV, other
+        )),
+    }
+}
+
+fn configured_interaction_mode() -> Result<InteractionMode, String> {
+    match std::env::var(INTERACTION_MODE_ENV) {
+        Ok(value) => interaction_mode_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => interaction_mode_from_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{} must contain valid UTF-8", INTERACTION_MODE_ENV))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +145,16 @@ fn show_confirmation_notification(
     prompt_kind: PromptKind,
 ) -> Result<NotificationResult, String> {
     debug_assert!(prompt_kind != PromptKind::YesNo);
+
+    if configured_interaction_mode()? == InteractionMode::Automatic {
+        warn!(
+            "{}=automatic: auto-approving {:?} without user interaction (rp={})",
+            INTERACTION_MODE_ENV,
+            prompt_kind,
+            relying_party.unwrap_or("<unknown>")
+        );
+        return Ok(NotificationResult::Accepted);
+    }
 
     let action_mode = notification_action_mode(prompt_kind);
 
@@ -345,6 +388,38 @@ mod tests {
         assert_eq!(NotificationResult::Accepted, NotificationResult::Accepted);
         assert_eq!(NotificationResult::Denied, NotificationResult::Denied);
         assert_ne!(NotificationResult::Accepted, NotificationResult::Denied);
+    }
+
+    #[test]
+    fn test_interaction_mode_defaults_to_desktop() {
+        assert_eq!(
+            interaction_mode_from_value(None).unwrap(),
+            InteractionMode::Desktop
+        );
+        assert_eq!(
+            interaction_mode_from_value(Some("desktop")).unwrap(),
+            InteractionMode::Desktop
+        );
+    }
+
+    #[test]
+    fn test_interaction_mode_supports_explicit_automatic_mode() {
+        assert_eq!(
+            interaction_mode_from_value(Some("automatic")).unwrap(),
+            InteractionMode::Automatic
+        );
+        assert_eq!(
+            interaction_mode_from_value(Some(" Automatic ")).unwrap(),
+            InteractionMode::Automatic
+        );
+    }
+
+    #[test]
+    fn test_interaction_mode_rejects_unknown_values() {
+        let error = interaction_mode_from_value(Some("headless")).unwrap_err();
+        assert!(error.contains(INTERACTION_MODE_ENV));
+        assert!(error.contains("desktop"));
+        assert!(error.contains("automatic"));
     }
 
     #[test]
