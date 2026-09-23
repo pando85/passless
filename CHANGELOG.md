@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.0](https://github.com/pando85/passless/tree/v0.20.0) - 2026-09-23
+
+### Added
+
+- Support explicit automatic interaction mode (#505) ([c6afa10](https://github.com/pando85/passless/commit/c6afa101eaf72ec11d93672528367d3f05f504ff))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.236 (#504) ([9d36564](https://github.com/pando85/passless/commit/9d36564629e6dc640f5ebcdb53a1492514080b71))
+- deps: Update dependency ubuntu to v26 (#496) ([ec9ab8f](https://github.com/pando85/passless/commit/ec9ab8f5a87ff26049d901267cb2dbc3c56c52c3))
+
 ## [v0.19.4](https://github.com/pando85/passless/tree/v0.19.4) - 2026-09-22
 
 ### Fixed
