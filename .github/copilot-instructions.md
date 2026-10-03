@@ -8,7 +8,7 @@ Passless is a software FIDO2 authenticator emulator written in Rust. It creates 
 
 **Key characteristics:**
 - Uses the `keylib` crate for FIDO2/CTAP protocol implementation
-- Operates as a platform authenticator with resident key (passkey) support
+- Operates as a roaming (cross-platform) authenticator over USB HID with resident key (passkey) support
 - Supports multiple storage backends: local filesystem, password-store (pass), and TPM 2.0
 - Implements security hardening (mlock, core dump prevention)
 - Desktop notifications for user verification prompts
@@ -174,11 +174,11 @@ For detailed TPM and swtpm setup instructions, see:
 
 ### Authenticator Configuration
 
-The authenticator is configured as a FIDO 2.1 platform authenticator with:
+The authenticator is configured as a FIDO 2.1 roaming (USB HID) authenticator with:
 - AAGUID: `66:69:64:6F:2E:70:61:73:73:6C:65:73:73:2E:72:73` ("fido.passless.rs")
 - Resident keys (rk=true) for discoverable credentials/passkeys
 - User verification support (uv=true, always_uv=true)
-- Platform authenticator mode (plat=true)
+- Roaming authenticator mode (plat=false), so browsers accept it for cross-platform requests
 - PIN UV auth token support
 - Credential management enabled (standard 0x0a + Yubikey 0x41 commands)
 - Max 100 resident credentials

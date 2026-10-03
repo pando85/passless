@@ -192,7 +192,7 @@ fn test_client_info() {
 
                 assert_eq!(option_bool("rk"), Some(true));
                 assert_eq!(option_bool("up"), Some(true));
-                assert_eq!(option_bool("plat"), Some(true));
+                assert_eq!(option_bool("plat"), Some(false));
                 assert_eq!(option_bool("uv"), Some(true));
                 assert_eq!(option_bool("clientPin"), Some(false));
                 assert_eq!(option_bool("alwaysUv"), Some(true));
