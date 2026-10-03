@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.1](https://github.com/pando85/passless/tree/v0.20.1) - 2026-10-03
+
+### Fixed
+
+- Advertise plat false for the USB HID authenticator (#514) ([4fdc09d](https://github.com/pando85/passless/commit/4fdc09d724877d0f39260413b803d7e5c4dc5a9c))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.237 (#507) ([05d0a74](https://github.com/pando85/passless/commit/05d0a74e4fc1031218c25ec43e6cec377e588a82))
+- deps: Update Rust crate thiserror to v2.0.21 (#508) ([2ac669d](https://github.com/pando85/passless/commit/2ac669de802068065178176478199a638d1e991c))
+- deps: Update Rust crate psl to v2.1.238 (#509) ([b887f2f](https://github.com/pando85/passless/commit/b887f2fba98f5e085a0dcbfdb606f40d93ea14ff))
+- deps: Update dependency @simplewebauthn/server to v14.0.3 (#510) ([f665b4e](https://github.com/pando85/passless/commit/f665b4e6763fd07c94deb0e9d31089f96a11c83c))
+- deps: Update Rust crate notify-rust to v4.18.1 (#511) ([6ca1347](https://github.com/pando85/passless/commit/6ca13471f9a0c374e97bf6893e61436bf11844b3))
+- deps: Update Rust crate libc to v0.2.190 (#512) ([4b0a927](https://github.com/pando85/passless/commit/4b0a9272e2225e4983c898f855f090c448057064))
+- deps: Update Rust crate psl to v2.1.239 (#515) ([0c21244](https://github.com/pando85/passless/commit/0c21244321ee5ad15a6ef1e91cf4503c00110713))
+- deps: Update Rust crate tokio to v1.53.2 (#516) ([d99a417](https://github.com/pando85/passless/commit/d99a4174f7879f0f7be40662c724f1d29c742f9d))
+
 ## [v0.20.0](https://github.com/pando85/passless/tree/v0.20.0) - 2026-09-23
 
 ### Added
