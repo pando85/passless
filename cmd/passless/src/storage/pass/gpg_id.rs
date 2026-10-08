@@ -140,9 +140,9 @@ pub fn parse_gpg_id_selectors(content: &str, gpg_id_path: &Path) -> Result<Vec<S
     let mut current_line = String::new();
 
     for line in content.lines() {
-        if line.ends_with('\\') {
+        if let Some(stripped) = line.strip_suffix('\\') {
             // Line continues: strip the backslash and accumulate
-            current_line.push_str(&line[..line.len() - 1]);
+            current_line.push_str(stripped);
         } else {
             // Line is complete
             current_line.push_str(line);
