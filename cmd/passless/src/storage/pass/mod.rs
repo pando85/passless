@@ -392,21 +392,11 @@ impl PassStorageAdapter {
             })?;
         }
 
-        // Resolve recipients by walking up from target to find the nearest .gpg-id
-        let recipients = self.resolve_recipients_for_target(&path)?;
-
-        // Create crypto context
-        let mut context = self.create_crypto_context()?;
-
-        // Encrypt and write the credential data directly to file
-        let plaintext = Plaintext::from(cred_bytes.to_vec());
-
-        context
-            .encrypt_file(&recipients, plaintext, &path)
-            .map_err(|e| {
-                debug!("Failed to encrypt credential: {:?}", e);
-                Error::Storage(format!("Failed to encrypt credential: {:?}", e))
-            })?;
+        // Match pass exactly at the .gpg-id boundary: pass forwards each
+        // recipient selector to GnuPG as -r without requiring a hex key ID.
+        let (gpg_id_path, content) = self.find_nearest_gpg_id(&path)?;
+        let recipients = gpg_id::parse_gpg_id_selectors(&content, &gpg_id_path)?;
+        encrypt_with_gnupg_binary(Path::new("gpg"), &recipients, cred_bytes, &path)?;
 
         debug!("Successfully wrote and encrypted credential");
 
@@ -571,7 +561,8 @@ impl PassStorageAdapter {
             ))
         })?;
 
-        let recipients = self.resolve_recipients_for_target(path)?;
+        let (gpg_id_path, content) = self.find_nearest_gpg_id(path)?;
+        let recipients = gpg_id::parse_gpg_id_selectors(&content, &gpg_id_path)?;
 
         let parent = path
             .parent()
@@ -586,15 +577,12 @@ impl PassStorageAdapter {
         );
         let tmp_path = parent.join(&tmp_name);
 
-        context
-            .encrypt_file(&recipients, plaintext, &tmp_path)
-            .map_err(|e| {
-                Error::Storage(format!(
-                    "Failed to re-encrypt credential {}: {:?}",
-                    path.display(),
-                    e
-                ))
-            })?;
+        encrypt_with_gnupg_binary(
+            Path::new("gpg"),
+            &recipients,
+            plaintext.unsecure_ref(),
+            &tmp_path,
+        )?;
 
         std::fs::rename(&tmp_path, path).map_err(|e| {
             Error::Storage(format!(
@@ -617,6 +605,66 @@ impl PassStorageAdapter {
         info!("Re-encrypted {}", path.display());
         Ok(())
     }
+}
+
+fn encrypt_with_gnupg_binary(
+    binary: &Path,
+    recipients: &[String],
+    plaintext: &[u8],
+    output_path: &Path,
+) -> Result<()> {
+    if recipients.is_empty() {
+        return Err(Error::Storage(
+            "Cannot encrypt without GPG recipients".to_string(),
+        ));
+    }
+
+    let mut command = Command::new(binary);
+    command
+        .arg("--quiet")
+        .arg("--yes")
+        .arg("--batch")
+        .arg("--compress-algo=none")
+        .arg("--no-encrypt-to");
+
+    for recipient in recipients {
+        command.arg("--recipient").arg(recipient);
+    }
+
+    command
+        .arg("--output")
+        .arg(output_path)
+        .arg("--encrypt")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| {
+        Error::Storage(format!("Failed to invoke GPG for encryption: {}", error))
+    })?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Storage("Failed to open GPG stdin for encryption".to_string()))?;
+        stdin.write_all(plaintext).map_err(|error| {
+            Error::Storage(format!("Failed to write plaintext to GPG: {}", error))
+        })?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| Error::Storage(format!("Failed to wait for GPG encryption: {}", error)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Storage(format!(
+            "GPG encryption failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    Ok(())
 }
 
 fn decrypt_with_gnupg_binary(
