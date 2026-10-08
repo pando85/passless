@@ -138,7 +138,7 @@ pub fn parse_gpg_id_selectors(content: &str, gpg_id_path: &Path) -> Result<Vec<S
     // First, handle line continuations: join lines ending with '\'
     let mut joined_lines = Vec::new();
     let mut current_line = String::new();
-    
+
     for line in content.lines() {
         if line.ends_with('\\') {
             // Line continues: strip the backslash and accumulate
@@ -154,7 +154,7 @@ pub fn parse_gpg_id_selectors(content: &str, gpg_id_path: &Path) -> Result<Vec<S
     if !current_line.is_empty() {
         joined_lines.push(current_line);
     }
-    
+
     let recipients: Vec<String> = joined_lines
         .iter()
         .filter_map(|line| {
