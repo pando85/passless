@@ -256,11 +256,7 @@ mod tests {
 
         assert_eq!(
             selectors,
-            vec![
-                "Jason@zx2c4.com",
-                "DEADBEEF",
-                "0x1234567890ABCDEF!",
-            ]
+            vec!["Jason@zx2c4.com", "DEADBEEF", "0x1234567890ABCDEF!",]
         );
     }
 
@@ -328,9 +324,11 @@ group-name\n",
     #[test]
     fn recipient_order_and_duplicates_are_preserved() {
         let path = Path::new(".gpg-id");
-        let selectors =
-            parse_gpg_id_selectors("alice@example.com\nbob@example.com\nalice@example.com\n", path)
-                .unwrap();
+        let selectors = parse_gpg_id_selectors(
+            "alice@example.com\nbob@example.com\nalice@example.com\n",
+            path,
+        )
+        .unwrap();
         assert_eq!(
             selectors,
             vec!["alice@example.com", "bob@example.com", "alice@example.com"]
