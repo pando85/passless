@@ -1167,7 +1167,7 @@ printf plaintext
     #[test]
     fn test_parse_strips_inline_comments_like_pass() {
         let selectors = gpg_id::parse_gpg_id_selectors(
-            "Jason@zx2c4.com # primary key\n# comment\n",
+            "Jason@zx2c4.com# primary key\n# comment\n",
             Path::new("/tmp/test/.gpg-id"),
         )
         .unwrap();
