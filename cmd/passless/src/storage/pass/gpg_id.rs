@@ -135,7 +135,7 @@ pub fn parse_gpg_id_selectors(content: &str, gpg_id_path: &Path) -> Result<Vec<S
     let recipients: Vec<String> = content
         .lines()
         .filter_map(|line| {
-            let recipient = line.split('#').next().unwrap_or("").trim();
+            let recipient = line.split('#').next().unwrap_or("");
             (!recipient.is_empty()).then(|| recipient.to_string())
         })
         .collect();
@@ -249,7 +249,7 @@ mod tests {
     fn pass_compatible_recipient_selectors_are_preserved() {
         let path = Path::new(".gpg-id");
         let selectors = parse_gpg_id_selectors(
-            "Jason@zx2c4.com # primary\nDEADBEEF\n0x1234567890ABCDEF!\n# comment\n\n",
+            "Jason@zx2c4.com# primary\nDEADBEEF\n0x1234567890ABCDEF!\n# comment\n\n",
             path,
         )
         .unwrap();
