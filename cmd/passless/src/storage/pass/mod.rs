@@ -24,7 +24,7 @@ use std::time::Instant;
 use core::fmt;
 use log::{debug, error, info, warn};
 use prs_lib::crypto::IsContext;
-use prs_lib::{Ciphertext, Plaintext, Store};
+use prs_lib::{Ciphertext, Store};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -356,6 +356,7 @@ impl PassStorageAdapter {
     }
 
     /// Resolve GPG recipients for a target file using hierarchical .gpg-id lookup.
+    #[allow(dead_code)]
     fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
         gpg_id::resolve_recipients_for_target(&self.store_path, target)
     }
