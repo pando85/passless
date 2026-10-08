@@ -265,6 +265,79 @@ mod tests {
     }
 
     #[test]
+    fn pass_recipient_parsing_matches_password_store_boundary() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors(
+            "0123456789ABCDEF0123456789ABCDEF01234567\n\\
+0123456789ABCDEF\n\\
+DEADBEEF\n\\
+user@example.com\n\\
+0x1234567890ABCDEF\n\\
+1234567890ABCDEF!\n\\
+group-name\n",
+            path,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selectors,
+            vec![
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+                "0123456789ABCDEF",
+                "DEADBEEF",
+                "user@example.com",
+                "0x1234567890ABCDEF",
+                "1234567890ABCDEF!",
+                "group-name",
+            ]
+        );
+    }
+
+    #[test]
+    fn pass_comment_semantics_preserve_pre_comment_whitespace() {
+        let path = Path::new(".gpg-id");
+        let selectors =
+            parse_gpg_id_selectors("alice@example.com # primary\n# comment\n\n", path).unwrap();
+
+        // password-store's sed expression removes the comment, not whitespace
+        // preceding '#'. GnuPG, not Passless, decides whether the selector works.
+        assert_eq!(selectors, vec!["alice@example.com "]);
+    }
+
+    #[test]
+    fn whitespace_only_recipient_is_forwarded_like_pass() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors("   \n", path).unwrap();
+        assert_eq!(selectors, vec!["   "]);
+    }
+
+    #[test]
+    fn comments_and_empty_lines_without_recipients_fail() {
+        let path = Path::new(".gpg-id");
+        let error = parse_gpg_id_selectors("# comment\n\n# another\n", path).unwrap_err();
+        assert!(error.to_string().contains("No GPG recipients"));
+    }
+
+    #[test]
+    fn invalid_selector_is_not_rejected_by_parser() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors("definitely-not-a-real-recipient\n", path).unwrap();
+        assert_eq!(selectors, vec!["definitely-not-a-real-recipient"]);
+    }
+
+    #[test]
+    fn recipient_order_and_duplicates_are_preserved() {
+        let path = Path::new(".gpg-id");
+        let selectors =
+            parse_gpg_id_selectors("alice@example.com\nbob@example.com\nalice@example.com\n", path)
+                .unwrap();
+        assert_eq!(
+            selectors,
+            vec!["alice@example.com", "bob@example.com", "alice@example.com"]
+        );
+    }
+
+    #[test]
     fn unrelated_subtree_policy_does_not_initialize_scope() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
