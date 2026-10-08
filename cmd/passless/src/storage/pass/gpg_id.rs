@@ -131,9 +131,32 @@ pub fn resolve_recipients_for_target(
 /// handed to GnuPG as a recipient selector. Do not validate or canonicalize
 /// selectors here: GnuPG accepts user IDs, email addresses, key IDs,
 /// fingerprints, groups, and its other recipient forms.
+///
+/// Backslash line continuations are supported: a line ending with `\` is joined
+/// with the next line (the `\` and newline are removed).
 pub fn parse_gpg_id_selectors(content: &str, gpg_id_path: &Path) -> Result<Vec<String>> {
-    let recipients: Vec<String> = content
-        .lines()
+    // First, handle line continuations: join lines ending with '\'
+    let mut joined_lines = Vec::new();
+    let mut current_line = String::new();
+    
+    for line in content.lines() {
+        if line.ends_with('\\') {
+            // Line continues: strip the backslash and accumulate
+            current_line.push_str(&line[..line.len() - 1]);
+        } else {
+            // Line is complete
+            current_line.push_str(line);
+            joined_lines.push(current_line);
+            current_line = String::new();
+        }
+    }
+    // If there's a remaining line (ended with backslash but no following line)
+    if !current_line.is_empty() {
+        joined_lines.push(current_line);
+    }
+    
+    let recipients: Vec<String> = joined_lines
+        .iter()
         .filter_map(|line| {
             let recipient = line.split('#').next().unwrap_or("");
             (!recipient.is_empty()).then(|| recipient.to_string())
