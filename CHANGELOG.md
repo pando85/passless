@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.2](https://github.com/pando85/passless/tree/v0.20.2) - 2026-10-08
+
+### Fixed
+
+- pass: Preserve password-store GPG recipient semantics (#525) ([09a0ad2](https://github.com/pando85/passless/commit/09a0ad2853a9091e1003d037e9b9adcd6899bd9f))
+
+### Build
+
+- deps: Update Rust crate signal-hook to v0.4.5 (#518) ([1b171eb](https://github.com/pando85/passless/commit/1b171ebf9fe22f2f6dfecf79f482b6aa3d6f8e91))
+- deps: Update Rust crate zeroize to v1.9.1 (#520) ([86d000b](https://github.com/pando85/passless/commit/86d000b2bf6fbe70d907e4819ce8ebde4901ac02))
+- deps: Update Rust crate psl to v2.1.240 (#521) ([5ccd03f](https://github.com/pando85/passless/commit/5ccd03f2a49b11dcb86e527a34dac4b7f30a647e))
+- deps: Update Rust crate notify-rust to v4.18.2 (#523) ([be5970b](https://github.com/pando85/passless/commit/be5970b5191a688936d2546de4e6ccdaaf94bab6))
+- deps: Update Rust crate psl to v2.1.241 (#526) ([b1c52f4](https://github.com/pando85/passless/commit/b1c52f494e557ea2393feb096b417c1b15d62aad))
+- deps: Update Rust crate toml to v1.1.7 (#527) ([aa98cec](https://github.com/pando85/passless/commit/aa98cecdae8e4454ba8aa1f7113285024f1b167a))
+
 ## [v0.20.1](https://github.com/pando85/passless/tree/v0.20.1) - 2026-10-03
 
 ### Fixed
