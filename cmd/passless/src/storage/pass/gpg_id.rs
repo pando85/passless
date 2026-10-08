@@ -2,7 +2,7 @@ use passless_core::error::{Error, Result};
 
 use std::path::{Path, PathBuf};
 
-use log::{debug, warn};
+use log::debug;
 
 /// Find the nearest `.gpg-id` file by walking from `target`'s parent
 /// directory up to `store_root`. Returns the path and raw content.
@@ -124,65 +124,77 @@ pub fn resolve_recipients_for_target(
     parse_gpg_id_content(&content, &gpg_id_path)
 }
 
-/// Parse GPG key IDs from .gpg-id file content.
+/// Parse GPG recipient selectors from .gpg-id file content.
 ///
-/// Security properties:
-/// - Strips blank lines, comments (lines starting with `#`) and optional GPG
-///   subkey `!` markers.
-/// - Rejects short 8-character key IDs (insecure).
-/// - Fails when the file contains no usable key IDs.
-pub fn parse_gpg_id_content(content: &str, gpg_id_path: &Path) -> Result<prs_lib::Recipients> {
-    let mut keys: Vec<prs_lib::Key> = Vec::new();
+/// This intentionally matches pass's `set_gpg_recipients` semantics: text after
+/// `#` is a comment, empty entries are ignored, and every remaining value is
+/// handed to GnuPG as a recipient selector. Do not validate or canonicalize
+/// selectors here: GnuPG accepts user IDs, email addresses, key IDs,
+/// fingerprints, groups, and its other recipient forms.
+///
+/// Backslash line continuations are supported: a line ending with `\` is joined
+/// with the next line (the `\` and newline are removed).
+pub fn parse_gpg_id_selectors(content: &str, gpg_id_path: &Path) -> Result<Vec<String>> {
+    // First, handle line continuations: join lines ending with '\'
+    let mut joined_lines = Vec::new();
+    let mut current_line = String::new();
 
     for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        if let Some(stripped) = line.strip_suffix('\\') {
+            // Line continues: strip the backslash and accumulate
+            current_line.push_str(stripped);
+        } else {
+            // Line is complete
+            current_line.push_str(line);
+            joined_lines.push(current_line);
+            current_line = String::new();
         }
-
-        let key_id = trimmed.strip_suffix('!').unwrap_or(trimmed);
-
-        let hex_part = key_id
-            .strip_prefix("0x")
-            .or_else(|| key_id.strip_prefix("0X"))
-            .unwrap_or(key_id);
-
-        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-            warn!(
-                "Non-hex character in GPG key ID '{}' from {:?}, skipping",
-                trimmed, gpg_id_path
-            );
-            continue;
-        }
-
-        if hex_part.len() == 8 {
-            return Err(Error::Storage(format!(
-                "Short 8-character GPG key ID '{}' rejected from .gpg-id at '{}'. \
-                 Use a long key ID (16 hex chars) or full fingerprint (40 hex chars).",
-                trimmed,
-                gpg_id_path.display()
-            )));
-        }
-
-        debug!("Found GPG key ID: {}", trimmed);
-        keys.push(prs_lib::Key::Gpg(prs_lib::crypto::proto::gpg::Key {
-            fingerprint: key_id.to_string(),
-            user_ids: vec![],
-        }));
+    }
+    // If there's a remaining line (ended with backslash but no following line)
+    if !current_line.is_empty() {
+        joined_lines.push(current_line);
     }
 
-    if keys.is_empty() {
+    let recipients: Vec<String> = joined_lines
+        .iter()
+        .filter_map(|line| {
+            let recipient = line.split('#').next().unwrap_or("");
+            (!recipient.is_empty()).then(|| recipient.to_string())
+        })
+        .collect();
+
+    if recipients.is_empty() {
         return Err(Error::Storage(format!(
-            "No valid GPG key IDs found in .gpg-id file at {:?}",
+            "No GPG recipients found in .gpg-id file at {:?}",
             gpg_id_path
         )));
     }
 
     debug!(
-        "Loaded {} GPG recipient(s) from {:?}",
-        keys.len(),
+        "Loaded {} GPG recipient selector(s) from {:?}",
+        recipients.len(),
         gpg_id_path
     );
+    Ok(recipients)
+}
+
+/// Resolve GPG recipients for prs-lib.
+///
+/// prs-lib models GPG keys using a field named `fingerprint`, but its GnuPG
+/// backend ultimately forwards that value to `gpg --recipient`. Preserve the
+/// selector verbatim so GnuPG, rather than Passless, applies recipient matching
+/// semantics just like pass does.
+pub fn parse_gpg_id_content(content: &str, gpg_id_path: &Path) -> Result<prs_lib::Recipients> {
+    let keys = parse_gpg_id_selectors(content, gpg_id_path)?
+        .into_iter()
+        .map(|selector| {
+            prs_lib::Key::Gpg(prs_lib::crypto::proto::gpg::Key {
+                fingerprint: selector,
+                user_ids: vec![],
+            })
+        })
+        .collect::<Vec<_>>();
+
     Ok(prs_lib::Recipients::from(keys))
 }
 
@@ -254,6 +266,96 @@ mod tests {
 
         assert_eq!(path, root.join(".gpg-id"));
         assert_eq!(content, "ROOT\n");
+    }
+
+    #[test]
+    fn pass_compatible_recipient_selectors_are_preserved() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors(
+            "Jason@zx2c4.com# primary\nDEADBEEF\n0x1234567890ABCDEF!\n# comment\n\n",
+            path,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selectors,
+            vec!["Jason@zx2c4.com", "DEADBEEF", "0x1234567890ABCDEF!",]
+        );
+    }
+
+    #[test]
+    fn pass_recipient_parsing_matches_password_store_boundary() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors(
+            "0123456789ABCDEF0123456789ABCDEF01234567\n\\
+0123456789ABCDEF\n\\
+DEADBEEF\n\\
+user@example.com\n\\
+0x1234567890ABCDEF\n\\
+1234567890ABCDEF!\n\\
+group-name\n",
+            path,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selectors,
+            vec![
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+                "0123456789ABCDEF",
+                "DEADBEEF",
+                "user@example.com",
+                "0x1234567890ABCDEF",
+                "1234567890ABCDEF!",
+                "group-name",
+            ]
+        );
+    }
+
+    #[test]
+    fn pass_comment_semantics_preserve_pre_comment_whitespace() {
+        let path = Path::new(".gpg-id");
+        let selectors =
+            parse_gpg_id_selectors("alice@example.com # primary\n# comment\n\n", path).unwrap();
+
+        // password-store's sed expression removes the comment, not whitespace
+        // preceding '#'. GnuPG, not Passless, decides whether the selector works.
+        assert_eq!(selectors, vec!["alice@example.com "]);
+    }
+
+    #[test]
+    fn whitespace_only_recipient_is_forwarded_like_pass() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors("   \n", path).unwrap();
+        assert_eq!(selectors, vec!["   "]);
+    }
+
+    #[test]
+    fn comments_and_empty_lines_without_recipients_fail() {
+        let path = Path::new(".gpg-id");
+        let error = parse_gpg_id_selectors("# comment\n\n# another\n", path).unwrap_err();
+        assert!(error.to_string().contains("No GPG recipients"));
+    }
+
+    #[test]
+    fn invalid_selector_is_not_rejected_by_parser() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors("definitely-not-a-real-recipient\n", path).unwrap();
+        assert_eq!(selectors, vec!["definitely-not-a-real-recipient"]);
+    }
+
+    #[test]
+    fn recipient_order_and_duplicates_are_preserved() {
+        let path = Path::new(".gpg-id");
+        let selectors = parse_gpg_id_selectors(
+            "alice@example.com\nbob@example.com\nalice@example.com\n",
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            selectors,
+            vec!["alice@example.com", "bob@example.com", "alice@example.com"]
+        );
     }
 
     #[test]
