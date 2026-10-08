@@ -1061,21 +1061,12 @@ printf plaintext
     }
 
     #[test]
-    fn test_parse_rejects_short_key_id() {
+    fn test_parse_accepts_short_key_id_like_pass() {
         let adapter = create_adapter(Path::new("/tmp/test"));
         let dir = Path::new("/tmp/test");
         let content = "DEADBEEF\n";
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
-        assert!(result.is_err(), "short 8-char key ID should be rejected");
-        let err = match result {
-            Err(e) => e.to_string(),
-            _ => unreachable!(),
-        };
-        assert!(
-            err.contains("8-character"),
-            "error should mention 8-char: {}",
-            err
-        );
+        assert!(result.is_ok(), "pass delegates short key IDs to GnuPG");
     }
 
     #[test]
@@ -1117,15 +1108,22 @@ printf plaintext
     }
 
     #[test]
-    fn test_parse_non_hex_chars_skipped() {
+    fn test_parse_accepts_user_id_like_pass() {
         let adapter = create_adapter(Path::new("/tmp/test"));
         let dir = Path::new("/tmp/test");
-        let content = "NOTHEX!!\nABCDEF0123456789ABCDEF0123456789ABCDEF01\n";
+        let content = "Jason@zx2c4.com\n";
         let result = adapter.parse_gpg_id_content(content, &dir.join(".gpg-id"));
-        assert!(
-            result.is_ok(),
-            "non-hex lines should be skipped, valid keys should remain"
-        );
+        assert!(result.is_ok(), "pass accepts GnuPG user ID selectors");
+    }
+
+    #[test]
+    fn test_parse_strips_inline_comments_like_pass() {
+        let selectors = gpg_id::parse_gpg_id_selectors(
+            "Jason@zx2c4.com # primary key\n# comment\n",
+            Path::new("/tmp/test/.gpg-id"),
+        )
+        .unwrap();
+        assert_eq!(selectors, vec!["Jason@zx2c4.com"]);
     }
 
     #[test]
@@ -1243,7 +1241,7 @@ printf plaintext
     }
 
     #[test]
-    fn test_resolve_short_key_id_in_root_fails() {
+    fn test_resolve_short_key_id_in_root_is_delegated_to_gpg() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let target = root.join("fido2/example.com/cred.gpg");
@@ -1254,8 +1252,8 @@ printf plaintext
         let adapter = create_adapter(&root);
         let result = adapter.resolve_recipients_for_target(&target);
         assert!(
-            result.is_err(),
-            "short 8-char key ID in .gpg-id should fail"
+            result.is_ok(),
+            "pass accepts short key IDs and lets GnuPG resolve them"
         );
     }
 
