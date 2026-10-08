@@ -1353,6 +1353,84 @@ printf plaintext
         assert_eq!(found_path, rp_dir.join(".gpg-id"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn gnupg_encrypt_forwards_recipient_selectors_verbatim_and_in_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_gpg = dir.path().join("gpg");
+        let args_file = dir.path().join("args");
+        let output = dir.path().join("credential.gpg");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat >/dev/null\nexit 0\n",
+            args_file.display()
+        );
+        fs::write(&fake_gpg, script).unwrap();
+        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_gpg, permissions).unwrap();
+
+        let recipients = vec![
+            "alice@example.com".to_string(),
+            "DEADBEEF".to_string(),
+            "0x1234567890ABCDEF!".to_string(),
+            "alice@example.com ".to_string(),
+            "group-name".to_string(),
+        ];
+
+        encrypt_with_gnupg_binary(&fake_gpg, &recipients, b"secret", &output).unwrap();
+
+        let args = fs::read_to_string(args_file).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        let forwarded: Vec<&str> = args
+            .windows(2)
+            .filter(|window| window[0] == "--recipient")
+            .map(|window| window[1])
+            .collect();
+
+        assert_eq!(
+            forwarded,
+            vec![
+                "alice@example.com",
+                "DEADBEEF",
+                "0x1234567890ABCDEF!",
+                "alice@example.com ",
+                "group-name",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gnupg_encrypt_propagates_recipient_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_gpg = dir.path().join("gpg");
+        fs::write(
+            &fake_gpg,
+            "#!/bin/sh\ncat >/dev/null\necho 'gpg: error reading key: No public key' >&2\nexit 2\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_gpg, permissions).unwrap();
+
+        let recipients = vec!["definitely-not-a-real-recipient".to_string()];
+        let error = encrypt_with_gnupg_binary(
+            &fake_gpg,
+            &recipients,
+            b"secret",
+            &dir.path().join("credential.gpg"),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("GPG encryption failed"));
+        assert!(message.contains("No public key"));
+    }
+
     #[test]
     fn test_find_nearest_gpg_id_outside_store_fails() {
         let dir = tempfile::tempdir().unwrap();
