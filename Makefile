@@ -2,6 +2,8 @@ CARGO_TARGET_DIR ?= target
 CARGO_TARGET ?= x86_64-unknown-linux-gnu
 PKG_BASE_NAME ?= passless-${CARGO_TARGET}
 PROJECT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' ./Cargo.toml | head -n1)
+# Default to tpm feature only, face feature requires glibc 2.38+
+CARGO_FEATURES ?= tpm
 AGENT_FUZZ_SMOKE_SECS ?= 10
 
 .DEFAULT: help
