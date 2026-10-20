@@ -1863,6 +1863,7 @@ mod tests {
             Some(pin_storage.clone()),
             security_config,
             pin_config,
+            UvConfig::default(),
         )
         .expect("create authenticator service");
 
@@ -1976,6 +1977,7 @@ mod tests {
             user_verification_registration: false,
             user_verification_authentication: false,
             notification_timeout: 30,
+            enable_credential_backup: false,
         };
 
         let pin_config = PinConfig::default();
@@ -2013,6 +2015,7 @@ mod tests {
             user_verification_registration: false,
             user_verification_authentication: false,
             notification_timeout: 30,
+            enable_credential_backup: false,
         };
 
         let pin_config = PinConfig::default();
@@ -2040,6 +2043,7 @@ mod tests {
             None::<Arc<Mutex<()>>>,
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("Service creation should succeed");
 
