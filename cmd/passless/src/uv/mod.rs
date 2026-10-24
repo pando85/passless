@@ -121,11 +121,7 @@ impl From<zbus::Error> for VerificationError {
     }
 }
 
-impl From<zbus::zvariant::Error> for VerificationError {
-    fn from(err: zbus::zvariant::Error) -> Self {
-        VerificationError::DeviceError(format!("D-Bus variant error: {}", err))
-    }
-}
+
 
 /// Context for user verification request
 #[derive(Debug, Clone)]

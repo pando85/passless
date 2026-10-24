@@ -51,7 +51,8 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hex = "0.4"
 shadow-rs = "2.0"
 psl = "2"
-zbus = "5.14"
+zbus = "6.0"
+futures-lite = "2"
 
 # UV provider dependencies
 nokhwa = { version = "0.10", features = ["input-native"] }

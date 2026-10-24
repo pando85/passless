@@ -61,7 +61,7 @@ impl FprintdProvider {
             VerificationError::DeviceError(format!("D-Bus connection failed: {}", e))
         })?;
 
-        let device_path: zbus::zvariant::OwnedObjectPath = conn
+        let device_path: zbus::OwnedObjectPath = conn
             .call_method(
                 Some("net.reactivated.Fprint"),
                 "/net/reactivated/Fprint/Manager",
@@ -104,7 +104,7 @@ impl FprintdProvider {
 
     async fn wait_for_verification(
         conn: &zbus::Connection,
-        device_path: &zbus::zvariant::OwnedObjectPath,
+        device_path: &zbus::OwnedObjectPath,
         timeout_secs: u32,
     ) -> Result<VerificationResult, VerificationError> {
         use futures_util::StreamExt;
@@ -244,7 +244,7 @@ impl FprintdProvider {
                         Ok(reply) => {
                             if let Ok(path) = reply
                                 .body()
-                                .deserialize::<zbus::zvariant::OwnedObjectPath>()
+                                .deserialize::<zbus::OwnedObjectPath>()
                             {
                                 info!("fprintd device available at: {:?}", path);
                                 true

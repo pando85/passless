@@ -54,6 +54,7 @@ libc.workspace = true
 nix.workspace = true
 notify-rust.workspace = true
 zbus.workspace = true
+futures-lite.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 ctrlc.workspace = true
@@ -100,7 +101,7 @@ serde.workspace = true
 serde_json.workspace = true
 passless-config-doc.workspace = true
 zbus = { workspace = true, features = ["tokio"] }
-tokio = { version = "1.0", features = ["rt", "macros", "time", "sync"] }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 
 [build-dependencies]
 passless-core.workspace = true

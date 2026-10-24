@@ -504,7 +504,7 @@ pub fn query_server_capabilities() -> ServerCapability {
 }
 
 fn resolve_notification_server_unique_name() -> Result<String, PromptError> {
-    let conn = zbus::blocking::Connection::session().map_err(|e| {
+    let conn = zbus::block_on(zbus::Connection::session()).map_err(|e| {
         warn!(
             "Prompt: failed to connect to session bus for sender validation: {}",
             e
@@ -514,23 +514,22 @@ fn resolve_notification_server_unique_name() -> Result<String, PromptError> {
         }
     })?;
 
-    let reply = conn
-        .call_method(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "GetNameOwner",
-            &NOTIFICATIONS_WELL_KNOWN_NAME,
-        )
-        .map_err(|e| {
-            warn!(
-                "Prompt: failed to resolve notification server unique name: {}",
-                e
-            );
-            PromptError {
-                kind: PromptErrorKind::NotificationUnsupported,
-            }
-        })?;
+    let reply = zbus::block_on(conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "GetNameOwner",
+        &NOTIFICATIONS_WELL_KNOWN_NAME,
+    ))
+    .map_err(|e| {
+        warn!(
+            "Prompt: failed to resolve notification server unique name: {}",
+            e
+        );
+        PromptError {
+            kind: PromptErrorKind::NotificationUnsupported,
+        }
+    })?;
 
     let unique_name: String = reply.body().deserialize().map_err(|e| {
         warn!("Prompt: failed to deserialize GetNameOwner reply: {}", e);
@@ -553,7 +552,7 @@ fn wait_for_validated_action(
     notification_id: u32,
     timeout: Duration,
 ) -> ValidatedAction {
-    let conn = match zbus::blocking::Connection::session() {
+    let conn = match zbus::block_on(zbus::Connection::session()) {
         Ok(c) => c,
         Err(e) => {
             warn!(
@@ -567,17 +566,23 @@ fn wait_for_validated_action(
     let rule = match zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .sender(server_unique_name)
-        .and_then(|b| b.interface(NOTIFICATIONS_IFACE))
+        .interface(NOTIFICATIONS_IFACE)
+        .build()
     {
-        Ok(builder) => builder.build(),
+        Ok(rule) => rule,
         Err(e) => {
             warn!("Prompt: failed to build match rule: {}", e);
             return ValidatedAction::Closed;
         }
     };
 
-    let mut iter = match zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(16)) {
-        Ok(iter) => iter,
+    let max_queued = std::num::NonZeroUsize::new(16).unwrap();
+    let stream = match zbus::block_on(zbus::MessageStream::for_match_rule(
+        rule,
+        &conn,
+        Some(max_queued),
+    )) {
+        Ok(s) => s,
         Err(e) => {
             warn!("Prompt: failed to subscribe to signals: {}", e);
             return ValidatedAction::Closed;
@@ -589,49 +594,53 @@ fn wait_for_validated_action(
 
     let server_unique_name_owned = server_unique_name.to_string();
     let thread = std::thread::spawn(move || {
-        for msg in &mut iter {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let header = msg.header();
-            let sender = match header.sender() {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            if sender != server_unique_name_owned {
-                debug!(
-                    "Prompt: rejecting signal from unexpected sender: {}",
-                    sender
-                );
-                continue;
-            }
-            let member = match header.member() {
-                Some(m) => m.to_string(),
-                None => continue,
-            };
-            match member.as_str() {
-                "ActionInvoked" => {
-                    let body: Result<(u32, String), _> = msg.body().deserialize();
-                    if let Ok((id, action_key)) = body
-                        && id == notification_id
-                    {
-                        let _ = tx.send(ValidatedAction::Action(action_key));
-                        return;
-                    }
+        zbus::block_on(async {
+            use futures_lite::StreamExt;
+            let mut stream = std::pin::pin!(stream);
+            while let Some(msg_result) = stream.next().await {
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let header = msg.header();
+                let sender = match header.sender() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                if sender != server_unique_name_owned {
+                    debug!(
+                        "Prompt: rejecting signal from unexpected sender: {}",
+                        sender
+                    );
+                    continue;
                 }
-                "NotificationClosed" => {
-                    let body: Result<(u32, u32), _> = msg.body().deserialize();
-                    if let Ok((id, _reason)) = body
-                        && id == notification_id
-                    {
-                        let _ = tx.send(ValidatedAction::Closed);
-                        return;
+                let member = match header.member() {
+                    Some(m) => m.to_string(),
+                    None => continue,
+                };
+                match member.as_str() {
+                    "ActionInvoked" => {
+                        let body: Result<(u32, String), _> = msg.body().deserialize();
+                        if let Ok((id, action_key)) = body
+                            && id == notification_id
+                        {
+                            let _ = tx.send(ValidatedAction::Action(action_key));
+                            return;
+                        }
                     }
+                    "NotificationClosed" => {
+                        let body: Result<(u32, u32), _> = msg.body().deserialize();
+                        if let Ok((id, _reason)) = body
+                            && id == notification_id
+                        {
+                            let _ = tx.send(ValidatedAction::Closed);
+                            return;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
+        });
     });
 
     let now = Instant::now();
@@ -1637,7 +1646,7 @@ mod dbus_tests {
             summary: &str,
             body: &str,
             actions: Vec<String>,
-            _hints: HashMap<String, zbus::zvariant::Value<'_>>,
+            _hints: HashMap<String, zbus::Variant<'_>>,
             expire_timeout: i32,
         ) -> zbus::fdo::Result<u32> {
             let mut state = self.state.lock().unwrap();
@@ -1817,11 +1826,8 @@ mod dbus_tests {
         let timeout_result = tokio::time::timeout(Duration::from_secs(TEST_TIMEOUT_SECS), async {
             let (service, state, notify_ready) = TestNotificationService::new(server_kind);
             let conn = Builder::session()
-                .unwrap()
                 .name("org.freedesktop.Notifications")
-                .unwrap()
                 .serve_at("/org/freedesktop/Notifications", service)
-                .unwrap()
                 .build()
                 .await
                 .unwrap();
