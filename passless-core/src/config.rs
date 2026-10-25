@@ -104,6 +104,20 @@ pub struct PassBackendConfig {
     #[serde(default)]
     #[default(true)]
     pub git_sync: bool,
+
+    /// Automatically push password-store Git commits to the remote (default: true).
+    /// When disabled, Git sync still pulls and commits changes locally.
+    #[arg(
+        long = "pass-git-auto-push",
+        env = "PASSLESS_PASS_GIT_AUTO_PUSH",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub git_auto_push: bool,
 }
 
 /// Compute default TPM storage path
