@@ -503,7 +503,7 @@ mod tests {
             "Git commit-only finalization failed"
         );
         let commit = repository.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(commit.message(), Some("Update credential\n"));
+        assert_eq!(commit.message(), Ok("Update credential\n"));
         assert_ne!(commit.id(), seed, "the change must be committed locally");
         assert_eq!(
             remote.find_reference(&remote_ref).unwrap().target(),
