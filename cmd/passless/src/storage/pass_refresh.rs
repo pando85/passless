@@ -52,6 +52,7 @@ impl PassStorageAdapter {
             gpg_backend,
             allow_create_without_prompt,
             true,
+            true,
         )
     }
 
@@ -61,6 +62,7 @@ impl PassStorageAdapter {
         gpg_backend: GpgBackend,
         allow_create_without_prompt: bool,
         git_sync: bool,
+        git_auto_push: bool,
     ) -> Result<Self> {
         let inner = InnerPassStorageAdapter::new_with_options(
             store_path.clone(),
@@ -69,7 +71,7 @@ impl PassStorageAdapter {
             allow_create_without_prompt,
         )?;
         let indexed_generation = repository_generation(&store_path, &path);
-        let sync = PassGitSync::new(store_path.clone(), git_sync);
+        let sync = PassGitSync::new(store_path.clone(), git_sync, git_auto_push);
 
         let mut adapter = Self {
             inner,

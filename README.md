@@ -206,6 +206,23 @@ passless config print > ~/.config/passless/config.toml
 You can then edit this file to customize the storage backend, security settings, and other options.
 Command-line arguments will override settings from the configuration file.
 
+### Password-store Git synchronization
+
+By default, the `pass` backend pulls changes, creates local Git commits, and pushes those commits
+when a remote is configured. To retain automatic pulls and local commits but **disable automatic
+pushes**, configure:
+
+```toml
+[pass]
+git_sync = true
+git_auto_push = false
+```
+
+The default is `git_auto_push = true` when the setting is omitted, preserving existing behavior.
+You can also use `--pass-git-auto-push=false` or `PASSLESS_PASS_GIT_AUTO_PUSH=false`.
+With automatic pushes disabled, use `git -C ~/.password-store push` when you want to publish
+local commits. Setting `git_sync = false` instead disables automatic pull and commit as well.
+
 ### Headless automatic interaction
 
 By default, Passless uses the desktop notification service when a WebAuthn operation needs local

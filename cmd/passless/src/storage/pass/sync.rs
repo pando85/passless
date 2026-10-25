@@ -30,6 +30,7 @@ pub struct PassGitSync {
 struct SyncState {
     store_path: PathBuf,
     enabled: bool,
+    auto_push: bool,
     depth: usize,
     prepared: bool,
     dirty: bool,
@@ -37,11 +38,12 @@ struct SyncState {
 }
 
 impl PassGitSync {
-    pub fn new(store_path: PathBuf, enabled: bool) -> Self {
+    pub fn new(store_path: PathBuf, enabled: bool, auto_push: bool) -> Self {
         Self {
             state: Arc::new(Mutex::new(SyncState {
                 store_path,
                 enabled,
+                auto_push,
                 depth: 0,
                 prepared: false,
                 dirty: false,
@@ -131,7 +133,7 @@ impl PassGitSync {
     }
 
     /// Finish a logical operation. The outermost operation produces at most one
-    /// Git commit and push, irrespective of how many credential/PIN writes occurred.
+    /// Git commit (and optionally push), irrespective of how many writes occurred.
     pub fn end_operation(&self) {
         let Ok(mut state) = self.state.lock() else {
             warn!("Failed to acquire pass Git sync lock while ending operation");
@@ -168,7 +170,7 @@ impl PassGitSync {
             _ => "Update Passless authenticator state.".to_string(),
         };
 
-        match Self::finalize_store(&state.store_path, &message) {
+        match Self::finalize_store(&state.store_path, &message, state.auto_push) {
             Ok(()) => {
                 state.dirty = false;
                 state.messages.clear();
@@ -250,8 +252,23 @@ impl PassGitSync {
             .map_err(|error| format!("prepare failed: {error:?}"))
     }
 
-    fn finalize_store(store_path: &Path, message: &str) -> Result<(), String> {
+    fn finalize_store(store_path: &Path, message: &str, auto_push: bool) -> Result<(), String> {
         debug!("Finalizing password-store Git sync: {message}");
+
+        if !auto_push {
+            // prs-lib's finalize() always pushes when a remote is configured.
+            // Use its own commit implementation to retain local commits without
+            // reaching any remote or needing the SSH helper.
+            let store = Store::open(store_path.to_string_lossy().as_ref())
+                .map_err(|error| format!("failed to open store: {error:?}"))?;
+            let sync = store.sync();
+            return if sync.is_init() {
+                sync.commit_all(message, false)
+                    .map_err(|error| format!("commit failed: {error:?}"))
+            } else {
+                Ok(())
+            };
+        }
         if let Some(ssh_auth_sock) = configured_ssh_auth_sock() {
             return run_sync_helper(
                 store_path,
@@ -362,7 +379,7 @@ mod tests {
     #[test]
     fn nested_operations_do_not_finalize_inner_boundary() {
         let temp = tempfile::tempdir().unwrap();
-        let sync = PassGitSync::new(temp.path().to_path_buf(), true);
+        let sync = PassGitSync::new(temp.path().to_path_buf(), true, true);
 
         sync.begin_operation();
         sync.begin_operation();
@@ -380,7 +397,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
         let local = temp.path().join("fido2/pin_retries.local.gpg");
-        let sync = PassGitSync::new(temp.path().to_path_buf(), false);
+        let sync = PassGitSync::new(temp.path().to_path_buf(), false, true);
 
         sync.ensure_local_only_path(&local);
 
@@ -390,6 +407,34 @@ mod tests {
                 .lines()
                 .any(|line| line == "/fido2/pin_retries.local.gpg")
         );
+    }
+
+    #[test]
+    fn commit_only_mode_never_pushes_to_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("password-store");
+        let remote_path = temp.path().join("remote.git");
+        let repository = Repository::init(&store_path).unwrap();
+        let remote = Repository::init_bare(&remote_path).unwrap();
+        repository
+            .remote("origin", remote_path.to_str().unwrap())
+            .unwrap();
+        let mut config = repository.config().unwrap();
+        config.set_str("user.name", "Passless Test").unwrap();
+        config
+            .set_str("user.email", "passless@example.invalid")
+            .unwrap();
+
+        fs::write(store_path.join("credential.gpg"), b"test encrypted bytes").unwrap();
+        let sync = PassGitSync::new(store_path, true, false);
+        sync.begin_operation();
+        sync.mark_dirty("Update credential");
+        sync.end_operation();
+
+        assert!(!sync.state.lock().unwrap().dirty);
+        let commit = repository.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.message(), Some("Update credential"));
+        assert!(remote.head().is_err(), "commit-only mode must not push");
     }
 
     #[test]
