@@ -432,7 +432,10 @@ mod tests {
                 .env(CHILD, "1")
                 .env("PATH", std::env::join_paths(git_paths).unwrap())
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
                 .env_remove(PASS_GIT_SSH_AUTH_SOCK_ENV)
                 .output()
                 .unwrap();
@@ -468,7 +471,14 @@ mod tests {
         let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
         let signature = git2::Signature::now("Passless Test", "passless@example.invalid").unwrap();
         let seed = repository
-            .commit(Some("HEAD"), &signature, &signature, "Initial store", &tree, &[])
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "Initial store",
+                &tree,
+                &[],
+            )
             .unwrap();
         let branch = repository.head().unwrap().shorthand().unwrap().to_string();
         repository
@@ -477,7 +487,10 @@ mod tests {
             .push(&[format!("refs/heads/{branch}:refs/heads/{branch}")], None)
             .unwrap();
         let remote_ref = format!("refs/heads/{branch}");
-        assert_eq!(remote.find_reference(&remote_ref).unwrap().target(), Some(seed));
+        assert_eq!(
+            remote.find_reference(&remote_ref).unwrap().target(),
+            Some(seed)
+        );
 
         fs::write(store_path.join("credential.gpg"), b"test encrypted bytes").unwrap();
         let sync = PassGitSync::new(store_path.clone(), true, false);
@@ -485,7 +498,10 @@ mod tests {
         sync.mark_dirty("Update credential");
         sync.end_operation();
 
-        assert!(!sync.state.lock().unwrap().dirty, "Git commit-only finalization failed");
+        assert!(
+            !sync.state.lock().unwrap().dirty,
+            "Git commit-only finalization failed"
+        );
         let commit = repository.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(commit.message(), Some("Update credential\n"));
         assert_ne!(commit.id(), seed, "the change must be committed locally");
