@@ -241,6 +241,8 @@ git_auto_push = true  # This isolated agent still pushes
 
 A `same-user` agent shares the human backend and follows `[pass]`. See
 [agent storage configuration](docs/agents/configuration.md#storage-backends) for details.
+Because a Git push publishes all reachable commits, use **separate Git repositories**
+for human and isolated-agent stores when you need strict push isolation.
 
 ### Headless automatic interaction
 

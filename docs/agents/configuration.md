@@ -224,6 +224,12 @@ commits, and pushes for that profile. These options are independent of the top-l
 for isolated agents, and vice versa. A `same-user` profile uses the human backend
 and therefore follows the global `[pass]` settings instead.
 
+**Git repository boundaries matter:** these flags control whether each backend initiates a
+push, not which commits are included. If the human backend and an isolated agent share
+the same Git repository, a push from either backend can publish the other's unpushed
+commits. Use separate Git repositories (distinct `store_path` roots) when pushes must
+be isolated between human credentials and agent credentials.
+
 ## Device identity
 
 Isolated profiles require a complete, unique UHID device identity:
