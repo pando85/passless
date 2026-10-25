@@ -433,7 +433,7 @@ mod tests {
 
         assert!(!sync.state.lock().unwrap().dirty);
         let commit = repository.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(commit.message(), Some("Update credential"));
+        assert_eq!(commit.message(), Ok("Update credential\n"));
         assert!(remote.head().is_err(), "commit-only mode must not push");
     }
 

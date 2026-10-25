@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn cached_pin_configuration_avoids_storage_load() {
         let temp = tempfile::tempdir().unwrap();
-        let sync = PassGitSync::new(temp.path().to_path_buf(), false);
+        let sync = PassGitSync::new(temp.path().to_path_buf(), false, false);
         let storage = PassPinStorage::new_with_sync(
             temp.path().to_path_buf(),
             PathBuf::from("fido2"),
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn retry_state_version_and_timestamp_churn_do_not_change_synced_config() {
         let temp = tempfile::tempdir().unwrap();
-        let sync = PassGitSync::new(temp.path().to_path_buf(), false);
+        let sync = PassGitSync::new(temp.path().to_path_buf(), false, false);
         let storage = PassPinStorage::new_with_sync(
             temp.path().to_path_buf(),
             PathBuf::from("fido2"),
