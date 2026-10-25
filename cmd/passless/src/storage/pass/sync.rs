@@ -411,6 +411,40 @@ mod tests {
 
     #[test]
     fn commit_only_mode_never_pushes_to_remote() {
+        const CHILD: &str = "PASSLESS_GIT_SYNC_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // prs-lib executes the external git binary. Other unit tests temporarily
+            // replace the process-wide PATH, so exercise Git in a separate process.
+            let binary = std::env::current_exe().unwrap();
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut git_paths = vec![
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/opt/local/bin"),
+            ];
+            git_paths.extend(std::env::split_paths(&path));
+            let output = Command::new(binary)
+                .arg("--exact")
+                .arg("storage::pass::sync::tests::commit_only_mode_never_pushes_to_remote")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("PATH", std::env::join_paths(git_paths).unwrap())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .env_remove(PASS_GIT_SSH_AUTH_SOCK_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated commit-only Git test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let store_path = temp.path().join("password-store");
         let remote_path = temp.path().join("remote.git");
@@ -425,16 +459,41 @@ mod tests {
             .set_str("user.email", "passless@example.invalid")
             .unwrap();
 
+        // Seed an actual remote branch. Checking an initially empty bare remote
+        // would not detect an accidental push to an unexpected branch.
+        fs::write(store_path.join(".gpg-id"), b"test@example.invalid\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new(".gpg-id")).unwrap();
+        index.write().unwrap();
+        let tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("Passless Test", "passless@example.invalid").unwrap();
+        let seed = repository
+            .commit(Some("HEAD"), &signature, &signature, "Initial store", &tree, &[])
+            .unwrap();
+        let branch = repository.head().unwrap().shorthand().unwrap().to_string();
+        repository
+            .find_remote("origin")
+            .unwrap()
+            .push(&[format!("refs/heads/{branch}:refs/heads/{branch}")], None)
+            .unwrap();
+        let remote_ref = format!("refs/heads/{branch}");
+        assert_eq!(remote.find_reference(&remote_ref).unwrap().target(), Some(seed));
+
         fs::write(store_path.join("credential.gpg"), b"test encrypted bytes").unwrap();
-        let sync = PassGitSync::new(store_path, true, false);
+        let sync = PassGitSync::new(store_path.clone(), true, false);
         sync.begin_operation();
         sync.mark_dirty("Update credential");
         sync.end_operation();
 
-        assert!(!sync.state.lock().unwrap().dirty);
+        assert!(!sync.state.lock().unwrap().dirty, "Git commit-only finalization failed");
         let commit = repository.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(commit.message(), Ok("Update credential\n"));
-        assert!(remote.head().is_err(), "commit-only mode must not push");
+        assert_eq!(commit.message(), Some("Update credential\n"));
+        assert_ne!(commit.id(), seed, "the change must be committed locally");
+        assert_eq!(
+            remote.find_reference(&remote_ref).unwrap().target(),
+            Some(seed),
+            "commit-only mode must leave the remote branch unchanged"
+        );
     }
 
     #[test]
