@@ -28,8 +28,92 @@ fn valid_minimal_toml_loads_with_defaults() {
     let path = write_config(dir.path(), r#"backend_type = "local""#);
     let config = load_from_file(&path).unwrap();
     assert_eq!(config.backend_type, "local");
+    assert!(config.pass.git_sync);
+    assert!(config.pass.git_auto_push);
     assert!(config.security.always_uv);
     assert_eq!(config.pin.min_length, 4);
+}
+
+#[test]
+fn pass_git_auto_push_false_preserves_git_sync() {
+    let dir = tempdir().unwrap();
+    let path = write_config(dir.path(), "[pass]\ngit_auto_push = false\n");
+    let config = load_from_file(&path).unwrap();
+    assert!(config.pass.git_sync);
+    assert!(!config.pass.git_auto_push);
+}
+
+#[cfg(feature = "agent")]
+#[test]
+fn isolated_agent_has_independent_pass_git_configuration() {
+    use passless_core::agent::AgentStorageConfig;
+
+    let dir = tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        r#"
+[pass]
+git_sync = false
+git_auto_push = false
+
+[agents]
+enabled = false
+
+[agents.profiles.bot]
+mode = "isolated"
+principal_user = "agent"
+
+[agents.profiles.bot.storage.pass]
+store_path = "/tmp/agent-password-store"
+path = "fido2"
+pin_path = "pin"
+git_sync = true
+git_auto_push = true
+"#,
+    );
+    let config = load_from_file(&path).unwrap();
+    assert!(!config.pass.git_sync);
+    assert!(!config.pass.git_auto_push);
+    let profile = config.agents.profiles.get("bot").unwrap();
+    match profile.storage.as_ref().unwrap() {
+        AgentStorageConfig::Pass {
+            git_sync,
+            git_auto_push,
+            ..
+        } => {
+            assert!(*git_sync);
+            assert!(*git_auto_push);
+        }
+        other => panic!("expected isolated pass backend, got {other:?}"),
+    }
+}
+
+#[test]
+fn cli_can_override_git_auto_push_in_config_file() {
+    let dir = tempdir().unwrap();
+    let path = write_config(dir.path(), "[pass]\ngit_auto_push = false\n");
+    let mut args = Args::try_parse_from([
+        "passless",
+        "--config-path",
+        &path.display().to_string(),
+        "--pass-git-auto-push=true",
+    ])
+    .unwrap();
+    let config = AppConfig::load(&mut args).unwrap();
+    assert!(config.pass.git_auto_push);
+}
+
+#[test]
+fn cli_can_disable_git_auto_push() {
+    let mut args = Args::try_parse_from([
+        "passless",
+        "--config-path",
+        "/nonexistent/path/config.toml",
+        "--pass-git-auto-push=false",
+    ])
+    .unwrap();
+    let config = AppConfig::load(&mut args).unwrap();
+    assert!(!config.pass.git_auto_push);
 }
 
 #[test]
@@ -212,6 +296,9 @@ fn config_print_produces_valid_toml() {
     let toml_str = config.to_toml_with_comments();
     assert!(toml_str.contains("backend_type"));
     assert!(toml_str.contains("[security]"));
+    let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
+    assert_eq!(parsed["pass"]["git_auto_push"].as_bool(), Some(true));
+    assert!(toml_str.contains("git_auto_push = true"));
     assert!(toml_str.contains("[pin]"));
 }
 

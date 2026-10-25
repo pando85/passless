@@ -467,6 +467,7 @@ fn run() -> Result<()> {
     })?;
 
     let pass_git_sync = config.pass.git_sync;
+    let pass_git_auto_push = config.pass.git_auto_push;
 
     #[cfg(feature = "agent")]
     let agent_enabled = config.agents.enabled;
@@ -604,6 +605,7 @@ fn run() -> Result<()> {
                         gpg_backend,
                         allow_storage_creation,
                         pass_git_sync,
+                        pass_git_auto_push,
                     )?;
                     let pass_sync = storage.sync_handle();
                     let boxed: Box<dyn CredentialStorage> = Box::new(storage);
@@ -817,6 +819,7 @@ fn run() -> Result<()> {
                     gpg_backend,
                     allow_storage_creation,
                     pass_git_sync,
+                    pass_git_auto_push,
                 )?;
                 let pass_sync = storage.sync_handle();
                 let pin_storage = PassPinStorage::new_with_sync(

@@ -52,6 +52,7 @@ fn config_print_exits_zero() {
     assert!(stdout.contains("backend_type"));
     assert!(stdout.contains("[security]"));
     assert!(stdout.contains("[pin]"));
+    assert!(stdout.contains("git_auto_push = true"));
 }
 
 #[test]
