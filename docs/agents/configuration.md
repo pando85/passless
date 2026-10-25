@@ -204,6 +204,8 @@ store_path = "/path/to/password-store"
 path = "agent/<profile>"
 gpg_backend = "gnupg-bin"
 pin_path = "agent/<profile>-pin"
+git_sync = true
+git_auto_push = false
 
 # TPM, when compiled with TPM support
 [agents.profiles.<id>.storage.tpm]
@@ -212,6 +214,15 @@ tcti = "device:/dev/tpmrm0"
 pin_path = "/var/lib/passless-agent/<profile>/pin"
 portable = false
 ```
+
+For an isolated profile using `storage.pass`, `git_sync` and `git_auto_push` are
+**profile-specific** and both default to `true` when omitted. Setting
+`git_auto_push = false` keeps automatic pulls and local commits but prevents automatic
+pushes for that profile. Setting `git_sync = false` disables automatic Git pulls,
+commits, and pushes for that profile. These options are independent of the top-level
+`[pass]` settings: disabling pushes for the human backend does **not** disable them
+for isolated agents, and vice versa. A `same-user` profile uses the human backend
+and therefore follows the global `[pass]` settings instead.
 
 ## Device identity
 

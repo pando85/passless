@@ -293,16 +293,20 @@ pub fn create_storage_bundle_with_options(
             ref path,
             ref gpg_backend,
             ref pin_path,
+            git_sync,
+            git_auto_push,
         } => {
             let gpg = gpg_backend.parse::<GpgBackend>().map_err(|e| {
                 Error::Storage(format!("invalid GPG backend '{}': {}", gpg_backend, e))
             })?;
 
-            let cred_storage = crate::storage::PassStorageAdapter::new_with_options(
+            let cred_storage = crate::storage::PassStorageAdapter::new_with_options_and_git_sync(
                 store_path.clone(),
                 PathBuf::from(path),
                 gpg,
                 allow_create_without_prompt,
+                git_sync,
+                git_auto_push,
             )
             .map_err(|e| {
                 Error::Storage(format!(
@@ -881,6 +885,8 @@ mod tests {
             path: "fido2".to_string(),
             gpg_backend: "gnupg-bin".to_string(),
             pin_path: PathBuf::from("/absolute/pin"),
+            git_sync: true,
+            git_auto_push: true,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -894,6 +900,8 @@ mod tests {
             path: "fido2".to_string(),
             gpg_backend: "gnupg-bin".to_string(),
             pin_path: PathBuf::from("../escape"),
+            git_sync: true,
+            git_auto_push: true,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -911,6 +919,8 @@ mod tests {
             path: "fido2".to_string(),
             gpg_backend: "gnupg-bin".to_string(),
             pin_path: PathBuf::from("pin"),
+            git_sync: true,
+            git_auto_push: true,
         };
         let pin_path = config.pin_state_path();
         let expected = passless_core::BackendConfig::canonicalize_path(&store.join("pin"));
@@ -2088,6 +2098,8 @@ mod tests {
                 path: "fido2".to_string(),
                 gpg_backend: "gnupg-bin".to_string(),
                 pin_path: PathBuf::from("pin"),
+                git_sync: true,
+                git_auto_push: true,
             };
 
             let _gpg_home_guard = unsafe { ProcessEnvGuard::set("GNUPGHOME", &gpg_home) };

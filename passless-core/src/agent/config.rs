@@ -370,6 +370,10 @@ fn default_gpg_backend() -> String {
     "gnupg-bin".to_string()
 }
 
+fn default_git_enabled() -> bool {
+    true
+}
+
 #[cfg(feature = "tpm")]
 fn default_tcti() -> String {
     "device:/dev/tpmrm0".to_string()
@@ -388,6 +392,12 @@ pub enum AgentStorageConfig {
         #[serde(default = "default_gpg_backend")]
         gpg_backend: String,
         pin_path: PathBuf,
+        /// Synchronize this isolated agent's pass store (independent of [pass]).
+        #[serde(default = "default_git_enabled")]
+        git_sync: bool,
+        /// Push this isolated agent's Git commits (independent of [pass]).
+        #[serde(default = "default_git_enabled")]
+        git_auto_push: bool,
     },
     #[cfg(feature = "tpm")]
     Tpm {
@@ -2732,6 +2742,8 @@ store_path = "/home/user/.password-store"
 path = "fido2/ci"
 gpg_backend = "gpgme"
 pin_path = "pin"
+git_sync = true
+git_auto_push = false
 "#;
         let config: AgentConfig = toml::from_str(toml_str).unwrap();
         let profile = config.profiles.get("ci").unwrap();
@@ -2741,14 +2753,21 @@ pin_path = "pin"
                 path,
                 gpg_backend,
                 pin_path,
+                git_sync,
+                git_auto_push,
             }) => {
                 assert_eq!(store_path, &PathBuf::from("/home/user/.password-store"));
                 assert_eq!(path, "fido2/ci");
                 assert_eq!(gpg_backend, "gpgme");
                 assert_eq!(pin_path, &PathBuf::from("pin"));
+                assert!(*git_sync);
+                assert!(!*git_auto_push);
             }
             other => panic!("expected Pass storage, got: {:?}", other),
         }
+        let serialized = toml::to_string(&config).unwrap();
+        let decoded: AgentConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(serialized, toml::to_string(&decoded).unwrap());
     }
 
     #[test]
@@ -2777,8 +2796,15 @@ pin_path = "pin"
         let config: AgentConfig = toml::from_str(toml_str).unwrap();
         let profile = config.profiles.get("ci").unwrap();
         match &profile.storage {
-            Some(AgentStorageConfig::Pass { gpg_backend, .. }) => {
+            Some(AgentStorageConfig::Pass {
+                gpg_backend,
+                git_sync,
+                git_auto_push,
+                ..
+            }) => {
                 assert_eq!(gpg_backend, "gnupg-bin");
+                assert!(*git_sync);
+                assert!(*git_auto_push);
             }
             other => panic!("expected Pass storage, got: {:?}", other),
         }
@@ -2884,6 +2910,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             path: "fido2".to_string(),
             gpg_backend: "gnupg-bin".to_string(),
             pin_path: PathBuf::from("pin"),
+            git_sync: true,
+            git_auto_push: true,
         };
         let backend = storage.to_backend_config();
         match backend {
@@ -3011,6 +3039,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             path: "fido2".to_string(),
             gpg_backend: "gnupg-bin".to_string(),
             pin_path: PathBuf::from("pin"),
+            git_sync: true,
+            git_auto_push: true,
         };
         assert_eq!(format!("{}", pass), "pass");
     }
@@ -3178,6 +3208,8 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             path: "fido2".to_string(),
             gpg_backend: "gnupg-bin".to_string(),
             pin_path: PathBuf::from("pin"),
+            git_sync: true,
+            git_auto_push: true,
         };
         let cred_path = storage.credential_state_path();
         let expected = crate::config::BackendConfig::canonicalize_path(&store.join("fido2"));

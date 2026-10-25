@@ -223,6 +223,25 @@ You can also use `--pass-git-auto-push=false` or `PASSLESS_PASS_GIT_AUTO_PUSH=fa
 With automatic pushes disabled, use `git -C ~/.password-store push` when you want to publish
 local commits. Setting `git_sync = false` instead disables automatic pull and commit as well.
 
+**Agent profiles use separate Git settings.** An isolated agent with a `pass` backend
+uses `[agents.profiles.<id>.storage.pass]` with its own `git_sync` and
+`git_auto_push` settings (both default to `true`); it does not inherit the global
+`[pass]` values. For example:
+
+```toml
+[pass]
+git_auto_push = false  # Human backend only
+
+[agents.profiles.release-bot.storage.pass]
+store_path = "/home/user/.password-store-agents"
+path = "fido2"
+pin_path = "pin"
+git_auto_push = true  # This isolated agent still pushes
+```
+
+A `same-user` agent shares the human backend and follows `[pass]`. See
+[agent storage configuration](docs/agents/configuration.md#storage-backends) for details.
+
 ### Headless automatic interaction
 
 By default, Passless uses the desktop notification service when a WebAuthn operation needs local

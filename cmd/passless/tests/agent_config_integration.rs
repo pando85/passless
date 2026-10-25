@@ -300,6 +300,8 @@ fn pass_storage_pin_path_absolute_rejected() {
         path: "fido2".into(),
         gpg_backend: "gnupg-bin".into(),
         pin_path: PathBuf::from("/absolute/pin"),
+        git_sync: true,
+        git_auto_push: true,
     };
     let err = storage.validate().unwrap_err();
     assert!(err.to_string().contains("relative subpath"));
@@ -312,6 +314,8 @@ fn pass_storage_pin_path_traversal_rejected() {
         path: "fido2".into(),
         gpg_backend: "gnupg-bin".into(),
         pin_path: PathBuf::from("../escape"),
+        git_sync: true,
+        git_auto_push: true,
     };
     let err = storage.validate().unwrap_err();
     assert!(err.to_string().contains("path traversal"));

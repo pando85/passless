@@ -43,6 +43,51 @@ fn pass_git_auto_push_false_preserves_git_sync() {
     assert!(!config.pass.git_auto_push);
 }
 
+#[cfg(feature = "agent")]
+#[test]
+fn isolated_agent_has_independent_pass_git_configuration() {
+    use passless_core::agent::AgentStorageConfig;
+
+    let dir = tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        r#"
+[pass]
+git_sync = false
+git_auto_push = false
+
+[agents]
+enabled = false
+
+[agents.profiles.bot]
+mode = "isolated"
+principal_user = "agent"
+
+[agents.profiles.bot.storage.pass]
+store_path = "/tmp/agent-password-store"
+path = "fido2"
+pin_path = "pin"
+git_sync = true
+git_auto_push = true
+"#,
+    );
+    let config = load_from_file(&path).unwrap();
+    assert!(!config.pass.git_sync);
+    assert!(!config.pass.git_auto_push);
+    let profile = config.agents.profiles.get("bot").unwrap();
+    match profile.storage.as_ref().unwrap() {
+        AgentStorageConfig::Pass {
+            git_sync,
+            git_auto_push,
+            ..
+        } => {
+            assert!(*git_sync);
+            assert!(*git_auto_push);
+        }
+        other => panic!("expected isolated pass backend, got {other:?}"),
+    }
+}
+
 #[test]
 fn cli_can_override_git_auto_push_in_config_file() {
     let dir = tempdir().unwrap();
