@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.21.0](https://github.com/pando85/passless/tree/v0.21.0) - 2026-10-25
+
+### Added
+
+- pass: Configure automatic Git pushing (fixes #547) (#548) ([a5db941](https://github.com/pando85/passless/commit/a5db9412cc5b7dc6c71043928f011ce4b583d1f2))
+
+### Build
+
+- deps: Update Rust crate toml to v1.1.8 (#529) ([4e420e0](https://github.com/pando85/passless/commit/4e420e081c115122ac16bb13824984dc78ba6513))
+- deps: Update Rust crate syn to v3.0.7 (#530) ([8806a1d](https://github.com/pando85/passless/commit/8806a1d0c3d8b6f44cf70c8fba7ae0685508ce7d))
+- deps: Update Rust crate serde_json to v1.0.152 (#531) ([022b991](https://github.com/pando85/passless/commit/022b991198cb0c27ba4ac390922964b7d2327e50))
+- deps: Update Rust crate syn to v3.0.8 (#533) ([59b5e72](https://github.com/pando85/passless/commit/59b5e72824cbb1c116d7f4b6dbaeb96ae49e348b))
+- deps: Update Rust crate serde_json to v1.0.154 (#532) ([23e6251](https://github.com/pando85/passless/commit/23e625102464617c0dc1423281b5042ef8202bf9))
+- deps: Update Rust crate sha2 to v0.11.1 (#534) ([e889b2e](https://github.com/pando85/passless/commit/e889b2e019643f59524550c840c5944be9ea72e3))
+- deps: Update Rust crate syn to v3.0.9 (#535) ([ea5d9bc](https://github.com/pando85/passless/commit/ea5d9bc8d3aaab6f52cdf8e4cb0c6a97f98a2383))
+- deps: Update Rust crate tokio to v1.53.3 (#536) ([7ccc061](https://github.com/pando85/passless/commit/7ccc0617050ed1a84f5576f57a3e3d3f0aefc5d0))
+- deps: Update Rust crate libc to v0.2.191 (#538) ([aa15d26](https://github.com/pando85/passless/commit/aa15d262991e2b5fc79d81fe80ff84dfe2fbfa34))
+- deps: Update Rust crate psl to v2.1.242 (#540) ([37a6925](https://github.com/pando85/passless/commit/37a692551a3692bf5d2352c272b0ef8bfec22994))
+- deps: Update Rust crate psl to v2.1.243 (#541) ([4e5dfa5](https://github.com/pando85/passless/commit/4e5dfa54c729ec830e29237b39b5bf4de9e366b7))
+- deps: Update Rust crate tokio to v1.54.0 (#542) ([ec36fce](https://github.com/pando85/passless/commit/ec36fce23954f840f49d4128e2c84d5181e5eedf))
+- deps: Update Rust crate psl to v2.1.244 (#543) ([9b45e32](https://github.com/pando85/passless/commit/9b45e32955efa2677bc00baea09cbd4bf9ac68c9))
+- deps: Update Rust crate tokio to v1.54.1 (#544) ([2ac3239](https://github.com/pando85/passless/commit/2ac3239ad70d98c1c41816b4e5369dd03620ff57))
+- deps: Update Rust crate psl to v2.1.245 (#545) ([bc174d1](https://github.com/pando85/passless/commit/bc174d19d126f1e686d73b0e32b8e2a13229057f))
+- deps: Update Rust crate zbus to v6 (#537) ([1cd60f5](https://github.com/pando85/passless/commit/1cd60f5f0829758a2e2e0558bcdb054885e0ed7b))
+- deps: Update Rust crate zbus to v6.1.0 (#546) ([b5e814f](https://github.com/pando85/passless/commit/b5e814ff39f78680164065f23c21a0cee9b7025f))
+
 ## [v0.20.2](https://github.com/pando85/passless/tree/v0.20.2) - 2026-10-08
 
 ### Fixed
