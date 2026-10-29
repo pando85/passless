@@ -69,7 +69,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
 
       - name: Run deterministic agent validation
         run: make test-agent-validation

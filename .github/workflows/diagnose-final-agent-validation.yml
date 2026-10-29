@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
       - uses: Swatinem/rust-cache@v2
       - name: Run deterministic validation with captured output
         id: validation
