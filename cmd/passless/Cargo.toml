@@ -32,6 +32,7 @@ required-features = ["agent"]
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]
+face = ["dep:nokhwa", "dep:face_id", "dep:image"]
 agent = ["passless-core/agent", "passless-uhid"]
 agent-validation = ["agent"]
 
@@ -63,6 +64,7 @@ zeroize.workspace = true
 hex.workspace = true
 shadow-rs.workspace = true
 dirs.workspace = true
+thiserror.workspace = true
 ciborium = "0.2"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 hmac = "0.13"
@@ -77,6 +79,16 @@ aes = { version = "0.9", optional = true }
 cipher = { version = "0.5", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 toml.workspace = true
+
+# UV provider dependencies
+tokio.workspace = true
+which.workspace = true
+futures-util = "0.3"
+
+# Face recognition (optional, heavy dependencies)
+nokhwa = { workspace = true, optional = true }
+face_id = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64 = "0.23"

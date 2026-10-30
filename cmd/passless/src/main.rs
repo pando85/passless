@@ -9,6 +9,7 @@ mod notification;
 mod pin_storage;
 mod storage;
 mod util;
+mod uv;
 mod worker;
 
 use passless_core::{
@@ -193,6 +194,7 @@ fn spawn_agent_runtime(
     agent_config: passless_core::agent::AgentConfig,
     security_config: passless_core::config::SecurityConfig,
     pin_config: passless_core::config::PinConfig,
+    uv_config: passless_core::config::UvConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let shutdown_for_runtime = shutdown.clone();
@@ -207,6 +209,7 @@ fn spawn_agent_runtime(
                 &agent_config,
                 security_config,
                 pin_config,
+                uv_config,
                 shutdown_for_runtime.clone(),
             ) {
                 Ok(runtime) => {
@@ -444,6 +447,12 @@ fn run() -> Result<()> {
         return Err(e);
     }
 
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        error!("Configuration validation failed: {}", e);
+        process::exit(1);
+    }
+
     if config.verbose && log_level != log::LevelFilter::Debug {
         info!("Enabling verbose logging...");
         log::set_max_level(log::LevelFilter::Debug);
@@ -554,6 +563,7 @@ fn run() -> Result<()> {
 
             let security_config = config.security_config();
             let pin_config = config.pin_config();
+            let uv_config = config.uv_config();
             let operation_lock = Arc::new(Mutex::new(()));
             let allow_storage_creation = allow_e2e_storage_creation();
 
@@ -574,6 +584,7 @@ fn run() -> Result<()> {
                         Some(pin_storage.clone()),
                         security_config.clone(),
                         pin_config.clone(),
+                        uv_config.clone(),
                     )?;
 
                     let agent_runtime = spawn_agent_runtime(
@@ -584,6 +595,7 @@ fn run() -> Result<()> {
                         config.agents.clone(),
                         security_config,
                         pin_config,
+                        uv_config,
                         shutdown.clone(),
                     );
 
@@ -624,6 +636,7 @@ fn run() -> Result<()> {
                         Some(pin_storage.clone()),
                         security_config.clone(),
                         pin_config.clone(),
+                        uv_config.clone(),
                     )?;
 
                     let agent_runtime = spawn_agent_runtime(
@@ -634,6 +647,7 @@ fn run() -> Result<()> {
                         config.agents.clone(),
                         security_config,
                         pin_config,
+                        uv_config,
                         shutdown.clone(),
                     );
 
@@ -672,6 +686,7 @@ fn run() -> Result<()> {
                             provider,
                             security_config.clone(),
                             pin_config.clone(),
+                            uv_config.clone(),
                         )?;
 
                         let agent_runtime = spawn_agent_runtime(
@@ -682,6 +697,7 @@ fn run() -> Result<()> {
                             config.agents.clone(),
                             security_config,
                             pin_config,
+                            uv_config,
                             shutdown.clone(),
                         );
 
@@ -707,6 +723,7 @@ fn run() -> Result<()> {
                             Some(pin_storage.clone()),
                             security_config.clone(),
                             pin_config.clone(),
+                            uv_config.clone(),
                         )?;
 
                         let agent_runtime = spawn_agent_runtime(
@@ -717,6 +734,7 @@ fn run() -> Result<()> {
                             config.agents.clone(),
                             security_config,
                             pin_config,
+                            uv_config,
                             shutdown.clone(),
                         );
 
@@ -791,6 +809,9 @@ fn run() -> Result<()> {
         let pin_config = config.pin_config();
         let allow_storage_creation = allow_e2e_storage_creation();
 
+        // Get UV config for biometric verification
+        let uv_config = config.uv_config();
+
         match backend {
             BackendConfig::Local { path } => {
                 let storage = LocalStorageAdapter::new_with_options(
@@ -804,6 +825,7 @@ fn run() -> Result<()> {
                     Some(pin_storage),
                     security_config,
                     pin_config,
+                    uv_config,
                 )?;
                 run_with_service(service, uhid, shutdown)
             }
@@ -834,6 +856,7 @@ fn run() -> Result<()> {
                     Some(pin_storage),
                     security_config,
                     pin_config,
+                    uv_config,
                 )?;
                 run_with_service(service, uhid, shutdown)
             }
@@ -858,6 +881,7 @@ fn run() -> Result<()> {
                         provider,
                         security_config,
                         pin_config,
+                        uv_config,
                     )?;
                     run_with_service(service, uhid, shutdown)
                 } else {
@@ -873,6 +897,7 @@ fn run() -> Result<()> {
                         Some(pin_storage),
                         security_config,
                         pin_config,
+                        uv_config,
                     )?;
                     run_with_service(service, uhid, shutdown)
                 }

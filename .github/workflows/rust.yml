@@ -125,11 +125,11 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cargo build --verbose
+        run: cargo build --verbose --features tpm
 
       - name: Run tests
         shell: bash
-        run: cargo test --verbose
+        run: cargo test --verbose --features tpm
 
       - name: Extract crate information
         shell: bash

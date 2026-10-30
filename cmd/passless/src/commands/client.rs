@@ -378,6 +378,7 @@ fn format_uv_blocked_message(error: &soft_fido2::Error) -> String {
     )
 }
 
+
 /// Fallback to PIN authentication when UV fails
 fn fallback_to_pin_auth(
     transport: &mut Transport,
@@ -896,7 +897,7 @@ pub fn show(output: OutputFormat, device: Option<&str>, credential_id_hex: &str)
 
     let mut transport = open_authenticator(device)?;
 
-    let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
+let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
     // Decode credential ID
     let credential_id = hex::decode(credential_id_hex)
@@ -1046,7 +1047,7 @@ pub fn delete(output: OutputFormat, device: Option<&str>, credential_id_hex: &st
         println!("Deleting credential: {}\n", credential_id_hex);
     }
 
-    let mut transport = open_authenticator(device)?;
+let mut transport = open_authenticator(device)?;
 
     let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
@@ -1102,7 +1103,7 @@ pub fn rename(
         println!("Renaming credential: {}\n", credential_id_hex);
     }
 
-    let mut transport = open_authenticator(device)?;
+let mut transport = open_authenticator(device)?;
 
     let pin_uv_auth = authenticate_for_credential_management_opt(&mut transport, output);
 
