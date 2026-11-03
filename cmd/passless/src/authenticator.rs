@@ -1248,15 +1248,19 @@ impl<
         Ok(())
     }
 
-    /// Resolve PIN configuration for an authorization-sensitive command.
-    /// Unlike the GetInfo policy refresh, errors must not be interpreted as
-    /// "no PIN", which would permit an unauthenticated retry reset.
+    /// Read authoritative PIN state for the privileged UV reset command.
+    ///
+    /// Unlike GetInfo, do not use the cached PIN configuration hint: a
+    /// synchronized password store can acquire a PIN while that cache still
+    /// reports "not configured". Backend failures must fail closed.
     fn pin_configured_for_uv_reset(&self) -> core::result::Result<bool, StatusCode> {
         match &self.pin_storage {
-            Some(storage) => storage
+            Some(storage) => Ok(storage
                 .lock()
                 .map_err(|_| StatusCode::Other)?
-                .is_pin_configured(),
+                .load_pin_state()?
+                .pin_hash
+                .is_some()),
             None => Ok(false),
         }
     }
@@ -1730,13 +1734,18 @@ mod tests {
         }
     }
 
-    /// Models a backend that can load its PIN state but cannot determine
-    /// whether a PIN is configured at the time of an authorization check.
-    struct FailingPinConfigStorage;
+    /// Models a PIN backend that becomes unreadable after initialization.
+    struct FailingPinConfigStorage {
+        fail_load: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl PinStorage for FailingPinConfigStorage {
         fn load_pin_state(&self) -> core::result::Result<PinState, StatusCode> {
-            Ok(pin_state_with_pin())
+            if self.fail_load.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(StatusCode::Other)
+            } else {
+                Ok(pin_state_with_pin())
+            }
         }
 
         fn save_pin_state(&self, _state: &PinState) -> core::result::Result<(), StatusCode> {
@@ -1744,7 +1753,33 @@ mod tests {
         }
 
         fn is_pin_configured(&self) -> core::result::Result<bool, StatusCode> {
-            Err(StatusCode::Other)
+            Ok(true)
+        }
+    }
+
+    /// Simulates a synchronized pass backend with an out-of-date PIN hint.
+    ///
+    /// The hint is suitable for GetInfo but must not authorize a UV reset.
+    struct StalePinConfigStorage {
+        state: Mutex<PinState>,
+        cached_pin_configured: bool,
+    }
+
+    impl PinStorage for StalePinConfigStorage {
+        fn load_pin_state(&self) -> core::result::Result<PinState, StatusCode> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| StatusCode::Other)
+        }
+
+        fn save_pin_state(&self, state: &PinState) -> core::result::Result<(), StatusCode> {
+            *self.state.lock().map_err(|_| StatusCode::Other)? = state.clone();
+            Ok(())
+        }
+
+        fn is_pin_configured(&self) -> core::result::Result<bool, StatusCode> {
+            Ok(self.cached_pin_configured)
         }
     }
 
@@ -2030,7 +2065,10 @@ mod tests {
         std::fs::create_dir_all(&cred_dir).expect("create credential directory");
         let storage = LocalStorageAdapter::new(cred_dir).expect("create credential storage");
 
-        let pin_storage = Arc::new(Mutex::new(FailingPinConfigStorage));
+        let fail_load = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pin_storage = Arc::new(Mutex::new(FailingPinConfigStorage {
+            fail_load: fail_load.clone(),
+        }));
         let mut service = AuthenticatorService::with_pin_storage(
             storage,
             Some(pin_storage),
@@ -2039,6 +2077,9 @@ mod tests {
         )
         .expect("create authenticator service");
 
+        // A backend error after successful startup must not be interpreted as
+        // "no PIN" even when the GetInfo path can still query a cached hint.
+        fail_load.store(true, std::sync::atomic::Ordering::SeqCst);
         let payload = MapBuilder::new()
             .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
             .expect("subcommand")
@@ -2051,6 +2092,145 @@ mod tests {
             .handle(&request, &mut response)
             .expect("handle reset request");
         assert_eq!(response, vec![StatusCode::Other as u8]);
+    }
+
+
+    #[test]
+    fn test_reset_uv_retries_uses_authoritative_pin_state_not_cached_hint() {
+        use soft_fido2_ctap::cbor::MapBuilder;
+
+        // Both directions matter: a newly configured PIN must be enforced,
+        // while a removed PIN must not permanently block the recovery path.
+        for (cached_pin_configured, actual_pin_configured) in [(false, true), (true, false)] {
+            let temp_dir = tempfile::tempdir().expect("create temp directory");
+            let cred_dir = temp_dir.path().join("credentials");
+            std::fs::create_dir_all(&cred_dir).expect("create credential directory");
+            let storage = LocalStorageAdapter::new(cred_dir).expect("create credential storage");
+
+            let mut state = if actual_pin_configured {
+                pin_state_with_pin()
+            } else {
+                PinState::new()
+            };
+            state.uv_retries = 0;
+            let pin_storage = Arc::new(Mutex::new(StalePinConfigStorage {
+                state: Mutex::new(state),
+                cached_pin_configured,
+            }));
+            let mut service = AuthenticatorService::with_pin_storage(
+                storage,
+                Some(pin_storage.clone()),
+                SecurityConfig::default(),
+                PinConfig::default(),
+            )
+            .expect("create authenticator service");
+
+            let payload = MapBuilder::new()
+                .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+                .expect("subcommand")
+                .build()
+                .expect("CBOR payload");
+            let mut request = vec![CMD_PASSLESS_RESET_UV_RETRIES];
+            request.extend_from_slice(&payload);
+            let mut response = Vec::new();
+            service
+                .handle(&request, &mut response)
+                .expect("handle reset request");
+
+            let persisted_retries = pin_storage
+                .lock()
+                .expect("PIN storage lock")
+                .load_pin_state()
+                .expect("load PIN state")
+                .uv_retries;
+            if actual_pin_configured {
+                assert_eq!(response, vec![StatusCode::PuatRequired as u8]);
+                assert_eq!(persisted_retries, 0, "unauthenticated reset changed UV retries");
+            } else {
+                assert_eq!(response, vec![0x00, 0xa1, 0x01, 0x08]);
+                assert_eq!(persisted_retries, 8, "PIN-less recovery was unexpectedly blocked");
+            }
+        }
+    }
+
+    #[test]
+    fn test_reset_uv_retries_without_pin_rejects_partial_or_invalid_auth() {
+        use soft_fido2_ctap::cbor::MapBuilder;
+
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let cred_dir = temp_dir.path().join("credentials");
+        std::fs::create_dir_all(&cred_dir).expect("create credential directory");
+        let storage = LocalStorageAdapter::new(cred_dir).expect("create credential storage");
+
+        let mut state = PinState::new();
+        state.uv_retries = 0;
+        let pin_storage = Arc::new(Mutex::new(TestPinStorage::new(state)));
+        let mut service = AuthenticatorService::with_pin_storage(
+            storage,
+            Some(pin_storage.clone()),
+            SecurityConfig::default(),
+            PinConfig::default(),
+        )
+        .expect("create authenticator service");
+
+        let payloads = [
+            (
+                "protocol only",
+                MapBuilder::new()
+                    .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+                    .expect("subcommand")
+                    .insert(3, 2u8)
+                    .expect("protocol")
+                    .build()
+                    .expect("CBOR payload"),
+            ),
+            (
+                "parameter only",
+                MapBuilder::new()
+                    .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+                    .expect("subcommand")
+                    .insert_bytes(4, &[0u8; 32])
+                    .expect("parameter")
+                    .build()
+                    .expect("CBOR payload"),
+            ),
+            (
+                "bogus complete authorization",
+                MapBuilder::new()
+                    .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+                    .expect("subcommand")
+                    .insert(3, 2u8)
+                    .expect("protocol")
+                    .insert_bytes(4, &[0u8; 32])
+                    .expect("parameter")
+                    .build()
+                    .expect("CBOR payload"),
+            ),
+        ];
+
+        for (case, payload) in payloads {
+            let mut request = vec![CMD_PASSLESS_RESET_UV_RETRIES];
+            request.extend_from_slice(&payload);
+            let mut response = Vec::new();
+            service
+                .handle(&request, &mut response)
+                .expect("handle reset request");
+            assert_ne!(
+                response.first(),
+                Some(&(StatusCode::Success as u8)),
+                "{case} should not bypass authorization checks"
+            );
+            assert_eq!(
+                pin_storage
+                    .lock()
+                    .expect("PIN storage lock")
+                    .load_pin_state()
+                    .expect("load PIN state")
+                    .uv_retries,
+                0,
+                "{case} must not change exhausted UV retries"
+            );
+        }
     }
 
     #[test]
