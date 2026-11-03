@@ -892,6 +892,8 @@ fn test_authenticated_uv_retry_reset_command() {
     let mut transport = connect_to_authenticator().expect("Failed to connect");
     set_pin(&mut transport, "1234").expect("Failed to set PIN");
 
+    let retries_before = get_uv_retries(&mut transport).expect("read initial UV retries");
+
     // A well-formed request that omits PIN authentication must not reset UV
     // retries. The old test sent an empty (invalid) CBOR payload, which was
     // rejected by the parser before reaching the vulnerable authorization path.
@@ -909,6 +911,53 @@ fn test_authenticated_uv_retry_reset_command() {
             )
             .is_err(),
         "PIN-configured UV reset must reject missing authentication"
+    );
+    assert_eq!(
+        get_uv_retries(&mut transport).expect("read UV retries after missing auth"),
+        retries_before,
+        "missing authorization must not change UV retries"
+    );
+
+    // A valid token for another permission must not authorize credential
+    // management, even if the HMAC is otherwise correct.
+    let mut encapsulation =
+        soft_fido2::PinUvAuthEncapsulation::new(&mut transport, soft_fido2::PinProtocol::V2)
+            .expect("create PIN protocol");
+    let wrong_permission_token = encapsulation
+        .get_pin_uv_auth_token_using_pin_with_permissions(
+            &mut transport,
+            "1234",
+            0x02, // getAssertion, NOT credentialManagement
+            Some("example.com"),
+        )
+        .expect("acquire getAssertion token");
+    let auth_data = [CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND];
+    let wrong_permission_param = encapsulation
+        .authenticate(&auth_data, &wrong_permission_token)
+        .expect("authenticate with insufficient permission");
+    let wrong_permission_payload = soft_fido2_ctap::cbor::MapBuilder::new()
+        .insert(0x01, RESET_UV_RETRIES_SUBCOMMAND)
+        .expect("subcommand")
+        .insert(0x03, 0x02u8)
+        .expect("protocol")
+        .insert_bytes(0x04, &wrong_permission_param)
+        .expect("authorization parameter")
+        .build()
+        .expect("CBOR payload");
+    assert!(
+        transport
+            .send_ctap_command(
+                CMD_PASSLESS_RESET_UV_RETRIES,
+                &wrong_permission_payload,
+                30000,
+            )
+            .is_err(),
+        "a token without credential-management permission must be rejected"
+    );
+    assert_eq!(
+        get_uv_retries(&mut transport).expect("read UV retries after insufficient permission"),
+        retries_before,
+        "insufficient permission must not change UV retries"
     );
 
     let payload = build_authenticated_uv_reset_payload(&mut transport, "1234")
