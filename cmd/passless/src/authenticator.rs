@@ -2094,7 +2094,6 @@ mod tests {
         assert_eq!(response, vec![StatusCode::Other as u8]);
     }
 
-
     #[test]
     fn test_reset_uv_retries_uses_authoritative_pin_state_not_cached_hint() {
         use soft_fido2_ctap::cbor::MapBuilder;
@@ -2145,10 +2144,16 @@ mod tests {
                 .uv_retries;
             if actual_pin_configured {
                 assert_eq!(response, vec![StatusCode::PuatRequired as u8]);
-                assert_eq!(persisted_retries, 0, "unauthenticated reset changed UV retries");
+                assert_eq!(
+                    persisted_retries, 0,
+                    "unauthenticated reset changed UV retries"
+                );
             } else {
                 assert_eq!(response, vec![0x00, 0xa1, 0x01, 0x08]);
-                assert_eq!(persisted_retries, 8, "PIN-less recovery was unexpectedly blocked");
+                assert_eq!(
+                    persisted_retries, 8,
+                    "PIN-less recovery was unexpectedly blocked"
+                );
             }
         }
     }
