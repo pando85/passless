@@ -2282,6 +2282,36 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_uv_retries_without_pin_storage_remains_available() {
+        use soft_fido2_ctap::cbor::MapBuilder;
+
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let cred_dir = temp_dir.path().join("credentials");
+        std::fs::create_dir_all(&cred_dir).expect("create credential directory");
+        let storage = LocalStorageAdapter::new(cred_dir).expect("create credential storage");
+        let mut service = AuthenticatorService::with_pin_storage(
+            storage,
+            None::<Arc<Mutex<()>>>,
+            SecurityConfig::default(),
+            PinConfig::default(),
+        )
+        .expect("create authenticator service");
+
+        let payload = MapBuilder::new()
+            .insert(1, RESET_UV_RETRIES_SUBCOMMAND)
+            .expect("subcommand")
+            .build()
+            .expect("CBOR payload");
+        let mut request = vec![CMD_PASSLESS_RESET_UV_RETRIES];
+        request.extend_from_slice(&payload);
+        let mut response = Vec::new();
+        service
+            .handle(&request, &mut response)
+            .expect("handle reset without PIN storage");
+        assert_eq!(response, vec![0x00, 0xa1, 0x01, 0x08]);
+    }
+
+    #[test]
     fn test_reset_uv_retries_command_requires_authentication() {
         let temp_dir = std::env::temp_dir().join("test_passless_reset_uv_retries");
         let _ = std::fs::remove_dir_all(&temp_dir);
