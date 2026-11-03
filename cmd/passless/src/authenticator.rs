@@ -20,6 +20,7 @@ use soft_fido2::{
 };
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,16 +74,69 @@ enum UvRetryTransition {
 ///
 /// It also tracks UV retry transitions to emit actionable warnings when retries
 /// approach or reach exhaustion, independent of the storage backend.
+///
+/// Finally, it restores an exhausted UV retry counter once per process start,
+/// implementing CTAP 2.1 power-cycle semantics. See
+/// [`PinStorageWrapper::restore_uv_retries_on_power_cycle`].
 struct PinStorageWrapper<P: PinStorage> {
     storage: Arc<Mutex<P>>,
     max_uv_retries: u8,
     last_uv_retries: Mutex<Option<u8>>,
+    /// Whether the once-per-process UV retry restore has already run.
+    power_cycle_restored: AtomicBool,
 }
 
 impl<P: PinStorage> PinStorageWrapper<P> {
     fn clamp_uv_retries(&self, state: &mut PinState) {
         if state.uv_retries > self.max_uv_retries {
             state.uv_retries = self.max_uv_retries;
+        }
+    }
+
+    /// Restore the built-in UV retry counter once per process start.
+    ///
+    /// CTAP 2.1 permits an authenticator to reset the built-in UV retry counter
+    /// on power cycle, and for a userspace authenticator every process start
+    /// *is* a power cycle.
+    ///
+    /// Without this, an exhausted counter persists across restarts and blocks
+    /// built-in UV permanently: `getPinUvAuthTokenUsingUvWithPermissions`
+    /// rejects with `CTAP2_ERR_UV_BLOCKED` *before* the UV callback runs, so no
+    /// amount of approving desktop prompts can recover it. Clients that require
+    /// a `pinUvAuthToken` (which `alwaysUv` forces) then fail outright, and with
+    /// no PIN set there is no fallback either, leaving the authenticator unusable
+    /// with an unhelpful "set a PIN" prompt in the browser.
+    ///
+    /// Restoring the counter is safe here because built-in UV is a desktop
+    /// confirmation prompt rather than a guessable secret, so the retry budget
+    /// does not defend against brute force.
+    ///
+    /// Only a fully exhausted counter is lifted. A partially consumed counter is
+    /// left as stored, so a restart never masks UV consumption.
+    ///
+    /// Persistence failures are logged and ignored: the in-memory restore is
+    /// enough to keep the current session working.
+    fn restore_uv_retries_on_power_cycle(&self, storage: &P, state: &mut PinState) {
+        if self.power_cycle_restored.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        if state.uv_retries != 0 {
+            return;
+        }
+
+        state.uv_retries = self.max_uv_retries;
+        info!(
+            "Built-in UV retries were exhausted; restoring to {} on startup (power cycle)",
+            self.max_uv_retries
+        );
+
+        if let Err(status) = storage.save_pin_state(state) {
+            warn!(
+                "Failed to persist restored UV retries ({:?}); \
+                 the counter is restored for this session only",
+                status
+            );
         }
     }
 
@@ -137,6 +191,7 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
             .map_err(|_| soft_fido2::StatusCode::Other)?;
         let mut state = storage.load_pin_state()?;
         self.clamp_uv_retries(&mut state);
+        self.restore_uv_retries_on_power_cycle(&storage, &mut state);
         let mut last = self
             .last_uv_retries
             .lock()
@@ -731,6 +786,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                         storage: ps,
                         max_uv_retries: pin_config.max_uv_retries,
                         last_uv_retries: Mutex::new(None),
+                        power_cycle_restored: AtomicBool::new(false),
                     },
                 )
             } else {
@@ -852,6 +908,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                     storage: ps,
                     max_uv_retries: pin_config.max_uv_retries,
                     last_uv_retries: Mutex::new(None),
+                    power_cycle_restored: AtomicBool::new(false),
                 },
             )?
         } else {
@@ -1026,6 +1083,7 @@ impl<
                         storage: ps,
                         max_uv_retries: pin_config.max_uv_retries,
                         last_uv_retries: Mutex::new(None),
+                        power_cycle_restored: AtomicBool::new(false),
                     },
                     key_provider,
                 )
@@ -1129,6 +1187,7 @@ impl<
                     storage: ps,
                     max_uv_retries: pin_config.max_uv_retries,
                     last_uv_retries: Mutex::new(None),
+                    power_cycle_restored: AtomicBool::new(false),
                 },
                 key_provider,
             )?
@@ -1906,6 +1965,7 @@ mod tests {
             storage: Arc::new(Mutex::new(pin_storage)),
             max_uv_retries: 5,
             last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
         };
 
         let mut state = PinState::new();
@@ -1936,6 +1996,7 @@ mod tests {
             storage: Arc::new(Mutex::new(pin_storage)),
             max_uv_retries: 8,
             last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
         };
         let mut state = PinState::new();
         state.uv_retries = 8;
@@ -1948,6 +2009,7 @@ mod tests {
             storage: Arc::new(Mutex::new(pin_storage2)),
             max_uv_retries: 3,
             last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
         };
 
         // Load should clamp to the lower max
@@ -1958,6 +2020,98 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_uv_retries_restored_on_power_cycle() {
+        use soft_fido2::PinStorageCallbacks;
+
+        // An authenticator that was left with an exhausted UV retry counter.
+        let mut stored = PinState::new();
+        stored.uv_retries = 0;
+
+        let storage = Arc::new(Mutex::new(TestPinStorage::new(stored)));
+        let wrapper = PinStorageWrapper {
+            storage: Arc::clone(&storage),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
+        };
+
+        let loaded = wrapper.load_pin_state().expect("load should succeed");
+        assert_eq!(
+            loaded.uv_retries, 8,
+            "exhausted UV retries must be restored on the first load of a process"
+        );
+
+        // The restore must be persisted, not just applied in memory, so the
+        // recovery survives even if the counter is re-read from storage.
+        let persisted = storage
+            .lock()
+            .expect("storage lock")
+            .load_pin_state()
+            .expect("stored state");
+        assert_eq!(
+            persisted.uv_retries, 8,
+            "restored UV retries should be written back to storage"
+        );
+    }
+
+    #[test]
+    fn test_uv_retries_not_restored_twice_in_one_process() {
+        use soft_fido2::PinStorageCallbacks;
+
+        let mut stored = PinState::new();
+        stored.uv_retries = 0;
+
+        let storage = Arc::new(Mutex::new(TestPinStorage::new(stored)));
+        let wrapper = PinStorageWrapper {
+            storage: Arc::clone(&storage),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
+        };
+
+        assert_eq!(
+            wrapper.load_pin_state().expect("first load").uv_retries,
+            8,
+            "first load restores the counter"
+        );
+
+        // Exhausting UV within the same session must stick: the lockout is only
+        // lifted by an actual power cycle, not by a subsequent state reload.
+        let mut exhausted = PinState::new();
+        exhausted.uv_retries = 0;
+        storage.lock().expect("storage lock").set_state(exhausted);
+
+        assert_eq!(
+            wrapper.load_pin_state().expect("second load").uv_retries,
+            0,
+            "in-session exhaustion must not be undone by a reload"
+        );
+    }
+
+    #[test]
+    fn test_uv_retries_untouched_when_not_exhausted() {
+        use soft_fido2::PinStorageCallbacks;
+
+        let mut stored = PinState::new();
+        stored.uv_retries = 3;
+
+        let storage = Arc::new(Mutex::new(TestPinStorage::new(stored)));
+        let wrapper = PinStorageWrapper {
+            storage: Arc::clone(&storage),
+            max_uv_retries: 8,
+            last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
+        };
+
+        let loaded = wrapper.load_pin_state().expect("load should succeed");
+        assert_eq!(
+            loaded.uv_retries, 3,
+            "a partially consumed counter must be left alone, so that a restart \
+             never masks UV consumption"
+        );
     }
 
     #[test]
@@ -2014,6 +2168,7 @@ mod tests {
             storage: Arc::new(Mutex::new(pin_storage)),
             max_uv_retries: 8,
             last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
         };
 
         let mut state = PinState::new();
@@ -2076,6 +2231,7 @@ mod tests {
             storage: Arc::new(Mutex::new(pin_storage)),
             max_uv_retries: 8,
             last_uv_retries: Mutex::new(None),
+            power_cycle_restored: AtomicBool::new(false),
         };
 
         {
