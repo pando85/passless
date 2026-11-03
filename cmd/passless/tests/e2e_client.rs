@@ -892,10 +892,24 @@ fn test_authenticated_uv_retry_reset_command() {
     let mut transport = connect_to_authenticator().expect("Failed to connect");
     set_pin(&mut transport, "1234").expect("Failed to set PIN");
 
-    let unauthenticated = transport.send_ctap_command(CMD_PASSLESS_RESET_UV_RETRIES, &[], 30000);
-    if let Ok(response) = unauthenticated {
-        assert_ne!(response, vec![0x00, 0xa0]);
-    }
+    // A well-formed request that omits PIN authentication must not reset UV
+    // retries. The old test sent an empty (invalid) CBOR payload, which was
+    // rejected by the parser before reaching the vulnerable authorization path.
+    let unauthenticated_payload = soft_fido2_ctap::cbor::MapBuilder::new()
+        .insert(0x01, RESET_UV_RETRIES_SUBCOMMAND)
+        .expect("subcommand")
+        .build()
+        .expect("CBOR payload");
+    assert!(
+        transport
+            .send_ctap_command(
+                CMD_PASSLESS_RESET_UV_RETRIES,
+                &unauthenticated_payload,
+                30000,
+            )
+            .is_err(),
+        "PIN-configured UV reset must reject missing authentication"
+    );
 
     let payload = build_authenticated_uv_reset_payload(&mut transport, "1234")
         .expect("Failed to build authenticated reset payload");
