@@ -22,7 +22,7 @@ use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, BrowserScope, DaemonStatus,
     EndpointId, EndpointStatusResponse, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
 };
-use passless_core::config::{PinConfig, SecurityConfig};
+use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
 use super::audit::AuditGate;
 use super::audit_events::{
@@ -83,6 +83,7 @@ pub struct RuntimeStartParams<'a> {
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
     pub pin_config: PinConfig,
+    pub uv_config: UvConfig,
     pub shutdown: Arc<AtomicBool>,
     pub endpoint_factory: Option<EndpointFactory>,
 }
@@ -122,6 +123,7 @@ pub struct EndpointSpec {
     pub profile_config: AgentProfileConfig,
     pub security_config: SecurityConfig,
     pub pin_config: PinConfig,
+    pub uv_config: UvConfig,
     pub interaction_manager: Arc<AgentInteractionManager>,
     pub preparation_slot: Arc<CeremonyPreparationSlot>,
     pub operation_lock: Arc<Mutex<()>>,
@@ -602,6 +604,7 @@ impl AgentRuntime {
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
         pin_config: PinConfig,
+        uv_config: UvConfig,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factories(RuntimeStartParams {
@@ -612,6 +615,7 @@ impl AgentRuntime {
             agent_config,
             security_config,
             pin_config,
+            uv_config,
             shutdown,
             endpoint_factory: None,
         })
@@ -626,6 +630,7 @@ impl AgentRuntime {
             agent_config,
             security_config,
             pin_config,
+            uv_config,
             shutdown,
             endpoint_factory,
         } = params;
@@ -1093,6 +1098,7 @@ impl AgentRuntime {
                         profile_config: profile.clone(),
                         security_config: security_config.clone(),
                         pin_config: pin_config.clone(),
+                        uv_config: uv_config.clone(),
                         interaction_manager: interaction_manager.clone(),
                         preparation_slot: preparation_slot.clone(),
                         operation_lock: backend.operation_lock.clone(),
@@ -1152,6 +1158,7 @@ impl AgentRuntime {
                         profile_config: profile.clone(),
                         security_config: security_config.clone(),
                         pin_config: effective_pin_config,
+                        uv_config: uv_config.clone(),
                         interaction_manager: interaction_manager.clone(),
                         preparation_slot: preparation_slot.clone(),
                         operation_lock,
@@ -1408,6 +1415,7 @@ impl AgentRuntime {
                                 provider,
                                 spec.security_config.clone(),
                                 spec.pin_config.clone(),
+                                spec.uv_config.clone(),
                                 spec.interaction_manager.clone(),
                             )
                             .map_err(|e| {
@@ -1504,6 +1512,7 @@ impl AgentRuntime {
                     Some(deps.pin_storage.clone()),
                     spec.security_config.clone(),
                     spec.pin_config.clone(),
+                    spec.uv_config.clone(),
                     spec.interaction_manager.clone(),
                 )
                 .map_err(|e| {
@@ -1674,6 +1683,7 @@ impl AgentRuntime {
                         Some(deps.pin_storage.clone()),
                         spec.security_config.clone(),
                         spec.pin_config.clone(),
+                        spec.uv_config.clone(),
                         spec.interaction_manager.clone(),
                     )
                     .map_err(|e| {
@@ -6136,6 +6146,7 @@ mod tests {
             },
             security_config: SecurityConfig::default(),
             pin_config: PinConfig::default(),
+            uv_config: UvConfig::default(),
             interaction_manager: Arc::new(super::super::interaction::AgentInteractionManager::new()),
             preparation_slot: Arc::new(super::super::ceremony::CeremonyPreparationSlot::new()),
             operation_lock: Arc::new(Mutex::new(())),
@@ -6417,6 +6428,7 @@ mod tests {
             profile_config: agent_config.profiles.get("test-isolated").unwrap().clone(),
             security_config: SecurityConfig::default(),
             pin_config: PinConfig::default(),
+            uv_config: UvConfig::default(),
             interaction_manager: interaction_manager.clone(),
             preparation_slot: preparation_slot.clone(),
             operation_lock: operation_lock.clone(),
