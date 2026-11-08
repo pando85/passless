@@ -49,6 +49,7 @@ Users should choose the solution that best fits their own security and practical
 - [Installation](#installation)
   - [Cargo](#cargo)
   - [Arch Linux](#arch-linux)
+  - [First-run setup](#first-run-setup)
 - [Permissions and Hardening](#permissions-and-hardening)
 - [Acknowledgements](#acknowledgements)
 
@@ -308,6 +309,49 @@ or the binary from AUR:
 ```bash
 yay -S passless-bin
 ```
+
+### First-run setup
+
+Both AUR packages (`passless` and `passless-bin`), as well as `make install`,
+install the `fido` group definition, the `/dev/uhid` udev rule, the persistent
+`uhid` module-loading configuration, and the `passless.service` **systemd user
+unit**. You still need to grant your account access to the device and start the
+service yourself.
+
+```bash
+# Grant your login user read/write access to /dev/uhid via the fido group.
+sudo usermod -aG fido "$USER"
+
+# Load the uhid module now (the packaged configuration loads it on future boots).
+sudo modprobe uhid
+```
+
+**Log out and log back in** so the new group membership takes effect. Then
+verify device access:
+
+```bash
+id -nG | grep -qw fido && echo "fido group OK"
+test -r /dev/uhid && test -w /dev/uhid && echo "UHID access OK"
+```
+
+Before starting Passless, make sure your chosen storage backend is ready.
+The default `pass` backend requires an initialized password store and an
+available GPG key; see [Configuration](#configuration) and
+[backend permissions](docs/PERMISSIONS.md#optional-backend-specific-access).
+
+```bash
+# Enable the authenticator for your user session and start it now.
+systemctl --user enable --now passless.service
+
+# Check startup errors if it does not stay running.
+systemctl --user status passless.service
+journalctl --user -u passless.service -n 50
+```
+
+Use `systemctl --user` without `sudo`: Passless runs as your regular user,
+not as a system-wide root service. The user unit is optional if you prefer to
+start `passless` manually. If device access checks fail, see the
+[udev and group troubleshooting steps](docs/PERMISSIONS.md#permission-denied-on-devuhid).
 
 ## Permissions and Hardening
 
