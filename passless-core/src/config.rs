@@ -621,7 +621,7 @@ impl SecurityConfig {
         } else {
             log::warn!(
                 "mlock capability probe failed - memory locking may not be available.\n\
-                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcaps cap_ipc_lock=+ep $(which passless)'"
+                 Hint: grant CAP_IPC_LOCK to the binary with: 'sudo setcap cap_ipc_lock=+ep $(which passless)'"
             );
         }
         Ok(())
@@ -951,7 +951,35 @@ impl AppConfig {
     /// Validate the configuration
     pub fn validate(&self) -> crate::error::Result<()> {
         self.pin.validate()?;
-        self.uv.face.validate().map_err(crate::error::Error::Config)?;
+        self.uv
+            .face
+            .validate()
+            .map_err(crate::error::Error::Config)?;
+        if self.uv.timeout_seconds == 0 || self.uv.timeout_seconds > 300 {
+            return Err(crate::error::Error::Config(
+                "uv.timeout_seconds must be between 1 and 300".into(),
+            ));
+        }
+        match self.uv.provider {
+            UvProviderType::Fprintd if !self.uv.fprintd.enabled => {
+                return Err(crate::error::Error::Config(
+                    "uv.provider=fprintd requires uv.fprintd.enabled=true".into(),
+                ));
+            }
+            UvProviderType::Face if !self.uv.face.enabled => {
+                return Err(crate::error::Error::Config(
+                    "uv.provider=face requires uv.face.enabled=true".into(),
+                ));
+            }
+            UvProviderType::Command
+                if !self.uv.command.enabled || self.uv.command.command.is_empty() =>
+            {
+                return Err(crate::error::Error::Config(
+                    "uv.provider=command requires an enabled non-empty trusted command".into(),
+                ));
+            }
+            _ => {}
+        }
         #[cfg(feature = "agent")]
         {
             let human_path = self.backend().ok().map(|b| b.state_path());
@@ -1803,6 +1831,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_invalid_uv_timeout_and_command_config() {
+        let mut cfg = AppConfig::from(&mut Args::parse_from(["passless"]).config);
+        cfg.uv.timeout_seconds = 0;
+        assert!(cfg.validate().is_err());
+        cfg.uv.timeout_seconds = 301;
+        assert!(cfg.validate().is_err());
+        cfg.uv.timeout_seconds = 30;
+        cfg.uv.provider = UvProviderType::Command;
+        cfg.uv.command.enabled = true;
+        cfg.uv.command.command.clear();
+        assert!(cfg.validate().is_err());
+        cfg.uv.command.command = vec!["/usr/bin/true".into()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
