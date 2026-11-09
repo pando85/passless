@@ -1590,6 +1590,7 @@ dependencies = [
  "dirs 7.0.0",
  "env_logger",
  "futures-lite",
+ "getrandom 0.4.3",
  "git2 0.21.0",
  "hex",
  "hkdf",
