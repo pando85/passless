@@ -28,7 +28,7 @@ soft-fido2-transport = "0.17.0"
 
 thiserror = "2.0"
 clap = { version = "4.5", features = ["std", "color", "derive", "cargo", "env"] }
-clap-serde-derive = "0.2"
+clap-serde-derive = "1.0"
 clap_complete = "4.5"
 log = "0.4"
 env_logger = "0.11"
