@@ -2024,6 +2024,35 @@ mod tests {
     }
 
     #[test]
+    fn test_notification_only_cannot_satisfy_ctap_uv_even_when_up_prompts_disabled() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = LocalStorageAdapter::new(dir.path().join("credentials"))
+            .expect("create credential storage");
+        let security = SecurityConfig {
+            user_verification_authentication: false,
+            user_verification_registration: false,
+            ..Default::default()
+        };
+        let uv = UvConfig {
+            provider: UvProviderType::Notification,
+            ..Default::default()
+        };
+        let callbacks = PasslessCallbacks::<LocalStorageAdapter, ()>::new(
+            Arc::new(Mutex::new(storage)),
+            None,
+            security,
+            PinConfig::default(),
+            uv,
+        );
+
+        assert!(matches!(
+            callbacks.request_up("authentication", None, "example.com"),
+            Ok(UpResult::Accepted)
+        ));
+        assert!(callbacks.request_uv("authentication", None, "example.com").is_err());
+    }
+
+    #[test]
     fn test_service_creation() {
         let temp_dir = std::env::temp_dir().join("test_passless");
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
