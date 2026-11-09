@@ -3493,6 +3493,7 @@ dependencies = [
  "nix",
  "nokhwa",
  "notify-rust",
+ "ort",
  "p256",
  "passless-config-doc",
  "passless-core",
