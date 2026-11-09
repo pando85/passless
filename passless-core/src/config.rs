@@ -468,9 +468,9 @@ pub struct FaceConfig {
 impl FaceConfig {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), String> {
-        if self.threshold < 0.0 || self.threshold > 1.0 {
+        if !self.threshold.is_finite() || self.threshold <= 0.0 || self.threshold > 1.0 {
             return Err(format!(
-                "Face threshold must be between 0.0 and 1.0, got {}",
+                "Face threshold must be finite and in (0.0, 1.0], got {}",
                 self.threshold
             ));
         }
@@ -1019,6 +1019,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Manage experimental face enrollment and test matching locally
+    Uv {
+        #[command(subcommand)]
+        action: UvAction,
+    },
     /// FIDO2 client commands for managing authenticators
     ///
     /// These commands require a running authenticator. For testing:
@@ -1084,6 +1089,27 @@ pub enum Commands {
         #[command(subcommand)]
         action: TpmAction,
     },
+}
+
+/// Experimental face operations. These do not imply presentation-attack detection.
+#[derive(Subcommand, Debug, Clone)]
+pub enum UvAction {
+    /// Enroll five face samples; requires a build with the face feature
+    FaceEnroll {
+        #[arg(long, default_value_t = 0)]
+        camera_index: usize,
+        #[arg(long, default_value_t = 0.6)]
+        threshold: f32,
+    },
+    /// Exercise face matching on the local webcam; not a FIDO UV assurance check
+    FaceVerify {
+        #[arg(long, default_value_t = 0)]
+        camera_index: usize,
+        #[arg(long, default_value_t = 0.6)]
+        threshold: f32,
+    },
+    /// Show whether a local face template exists
+    FaceStatus,
 }
 
 /// TPM portable parent actions
@@ -1775,6 +1801,33 @@ mod tests {
                     force: true,
                 },
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_face_threshold_rejects_nonfinite_and_zero() {
+        let mut cfg = FaceConfig {
+            enabled: true,
+            camera_index: 0,
+            threshold: 0.6,
+        };
+        for value in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.1] {
+            cfg.threshold = value;
+            assert!(cfg.validate().is_err(), "value {} should be rejected", value);
+        }
+        cfg.threshold = 0.6;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_uv_face_cli_commands_parse() {
+        let args = Args::try_parse_from(["passless", "uv", "face-enroll", "--camera-index", "1"])
+            .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Uv {
+                action: UvAction::FaceEnroll { camera_index: 1, .. }
             })
         ));
     }
