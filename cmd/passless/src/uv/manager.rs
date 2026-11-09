@@ -55,27 +55,19 @@ impl UserVerificationManager {
         &self,
         context: &VerificationContext,
     ) -> Result<VerificationResult, VerificationError> {
-        let available: Vec<_> = self
-            .available_providers()
-            .into_iter()
-            .filter(|provider| !context.require_strong_uv || provider.supports_strong_uv())
-            .collect();
-
-        if available.is_empty() {
-            warn!("No UV providers available");
-            return Err(VerificationError::NotAvailable(
-                "No provider available for requested verification assurance".into(),
-            ));
-        }
-
-        info!(
-            "Starting user verification with {} available provider(s)",
-            available.len()
-        );
-
+        // Evaluate lazily. Probing later providers (especially webcams) before
+        // needed is slow and can expose hardware without an authentication need.
         let mut last_error: Option<VerificationError> = None;
+        let mut tried_provider = false;
 
-        for provider in &available {
+        for provider in &self.providers {
+            if context.require_strong_uv && !provider.supports_strong_uv() {
+                continue;
+            }
+            if !provider.available() {
+                continue;
+            }
+            tried_provider = true;
             debug!(
                 "Trying UV provider: {} (priority {})",
                 provider.name(),
@@ -111,11 +103,16 @@ impl UserVerificationManager {
             }
         }
 
-        // All providers failed
-        let error = last_error.unwrap_or_else(|| {
-            VerificationError::Other("All verification providers failed".into())
-        });
-        Err(error)
+        if !tried_provider {
+            warn!("No eligible UV provider available");
+            return Err(VerificationError::NotAvailable(
+                "No provider available for requested verification assurance".into(),
+            ));
+        }
+        // Every eligible provider failed, timed out, or was unenrolled.
+        Err(last_error.unwrap_or_else(|| {
+            VerificationError::NotAvailable("All eligible verification providers unavailable".into())
+        }))
     }
 
     /// Get a provider by name for enrollment
