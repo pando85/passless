@@ -2026,8 +2026,9 @@ mod tests {
     #[test]
     fn test_notification_only_cannot_satisfy_ctap_uv_even_when_up_prompts_disabled() {
         let dir = tempfile::tempdir().expect("create temp directory");
-        let storage = LocalStorageAdapter::new(dir.path().join("credentials"))
-            .expect("create credential storage");
+        let credential_dir = dir.path().join("credentials");
+        std::fs::create_dir_all(&credential_dir).expect("create credential dir");
+        let storage = LocalStorageAdapter::new(credential_dir).expect("create credential storage");
         let security = SecurityConfig {
             user_verification_authentication: false,
             user_verification_registration: false,
