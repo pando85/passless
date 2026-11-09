@@ -75,7 +75,7 @@ p256 = { version = "0.14", features = ["ecdh", "arithmetic"], optional = true }
 hkdf = { version = "0.13", optional = true }
 aes = { version = "0.9", optional = true }
 cipher = { version = "0.5", optional = true }
-rsa = { version = "0.10", default-features = false, features = ["std"] }
+rsa = { version = "0.10", default-features = false, features = ["std", "encoding"] }
 toml.workspace = true
 
 [dev-dependencies]
