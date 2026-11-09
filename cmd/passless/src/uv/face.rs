@@ -20,10 +20,10 @@ use super::{
 use log::{debug, info, warn};
 
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use image::DynamicImage;
 use nokhwa::Camera;
@@ -206,35 +206,47 @@ impl FaceIdProvider {
             VerificationError::DeviceError(format!("Failed to read template: {}", e))
         })?;
         if data.len() < 8 {
-            return Err(VerificationError::DeviceError("Truncated face template".into()));
+            return Err(VerificationError::DeviceError(
+                "Truncated face template".into(),
+            ));
         }
         let length = u64::from_le_bytes(data[0..8].try_into().unwrap());
         if length == 0 || length > 4096 || data.len() as u64 != 8 + length * 4 {
-            return Err(VerificationError::DeviceError("Invalid face template length".into()));
+            return Err(VerificationError::DeviceError(
+                "Invalid face template length".into(),
+            ));
         }
         let embedding: Vec<f32> = data[8..]
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         if !embedding.iter().all(|value| value.is_finite()) {
-            return Err(VerificationError::DeviceError("Invalid face template value".into()));
+            return Err(VerificationError::DeviceError(
+                "Invalid face template value".into(),
+            ));
         }
         Ok(embedding)
     }
 
     /// Atomically save a template with owner-only access; never follow output symlinks.
     fn save_template(&self, embedding: &[f32]) -> Result<(), VerificationError> {
-        if embedding.is_empty() || embedding.len() > 4096
+        if embedding.is_empty()
+            || embedding.len() > 4096
             || !embedding.iter().all(|value| value.is_finite())
         {
-            return Err(VerificationError::DeviceError("Invalid face embedding".into()));
+            return Err(VerificationError::DeviceError(
+                "Invalid face embedding".into(),
+            ));
         }
         #[cfg(unix)]
         {
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
             builder.create(&self.embeddings_path).map_err(|e| {
-                VerificationError::DeviceError(format!("Failed to create template directory: {}", e))
+                VerificationError::DeviceError(format!(
+                    "Failed to create template directory: {}",
+                    e
+                ))
             })?;
             std::fs::set_permissions(
                 &self.embeddings_path,
@@ -245,9 +257,9 @@ impl FaceIdProvider {
         std::fs::create_dir_all(&self.embeddings_path)?;
 
         let path = self.embeddings_file();
-        let tmp_path = self.embeddings_path.join(format!(
-            ".face_template-{}.tmp", std::process::id()
-        ));
+        let tmp_path = self
+            .embeddings_path
+            .join(format!(".face_template-{}.tmp", std::process::id()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -262,12 +274,18 @@ impl FaceIdProvider {
         }
         if let Err(e) = file.write_all(&data).and_then(|_| file.sync_all()) {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(VerificationError::DeviceError(format!("Failed to save template: {}", e)));
+            return Err(VerificationError::DeviceError(format!(
+                "Failed to save template: {}",
+                e
+            )));
         }
         drop(file);
         if let Err(e) = std::fs::rename(&tmp_path, &path) {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(VerificationError::DeviceError(format!("Failed to install template: {}", e)));
+            return Err(VerificationError::DeviceError(format!(
+                "Failed to install template: {}",
+                e
+            )));
         }
         info!("Saved face template to {}", path.display());
         Ok(())
@@ -450,7 +468,9 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::metadata(provider.embeddings_file()).unwrap().permissions();
+            let permissions = std::fs::metadata(provider.embeddings_file())
+                .unwrap()
+                .permissions();
             assert_eq!(permissions.mode() & 0o777, 0o600);
         }
     }

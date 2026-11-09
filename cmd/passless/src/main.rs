@@ -367,7 +367,9 @@ fn run() -> Result<()> {
                     #[cfg(not(feature = "face"))]
                     {
                         let _ = (camera_index, threshold);
-                        Err(Error::Config("Face support requires --features face".into()))
+                        Err(Error::Config(
+                            "Face support requires --features face".into(),
+                        ))
                     }
                 }
                 UvAction::FaceVerify {
@@ -394,19 +396,26 @@ fn run() -> Result<()> {
                     #[cfg(not(feature = "face"))]
                     {
                         let _ = (camera_index, threshold);
-                        Err(Error::Config("Face support requires --features face".into()))
+                        Err(Error::Config(
+                            "Face support requires --features face".into(),
+                        ))
                     }
                 }
                 UvAction::FaceStatus => {
                     #[cfg(feature = "face")]
                     {
                         let provider = uv::FaceIdProvider::new(0, 0.6, None);
-                        println!("Face enrolled: {}", uv::UserVerificationProvider::is_enrolled(&provider));
+                        println!(
+                            "Face enrolled: {}",
+                            uv::UserVerificationProvider::is_enrolled(&provider)
+                        );
                         Ok(())
                     }
                     #[cfg(not(feature = "face"))]
                     {
-                        Err(Error::Config("Face support requires --features face".into()))
+                        Err(Error::Config(
+                            "Face support requires --features face".into(),
+                        ))
                     }
                 }
             },

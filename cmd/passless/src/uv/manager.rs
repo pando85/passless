@@ -318,13 +318,16 @@ mod tests {
         let weak = MockProvider::new("notification", 10, true, VerificationResult::Accepted);
         let manager = UserVerificationManager::new(vec![Box::new(weak)]);
         let ctx = VerificationContext::new("authentication").require_strong_uv();
-        assert!(matches!(manager.verify(&ctx), Err(VerificationError::NotAvailable(_))));
+        assert!(matches!(
+            manager.verify(&ctx),
+            Err(VerificationError::NotAvailable(_))
+        ));
     }
 
     #[test]
     fn test_strong_uv_denial_does_not_fall_back_to_notification() {
-        let strong = MockProvider::new("fprintd", 100, true, VerificationResult::Denied)
-            .with_strong_uv();
+        let strong =
+            MockProvider::new("fprintd", 100, true, VerificationResult::Denied).with_strong_uv();
         let weak = MockProvider::new("notification", 10, true, VerificationResult::Accepted);
         let manager = UserVerificationManager::new(vec![Box::new(strong), Box::new(weak)]);
         let ctx = VerificationContext::new("authentication").require_strong_uv();
@@ -333,8 +336,8 @@ mod tests {
 
     #[test]
     fn test_enrolled_strong_provider_can_accept_uv() {
-        let strong = MockProvider::new("fprintd", 100, true, VerificationResult::Accepted)
-            .with_strong_uv();
+        let strong =
+            MockProvider::new("fprintd", 100, true, VerificationResult::Accepted).with_strong_uv();
         let manager = UserVerificationManager::new(vec![Box::new(strong)]);
         let ctx = VerificationContext::new("authentication").require_strong_uv();
         assert_eq!(manager.verify(&ctx).unwrap(), VerificationResult::Accepted);

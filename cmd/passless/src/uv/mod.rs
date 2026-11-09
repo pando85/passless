@@ -121,8 +121,6 @@ impl From<zbus::Error> for VerificationError {
     }
 }
 
-
-
 /// Context for user verification request
 #[derive(Debug, Clone)]
 pub struct VerificationContext {

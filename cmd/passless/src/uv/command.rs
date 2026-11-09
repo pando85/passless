@@ -90,10 +90,14 @@ impl CommandProvider {
         cmd.env("PASSLESS_UV_TIMEOUT", context.timeout_seconds.to_string());
 
         // Bounded execution: a broken verifier must not stall a CTAP request.
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let timeout = Duration::from_secs(context.timeout_seconds.min(self.timeout_seconds) as u64);
         if timeout.is_zero() {
-            return Err(VerificationError::Other("Command timeout must be positive".into()));
+            return Err(VerificationError::Other(
+                "Command timeout must be positive".into(),
+            ));
         }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -115,7 +119,10 @@ impl CommandProvider {
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(VerificationError::DeviceError(format!("Command wait failed: {}", e)));
+                    return Err(VerificationError::DeviceError(format!(
+                        "Command wait failed: {}",
+                        e
+                    )));
                 }
             }
         };
@@ -123,7 +130,10 @@ impl CommandProvider {
             info!("User verification accepted via command");
             Ok(VerificationResult::Accepted)
         } else {
-            info!("User verification denied via command (exit code: {:?})", status.code());
+            info!(
+                "User verification denied via command (exit code: {:?})",
+                status.code()
+            );
             Ok(VerificationResult::Denied)
         }
     }

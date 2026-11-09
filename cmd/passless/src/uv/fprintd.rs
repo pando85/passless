@@ -246,28 +246,36 @@ impl FprintdProvider {
             let Ok(conn) = Connection::system().await else {
                 return false;
             };
-            let Ok(reply) = conn.call_method(
-                Some("net.reactivated.Fprint"),
-                "/net/reactivated/Fprint/Manager",
-                Some("net.reactivated.Fprint.Manager"),
-                "GetDefaultDevice",
-                &(),
-            ).await else {
+            let Ok(reply) = conn
+                .call_method(
+                    Some("net.reactivated.Fprint"),
+                    "/net/reactivated/Fprint/Manager",
+                    Some("net.reactivated.Fprint.Manager"),
+                    "GetDefaultDevice",
+                    &(),
+                )
+                .await
+            else {
                 return false;
             };
             let Ok(path) = reply.body().deserialize::<zbus::OwnedObjectPath>() else {
                 return false;
             };
-            let Ok(reply) = conn.call_method(
-                Some("net.reactivated.Fprint"),
-                path.as_str(),
-                Some("net.reactivated.Fprint.Device"),
-                "ListEnrolledFingers",
-                &"",
-            ).await else {
+            let Ok(reply) = conn
+                .call_method(
+                    Some("net.reactivated.Fprint"),
+                    path.as_str(),
+                    Some("net.reactivated.Fprint.Device"),
+                    "ListEnrolledFingers",
+                    &"",
+                )
+                .await
+            else {
                 return false;
             };
-            reply.body().deserialize::<Vec<String>>()
+            reply
+                .body()
+                .deserialize::<Vec<String>>()
                 .map(|fingers| !fingers.is_empty())
                 .unwrap_or(false)
         })
@@ -295,10 +303,7 @@ impl FprintdProvider {
                         .await
                     {
                         Ok(reply) => {
-                            if let Ok(path) = reply
-                                .body()
-                                .deserialize::<zbus::OwnedObjectPath>()
-                            {
+                            if let Ok(path) = reply.body().deserialize::<zbus::OwnedObjectPath>() {
                                 info!("fprintd device available at: {:?}", path);
                                 true
                             } else {

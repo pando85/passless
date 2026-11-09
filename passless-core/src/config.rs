@@ -581,7 +581,6 @@ pub struct UvConfig {
     pub command: CommandConfig,
 }
 
-
 impl SecurityConfig {
     /// Apply security hardening measures
     pub fn apply_hardening(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -951,7 +950,10 @@ impl AppConfig {
     /// Validate the configuration
     pub fn validate(&self) -> crate::error::Result<()> {
         self.pin.validate()?;
-        self.uv.face.validate().map_err(crate::error::Error::Config)?;
+        self.uv
+            .face
+            .validate()
+            .map_err(crate::error::Error::Config)?;
         #[cfg(feature = "agent")]
         {
             let human_path = self.backend().ok().map(|b| b.state_path());
@@ -1814,7 +1816,11 @@ mod tests {
         };
         for value in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.1] {
             cfg.threshold = value;
-            assert!(cfg.validate().is_err(), "value {} should be rejected", value);
+            assert!(
+                cfg.validate().is_err(),
+                "value {} should be rejected",
+                value
+            );
         }
         cfg.threshold = 0.6;
         assert!(cfg.validate().is_ok());
@@ -1822,12 +1828,15 @@ mod tests {
 
     #[test]
     fn test_uv_face_cli_commands_parse() {
-        let args = Args::try_parse_from(["passless", "uv", "face-enroll", "--camera-index", "1"])
-            .unwrap();
+        let args =
+            Args::try_parse_from(["passless", "uv", "face-enroll", "--camera-index", "1"]).unwrap();
         assert!(matches!(
             args.command,
             Some(Commands::Uv {
-                action: UvAction::FaceEnroll { camera_index: 1, .. }
+                action: UvAction::FaceEnroll {
+                    camera_index: 1,
+                    ..
+                }
             })
         ));
     }
