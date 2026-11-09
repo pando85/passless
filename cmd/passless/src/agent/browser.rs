@@ -19,7 +19,7 @@ use passless_core::agent::config::{ANY_RP_ID, CdpExposeMode, validate_rp_id};
 use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
 
 use rand::Rng;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -60,19 +60,19 @@ fn extension_key_path() -> Result<PathBuf, LaunchError> {
         })
 }
 
-fn generate_extension_key() -> Result<RsaPrivateKey, LaunchError> {
-    let mut rng = rand::thread_rng();
-    RsaPrivateKey::new(&mut rng, 2048)
+fn generate_extension_key() -> Result<PrivateKey, LaunchError> {
+    let mut rng = getrandom::SysRng;
+    PrivateKey::new(&mut rng, 2048)
         .map_err(|e| LaunchError::ExtensionSetupFailed(format!("generate RSA key: {}", e)))
 }
 
-fn load_or_create_extension_key() -> Result<RsaPrivateKey, LaunchError> {
+fn load_or_create_extension_key() -> Result<PrivateKey, LaunchError> {
     let key_path = extension_key_path()?;
 
     if key_path.exists() {
         let pem_data = fs::read_to_string(&key_path)
             .map_err(|e| LaunchError::ExtensionSetupFailed(format!("read extension key: {}", e)))?;
-        RsaPrivateKey::from_pkcs8_pem(&pem_data)
+        PrivateKey::from_pkcs8_pem(&pem_data)
             .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse extension key: {}", e)))
     } else {
         let key = generate_extension_key()?;
@@ -94,7 +94,7 @@ fn load_or_create_extension_key() -> Result<RsaPrivateKey, LaunchError> {
     }
 }
 
-fn compute_extension_id_from_key(key: &RsaPrivateKey) -> Result<String, LaunchError> {
+fn compute_extension_id_from_key(key: &PrivateKey) -> Result<String, LaunchError> {
     use sha2::Digest;
 
     let pub_key = key.to_public_key();
@@ -116,7 +116,7 @@ fn compute_extension_id_from_key(key: &RsaPrivateKey) -> Result<String, LaunchEr
     Ok(ext_id)
 }
 
-fn get_public_key_base64(key: &RsaPrivateKey) -> Result<String, LaunchError> {
+fn get_public_key_base64(key: &PrivateKey) -> Result<String, LaunchError> {
     let pub_key = key.to_public_key();
     let pub_key_der = pub_key
         .to_public_key_der()
