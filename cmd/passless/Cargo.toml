@@ -32,7 +32,7 @@ required-features = ["agent"]
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]
-face = ["dep:nokhwa", "dep:face_id", "dep:image"]
+face = ["dep:nokhwa", "dep:face_id", "dep:image", "dep:ort"]
 agent = ["passless-core/agent", "passless-uhid"]
 agent-validation = ["agent"]
 
@@ -90,6 +90,8 @@ futures-util = "0.3"
 nokhwa = { workspace = true, optional = true }
 face_id = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+# face_id 0.4.4 still needs the pre-rc.14 ort Session::builder API.
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }
 
 [dev-dependencies]
 base64 = "0.23"
