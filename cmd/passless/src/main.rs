@@ -14,6 +14,7 @@ mod worker;
 
 use passless_core::{
     AppConfig, Args, BackendConfig, ClientAction, Commands, ConfigAction, Error, PinAction, Result,
+    UvAction,
 };
 
 use soft_fido2::CredentialKeyProvider;
@@ -347,6 +348,68 @@ fn run() -> Result<()> {
                     Ok(())
                 }
             },
+            Commands::Uv { action } => match action {
+                UvAction::FaceEnroll {
+                    camera_index,
+                    threshold,
+                } => {
+                    #[cfg(feature = "face")]
+                    {
+                        if !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0 {
+                            return Err(Error::Config("Invalid face threshold".into()));
+                        }
+                        let provider = uv::FaceIdProvider::new(*camera_index, *threshold, None);
+                        uv::UserVerificationProvider::enroll(&provider)
+                            .map_err(|e| Error::Config(e.to_string()))?;
+                        println!("Face template enrolled (experimental; no liveness detection)");
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "face"))]
+                    {
+                        let _ = (camera_index, threshold);
+                        Err(Error::Config("Face support requires --features face".into()))
+                    }
+                }
+                UvAction::FaceVerify {
+                    camera_index,
+                    threshold,
+                } => {
+                    #[cfg(feature = "face")]
+                    {
+                        if !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0 {
+                            return Err(Error::Config("Invalid face threshold".into()));
+                        }
+                        let provider = uv::FaceIdProvider::new(*camera_index, *threshold, None);
+                        let ctx = uv::VerificationContext::new("local face test");
+                        match uv::UserVerificationProvider::verify(&provider, &ctx)
+                            .map_err(|e| Error::Config(e.to_string()))?
+                        {
+                            uv::VerificationResult::Accepted => {
+                                println!("Face matched (experimental; no liveness detection)");
+                                Ok(())
+                            }
+                            _ => Err(Error::Config("Face did not match".into())),
+                        }
+                    }
+                    #[cfg(not(feature = "face"))]
+                    {
+                        let _ = (camera_index, threshold);
+                        Err(Error::Config("Face support requires --features face".into()))
+                    }
+                }
+                UvAction::FaceStatus => {
+                    #[cfg(feature = "face")]
+                    {
+                        let provider = uv::FaceIdProvider::new(0, 0.6, None);
+                        println!("Face enrolled: {}", uv::UserVerificationProvider::is_enrolled(&provider));
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "face"))]
+                    {
+                        Err(Error::Config("Face support requires --features face".into()))
+                    }
+                }
+            },
             Commands::Client {
                 device,
                 output,
@@ -445,12 +508,6 @@ fn run() -> Result<()> {
     if let Err(e) = config.validate() {
         error!("{}", e.format_cli());
         return Err(e);
-    }
-
-    // Validate configuration
-    if let Err(e) = config.validate() {
-        error!("Configuration validation failed: {}", e);
-        process::exit(1);
     }
 
     if config.verbose && log_level != log::LevelFilter::Debug {
