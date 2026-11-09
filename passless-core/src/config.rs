@@ -454,32 +454,27 @@ pub struct AppConfig {
 
     /// Pass backend configuration
     #[clap_serde]
-    #[serde(default)]
     #[command(flatten)]
     pub pass: PassBackendConfig,
 
     /// TPM backend configuration
     #[cfg(feature = "tpm")]
     #[clap_serde]
-    #[serde(default)]
     #[command(flatten)]
     pub tpm: TpmBackendConfig,
 
     /// Local backend configuration
     #[clap_serde]
-    #[serde(default)]
     #[command(flatten)]
     pub local: LocalBackendConfig,
 
     /// Security hardening configuration
     #[clap_serde]
-    #[serde(default)]
     #[command(flatten)]
     pub security: SecurityConfig,
 
     /// PIN configuration
     #[clap_serde]
-    #[serde(default)]
     #[command(flatten)]
     pub pin: PinConfig,
 
