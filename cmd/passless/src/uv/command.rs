@@ -22,12 +22,12 @@ use super::{
 
 use log::{debug, info};
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Command-based user verification provider
 pub struct CommandProvider {
     command: Vec<String>,
-    #[allow(dead_code)]
     timeout_seconds: u32,
 }
 
@@ -89,29 +89,41 @@ impl CommandProvider {
 
         cmd.env("PASSLESS_UV_TIMEOUT", context.timeout_seconds.to_string());
 
-        let result = cmd.output().map_err(|e| {
+        // Bounded execution: a broken verifier must not stall a CTAP request.
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let timeout = Duration::from_secs(context.timeout_seconds.min(self.timeout_seconds) as u64);
+        if timeout.is_zero() {
+            return Err(VerificationError::Other("Command timeout must be positive".into()));
+        }
+        let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 VerificationError::NotAvailable(format!("Command not found: {}", program))
             } else {
                 VerificationError::DeviceError(format!("Failed to execute command: {}", e))
             }
         })?;
-
-        debug!(
-            "Command exit code: {}, stdout: {}, stderr: {}",
-            result.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&result.stdout).trim(),
-            String::from_utf8_lossy(&result.stderr).trim()
-        );
-
-        if result.status.success() {
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if start.elapsed() >= timeout => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(VerificationResult::Timeout);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(VerificationError::DeviceError(format!("Command wait failed: {}", e)));
+                }
+            }
+        };
+        if status.success() {
             info!("User verification accepted via command");
             Ok(VerificationResult::Accepted)
         } else {
-            info!(
-                "User verification denied via command (exit code: {:?})",
-                result.status.code()
-            );
+            info!("User verification denied via command (exit code: {:?})", status.code());
             Ok(VerificationResult::Denied)
         }
     }
@@ -145,6 +157,11 @@ impl UserVerificationProvider for CommandProvider {
 
     fn priority(&self) -> u8 {
         priority::COMMAND
+    }
+
+    // An explicit custom command is operator-controlled; it MUST authenticate the user.
+    fn supports_strong_uv(&self) -> bool {
+        true
     }
 }
 
@@ -257,6 +274,18 @@ mod tests {
 
         let result = provider.verify(&ctx);
         assert_eq!(result.unwrap(), VerificationResult::Accepted);
+    }
+
+    #[test]
+    fn test_command_timeout() {
+        let provider = CommandProvider::new(vec!["sh".into(), "-c".into(), "sleep 3".into()], 1);
+        if !provider.available() {
+            return;
+        }
+        let start = Instant::now();
+        let result = provider.verify(&VerificationContext::new("authentication").with_timeout(1));
+        assert_eq!(result.unwrap(), VerificationResult::Timeout);
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

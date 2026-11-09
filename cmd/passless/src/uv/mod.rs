@@ -134,6 +134,8 @@ pub struct VerificationContext {
     pub user: Option<String>,
     /// Timeout in seconds
     pub timeout_seconds: u32,
+    /// Identity verification (UV), not merely presence approval (UP).
+    pub require_strong_uv: bool,
 }
 
 impl VerificationContext {
@@ -144,6 +146,7 @@ impl VerificationContext {
             relying_party: None,
             user: None,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            require_strong_uv: false,
         }
     }
 
@@ -162,6 +165,12 @@ impl VerificationContext {
     /// Set the timeout
     pub fn with_timeout(mut self, seconds: u32) -> Self {
         self.timeout_seconds = seconds;
+        self
+    }
+
+    /// Exclude presence-only providers from the verification chain.
+    pub fn require_strong_uv(mut self) -> Self {
+        self.require_strong_uv = true;
         self
     }
 }
@@ -194,6 +203,11 @@ pub trait UserVerificationProvider: Send + Sync {
     /// See [`priority`] module for standard values.
     fn priority(&self) -> u8 {
         priority::COMMAND
+    }
+
+    /// A notification acknowledgement cannot satisfy CTAP user verification.
+    fn supports_strong_uv(&self) -> bool {
+        false
     }
 
     /// Whether this provider supports enrollment
@@ -231,6 +245,7 @@ mod tests {
         assert_eq!(ctx.relying_party, None);
         assert_eq!(ctx.user, None);
         assert_eq!(ctx.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
+        assert!(!ctx.require_strong_uv);
     }
 
     #[test]
@@ -238,8 +253,10 @@ mod tests {
         let ctx = VerificationContext::new("authentication")
             .with_relying_party("example.com")
             .with_user("alice")
-            .with_timeout(60);
+            .with_timeout(60)
+            .require_strong_uv();
 
+        assert!(ctx.require_strong_uv);
         assert_eq!(ctx.operation, "authentication");
         assert_eq!(ctx.relying_party, Some("example.com".to_string()));
         assert_eq!(ctx.user, Some("alice".to_string()));

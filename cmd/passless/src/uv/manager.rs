@@ -55,12 +55,16 @@ impl UserVerificationManager {
         &self,
         context: &VerificationContext,
     ) -> Result<VerificationResult, VerificationError> {
-        let available: Vec<_> = self.available_providers();
+        let available: Vec<_> = self
+            .available_providers()
+            .into_iter()
+            .filter(|provider| !context.require_strong_uv || provider.supports_strong_uv())
+            .collect();
 
         if available.is_empty() {
             warn!("No UV providers available");
             return Err(VerificationError::NotAvailable(
-                "No user verification providers available".into(),
+                "No provider available for requested verification assurance".into(),
             ));
         }
 
@@ -141,6 +145,7 @@ mod tests {
         result: VerificationResult,
         requires_enrollment: bool,
         is_enrolled: bool,
+        strong_uv: bool,
     }
 
     impl MockProvider {
@@ -157,12 +162,18 @@ mod tests {
                 result,
                 requires_enrollment: false,
                 is_enrolled: true,
+                strong_uv: false,
             }
         }
 
         fn with_enrollment(mut self, requires: bool, enrolled: bool) -> Self {
             self.requires_enrollment = requires;
             self.is_enrolled = enrolled;
+            self
+        }
+
+        fn with_strong_uv(mut self) -> Self {
+            self.strong_uv = true;
             self
         }
     }
@@ -188,6 +199,10 @@ mod tests {
 
         fn priority(&self) -> u8 {
             self.priority
+        }
+
+        fn supports_strong_uv(&self) -> bool {
+            self.strong_uv
         }
 
         fn requires_enrollment(&self) -> bool {
@@ -296,6 +311,33 @@ mod tests {
 
         assert!(manager.get_provider("test_provider").is_some());
         assert!(manager.get_provider("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_weak_provider_cannot_satisfy_uv() {
+        let weak = MockProvider::new("notification", 10, true, VerificationResult::Accepted);
+        let manager = UserVerificationManager::new(vec![Box::new(weak)]);
+        let ctx = VerificationContext::new("authentication").require_strong_uv();
+        assert!(matches!(manager.verify(&ctx), Err(VerificationError::NotAvailable(_))));
+    }
+
+    #[test]
+    fn test_strong_uv_denial_does_not_fall_back_to_notification() {
+        let strong = MockProvider::new("fprintd", 100, true, VerificationResult::Denied)
+            .with_strong_uv();
+        let weak = MockProvider::new("notification", 10, true, VerificationResult::Accepted);
+        let manager = UserVerificationManager::new(vec![Box::new(strong), Box::new(weak)]);
+        let ctx = VerificationContext::new("authentication").require_strong_uv();
+        assert_eq!(manager.verify(&ctx).unwrap(), VerificationResult::Denied);
+    }
+
+    #[test]
+    fn test_enrolled_strong_provider_can_accept_uv() {
+        let strong = MockProvider::new("fprintd", 100, true, VerificationResult::Accepted)
+            .with_strong_uv();
+        let manager = UserVerificationManager::new(vec![Box::new(strong)]);
+        let ctx = VerificationContext::new("authentication").require_strong_uv();
+        assert_eq!(manager.verify(&ctx).unwrap(), VerificationResult::Accepted);
     }
 
     #[test]
