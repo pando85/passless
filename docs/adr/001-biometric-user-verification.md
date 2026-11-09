@@ -1,104 +1,111 @@
-# ADR 001: Biometric User Verification
+# ADR 001: Biometric user verification
 
 ## Status
 
-Accepted
+Accepted for fingerprint verification. Webcam matching remains **experimental** and
+MUST NOT satisfy FIDO2/CTAP user verification until independently validated
+presentation-attack detection (liveness) is integrated.
 
-## Context
+## Problem and trust boundary
 
-Passless currently uses desktop notifications for user verification (UV) in FIDO2 operations. This is a "something you have" factor (the device with passless running). To provide true multi-factor authentication, we need "something you are" - biometric verification.
-
-Linux provides several options for biometric authentication:
-
-1. **fprintd** - Standard Linux fingerprint daemon with D-Bus interface
-2. **Webcam face recognition** - Using modern ML models via ONNX
-3. **External commands** - Allow users to integrate any biometric tool
+A notification proves **user presence (UP)**, not user identity. It must never
+set or satisfy a FIDO2 **user verification (UV)** result. A camera embedding
+comparison alone is vulnerable to photos, replays and synthetic media.
 
 ## Decision
 
-We will implement a pluggable user verification system with multiple providers:
+The authenticator uses a pluggable verification manager:
 
-### Architecture
+- `fprintd`: OS-managed enrolled fingerprint via the system D-Bus service.
+  Can satisfy UV only after successful fingerprint verification.
+- `notification`: desktop confirmation, **UP only**. It may be used as
+  the presence fallback when a fingerprint reader is absent or unavailable.
+- `command`: custom verifier, explicitly enabled and selected by an
+  administrator. Exit 0 means accepted; nonzero means denied; timeout fails
+  closed. Commands run without a shell unless one is explicitly configured.
+  A trivial success command must never be configured for production UV.
+- `face`: webcam and face-embedding comparison, **experimental**. Enrollment,
+  storage and local matching tests are supported. A face match is *not* strong
+  FIDO2 UV because this implementation has no liveness detection.
 
-```
-UserVerificationManager (chain of responsibility)
-├── FprintdProvider (fingerprint via D-Bus)
-├── FaceIdProvider (webcam + face recognition)
-├── NotificationProvider (fallback, current behavior)
-└── CommandProvider (user-defined script)
-```
+There is one configured provider selection, not an ordered list. With
+`provider = "auto"`, fingerprint is attempted first, then desktop notification
+for **UP only**. For UV, the manager excludes notifications and experimental
+face recognition; if no eligible provider is available it denies UV.
 
-### Technology Choices
+An explicit denial stops the provider chain. Failures or timeouts can fall
+back only to another provider with adequate assurance.
 
-1. **D-Bus Integration**: Use `zbus` crate (pure Rust, async-native)
-2. **Webcam Capture**: Use `nokhwa` crate (cross-platform, no OpenCV dependency)
-3. **Face Recognition**: Use `face_id` crate (SCRFD detection + ArcFace embeddings via ONNX Runtime)
-4. **Provider Selection**: Configurable chain with automatic fallback
-
-### Configuration
+## Configuration
 
 ```toml
 [uv]
-providers = ["fprintd", "face", "notification"]  # Try in order
-
-[uv.fprintd]
+provider = "auto" # auto | fprintd | face | notification | command
 timeout_seconds = 30
 
-[uv.face]
+[uv.fprintd]
 enabled = true
+
+[uv.face]
+enabled = false
 camera_index = 0
 threshold = 0.6
+
+[uv.command]
+enabled = false
+command = []
 ```
 
-## Consequences
+`threshold` must be finite, greater than 0 and at most 1. For a dedicated
+fingerprint-only authenticator, set `provider = "fprintd"`. A command provider
+requires `provider = "command"`, `enabled = true`, and a nonempty
+`command` array. Command execution is limited by the verification timeout.
 
-### Positive
+The older `security.notification_timeout` is distinct from
+`uv.timeout_seconds`. The UV manager uses the latter.
 
-- True biometric verification for FIDO2 operations
-- Multiple provider options for different hardware
-- Automatic fallback ensures users aren't locked out
-- Modern Rust stack (zbus, face_id) with minimal C dependencies
+## Face enrollment and local smoke testing
 
-### Negative
-
-- Increased binary size and dependencies
-- face_id downloads ONNX models from HuggingFace on first use
-- Webcam access requires proper permissions
-- fprintd requires system-level setup
-
-### Neutral
-
-- Face recognition provider is feature-gated (`--features face`) to reduce binary size
-- Other providers (fprintd, notification, command) are always included
-- Face embeddings stored locally in user's storage backend
-
-## Implementation
-
-1. Create `uv/` module with `UserVerificationProvider` trait
-2. Implement provider chain in `UserVerificationManager`
-3. Implement each provider (fprintd, face, notification, command)
-4. Update authenticator to use manager instead of direct notifications
-
-### Build Options
+Build with `cargo build -p passless-rs --features face`. Then run:
 
 ```bash
-# Standard build (fprintd + notification providers)
-cargo build
-
-# With face recognition support (adds ~50MB+ due to ONNX Runtime)
-cargo build --features face
+passless uv face-status
+passless uv face-enroll --camera-index 0 --threshold 0.6
+passless uv face-verify --camera-index 0 --threshold 0.6
 ```
 
-## Alternatives Considered
+Five face samples are averaged. An error is returned when a frame contains
+more than one detected face. Templates are stored under the user's
+`XDG_DATA_HOME/passless/face_embeddings/face_template.bin`, with a private
+directory and 0600 file permissions on Unix. Templates are still **not
+cryptographically encrypted**; file permissions do not protect against
+malware running as the same account. A known-good biometric template must not
+be treated as an MFA or liveness guarantee.
 
-1. **All providers feature-gated**: Rejected - fprintd and notification are lightweight enough to include by default
-2. **Howdy integration**: Rejected - Python-based, command provider allows users to integrate it themselves
-3. **OpenCV for face recognition**: Rejected - heavy C++ dependency, face_id uses ONNX Runtime instead
-4. **PAM integration**: Rejected - indirect, requires PAM conversation setup
+The analyzer may download model files on first use, so an initial network
+connection is needed. Users must review the privacy and provenance of the
+models before enrollment.
+
+## Tests and acceptance
+
+CI exercises default and TPM-enabled builds, headless face compilation and
+unit tests, command timeout behavior, invalid face templates and strict
+UV/UP separation. CI cannot validate camera liveness, OS biometrics or
+fingerprint hardware.
+
+Follow `docs/BIOMETRIC_TESTING.md` for the local device-validation matrix.
+
+## Follow-up required for production face UV
+
+Introduce an audited liveness/PAD implementation (or a trusted
+platform biometric API), validate demographic and environmental performance,
+spoof/replay resistance, privacy, model delivery and retention, then define
+a calibrated threshold and enable `supports_strong_uv` only after those
+acceptance tests pass. No source-code-only assertion can replace this review.
 
 ## References
 
-- [fprintd D-Bus API](https://fprint.freedesktop.org/)
-- [nokhwa crate](https://crates.io/crates/nokhwa)
-- [face_id crate](https://crates.io/crates/face_id)
-- [zbus crate](https://crates.io/crates/zbus)
+- [fprintd D-Bus Device API](https://fprint.freedesktop.org/fprintd-dev/Device.html)
+- [FIDO user presence and verification requirements](https://fidoalliance.org/specifications/)
+- [nokhwa](https://crates.io/crates/nokhwa)
+- [face_id](https://crates.io/crates/face_id)
