@@ -180,6 +180,7 @@ pub struct PasslessCallbacks<S: CredentialStorage, P: PinStorage> {
     security_config: SecurityConfig,
     pin_config: PinConfig,
     uv_manager: UserVerificationManager,
+    uv_timeout_seconds: u32,
     #[cfg(feature = "agent")]
     interaction_manager: Option<Arc<AgentInteractionManager>>,
     #[cfg(feature = "agent")]
@@ -202,6 +203,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             security_config,
             pin_config,
             uv_manager,
+            uv_timeout_seconds: uv_config.timeout_seconds,
             #[cfg(feature = "agent")]
             interaction_manager: None,
             #[cfg(feature = "agent")]
@@ -226,6 +228,7 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             security_config,
             pin_config,
             uv_manager,
+            uv_timeout_seconds: uv_config.timeout_seconds,
             interaction_manager: Some(interaction_manager),
             isolated_mode,
         }
@@ -236,10 +239,11 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
         operation: &str,
         user: Option<&str>,
         rp: &str,
+        require_strong_uv: bool,
     ) -> Result<VerificationResult> {
         #[cfg(debug_assertions)]
         {
-            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").as_deref() == Ok("1") {
                 info!("E2E test mode: Auto-accepting user verification");
                 return Ok(VerificationResult::Accepted);
             }
@@ -262,12 +266,19 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             }
         };
 
-        if storage.disable_user_verification() && !is_registration && !should_verify {
-            debug!("User verification handled by backend (e.g., GPG): {}", operation);
+        if storage.disable_user_verification()
+            && !is_registration
+            && !should_verify
+            && !require_strong_uv
+        {
+            debug!(
+                "User verification handled by backend (e.g., GPG): {}",
+                operation
+            );
             return Ok(VerificationResult::Accepted);
         }
 
-        if !should_verify {
+        if !should_verify && !require_strong_uv {
             debug!(
                 "User verification disabled for {}: {}",
                 if is_registration {
@@ -280,10 +291,16 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
             return Ok(VerificationResult::Accepted);
         }
 
+        drop(storage);
         let context = VerificationContext::new(operation)
             .with_relying_party(rp)
             .with_user(user.unwrap_or(""))
-            .with_timeout(self.security_config.notification_timeout);
+            .with_timeout(self.uv_timeout_seconds);
+        let context = if require_strong_uv {
+            context.require_strong_uv()
+        } else {
+            context
+        };
 
         self.uv_manager.verify(&context).map_err(|e| {
             warn!("User verification failed: {}", e);
@@ -363,7 +380,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        match self.do_user_verification(info, user, rp)? {
+        match self.do_user_verification(info, user, rp, false)? {
             VerificationResult::Accepted => Ok(UpResult::Accepted),
             VerificationResult::Denied => Ok(UpResult::Denied),
             VerificationResult::Timeout => Ok(UpResult::Denied),
@@ -400,7 +417,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         #[cfg(debug_assertions)]
         {
-            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
+            if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").as_deref() == Ok("1") {
                 info!("E2E test mode: Auto-accepting user verification");
                 return Ok(UvResult::Accepted);
             }
@@ -467,7 +484,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
-        match self.do_user_verification(info, user, rp)? {
+        match self.do_user_verification(info, user, rp, true)? {
             VerificationResult::Accepted => {
                 info!("User verification accepted");
                 Ok(UvResult::AcceptedWithUp)
