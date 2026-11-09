@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn test_getinfo_through_type_erased_service() {
         use crate::authenticator::AuthenticatorService;
-        use passless_core::config::{PinConfig, SecurityConfig};
+        use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
         let base = tempdir().unwrap();
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1065,6 +1065,7 @@ mod tests {
             Some(bundle.pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("service creation should succeed");
 
@@ -1080,7 +1081,7 @@ mod tests {
     #[test]
     fn test_separate_type_erased_services_do_not_share_storage() {
         use crate::authenticator::AuthenticatorService;
-        use passless_core::config::{PinConfig, SecurityConfig};
+        use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
         let base = tempdir().unwrap();
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1097,6 +1098,7 @@ mod tests {
             Some(bundle_a.pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .unwrap();
 
@@ -1105,6 +1107,7 @@ mod tests {
             Some(bundle_b.pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .unwrap();
 
@@ -1130,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_separate_type_erased_services_do_not_share_pin_state() {
-        use passless_core::config::{PinConfig, SecurityConfig};
+        use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
         let base = tempdir().unwrap();
         fs::set_permissions(base.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1147,6 +1150,7 @@ mod tests {
             Some(bundle_a.pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .unwrap();
 
@@ -1155,6 +1159,7 @@ mod tests {
             Some(bundle_b.pin_storage.clone()),
             SecurityConfig::default(),
             PinConfig::default(),
+            UvConfig::default(),
         )
         .unwrap();
 
@@ -1951,7 +1956,7 @@ mod tests {
         #[test]
         fn human_regression_getinfo_with_agent_compiled() {
             use crate::authenticator::AuthenticatorService;
-            use passless_core::config::{PinConfig, SecurityConfig};
+            use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
             let base = secure_temp_dir();
             let cred_dir = base.path().join("human_reg_creds");
@@ -1968,6 +1973,7 @@ mod tests {
                 Some(bundle.pin_storage.clone()),
                 SecurityConfig::default(),
                 PinConfig::default(),
+                UvConfig::default(),
             )
             .expect("service creation should succeed");
 
@@ -1983,7 +1989,7 @@ mod tests {
         #[test]
         fn human_regression_seed_and_readback_without_ceremony() {
             use crate::authenticator::AuthenticatorService;
-            use passless_core::config::{PinConfig, SecurityConfig};
+            use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
             let base = secure_temp_dir();
             let cred_dir = base.path().join("human_ops_creds");
@@ -2009,6 +2015,7 @@ mod tests {
                 Some(bundle.pin_storage.clone()),
                 SecurityConfig::default(),
                 PinConfig::default(),
+                UvConfig::default(),
             )
             .unwrap();
 

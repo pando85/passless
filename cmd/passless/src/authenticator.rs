@@ -2755,6 +2755,7 @@ mod tests {
             Some(pin_storage.clone()),
             security_config,
             pin_config,
+            UvConfig::default(),
             interaction_manager,
         )
         .expect("Service creation should succeed");
