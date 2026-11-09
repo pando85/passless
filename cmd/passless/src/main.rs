@@ -510,6 +510,13 @@ fn run() -> Result<()> {
         return Err(e);
     }
 
+    #[cfg(not(feature = "face"))]
+    if config.uv.provider == passless_core::config::UvProviderType::Face {
+        return Err(Error::Config(
+            "uv.provider=face requires a build with --features face".into(),
+        ));
+    }
+
     if config.verbose && log_level != log::LevelFilter::Debug {
         info!("Enabling verbose logging...");
         log::set_max_level(log::LevelFilter::Debug);
