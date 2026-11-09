@@ -19,8 +19,11 @@ use super::{
 
 use log::{debug, info, warn};
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use image::DynamicImage;
 use nokhwa::Camera;
@@ -37,7 +40,6 @@ pub struct FaceIdProvider {
     camera_index: usize,
     threshold: f32,
     embeddings_path: PathBuf,
-    enrolled: Arc<Mutex<Option<bool>>>,
     analyzer: Arc<Mutex<Option<face_id::analyzer::FaceAnalyzer>>>,
 }
 
@@ -55,7 +57,6 @@ impl FaceIdProvider {
             camera_index,
             threshold,
             embeddings_path,
-            enrolled: Arc::new(Mutex::new(None)),
             analyzer: Arc::new(Mutex::new(None)),
         }
     }
@@ -167,7 +168,9 @@ impl FaceIdProvider {
         }
 
         if results.len() > 1 {
-            warn!("Multiple faces detected, using the first one");
+            return Err(VerificationError::DeviceError(
+                "Multiple faces detected; only one person may be in frame".into(),
+            ));
         }
 
         let face = &results[0];
@@ -178,57 +181,94 @@ impl FaceIdProvider {
         Ok(face.embedding.clone())
     }
 
-    /// Load stored embeddings template
+    /// Load an enrolled template from a private, regular file.
     fn load_template(&self) -> Result<Vec<f32>, VerificationError> {
         let path = self.embeddings_file();
-        if !path.exists() {
-            return Err(VerificationError::NotEnrolled);
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                VerificationError::NotEnrolled
+            } else {
+                VerificationError::DeviceError(format!("Failed to inspect template: {}", e))
+            }
+        })?;
+        if !meta.file_type().is_file() {
+            return Err(VerificationError::DeviceError(
+                "Face template must be a regular file".into(),
+            ));
         }
-
+        #[cfg(unix)]
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(VerificationError::DeviceError(
+                "Face template permissions must be 0600".into(),
+            ));
+        }
         let data = std::fs::read(&path).map_err(|e| {
             VerificationError::DeviceError(format!("Failed to read template: {}", e))
         })?;
-
-        let embedding_len = u64::from_le_bytes(
-            data.get(0..8)
-                .ok_or_else(|| VerificationError::DeviceError("Invalid template format".into()))?
-                .try_into()
-                .unwrap(),
-        ) as usize;
-
+        if data.len() < 8 {
+            return Err(VerificationError::DeviceError("Truncated face template".into()));
+        }
+        let length = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        if length == 0 || length > 4096 || data.len() as u64 != 8 + length * 4 {
+            return Err(VerificationError::DeviceError("Invalid face template length".into()));
+        }
         let embedding: Vec<f32> = data[8..]
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-
-        if embedding.len() != embedding_len {
-            return Err(VerificationError::DeviceError(
-                "Template length mismatch".into(),
-            ));
+        if !embedding.iter().all(|value| value.is_finite()) {
+            return Err(VerificationError::DeviceError("Invalid face template value".into()));
         }
-
         Ok(embedding)
     }
 
-    /// Save embeddings template
-    #[allow(dead_code)]
+    /// Atomically save a template with owner-only access; never follow output symlinks.
     fn save_template(&self, embedding: &[f32]) -> Result<(), VerificationError> {
-        std::fs::create_dir_all(&self.embeddings_path).map_err(|e| {
-            VerificationError::DeviceError(format!("Failed to create embeddings directory: {}", e))
-        })?;
+        if embedding.is_empty() || embedding.len() > 4096
+            || !embedding.iter().all(|value| value.is_finite())
+        {
+            return Err(VerificationError::DeviceError("Invalid face embedding".into()));
+        }
+        #[cfg(unix)]
+        {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&self.embeddings_path).map_err(|e| {
+                VerificationError::DeviceError(format!("Failed to create template directory: {}", e))
+            })?;
+            std::fs::set_permissions(
+                &self.embeddings_path,
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&self.embeddings_path)?;
 
         let path = self.embeddings_file();
-
+        let tmp_path = self.embeddings_path.join(format!(
+            ".face_template-{}.tmp", std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp_path).map_err(|e| {
+            VerificationError::DeviceError(format!("Failed to create temporary template: {}", e))
+        })?;
         let mut data = Vec::with_capacity(8 + embedding.len() * 4);
         data.extend_from_slice(&(embedding.len() as u64).to_le_bytes());
-        for &val in embedding {
-            data.extend_from_slice(&val.to_le_bytes());
+        for &value in embedding {
+            data.extend_from_slice(&value.to_le_bytes());
         }
-
-        std::fs::write(&path, &data).map_err(|e| {
-            VerificationError::DeviceError(format!("Failed to write template: {}", e))
-        })?;
-
+        if let Err(e) = file.write_all(&data).and_then(|_| file.sync_all()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(VerificationError::DeviceError(format!("Failed to save template: {}", e)));
+        }
+        drop(file);
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(VerificationError::DeviceError(format!("Failed to install template: {}", e)));
+        }
         info!("Saved face template to {}", path.display());
         Ok(())
     }
@@ -302,13 +342,7 @@ impl UserVerificationProvider for FaceIdProvider {
     }
 
     fn is_enrolled(&self) -> bool {
-        if let Some(enrolled) = *self.enrolled.lock().unwrap() {
-            return enrolled;
-        }
-
-        let enrolled = self.embeddings_file().exists();
-        *self.enrolled.lock().unwrap() = Some(enrolled);
-        enrolled
+        self.embeddings_file().is_file()
     }
 
     fn enroll(&self) -> Result<(), VerificationError> {
@@ -353,8 +387,6 @@ impl UserVerificationProvider for FaceIdProvider {
 
         self.save_template(&avg_embedding)?;
 
-        *self.enrolled.lock().unwrap() = Some(true);
-
         info!("Face enrollment completed successfully");
         Ok(())
     }
@@ -397,6 +429,38 @@ mod tests {
             Some(temp_dir.path().join("face_embeddings")),
         );
         assert!(!provider.is_enrolled());
+    }
+
+    #[test]
+    fn test_reject_malformed_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FaceIdProvider::new(0, DEFAULT_THRESHOLD, Some(tmp.path().into()));
+        std::fs::write(provider.embeddings_file(), [0u8, 1, 2]).unwrap();
+        assert!(provider.load_template().is_err());
+    }
+
+    #[test]
+    fn test_face_template_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FaceIdProvider::new(0, DEFAULT_THRESHOLD, Some(tmp.path().join("face")));
+        let template = vec![0.1, -0.2, 0.3, 0.4];
+        provider.save_template(&template).unwrap();
+        assert_eq!(provider.load_template().unwrap(), template);
+        assert!(provider.is_enrolled());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::metadata(provider.embeddings_file()).unwrap().permissions();
+            assert_eq!(permissions.mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_reject_invalid_embedding_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FaceIdProvider::new(0, DEFAULT_THRESHOLD, Some(tmp.path().join("face")));
+        assert!(provider.save_template(&[f32::NAN]).is_err());
+        assert!(provider.save_template(&[]).is_err());
     }
 
     #[test]
