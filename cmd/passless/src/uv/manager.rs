@@ -64,6 +64,12 @@ impl UserVerificationManager {
             if context.require_strong_uv && !provider.supports_strong_uv() {
                 continue;
             }
+            // Do not open or probe a camera unless a face template is enrolled.
+            if provider.requires_enrollment() && !provider.is_enrolled() {
+                debug!("Provider {} not enrolled, skipping", provider.name());
+                last_error = Some(VerificationError::NotEnrolled);
+                continue;
+            }
             if !provider.available() {
                 continue;
             }
@@ -73,13 +79,6 @@ impl UserVerificationManager {
                 provider.name(),
                 provider.priority()
             );
-
-            // Check enrollment
-            if provider.requires_enrollment() && !provider.is_enrolled() {
-                debug!("Provider {} not enrolled, skipping", provider.name());
-                last_error = Some(VerificationError::NotEnrolled);
-                continue;
-            }
 
             match provider.verify(context) {
                 Ok(result @ VerificationResult::Accepted) => {
