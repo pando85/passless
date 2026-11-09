@@ -75,6 +75,22 @@ impl FprintdProvider {
 
         debug!("Found device at path: {:?}", device_path);
 
+        // D-Bus broadcasts can be emitted by other clients. Bind VerifyStatus to
+        // the unique owner of the fprintd service, not just its interface/path.
+        let service_owner: String = conn
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetNameOwner",
+                &"net.reactivated.Fprint",
+            )
+            .await
+            .map_err(|e| VerificationError::DeviceError(format!("fprintd owner lookup failed: {}", e)))?
+            .body()
+            .deserialize()
+            .map_err(|e| VerificationError::DeviceError(format!("Invalid fprintd owner: {}", e)))?;
+
         conn.call_method(
             Some("net.reactivated.Fprint"),
             device_path.as_str(),
@@ -85,7 +101,7 @@ impl FprintdProvider {
         .await
         .map_err(|e| VerificationError::DeviceError(format!("Failed to claim device: {}", e)))?;
 
-        let result = Self::wait_for_verification(&conn, &device_path, timeout_secs).await;
+        let result = Self::wait_for_verification(&conn, &device_path, &service_owner, timeout_secs).await;
 
         let _ = conn
             .call_method(
@@ -103,6 +119,7 @@ impl FprintdProvider {
     async fn wait_for_verification(
         conn: &zbus::Connection,
         device_path: &zbus::OwnedObjectPath,
+        service_owner: &str,
         timeout_secs: u32,
     ) -> Result<VerificationResult, VerificationError> {
         use futures_util::StreamExt;
@@ -139,6 +156,12 @@ impl FprintdProvider {
                     match msg {
                         Some(Ok(msg)) => {
                             let header = msg.header();
+                            if !Self::is_expected_sender(
+                                service_owner,
+                                header.sender().map(|s| s.as_str()),
+                            ) {
+                                continue;
+                            }
 
                             if header.interface().map(|i| i.as_str()) != Some("net.reactivated.Fprint.Device") {
                                 continue;
@@ -234,6 +257,10 @@ impl FprintdProvider {
         } else {
             Ok(result)
         }
+    }
+
+    fn is_expected_sender(owner: &str, sender: Option<&str>) -> bool {
+        sender == Some(owner)
     }
 
     fn check_enrolled(&self) -> bool {
@@ -364,6 +391,14 @@ impl UserVerificationProvider for FprintdProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reject_forged_fprintd_status_sender() {
+        assert!(FprintdProvider::is_expected_sender(":1.42", Some(":1.42")));
+        assert!(!FprintdProvider::is_expected_sender(":1.42", Some(":1.43")));
+        assert!(!FprintdProvider::is_expected_sender(":1.42", None));
+        assert!(!FprintdProvider::is_expected_sender(":1.42", Some("net.reactivated.Fprint")));
+    }
 
     #[test]
     fn test_fprintd_provider_name() {
