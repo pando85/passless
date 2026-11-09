@@ -38,6 +38,7 @@ impl UserVerificationManager {
     }
 
     /// Get list of available providers
+    #[allow(dead_code)]
     pub fn available_providers(&self) -> Vec<&dyn UserVerificationProvider> {
         self.providers
             .iter()
@@ -111,7 +112,9 @@ impl UserVerificationManager {
         }
         // Every eligible provider failed, timed out, or was unenrolled.
         Err(last_error.unwrap_or_else(|| {
-            VerificationError::NotAvailable("All eligible verification providers unavailable".into())
+            VerificationError::NotAvailable(
+                "All eligible verification providers unavailable".into(),
+            )
         }))
     }
 
