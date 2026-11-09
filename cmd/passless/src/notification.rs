@@ -8,6 +8,11 @@ use std::sync::{Arc, Mutex};
 use log::{debug, info, warn};
 use notify_rust::{Notification, Timeout, Urgency};
 
+// The pluggable UV providers (`uv::NotificationProvider` and friends) replaced the
+// notification-based user-presence and user-verification prompts, so the helpers
+// below no longer have callers outside their unit tests. They are kept until that
+// migration is settled; see the biometric UV ADR in docs/adr.
+#[allow(dead_code)]
 const INTERACTION_MODE_ENV: &str = "PASSLESS_INTERACTION_MODE";
 
 /// Result of user interaction via notification
@@ -23,6 +28,7 @@ pub enum NotificationResult {
 pub type YesNoResult = NotificationResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum PromptKind {
     UserPresence,
     UserVerification,
@@ -30,11 +36,13 @@ enum PromptKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum InteractionMode {
     Desktop,
     Automatic,
 }
 
+#[allow(dead_code)]
 fn interaction_mode_from_value(value: Option<&str>) -> Result<InteractionMode, String> {
     let Some(value) = value else {
         return Ok(InteractionMode::Desktop);
@@ -50,6 +58,7 @@ fn interaction_mode_from_value(value: Option<&str>) -> Result<InteractionMode, S
     }
 }
 
+#[allow(dead_code)]
 fn configured_interaction_mode() -> Result<InteractionMode, String> {
     match std::env::var(INTERACTION_MODE_ENV) {
         Ok(value) => interaction_mode_from_value(Some(&value)),
@@ -137,6 +146,7 @@ fn action_is_accepted(
     action == "default" && action_mode.uses_default_action()
 }
 
+#[allow(dead_code)]
 fn show_confirmation_notification(
     operation: &str,
     relying_party: Option<&str>,
@@ -234,6 +244,7 @@ fn show_confirmation_notification(
 /// User presence is a consent gesture (for example, touching a hardware key),
 /// so notification activation may be used as the explicit gesture on daemons
 /// such as Dunst that do not expose action buttons directly.
+#[allow(dead_code)]
 pub fn show_user_presence_notification(
     operation: &str,
     relying_party: Option<&str>,
@@ -253,6 +264,7 @@ pub fn show_user_presence_notification(
 ///
 /// Unlike user presence, Dunst activation is not treated as verification: the
 /// user must invoke the explicit Accept action through Dunst's action UI.
+#[allow(dead_code)]
 pub fn show_verification_notification(
     operation: &str,
     relying_party: Option<&str>,

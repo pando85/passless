@@ -217,8 +217,10 @@ impl FaceIdProvider {
             ));
         }
         let embedding: Vec<f32> = data[8..]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         if !embedding.iter().all(|value| value.is_finite()) {
             return Err(VerificationError::DeviceError(
