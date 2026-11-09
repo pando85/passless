@@ -19,7 +19,6 @@ use std::sync::Mutex;
 
 /// fprintd-based fingerprint verification provider
 pub struct FprintdProvider {
-    available_cache: Mutex<Option<bool>>,
     runtime: Mutex<Option<Arc<tokio::runtime::Runtime>>>,
 }
 
@@ -27,7 +26,6 @@ impl FprintdProvider {
     /// Create a new fprintd provider
     pub fn new() -> Self {
         Self {
-            available_cache: Mutex::new(None),
             runtime: Mutex::new(None),
         }
     }
@@ -110,6 +108,9 @@ impl FprintdProvider {
         use futures_util::StreamExt;
         use zbus::MessageStream;
 
+        // Subscribe BEFORE starting verification so a fast VerifyStatus signal
+        // cannot race the creation of the receiver.
+        let mut stream = MessageStream::from(conn);
         conn.call_method(
             Some("net.reactivated.Fprint"),
             device_path.as_str(),
@@ -122,12 +123,11 @@ impl FprintdProvider {
             VerificationError::DeviceError(format!("Failed to start verification: {}", e))
         })?;
 
-        let mut stream = MessageStream::from(conn);
-
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs as u64));
         tokio::pin!(timeout);
 
         let mut result = VerificationResult::Timeout;
+        let mut provider_error: Option<VerificationError> = None;
 
         loop {
             tokio::select! {
@@ -151,35 +151,43 @@ impl FprintdProvider {
                             }
 
                             match msg.body().deserialize::<(&str, bool)>() {
-                                Ok((status, _done)) => {
+                                Ok((status, done)) => {
                                     debug!("fprintd status: {}", status);
 
                                     match status {
-                                        "verify-match" => {
+                                        "verify-match" if done => {
                                             info!("Fingerprint matched");
                                             result = VerificationResult::Accepted;
                                             break;
                                         }
-                                        "verify-no-match" => {
+                                        "verify-match" => continue,
+                                        "verify-no-match" if done => {
                                             info!("Fingerprint not matched");
                                             result = VerificationResult::Denied;
                                             break;
                                         }
+                                        "verify-no-match" => continue,
                                         "verify-retry-scan"
                                         | "verify-swipe-too-short"
                                         | "verify-finger-not-entered"
+                                        | "verify-finger-not-centered"
+                                        | "verify-too-fast"
                                         | "verify-remove-and-retry" => {
                                             debug!("Retry requested: {}", status);
                                             continue;
                                         }
                                         "verify-disconnected" => {
-                                            error!("Device disconnected");
-                                            result = VerificationResult::Denied;
+                                            error!("Fingerprint device disconnected");
+                                            provider_error = Some(VerificationError::DeviceError(
+                                                "Fingerprint device disconnected".into(),
+                                            ));
                                             break;
                                         }
                                         "verify-unknown-error" => {
-                                            error!("Unknown error");
-                                            result = VerificationResult::Denied;
+                                            error!("Fingerprint device returned an error");
+                                            provider_error = Some(VerificationError::DeviceError(
+                                                "Fingerprint device returned an error".into(),
+                                            ));
                                             break;
                                         }
                                         _ => {
@@ -195,11 +203,15 @@ impl FprintdProvider {
                             }
                         }
                         Some(Err(e)) => {
-                            error!("Error receiving message: {}", e);
-                            continue;
+                            error!("Error receiving fingerprint signal: {}", e);
+                            provider_error = Some(VerificationError::DeviceError(e.to_string()));
+                            break;
                         }
                         None => {
-                            error!("Signal stream closed");
+                            error!("Fingerprint signal stream closed");
+                            provider_error = Some(VerificationError::DeviceError(
+                                "Fingerprint signal stream closed".into(),
+                            ));
                             break;
                         }
                     }
@@ -217,7 +229,48 @@ impl FprintdProvider {
             )
             .await;
 
-        Ok(result)
+        if let Some(error) = provider_error {
+            Err(error)
+        } else {
+            Ok(result)
+        }
+    }
+
+    fn check_enrolled(&self) -> bool {
+        let rt = match self.get_runtime() {
+            Ok(rt) => rt,
+            Err(_) => return false,
+        };
+        rt.block_on(async {
+            use zbus::Connection;
+            let Ok(conn) = Connection::system().await else {
+                return false;
+            };
+            let Ok(reply) = conn.call_method(
+                Some("net.reactivated.Fprint"),
+                "/net/reactivated/Fprint/Manager",
+                Some("net.reactivated.Fprint.Manager"),
+                "GetDefaultDevice",
+                &(),
+            ).await else {
+                return false;
+            };
+            let Ok(path) = reply.body().deserialize::<zbus::OwnedObjectPath>() else {
+                return false;
+            };
+            let Ok(reply) = conn.call_method(
+                Some("net.reactivated.Fprint"),
+                path.as_str(),
+                Some("net.reactivated.Fprint.Device"),
+                "ListEnrolledFingers",
+                &"",
+            ).await else {
+                return false;
+            };
+            reply.body().deserialize::<Vec<String>>()
+                .map(|fingers| !fingers.is_empty())
+                .unwrap_or(false)
+        })
     }
 
     fn check_available(&self) -> bool {
@@ -273,13 +326,8 @@ impl UserVerificationProvider for FprintdProvider {
     }
 
     fn available(&self) -> bool {
-        if let Some(cached) = *self.available_cache.lock().unwrap() {
-            return cached;
-        }
-
-        let available = self.check_available();
-        *self.available_cache.lock().unwrap() = Some(available);
-        available
+        // Device hotplug and fprintd restarts must not leave stale cache entries.
+        self.check_available()
     }
 
     fn verify(
@@ -296,6 +344,10 @@ impl UserVerificationProvider for FprintdProvider {
         priority::FPRINTD
     }
 
+    fn supports_strong_uv(&self) -> bool {
+        true
+    }
+
     fn supports_enrollment(&self) -> bool {
         true
     }
@@ -305,7 +357,7 @@ impl UserVerificationProvider for FprintdProvider {
     }
 
     fn is_enrolled(&self) -> bool {
-        true
+        self.check_enrolled()
     }
 }
 
