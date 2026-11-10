@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "passless-proxy-spike",
+  "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmZzEC4FAD1ZOxhldD3s22pPnUoC/PPq9nfYvEjuIVp/vWBmmrtqZA/sYDRFVt3c18ym0HZQINx1jS2+8PcAN+o3ONeSa68jqUngUUi+MnrLMMu/Y1nbyYZj+o8zweSBBju/N6ImppihzwQls/TcMRWZULAmSwIuxZDvd0E4RbLNG0XNVM9bViBCLikFiSfR5QgbTpeVqtRMo6nk2Ws4HnaQFLScDOvQtsMXcYJPvPfuq8+pT+7LE0RwXj+c6odRuKxf0KQvo5VnCBaB6zK+aS1BpzUGI6UtMjmtcUIq7KZpmgRtXh7AG8v08DA8zAffozGdkn0qWB3/vRXef63oV3wIDAQAB",
+  "permissions": [
+    "webAuthenticationProxy",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  }
+}

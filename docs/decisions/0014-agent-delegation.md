@@ -4,6 +4,8 @@
 - **Date:** 2026-11-10
 - **Decision owners:** Passless maintainers
 - **Implementation status:** Partially implemented; see [Implementation status](#19-implementation-status)
+- **Amended:** 2026-11-11, with maintainer-resolved decisions and the results of the browser and
+  environment spikes (see [History](#20-history))
 
 This ADR is the single source of truth for letting AI and browser agents authenticate with
 passkeys through the Passless daemon. It replaces ADRs 0001, 0002 and 0004–0012 and the agent
@@ -95,10 +97,10 @@ agent principal ── IPC (capability) ──▶ daemon ◀── UHID ── h
       │                                   │
       │ CDP (pipe or port)                ├─ policy engine + granted-rules store
       ▼                                   ├─ operation service (sign / register)
-managed browser                           ├─ backend handles (human, isolated/<profile>)
-  MAIN-world script ─▶ broker ─▶ worker   ├─ notification prompt (D-Bus)
-                                 │        └─ audit writer
-                                 └─ native messaging ─▶ sign-proxy ─▶ Unix socket ─┘
+managed browser (private /dev)            ├─ backend handles (human, isolated/<profile>)
+  webAuthenticationProxy ─▶ worker        ├─ notification prompt (D-Bus)
+                              │           └─ audit writer
+                              └─ native messaging ─▶ sign-proxy ─▶ Unix socket ─┘
 ```
 
 ### 4.1 Daemon
@@ -131,6 +133,23 @@ defines runtime isolation.
 - Session end, expiry or revocation revokes its lease and sign bearer, terminates Chromium and
   cleans the profile. A profile that fails cleanup is quarantined and never reused.
 - Killing the browser does not revoke RP sessions or material the principal copied.
+- **Supported browsers.** Chromium and Chrome for Testing. Chrome for Testing is detected from the
+  `--version` output (`Google Chrome for Testing …`); the user agent does not distinguish it from
+  branded Chrome, so detection never relies on it, and the check for branded Google Chrome must not
+  match this string. Branded Google Chrome (it ignores `--load-extension`) and `chrome-headless-shell`
+  (it loads no extensions) are rejected at launch with an actionable error. Edge and Brave were not
+  probed and are unsupported. In a distinct-UID deployment only root-owned binaries that the
+  principal cannot write are accepted.
+- **Incognito and CDP-created contexts.** The extension, and with it the proxy (§4.4), applies in an
+  off-the-record context only if the extension is allowed in incognito. The launcher therefore
+  seeds the managed browser's fresh profile before its first launch: `Default/Preferences` contains
+  `extensions.settings.<id>.incognito = true`, where `<id>` is the stable extension ID derived from
+  the manifest `key`. Verified on Chromium 156 and Chrome for Testing 156: with the seed, the
+  extension and the proxy apply in the primary off-the-record profile and in
+  `Target.createBrowserContext` contexts, which is what Playwright `newContext()`, Playwright MCP
+  `--isolated` and chrome-devtools-mcp `isolatedContext` create. Without the seed those contexts use
+  the native path. The seed relies on these browsers not enforcing the preference MAC for this key.
+  The launcher must verify at startup that the seeding took effect and fail closed if it did not.
 
 ### 4.3 Browser control and CDP exposure
 
@@ -158,12 +177,21 @@ authenticated browser-session authority.
 ### 4.4 Extension and transport
 
 The daemon loads an MV3 extension (`cmd/passless/assets/agent-extension/`) with
-`--load-extension`:
+`--load-extension`. `chrome.webAuthenticationProxy` is the interception mechanism. The extension is a
+service worker only: it has no content script, and the MAIN-world override of
+`navigator.credentials` is removed. The page therefore receives a genuine `PublicKeyCredential`,
+and the browser, not the extension, applies the RP-ID and Permissions Policy checks before the
+extension sees a request (§11).
 
-- `main.js`, MAIN world, `document_start`: overrides `navigator.credentials.get()` and `create()`,
-  reads the frame's origin, serializes options, and returns a duck-typed `PublicKeyCredential`;
-- `broker.js`, isolated world: validates and relays messages;
-- `worker.js`, service worker: holds the bearer and talks to the daemon.
+The worker:
+
+- calls `chrome.webAuthenticationProxy.attach()` on every start; a repeated call is idempotent;
+- handles `onCreateRequest` and `onGetRequest` by forwarding the request details to the daemon and
+  completing the request with `completeCreateRequest` or `completeGetRequest`, passing the daemon's
+  output through verbatim or, on failure, a DOMException name;
+- handles `onRequestCanceled` by sending an abort to the daemon;
+- answers every `onIsUvpaaRequest` with `false`;
+- holds the daemon bearer and talks to the daemon (below).
 
 As implemented (PR #450), the worker calls `chrome.runtime.sendNativeMessage` to the native host
 `rs.passless.sign_proxy` (`cmd/passless/src/bin/sign-proxy.rs`), which forwards an HTTP request
@@ -247,7 +275,9 @@ the profile value (§10.1). Policy is owned by the operator; a principal cannot 
 reload or revoke it, and cannot choose an evidence source at request time.
 
 RP IDs are normalized exact DNS names: no scheme, port, path, trailing dot, IP address or public
-suffix. The only pattern is the constrained `*` (§6.3).
+suffix. The only pattern is the constrained `*` (§6.3). The one exception to the public-suffix rule
+is `localhost`: `rp_id = "localhost"` and origins `http://localhost[:port]` are valid for exact
+rules only and never match through the wildcard.
 
 ### 6.2 Resolution
 
@@ -288,26 +318,59 @@ through exactly one rule, and a wildcard match is audited as `rule = "*"`.
   `human_verification_prompt` are removed; a config using them fails with a migration message.
 - The policy digest covers every rule field, profile-level `credential_selection`, every
   acknowledgement, and the granted-rules store content (§8.4).
+- A ceremony resolves against the live configuration plus the granted-rules store, never against a
+  copy of the profile configuration frozen into the session. Change is tracked by two monotonic
+  counters: the *revocation epoch*, bumped by a config reload, a grant revocation and a config
+  change, which revokes sessions; and the *grant epoch*, bumped when a grant is added, which does
+  not revoke sessions (§8.4, §9).
 
 ## 7. Ceremonies and evidence
 
 An agent ceremony never invokes the notification prompt, the PIN path or native WebAuthn. The
-extension never falls back to the original `navigator.credentials` methods for a request it has
-routed to the daemon. A `deny`, a rejected or timed-out escalation, and every policy failure
-return `NotAllowedError` to the page.
+extension never falls back to a native authenticator for a request it has routed to the daemon. A
+`deny`, a rejected or timed-out escalation, and every policy failure return `NotAllowedError` to
+the page. Non-public-key credential calls (passwords, federated credentials) are not WebAuthn and
+never reach an authenticator.
 
-Non-public-key credential calls and requests the extension does not intercept (such as
-conditional mediation, and cross-origin frames until §11 lands) still use the native path. That
-path belongs to the human authenticator and is outside agent policy.
-`PASSLESS_INTERACTION_MODE=automatic` (PR #505) affects only the human CTAP path and never
-approves an escalation.
+**The managed browser never reaches the human authenticator (invariant 25).** While attached, the
+proxy routes every WebAuthn create and get from the managed browser to the extension, and a request
+the extension cannot handle fails closed. Conditional mediation is unavailable while attached (§11).
+The remaining gaps are an unloaded extension, a request before the first attach, and a context in
+which the extension is not enabled (§4.2): each would be handled by the browser itself, through
+CTAP over HID, and so could reach the human's UHID device. No command-line switch or feature flag
+disables CTAP over HID (verified: plain Chromium created a credential through the UHID device with
+every candidate flag), and the binary's policy list contains no policy that does (enterprise policy
+installation was not tested). The CDP virtual authenticator is not a substitute, because it signs
+inside the browser and any CDP client can remove it. Containment is therefore mandatory and is based
+on the filesystem and the UID:
+
+- Whenever `bwrap` and unprivileged user namespaces are available, the managed browser runs in a
+  private `/dev` that has no `hidraw*` and no `uhid`, as defence in depth:
+  `bwrap --dev-bind / / --dev /dev --die-with-parent <browser> …`. Chromium's own sandbox keeps
+  working inside it (verified on distro Chromium 156, with no `--no-sandbox`; Playwright Chromium
+  and Chrome for Testing are verified before they are supported under containment).
+- The private `/dev` is required, and the launcher refuses to start the browser without it, when
+  the browser's UID could open any `/dev/hidraw*` (no `bwrap`, or no unprivileged user namespaces,
+  means refusal).
+- In a distinct-UID deployment where the browser user cannot open any hidraw node, containment is
+  not required. `passless doctor` reports which case applies: required and in place, in place as
+  defence in depth, not required, or refused.
+- A missing or unloadable extension is a launch error, never a launch without the extension. The
+  CDP endpoint is not handed out until the worker has attached the proxy, and is withheld again if
+  the attachment is lost.
+
+`PASSLESS_INTERACTION_MODE=automatic` (PR #505) affects only the human CTAP path and never approves
+an escalation. Because it would let a request that reaches the native path be signed silently, the
+daemon refuses to start agents when it is set and any same-user profile has an `allow` or `request`
+rule, unless `agents.allow_automatic_human_path = true`. `passless doctor` flags the combination.
 
 For an `allow` decision the daemon sets UP=1 and UV=1 only after validating that:
 
 - the bearer session is active, unexpired and within its operation budget;
 - the session is bound to the profile, the principal digest and the browser lease;
 - the operation passes origin and RP validation;
-- the current policy generation still resolves to `allow` immediately before key use;
+- the revocation epoch is unchanged and the rule, re-resolved against the live configuration and
+  grants, still resolves to `allow` immediately before key use;
 - the replay key is fresh;
 - the durable audit reservation has succeeded.
 
@@ -323,13 +386,16 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
 
 1. A ceremony resolves to `request`.
 2. The daemon creates or joins a pending escalation keyed by `(profile, rp_id, action)`. One is
-   pending per key; concurrent ceremonies wait on it.
+   pending per key; concurrent `authenticate` ceremonies wait on it. Registration escalations are
+   not joinable (§8.3).
 3. The daemon writes an `escalation_requested` audit record; if the write fails, the ceremony
    fails.
 4. The daemon shows a notification built only from daemon-derived fields: profile, identity
    mode, principal, action, RP ID, origin, and whether the grant would be persistent. It shows no
    page- or agent-supplied text. The only actions are **Allow always** and **Deny**.
-5. The WebAuthn call stays open until a decision or the ceremony's effective timeout. The timeout
+5. The WebAuthn call stays open until a decision or the ceremony's effective timeout. The waiting
+   ceremony is a parked continuation in the escalation service; it holds no thread, no operation
+   lock and no storage lock (§8.2). The timeout
    matches Chromium: the page's `timeout` clamped to 3 minutes–20 hours, or 20 hours when unset
    (`AdjustTimeout()` in `content/browser/webauth/authenticator_common_impl.cc`;
    `kMinRequestTimeout`/`kMaxRequestTimeout` in `device/fido/public/fido_constants.cc`). The
@@ -340,7 +406,12 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
    bumps the policy generation, then re-resolves and continues the original ceremony as `allow`.
 7. On denial or timeout it writes `escalation_denied` or `escalation_expired`, fails the
    ceremony, and starts a cooldown for that key (default 10 minutes) during which new requests
-   are denied without prompting.
+   are denied without prompting. When a waiting ceremony is aborted it stops waiting; when the last
+   waiter of an escalation has left, the escalation is withdrawn, its notification is closed, a
+   late click has no effect, and `escalation_expired` with `reason = aborted` is recorded (§12).
+   Withdrawn or aborted escalations are rate-limited: after 3 per key within 10 minutes, the
+   cooldown applies to that key. A queued entry is dequeued when its last waiter leaves, and an
+   active prompt with zero waiters is withdrawn immediately.
 
 ### 8.2 Integrity and abuse limits
 
@@ -350,11 +421,30 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
   a rule without a prompt edit the config.
 - The notification-server capability gate fails closed on servers without distinct actions.
   `min_review_delay_ms` is a timing heuristic, not authentication.
-- With no notification service the request is denied immediately and audited. Headless hosts use
-  explicit `allow` rules.
+- `agents.notify_user` names the human whose session bus receives escalation prompts. The user
+  unit uses its own bus. If no bus can be resolved, escalation is unavailable: the request is denied
+  immediately and audited. Headless hosts use explicit `allow` rules.
+- A root daemon (distinct-UID deployment) reaches the `notify_user` session bus only through a
+  dedicated per-prompt child process that lives exactly as long as that prompt: it owns the bus
+  connection, emits the notification, waits for the action or close signal, and exits. The daemon
+  can kill it to withdraw the prompt. The child drops privileges (`setgroups`, `setresgid`,
+  `setresuid`, `PR_SET_NO_NEW_PRIVS`, no capabilities) and connects to
+  `unix:path=/run/user/<uid>/bus` before it does anything else, and reports the result to the
+  daemon. The daemon never changes its own credentials. D-Bus EXTERNAL authentication requires the peer UID to
+  equal the bus owner's UID (verified), so a root process connecting as itself is rejected, and the
+  drop is process-wide and irreversible, which rules out doing it in the daemon.
 - Each profile shows at most one escalation prompt at a time. Other keys queue in a bounded
   queue; overflow is denied.
-- The budget claim happens only after origin and policy validation (§9).
+- Waiting ceremonies are parked continuations that hold no thread. At most 4 escalation waiters
+  exist per session and 16 per profile; a ceremony beyond either cap is denied and audited, and
+  other profiles are unaffected.
+- The budget claim happens only after origin and policy validation, and for a `request` rule only
+  after approval (§9).
+- A same-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, or a replaced
+  server) and so approve its own escalation. This cannot be prevented. Escalation integrity holds
+  only for distinct-UID principals (§13, §15). In a distinct-UID deployment (root daemon)
+  `notify_user` must differ from every `principal_user` and `browser_user`. In the shared-UID user
+  unit the notification user is the same user by design, and the residual risk applies.
 
 ### 8.3 Registration escalation
 
@@ -362,16 +452,22 @@ Autonomous registration is the explicit setting `register = "allow"`; it is neve
 through escalation. `register = "request"` is valid only where `register = "allow"` would be
 valid, and invalid when the same rule has `authenticate = "deny"`.
 
-Approving a registration escalation permits exactly one registration, for exactly that RP, within
-the waiting ceremony. The approval binds to that ceremony's session and is not a separate
-transferable credential. It does not persist `register = allow`. On successful creation it persists
+Registration escalations are not joinable. Each registration ceremony that resolves to `request`
+raises its own escalation, and a concurrent duplicate for the same `(profile, rp_id)` is denied.
+Approving a registration escalation issues a one-use token that is bound to the creating ceremony;
+no other waiter can claim it. It permits exactly one registration, for exactly that RP, within that
+ceremony. The approval binds to that ceremony's session and is not a separate transferable
+credential. It does not persist `register = allow`. On successful creation it persists
 `authenticate = allow` for that exact RP with `kind = "registration"` and the new credential
-reference. If registration fails after approval, nothing is persisted.
+reference, and that credential reference joins the pinned set for the RP (§10.1). If registration
+fails after approval, nothing is persisted.
 
 ### 8.4 Granted-rules store
 
-- **Location:** `<agent state dir>/granted-rules/<profile>.toml`, owned by the daemon user, mode
-  0600, in a 0700 directory. The daemon never writes the operator's config file.
+- **Location:** `<agents.state_dir>/granted-rules/<profile>.toml`, owned by the daemon user, mode
+  0600, in a 0700 directory. `agents.state_dir` defaults to `$XDG_STATE_HOME/passless/agent` in the
+  user unit and to `/var/lib/passless-agent` (systemd `StateDirectory=`) in the system unit. The
+  daemon never writes the operator's config file.
 - **Entry:** `rp_id` (exact), `action` (`authenticate`), `kind` (`escalation` or
   `registration`), `granted_at`, approving `request_id`, origin at request time, and the
   permitting config rule (`exact` or `*`).
@@ -382,11 +478,14 @@ reference. If registration fails after approval, nothing is persisted.
   `passless doctor`.
 - **Administration:** `passless agent grants list [--profile P]`,
   `passless agent grants revoke --profile P --rp R [--action A]`,
-  `passless agent grants clear --profile P`. Revocation is audited.
+  `passless agent grants clear --profile P`. Revocation is audited. The commands that administer
+  session grants (§9) are `passless agent sessions …`; their former spelling under
+  `passless agent grants` remains a hidden alias for one release.
 - **Lifetime:** permanent until revoked or made inert by a config change (§6.2); no TTL.
-- **Generation:** adding a grant bumps the generation without invalidating active sessions,
-  because it only widens authority the human just approved. Revoking a grant or changing the
-  config invalidates active sessions of the affected profile.
+- **Epochs:** adding a grant bumps the grant epoch without invalidating active sessions, because it
+  only widens authority the human just approved. Revoking a grant, reloading the configuration or
+  changing the config bumps the revocation epoch and invalidates the active sessions of the affected
+  profile (§6.4).
 - **Cap:** `max_granted_rules` per profile, default 64; above it requests are denied.
 
 In shared-UID deployments the agent can write this file as it can write the config; that is inside
@@ -397,17 +496,25 @@ principal.
 
 The normative model is a bearer session, not a per-operation state machine.
 
-- **Binding.** Profile, identity mode, principal digest, browser lease, policy generation at
+- **Binding.** Profile, identity mode, principal digest, browser lease, revocation epoch at
   creation, TTL and `max_operations` (recommended 10 minutes and 16; the daemon enforces
   configured maxima).
 - **Self-issued.** A principal obtains its session itself within policy. This is the `allow`
   model, not a bypass; the `AdminAuthority` seal is cosmetic. Session (grant) request and approval
   are audited.
-- **Order of checks.** Authenticate the bearer; validate origin and RP; resolve policy; claim
-  budget; check the replay key; reserve audit; re-check policy generation; use the key.
+- **Order of checks.** Authenticate the bearer; validate origin and RP; resolve policy. For `allow`:
+  check the replay key, claim budget, reserve audit. For `request`: check the cooldown, the grant
+  cap, the notification bus and the queue; check the replay key; wait for the decision; claim
+  budget only after approval; reserve audit. Then re-check the revocation epoch, re-resolve the rule
+  against the live configuration and grants, and use the key. A rejected request never consumes
+  budget. The bearer is validated against the revocation epoch on every request.
 - **Replay key.** `SHA-256(action ‖ rp_id ‖ origin ‖ top_origin ‖ challenge)`, held per session
-  until expiry. A repeated key is rejected; cached responses are not returned. Failures consume
-  the key.
+  until expiry (`top_origin` is null on the proxy path, §11). An identical key never causes a second
+  signature or credential creation. While the first request is in flight, a duplicate joins it and
+  waits until the ceremony's deadline; a duplicate's abort detaches only that duplicate. After
+  completion the duplicate receives the original result for 120 seconds, in the same session only.
+  Any other repeat is rejected. Failures consume the key. This accommodates relying parties that
+  resubmit an identical request (Kanidm).
 - **Revocation.** Browser exit, lease revocation, principal death, TTL expiry, config reload and
   grant revocation revoke both sign and registration bearers. Registration authority on the
   extension path is the session bearer itself; there is no separate registration grant (§10.3).
@@ -442,7 +549,10 @@ possible; finalizes audit; and returns a WebAuthn response or a specific DOMExce
 per-credential lock spans read-sign-update so the human and agent paths cannot race a counter.
 
 Authentication honors `allowCredentials`, discoverable credentials, user handles, counters,
-`credProtect`, supported extensions and the backend's real key provider.
+`credProtect`, supported extensions and the backend's real key provider. The daemon builds the
+`clientDataJSON` of type `webauthn.get` as it does for registration (§11). The proxy's
+`remoteDesktopClientOverride` entry in the request extensions is supplied by the browser (§11) and
+is not an unsupported extension.
 
 ### 10.3 Registration
 
@@ -455,7 +565,7 @@ profile backend. It is denied unless the exact rule says `allow` (or an escalati
 - generates the key through `CredentialKeyProvider::generate()` (TPM keys are generated and
   sealed in one step) and a random credential ID;
 - builds `authenticatorData` with attested credential data and `clientDataJSON` of type
-  `webauthn.create`, with attestation format `none`;
+  `webauthn.create`, from the validated request (§11), with attestation format `none`;
 - writes the credential before returning.
 
 Unsupported requirements (resident-key, attestation, extensions) return `NotSupportedError` before
@@ -469,27 +579,64 @@ path is the session bearer (§9).
 
 ## 11. Browser extension contract
 
-The extension must:
+Interception uses `chrome.webAuthenticationProxy` (§4.4); the MAIN-world override of
+`navigator.credentials` is removed. The facts below were verified on Chromium 156 and Chrome for
+Testing 156, each headed and with `--headless=new`
+([results](../../tests/agent-e2e/spikes/RESULTS-proxy.md)). The extension must:
 
-- intercept `navigator.credentials.get()` and `create()` at `document_start`;
-- pass non-public-key calls to the original API;
-- take the caller origin from trusted sender metadata and cross-check the MAIN-world report;
-- capture top origin and cross-origin state, and apply WebAuthn RP-ID rules rather than equating
-  origin host with RP ID (explicit ports are valid);
-- keep the daemon bearer out of the MAIN world and page JavaScript;
-- serialize all relevant options without lossy conversion;
-- honor `AbortSignal`, RP timeout and browser shutdown, propagating abort to the daemon, which
-  cancels any pending escalation wait for that ceremony;
-- key its completed-request cache by tab, origin and request ID;
-- return correct DOMException names and expose the expected credential methods and JSON
-  serialization;
-- never fall back to native WebAuthn for a request routed to the daemon (§7).
+- attach the proxy on every worker start and register its event listeners synchronously at the top
+  level of the worker, so that a request wakes a stopped worker;
+- forward `onCreateRequest` and `onGetRequest` to the daemon with the request details verbatim, and
+  complete them with the daemon's output verbatim; it never constructs or edits `clientDataJSON` or
+  any other part of a response;
+- answer every `onIsUvpaaRequest` with `false`, because an unanswered request hangs the page;
+- treat `onRequestCanceled` as an abort, propagating it to the daemon, which cancels any pending
+  escalation wait for that ceremony; honor the RP timeout and browser shutdown;
+- keep the daemon bearer in the service worker; it is never visible to page JavaScript;
+- return correct DOMException names (the page receives the name given to `complete*Request`);
+- track in-flight requests by the browser-supplied request ID (the event carries no tab or frame
+  identifier), record the pending request IDs in `chrome.storage.session`, and fail them with
+  `NotAllowedError` when the worker restarts;
+- never fall back to native WebAuthn for a request routed to the daemon (§7);
+- never call `chrome.runtime.reload()`: an unloaded extension sends requests to the native path
+  (§7).
 
-Top-level frames are the minimum. Cross-origin frames fail closed in the daemon until origin,
-top-origin, Permissions Policy and ancestor validation are implemented there; the page-controlled
-MAIN-world check is not a gate. A `chrome.webAuthenticationProxy` adapter may be added for RPs
-that need native `PublicKeyCredential` identity, using the same operation service and without
-weakening origin binding.
+**Origin.** The origin comes only from the browser-supplied
+`extensions.remoteDesktopClientOverride.origin` inside `requestDetailsJson`. A page cannot forge it
+(verified: the browser overwrites a page-supplied value, also from a cross-origin frame).
+`sameOriginWithAncestors` comes from the same object. The worker may copy both out of the request
+details unmodified, but the daemon re-parses the request details itself and does not rely on a
+worker-extracted copy. The top origin is not available on this path,
+so the audit records `top_origin = null` together with `cross_origin` (§12). A request with
+`sameOriginWithAncestors = false` is denied: cross-origin frames fail closed. The daemon treats
+`remoteDesktopClientOverride` as browser metadata, not as an RP-supplied extension.
+
+**`clientDataJSON`.** Chrome does not validate the `clientDataJSON` the extension returns (verified:
+a wrong origin, a wrong challenge and an absent value were all handed to the page). The daemon alone
+builds it (type, challenge, origin, `crossOrigin`) from the validated request and signs over its
+hash. The extension forwards the result verbatim and never constructs or edits it.
+
+**RP ID.** Chrome validates the RP ID against the origin, and enforces the iframe Permissions
+Policy, before the event fires. The daemon still performs its own origin and RP ID check as defence
+in depth; related-origin requests can carry an RP ID that is not a suffix of the origin, so the daemon
+does not rely on a suffix rule being enforced by the browser. Explicit ports are valid (§14).
+
+**Conditional mediation and UVPAA.** While the proxy is attached,
+`PublicKeyCredential.isConditionalMediationAvailable()` returns false and a conditional `get()` is
+rejected with `NotAllowedError`. Passkey autofill UI is therefore not supported for agents. Pages
+that call `isUserVerifyingPlatformAuthenticatorAvailable()` or `getClientCapabilities()` trigger
+`onIsUvpaaRequest`; the extension answers `false`.
+
+**Worker lifecycle.** The attachment is browser-side state and persists across service-worker
+stops. A request arriving while the worker is stopped wakes it and is delivered; it does not go
+native. `attach()` on every start is idempotent.
+
+**Known limitation: focus.** Chrome rejects `create()` from a tab that does not have focus with
+`NotAllowedError`, even after the extension has completed the request. A registration can therefore
+complete in the daemon while the page receives `NotAllowedError`, leaving an orphan credential in the
+isolated profile's store. The audit records the registration, and the operator can delete the
+credential. Adapters bring the target page to the front before a ceremony where they can. `get()` is
+not affected.
 
 ## 12. Audit
 
@@ -503,14 +650,16 @@ private keys, PINs, capabilities, bearers, cookies, tokens, raw assertions, clie
 credential records or browser profile contents.
 
 Each operation record carries at least: session ID hash and request or escalation ID; profile,
-mode, principal relationship and the real policy generation; action, RP ID, origin, top origin and
-cross-origin flag; matched rule (`exact`, `*` or `granted`); decision and evidence source (`agent`
+mode, principal relationship and the real revocation and grant epochs; action, RP ID, origin, top
+origin (null on the proxy path) and cross-origin flag; matched rule (`exact`, `*` or `granted`); decision and evidence source (`agent`
 or absent); credential reference and selection rule; backend and key-provider type; counter before
 and after; terminal result and failure class.
 
 Also recorded: session (grant) request and approval with profile, principal, RP scope and TTL;
 escalations as `requested`, `approved`, `denied`, `expired` and `revoked`; and browser-lease
-creation, expiry, revocation, exit and cleanup.
+creation, expiry, revocation, exit and cleanup. An escalation that ends by timeout or by abort is
+recorded as `expired` with `reason = timeout` or `reason = aborted`; `revoked` is used only for
+operator revocation.
 
 ## 13. Deployment axes and hardening scope
 
@@ -534,10 +683,18 @@ gpg-agent. Omitting `PR_SET_NO_NEW_PRIVS` in the same-UID port-mode spawn is int
 break Chromium's sandbox helper). Spawn hygiene is reliability, not security: the same-UID spawn
 closes inherited daemon descriptors and sets `PR_SET_PDEATHSIG`; rlimits are optional. The user unit's
 `systemd-analyze security` score is accepted. Namespace and seccomp work does not apply. The
-human/agent boundary still applies, so escalation integrity (§8.2) is in scope.
+human/agent boundary still applies, so escalation integrity (§8.2) is in scope, with one residual
+risk: a same-UID agent can drive the user's notification server and approve its own escalation
+(§8.2, §15). Escalation integrity holds only for distinct-UID principals. In the same-UID port-mode
+spawn the browser has the daemon's UID, so the containment of §7 (private `/dev`) is required
+whenever that UID can open a hidraw node.
 
 **Distinct-UID.** The root system unit (`passless-agent.service`) needs root continuously for
-cross-user `setuid`/`setgid` spawns.
+cross-user `setuid`/`setgid` spawns. It never changes its own credentials to reach a user's
+notification bus: it uses the privilege-dropping child of §8.2, and `notify_user` differs from every
+`principal_user` and `browser_user`. The containment of §7 is not required when the browser user
+cannot open any hidraw node, but is still applied when `bwrap` is available; `passless doctor`
+reports which case applies.
 
 - *Systemd baseline (enabled):* `ProtectHostname`, `ProtectClock`, `ProtectKernelLogs`,
   `LockPersonality`, `RestrictRealtime`, plus `ProtectKernelTunables`, `ProtectControlGroups`,
@@ -575,7 +732,8 @@ cross-user `setuid`/`setgid` spawns.
     extension, page, API or automatic interaction mode.
 12. Granted rules are exact-RP, additive only, persisted atomically, included in the digest, and
     revocable.
-13. Policy is re-checked against the current generation immediately before key use.
+13. The revocation epoch and the resolved rule, against the live configuration and grants, are
+    re-checked immediately before key use.
 14. Replay keys bind action, RP, origin context and challenge, and are consumed on every result.
 15. Credential protection and backend requirements may strengthen, but never weaken, the
     configured evidence requirement.
@@ -592,9 +750,12 @@ cross-user `setuid`/`setgid` spawns.
     requirements fail closed.
 23. Agent failure cannot disable or weaken the ordinary human authenticator path.
 24. Agents have no CTAP/UHID transport; the extension path is the only agent transport.
+25. The managed browser never reaches the human authenticator: a request the extension does not
+    handle fails closed instead of reaching the native path, and the browser has either a private
+    `/dev` without `hidraw*` and `uhid` or a UID that cannot open any hidraw node.
 
 Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 replace its items 7–14;
-24 is new.
+24 and 25 are new.
 
 ## 15. Threats and residual risk
 
@@ -603,16 +764,18 @@ Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 
 | Compromised same-user agent acts as the human | Explicit mode, exact rules, short sessions, budgets, selectors, audit | Allowed by design within policy |
 | Isolated agent reaches human credentials | Separate backend handle, no shared paths | Host root or daemon compromise; shared-UID deployments |
 | Malicious page drives the agent to request many RPs | Only `request` rules escalate; one prompt per profile; bounded queue; cooldown; grant cap | Prompt fatigue can still widen policy permanently |
-| Notification click-jacking or spoofed approval | Verified D-Bus sender; daemon-derived text only | A desktop-automation agent in the user's session can click its own prompt |
+| Notification click-jacking or spoofed approval | Verified D-Bus sender; daemon-derived text only | A same-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, a replaced server) and approve its own prompt; integrity holds only for distinct-UID principals |
 | Agent tampers with granted rules or config | Daemon-owned store, owner/mode checks, digest | Shared-UID agents can tamper |
-| Supervised policy silently auto-approved | No `confirm`; no native fallback; automatic mode excluded | None on the agent path |
+| Supervised policy silently auto-approved | No `confirm`; no native fallback; automatic mode excluded; agents refuse to start under automatic mode with `allow` or `request` rules unless acknowledged | None on the agent path |
+| Browser request reaches the human authenticator (unloaded extension, unattached worker, context without the extension) | Proxy interception; launch fails closed; private `/dev` without hidraw, or a UID that cannot open it (§7) | A hidraw node that appears after launch, where containment is not applied |
 | Page replays a request | Replay key per session, consumed on every result | A new valid request is authorized by `allow` |
 | Page burns the operation budget | Budget claimed after origin and policy validation | — |
 | Local process calls the sign socket | Bearer, short TTL, profile binding, origin/RP/policy checks | Inside the boundary for shared-UID |
 | RP-requested UV is fabricated | UV only from validated agent evidence | RP cannot distinguish agent from human UV |
 | Wildcard or ambiguity picks the wrong account | Pinning before `allowCredentials`; forced `single` under `*` | `first-matching` is deliberately less specific |
 | Counter races corrupt human credentials | Shared handle and operation lock | Backend-specific crash consistency |
-| Extension reports a false origin | Sender metadata cross-check; cross-origin frames fail closed | Browser and extension are in the TCB |
+| Extension reports a false origin | Origin taken only from the browser-supplied `remoteDesktopClientOverride`, which a page cannot forge; the daemon builds `clientDataJSON`; cross-origin frames fail closed | Browser and extension are in the TCB; the top origin is not available |
+| Registration completes but the page gets `NotAllowedError` (unfocused tab) | The audit records the registration; the operator deletes the orphan credential; adapters bring the page to the front | An orphan credential can remain until deleted |
 | Stale registration authority | Registration bearers revoked with the lease; escalation bound to the waiting ceremony's session | — |
 | Unwanted autonomous registration | Separate rule, exact RP, acknowledgement, exclude checks, audit | A broad registration rule grants broad power |
 | Port-mode CDP reached by another local user | Loopback only; pipe mode for untrusted peers | Accepted in port mode |
@@ -626,8 +789,10 @@ Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 
   serves both modes and both key providers, including non-extractable TPM keys.
 - **Negative:** per-ceremony human approval and human UV for agents are no longer available;
   approved escalations persist until revoked, so policy can grow through clicks; agent UP/UV is
-  indistinguishable from human UP/UV at the RP; the extension adds a TCB component and a
-  duck-typed credential object that `instanceof` checks reject.
+  indistinguishable from human UP/UV at the RP; the extension adds a TCB component;
+  passkey autofill (conditional mediation) is unavailable to agents while the proxy is attached;
+  containment of the managed browser needs `bwrap` with unprivileged user namespaces or a UID that
+  cannot open hidraw nodes; only Chromium and Chrome for Testing are supported browsers.
 - **Migration:** `supervised` and `confirm` rules become `request`; existing configs keep working
   with warnings for one minor release (§6.4).
 
@@ -648,8 +813,10 @@ Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 
 | Isolated UHID compatibility transport alongside the extension | Rejected. Duplicates the policy pipeline, needs a per-ceremony human prompt that contradicts autonomous-only ceremonies, and is unreachable once native fallback is removed. |
 | Operator-minted one-shot enrollment grants (#411) | Replaced by `register = "request"` (human approval) and `register = "allow"` plus acknowledgement (§10.3). |
 | CDP virtual authenticator with injected key | Rejected for production; test only. Leaks keys, bypasses policy, cannot use TPM keys. |
-| `chrome.webAuthenticationProxy` as primary transport | Rejected. `requestDetailsJson` lacks the frame origin. Allowed as an adapter (§11). |
-| `remoteDesktopClientOverride` | Rejected. Breaks origin binding and needs enterprise policy. |
+| MAIN-world override of `navigator.credentials` | Removed. `chrome.webAuthenticationProxy` replaces it: the origin is browser-supplied and the page receives a native `PublicKeyCredential` (§4.4, §11). |
+| `chrome.webAuthenticationProxy` as the interception mechanism | Chosen (§4.4, §11). The request carries a browser-supplied origin and `sameOriginWithAncestors`; the page receives a native `PublicKeyCredential`. |
+| `remoteDesktopClientOverride` as a way for a page or agent to set the origin | Rejected. The browser overwrites a page-supplied value; only the browser-supplied value is read (§11). |
+| A Chromium switch or feature flag that disables CTAP over HID | Not available; no policy was found either (§7). Containment by a private `/dev` or a UID boundary replaces it. |
 | D-Bus platform authenticator / credentialsd for agents | Rejected. Portal UI, no trusted origin binding (ADR 0013). |
 | Shared CTAP endpoint classified per request | Rejected. CTAP carries no caller identity. |
 | Separate daemon process for agents | Rejected. Duplicates the storage TCB and counter synchronization. |
@@ -669,6 +836,7 @@ sessions; external audit checkpoints; RP-integrated session revocation; remote p
 - Configuration and policy digest: `passless-core/src/agent/config.rs`, `policy.rs`.
 - Extension: `cmd/passless/assets/agent-extension/`; native host: `cmd/passless/src/bin/sign-proxy.rs`.
 - Systemd units: `contrib/systemd/passless-agent.service`, `contrib/systemd/passless.service`.
+- To be removed (§4.4): the MAIN-world override and its broker (`main.js`, `broker.js`).
 - To be removed (§5, §10.3): the isolated UHID route (`agent/endpoint_manager.rs`; the per-ceremony
   confirm prompt in `agent/ceremony.rs:1426-1479`; endpoint wiring in `runtime.rs`; `/dev/uhid`
   probing for agents in `launcher.rs` and `doctor.rs`, which must then cover only the human
@@ -682,26 +850,45 @@ References are `file:line` at commit `130eaa5`.
 
 | Item | Current | Target |
 |---|---|---|
-| Native fallback for `confirm`/human rules | Daemon returns `human_interaction_required` (`sign.rs:1383-1414`); worker flags `fallback` (`worker.js:140`); page replays natively (`main.js:282`) | Removed (§7) |
-| Human/confirm evidence in schema | `AgentAuthorization::Confirm`, human UP/UV sources (`passless-core/src/agent/config.rs:198-320`) | `deny`, `allow` and `request` only (§6) |
-| Legacy fields and `policy` alias | Accepted without warning (`config.rs:218`, `654-684`) | Warn for one release, then fail (§6.4) |
-| Cross-origin frames | Accepted with any parseable top origin (`sign.rs:208`) | Fail closed (§11) |
-| `credential:<ref>` vs `allowCredentials` | `allowCredentials` match returns before pinning (`sign.rs:1633-1642`) | Pin first (§10.1) |
-| Budget claim order | Claimed at `sign.rs:1080`, before origin check at `sign.rs:1256` | After origin and policy (§9) |
-| Replay | Raw body hash; identical body gets a 120 s cached response (`sign.rs:298-345`) | Replay key, no cached responses (§9) |
-| Registration bearers | Not revoked with the lease (`revoke_by_lease`, `sign.rs:644-663`) | Revoked (§9) |
-| Operator-minted enrollment grants (#411) | `request_registration_grant` with placeholder session, endpoint and zero principal digest (`policy_engine.rs:870-892`); CLI `commands/agent_admin.rs:658`, IPC `AdminRequest::RequestRegistration` (`protocol.rs:378`) | Removed (§10.3) |
-| Isolated UHID route | Per-profile UHID endpoints (`endpoint_manager.rs`, `runtime.rs:1425`, `runtime.rs:1516`); in-daemon confirm prompt (`ceremony.rs:1426-1479`); agent UHID probing (`launcher.rs:1259`, `doctor.rs:251`) | Removed (§5) |
-| Principal digest at signing | Not checked | Checked (§7) |
-| Policy digest | Omits `credential_selection` and `human_verification_prompt` (`passless-core/src/agent/policy.rs:497-518`) | Covers all fields and grants (§6.4) |
-| Audit content | No session, operation, origin, credential or result in `PolicyAllowMeta` (`audit_events.rs:659-666`); "generation" is an ID length (`runtime.rs:4079`) | Fields of §12 |
-| Abort | Local reject only (`main.js:320-325`) | Propagated to daemon (§11) |
-| Extension cache | Keyed by `request_id` only (`worker.js:84-117`) | Tab, origin, request ID (§11) |
-| Unsupported options | Silently dropped | `NotSupportedError` (§10.3) |
-| Transport | `sendNativeMessage` (`worker.js:126`); sign-proxy 10 s socket timeout | `connectNative` with keepalive (§4.4) |
-| Escalation, granted-rules store, `passless agent grants` | Not implemented | §8 |
-| Principal relationship | Used only for browser spawn (`browser.rs:2224`); not in doctor or audit; no shared-UID `isolated` warning | Both axes reported; startup warning (§13) |
-| User guides | Describe `confirm`, presets, `registration_allowed` | Rewrite when the code lands |
+| Native fallback for `confirm`/human rules | Daemon returns `human_interaction_required` (`sign.rs:1383-1414`); worker flags `fallback` (`worker.js:140`); page replays natively (`main.js:282`) | Planned (P2): removed (§7) |
+| Human/confirm evidence in schema | `AgentAuthorization::Confirm`, human UP/UV sources (`passless-core/src/agent/config.rs:198-320`) | Planned (P4): `deny`, `allow` and `request` only (§6) |
+| Legacy fields and `policy` alias | Accepted without warning (`config.rs:218`, `654-684`) | Planned (P4): warn for one release, then fail (§6.4) |
+| Cross-origin frames | Accepted with any parseable top origin (`sign.rs:208`) | Planned (P2, P6): fail closed; `sameOriginWithAncestors = false` denied (§11) |
+| `localhost` RP | `localhost` RP and `http://localhost` origins rejected by `validate_rp_id` and `parse_origin` | Planned (P4): valid for exact rules only, never through the wildcard (§6.1) |
+| `credential:<ref>` vs `allowCredentials` | `allowCredentials` match returns before pinning (`sign.rs:1633-1642`) | Planned (P4): pin first (§10.1) |
+| Epochs and live resolution | Reload replaces the session-grant registries and wipes every session (`policy_engine.rs:1086`); ceremonies use a frozen profile config; digest-based generation | Planned (P4, P5, P7): revocation and grant epochs; live resolution (§6.4, §8.4, §9) |
+| Budget claim order | Claimed at `sign.rs:1080`, before origin check at `sign.rs:1256` | Planned (P5): after origin and policy; for `request`, after approval (§9) |
+| Replay | Raw body hash; identical body gets a 120 s cached response (`sign.rs:298-345`) | Planned (P5): replay key; a duplicate joins the in-flight request or gets the original result for 120 s in the same session; other repeats rejected (§9) |
+| Registration bearers | Not revoked with the lease (`revoke_by_lease`, `sign.rs:644-663`) | Planned (P3): revoked (§9) |
+| Operator-minted enrollment grants (#411) | `request_registration_grant` with placeholder session, endpoint and zero principal digest (`policy_engine.rs:870-892`); CLI `commands/agent_admin.rs:658`, IPC `AdminRequest::RequestRegistration` (`protocol.rs:378`) | Planned (P3): removed (§10.3) |
+| Isolated UHID route | Per-profile UHID endpoints (`endpoint_manager.rs`, `runtime.rs:1425`, `runtime.rs:1516`); in-daemon confirm prompt (`ceremony.rs:1426-1479`); agent UHID probing (`launcher.rs:1259`, `doctor.rs:251`) | Planned (P3): removed (§5) |
+| Principal digest at signing | Not checked | Planned (P5): checked (§7) |
+| Policy digest | Omits `credential_selection` and `human_verification_prompt` (`passless-core/src/agent/policy.rs:497-518`) | Planned (P4): covers all fields and grants (§6.4) |
+| Audit content | No session, operation, origin, credential or result in `PolicyAllowMeta` (`audit_events.rs:659-666`); "generation" is an ID length (`runtime.rs:4079`) | Planned (P8): fields of §12, including `top_origin = null` with `cross_origin` |
+| Escalation audit events | Not implemented | Planned (P8): timeout or abort recorded as `escalation_expired` with a reason; `escalation_revoked` only for operator revocation (§12) |
+| Interception mechanism | Page-controlled MAIN-world override, duck-typed credential, manifest matches only `https://*/*` (`main.js`, `broker.js`, `manifest.json`) | Planned (P6): `chrome.webAuthenticationProxy` only; MAIN-world override removed (§4.4, §11) |
+| Origin source and `clientDataJSON` | Origin reported by the MAIN-world script; response built by the override | Planned (P6): origin from the browser-supplied `remoteDesktopClientOverride`; the daemon builds `clientDataJSON`; the extension forwards it verbatim (§11) |
+| Conditional mediation and UVPAA | Conditional requests left native and unhandled | Planned (P6): unavailable while attached; `onIsUvpaaRequest` answered `false`; passkey autofill unsupported (§11) |
+| Worker lifecycle | No proxy attachment | Planned (P6): `attach()` on every worker start; never `chrome.runtime.reload()` (§11) |
+| Abort | Local reject only (`main.js:320-325`) | Planned (P6): propagated to daemon (§11) |
+| Extension cache | Keyed by `request_id` only (`worker.js:84-117`) | Planned (P6): in-flight requests tracked by the browser-supplied request ID (§11) |
+| Unsupported options | Silently dropped | Planned (P5): `NotSupportedError` (§10.3) |
+| Transport | `sendNativeMessage` (`worker.js:126`); sign-proxy 10 s socket timeout | Planned (P6): `connectNative` with keepalive (§4.4) |
+| Unfocused-tab registration | Not handled | Planned (P6, P10): documented limitation (orphan credential, audit records it); adapters bring the page to the front (§11) |
+| Escalation, granted-rules store, `passless agent grants` | Not implemented | Planned (P7): §8 |
+| Registration escalation | Not implemented | Planned (P7): not joinable; one-use token bound to the creating ceremony; the credential reference joins the pinned set (§8.3) |
+| Abort handling and in-flight tracking | Not implemented | Planned (P6, P7): withdrawn or aborted escalations rate-limited, 3 per key per 10 minutes, then cooldown (§8.1); pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11) |
+| Escalation waiters | Not implemented | Planned (P7): parked continuations holding no thread; caps of 4 per session and 16 per profile (§8.2) |
+| Notification bus for a root daemon | Prompt uses the daemon's own session bus | Planned (P7): `agents.notify_user`; dedicated per-prompt privilege-dropping child; no bus means deny and audit (§8.2) |
+| Granted-rules location | Not implemented | Planned (P7): `agents.state_dir` with unit-specific defaults (§8.4) |
+| CLI naming | Session-grant commands use the name `grants` (`commands/agent_admin.rs`) | Planned (P7): granted rules under `passless agent grants`; session commands under `passless agent sessions` with a hidden alias for one release (§8.4) |
+| Same-UID self-approval | Not documented | Planned (P11): documented residual risk; `notify_user` differs from every principal and browser user (§8.2, §13, §15) |
+| Supported browsers | No detection; the launcher can start with `--disable-extensions` (`browser.rs:2040-2044`) | Planned (P2, P10): launch error without the extension; Chromium and Chrome for Testing accepted; branded Chrome and `chrome-headless-shell` rejected; root-owned binaries only in distinct-UID deployments (§4.2) |
+| Incognito and CDP-created contexts | The extension is not active in them; requests go native | Planned (P10): `Default/Preferences` seeded with `incognito = true` for the manifest-key extension ID; startup verification fails closed (§4.2) |
+| Native-path containment | A request the extension does not handle can reach the human UHID device | Planned (P2, P6, P10): fail closed; private `/dev` through `bwrap` whenever available, required (launcher refusal) when the browser UID can open hidraw; invariant 25 (§7) |
+| Automatic interaction mode with agents | Not guarded | Planned (P10): agents refuse to start unless `agents.allow_automatic_human_path = true`; `doctor` flags it (§7) |
+| Principal relationship | Used only for browser spawn (`browser.rs:2224`); not in doctor or audit; no shared-UID `isolated` warning | Planned (P9): both axes reported; startup warning (§13) |
+| User guides | Describe `confirm`, presets, `registration_allowed` | Planned (P11): rewrite when the code lands |
 | Backend separation | **Done.** `CredentialBackendHandle`, `CredentialNamespace` (`backend.rs:18-73`) | — |
 | Audit before key use | **Done.** Fsynced, hash-chained append (`audit.rs:163-164`, `audit.rs:1258`); allow record gates signing (`sign.rs:1516`) | — |
 | `credProtect` | **Done.** Levels 2 and 3 enforced (`sign.rs:1468`, `sign.rs:1531`) | — |
@@ -732,6 +919,13 @@ file; `130eaa5` is the last commit containing all of them (`git show 130eaa5:doc
 
 The agent implementation plans and verification matrices in `docs/plans/` and the
 `docs/agents/delegated-session.md` migration notice were removed at the same time.
+
+On 2026-11-11 the ADR was amended with maintainer-resolved decisions (replay coalescing, claim
+order, notification bus and state directory, `localhost`, epochs, containment, supported browsers,
+incognito seeding, non-joinable registration escalations, waiter caps) and with the results of the
+spikes that settled the interception mechanism and the environment questions:
+[proxy results](../../tests/agent-e2e/spikes/RESULTS-proxy.md) and
+[environment results](../../tests/agent-e2e/spikes/RESULTS-env.md).
 
 | PR | Change |
 |---|---|

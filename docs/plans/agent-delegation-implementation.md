@@ -52,29 +52,29 @@ Defaults are applied until answered.
 ### Orchestrator resolutions
 
 These resolve the open implementation questions. The maintainer may override any of them.
-Rows marked **ADR amend** change ADR text in phase P0b.
+Rows marked *amended* were applied to the ADR in phase P0b.
 
 | # | Topic | Resolution | ADR |
 |---|---|---|---|
-| R1 | Kanidm resubmits an identical request (`sign.rs:300-308`) | An identical replay key never causes a second signature. While the first request is in flight, the duplicate joins it. After completion, the duplicate receives the original result for 120 s, in the same session only. Any other repeat is rejected. | **amend §9** |
-| R2 | Notification bus for the root (distinct-UID) daemon | `agents.notify_user` names the human whose session bus receives escalation prompts. The user unit uses its own bus. If no bus can be resolved, escalation is unavailable: deny and audit. | **amend §8.2** |
-| R3 | Granted-rules location | `agents.state_dir`. The user unit defaults to `$XDG_STATE_HOME/passless/agent`. The system unit defaults to `/var/lib/passless-agent` (systemd `StateDirectory=`). | **amend §8.4** |
-| R4 | Claim timing (revised by V-H2) | Order: origin/RP check → resolve → (if `request`) cooldown, grant cap, bus and queue checks → replay key → wait → budget claimed after approval. For `allow`: replay key, then budget, before audit. Rejected requests never consume budget. | **amend §9** |
-| R5 | Several ceremonies waiting on one `register` escalation | The first waiter to resume receives the one-use registration token. The others fail with `NotAllowedError`. | **amend §8.3** |
+| R1 | Kanidm resubmits an identical request (`sign.rs:300-308`) | An identical replay key never causes a second signature. While the first request is in flight, the duplicate joins it. After completion, the duplicate receives the original result for 120 s, in the same session only. Any other repeat is rejected. | amended §9 |
+| R2 | Notification bus for the root (distinct-UID) daemon | `agents.notify_user` names the human whose session bus receives escalation prompts. The user unit uses its own bus. If no bus can be resolved, escalation is unavailable: deny and audit. | amended §8.2 |
+| R3 | Granted-rules location | `agents.state_dir`. The user unit defaults to `$XDG_STATE_HOME/passless/agent`. The system unit defaults to `/var/lib/passless-agent` (systemd `StateDirectory=`). | amended §8.4 |
+| R4 | Claim timing (revised by V-H2) | Order: origin/RP check → resolve → (if `request`) cooldown, grant cap, bus and queue checks → replay key → wait → budget claimed after approval. For `allow`: replay key, then budget, before audit. Rejected requests never consume budget. | amended §9 |
+| R5 | Several ceremonies waiting on one `register` escalation | **Superseded by V-M3.** Registration escalations are not joinable. The one-use token is bound to the creating ceremony, and a concurrent duplicate is denied. | amended §8.3 (V-M3) |
 | R6 | Legacy isolated `device` key and agent udev rule | Warn and ignore for one release. Remove the agent UHID udev and systemd device access. | — |
-| R7 | CLI naming collision | Granted rules use `passless agent grants`. The existing session-grant commands move to `passless agent sessions`, with a hidden alias for one release. | **amend §8.4** |
+| R7 | CLI naming collision | Granted rules use `passless agent grants`. The existing session-grant commands move to `passless agent sessions`, with a hidden alias for one release. | amended §8.4 |
 | R8 | Deprecation channel | A startup warning plus a `passless doctor` warning. Legacy parsing is removed in the release after next. | — |
-| R9 | Aborted escalation audit | `escalation_expired` with `reason = timeout or aborted`. `escalation_revoked` is only for operator revocation. | **amend §12** |
-| R10 | Pinned `credential_refs` and a registration grant | The credential ref of a registration-kind grant joins the pinned set for that RP. | **amend §8.3** |
+| R9 | Aborted escalation audit | `escalation_expired` with `reason = timeout or aborted`. `escalation_revoked` is only for operator revocation. | amended §12 |
+| R10 | Pinned `credential_refs` and a registration grant | The credential ref of a registration-kind grant joins the pinned set for that RP. | amended §8.3 |
 | R11 | Sign-server capacity | No silent drops. Use per-connection and global caps on concurrent requests. Overflow returns an explicit `busy` error. | — |
-| R12 | Interception mechanism | `chrome.webAuthenticationProxy` is the primary path, if the P0a spike passes. Otherwise keep the MAIN-world override and widen the matches to `http://localhost/*`. See D1. | **amend §4.4, §11** |
-| R13 | Extension in CDP-created (incognito-like) contexts | Enable the managed extension in incognito. If P0a proves that cannot be done reliably, adapters must forbid isolated contexts. See D4. | **amend §4.2** |
-| R14 | Supported browsers | Chromium, and Chrome for Testing. Branded Google Chrome and `chrome-headless-shell` are rejected at launch with a clear error. Edge and Brave are best effort, decided after the P0a probe. Detection must not match "Google Chrome for Testing". In distinct-UID deployments, only root-owned, principal-unwritable binaries are accepted. | **amend §4.2** |
-| R15 | `localhost` RP | `rp_id = "localhost"` and `http://localhost[:port]` origins are valid for exact rules only, never through the wildcard. `validate_rp_id` and `parse_origin` are extended accordingly. | **amend §6.1** |
-| R16 | Policy epochs (V-H3) | Split the revocation epoch (bumped by reload, grant revocation and config change; revokes sessions) from the grant epoch (bumped when a grant is added; does not revoke). Ceremonies resolve against the live config plus grants, never against the frozen `ctx.profile_config`. The pre-key-use check compares the revocation epoch and re-resolves the rule. | **amend §6.4, §8.4, §9** |
-| R17 | Managed browser must never reach the human authenticator (V-C1) | See D6. Requests the extension does not handle fail closed instead of reaching the native path. | **amend §7, add invariant 25** |
-| R18 | Self-approval by a same-UID agent (V-H4) | A shared-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, a replaced server). This cannot be prevented and is documented as residual risk. `notify_user` must differ from every `principal_user`/`browser_user`. The root daemon talks to the user bus only through a helper that drops to `notify_user`. | **amend §8.2, §13, §15** |
-| R19 | Automatic interaction mode with agents (V-C1) | If `PASSLESS_INTERACTION_MODE=automatic` is set and any same-user profile has `allow` or `request`, the daemon refuses to start agents unless `agents.allow_automatic_human_path = true`, and `doctor` flags it. | **amend §7** |
+| R12 | Interception mechanism | **Resolved (P0a):** `chrome.webAuthenticationProxy` is the primary path and the only one. The MAIN-world override is removed. See D1. | amended §4.4, §11 |
+| R13 | Extension in CDP-created (incognito-like) contexts | **Resolved (P0a):** enable the managed extension in incognito by seeding `extensions.settings.<id>.incognito = true` into the fresh profile's `Default/Preferences`. Adapters need not forbid isolated contexts. See D4. | amended §4.2 |
+| R14 | Supported browsers | Chromium, and Chrome for Testing. Branded Google Chrome and `chrome-headless-shell` are rejected at launch with a clear error. Edge and Brave were not probed in P0a and are unsupported for now. Detection must not match "Google Chrome for Testing". In distinct-UID deployments, only root-owned, principal-unwritable binaries are accepted. | amended §4.2 |
+| R15 | `localhost` RP | `rp_id = "localhost"` and `http://localhost[:port]` origins are valid for exact rules only, never through the wildcard. `validate_rp_id` and `parse_origin` are extended accordingly. | amended §6.1 |
+| R16 | Policy epochs (V-H3) | Split the revocation epoch (bumped by reload, grant revocation and config change; revokes sessions) from the grant epoch (bumped when a grant is added; does not revoke). Ceremonies resolve against the live config plus grants, never against the frozen `ctx.profile_config`. The pre-key-use check compares the revocation epoch and re-resolves the rule. | amended §6.4, §8.4, §9 |
+| R17 | Managed browser must never reach the human authenticator (V-C1) | See D6. Requests the extension does not handle fail closed instead of reaching the native path. | amended §7, add invariant 25 |
+| R18 | Self-approval by a same-UID agent (V-H4) | A shared-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, a replaced server). This cannot be prevented and is documented as residual risk. In distinct-UID deployments (root daemon) `notify_user` must differ from every `principal_user`/`browser_user`; in the shared-UID user unit it is the same user by design and the residual risk applies. The root daemon talks to the user bus only through a dedicated per-prompt child that lives as long as the prompt and drops to `notify_user`; the daemon can kill it to withdraw the prompt. | amended §8.2, §13, §15 |
+| R19 | Automatic interaction mode with agents (V-C1) | If `PASSLESS_INTERACTION_MODE=automatic` is set and any same-user profile has `allow` or `request`, the daemon refuses to start agents unless `agents.allow_automatic_human_path = true`, and `doctor` flags it. | amended §7 |
 
 ## Investigation facts this plan relies on
 
@@ -113,6 +113,9 @@ Rows marked **ADR amend** change ADR text in phase P0b.
 | `chrome-headless-shell` | **no** | ❌ | ❌ | ❌ |
 | any browser, `http://localhost` page | loaded but not injected (manifest is https-only) | ❌ | ❌ | ❌ |
 
+P0a answered the open items below; see the [proxy](../../tests/agent-e2e/spikes/RESULTS-proxy.md)
+and [environment](../../tests/agent-e2e/spikes/RESULTS-env.md) results and the P0a checklist.
+
 - Playwright MCP 0.0.85 with `--cdp-endpoint` uses `contexts()[0]` and works. Adding `--isolated`
   calls `newContext()` and breaks. Its `browser_tabs` `isolatedContext` also creates an OTR
   context.
@@ -129,7 +132,7 @@ Rows marked **ADR amend** change ADR text in phase P0b.
   - spanning extensions with incognito access also cover OTR profiles;
   - conditional mediation is rejected while attached, an active virtual authenticator takes
     precedence, and `attach()` must be re-run when the worker restarts;
-  - unverified with an unpacked extension and in new headless.
+  - unverified with an unpacked extension and in new headless (P0a: verified on both).
 - Chromium WebAuthn timeout is clamp(page timeout, 3 min, 20 h), or 20 h when unset
   (`AdjustTimeout()`, `fido_constants.cc`, verified). Under MV3, `sendNativeMessage` and events
   are limited to 5 min and `fetch` to 30 s. A `connectNative` port keeps the worker alive.
@@ -138,31 +141,47 @@ Rows marked **ADR amend** change ADR text in phase P0b.
 
 ### D1 Interception
 
-**Primary path (subject to the P0a gate):** `chrome.webAuthenticationProxy` in the service
-worker.
+`chrome.webAuthenticationProxy` in the service worker is the only interception path (P0a gate
+passed, see the [proxy results](../../tests/agent-e2e/spikes/RESULTS-proxy.md)). The MAIN-world
+`navigator.credentials` override is removed.
 
-- `attach()` on worker start and on every wake.
-- `onCreateRequest` / `onGetRequest` forward `requestDetailsJson` plus the browser-supplied origin
-  to the daemon. The reply goes through `completeCreateRequest` / `completeGetRequest` with
-  `responseJson`, or a DOMException name.
-- `onRequestCanceled` sends `abort` to the daemon.
-- `onIsUvpaaRequest` answers `true` when the profile has any `allow` or `request` rule.
-- No MAIN-world script, so the page receives a genuine `PublicKeyCredential`. The browser enforces
-  the origin and RP-ID relationship and the iframe Permissions Policy before the extension sees
-  the request.
-- The daemon still validates the origin against the RP ID, and still rejects cross-origin frames.
-- Conditional mediation is rejected by Chromium while attached. This is equivalent to today,
-  where conditional requests are already left native and unhandled.
-
-**Fallback (only if P0a fails):** keep the MAIN-world override, but:
-
-- matches `https://*/*`, `http://localhost/*` and `http://127.0.0.1/*`;
-- trusted origin taken from the broker's `sender` metadata;
-- full `PublicKeyCredential`-compatible shape: `getClientExtensionResults`, `toJSON`,
-  `getTransports`, `getPublicKey*`, `getAuthenticatorData`;
-- static `PublicKeyCredential` methods patched consistently.
-
-The ADR is amended to record whichever path ships.
+- **Worker.**
+  - `attach()` runs on every worker start; a repeated call is idempotent.
+  - Listeners are registered synchronously at the top level, so a request wakes a stopped worker.
+    The attachment persists across worker stops.
+  - The worker never calls `chrome.runtime.reload()`. An unloaded extension sends requests to the
+    native path, which is another reason for D6.
+- **Requests.**
+  - `onCreateRequest` / `onGetRequest` forward `requestDetailsJson` verbatim to the daemon.
+  - The reply goes through `completeCreateRequest` / `completeGetRequest` with the daemon's
+    `responseJson` verbatim, or an error name that the page sees as a DOMException.
+  - `onRequestCanceled` sends `abort` to the daemon.
+- **UVPAA.** The worker answers every `onIsUvpaaRequest` with `false` (V-L2); an unanswered request
+  hangs the page.
+- **Origin.**
+  - The origin comes only from the browser-supplied `extensions.remoteDesktopClientOverride.origin`
+    inside `requestDetailsJson`. A page cannot forge it: the browser overwrites a page-supplied
+    value, also from a cross-origin frame.
+  - `sameOriginWithAncestors` comes from the same object.
+  - The top origin is not available on this path, so the audit records `top_origin = null` plus
+    `cross_origin`.
+  - A request with `sameOriginWithAncestors = false` is denied (cross-origin fails closed).
+- **`clientDataJSON`.** Chrome does not validate what the extension returns. The daemon alone
+  builds it (type, challenge, origin, `crossOrigin`) from the validated request and signs over its
+  hash. The extension forwards daemon output verbatim and never constructs or edits it.
+- **RP ID.** Chrome validates the RP ID against the origin, and the iframe Permissions Policy,
+  before the event fires. The daemon still runs its own origin and RP-ID check (defence in depth;
+  related origins were not tested).
+- **Conditional mediation.** While attached, `isConditionalMediationAvailable()` returns false and a
+  conditional `get()` rejects with `NotAllowedError`. Passkey autofill UI is unsupported for agents
+  and documented as such.
+- **Focus caveat.** `create()` from a tab without focus is rejected by Chrome even after the
+  extension completed the request, so a registration can complete in the daemon while the page gets
+  `NotAllowedError`, leaving an orphan credential in the isolated profile store. This is a known
+  limitation: the audit records the registration and the operator can delete the credential.
+  Adapters bring the target page to the front before ceremonies where they can (E2E-51).
+- **Not tested in P0a:** related-origin requests (need https), nested cross-origin frames,
+  `onRequestCanceled` on navigation or tab close, and a worker dying with a request in flight.
 
 ### D2 Transport
 
@@ -171,8 +190,10 @@ The ADR is amended to record whichever path ships.
 - **Relay.** `sign-proxy` becomes a two-thread relay between the native-messaging frames (4-byte
   LE length + JSON) and one persistent Unix-socket connection that uses the same framing.
 - **Frames:**
-  - `hello{v:2, bearer}`
-  - `request{id, op, timeout_ms, origin, top_origin?, cross_origin, body}`
+  - `hello{v:2, build_version, bearer, attached, incognito_allowed}`, where `incognito_allowed` is
+    the result of `chrome.extension.isAllowedIncognitoAccess()` (D4, D6.1)
+  - `request{id, op, timeout_ms, origin, cross_origin, body}`, where `body` carries
+    `requestDetailsJson` verbatim
   - `abort{id}`
   - `result{id, ok, body | error{code, dom}}`
   - `keepalive`
@@ -188,7 +209,14 @@ The ADR is amended to record whichever path ships.
     resume (replay keys are consumed);
   - a version mismatch in `hello` fails closed.
 - **Removed:** the HTTP `/sign` and `/register` endpoints.
-- **Request cache:** the worker's request cache key is `(tabId, frameId, origin, requestId)`.
+- **Request identity and origin:**
+  - Wire IDs are allocated by the worker and map to the proxy `requestId`. In-flight requests are
+    keyed by the proxy `requestId`, scoped to the connection. The event carries no tab or frame, so
+    there is no `(tabId, frameId)` key.
+  - `origin` and `cross_origin` are `remoteDesktopClientOverride.origin` and
+    `sameOriginWithAncestors` (as `cross_origin = !sameOriginWithAncestors`), copied by the worker
+    out of `requestDetailsJson` unmodified. There is no `top_origin` on the wire.
+  - The daemon re-parses `requestDetailsJson` itself and never trusts the worker-extracted copy.
 
 ### D3 Escalation
 
@@ -207,10 +235,14 @@ There is one prompt thread per profile.
 1. Authenticate the bearer.
 2. Validate origin and RP.
 3. Resolve the rule to `request`.
-4. Claim budget and replay key.
-5. Deny if in cooldown, at the grant cap, or with no notification bus.
-6. Join or create the escalation. The creator writes `escalation_requested`.
+4. Deny if in cooldown, at the grant cap, with no notification bus, or if the queue is full.
+5. Check the replay key (R1). A duplicate of an in-flight request joins it.
+6. Join or create the escalation. The creator writes `escalation_requested`. Authenticate
+   escalations are joinable; registration escalations are not (V-M3).
 7. Wait in a timed loop on the condvar, checking the cancel token and the deadline.
+
+Budget is claimed only after approval (R4 as revised by V-H2). A rejected, denied, expired or
+aborted escalation never consumes budget.
 
 Approval is accepted only from the verified D-Bus sender, and only while the entry is still
 Pending. On approval:
@@ -219,10 +251,10 @@ Pending. On approval:
 2. Persist the grant under the per-profile store mutex.
 3. Call `bump_generation_additive()`, which does not revoke sessions.
 4. Wake the waiters.
-5. Each waiter re-resolves to `Granted`, then takes the operation lock, re-checks the generation,
-   reserves audit and executes.
+5. Each waiter claims budget, re-resolves to `Granted`, then takes the operation lock, re-checks
+   the revocation epoch, reserves audit and executes.
 
-Registration approval issues a one-use token (R5). Its `authenticate` grant is persisted only
+Registration approval issues a one-use token bound to the creating ceremony (V-M3). Its `authenticate` grant is persisted only
 after the credential is created.
 
 On deny or timeout: audit the outcome, set the cooldown, and fail the waiters.
@@ -261,15 +293,36 @@ under the operation or storage lock.
 3. Chrome for Testing;
 4. distro `chromium`.
 
-Branded Google Chrome and `chrome-headless-shell` are rejected with a clear error (R14). The
-default is `--headless=new`; `--headed` is optional.
+Detection and rejection (R14):
+
+- Supported: Chromium and Chrome for Testing. Chrome for Testing is detected from the `--version`
+  output ("Google Chrome for Testing …"); the user agent does not distinguish it. The branded-Chrome
+  check must not match that string.
+- Rejected with an actionable error: branded Google Chrome (ignores `--load-extension`) and
+  `chrome-headless-shell` (loads no extensions). `chrome-headless-shell` is recognised by its binary
+  name or install path, because its `--version` output was not recorded in P0a; P10 confirms.
+- Edge and Brave were not probed and are unsupported for now.
+- In distinct-UID deployments only root-owned, principal-unwritable binaries are accepted (V-H7).
+
+The default is `--headless=new`; `--headed` is optional.
 
 **Contexts.**
 
-- The managed profile pre-enables the extension in incognito (R13), so `--isolated` and
-  `newContext()` contexts are covered.
-- If that is impossible, the MCP adapters strip `--isolated` and the docs warn against
-  `newContext()`.
+- **Seeding (R13).** The launcher writes `Default/Preferences` into the fresh `--user-data-dir`
+  before the first launch, containing `{"extensions":{"settings":{"<id>":{"incognito":true}}}}`.
+  `<id>` is the stable extension ID derived from the manifest `key`; the manifest has no `key` today,
+  so P10 adds one. P0a verified that this works without UI, with a profile that was never launched,
+  and with stale or absent preference MACs, on Chromium 156 and Chrome for Testing 156. The
+  extension and the proxy then apply in the primary off-the-record profile and in
+  `Target.createBrowserContext` contexts, which is what Playwright `newContext()`, Playwright MCP
+  `--isolated` and chrome-devtools-mcp `isolatedContext` use. Without the seed those contexts go
+  native.
+- **Fail-closed verification.** The worker calls `chrome.extension.isAllowedIncognitoAccess()` and
+  includes the result in `hello` (D6.1). The bootstrap withholds the endpoint, and the launch fails,
+  unless it is `true`. A seed that did not take effect is a launch error, never a browser whose
+  isolated contexts go native.
+- **Caveat.** The seed relies on Chromium and Chrome for Testing not enforcing preference MACs for
+  this key; P10 re-checks it for each supported browser version.
 
 **Adapters** (stdio MCP launchers that resolve the endpoint lazily on first tool use):
 
@@ -295,32 +348,60 @@ default is `--headless=new`; `--headed` is optional.
 
 ### D6 Native-path containment (V-C1)
 
-A WebAuthn request from the managed browser must never reach the human authenticator. There are
-four layers.
+A WebAuthn request from the managed browser must never reach the human authenticator (ADR
+invariant 25). P0a showed that no command-line switch or feature flag disables CTAP over HID (plain
+Chromium created a credential through the UHID device with every candidate flag), and that the
+binary's policy list contains no policy that does (enterprise policy installation was not tested).
+Containment is therefore mandatory and based on the filesystem and the UID. There
+are four layers.
 
 1. **Interception always ready.**
    - The worker opens the native port on startup and keeps it open, with keepalive in both
      directions, not only while a request is pending.
-   - On the proxy path, `attach()` runs before the worker reports `hello{attached:true}`.
+   - `attach()` runs before the worker reports `hello{attached:true, incognito_allowed:true}`
+     (D4: `chrome.extension.isAllowedIncognitoAccess()`).
    - `passless agent browser --wait` and the CDP bootstrap do not return an endpoint until that
      hello arrives.
    - If the port drops, or `attach()` fails or is lost, the daemon marks the lease degraded and
      the bootstrap stops handing out the endpoint until the worker re-attaches.
+   - The worker never calls `chrome.runtime.reload()`: an unloaded extension sends requests to the
+     native path (P0a), so no code path may unload it.
 2. **Launch fails closed.**
    - A missing or unloadable extension directory is a launch error, never `--disable-extensions`
      (`browser.rs:2040-2044`).
-   - Browsers that cannot load the extension are rejected (R14).
-3. **No device access.** The managed browser gets no hidraw access to the human device.
-   - **Unprivileged-userns hosts:** launch it under `bwrap`, with a private `/dev` that omits
-     `hidraw*` and `uhid`.
-   - **Distinct-UID:** the browser user is not in the `fido` group (`doctor` checks this).
-   - **Shared-UID with no userns:** fall back to the Chromium policy file
-     `SecurityKeyPermitAttestation`, which is not sufficient, so instead `doctor` warns. P0a must
-     find a Chromium switch or policy that disables the HID transport. Candidates:
-     `--disable-features=WebAuthenticationHid…`, and a managed-policy file in a per-profile policy
-     dir via `--policy-dir`/`CHROME_POLICY`, which is unverified.
-4. **Human path guard (R19).** Agents refuse to start when automatic mode would silently approve
-   the human path.
+   - Browsers that cannot load the extension are rejected (R14, D4).
+   - A failed incognito seed (D4) is a launch error.
+3. **No device access.** The managed browser gets no access to any `/dev/hidraw*`.
+   - **Private `/dev` through `bwrap`** (verified on distro Chromium 156, headed and
+     `--headless=new`; Chrome for Testing under `bwrap` was not run):
+
+     ```text
+     bwrap --dev-bind / / --dev /dev --die-with-parent <browser> <browser args>
+     ```
+
+     The private `/dev` contains `core fd full null ptmx pts random shm stderr stdin stdout tty
+     urandom zero`: no `hidraw*` and no `uhid`. Chromium's own sandbox keeps working inside it, with
+     no `--no-sandbox` (browser `NoNewPrivs=1`, renderers in their own user and pid namespaces with
+     seccomp). Side effects: supplementary groups are dropped (the `fido` group is lost, which is
+     fine) and the UID is unchanged; `/sys/class/hidraw` stays visible but the nodes do not exist;
+     the host `/dev/shm` is hidden, so something shared through it needs `--bind /dev/shm /dev/shm`,
+     which does not expose hidraw; headed mode needs the X socket, which `--dev-bind / /` keeps
+     visible.
+   - **When it applies.** The launcher always runs the managed browser in the private `/dev` when
+     `bwrap` and unprivileged user namespaces are available, as defence in depth.
+   - **Launcher refusal.** The private `/dev` is required when the browser's UID, with its groups,
+     could open any `/dev/hidraw*` (a `faccessat(AT_EACCESS, R_OK|W_OK)` evaluated as that UID; for
+     a distinct-UID browser the check runs in the already-dropped child that will exec the
+     browser). If it is required and unavailable (`bwrap` not installed, or no unprivileged user
+     namespaces), the launcher refuses to start the browser with an actionable error.
+   - **Distinct-UID where the browser user cannot open any hidraw node:** the private `/dev` is not
+     required. `doctor` reports which case applies: required and in place, in place as defence in
+     depth, not required, or refused.
+   - A hidraw node that appears after launch is not seen by the launch-time check; under `bwrap`
+     it never appears in the private `/dev`.
+4. **Human path guard (R19).** If `PASSLESS_INTERACTION_MODE=automatic` is set and any same-user
+   profile has an `allow` or `request` rule, the daemon refuses to start agents unless
+   `agents.allow_automatic_human_path = true`, and `doctor` flags it.
 
 E2E: E2E-45 to E2E-47.
 
@@ -341,9 +422,10 @@ E2E: E2E-45 to E2E-47.
 - **Test RP:** a Node server using `@simplewebauthn/server`, with pages using
   `@simplewebauthn/browser` plus a raw `navigator.credentials` page.
   - Origins: `http://localhost:<port>`, plus `https://rp-a.test`, `https://rp-b.test` and
-    `https://evil.test` via `--host-resolver-rules`.
-  - TLS: a test CA trusted through `--ignore-certificate-errors-spki-list` (verified in P0a; the
-    fallback is an NSS db).
+    `https://evil.test` via `--host-resolver-rules`. Multi-origin scenarios use these TLS `.test`
+    origins, not `*.localhost`: R15 allows only the exact `localhost` RP and origin.
+  - TLS: a self-signed certificate trusted through `--ignore-certificate-errors-spki-list`
+    (verified in P0a Q4, headed and new headless; no NSS db is needed).
   - The server verifies every assertion and attestation for real: signature, counter, flags,
     origin and RP ID hash.
 - **Browsers:** Chromium (distro), Playwright Chromium, and Chrome for Testing (downloaded and
@@ -373,7 +455,7 @@ global orchestration rules.
 | P3 | Remove the UHID agent route (B) and the minted enrollment grants (A); lease-bound registration bearers | §5, §9, §10.3 | sonnet | sonnet | L |
 | P4 | Policy schema and resolution: `RuleAction`, legacy mapping and warnings, validation, digest, `resolve()` with `MatchedRule`, numeric generation, pinning before `allowCredentials` | §6, §10.1 | sonnet | opus | L |
 | P5 | Sessions and replay: check order, replay key with coalescing (R1), principal digest, reload revocation, `NotSupportedError`, DOMException names, capacity caps (R11) | §9, §10.2, §10.3 | opus | opus | M |
-| P6 | Interception and transport: D1 (proxy or hardened fallback), D2 (connectNative relay, framing, keepalive, abort, reconnect) and D6.1 (always-attached readiness, degraded lease); removal of the HTTP endpoints | §4.4, §11 | opus | opus | L |
+| P6 | Interception and transport: D1 (proxy), D2 (connectNative relay, framing, keepalive, abort, reconnect) and D6.1 (always-attached readiness, degraded lease); removal of the HTTP endpoints | §4.4, §11 | opus | opus | L |
 | P7 | Escalation (D3), granted-rules store, `passless agent grants`, `agent sessions` rename, `prompt.rs` fixes, `notify_user` and `state_dir` | §8 | opus | opus | L |
 | P8 | Audit: §12 fields, terminal records, escalation events, schema bump | §12 | sonnet | sonnet | M |
 | P9 | Deployment axes: `PrincipalRelationship` in doctor and audit, shared-UID `isolated` warning, doctor test rework | §13 | sonnet | sonnet | S |
@@ -387,26 +469,39 @@ global orchestration rules.
 
 - One spike script per question, kept under `tests/agent-e2e/spikes/`.
 - Each question gets a yes/no answer with evidence.
-- **Questions:**
-  - **Q1.** Proxy create/get/cancel work with an unpacked extension, both headed and in new
-    headless.
-  - **Q1b.** The origin is browser-supplied, a page-forged `remoteDesktopClientOverride` is
-    ignored, and `sameOriginWithAncestors` is present.
-  - **Q2.** `attach()` survives a worker stop and restart, or is re-run on wake. Requests that
-    arrive while the worker is detached: which path do they take?
-  - **Q3.** The extension is enabled in incognito without user interaction, covering the primary
-    OTR profile and `Target.createBrowserContext` contexts.
-  - **Q4.** `--ignore-certificate-errors-spki-list` allows WebAuthn on `https://rp-a.test`.
-  - **Q5.** Chrome for Testing loads the extension; Edge and Brave probe.
-  - **Q6.** `isConditionalMediationAvailable` and the isUVPAA behaviour under the proxy.
-  - **Q7.** A Chromium switch or managed policy that disables the HID/USB security-key transport.
-  - **Q8.** `bwrap` with a private `/dev` (no hidraw) runs Chromium headed and in new headless.
-  - **Q9.** A root process can connect to a user session bus after dropping to that user (helper
-    design for R18).
-- **Gate:**
-  - D1 uses the proxy only if create, get, cancel and worker-restart all work on Chromium and
-    Chrome for Testing, both headed and new headless.
-  - D4 relies on incognito enablement only if it works without user interaction.
+- **Questions** (all answered; details in the
+  [proxy results](../../tests/agent-e2e/spikes/RESULTS-proxy.md) for Q1, Q1b, Q2, Q3 and Q6, and the
+  [environment results](../../tests/agent-e2e/spikes/RESULTS-env.md) for Q4, Q5 and Q7 to Q9):
+  - **Q1. Yes.** Proxy create/get/cancel work with an unpacked extension, headed and new headless, on
+    Chromium 156 and Chrome for Testing 156.
+  - **Q1b. Yes.** The origin is browser-supplied, a page-forged `remoteDesktopClientOverride` is
+    overwritten, and `sameOriginWithAncestors` is present; the top origin is not available. Chrome
+    does not validate `clientDataJSON`, so the daemon builds it.
+  - **Q2. Yes.** `attach()` survives a worker stop, a request wakes the stopped worker (it does not
+    go native), and a second `attach()` does not throw. After `chrome.runtime.reload()` the extension
+    stays unloaded and requests reach no extension (native path).
+  - **Q3. Yes.** Seeding `extensions.settings.<id>.incognito = true` into `Default/Preferences` works
+    without UI and covers the primary OTR profile and `Target.createBrowserContext` contexts;
+    unseeded, both go native.
+  - **Q4. Yes.** `--ignore-certificate-errors-spki-list` allows WebAuthn on `https://rp-a.test`.
+  - **Q5. Partly.** Chrome for Testing 157 loads the extension (headed and new headless). Branded
+    Chrome ignores `--load-extension` and `chrome-headless-shell` loads no extensions. Edge and Brave
+    were not installed and are unprobed.
+  - **Q6. Answered.** While attached, `isConditionalMediationAvailable()` is false and a conditional
+    `get()` is rejected; the extension must answer `onIsUvpaaRequest`. Whether RPs still offer a
+    passkey sign-in when the answer is `false` (V-L2) was not tested.
+  - **Q7. No.** No Chromium switch or feature flag disables the HID transport, and no such policy
+    appears in the binary's policy list (policy files could not be installed without root, so none
+    was tried).
+  - **Q8. Yes.** `bwrap --dev-bind / / --dev /dev --die-with-parent` hides hidraw; Chromium runs
+    headed and in new headless with its own sandbox intact.
+  - **Q9. Yes, with a real UID drop.** EXTERNAL auth needs the peer UID to equal the bus owner, so a
+    root process must drop to the user in a child before connecting. The user's `dbus-broker` policy
+    for UID 0 and a run as real root were not checked.
+- **Gate (passed).**
+  - D1 uses the proxy: create, get, cancel and worker restart work on Chromium and Chrome for
+    Testing, headed and new headless.
+  - D4 relies on incognito enablement: it works without user interaction.
 
 **P1.** Scenarios E2E-01 to E2E-08 run against the current code. Record the baseline pass/fail
 in the progress log. The harness itself is reviewed for hermeticity: it must not touch the real
@@ -479,7 +574,14 @@ list. The schema version is bumped. E2E-32.
 **P9.** Doctor and audit report both axes. The shared-UID `isolated` warning is emitted. Rework
 `test_same_uid_is_fatal`. E2E-33.
 
-**P10.** E2E-34 to E2E-42 across the browser and tool matrix.
+**P10.** E2E-34 to E2E-42 across the browser and tool matrix. Also:
+
+- Verify the `bwrap` private `/dev` with Playwright Chromium and Chrome for Testing, headed and
+  new headless (P0a Q8 covered distro Chromium 156 only), before they are supported under
+  containment.
+- Add the manifest `key`; implement the incognito seed and its `isAllowedIncognitoAccess`
+  verification (D4); confirm `chrome-headless-shell` detection (D4).
+- Re-check preference MAC behaviour for each supported browser version (D4).
 
 **P11.**
 
@@ -513,7 +615,7 @@ local-full only.
 | E2E-13 | Legacy config | Warns and maps; `allow + human` fails startup |
 | E2E-14 C | Replay: page resubmits identical options (Kanidm pattern) | One signature; duplicate receives the same result |
 | E2E-15 C | Budget: `evil.test` floods denied requests | Budget intact for `rp-a` |
-| E2E-16 C | Page receives a credential passing `instanceof PublicKeyCredential` and `toJSON()` | Native object (proxy) or a compatible shape (fallback) |
+| E2E-16 C | Page receives a credential passing `instanceof PublicKeyCredential` and `toJSON()` | A native `PublicKeyCredential` only; no MAIN-world shim is present |
 | E2E-17 C | Abort via `AbortSignal` mid-request | Daemon receives abort; no signature; audit aborted |
 | E2E-18 | Service worker stopped (CDP `ServiceWorker.stopWorker`) between requests | Next request reconnects and succeeds |
 | E2E-19 | Worker killed during a pending request | Page gets `NotAllowedError`; daemon cancels; no orphaned escalation |
@@ -532,8 +634,8 @@ local-full only.
 | E2E-32 C | Audit content for allow, deny, escalation and abort | All §12 fields present; terminal record for every reservation |
 | E2E-33 | Distinct-UID principal (if a second local user is available, else unit-level) | Axes reported; shared-UID isolated warning |
 | E2E-34 C | Playwright MCP via `passless agent mcp playwright`: navigate, log in with passkey | Success |
-| E2E-35 C | Playwright MCP with `--isolated` | Works (incognito enabled) or rejected with a clear message (per P0a) |
-| E2E-36 | chrome-devtools-mcp via adapter, including `isolatedContext` | Same as above |
+| E2E-35 C | Playwright MCP with `--isolated` | Works (extension enabled in incognito by preference seeding) |
+| E2E-36 | chrome-devtools-mcp via adapter, including `isolatedContext` | Works, as above |
 | E2E-37 C | Playwright library `connectOverCDP(PASSLESS_CDP_URL)` | Success |
 | E2E-38 | browser-use with `cdp_url` | Success (local, optional) |
 | E2E-39 | agent-browser `--cdp` | Success (local, optional) |
@@ -542,12 +644,13 @@ local-full only.
 | E2E-42 | Real `dunst` with `dunstctl action` approval | Approval works with a real notification server |
 | E2E-43 | Human authenticator concurrently in use (same-user) during a pending escalation | Human CTAP operation is not blocked |
 | E2E-44 | `PASSLESS_INTERACTION_MODE=automatic` with a `request` rule | Escalation still prompts or denies; never auto-approved. Agents refuse to start without `allow_automatic_human_path` (R19). |
-| E2E-45 C | Request while the extension worker is stopped or before attach; conditional-mediation request; request from a CDP-created context | Never reaches the human device: the human authenticator records no CTAP request, and the page gets `NotAllowedError` or no-op |
+| E2E-45 C | Request while the extension worker is stopped or before attach; conditional-mediation request; request from a CDP-created context; extension unloaded (for example `chrome.runtime.reload()` leaves it unloaded) | Never reaches the human device: the human authenticator records no CTAP request, and the page gets `NotAllowedError` or no-op |
 | E2E-46 C | Managed browser process | Cannot open any `/dev/hidraw*` (probe inside the browser sandbox namespace), or `doctor` warns on hosts without userns |
 | E2E-47 C | Extension directory missing or unloadable | Launch fails with an actionable error; no browser without interception |
 | E2E-48 C | Escalation waiters beyond the per-session or per-profile cap; `allow` ceremonies of another profile run concurrently | Caps enforced; other profiles unaffected; no pool exhaustion |
 | E2E-49 | Notification server restarts while a prompt is pending | Pending entry expires cleanly; next request prompts on the new server |
 | E2E-50 C | Repeated abort at the last second | Rate limit then cooldown (V-M2) |
+| E2E-51 | `create()` from an unfocused tab (an older tab in front of the new one) | The page gets `NotAllowedError`; the audit shows the registration; the documented cleanup (the operator deletes the orphan credential) removes it |
 
 ## Traceability matrix
 
@@ -557,7 +660,7 @@ P12 audit fills in the Verified column.
 | ADR | Decision | Phase | Tests | Verified |
 |---|---|---|---|---|
 | §4.2 | Managed browser; supported binaries; contexts | P10 | E2E-35, 36, 40, 41 | |
-| §4.4 / §11 | Interception (D1), connectNative transport, keepalive, abort | P6 | E2E-16 to 22 | |
+| §4.4 / §11 | Interception (D1), origin and `clientDataJSON` ownership, connectNative transport, keepalive, abort, focus limitation | P6 | E2E-16 to 22, 51 | |
 | §5 | Identity modes; no UHID agent transport | P3 | E2E-01, 02; unit | |
 | §6.1–6.2 | deny/allow/request; resolution precedence | P4 | E2E-03, 04, 12; unit | |
 | §6.3 | Constrained wildcard | P4 | E2E-12; unit | |
@@ -615,8 +718,8 @@ Findings are prefixed `V-`. All are accepted unless marked otherwise.
 | ID | Finding | Resolution |
 |---|---|---|
 | V-C1 | The managed browser reaches the human UHID device whenever interception is missing (idle worker, page loaded before attach, OTR context, missing extension); automatic mode then signs silently | D6, R17, R19; P0a Q7–Q8; E2E-45 to 47 |
-| V-H1 | Origin source on the proxy path unproven; a page might forge `remoteDesktopClientOverride`; no top origin or frame | P0a gate Q1b: forged override must be ignored, origin must come from the browser. Define `cross_origin` from `sameOriginWithAncestors`; top origin is unavailable on the proxy path, so the audit records `top_origin = null` with `cross_origin`. If forging is possible, D1 falls back. |
-| V-H2 | Escalation waiters exhaust pool threads; budget drained in cooldown | Waiters are parked continuations in `EscalationService`, holding no thread. The decision dispatches completion to the pool. Waiters are capped per session (4) and per profile (16). R4 revised. |
+| V-H1 | Origin source on the proxy path unproven; a page might forge `remoteDesktopClientOverride`; no top origin or frame | P0a gate Q1b: forged override must be ignored, origin must come from the browser. Define `cross_origin` from `sameOriginWithAncestors`; top origin is unavailable on the proxy path, so the audit records `top_origin = null` with `cross_origin`. **Resolved (P0a Q1b):** the browser overwrites a forged value, so D1 uses the proxy. |
+| V-H2 | Escalation waiters exhaust pool threads; budget drained in cooldown | Waiters are parked continuations in `EscalationService`, holding no thread. The decision dispatches completion to the pool. Waiters are capped per session (4) and per profile (16). R4 revised. Applied to ADR §8.2 and §9 in P0b. |
 | V-H3 | Re-resolution after approval impossible with a frozen `ctx.profile_config` and digest-based generation | R16 |
 | V-H4 | Agent can self-approve on the user's bus; root on user bus | R18; ADR residual-risk amendment |
 | V-H5 | Prompt thread can wedge forever on `join()` | P7: cancellable inner thread through a channel; `CloseNotification` before join; `NameOwnerChanged` watch expires pending entries and re-resolves the server name |
@@ -624,7 +727,7 @@ Findings are prefixed `V-`. All are accepted unless marked otherwise.
 | V-H7 | Auto-detection runs a principal-writable binary under the root daemon; easy path is port-mode only | R14 amended; `agent browser` fails with a clear message in pipe mode, and documents it |
 | V-M1 | Lock order incomplete and contradictory | P5 inventories every lock into a documented order in `agent/LOCKING.md`. The escalation mutex is a leaf. No policy guard is held across another acquisition. The check order follows §9: audit reservation, then epoch re-check, then key use. |
 | V-M2 | Abort dodges cooldown; an ignored prompt blocks the slot | Withdrawn escalations are rate-limited (3 per key per 10 min, then cooldown). A queued entry is dequeued when its last waiter leaves. An active prompt with zero waiters is withdrawn immediately. |
-| V-M3 | Registration token goes to the wrong waiter | Registration escalations are not joinable. The token is bound to the creating ceremony. Concurrent duplicates are denied. R5 superseded. |
+| V-M3 | Registration token goes to the wrong waiter | Registration escalations are not joinable. The token is bound to the creating ceremony. Concurrent duplicates are denied. **Supersedes R5.** Applied to ADR §8.3 in P0b. |
 | V-M4 | A restarted worker leaves proxied requests hanging | Pending ids are kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart |
 | V-M5 | D2 lacks back-pressure and re-authentication | Write timeout (5 s) closes the connection. The bearer is re-validated on every request against the revocation epoch. Wire ids are worker-allocated. Frames are capped at 1 MiB before allocation. |
 | V-M6 | Phases not green as written | The harness supports phase-tagged expected failures (`xfail-until: Pn`). `request` denies with audit until P7. P2 text fixed to "until P7". P3 updates `test-device-matrix.sh`. E2E-09's canary is replaced by a hidraw-access probe (D6) and native-call instrumentation. E2E-12 asserts `rule="*"` only from P8. |
@@ -635,7 +738,9 @@ Findings are prefixed `V-`. All are accepted unless marked otherwise.
 | V-L5 | Sign-proxy and daemon version skew | `doctor` compares versions; `hello` carries the build version |
 | V-L6 | Test mechanics: stopWorker, cooldown clock, hidraw | E2E-18 uses `Target.closeTarget` on the worker target. Cooldown is configurable, `agents.escalation_cooldown`, with a minimum of 1 s in debug builds only. hidraw is hidden through D6. |
 
-**Not verified by the reviewer.** These are carried into P0a:
+**Not verified by the reviewer.** These were carried into P0a and are answered there (the proxy
+origin source, attach persistence, conditional mediation, SPKI-list TLS and root access to a user
+session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays open for P7:
 
 - the proxy origin source;
 - whether `attach()` persists while the worker is stopped;
@@ -663,8 +768,8 @@ Findings are prefixed `V-`. All are accepted unless marked otherwise.
 |---|---|---|---|
 | ADR consolidation | ✅ staged | — | ADR 0014 written; 11 ADRs and 14 plans removed |
 | Design validation | ✅ | — | Opus review: 1 critical, 7 high, 6 medium, 6 low. All accepted (see Validation results) |
-| P0a | ⏳ | — | |
-| P0b | ⏳ | — | |
+| P0a | ✅ | — | proxy gate passed; incognito via Preferences seeding; no HID-disable switch → bwrap mandatory; TLS via spki list OK; CfT 157 loads extensions |
+| P0b | ✅ | — | ADR 0014 amended (R1–R4, R7, R9, R10, R12–R19, V-M3, V-H2, P0a outcomes; invariant 25; §19 rows); plan R, D1, D4, D6, P0a, E2E updated |
 | P1 | ⏳ | — | |
 | P2 | ⏳ | — | |
 | P3 | ⏳ | — | |
