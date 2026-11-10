@@ -27,7 +27,7 @@ This is a trust mode, not an isolation mode. Prefer exact RP rules and short ses
 
 See [Same-user mode](same-user.md).
 
-`delegated-session` has been removed. See [the migration tombstone](delegated-session.md) only when updating an older experimental configuration.
+`delegated-session` has been removed; migrate such configurations to `same-user`. See [ADR 0014 History](../decisions/0014-agent-delegation.md#20-history).
 
 ## Authority levels
 

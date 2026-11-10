@@ -1,6 +1,6 @@
 # Agent Validation Orchestrator
 
-This directory contains the fail-closed release-lab orchestrator specified in `docs/plans/agent-adr-validation-closure.md`.
+This directory contains the fail-closed release-lab orchestrator originally specified in the agent ADR validation closure plan (removed; see `docs/decisions/0014-agent-delegation.md`, History). The normative requirements are in that ADR.
 
 ## Overview
 
