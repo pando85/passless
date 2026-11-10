@@ -6,6 +6,7 @@ members = [
     "passless-uhid",
     "tools/agent-principal-probe",
     "tools/agent-uhid-feasibility",
+    "tools/notify-double",
 ]
 resolver = "2"
 

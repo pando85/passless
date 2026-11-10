@@ -1406,6 +1406,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify-double"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "notify-rust"
 version = "4.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

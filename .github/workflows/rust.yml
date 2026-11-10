@@ -74,6 +74,62 @@ jobs:
       - name: Run deterministic agent validation
         run: make test-agent-validation
 
+  agent-e2e:
+    name: Agent E2E (real browser)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt-get install -y bubblewrap dbus-daemon dbus-x11 libtss2-dev libudev-dev openssl xauth xvfb
+
+      - name: Enable UHID and hidraw access for the runner user
+        run: |
+          sudo modprobe uhid
+          printf '%s\n' \
+            'KERNEL=="uhid", MODE="0666"' \
+            'SUBSYSTEM=="hidraw", MODE="0666"' | sudo tee /etc/udev/rules.d/90-passless-e2e.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          sudo chmod 0666 /dev/uhid
+          test -r /dev/uhid -a -w /dev/uhid
+
+      - name: Allow unprivileged user namespaces (Chromium sandbox, bubblewrap)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - name: Install harness dependencies and Playwright Chromium
+        working-directory: tests/agent-e2e
+        run: |
+          npm ci --no-audit --no-fund
+          # Playwright's Chromium goes into the harness cache only (never a shared cache).
+          PLAYWRIGHT_BROWSERS_PATH="$GITHUB_WORKSPACE/target/agent-e2e-cache/ms-playwright" \
+            node node_modules/playwright-core/cli.js install --with-deps chromium
+
+      - name: Run agent E2E (CI subset)
+        run: make test-agent-e2e
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-e2e-artifacts
+          path: target/agent-e2e-artifacts
+
   agent-fuzz:
     name: Agent protocol fuzz smoke
     runs-on: ubuntu-26.04

@@ -1,0 +1,226 @@
+'use strict';
+// Browser discovery, matrix variants, CDP attach, and a plain (extension-less) launcher.
+//
+// Browser ids:
+//   chromium     distro /usr/bin/chromium
+//   pw-chromium  Playwright Chromium from the harness cache <repo>/target/agent-e2e-cache/ms-playwright (auto-installed once)
+//   cft          Chrome for Testing, downloaded once via @puppeteer/browsers into
+//                <repo>/target/agent-e2e-cache/cft (skipped, with a reason, when offline)
+// Negative controls (never in the default matrix): `chrome` (branded Google Chrome) and
+// `headless-shell` (they cannot load the extension); select them explicitly with AGENT_E2E_BROWSERS.
+//
+// The managed browser is launched by the product (daemon.launchBrowser); this module only decides the
+// executable and the variant flags that go into the profile's `browser_command`.
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn, spawnSync, execFileSync } = require('node:child_process');
+
+const { chromium } = require('playwright-core');
+
+const { CACHE_DIR, HARNESS_ROOT } = require('./paths');
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function version(exe) {
+  const r = spawnSync(exe, ['--version'], { encoding: 'utf8', timeout: 15000 });
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
+// Playwright browsers come ONLY from the harness cache (<repo>/target/agent-e2e-cache/ms-playwright), which
+// is also what PLAYWRIGHT_BROWSERS_PATH points at for every child. The shared ~/.cache/ms-playwright is
+// never read, installed into or pruned (Playwright's installer garbage-collects that cache). An explicit
+// AGENT_E2E_PW_BROWSERS_PATH may add a read-only extra root.
+function pwRoots() {
+  return [process.env.AGENT_E2E_PW_BROWSERS_PATH, path.join(CACHE_DIR, 'ms-playwright')]
+    .filter(Boolean).filter(d => fs.existsSync(d));
+}
+
+function findPlaywrightChromium() {
+  for (const base of pwRoots()) {
+    const dirs = fs.readdirSync(base).filter(d => /^chromium-\d+$/.test(d))
+      .sort((a, b) => Number(b.split('-')[1]) - Number(a.split('-')[1]));
+    for (const d of dirs) {
+      for (const sub of ['chrome-linux64/chrome', 'chrome-linux/chrome']) {
+        const p = path.join(base, d, sub);
+        if (fs.existsSync(p)) return p;
+      }
+    }
+  }
+  return null;
+}
+
+/** Install Playwright's Chromium into the harness cache (never into ~/.cache/ms-playwright). */
+function downloadPlaywrightChromium() {
+  const root = path.join(CACHE_DIR, 'ms-playwright');
+  fs.mkdirSync(root, { recursive: true });
+  const cli = path.join(HARNESS_ROOT, 'node_modules', 'playwright-core', 'cli.js');
+  const r = spawnSync(process.execPath, [cli, 'install', 'chromium'], {
+    encoding: 'utf8', timeout: 300000, env: { ...process.env, PLAYWRIGHT_BROWSERS_PATH: root },
+  });
+  if (r.status !== 0) return { ok: false, reason: `playwright install failed (likely offline): ${(r.stderr || r.stdout || '').trim().split('\n').pop()}` };
+  return { ok: true };
+}
+
+function findCft() {
+  const root = path.join(CACHE_DIR, 'cft');
+  if (!fs.existsSync(root)) return null;
+  const hits = [];
+  const walk = (d, depth) => {
+    if (depth > 4) return;
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (e.name === 'chrome' && /chrome-linux64$/.test(d)) hits.push(p);
+    }
+  };
+  walk(root, 0);
+  return hits.sort().pop() || null;
+}
+
+function downloadCft() {
+  const root = path.join(CACHE_DIR, 'cft');
+  fs.mkdirSync(root, { recursive: true });
+  const bin = path.join(HARNESS_ROOT, 'node_modules', '.bin', 'browsers');
+  const r = spawnSync(bin, ['install', 'chrome@stable', '--path', root], { encoding: 'utf8', timeout: 300000 });
+  if (r.status !== 0) return { ok: false, reason: `download failed (likely offline): ${(r.stderr || r.stdout || '').trim().split('\n').pop()}` };
+  return { ok: true };
+}
+
+/** Detect the kind of a Chrome-family binary from `--version` (the UA does not say "for Testing"). */
+function classify(versionString) {
+  if (!versionString) return 'unknown';
+  if (/for Testing/i.test(versionString)) return 'cft';
+  if (/^Chromium/i.test(versionString)) return 'chromium';
+  if (/^Google Chrome/i.test(versionString)) return 'chrome';
+  return 'unknown';
+}
+
+const _cache = new Map();
+/** @returns {{id, exe?, version?, skip?: string}} */
+function discover(id) {
+  if (_cache.has(id)) return _cache.get(id);
+  let r;
+  if (id === 'chromium') {
+    const exe = process.env.AGENT_E2E_CHROMIUM || '/usr/bin/chromium';
+    r = fs.existsSync(exe) ? { id, exe, version: version(exe) } : { id, skip: `${exe} not found` };
+  } else if (id === 'pw-chromium') {
+    let exe = findPlaywrightChromium();
+    let why = null;
+    if (!exe && process.env.AGENT_E2E_OFFLINE !== '1') {
+      const d = downloadPlaywrightChromium();
+      if (d.ok) exe = findPlaywrightChromium(); else why = d.reason;
+    } else if (!exe) why = 'AGENT_E2E_OFFLINE=1 and no Playwright Chromium found';
+    r = exe ? { id, exe, version: version(exe) } : { id, skip: why || 'Playwright Chromium unavailable' };
+  } else if (id === 'cft') {
+    let exe = findCft();
+    let why = null;
+    if (!exe && process.env.AGENT_E2E_OFFLINE !== '1') {
+      const d = downloadCft();
+      if (d.ok) exe = findCft(); else why = d.reason;
+    } else if (!exe) why = 'AGENT_E2E_OFFLINE=1 and no cached Chrome for Testing';
+    if (exe) {
+      const v = version(exe);
+      r = classify(v) === 'cft' ? { id, exe, version: v } : { id, skip: `${exe} is not Chrome for Testing (${v})` };
+    } else r = { id, skip: why || 'Chrome for Testing unavailable' };
+  } else if (id === 'chrome') {
+    const exe = ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find(p => fs.existsSync(p));
+    r = exe ? { id, exe, version: version(exe), negativeControl: true } : { id, skip: 'branded Google Chrome not installed' };
+  } else if (id === 'headless-shell') {
+    let exe = null;
+    for (const base of pwRoots()) {
+      const d = fs.readdirSync(base).filter(x => /^chromium_headless_shell-\d+$/.test(x)).sort().pop();
+      exe = d && ['chrome-headless-shell-linux64/chrome-headless-shell', 'chrome-linux/headless_shell'].map(x => path.join(base, d, x)).find(fs.existsSync);
+      if (exe) break;
+    }
+    r = exe ? { id, exe, version: version(exe), negativeControl: true } : { id, skip: 'chrome-headless-shell not found' };
+  } else r = { id, skip: `unknown browser id ${id}` };
+  _cache.set(id, r);
+  return r;
+}
+
+/**
+ * Matrix variants from env.
+ *   AGENT_E2E_BROWSERS  comma list of ids (default: pw-chromium for `ci`, chromium,pw-chromium,cft for `full`)
+ *   AGENT_E2E_HEADLESS  `new`, `headed` or `both` (default: new for `ci`, both for `full`)
+ *   AGENT_E2E_MATRIX    `ci` (default) or `full`
+ */
+function matrix() {
+  const m = process.env.AGENT_E2E_MATRIX || 'ci';
+  const ids = (process.env.AGENT_E2E_BROWSERS || (m === 'full' ? 'chromium,pw-chromium,cft' : 'pw-chromium')).split(',').map(s => s.trim()).filter(Boolean);
+  const hl = process.env.AGENT_E2E_HEADLESS || (m === 'full' ? 'both' : 'new');
+  const modes = hl === 'both' ? ['new', 'headed'] : hl.split(',').map(s => s.trim());
+  const out = [];
+  for (const id of ids) for (const mode of modes) {
+    const b = discover(id);
+    let skip = b.skip;
+    if (!skip && mode === 'headed' && !process.env.DISPLAY) skip = 'headed variant needs DISPLAY (run via run.sh, which uses xvfb-run)';
+    out.push({ browser: b, mode, name: `${id}/${mode === 'new' ? 'headless' : 'headed'}`, skip });
+  }
+  return { name: m, variants: out };
+}
+
+/** Flags that belong to the variant (put after the executable in browser_command). */
+function variantArgs(variant) {
+  return variant.mode === 'new' ? ['--headless=new'] : [];
+}
+
+/** Attach Playwright to a CDP endpoint (http://127.0.0.1:PORT). Uses the default context, as Playwright MCP does. */
+async function connect(cdpUrl) {
+  let browser = null;
+  let lastErr = null;
+  // The debugging port can accept connections slightly before the HTTP/WebSocket endpoint is usable.
+  for (let i = 0; i < 20 && !browser; i++) {
+    try { browser = await chromium.connectOverCDP(cdpUrl); } catch (e) { lastErr = e; await sleep(500); }
+  }
+  if (!browser) throw lastErr;
+  const context = browser.contexts()[0];
+  if (!context) throw new Error('browser has no default context');
+  return { browser, context };
+}
+
+/** Wait until an extension service worker (the Passless `worker.js`) is running in the browser. */
+async function waitForExtensionWorker(context, page, timeoutMs = 15000) {
+  const cdp = await context.newCDPSession(page);
+  try {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      const { targetInfos } = await cdp.send('Target.getTargets');
+      if (targetInfos.some(t => t.type === 'service_worker' && /^chrome-extension:\/\/[a-p]{32}\/worker\.js$/.test(t.url))) return true;
+      await sleep(200);
+    }
+    return false;
+  } finally { await cdp.detach().catch(() => {}); }
+}
+
+/**
+ * Plain browser: same executable, no extension, fresh profile, always under bubblewrap with a private
+ * /dev, so it cannot open ANY hidraw device (real security keys, other Passless instances). Pass
+ * `{hidraw: '/dev/hidrawN'}` to expose exactly that one node (this run's own human UHID device); that is how
+ * a human credential is seeded. bwrap argv as proven in spikes/RESULTS-env.md (Q8); Chromium's own sandbox
+ * keeps working nested inside bwrap's user namespace.
+ */
+async function launchPlain(env, variant, extraArgs = [], { hidraw = null } = {}) {
+  const bwrap = bwrapPath();
+  if (!bwrap) throw new Error('bubblewrap (bwrap) is required to run an extension-less browser hermetically; install it (unprivileged user namespaces must be enabled)');
+  const prof = fs.mkdtempSync(path.join(env.dirs.work, 'plain-'));
+  const args = [`--user-data-dir=${prof}`, '--no-first-run', '--no-default-browser-check', '--disable-sync', '--password-store=basic',
+    '--disable-background-networking', '--disable-component-update', '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
+    '--remote-allow-origins=*', ...variantArgs(variant), ...extraArgs, 'about:blank'];
+  const prefix = ['--dev-bind', '/', '/', '--dev', '/dev', '--die-with-parent'];
+  if (hidraw) prefix.push('--dev-bind', hidraw, hidraw);
+  const child = env.spawnTracked(spawn, bwrap, [...prefix, variant.browser.exe, ...args], { stdio: 'ignore', env: env.env });
+  const portFile = path.join(prof, 'DevToolsActivePort');
+  for (let i = 0; i < 150 && !fs.existsSync(portFile); i++) await sleep(200);
+  if (!fs.existsSync(portFile)) { env.killTree(child.pid); throw new Error('plain browser (bwrap) did not start'); }
+  const port = fs.readFileSync(portFile, 'utf8').split('\n')[0];
+  return { cdpUrl: `http://127.0.0.1:${port}`, kill: () => env.killTree(child.pid) };
+}
+
+function bwrapPath() {
+  for (const d of (process.env.PATH || '').split(':')) { const p = path.join(d, 'bwrap'); if (fs.existsSync(p)) return p; }
+  return null;
+}
+
+module.exports = { bwrapPath, discover, matrix, variantArgs, connect, launchPlain, classify, waitForExtensionWorker };

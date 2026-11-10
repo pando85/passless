@@ -1,0 +1,6 @@
+<!doctype html><meta charset="utf-8"><title>E2E cross-origin embed</title>
+<body><script>
+  const target = new URLSearchParams(location.search).get('target');
+  const f = document.createElement('iframe'); f.id = 'f'; f.name = 'f'; f.src = target;
+  f.allow = 'publickey-credentials-get *; publickey-credentials-create *'; document.body.appendChild(f);
+</script></body>

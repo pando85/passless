@@ -137,6 +137,18 @@ and [environment](../../tests/agent-e2e/spikes/RESULTS-env.md) results and the P
   (`AdjustTimeout()`, `fido_constants.cc`, verified). Under MV3, `sendNativeMessage` and events
   are limited to 5 min and `fetch` to 30 s. A `connectNative` port keeps the worker alive.
 
+### Defects found by the P1 baseline
+
+| # | Defect | Fixed in |
+|---|---|---|
+| B1 | With `browser_scope = "session"`, `PR_SET_PDEATHSIG` fires when the short-lived IPC handler thread that spawned the browser exits, so the managed browser is killed right after launch | P10 |
+| B2 | A launch `--url` page loads before the extension worker has attached, so a ceremony on it reaches the native path | P6 (readiness: navigate only after the worker's `hello` reports `attached`) |
+| B3 | Registration `authenticatorData` carries a raw EC point instead of a COSE_Key, so real RPs reject the attestation | P3 |
+| B4 | A profile whose rules are all `deny` fails to start (`allowed_actions must not be empty`) | P4 |
+| B5 | `max_session_ttl` above 300 s breaks session grant creation | P5 |
+| B6 | Every profile needs a unique `[device]` | P3 (UHID route removal) |
+| B7 | Isolated profiles reject `browser_runtime_root` | P10 |
+
 ## Designs
 
 ### D1 Interception
@@ -527,6 +539,8 @@ E2E-09 and E2E-10.
 Tests: registration after lease revocation is refused; registration under the wildcard is
 denied. E2E-11.
 
+- Fix B3 and B6 (see Defects found by the P1 baseline) with a regression test.
+
 **P4.** Unit tests:
 
 - the legacy mapping table;
@@ -536,6 +550,8 @@ denied. E2E-11.
 
 Migrate the fixtures in `config.rs` tests (1449-1758), `policy.rs` tests (1019-1063),
 `agent_config_integration.rs` and `policy_integration.rs`. E2E-12 and E2E-13.
+
+- Fix B4 (see Defects found by the P1 baseline) with a regression test.
 
 **P5.** Unit tests:
 
@@ -547,12 +563,15 @@ Migrate the fixtures in `config.rs` tests (1449-1758), `policy.rs` tests (1019-1
 
 Replace the `sign.rs` replay tests (2091-2258). E2E-14 and E2E-15.
 
+- Fix B5 (see Defects found by the P1 baseline) with a regression test.
+
 **P6.**
 
 - JS unit tests for the worker and relay: framing, multiplexing, abort and reconnect.
 - Rust tests for the relay and the connection handler.
 - Rewrite `agent_extension_behavioral.js`.
 - E2E-16 to E2E-22.
+- Fix B2 (see Defects found by the P1 baseline) with a regression test.
 
 **P7.** Unit tests:
 
@@ -582,6 +601,7 @@ list. The schema version is bumped. E2E-32.
 - Add the manifest `key`; implement the incognito seed and its `isAllowedIncognitoAccess`
   verification (D4); confirm `chrome-headless-shell` detection (D4).
 - Re-check preference MAC behaviour for each supported browser version (D4).
+- Fix B1 and B7 (see Defects found by the P1 baseline) with a regression test.
 
 **P11.**
 
@@ -770,7 +790,7 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 | Design validation | ✅ | — | Opus review: 1 critical, 7 high, 6 medium, 6 low. All accepted (see Validation results) |
 | P0a | ✅ | — | proxy gate passed; incognito via Preferences seeding; no HID-disable switch → bwrap mandatory; TLS via spki list OK; CfT 157 loads extensions |
 | P0b | ✅ | — | ADR 0014 amended (R1–R4, R7, R9, R10, R12–R19, V-M3, V-H2, P0a outcomes; invariant 25; §19 rows); plan R, D1, D4, D6, P0a, E2E updated |
-| P1 | ⏳ | — | |
+| P1 | ✅ | — | Baseline: 24 PASS, 8 XFAIL (E2E-02, 06 until P6) on Chromium and PW Chromium headed/headless; CfT 12 PASS/4 XFAIL; defects B1–B7 recorded |
 | P2 | ⏳ | — | |
 | P3 | ⏳ | — | |
 | P4 | ⏳ | — | |

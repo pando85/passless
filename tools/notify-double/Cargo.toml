@@ -1,0 +1,24 @@
+[package]
+name = "notify-double"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zbus = { workspace = true, features = ["tokio"] }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal"] }
+
+[dev-dependencies]
+futures-lite.workspace = true
+libc.workspace = true
+
+[lib]
+name = "notify_double"
+path = "src/lib.rs"
+
+[[bin]]
+name = "notify-double"
+path = "src/main.rs"
