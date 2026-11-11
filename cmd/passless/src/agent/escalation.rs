@@ -1680,7 +1680,20 @@ impl Waiter {
     /// calls both checks with no lock held. `park` suspends the ceremony's capacity permit for the
     /// wait and resumes it afterwards, unconditionally.
     pub fn wait(
+        self,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        still_valid: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+    ) -> EscalationOutcome {
+        self.wait_polling(WAIT_POLL_INTERVAL, deadline, cancelled, still_valid, park)
+    }
+
+    /// [`Waiter::wait`] with an explicit poll interval (a test passes a very long one to show that
+    /// a decision wakes the waiter without waiting for a poll).
+    fn wait_polling(
         mut self,
+        poll_interval: Duration,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
         still_valid: &dyn Fn() -> bool,
@@ -1697,7 +1710,7 @@ impl Waiter {
                 }
                 let now = Instant::now();
                 if now < deadline {
-                    let pause = WAIT_POLL_INTERVAL.min(deadline - now);
+                    let pause = poll_interval.min(deadline - now);
                     inner = inner.wait_timeout(&service.changed, pause);
                     if let Some(outcome) = self.take_outcome(&mut inner) {
                         return outcome;
@@ -3058,14 +3071,28 @@ mod tests {
     }
 
     #[test]
-    fn waiters_wake_on_the_decision_well_within_the_poll_interval() {
+    fn waiters_are_woken_by_the_decision_not_by_the_poll_interval() {
+        // A poll interval and a deadline far beyond the bound: only the decision's notification
+        // can wake the waiter in time. No scheduler delay can fail this, since the bound is
+        // generous and a polling-only waiter would sleep for the whole minute.
+        const POLL: Duration = Duration::from_secs(60);
+        const BOUND: Duration = Duration::from_secs(10);
         let h = harness();
-        let parked = park(
-            h.service
-                .join_or_create(request("p", "a.example", 1))
-                .unwrap(),
-        );
-        thread::sleep(Duration::from_millis(20));
+        let waiter = h
+            .service
+            .join_or_create(request("p", "a.example", 1))
+            .unwrap();
+        let parked = thread::spawn(move || {
+            waiter.wait_polling(
+                POLL,
+                Instant::now() + 2 * POLL,
+                &|| false,
+                &|| true,
+                &mut NoPark,
+            )
+        });
+        // Let the waiter reach its condvar wait; deciding earlier is harmless but proves less.
+        thread::sleep(Duration::from_millis(50));
         let start = Instant::now();
         h.service
             .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
@@ -3073,7 +3100,11 @@ mod tests {
             parked.join().unwrap(),
             EscalationOutcome::Approved { .. }
         ));
-        assert!(start.elapsed() < WAIT_POLL_INTERVAL);
+        assert!(
+            start.elapsed() < BOUND,
+            "the waiter slept through the decision for {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

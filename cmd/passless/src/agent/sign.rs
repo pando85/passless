@@ -5715,10 +5715,12 @@ pub(crate) mod tests {
                 profile_id: f.profile_id.clone(),
                 principal_digest: [0u8; 32],
                 revocation_epoch: f.policy_runtime.revocation_epoch(),
-                ttl: Duration::from_millis(600),
+                ttl: Duration::from_secs(600),
             });
             let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            // The session expires only once the ceremony is parked on its shown prompt.
             f.prompter.wait_shown(1);
+            ctx.session.expire_now();
             let err = ceremony.join().unwrap().unwrap_err();
             // The session expired: not a timeout (`escalation_expired`, which starts a cooldown).
             assert_eq!(err.code, ErrorCode::Unauthorized);

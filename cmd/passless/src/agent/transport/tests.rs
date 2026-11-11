@@ -903,7 +903,12 @@ fn an_abort_before_key_use_signs_nothing_and_is_audited() {
     client.request(7, "get", &get_body(b"abort-me"));
     server.wait_admitted(1);
     client.send(json!({"type": "abort", "id": 7}));
-    thread::sleep(Duration::from_millis(100));
+    // The connection's reader handles frames in order, and answers a malformed request on the
+    // spot: its result proves the abort before it has been applied to the in-flight request.
+    client.send(json!({"type": "request", "id": 8, "op": "nope"}));
+    let barrier = client.result();
+    assert_eq!(barrier["id"], 8);
+    assert_eq!(error_code(&barrier).0, "bad_request");
     drop(op);
 
     let result = client.result();

@@ -349,6 +349,9 @@ pub struct AgentSession {
     /// ([`Self::audit_id_hash`]); it is not the bearer and grants nothing.
     audit_id: [u8; 16],
     expires_at: Instant,
+    /// Test seam: expire the session now, without waiting for the TTL.
+    #[cfg(test)]
+    expired_now: AtomicBool,
     grant_id: OnceLock<GrantId>,
     /// The UID the lease's browser (and so its `sign-proxy` relay) runs as. The sign transport
     /// admits a hello for this session only from a peer with this UID (`SO_PEERCRED`); unset means
@@ -382,6 +385,8 @@ impl AgentSession {
             binding,
             audit_id,
             expires_at,
+            #[cfg(test)]
+            expired_now: AtomicBool::new(false),
             grant_id: OnceLock::new(),
             browser_uid: OnceLock::new(),
             revoked: AtomicBool::new(false),
@@ -466,7 +471,17 @@ impl AgentSession {
         if now >= self.expires_at {
             return Err(SessionInvalid::Expired);
         }
+        #[cfg(test)]
+        if self.expired_now.load(Ordering::Acquire) {
+            return Err(SessionInvalid::Expired);
+        }
         Ok(())
+    }
+
+    /// Expire the session as if its TTL had just passed.
+    #[cfg(test)]
+    pub(crate) fn expire_now(&self) {
+        self.expired_now.store(true, Ordering::Release);
     }
 
     /// Operations claimed so far.
