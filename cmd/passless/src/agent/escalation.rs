@@ -88,8 +88,14 @@ pub const WITHDRAWAL_WINDOW: Duration = Duration::from_secs(600);
 pub const WITHDRAWALS_BEFORE_COOLDOWN: usize = 3;
 /// Keys each of the cooldown and withdrawal maps tracks. The withdrawal map evicts its oldest
 /// entry beyond it. The cooldown map never evicts a live cooldown (a human's deny must hold):
-/// when live cooldowns plus live escalations reach it, new escalations are refused.
+/// when live cooldowns plus live escalations reach it, new escalations are refused. No profile
+/// may hold more than [`MAX_TRACKED_KEYS_PER_PROFILE`] of them, so the global bound is a backstop.
 pub const MAX_TRACKED_KEYS: usize = 4096;
+/// Live cooldowns plus live escalations one profile may hold. A profile at its quota is refused
+/// alone (`escalation_tracking_full`), so a hostile page behind a broad `request` rule cannot
+/// fill the shared table and starve other profiles (review M-e). The global [`MAX_TRACKED_KEYS`]
+/// stays as a backstop; it is 16 times this quota.
+pub const MAX_TRACKED_KEYS_PER_PROFILE: usize = 256;
 /// Longest a waiter parks before it re-checks its cancellation, deadline and session.
 pub const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// An abort this close to the deadline counts as a timeout (Chromium's cancel and the daemon's
@@ -624,15 +630,28 @@ impl Inner {
         self.cooldown.insert(key.clone(), later(now, cooldown));
     }
 
-    /// Whether the cooldown table has no room for another escalation: every live cooldown, plus a
-    /// slot for each live escalation (which may end in a cooldown), fills it. Expired cooldowns
-    /// are pruned first, so an entry that ran out frees its slot.
-    fn tracking_full(&mut self, now: MonotonicTime) -> bool {
-        if self.cooldown.len() + self.by_key.len() < MAX_TRACKED_KEYS {
+    /// Whether `profile` has no room for another escalation: its own live cooldowns plus a slot
+    /// for each of its live escalations (which may end in a cooldown) reach
+    /// [`MAX_TRACKED_KEYS_PER_PROFILE`], or the same count over all profiles reaches the
+    /// [`MAX_TRACKED_KEYS`] backstop. Expired cooldowns are pruned first, so an entry that ran
+    /// out frees its slot; a live one is never evicted. Only the profile at its quota is refused.
+    fn tracking_full(&mut self, profile: &ProfileId, now: MonotonicTime) -> bool {
+        if !self.tracking_reached(profile) {
             return false;
         }
         self.cooldown.retain(|_, until| now < *until);
-        self.cooldown.len() + self.by_key.len() >= MAX_TRACKED_KEYS
+        self.tracking_reached(profile)
+    }
+
+    fn tracking_reached(&self, profile: &ProfileId) -> bool {
+        let total = self.cooldown.len() + self.by_key.len();
+        let own = self
+            .cooldown
+            .keys()
+            .filter(|k| &k.profile == profile)
+            .count()
+            + self.by_key.keys().filter(|k| &k.profile == profile).count();
+        own >= MAX_TRACKED_KEYS_PER_PROFILE || total >= MAX_TRACKED_KEYS
     }
 
     /// Count a withdrawal of `key` (V-M2); the third within the window starts the cooldown.
@@ -709,9 +728,9 @@ impl Inner {
             self.check_waiter_caps(&request.profile, request.session)?;
             return Ok(Some(serial));
         }
-        // A new escalation may end in a cooldown: refuse it while the table is full of live ones
-        // rather than evict one (review L1).
-        if self.tracking_full(now) {
+        // A new escalation may end in a cooldown: refuse it while its profile's share of the table
+        // (or the table) is full of live ones rather than evict one (reviews L1, M-e).
+        if self.tracking_full(&request.profile, now) {
             return Err(EscalationRefusal::TrackingFull);
         }
         if let Some(slot) = self.profiles.get(&request.profile) {
@@ -3525,6 +3544,76 @@ mod tests {
         let next = request("p", "next.example", 1);
         assert_eq!(
             inner.admit(&next, &next.key(), at(2_000)),
+            Err(EscalationRefusal::TrackingFull)
+        );
+    }
+
+    fn profile_key(profile_name: &str, index: usize) -> EscalationKey {
+        EscalationKey {
+            profile: profile(profile_name),
+            rp_id: format!("{index}.example"),
+            action: CeremonyAction::Authenticate,
+        }
+    }
+
+    /// Review M-e: one profile filling its quota is refused alone. Another profile still
+    /// escalates, and the saturated profile's live cooldowns are all kept.
+    #[test]
+    fn a_profile_at_its_tracking_quota_does_not_starve_another_profile() {
+        let mut inner = Inner::default();
+        let long = Duration::from_secs(3_600);
+        for index in 0..MAX_TRACKED_KEYS_PER_PROFILE {
+            inner.start_cooldown(&profile_key("hostile", index), at(1_000), long);
+        }
+        let now = at(2_000);
+        let more = request("hostile", "more.example", 1);
+        assert_eq!(
+            inner.admit(&more, &more.key(), now),
+            Err(EscalationRefusal::TrackingFull)
+        );
+        // Live escalations count toward the quota as well.
+        let other = request("other", "a.example", 2);
+        assert!(matches!(inner.admit(&other, &other.key(), now), Ok(None)));
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS_PER_PROFILE);
+        assert!(inner.in_cooldown(&profile_key("hostile", 0), now));
+        // The quota frees up when the cooldowns run out.
+        let later = at(1_000 + 3_600_000 + 1);
+        assert!(matches!(inner.admit(&more, &more.key(), later), Ok(None)));
+    }
+
+    #[test]
+    fn live_escalations_count_against_the_profile_quota_only() {
+        let mut inner = Inner::default();
+        for index in 0..MAX_TRACKED_KEYS_PER_PROFILE {
+            inner
+                .by_key
+                .insert(profile_key("hostile", index), index as u64);
+        }
+        let hostile = request("hostile", "new.example", 1);
+        assert_eq!(
+            inner.admit(&hostile, &hostile.key(), at(1)),
+            Err(EscalationRefusal::TrackingFull)
+        );
+        let other = request("other", "new.example", 2);
+        assert!(matches!(inner.admit(&other, &other.key(), at(1)), Ok(None)));
+    }
+
+    /// The global bound stays a backstop: profiles that each stay under their quota can still
+    /// fill it, and then every profile is refused.
+    #[test]
+    fn the_global_tracking_bound_is_a_backstop_behind_the_profile_quota() {
+        let mut inner = Inner::default();
+        let long = Duration::from_secs(3_600);
+        let profiles = MAX_TRACKED_KEYS / MAX_TRACKED_KEYS_PER_PROFILE;
+        for p in 0..profiles {
+            for index in 0..MAX_TRACKED_KEYS_PER_PROFILE {
+                inner.start_cooldown(&profile_key(&format!("p{p}"), index), at(1_000), long);
+            }
+        }
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        let fresh = request("fresh", "a.example", 1);
+        assert_eq!(
+            inner.admit(&fresh, &fresh.key(), at(2_000)),
             Err(EscalationRefusal::TrackingFull)
         );
     }
