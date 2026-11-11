@@ -427,13 +427,18 @@ impl core::fmt::Debug for ProfileRuntime {
 }
 
 impl ProfileRuntime {
+    /// The profile's place in the section 13 matrix: its mode and the principal relationship.
+    pub fn deployment_axes(&self) -> super::deployment::DeploymentAxes {
+        super::deployment::DeploymentAxes::new(self.mode, self.uid, self.daemon_uid)
+    }
+
     /// What this profile's operation records say about the deployment (ADR 0014 sections 5, 12
     /// and 13): the identity mode, the principal relationship (the principal's UID against the
     /// daemon's), the storage kind and the key provider.
     pub fn audit_deployment(&self) -> AuditDeployment {
         AuditDeployment::new(
             self.mode,
-            self.uid == self.daemon_uid,
+            self.deployment_axes().relationship,
             self.backend_kind,
             &*self.backend.key_provider,
         )
@@ -970,77 +975,6 @@ impl AgentRuntime {
                     None
                 };
 
-                let mut uid_checks = Vec::new();
-                let is_root = unsafe { libc::geteuid() == 0 };
-                if is_root {
-                    uid_checks.push(super::doctor::UidCheck {
-                        label: "principal_vs_daemon".into(),
-                        passed: resolved.uid != daemon_uid,
-                        message: if resolved.uid != daemon_uid {
-                            format!(
-                                "principal uid {} differs from daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        } else {
-                            format!(
-                                "principal uid {} same as daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        },
-                    });
-                    uid_checks.push(super::doctor::UidCheck {
-                        label: "principal_not_root".into(),
-                        passed: resolved.uid != 0,
-                        message: if resolved.uid != 0 {
-                            "principal is not root".into()
-                        } else {
-                            "principal must not be root".into()
-                        },
-                    });
-                    if let Some(bu) = resolved_browser_users
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .and_then(|(_, bu)| bu.as_ref())
-                    {
-                        uid_checks.push(super::doctor::UidCheck {
-                            label: "browser_vs_principal".into(),
-                            passed: bu.uid != resolved.uid,
-                            message: if bu.uid != resolved.uid {
-                                format!(
-                                    "browser uid {} differs from principal uid {}",
-                                    bu.uid, resolved.uid
-                                )
-                            } else {
-                                format!(
-                                    "browser uid {} same as principal uid {}",
-                                    bu.uid, resolved.uid
-                                )
-                            },
-                        });
-                        uid_checks.push(super::doctor::UidCheck {
-                            label: "browser_vs_daemon".into(),
-                            passed: bu.uid != daemon_uid,
-                            message: if bu.uid != daemon_uid {
-                                format!(
-                                    "browser uid {} differs from daemon uid {}",
-                                    bu.uid, daemon_uid
-                                )
-                            } else {
-                                format!("browser uid {} same as daemon uid {}", bu.uid, daemon_uid)
-                            },
-                        });
-                        uid_checks.push(super::doctor::UidCheck {
-                            label: "browser_not_root".into(),
-                            passed: bu.uid != 0,
-                            message: if bu.uid != 0 {
-                                "browser is not root".into()
-                            } else {
-                                "browser must not be root".into()
-                            },
-                        });
-                    }
-                }
-
                 profile_startup_infos.push((name.clone(), {
                     super::doctor::ProfileStartupInfo {
                         storage_roots: storage_roots
@@ -1054,6 +988,11 @@ impl AgentRuntime {
                             }
                         }),
                         uid_checks: Vec::new(),
+                        deployment: super::deployment::DeploymentAxes::new(
+                            profile.mode,
+                            resolved.uid,
+                            daemon_uid,
+                        ),
                     }
                 }));
             }
@@ -1065,21 +1004,9 @@ impl AgentRuntime {
                 let resolved = &resolved_users[i].1;
                 let is_root = unsafe { libc::geteuid() == 0 };
                 if is_root {
-                    info.uid_checks.push(super::doctor::UidCheck {
-                        label: "principal_vs_daemon".into(),
-                        passed: resolved.uid != daemon_uid,
-                        message: if resolved.uid != daemon_uid {
-                            format!(
-                                "principal uid {} differs from daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        } else {
-                            format!(
-                                "principal uid {} same as daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        },
-                    });
+                    // A principal that shares the daemon's UID is a legitimate deployment
+                    // (ADR 0014 section 13), reported as an axis and not refused here. A root
+                    // daemon cannot have one without a root principal, refused below.
                     info.uid_checks.push(super::doctor::UidCheck {
                         label: "principal_not_root".into(),
                         passed: resolved.uid != 0,
@@ -1142,6 +1069,10 @@ impl AgentRuntime {
                 agent_config.audit_path.as_deref(),
                 &final_infos,
             );
+
+            for warning in &diag.warnings {
+                log::warn!("startup diagnostic: {warning}");
+            }
 
             if !diag.is_ok() {
                 for check in &diag.checks {
@@ -2957,6 +2888,8 @@ impl AgentRuntime {
                 require_uv,
             },
         );
+        // Both deployment axes and the shared-UID `isolated` warning (ADR 0014 section 13).
+        report.checks.extend(profile.deployment_axes().checks(None));
         // The installed relay against the daemon's build (plan V-L5).
         report.checks.push(super::doctor::relay_version_check(
             &super::doctor::ProductionRelayProbe,
@@ -4879,13 +4812,37 @@ mod tests {
     fn the_audit_deployment_carries_the_backend_kind_name() {
         let deployment = AuditDeployment::new(
             AgentMode::SameUser,
-            true,
+            crate::agent::deployment::PrincipalRelationship::SharedUid,
             BackendKind::Pass,
             &soft_fido2::SoftwareCredentialKeyProvider,
         );
         assert_eq!(deployment.backend.as_deref(), Some("pass"));
         assert_eq!(deployment.mode.as_deref(), Some("same-user"));
         assert_eq!(deployment.key_provider.as_deref(), Some("software"));
+    }
+
+    #[test]
+    fn audit_and_doctor_report_the_same_axes_for_every_combination() {
+        use crate::agent::deployment::DeploymentAxes;
+        for mode in [AgentMode::SameUser, AgentMode::Isolated] {
+            for (principal_uid, expected) in [(1000, "shared-uid"), (1001, "distinct-uid")] {
+                let axes = DeploymentAxes::new(mode, principal_uid, 1000);
+                let audit = AuditDeployment::new(
+                    axes.mode,
+                    axes.relationship,
+                    BackendKind::Local,
+                    &soft_fido2::SoftwareCredentialKeyProvider,
+                );
+                assert_eq!(audit.mode.as_deref(), Some(mode.to_string().as_str()));
+                assert_eq!(audit.principal_relationship.as_deref(), Some(expected));
+                let doctor = axes.checks(None).remove(0).message;
+                assert!(doctor.contains(&format!("mode: {mode}")), "{doctor}");
+                assert!(
+                    doctor.contains(&format!("principal_relationship: {expected}")),
+                    "{doctor}"
+                );
+            }
+        }
     }
 
     // --- admin credential delete: storage errors are not "not found" ---

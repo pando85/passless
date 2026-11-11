@@ -11,6 +11,7 @@ use passless_core::agent::{AgentConfig, AgentMode, AgentProfileConfig, ProfileId
 
 use super::audit::AuditGate;
 use super::browser::{BrowserManifest, ProcessIdentity};
+use super::deployment::DeploymentAxes;
 use super::granted_rules::ProfileGrants;
 
 use passless_core::agent::ProfileDiagnosticReport;
@@ -215,6 +216,9 @@ fn is_process_alive_verified(pid: u32, expected_identity: &ProcessIdentity) -> b
 pub struct StartupDiagnosticResult {
     pub checks: Vec<DoctorCheck>,
     pub fatal: Vec<String>,
+    /// Non-fatal findings the daemon logs at start, such as the shared-UID `isolated` warning of
+    /// ADR 0014 section 13.
+    pub warnings: Vec<String>,
 }
 
 impl StartupDiagnosticResult {
@@ -231,6 +235,7 @@ pub fn run_startup_diagnostics(
 ) -> StartupDiagnosticResult {
     let mut checks = Vec::new();
     let mut fatal = Vec::new();
+    let mut warnings = Vec::new();
 
     if has_profiles {
         let euid_ok = probes.probe_euid_is_root();
@@ -282,6 +287,13 @@ pub fn run_startup_diagnostics(
     }
 
     for (name, info) in profile_configs {
+        // Both deployment axes (ADR 0014 section 13). No combination is fatal here: a principal
+        // that shares the daemon's UID is a supported deployment, and only `isolated` warns.
+        checks.extend(info.deployment.checks(Some(name)));
+        if let Some(warning) = info.deployment.isolated_shared_uid_warning() {
+            warnings.push(format!("profile '{name}': {warning}"));
+        }
+
         for (root_label, root_path, expected_uid) in &info.storage_roots {
             match probes.probe_storage_root(root_path, *expected_uid) {
                 Ok(()) => {
@@ -368,7 +380,11 @@ pub fn run_startup_diagnostics(
         }
     }
 
-    StartupDiagnosticResult { checks, fatal }
+    StartupDiagnosticResult {
+        checks,
+        fatal,
+        warnings,
+    }
 }
 
 /// What running the installed `sign-proxy --version` gave (plan V-L5).
@@ -507,6 +523,7 @@ pub struct ProfileStartupInfo {
     pub storage_roots: Vec<(String, PathBuf, u32)>,
     pub browser_runtime_root: Option<BrowserRuntimeRootInfo>,
     pub uid_checks: Vec<UidCheck>,
+    pub deployment: DeploymentAxes,
 }
 
 pub struct ProfileDiagnosticParams<'a> {
@@ -838,6 +855,7 @@ mod tests {
 
     fn make_profile_info() -> ProfileStartupInfo {
         ProfileStartupInfo {
+            deployment: DeploymentAxes::new(AgentMode::Isolated, 1001, 1000),
             storage_roots: vec![("credential".into(), PathBuf::from("/tmp/creds"), 1000)],
             browser_runtime_root: Some(BrowserRuntimeRootInfo {
                 path: PathBuf::from("/tmp/browser"),
@@ -910,20 +928,88 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ADR 0014 section 13: a principal that shares the daemon's UID is a supported deployment, so
+    // the relationship is reported as an axis and is never fatal by itself. (This test used to
+    // assert that a `principal_vs_daemon` uid check failing on "same as daemon" was fatal.) A
+    // principal that is root stays fatal through its own `principal_not_root` check.
     #[test]
-    fn test_same_uid_is_fatal() {
+    fn test_same_uid_is_reported_and_not_fatal() {
+        let probes = MockProbes::all_healthy();
+        for mode in [AgentMode::SameUser, AgentMode::Isolated] {
+            let mut info = make_profile_info();
+            info.deployment = DeploymentAxes::new(mode, 1000, 1000);
+            info.uid_checks.clear();
+            let profiles = vec![("test".into(), info)];
+            let result =
+                run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
+            assert!(result.is_ok(), "{mode}: fatal: {:?}", result.fatal);
+            let axes = result
+                .checks
+                .iter()
+                .find(|c| c.name == "deployment_axes.test")
+                .expect("axes check");
+            assert!(axes.passed);
+            assert!(axes.message.contains(&format!("mode: {mode}")));
+            assert!(axes.message.contains("principal_relationship: shared-uid"));
+            // Only `isolated` warns, in the checks and in the startup warnings.
+            let warned = result
+                .checks
+                .iter()
+                .any(|c| c.name == "isolated_shared_uid.test" && c.passed);
+            assert_eq!(warned, mode == AgentMode::Isolated, "{mode}");
+            assert_eq!(result.warnings.len(), usize::from(warned), "{mode}");
+        }
+    }
+
+    #[test]
+    fn test_distinct_uid_reports_the_axes_without_a_warning() {
+        let probes = MockProbes::all_healthy();
+        for mode in [AgentMode::SameUser, AgentMode::Isolated] {
+            let mut info = make_profile_info();
+            info.deployment = DeploymentAxes::new(mode, 1001, 1000);
+            let profiles = vec![("test".into(), info)];
+            let result =
+                run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
+            assert!(result.is_ok(), "{mode}: fatal: {:?}", result.fatal);
+            let axes = result
+                .checks
+                .iter()
+                .find(|c| c.name == "deployment_axes.test")
+                .expect("axes check");
+            assert!(
+                axes.message
+                    .contains("principal_relationship: distinct-uid")
+            );
+            assert!(result.warnings.is_empty(), "{mode}: {:?}", result.warnings);
+            assert!(
+                !result
+                    .checks
+                    .iter()
+                    .any(|c| c.name.starts_with("isolated_shared_uid"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_principal_root_is_still_fatal() {
         let probes = MockProbes::all_healthy();
         let mut info = make_profile_info();
+        info.deployment = DeploymentAxes::new(AgentMode::Isolated, 0, 0);
         info.uid_checks = vec![UidCheck {
-            label: "principal_vs_daemon".into(),
+            label: "principal_not_root".into(),
             passed: false,
-            message: "principal uid 0 same as daemon uid 0".into(),
+            message: "principal must not be root".into(),
         }];
         let profiles = vec![("test".into(), info)];
         let result =
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("same as daemon")));
+        assert!(
+            result
+                .fatal
+                .iter()
+                .any(|f| f.contains("principal must not be root"))
+        );
     }
 
     #[test]

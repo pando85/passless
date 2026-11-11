@@ -33,6 +33,7 @@ use super::audit_events::{
     AuditAction, BackendKind, OperationRecord, OperationTerminalBuilder, PolicyAllowBuilder,
     PolicyDenyBuilder, PolicyDenyReason, RuleGrantSource,
 };
+use super::deployment::PrincipalRelationship;
 use super::policy_engine::PolicyRuntime;
 use super::session::AgentSession;
 
@@ -54,7 +55,7 @@ pub struct AuditDeployment {
 impl AuditDeployment {
     pub fn new(
         mode: AgentMode,
-        shared_uid: bool,
+        relationship: PrincipalRelationship,
         backend: BackendKind,
         key_provider: &dyn soft_fido2::CredentialKeyProvider,
     ) -> Self {
@@ -77,14 +78,7 @@ impl AuditDeployment {
         };
         Self {
             mode: Some(mode.to_string()),
-            principal_relationship: Some(
-                if shared_uid {
-                    "shared-uid"
-                } else {
-                    "distinct-uid"
-                }
-                .to_string(),
-            ),
+            principal_relationship: Some(relationship.as_str().to_string()),
             backend: Some(backend.as_str().to_string()),
             key_provider: Some(key_provider),
         }

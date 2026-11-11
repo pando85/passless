@@ -5,6 +5,7 @@ pub mod browser;
 pub mod capacity;
 pub mod cdp_bootstrap;
 pub mod client;
+pub mod deployment;
 pub mod doctor;
 pub mod escalation;
 pub mod escalation_prompt;
