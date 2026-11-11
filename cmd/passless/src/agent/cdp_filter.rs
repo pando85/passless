@@ -7,28 +7,38 @@
 //!
 //! - denies the `Extensions` domain, `Target.exposeDevToolsProtocol` (it would hand page script an
 //!   unfiltered CDP channel to the browser), `Target.sendMessageToTarget` and
-//!   `Target.attachToBrowserTarget` (the agent already holds the browser session), and the
+//!   `Target.attachToBrowserTarget` (the agent already holds the browser session),
+//!   `Target.openDevTools`, `Target.setRemoteLocations` and `Browser.executeBrowserCommand`
+//!   (they open privileged UI or targets), and the
 //!   `ServiceWorker` commands that inspect or stop workers by version (`inspectWorker`,
 //!   `stopWorker`, `stopAllWorkers`), which cannot be attributed to a worker without tracking
 //!   every registration;
 //! - allows only flat sessions: `Target.attachToTarget` and `Target.setAutoAttach` must say
 //!   `flatten: true`, so every session's traffic is a top-level message the filter sees (a
 //!   non-flat session would tunnel commands through a JSON string, review H1);
-//! - denies a command whose `targetId` names an extension target, or whose session is on one. The
+//! - denies a command whose `targetId` names a hostile target, or whose session is on one (the
+//!   extension's own targets, and browser-internal ones: see below). The
 //!   daemon asks the browser with its own `Target.getTargetInfo` before it forwards a command that
 //!   names a target, or that runs on a session (the session's target is looked up, so a target
 //!   that turned into an extension page since it was attached is caught, review H2). A session the
 //!   filter never saw being created is refused;
 //! - denies a command whose parameters name an extension (`chrome-extension:`, the extension ID)
 //!   or a browser-internal page (`chrome:`, `chrome-untrusted:`, `chrome-search:`, `devtools:`,
-//!   `chrome-devtools:`, and `about:` except `about:blank` and `about:srcdoc`, since
+//!   `chrome-devtools:`, `chrome-error:`, and `about:` except `about:blank` and `about:srcdoc`, since
 //!   `about:inspect` is `chrome://inspect`). Strings are matched after the normalization a URL
 //!   parser applies (tabs and newlines dropped, `\uXXXX`/`\xHH` and percent escapes decoded once,
 //!   lowercase), and a string that is itself JSON is searched too;
-//! - hides extension targets from the agent: every response's `targetInfos` lose them, a
+//! - hides hostile targets from the agent: every response's `targetInfos` lose them, a
 //!   `targetInfo` of one becomes an error, and target events about them are dropped. When a target
-//!   is found to be an extension target, every session on it is refused and detached by the
-//!   daemon (resuming the target first if an auto-attach left it waiting for a debugger).
+//!   is found to be hostile, every session on it is refused and detached by the daemon (resuming
+//!   the target first if an auto-attach left it waiting for a debugger). A target is hostile when
+//!   it is the extension's (its URL holds the extension ID), when its `type` is browser chrome
+//!   ([`HOSTILE_TARGET_TYPES`]: `browser`, `browser_ui`, `background_page`, `app`, `webview`) or
+//!   when its URL, normalized, is on an internal scheme (the list above, any `chrome-extension:`
+//!   page, also behind `view-source:`). Those are the browser's own pages, a `devtools://` page
+//!   that `Target.getTargets` lists or an `openDevTools` created, and the like: attaching to one
+//!   would hand the agent the browser's privileges. `chrome-error:` pages stay visible (see
+//!   [`INTERNAL_SCHEMES`]);
 //!
 //! The filter never forwards an agent command with an ID in the daemon's range (from
 //! [`AGENT_ID_LIMIT`]), swallows the responses to its own commands and drops a browser message it
@@ -60,10 +70,21 @@ const MAX_PENDING_ATTACHES: usize = 64;
 /// How deep a JSON document inside a string is searched.
 const MAX_NESTED_JSON_DEPTH: usize = 4;
 
+const SESSION_DENIED: &str =
+    "the session belongs to the Passless extension or a browser-internal target";
+/// Also the text `browser.rs` gives when a lookup finds the target hostile.
+pub const TARGET_DENIED: &str = "the target is the Passless extension or a browser-internal target";
+
 const DENIED_METHODS: &[&str] = &[
     "Target.exposeDevToolsProtocol",
     "Target.sendMessageToTarget",
     "Target.attachToBrowserTarget",
+    // Open privileged UI or targets: a `devtools://` page on any page, a browser-side listener
+    // that connects out to chosen hosts and exposes what it finds as targets, and the browser's
+    // own UI commands (`openTabSearch` and the like).
+    "Target.openDevTools",
+    "Target.setRemoteLocations",
+    "Browser.executeBrowserCommand",
     "ServiceWorker.inspectWorker",
     "ServiceWorker.stopWorker",
     "ServiceWorker.stopAllWorkers",
@@ -72,8 +93,25 @@ const DENIED_METHODS: &[&str] = &[
 /// Commands that open sessions: allowed only with `flatten: true`.
 const FLAT_ONLY_METHODS: &[&str] = &["Target.attachToTarget", "Target.setAutoAttach"];
 
+/// `TargetInfo.type` values of browser chrome and of targets that are not web content. Chromium
+/// reports `page`, `iframe`, `worker`, `shared_worker`, `service_worker`, `tab`, `other` and the
+/// worklet and assistive-technology types for web content, which stay visible (a `tab` takes the
+/// URL of its page and `other` covers DevTools windows, both caught by their URL below):
+///
+/// - `browser`: the browser itself;
+/// - `browser_ui`: browser windows and their UI (tab strip, toolbar, `chrome://` WebUI hosts);
+/// - `background_page`, `app`: extension background pages and packaged apps;
+/// - `webview`: a `<webview>` guest, which only the browser's own WebUI embeds.
+const HOSTILE_TARGET_TYPES: &[&str] =
+    &["browser", "browser_ui", "background_page", "app", "webview"];
+
 /// URL schemes of browser-internal pages (from which the extension could be inspected,
 /// disabled or driven).
+///
+/// `chrome-error:` is deliberately not here. Chromium reports `chrome-error://chromewebdata/` as
+/// the URL of a page whose navigation failed, and an agent retries after a network error on that
+/// very page, so the target of such a page stays visible. A request that names a `chrome-error:`
+/// URL is still refused ([`REQUEST_ONLY_SCHEMES`]): no legitimate command needs to.
 const INTERNAL_SCHEMES: &[&str] = &[
     "chrome:",
     "chrome-untrusted:",
@@ -81,6 +119,19 @@ const INTERNAL_SCHEMES: &[&str] = &[
     "chrome-devtools:",
     "devtools:",
 ];
+
+/// Schemes refused in a request's strings but not in a target's URL (see [`INTERNAL_SCHEMES`]).
+const REQUEST_ONLY_SCHEMES: &[&str] = &["chrome-error:"];
+
+/// Why a target is hidden from the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hostile {
+    /// The Passless extension's own page or worker.
+    Extension,
+    /// Browser chrome, an internal page or another extension: [`HOSTILE_TARGET_TYPES`] and
+    /// [`INTERNAL_SCHEMES`].
+    Internal,
+}
 
 /// What to do with an agent's CDP request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,9 +189,9 @@ struct SessionInfo {
 pub struct ExtensionCdpFilter {
     /// The extension ID, lowercase.
     extension_id: String,
-    /// Targets known to be extension targets.
+    /// Targets known to be hostile (the extension's or browser-internal).
     targets: BoundedSet,
-    /// Sessions refused (on an extension target).
+    /// Sessions refused (on a hostile target).
     denied_sessions: BoundedSet,
     /// Live sessions, oldest first for eviction.
     sessions: HashMap<String, SessionInfo>,
@@ -205,13 +256,13 @@ impl ExtensionCdpFilter {
                 return deny("the session ID is not a string");
             };
             if self.denied_sessions.contains(session) {
-                return deny("the session belongs to the Passless extension");
+                return deny(SESSION_DENIED);
             }
             let Some(info) = self.sessions.get(session) else {
                 return deny("the session is not one browser-control attached");
             };
             if self.targets.contains(&info.target) {
-                return deny("the session belongs to the Passless extension");
+                return deny(SESSION_DENIED);
             }
             lookups.push(info.target.clone());
         }
@@ -220,14 +271,14 @@ impl ExtensionCdpFilter {
             .and_then(Value::as_str)
             .is_some_and(|session| self.denied_sessions.contains(session))
         {
-            return deny("the session belongs to the Passless extension");
+            return deny(SESSION_DENIED);
         }
         if let Some(reason) = self.forbidden_reference(params) {
             return deny(reason);
         }
         match params.get("targetId").and_then(Value::as_str) {
             Some(target) if self.targets.contains(target) => {
-                return deny("the target is the Passless extension");
+                return deny(TARGET_DENIED);
             }
             Some(target) if !lookups.iter().any(|known| known == target) => {
                 lookups.push(target.to_string());
@@ -271,16 +322,17 @@ impl ExtensionCdpFilter {
         )
     }
 
-    /// Record the lookup's response. True when `target_id` is an extension target; its sessions
-    /// are then refused and detached ([`Self::take_commands`]).
+    /// Record the lookup's response. True when `target_id` is a hostile target (the extension's
+    /// or a browser-internal one); its sessions are then refused and detached
+    /// ([`Self::take_commands`]).
     pub fn lookup_result(&mut self, target_id: &str, response: &Value) -> bool {
-        let extension = response
+        let hostile = response
             .pointer("/result/targetInfo")
-            .is_some_and(|info| self.is_extension_target(info));
-        if extension {
-            self.mark_extension_target(target_id);
+            .and_then(|info| self.hostile_kind(info));
+        if let Some(kind) = hostile {
+            self.mark_hostile_target(target_id, kind);
         }
-        extension
+        hostile.is_some()
     }
 
     /// The daemon commands the filter decided on since the last call (detaches), to be written
@@ -333,10 +385,11 @@ impl ExtensionCdpFilter {
             "Target.receivedMessageFromTarget" => return Inbound::Drop,
             "Target.attachedToTarget" => {
                 let session = params.get("sessionId").and_then(Value::as_str);
-                let extension = target_info.is_some_and(|info| self.is_extension_target(info))
+                let kind = target_info.and_then(|info| self.hostile_kind(info));
+                let hostile = kind.is_some()
                     || info_target.is_some_and(|target| self.targets.contains(target));
                 // Resume first, then detach (the detach is queued when the session is marked).
-                if extension
+                if hostile
                     && let Some(session) = session
                     && params.get("waitingForDebugger") == Some(&Value::Bool(true))
                 {
@@ -353,9 +406,11 @@ impl ExtensionCdpFilter {
                     let parent = message.get("sessionId").and_then(Value::as_str);
                     self.track_session(session, target, parent);
                 }
-                if extension {
+                if hostile {
                     match (info_target, session) {
-                        (Some(target), _) => self.mark_extension_target(target),
+                        (Some(target), _) => {
+                            self.mark_hostile_target(target, kind.unwrap_or(Hostile::Internal));
+                        }
                         (None, Some(session)) => {
                             let parent = message.get("sessionId").and_then(Value::as_str);
                             self.deny_session(session, parent);
@@ -367,10 +422,10 @@ impl ExtensionCdpFilter {
             }
             "Target.targetCreated" | "Target.targetInfoChanged" => {
                 if let Some(info) = target_info
-                    && self.is_extension_target(info)
+                    && let Some(kind) = self.hostile_kind(info)
                 {
                     if let Some(target) = info_target {
-                        self.mark_extension_target(target);
+                        self.mark_hostile_target(target, kind);
                     }
                     return Inbound::Drop;
                 }
@@ -404,9 +459,14 @@ impl ExtensionCdpFilter {
         Inbound::Deliver(raw.to_string())
     }
 
-    /// `target` is an extension target: remember it, and refuse and detach every session on it.
-    fn mark_extension_target(&mut self, target: &str) {
-        self.remember_extension_target(target);
+    /// `target` is a hostile target: remember it, and refuse and detach every session on it.
+    fn mark_hostile_target(&mut self, target: &str, kind: Hostile) {
+        self.remember_hostile_target(target, kind);
+        self.refuse_target_sessions(target);
+    }
+
+    /// Refuse and detach every live session on `target`.
+    fn refuse_target_sessions(&mut self, target: &str) {
         let sessions: Vec<(String, Option<String>)> = self
             .sessions
             .iter()
@@ -420,12 +480,17 @@ impl ExtensionCdpFilter {
         }
     }
 
-    /// Remember `target` as an extension target. Logged at debug level (the target ID is not a
-    /// secret: the filter refuses every command that names it, and the E2E harness reads it here
-    /// to attack it).
-    fn remember_extension_target(&mut self, target: &str) {
+    /// Remember `target` as hostile. Logged at debug level (the target ID is not a secret: the
+    /// filter refuses every command that names it). The `hid extension target` line is only for
+    /// the extension's own targets: the E2E harness reads the worker's ID from the first one.
+    fn remember_hostile_target(&mut self, target: &str, kind: Hostile) {
         if !self.targets.contains(target) {
-            log::debug!("cdp filter: hid extension target {target}");
+            match kind {
+                Hostile::Extension => log::debug!("cdp filter: hid extension target {target}"),
+                Hostile::Internal => {
+                    log::debug!("cdp filter: hid browser-internal target {target}");
+                }
+            }
         }
         self.targets.insert(target);
     }
@@ -460,7 +525,7 @@ impl ExtensionCdpFilter {
             },
         );
         if self.targets.contains(target) {
-            self.mark_extension_target(target);
+            self.refuse_target_sessions(target);
         }
     }
 
@@ -499,7 +564,7 @@ impl ExtensionCdpFilter {
         }
     }
 
-    /// Hide extension targets in any response: `targetInfos` lose them and a `targetInfo` of one
+    /// Hide hostile targets in any response: `targetInfos` lose them and a `targetInfo` of one
     /// becomes an error. True when the message changed. Applied to every response, whatever
     /// command it answers, so no bookkeeping can be outrun.
     fn rewrite_response(&mut self, message: &mut Value) -> bool {
@@ -509,23 +574,23 @@ impl ExtensionCdpFilter {
             .pointer_mut("/result/targetInfos")
             .and_then(Value::as_array_mut)
         {
-            let extension_id = self.extension_id.clone();
+            let extension_id = self.extension_id.as_str();
             infos.retain(|info| {
-                let extension = target_info_is_extension(info, &extension_id);
-                if extension && let Some(target) = info.get("targetId").and_then(Value::as_str) {
-                    hidden.push(target.to_string());
+                let Some(kind) = classify_target(info, extension_id) else {
+                    return true;
+                };
+                if let Some(target) = info.get("targetId").and_then(Value::as_str) {
+                    hidden.push((target.to_string(), kind));
                 }
-                if extension {
-                    changed = true;
-                }
-                !extension
+                changed = true;
+                false
             });
         }
         if let Some(info) = message.pointer("/result/targetInfo")
-            && self.is_extension_target(info)
+            && let Some(kind) = self.hostile_kind(info)
         {
             if let Some(target) = info.get("targetId").and_then(Value::as_str) {
-                hidden.push(target.to_string());
+                hidden.push((target.to_string(), kind));
             }
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             *message = json!({
@@ -534,8 +599,8 @@ impl ExtensionCdpFilter {
             });
             changed = true;
         }
-        for target in &hidden {
-            self.mark_extension_target(target);
+        for (target, kind) in hidden {
+            self.mark_hostile_target(&target, kind);
         }
         changed
     }
@@ -559,8 +624,8 @@ impl ExtensionCdpFilter {
         (id, command.to_string())
     }
 
-    fn is_extension_target(&self, info: &Value) -> bool {
-        target_info_is_extension(info, &self.extension_id)
+    fn hostile_kind(&self, info: &Value) -> Option<Hostile> {
+        classify_target(info, &self.extension_id)
     }
 
     /// Why `params` may not be forwarded, if a string in it names an extension or a
@@ -576,6 +641,7 @@ impl ExtensionCdpFilter {
                 found = Some("the request names an extension");
             } else if INTERNAL_SCHEMES
                 .iter()
+                .chain(REQUEST_ONLY_SCHEMES)
                 .any(|scheme| names_scheme(&text, scheme))
                 || names_internal_about_page(&text)
             {
@@ -586,10 +652,42 @@ impl ExtensionCdpFilter {
     }
 }
 
-fn target_info_is_extension(info: &Value, extension_id: &str) -> bool {
-    info.get("url")
+/// Why the target `info` (a `TargetInfo`) must be hidden from the agent, if it must: it is the
+/// extension's (its URL holds the extension ID), its `type` is browser chrome
+/// ([`HOSTILE_TARGET_TYPES`]) or its URL is internal ([`url_is_internal`]).
+fn classify_target(info: &Value, extension_id: &str) -> Option<Hostile> {
+    let url = info.get("url").and_then(Value::as_str);
+    if url.is_some_and(|url| normalize(url).contains(extension_id)) {
+        return Some(Hostile::Extension);
+    }
+    let hostile_type = info
+        .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|url| normalize(url).contains(extension_id))
+        .is_some_and(|kind| {
+            HOSTILE_TARGET_TYPES
+                .iter()
+                .any(|hostile| kind.eq_ignore_ascii_case(hostile))
+        });
+    (hostile_type || url.is_some_and(url_is_internal)).then_some(Hostile::Internal)
+}
+
+/// A target URL on an internal scheme ([`INTERNAL_SCHEMES`], any `chrome-extension:` page, `about:`
+/// other than `about:blank` and `about:srcdoc`), also behind `view-source:`. Normalized as the
+/// request strings are, and read as a URL parser does: leading control characters and spaces are
+/// skipped. `chrome-error:` is not internal (see [`INTERNAL_SCHEMES`]).
+fn url_is_internal(url: &str) -> bool {
+    let normalized = normalize(url);
+    let mut url = normalized.trim_start_matches(|c: char| c <= ' ');
+    while let Some(rest) = url.strip_prefix("view-source:") {
+        url = rest.trim_start_matches(|c: char| c <= ' ');
+    }
+    INTERNAL_SCHEMES
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
+        || url.starts_with("chrome-extension:")
+        || url
+            .strip_prefix("about:")
+            .is_some_and(about_page_is_internal)
 }
 
 /// Every string in `value`, object keys included. A string that is itself a JSON object or
@@ -648,15 +746,18 @@ fn names_scheme(text: &str, scheme: &str) -> bool {
 /// An `about:` URL other than `about:blank` and `about:srcdoc` (Chromium maps the others, such as
 /// `about:inspect` and `about:extensions`, to `chrome://` pages).
 fn names_internal_about_page(text: &str) -> bool {
-    text.match_indices("about:").any(|(at, scheme)| {
-        let rest = text.get(at + scheme.len()..).unwrap_or("");
-        let rest = rest.trim_start_matches(['/', '\\']);
-        let page: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        !page.is_empty() && page != "blank" && page != "srcdoc"
-    })
+    text.match_indices("about:")
+        .any(|(at, scheme)| about_page_is_internal(text.get(at + scheme.len()..).unwrap_or("")))
+}
+
+/// `rest` follows `about:`: a page other than `blank` and `srcdoc`.
+fn about_page_is_internal(rest: &str) -> bool {
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let page: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    !page.is_empty() && page != "blank" && page != "srcdoc"
 }
 
 /// What a URL parser and a script would do before a scheme or a host is compared: ASCII tabs and
@@ -1159,6 +1260,231 @@ mod tests {
         assert_eq!(f.inbound(&page_event), Inbound::Deliver(page_event.clone()));
         let response = json!({"id": 10, "result": {"frameId": "F"}}).to_string();
         assert_eq!(f.inbound(&response), Inbound::Deliver(response.clone()));
+    }
+
+    fn browser_ui_info(target: &str) -> Value {
+        json!({"targetId": target, "type": "browser_ui", "title": "", "url": "chrome://tab-strip/",
+               "attached": false, "canAccessOpener": false})
+    }
+
+    fn devtools_info(target: &str) -> Value {
+        json!({"targetId": target, "type": "page", "title": "DevTools",
+               "url": "devtools://devtools/bundled/devtools_app.html?remoteBase=x",
+               "attached": false, "canAccessOpener": false})
+    }
+
+    fn attach_request(target: &str) -> Value {
+        json!({"id": 8, "method": "Target.attachToTarget",
+               "params": {"targetId": target, "flatten": true}})
+    }
+
+    #[test]
+    fn browser_ui_and_devtools_targets_are_hidden_from_lists_and_refused_on_attach() {
+        let mut f = filter();
+        let response = json!({"id": 7, "result": {"targetInfos": [
+            page_info("P"), browser_ui_info("UI"), devtools_info("DT"),
+            json!({"targetId": "B", "type": "browser", "title": "", "url": "",
+                   "attached": true, "canAccessOpener": false}),
+            json!({"targetId": "BG", "type": "background_page", "title": "",
+                   "url": "https://rp.test/_generated_background_page.html"}),
+            json!({"targetId": "A", "type": "app", "title": "", "url": "https://rp.test/"}),
+            json!({"targetId": "WV", "type": "webview", "title": "", "url": "https://rp.test/"}),
+            json!({"targetId": "VS", "type": "page", "title": "",
+                   "url": "view-source:chrome://extensions"}),
+            json!({"targetId": "ABOUT", "type": "page", "title": "", "url": "about:inspect"}),
+            json!({"targetId": "OTHER", "type": "chrome-extension", "title": "",
+                   "url": "chrome-extension://someotherextensionidxxxxxxxxxxxx/page.html"}),
+            json!({"targetId": "BLANK", "type": "page", "title": "", "url": "about:blank"}),
+            json!({"targetId": "SRCDOC", "type": "iframe", "title": "", "url": "about:srcdoc"}),
+        ]}});
+        let Inbound::Deliver(delivered) = f.inbound(&response.to_string()) else {
+            panic!("the response was dropped");
+        };
+        let delivered = parse(&delivered);
+        let visible: Vec<&str> = delivered["result"]["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|info| info["targetId"].as_str().unwrap())
+            .collect();
+        assert_eq!(visible, ["P", "BLANK", "SRCDOC"]);
+        // Every hidden target is refused on attach, by ID, without any lookup.
+        for hidden in ["UI", "DT", "B", "BG", "A", "WV", "VS", "ABOUT", "OTHER"] {
+            assert!(denied(&f, attach_request(hidden)), "{hidden}");
+        }
+        assert_eq!(
+            f.check_request(&attach_request("P")),
+            RequestVerdict::LookupTargets(vec!["P".to_string()])
+        );
+
+        // A target the filter never listed is refused after the per-command lookup.
+        let mut f = filter();
+        for (target, info) in [
+            ("UI2", browser_ui_info("UI2")),
+            ("DT2", devtools_info("DT2")),
+        ] {
+            let RequestVerdict::LookupTargets(targets) = f.check_request(&attach_request(target))
+            else {
+                panic!("an unknown target is looked up");
+            };
+            assert_eq!(targets, [target]);
+            let (id, _) = f.lookup_command(target);
+            assert!(f.lookup_result(target, &json!({"id": id, "result": {"targetInfo": info}})));
+            assert!(denied(&f, attach_request(target)), "{target}");
+        }
+        // `Target.getTargetInfo` of one is an error.
+        let info = json!({"id": 9, "result": {"targetInfo": devtools_info("DT3")}});
+        let Inbound::Deliver(delivered) = f.inbound(&info.to_string()) else {
+            panic!("dropped");
+        };
+        assert!(parse(&delivered)["error"].is_object());
+
+        // An auto-attach, a target event and a changed target are hidden and detached as well.
+        for (session, info) in [("S1", browser_ui_info("UI4")), ("S2", devtools_info("DT4"))] {
+            let attached = json!({"method": "Target.attachedToTarget", "params": {
+                "sessionId": session, "targetInfo": info, "waitingForDebugger": false}});
+            assert_eq!(f.inbound(&attached.to_string()), Inbound::Drop);
+            let commands: Vec<Value> = f.take_commands().iter().map(|c| parse(c)).collect();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["method"], "Target.detachFromTarget");
+            assert_eq!(commands[0]["params"]["sessionId"], session);
+        }
+        for event in [
+            json!({"method": "Target.targetCreated", "params": {"targetInfo": devtools_info("DT5")}}),
+            json!({"method": "Target.targetInfoChanged",
+                   "params": {"targetInfo": browser_ui_info("UI5")}}),
+        ] {
+            assert_eq!(f.inbound(&event.to_string()), Inbound::Drop, "{event}");
+        }
+    }
+
+    #[test]
+    fn a_page_that_changes_its_url_to_an_internal_page_is_refused_and_detached() {
+        let mut f = filter_with_page_session();
+        let mut changed = page_info("P");
+        changed["url"] = Value::String("chrome://extensions".to_string());
+        let event =
+            json!({"method": "Target.targetInfoChanged", "params": {"targetInfo": changed}});
+        assert_eq!(f.inbound(&event.to_string()), Inbound::Drop);
+        let commands: Vec<Value> = f.take_commands().iter().map(|c| parse(c)).collect();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["method"], "Target.detachFromTarget");
+        assert_eq!(commands[0]["params"]["sessionId"], "S");
+        assert!(denied(
+            &f,
+            json!({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "1"},
+                   "sessionId": "S"})
+        ));
+        assert!(denied(&f, attach_request("P")));
+
+        // The same through the per-command lookup, with no event.
+        let mut f = filter_with_page_session();
+        let (id, _) = f.lookup_command("P");
+        assert!(f.lookup_result("P", &json!({"id": id, "result": {"targetInfo": changed}})));
+        assert_eq!(f.take_commands().len(), 1, "the session is detached");
+    }
+
+    #[test]
+    fn a_page_showing_the_chrome_error_page_is_not_detached() {
+        // Chromium reports `chrome-error://chromewebdata/` as the URL of a page whose navigation
+        // failed. The agent retries on that page, so it stays attached and visible.
+        let mut f = filter_with_page_session();
+        let mut failed = page_info("P");
+        failed["url"] = Value::String("chrome-error://chromewebdata/".to_string());
+        let event = json!({"method": "Target.targetInfoChanged", "params": {"targetInfo": failed}})
+            .to_string();
+        assert_eq!(f.inbound(&event), Inbound::Deliver(event.clone()));
+        assert!(f.take_commands().is_empty(), "nothing is detached");
+        let request = json!({"id": 1, "method": "Page.navigate",
+                             "params": {"url": "https://rp.test/"}, "sessionId": "S"});
+        assert_eq!(
+            f.check_request(&request),
+            RequestVerdict::LookupTargets(vec!["P".to_string()])
+        );
+        let (id, _) = f.lookup_command("P");
+        assert!(!f.lookup_result("P", &json!({"id": id, "result": {"targetInfo": failed}})));
+        let list = json!({"id": 2, "result": {"targetInfos": [failed]}}).to_string();
+        assert_eq!(f.inbound(&list), Inbound::Deliver(list.clone()));
+        assert!(f.take_commands().is_empty());
+        // A request that names a chrome-error URL is still refused.
+        assert!(denied(
+            &f,
+            json!({"id": 3, "method": "Page.navigate",
+                   "params": {"url": "chrome-error://chromewebdata/"}})
+        ));
+    }
+
+    #[test]
+    fn methods_that_open_privileged_ui_or_targets_are_denied() {
+        let f = filter();
+        for method in [
+            "Target.openDevTools",
+            "Target.setRemoteLocations",
+            "Browser.executeBrowserCommand",
+        ] {
+            assert!(
+                denied(
+                    &f,
+                    json!({"id": 1, "method": method, "params": {"targetId": "P"}})
+                ),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_targets_are_classified_by_why_they_are_hostile() {
+        let mut f = filter();
+        for (target, kind) in [("W", Hostile::Extension), ("UI", Hostile::Internal)] {
+            assert!(!f.targets.contains(target));
+            f.remember_hostile_target(target, kind);
+            assert!(f.targets.contains(target));
+        }
+        assert_eq!(
+            classify_target(&worker_info("W"), ID),
+            Some(Hostile::Extension)
+        );
+        assert_eq!(
+            classify_target(&browser_ui_info("UI"), ID),
+            Some(Hostile::Internal)
+        );
+        assert_eq!(classify_target(&page_info("P"), ID), None);
+    }
+
+    #[test]
+    fn internal_target_urls_are_read_as_a_url_parser_would() {
+        for url in [
+            "chrome://extensions",
+            "CHROME://extensions",
+            "  chrome://extensions",
+            "chrome:extensions",
+            "chrome-untrusted://print/",
+            "chrome-search://local-ntp/",
+            "devtools://devtools/bundled/inspector.html",
+            "chrome-devtools://devtools/bundled/inspector.html",
+            "view-source:chrome://extensions",
+            "view-source:view-source:devtools://x",
+            "about:inspect",
+            "about://extensions",
+            "chro\tme://extensions",
+            "\\u0063hrome://extensions",
+            "chrome-extension://someotherextensionidxxxxxxxxxxxx/",
+        ] {
+            assert!(url_is_internal(url), "{url}");
+        }
+        for url in [
+            "",
+            "https://rp.test/",
+            "https://rp.test/?next=chrome://extensions",
+            "about:blank",
+            "about:blank#top",
+            "about:srcdoc",
+            "view-source:https://rp.test/",
+            "chrome-error://chromewebdata/",
+            "data:text/html,chrome://extensions",
+        ] {
+            assert!(!url_is_internal(url), "{url}");
+        }
     }
 
     #[test]

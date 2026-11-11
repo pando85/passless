@@ -24,7 +24,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json;
 
-use super::cdp_filter::{ExtensionCdpFilter, Inbound, RequestVerdict};
+use super::cdp_filter::{ExtensionCdpFilter, Inbound, RequestVerdict, TARGET_DENIED};
 use super::containment::{ContainmentPlan, ContainmentPolicy, refuse_if_hidraw_accessible};
 use super::launcher::{
     DEFAULT_RLIMIT_CORE, HardenedChildSetup, bind_parent_death, cloexec_except,
@@ -2042,15 +2042,14 @@ impl BrowserProcessManager {
                 RequestVerdict::LookupTargets(targets) => targets,
             };
             for target in lookups {
-                let extension = lookup_extension_target(entry, &target, deadline)?;
-                // A target found to be the extension's has its sessions detached now.
+                let hostile = lookup_hostile_target(entry, &target, deadline)?;
+                // A target found to be hostile (the extension's or a browser-internal one) has
+                // its sessions detached now.
                 for command in entry.cdp_filter.take_commands() {
                     write_cdp_frame(entry, &command)?;
                 }
-                if extension {
-                    return Err(CdpError::Denied(
-                        "the target is the Passless extension".to_string(),
-                    ));
+                if hostile {
+                    return Err(CdpError::Denied(TARGET_DENIED.to_string()));
                 }
             }
             entry.cdp_filter.note_forwarded(&request);
@@ -3723,10 +3722,11 @@ fn read_cdp_message(
     }
 }
 
-/// Ask the browser what `target` is before an agent command that names it is forwarded. Messages
+/// Ask the browser what `target` is before an agent command that names it is forwarded; true when
+/// it is hostile (the extension's or a browser-internal target). Messages
 /// read meanwhile are kept for the agent (they pass the filter when delivered). Fails closed: a
 /// lookup without an answer by `deadline` refuses the command.
-fn lookup_extension_target(
+fn lookup_hostile_target(
     entry: &mut BrowserLease,
     target: &str,
     deadline: Instant,
