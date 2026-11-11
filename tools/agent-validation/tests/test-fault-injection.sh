@@ -262,7 +262,27 @@ test_process_kill_check_cleans_up() {
     if [[ "$status" == "pass" ]]; then
         log_pass "process kill check passed"
     else
-        log_pass "process kill check completed (status=$status)"
+        log_fail "process kill check did not pass (status=$status result=$result)"
+    fi
+}
+
+test_process_kill_check_is_race_free() {
+    log_test "process kill check is deterministic with an EXIT trap installed (spawn/SIGTERM race)"
+    setup_env
+    local status result failures=0
+    # This script already has an EXIT trap, which makes bash catch SIGTERM and
+    # is what exposed the original fork-before-exec race.
+    for _ in $(seq 1 25); do
+        result=$(av_run_process_kill_check "$EVIDENCE_DIR" 10) || true
+        status=$(printf '%s' "$result" | jq -r '.status' 2>/dev/null || echo "unknown")
+        if [[ "$status" != "pass" ]]; then
+            ((failures++)) || true
+        fi
+    done
+    if [[ $failures -eq 0 ]]; then
+        log_pass "25/25 process kill checks passed"
+    else
+        log_fail "$failures/25 process kill checks failed"
     fi
 }
 
@@ -317,6 +337,7 @@ main() {
     test_fault_category_includes_circuit_breaker
     test_resource_ceiling_check_cleans_up
     test_process_kill_check_cleans_up
+    test_process_kill_check_is_race_free
     test_fault_wired_in_run_sh
     test_fault_no_skip_stage_in_tier1
     test_fault_stage_function_exists
