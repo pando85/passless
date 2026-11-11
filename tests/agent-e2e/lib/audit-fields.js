@@ -18,10 +18,12 @@ function constBody(source, name) {
   const open = source.indexOf('= &[', start);
   const close = source.indexOf('\n];', open);
   if (open < 0 || close < 0) throw new Error(`${name} is not a slice literal in ${SOURCE}`);
-  return source.slice(open + 4, close);
+  return stripComments(source.slice(open + 4, close));
 }
 
-const strings = text => [...text.matchAll(/"([^"]+)"/g)].map(m => m[1]);
+// `//` comments are dropped first, so a quoted word in a comment is never taken for a field.
+const stripComments = text => text.replace(/\/\/[^\n]*/g, '');
+const strings = text => [...stripComments(text).matchAll(/"([^"]+)"/g)].map(m => m[1]);
 
 let cache = null;
 

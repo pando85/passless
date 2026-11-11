@@ -690,6 +690,24 @@ After the reservation a failure is the terminal record's `failure_class`, not a 
 `busy` or `error`. The test list `SECTION_12_OPERATION_FIELDS` in `audit_events.rs` is the
 canonical field list that the record types are tested against.
 
+Exceptions and recovery:
+
+- **A killed daemon.** A daemon exit or SIGKILL between a reservation and its terminal record
+  leaves an open reservation. At the next start, before the new run writes anything, the daemon
+  scans the newest two audit segments for `policy.allow` records without an `operation.terminal`
+  of the same `request_id` and closes each with one (`result = error`, `failure_class =
+  abandoned`, the reservation's fields copied). An orphan in an older segment is not recovered; it
+  stays visible as a reservation without a terminal record.
+- **A durable but unacknowledged reservation.** If the frame is written and fsynced but the
+  directory fsync or the anchor update then fails, the gate reports `DurableUnacknowledged` and
+  breaks its circuit. Key use is blocked, the ceremony still owes (and attempts) its terminal
+  record, which the broken circuit will normally refuse, and the next start's recovery closes the
+  reservation. A write that failed before the frame was synced is not a reservation.
+- **A duplicate whose own deadline passes** while it waits for the identical in-flight request is
+  a refusal: `policy.deny` with `failure_class = join_timeout` (`result = timeout`).
+- **Transport-level busy refusals** (the global, per-profile and per-session request caps) are answered before any ceremony
+  exists and write no operation record; they are not audited.
+
 Also recorded: session (grant) request and approval with profile, principal, RP scope and TTL;
 escalations as `requested`, `approved`, `denied`, `expired` and `revoked`; and browser-lease
 creation, expiry, revocation, exit and cleanup. An escalation that ends by timeout or by abort is
@@ -924,7 +942,7 @@ References are `file:line` at commit `130eaa5`.
 | Incognito and CDP-created contexts | The extension is not active in them; requests go native | Planned (P10): `Default/Preferences` seeded with `incognito = true` for the manifest-key extension ID; startup verification fails closed (§4.2) |
 | Native-path containment | A request the extension does not handle can reach the human UHID device | Planned (P2, P6, P10): fail closed; private `/dev` through `bwrap` whenever available, required (launcher refusal) when the browser UID can open hidraw; invariant 25 (§7) |
 | Automatic interaction mode with agents | Not guarded | Planned (P10): agents refuse to start unless `agents.allow_automatic_human_path = true`; `doctor` flags it (§7) |
-| Principal relationship | Used only for browser spawn (`browser.rs:2224`); not in doctor or audit; no shared-UID `isolated` warning | Planned (P9): both axes reported; startup warning (§13) |
+| Principal relationship | **Partly done (P8).** Every operation record carries `principal_relationship` (`shared-uid` or `distinct-uid`, the principal UID against the daemon UID) next to `mode`. Not yet in `passless doctor`; no shared-UID `isolated` warning | Planned (P9): doctor reports both axes; startup warning (§13) |
 | User guides | Describe `confirm`, presets, `registration_allowed` | Planned (P11): rewrite when the code lands |
 | Backend separation | **Done.** `CredentialBackendHandle`, `CredentialNamespace` (`backend.rs:18-73`) | — |
 | Audit before key use | **Done.** Fsynced, hash-chained append (`audit.rs:163-164`, `audit.rs:1258`); allow record gates signing (`sign.rs:1516`) | — |
