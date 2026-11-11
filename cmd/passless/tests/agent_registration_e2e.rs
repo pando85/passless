@@ -4,16 +4,16 @@ mod e2e_tests {
     #[ignore]
     fn test_e2e_registration_via_extension() {
         // E2E flow for registration via browser extension:
-        // 1. Start daemon with agent profile:
-        //    cargo run -- --agent --agent-profile <profile>
-        // 2. Launch browser with extension pointing to daemon endpoint
+        // 1. Start the daemon with an agent profile that has an exact-RP `register = "allow"` rule
+        // 2. Launch the managed browser (`passless agent browser`, or an MCP adapter)
         // 3. Navigate to a WebAuthn registration test page (e.g. webauthn.io)
-        // 4. Trigger navigator.credentials.create() via the extension
-        // 5. Extension sends POST /register to daemon sign server
-        // 6. Daemon checks the lease-bound bearer and the exact-RP `register = "allow"` rule, generates
-        //    the keypair, writes the credential
-        // 7. Extension receives response and returns PublicKeyCredential to RP
-        // 8. Verify the credential is in the profile's backend
+        // 4. Trigger navigator.credentials.create(); the extension's webAuthenticationProxy hands it
+        //    to the daemon over the native-messaging relay
+        // 5. Daemon checks the lease-bound bearer and the rule, generates the keypair, writes the
+        //    credential
+        // 6. Extension completes the request and the page receives a PublicKeyCredential
+        // 7. Verify the credential is in the profile's backend
+        // (automated in tests/agent-e2e, E2E-02 and E2E-27)
     }
 
     #[test]

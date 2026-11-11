@@ -216,8 +216,9 @@ impl std::str::FromStr for BrowserScope {
 /// * `deny`: reject before credential enumeration or key access; never prompts.
 /// * `allow`: authorize autonomously. UP and UV come from validated agent-session evidence; rules
 ///   carry no evidence fields.
-/// * `request`: not authorized yet; the ceremony raises an escalation (P7). Until the escalation
-///   service lands, a `request` decision denies with `escalation_unavailable`.
+/// * `request`: not authorized yet; the ceremony raises an escalation (ADR 0014 section 8): a
+///   notification asks the operator, and approval persists a granted rule. Without a usable
+///   notification server the request is denied with `escalation_unavailable`.
 ///
 /// A missing action denies.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

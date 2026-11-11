@@ -389,8 +389,8 @@ fn cleanup_all_shared_for_profile(
 /// The wire form of a rule action. `allow` always uses agent evidence (ADR 0014 section 7), and
 /// `deny` and `request` set no UP or UV at all.
 ///
-/// The `user_presence` / `user_verification` wire fields remain for client compatibility until P8/P9
-/// reshape the authority report.
+/// The `user_presence` / `user_verification` wire fields remain in the authority report for client
+/// compatibility; they only ever say `agent` or `none`.
 fn authority_ceremony(action: passless_core::agent::RuleAction) -> AuthorityCeremony {
     let evidence = if action == passless_core::agent::RuleAction::Allow {
         "agent"
@@ -2492,7 +2492,7 @@ impl AgentRuntime {
     ) -> Result<PrincipalResponse, ProtocolError> {
         Err(ProtocolError::new(
             ErrorCode::Forbidden,
-            "request delegation is not supported; delegated mode has been removed",
+            "request delegation is not supported; the delegated mode was removed (agents sign through the managed browser: see `passless agent mcp --help`)",
             RecommendedAction::FixRequest,
         ))
     }
@@ -4033,7 +4033,7 @@ impl AgentRuntime {
                 drop(eid_guard);
                 let eid = passless_core::agent::EndpointId::new();
                 info!(
-                    "Profile '{}' using human-shared endpoint (no agent UHID device): {}",
+                    "Profile '{}' endpoint id (agents have no UHID device): {}",
                     profile_id.as_str(),
                     eid.as_str()
                 );
@@ -4786,7 +4786,7 @@ impl PrincipalHandler for AgentRuntime {
             ),
             PrincipalRequest::SignAssertion(_req) => Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                "sign assertions are not available; delegated mode has been removed",
+                "sign assertions are not available; the delegated mode was removed (agents sign through the managed browser: see `passless agent mcp --help`)",
                 RecommendedAction::FixRequest,
             )),
         }
