@@ -11,7 +11,173 @@ use super::grant::{CeremonyId, GrantRequestId};
 use super::granted_rules::{GrantKind, PermittingRule};
 use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 2;
+/// The audit event schema version, written as `v` in every record.
+///
+/// - 1: the original records.
+/// - 2: `policy.*` records carry the origin context (`origin`, `top_origin`, `cross_origin`).
+/// - 3 (ADR 0014 section 12, P8): every operation record (`policy.allow`, `policy.deny`,
+///   `policy.replay_served`, `operation.terminal`) carries the full field set of
+///   [`OperationRecord`], with every key always present (null when it does not apply yet); a
+///   reservation (`policy.allow`) is followed by exactly one `operation.terminal`; escalation
+///   records carry `origin` and `rule`; `rule` is the matched rule everywhere (`exact` or `*`, as in
+///   the granted-rules store), with `grant_source` on operation records; session grant records
+///   carry `principal`, the RP scope and the TTL.
+///
+/// Readers accept every version: fields added in a later version default when absent.
+pub const AUDIT_SCHEMA_VERSION: u32 = 3;
+
+/// ADR 0014 section 12: the fields every operation record carries. This is the single canonical
+/// list: `OperationRecord` serializes exactly these keys, and the field-presence tests check
+/// every operation record type against it.
+#[cfg(test)]
+const SECTION_12_OPERATION_FIELDS: &[&str] = &[
+    "session_id_hash",
+    "request_id",
+    "escalation_id",
+    "profile_id",
+    "mode",
+    "principal_relationship",
+    "revocation_epoch",
+    "grant_epoch",
+    "action",
+    "rp_id",
+    "origin",
+    "top_origin",
+    "cross_origin",
+    "rule",
+    "grant_source",
+    "decision",
+    "evidence_source",
+    "credential_ref",
+    "selection_rule",
+    "backend",
+    "key_provider",
+    "counter_before",
+    "counter_after",
+    "result",
+    "failure_class",
+];
+
+/// The record kinds that carry [`SECTION_12_OPERATION_FIELDS`].
+#[cfg(test)]
+const SECTION_12_OPERATION_KINDS: &[&str] = &[
+    "policy.allow",
+    "policy.deny",
+    "policy.replay_served",
+    "operation.terminal",
+];
+
+/// The kind-specific fields of the operation records, besides the common set.
+#[cfg(test)]
+const SECTION_12_OPERATION_EXTRAS: &[(&str, &[&str])] = &[
+    (
+        "policy.allow",
+        &["authorization", "user_presence", "user_verification"],
+    ),
+    ("policy.deny", &["reason"]),
+    ("policy.replay_served", &["reason"]),
+    ("operation.terminal", &[]),
+];
+
+/// ADR 0014 section 12, "also recorded": the fields of the escalation, session grant and
+/// browser-lease records, per kind. The kind-specific outcome fields (`latency_ms`, `cause`,
+/// `reason`) are listed too, so a field added to a record without being listed here fails.
+#[cfg(test)]
+const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "escalation.requested",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+        ],
+    ),
+    (
+        "escalation.approved",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "latency_ms",
+        ],
+    ),
+    (
+        "escalation.denied",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "cause",
+        ],
+    ),
+    (
+        "escalation.expired",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "reason",
+        ],
+    ),
+    (
+        "escalation.revoked",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "reason",
+        ],
+    ),
+    (
+        "granted_rule.add",
+        &[
+            "profile_id",
+            "rp_id",
+            "grant_kind",
+            "escalation_id",
+            "rule",
+            "credential_ref",
+        ],
+    ),
+    ("granted_rule.revoke", &["profile_id", "rp_id", "revoked"]),
+    (
+        "grant.request",
+        &[
+            "request_id",
+            "profile_id",
+            "principal",
+            "rp_ids",
+            "ttl_secs",
+        ],
+    ),
+    (
+        "grant.approve",
+        &["grant_id", "profile_id", "principal", "rp_ids", "ttl_secs"],
+    ),
+    (
+        "browser_lease.launch",
+        &["lease_id", "profile_id", "endpoint_id", "cdp_expose"],
+    ),
+    ("browser_lease.revoke", &["lease_id", "reason"]),
+    ("browser_lease.expire", &["lease_id"]),
+    ("browser_lease.crash", &["lease_id", "exit_code"]),
+    ("browser_lease.cleanup", &["lease_id"]),
+];
 
 // The closed-schema tests apply these deny lists to every constructible event.
 #[cfg(test)]
@@ -196,6 +362,10 @@ pub enum AuditPayload {
     /// section 9). The `reason` is always `replay_served`.
     #[serde(rename = "policy.replay_served")]
     PolicyReplayServed(PolicyDenyMeta),
+    /// The terminal record of an operation reservation (`policy.allow`): exactly one follows
+    /// every reservation, on every exit path (ADR 0014 section 12).
+    #[serde(rename = "operation.terminal")]
+    OperationTerminal(OperationTerminalMeta),
 
     /// A sign-transport connection said hello with a build or relay version that differs from the
     /// daemon's (plan V-L5). Not fatal; recorded once per connection.
@@ -333,6 +503,7 @@ impl AuditPayload {
             Self::PolicyAllow(_) => "policy.allow",
             Self::PolicyDeny(_) => "policy.deny",
             Self::PolicyReplayServed(_) => "policy.replay_served",
+            Self::OperationTerminal(_) => "operation.terminal",
             Self::TransportVersionSkew(_) => "transport.version_skew",
             Self::TransportPeerRefused(_) => "transport.peer_refused",
             Self::CeremonyStart(_) => "ceremony.start",
@@ -694,13 +865,25 @@ pub struct IntentExpireMeta {
 pub struct GrantRequestMeta {
     request_id: String,
     profile_id: ProfileId,
+    /// Hex digest of the principal process the session grant is for.
+    #[serde(default)]
+    principal: String,
+    /// The RP scope of the requested grant.
     rp_ids: Vec<String>,
+    #[serde(default)]
+    ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantApproveMeta {
     grant_id: GrantId,
     profile_id: ProfileId,
+    /// Hex digest of the principal process the session grant is bound to.
+    #[serde(default)]
+    principal: String,
+    /// The RP scope of the approved grant.
+    #[serde(default)]
+    rp_ids: Vec<String>,
     ttl_secs: u64,
 }
 
@@ -728,35 +911,266 @@ pub struct GrantConsumeMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyAllowMeta {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    #[serde(flatten)]
+    op: Box<OperationRecord>,
     authorization: String,
     user_presence: String,
     user_verification: String,
-    #[serde(flatten)]
-    origin: OriginContextMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDenyMeta {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
-    reason: PolicyDenyReason,
     #[serde(flatten)]
-    origin: OriginContextMeta,
+    op: Box<OperationRecord>,
+    reason: PolicyDenyReason,
 }
 
-/// The origin context of a ceremony record (ADR 0014 section 12). `top_origin` is always written,
-/// and is null on the proxy path, where the browser never supplies it (section 11).
+/// The terminal record of a reservation: the common operation fields with the final result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationTerminalMeta {
+    #[serde(flatten)]
+    op: Box<OperationRecord>,
+}
+
+/// Which source granted the matched rule its `allow` (ADR 0014 section 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleGrantSource {
+    /// The configured rule itself decided.
+    Config,
+    /// A persisted granted rule upgraded a configured `request` to `allow` (section 8.4).
+    Granted,
+}
+
+/// How an operation ended (ADR 0014 section 12, "terminal result").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationResult {
+    /// The key was used and the outcome returned.
+    Success,
+    /// A duplicate was served the original outcome; no new key use.
+    ReplayServed,
+    /// Refused by policy, validation or a human decision.
+    Denied,
+    /// The browser cancelled the request.
+    Aborted,
+    /// Authority was revoked, expired or changed before the operation finished.
+    Revoked,
+    /// An escalation expired without a decision.
+    Timeout,
+    /// Refused because a capacity limit was reached.
+    Busy,
+    /// An internal failure: audit, storage, key provider or lease activation.
+    Error,
+}
+
+impl OperationResult {
+    /// The result a failure class implies.
+    pub fn of_failure(failure: PolicyDenyReason) -> Self {
+        use PolicyDenyReason as R;
+        match failure {
+            R::Aborted => Self::Aborted,
+            R::PolicyRevoked
+            | R::GrantRevoked
+            | R::GrantExpired
+            | R::BearerRevoked
+            | R::SessionExpired
+            | R::StaleGeneration => Self::Revoked,
+            R::EscalationExpired => Self::Timeout,
+            R::EscalationBusy | R::EscalationQueueFull | R::EscalationWaiterCap => Self::Busy,
+            R::ReplayServed => Self::ReplayServed,
+            R::AuditFailure
+            | R::CounterPersistenceFailure
+            | R::LeaseActivationFailed
+            | R::SigningFailed
+            | R::KeyGenerationFailed
+            | R::CredentialWriteFailed
+            | R::CredentialUnavailable
+            | R::InternalFailure
+            | R::Abandoned => Self::Error,
+            _ => Self::Denied,
+        }
+    }
+}
+
+/// The fields every operation record carries (ADR 0014 section 12). Every key is always
+/// serialized; a value that does not apply yet (the credential of a refusal, the counter after a
+/// reservation) is null. Records written before schema version 3 deserialize with the new fields
+/// null.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationRecord {
+    /// Hash of the bearer session's random identifier (never the bearer itself).
+    #[serde(default)]
+    session_id_hash: Option<String>,
+    /// The daemon-assigned ID of the ceremony; a reservation and its terminal record share it.
+    #[serde(default)]
+    request_id: Option<String>,
+    /// The escalation the ceremony waited on, if any.
+    #[serde(default)]
+    escalation_id: Option<String>,
+    profile_id: ProfileId,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    principal_relationship: Option<String>,
+    /// The live revocation epoch when the record was written.
+    #[serde(default)]
+    revocation_epoch: Option<u64>,
+    /// The live grant epoch when the record was written.
+    #[serde(default)]
+    grant_epoch: Option<u64>,
+    action: AuditAction,
+    rp_id: String,
+    #[serde(flatten)]
+    origin: OriginContextMeta,
+    /// The matched rule: `exact` (the RP's own rule; `rp_id` names it) or `*` (the wildcard).
+    /// Null when no rule matched or resolution had not happened.
+    #[serde(default)]
+    rule: Option<String>,
+    #[serde(default)]
+    grant_source: Option<RuleGrantSource>,
+    #[serde(default)]
+    decision: Option<PolicyDecision>,
+    /// `agent` when the validated agent session was the UP/UV evidence; null when none was used.
+    #[serde(default)]
+    evidence_source: Option<String>,
+    #[serde(default)]
+    credential_ref: Option<CredentialRef>,
+    #[serde(default)]
+    selection_rule: Option<String>,
+    /// The backend the operation used (`human`, `local`, `pass` or `tpm`).
+    #[serde(default)]
+    backend: Option<String>,
+    /// The key provider type (`software` or `tpm`).
+    #[serde(default)]
+    key_provider: Option<String>,
+    #[serde(default)]
+    counter_before: Option<u32>,
+    #[serde(default)]
+    counter_after: Option<u32>,
+    #[serde(default)]
+    result: Option<OperationResult>,
+    #[serde(default)]
+    failure_class: Option<PolicyDenyReason>,
+}
+
+impl OperationRecord {
+    pub fn new(profile_id: ProfileId, action: AuditAction, rp_id: &str) -> Self {
+        Self {
+            session_id_hash: None,
+            request_id: None,
+            escalation_id: None,
+            profile_id,
+            mode: None,
+            principal_relationship: None,
+            revocation_epoch: None,
+            grant_epoch: None,
+            action,
+            rp_id: rp_id.to_string(),
+            origin: OriginContextMeta::default(),
+            rule: None,
+            grant_source: None,
+            decision: None,
+            evidence_source: None,
+            credential_ref: None,
+            selection_rule: None,
+            backend: None,
+            key_provider: None,
+            counter_before: None,
+            counter_after: None,
+            result: None,
+            failure_class: None,
+        }
+    }
+
+    /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
+    pub fn origin_context(
+        mut self,
+        origin: Option<&str>,
+        top_origin: Option<&str>,
+        cross_origin: Option<bool>,
+    ) -> Self {
+        self.origin = OriginContextMeta::new(origin, top_origin, cross_origin);
+        self
+    }
+
+    pub fn session(mut self, session_id_hash: Option<String>, request_id: Option<String>) -> Self {
+        self.session_id_hash = session_id_hash;
+        self.request_id = request_id;
+        self
+    }
+
+    pub fn escalation(mut self, escalation_id: Option<String>) -> Self {
+        self.escalation_id = escalation_id;
+        self
+    }
+
+    pub fn deployment(
+        mut self,
+        mode: Option<String>,
+        principal_relationship: Option<String>,
+        backend: Option<String>,
+        key_provider: Option<String>,
+    ) -> Self {
+        self.mode = mode;
+        self.principal_relationship = principal_relationship;
+        self.backend = backend;
+        self.key_provider = key_provider;
+        self
+    }
+
+    pub fn epochs(mut self, revocation_epoch: u64, grant_epoch: u64) -> Self {
+        self.revocation_epoch = Some(revocation_epoch);
+        self.grant_epoch = Some(grant_epoch);
+        self
+    }
+
+    pub fn matched(mut self, rule: Option<String>, grant_source: Option<RuleGrantSource>) -> Self {
+        self.rule = rule;
+        self.grant_source = grant_source;
+        self
+    }
+
+    pub fn credential(
+        mut self,
+        credential_ref: Option<CredentialRef>,
+        selection_rule: Option<String>,
+    ) -> Self {
+        self.credential_ref = credential_ref;
+        self.selection_rule = selection_rule;
+        self
+    }
+
+    pub fn counters(mut self, before: Option<u32>, after: Option<u32>) -> Self {
+        self.counter_before = before;
+        self.counter_after = after;
+        self
+    }
+
+    pub fn decision(mut self, decision: PolicyDecision, evidence_source: Option<&str>) -> Self {
+        self.decision = Some(decision);
+        self.evidence_source = evidence_source.map(str::to_string);
+        self
+    }
+
+    /// The final result and its failure class (`None` for a success).
+    pub fn outcome(mut self, result: OperationResult, failure: Option<PolicyDenyReason>) -> Self {
+        self.result = Some(result);
+        self.failure_class = failure;
+        self
+    }
+}
+
+/// The origin context of a ceremony record (ADR 0014 section 12). Every key is always written:
+/// `top_origin` is null on the proxy path, where the browser never supplies it (section 11), and
+/// all three are null in a record about an RP only (a refused request whose origin is unknown).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OriginContextMeta {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     origin: Option<String>,
     #[serde(default)]
     top_origin: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     cross_origin: Option<bool>,
 }
 
@@ -862,6 +1276,20 @@ pub enum PolicyDenyReason {
     /// The browser cancelled the request (`onRequestCanceled`, or its connection closed) before
     /// key use. Nothing was signed or created.
     Aborted,
+    /// The key provider failed to sign, after the reservation.
+    SigningFailed,
+    /// The key provider failed to generate a key, or returned an unusable one, after the
+    /// reservation.
+    KeyGenerationFailed,
+    /// The new credential could not be written to storage, after the reservation.
+    CredentialWriteFailed,
+    /// The selected credential could not be read back from storage.
+    CredentialUnavailable,
+    /// An internal failure after the reservation that no other class names.
+    InternalFailure,
+    /// The ceremony ended without recording an outcome (a panic); the terminal record is written
+    /// by the drop guard.
+    Abandoned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -994,7 +1422,8 @@ pub struct GrantedRuleAddMeta {
     grant_kind: GrantKind,
     /// The approving escalation's ID.
     escalation_id: String,
-    rule: PermittingRule,
+    /// The permitting rule: `exact` or `*`.
+    rule: String,
     /// The credential a registration grant pins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credential_ref: Option<CredentialRef>,
@@ -1044,7 +1473,8 @@ pub struct EscalationRequestedMeta {
     action: AuditAction,
     rp_id: String,
     origin: String,
-    rule: PermittingRule,
+    /// The matched rule: `exact` or `*`.
+    rule: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1053,6 +1483,10 @@ pub struct EscalationApprovedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
     latency_ms: u64,
 }
 
@@ -1062,6 +1496,10 @@ pub struct EscalationDeniedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
     cause: EscalationDenyCause,
 }
 
@@ -1071,6 +1509,10 @@ pub struct EscalationExpiredMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
     reason: EscalationExpireReason,
 }
 
@@ -1080,6 +1522,10 @@ pub struct EscalationRevokedMeta {
     profile_id: ProfileId,
     action: AuditAction,
     rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
     reason: EscalationRevokeReason,
 }
 
@@ -1635,15 +2081,25 @@ impl BrowserControlRequestBuilder {
 pub struct GrantRequestBuilder {
     request_id: String,
     profile_id: ProfileId,
+    principal: String,
     rp_ids: Vec<String>,
+    ttl_secs: u64,
 }
 
 impl GrantRequestBuilder {
-    pub fn new(request_id: &GrantRequestId, profile_id: ProfileId, rp_ids: Vec<String>) -> Self {
+    pub fn new(
+        request_id: &GrantRequestId,
+        profile_id: ProfileId,
+        principal_digest: &[u8; 32],
+        rp_ids: Vec<String>,
+        ttl_secs: u64,
+    ) -> Self {
         Self {
             request_id: request_id.as_str().to_string(),
             profile_id,
+            principal: hex::encode(principal_digest),
             rp_ids,
+            ttl_secs,
         }
     }
 
@@ -1651,7 +2107,9 @@ impl GrantRequestBuilder {
         AuditEvent::new(AuditPayload::GrantRequest(GrantRequestMeta {
             request_id: self.request_id,
             profile_id: self.profile_id,
+            principal: self.principal,
             rp_ids: self.rp_ids,
+            ttl_secs: self.ttl_secs,
         }))
     }
 }
@@ -1659,14 +2117,24 @@ impl GrantRequestBuilder {
 pub struct GrantApproveBuilder {
     grant_id: GrantId,
     profile_id: ProfileId,
+    principal: String,
+    rp_ids: Vec<String>,
     ttl_secs: u64,
 }
 
 impl GrantApproveBuilder {
-    pub fn new(grant_id: GrantId, profile_id: ProfileId, ttl_secs: u64) -> Self {
+    pub fn new(
+        grant_id: GrantId,
+        profile_id: ProfileId,
+        principal_digest: &[u8; 32],
+        rp_ids: Vec<String>,
+        ttl_secs: u64,
+    ) -> Self {
         Self {
             grant_id,
             profile_id,
+            principal: hex::encode(principal_digest),
+            rp_ids,
             ttl_secs,
         }
     }
@@ -1675,6 +2143,8 @@ impl GrantApproveBuilder {
         AuditEvent::new(AuditPayload::GrantApprove(GrantApproveMeta {
             grant_id: self.grant_id,
             profile_id: self.profile_id,
+            principal: self.principal,
+            rp_ids: self.rp_ids,
             ttl_secs: self.ttl_secs,
         }))
     }
@@ -1755,25 +2225,19 @@ impl GrantConsumeBuilder {
 }
 
 pub struct PolicyAllowBuilder {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    op: OperationRecord,
     authorization: String,
     user_presence: String,
     user_verification: String,
-    origin: OriginContextMeta,
 }
 
 impl PolicyAllowBuilder {
     pub fn new(profile_id: ProfileId, action: AuditAction, rp_id: &str) -> Self {
         Self {
-            profile_id,
-            action,
-            rp_id: rp_id.to_string(),
+            op: OperationRecord::new(profile_id, action, rp_id),
             authorization: "confirm".to_string(),
             user_presence: "human".to_string(),
             user_verification: "none".to_string(),
-            origin: OriginContextMeta::default(),
         }
     }
 
@@ -1784,7 +2248,7 @@ impl PolicyAllowBuilder {
         top_origin: Option<&str>,
         cross_origin: Option<bool>,
     ) -> Self {
-        self.origin = OriginContextMeta::new(origin, top_origin, cross_origin);
+        self.op = self.op.origin_context(origin, top_origin, cross_origin);
         self
     }
 
@@ -1800,25 +2264,29 @@ impl PolicyAllowBuilder {
         self
     }
 
+    /// The section 12 operation fields (session, rule, credential, backend, counters and so on).
+    /// The decision is `allow`, and the evidence source `agent` when the agent session supplied
+    /// UP and UV.
+    pub fn operation(mut self, op: OperationRecord) -> Self {
+        self.op = op;
+        self
+    }
+
     pub fn build(self) -> AuditEvent {
+        let evidence =
+            (self.user_presence == "agent" && self.user_verification == "agent").then_some("agent");
         AuditEvent::new(AuditPayload::PolicyAllow(PolicyAllowMeta {
-            profile_id: self.profile_id,
-            action: self.action,
-            rp_id: self.rp_id,
+            op: Box::new(self.op.decision(PolicyDecision::Allow, evidence)),
             authorization: self.authorization,
             user_presence: self.user_presence,
             user_verification: self.user_verification,
-            origin: self.origin,
         }))
     }
 }
 
 pub struct PolicyDenyBuilder {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    op: OperationRecord,
     reason: PolicyDenyReason,
-    origin: OriginContextMeta,
 }
 
 impl PolicyDenyBuilder {
@@ -1829,11 +2297,8 @@ impl PolicyDenyBuilder {
         reason: PolicyDenyReason,
     ) -> Self {
         Self {
-            profile_id,
-            action,
-            rp_id: rp_id.to_string(),
+            op: OperationRecord::new(profile_id, action, rp_id),
             reason,
-            origin: OriginContextMeta::default(),
         }
     }
 
@@ -1844,23 +2309,65 @@ impl PolicyDenyBuilder {
         top_origin: Option<&str>,
         cross_origin: Option<bool>,
     ) -> Self {
-        self.origin = OriginContextMeta::new(origin, top_origin, cross_origin);
+        self.op = self.op.origin_context(origin, top_origin, cross_origin);
+        self
+    }
+
+    /// The section 12 operation fields. The decision, result and failure class are set from the
+    /// reason.
+    pub fn operation(mut self, op: OperationRecord) -> Self {
+        self.op = op;
         self
     }
 
     pub fn build(self) -> AuditEvent {
-        let meta = PolicyDenyMeta {
-            profile_id: self.profile_id,
-            action: self.action,
-            rp_id: self.rp_id,
-            reason: self.reason,
-            origin: self.origin,
+        let replay = self.reason == PolicyDenyReason::ReplayServed;
+        let op = if replay {
+            // Not a refusal: a duplicate served the original outcome.
+            self.op
+                .decision(PolicyDecision::Allow, Some("agent"))
+                .outcome(OperationResult::ReplayServed, None)
+        } else {
+            self.op
+                .decision(PolicyDecision::Deny, None)
+                .outcome(OperationResult::of_failure(self.reason), Some(self.reason))
         };
-        if meta.reason == PolicyDenyReason::ReplayServed {
+        let meta = PolicyDenyMeta {
+            op: Box::new(op),
+            reason: self.reason,
+        };
+        if replay {
             AuditEvent::new(AuditPayload::PolicyReplayServed(meta))
         } else {
             AuditEvent::new(AuditPayload::PolicyDeny(meta))
         }
+    }
+}
+
+/// The terminal record of an operation reservation: the same operation fields as the
+/// reservation, with the final result, the failure class (`None` on success) and the counter
+/// after.
+pub struct OperationTerminalBuilder {
+    op: OperationRecord,
+    failure: Option<PolicyDenyReason>,
+}
+
+impl OperationTerminalBuilder {
+    pub fn new(op: OperationRecord, failure: Option<PolicyDenyReason>) -> Self {
+        Self { op, failure }
+    }
+
+    pub fn build(self) -> AuditEvent {
+        let result = self
+            .failure
+            .map_or(OperationResult::Success, OperationResult::of_failure);
+        AuditEvent::new(AuditPayload::OperationTerminal(OperationTerminalMeta {
+            op: Box::new(
+                self.op
+                    .decision(PolicyDecision::Allow, Some("agent"))
+                    .outcome(result, self.failure),
+            ),
+        }))
     }
 }
 
@@ -2397,7 +2904,7 @@ impl GrantedRuleAddBuilder {
                 rp_id: rp_id.to_string(),
                 grant_kind: kind,
                 escalation_id: escalation_id.to_string(),
-                rule,
+                rule: rule.as_str().to_string(),
                 credential_ref: None,
             },
         }
@@ -2420,17 +2927,24 @@ pub struct EscalationAuditContext {
     pub profile_id: ProfileId,
     pub action: AuditAction,
     pub rp_id: String,
+    /// The origin of the ceremony that raised the escalation.
+    pub origin: String,
+    pub rule: PermittingRule,
 }
 
 impl EscalationAuditContext {
-    pub fn requested(&self, origin: &str, rule: PermittingRule) -> AuditEvent {
+    fn rule_name(&self) -> String {
+        self.rule.as_str().to_string()
+    }
+
+    pub fn requested(&self) -> AuditEvent {
         AuditEvent::new(AuditPayload::EscalationRequested(EscalationRequestedMeta {
             escalation_id: self.escalation_id.clone(),
             profile_id: self.profile_id.clone(),
             action: self.action,
             rp_id: self.rp_id.clone(),
-            origin: origin.to_string(),
-            rule,
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
         }))
     }
 
@@ -2440,6 +2954,8 @@ impl EscalationAuditContext {
             profile_id: self.profile_id.clone(),
             action: self.action,
             rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
             latency_ms,
         }))
     }
@@ -2450,6 +2966,8 @@ impl EscalationAuditContext {
             profile_id: self.profile_id.clone(),
             action: self.action,
             rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
             cause,
         }))
     }
@@ -2460,6 +2978,8 @@ impl EscalationAuditContext {
             profile_id: self.profile_id.clone(),
             action: self.action,
             rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
             reason,
         }))
     }
@@ -2470,6 +2990,8 @@ impl EscalationAuditContext {
             profile_id: self.profile_id.clone(),
             action: self.action,
             rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
             reason,
         }))
     }
@@ -2693,7 +3215,7 @@ impl AdminShutdownRequestBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::*;
 
@@ -2742,7 +3264,27 @@ mod tests {
             profile_id: pid.clone(),
             action: AuditAction::Authenticate,
             rp_id: "example.com".to_string(),
+            origin: "https://example.com".to_string(),
+            rule: PermittingRule::Exact,
         }
+    }
+
+    /// An operation record with every field set.
+    fn full_operation_record(pid: &ProfileId, cred: &CredentialRef) -> OperationRecord {
+        OperationRecord::new(pid.clone(), AuditAction::Authenticate, "example.com")
+            .origin_context(Some("https://example.com"), None, Some(false))
+            .session(Some("ab".repeat(32)), Some("req-1".to_string()))
+            .escalation(Some("esc-1".to_string()))
+            .deployment(
+                Some("same-user".to_string()),
+                Some("shared-uid".to_string()),
+                Some("human".to_string()),
+                Some("software".to_string()),
+            )
+            .epochs(3, 2)
+            .matched(Some("*".to_string()), Some(RuleGrantSource::Granted))
+            .credential(Some(cred.clone()), Some("single".to_string()))
+            .counters(Some(4), Some(5))
     }
 
     fn all_test_events() -> Vec<AuditEvent> {
@@ -2770,7 +3312,9 @@ mod tests {
             PrincipalLaunchBuilder::new(sid.clone(), pid.clone(), 1000).build(),
             PrincipalDenyBuilder::new(sid.clone(), pid.clone(), DenyReason::PolicyDenied).build(),
             PrincipalExitBuilder::new(sid.clone(), pid.clone(), ExitReason::Normal).build(),
-            BrowserLeaseLaunchBuilder::new(lid.clone(), pid.clone(), eid.clone()).build(),
+            BrowserLeaseLaunchBuilder::new(lid.clone(), pid.clone(), eid.clone())
+                .with_cdp_expose("pipe".to_string())
+                .build(),
             BrowserLeaseRevokeBuilder::new(lid.clone(), RevokeReason::AdminRevoked).build(),
             BrowserLeaseExpireBuilder::new(lid.clone()).build(),
             BrowserLeaseCrashBuilder::new(lid.clone(), -11).build(),
@@ -2790,8 +3334,22 @@ mod tests {
             historic_intent_event("intent.claim", &iid, None),
             historic_intent_event("intent.consume", &iid, None),
             historic_intent_event("intent.expire", &iid, None),
-            GrantRequestBuilder::new(&req_id, pid.clone(), vec!["example.com".to_string()]).build(),
-            GrantApproveBuilder::new(gid.clone(), pid.clone(), 300).build(),
+            GrantRequestBuilder::new(
+                &req_id,
+                pid.clone(),
+                &[7u8; 32],
+                vec!["example.com".to_string()],
+                300,
+            )
+            .build(),
+            GrantApproveBuilder::new(
+                gid.clone(),
+                pid.clone(),
+                &[7u8; 32],
+                vec!["example.com".to_string()],
+                300,
+            )
+            .build(),
             GrantRevokeBuilder::new(gid.clone()).build(),
             GrantExpireBuilder::new(gid.clone()).build(),
             GrantClaimBuilder::new(gid.clone(), &cer_id).build(),
@@ -2806,18 +3364,22 @@ mod tests {
             )
             .credential_ref(Some(cred.clone()))
             .build(),
-            escalation_context(&pid).requested("https://example.com", PermittingRule::Exact),
+            escalation_context(&pid).requested(),
             escalation_context(&pid).approved(1500),
             escalation_context(&pid).denied(EscalationDenyCause::User),
             escalation_context(&pid).expired(EscalationExpireReason::Aborted),
             escalation_context(&pid).revoked(EscalationRevokeReason::PolicyReload),
-            PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com").build(),
+            PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com")
+                .evidence_sources("allow", "agent", "agent")
+                .operation(full_operation_record(&pid, &cred))
+                .build(),
             PolicyDenyBuilder::new(
                 pid.clone(),
-                AuditAction::Register,
-                "evil.com",
-                PolicyDenyReason::DefaultDeny,
+                AuditAction::Authenticate,
+                "example.com",
+                PolicyDenyReason::EscalationDenied,
             )
+            .operation(full_operation_record(&pid, &cred))
             .build(),
             PolicyDenyBuilder::new(
                 pid.clone(),
@@ -2825,7 +3387,9 @@ mod tests {
                 "example.com",
                 PolicyDenyReason::ReplayServed,
             )
+            .operation(full_operation_record(&pid, &cred))
             .build(),
+            OperationTerminalBuilder::new(full_operation_record(&pid, &cred), None).build(),
             TransportVersionSkewBuilder::new(pid.clone(), "0.21.0+abc")
                 .reported(Some("0.20.0+def"), None)
                 .build(),
@@ -2982,6 +3546,230 @@ mod tests {
         }
     }
 
+    fn envelope_free_keys(json: &serde_json::Value) -> BTreeSet<String> {
+        json.as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "v" | "ts" | "kind"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn test_schema_version_is_bumped_for_the_section_12_records() {
+        assert_eq!(
+            AUDIT_SCHEMA_VERSION, 3,
+            "operation records changed shape in P8: the version must stay above 2"
+        );
+    }
+
+    #[test]
+    fn test_section_12_field_list_has_no_duplicates() {
+        let unique: BTreeSet<_> = SECTION_12_OPERATION_FIELDS.iter().collect();
+        assert_eq!(unique.len(), SECTION_12_OPERATION_FIELDS.len());
+    }
+
+    #[test]
+    fn test_every_operation_record_carries_exactly_the_canonical_section_12_fields() {
+        let events = all_test_events();
+        for kind in SECTION_12_OPERATION_KINDS {
+            let extras = SECTION_12_OPERATION_EXTRAS
+                .iter()
+                .find(|(extras_kind, _)| extras_kind == kind)
+                .unwrap_or_else(|| panic!("no extras row for {kind}"))
+                .1;
+            let expected: BTreeSet<String> = SECTION_12_OPERATION_FIELDS
+                .iter()
+                .chain(extras)
+                .map(|field| field.to_string())
+                .collect();
+            let samples: Vec<_> = events.iter().filter(|e| e.kind_name() == *kind).collect();
+            assert!(!samples.is_empty(), "no sample record of kind {kind}");
+            for event in samples {
+                let keys = envelope_free_keys(&serde_json::to_value(event).unwrap());
+                let missing: Vec<_> = expected.difference(&keys).collect();
+                let unlisted: Vec<_> = keys.difference(&expected).collect();
+                assert!(
+                    missing.is_empty(),
+                    "{kind} lacks the section 12 field(s) {missing:?}"
+                );
+                assert!(
+                    unlisted.is_empty(),
+                    "{kind} carries field(s) {unlisted:?} that the section 12 list does not name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_other_record_claims_the_operation_fields_without_being_listed() {
+        // A record kind that carries the operation record's fields must be in the kinds list.
+        for event in all_test_events() {
+            let json = serde_json::to_value(&event).unwrap();
+            if json.get("session_id_hash").is_some() {
+                assert!(
+                    SECTION_12_OPERATION_KINDS.contains(&event.kind_name()),
+                    "{} carries operation fields but is not in SECTION_12_OPERATION_KINDS",
+                    event.kind_name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_escalation_session_grant_and_lease_records_carry_exactly_their_listed_fields() {
+        let events = all_test_events();
+        for (kind, fields) in SECTION_12_OTHER_RECORD_FIELDS {
+            let expected: BTreeSet<String> = fields.iter().map(|field| field.to_string()).collect();
+            let event = events
+                .iter()
+                .find(|e| e.kind_name() == *kind)
+                .unwrap_or_else(|| panic!("no sample record of kind {kind}"));
+            let keys = envelope_free_keys(&serde_json::to_value(event).unwrap());
+            let missing: Vec<_> = expected.difference(&keys).collect();
+            let unlisted: Vec<_> = keys.difference(&expected).collect();
+            assert!(
+                missing.is_empty(),
+                "{kind} lacks the section 12 field(s) {missing:?}"
+            );
+            assert!(
+                unlisted.is_empty(),
+                "{kind} carries field(s) {unlisted:?} that the section 12 list does not name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_section_12_lists_cover_every_escalation_kind() {
+        for kind in [
+            "escalation.requested",
+            "escalation.approved",
+            "escalation.denied",
+            "escalation.expired",
+            "escalation.revoked",
+            "granted_rule.add",
+            "granted_rule.revoke",
+        ] {
+            assert!(
+                SECTION_12_OTHER_RECORD_FIELDS
+                    .iter()
+                    .any(|(listed, _)| *listed == kind),
+                "{kind} is not in the section 12 list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_operation_record_values() {
+        let pid = test_profile_id();
+        let cred = test_cred();
+        let terminal = [
+            OperationTerminalBuilder::new(full_operation_record(&pid, &cred), None).build(),
+            OperationTerminalBuilder::new(
+                full_operation_record(&pid, &cred),
+                Some(PolicyDenyReason::SigningFailed),
+            )
+            .build(),
+        ]
+        .map(|event| serde_json::to_value(event).unwrap());
+        assert_eq!(terminal[0]["result"], "success");
+        assert!(terminal[0]["failure_class"].is_null());
+        assert_eq!(terminal[0]["decision"], "allow");
+        assert_eq!(terminal[0]["evidence_source"], "agent");
+        assert_eq!(terminal[0]["counter_before"], 4);
+        assert_eq!(terminal[0]["counter_after"], 5);
+        assert_eq!(terminal[0]["rule"], "*");
+        assert_eq!(terminal[0]["grant_source"], "granted");
+        assert_eq!(terminal[1]["result"], "error");
+        assert_eq!(terminal[1]["failure_class"], "signing_failed");
+    }
+
+    #[test]
+    fn test_failure_classes_map_to_results() {
+        use PolicyDenyReason as R;
+        for (failure, result) in [
+            (R::Aborted, OperationResult::Aborted),
+            (R::PolicyRevoked, OperationResult::Revoked),
+            (R::GrantRevoked, OperationResult::Revoked),
+            (R::BearerRevoked, OperationResult::Revoked),
+            (R::SessionExpired, OperationResult::Revoked),
+            (R::EscalationExpired, OperationResult::Timeout),
+            (R::EscalationQueueFull, OperationResult::Busy),
+            (R::EscalationWaiterCap, OperationResult::Busy),
+            (R::EscalationDenied, OperationResult::Denied),
+            (R::ActionNotAllowed, OperationResult::Denied),
+            (R::OriginInvalid, OperationResult::Denied),
+            (R::SigningFailed, OperationResult::Error),
+            (R::CounterPersistenceFailure, OperationResult::Error),
+            (R::Abandoned, OperationResult::Error),
+        ] {
+            assert_eq!(OperationResult::of_failure(failure), result, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn test_records_of_an_older_schema_still_deserialize() {
+        let old_records = [
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "policy.allow", "profile_id": "test-profile",
+                "action": "authenticate", "rp_id": "example.com", "authorization": "allow",
+                "user_presence": "agent", "user_verification": "agent",
+                "origin": "https://example.com", "top_origin": null, "cross_origin": false
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "policy.deny", "profile_id": "test-profile",
+                "action": "authenticate", "rp_id": "example.com", "reason": "default_deny"
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "escalation.approved", "escalation_id": "esc-1",
+                "profile_id": "test-profile", "action": "authenticate", "rp_id": "example.com",
+                "latency_ms": 5
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "escalation.requested", "escalation_id": "esc-1",
+                "profile_id": "test-profile", "action": "authenticate", "rp_id": "example.com",
+                "origin": "https://example.com", "rule": "exact"
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "grant.request", "request_id": "r",
+                "profile_id": "test-profile", "rp_ids": ["example.com"]
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "grant.approve", "grant_id": test_grant_id(),
+                "profile_id": "test-profile", "ttl_secs": 300
+            }),
+        ];
+        for old in old_records {
+            let kind = old["kind"].as_str().unwrap().to_string();
+            let event: AuditEvent = serde_json::from_value(old)
+                .unwrap_or_else(|e| panic!("a version 2 {kind} record no longer parses: {e}"));
+            assert_eq!(event.schema_version(), 2);
+            assert_eq!(event.kind_name(), kind);
+        }
+    }
+
+    #[test]
+    fn test_escalation_records_name_the_rule_as_exact_or_star() {
+        let pid = test_profile_id();
+        for (rule, name) in [
+            (PermittingRule::Exact, "exact"),
+            (PermittingRule::Wildcard, "*"),
+        ] {
+            let mut context = escalation_context(&pid);
+            context.rule = rule;
+            for event in [
+                context.requested(),
+                context.approved(1),
+                context.denied(EscalationDenyCause::User),
+                context.expired(EscalationExpireReason::Timeout),
+                context.revoked(EscalationRevokeReason::PolicyReload),
+            ] {
+                let json = serde_json::to_value(&event).unwrap();
+                assert_eq!(json["rule"], name, "{}", event.kind_name());
+            }
+        }
+    }
+
     #[test]
     fn test_schema_version_present_in_all_events() {
         for event in all_test_events() {
@@ -3048,12 +3836,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 61);
+        assert_eq!(events.len(), 62);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 61, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 62, "duplicate kind names detected");
     }
 
     #[test]
@@ -3276,6 +4064,7 @@ mod tests {
             "policy.allow",
             "policy.deny",
             "policy.replay_served",
+            "operation.terminal",
             "transport.version_skew",
             "transport.peer_refused",
             "ceremony.start",

@@ -39,6 +39,7 @@ use super::launcher::{
     PrincipalSession, SessionCapability, SpawnConfig, dup_fd_cloexec, spawn_principal,
     verify_process_ancestry,
 };
+use super::operation_audit::AuditDeployment;
 use super::policy_engine::PolicyRuntime;
 use super::prompt::{NotificationPrompter, ProcessSpawner};
 use super::sign::SignContextRegistry;
@@ -418,6 +419,29 @@ impl core::fmt::Debug for ProfileRuntime {
             .field("browser_uid", &self.browser_uid)
             .field("browser_gid", &self.browser_gid)
             .finish_non_exhaustive()
+    }
+}
+
+impl ProfileRuntime {
+    /// What this profile's operation records say about the deployment (ADR 0014 sections 5, 12
+    /// and 13): the identity mode, the principal relationship (the principal's UID against the
+    /// daemon's), the backend and the key provider. A same-user profile reports the shared
+    /// `human` backend: the runtime is not told which storage kind the human backend uses.
+    pub fn audit_deployment(&self) -> AuditDeployment {
+        use passless_core::agent::config::AgentStorageConfig;
+        let backend = match (self.mode, self.profile_config.storage.as_ref()) {
+            (AgentMode::Isolated, Some(AgentStorageConfig::Local { .. })) => "local",
+            (AgentMode::Isolated, Some(AgentStorageConfig::Pass { .. })) => "pass",
+            #[cfg(feature = "tpm")]
+            (AgentMode::Isolated, Some(AgentStorageConfig::Tpm { .. })) => "tpm",
+            _ => "human",
+        };
+        AuditDeployment::new(
+            self.mode,
+            self.uid == self.daemon_uid,
+            backend,
+            &*self.backend.key_provider,
+        )
     }
 }
 
@@ -4153,6 +4177,7 @@ impl AgentRuntime {
             security_config: profile.security_config.clone(),
             operation_lock: profile.backend.operation_lock.clone(),
             escalation: self.escalation.clone(),
+            audit_deployment: profile.audit_deployment(),
         });
 
         // Register the bearer token with the sign registry for registration
@@ -4319,6 +4344,7 @@ impl AgentRuntime {
                                 key_provider: profile.backend.key_provider.clone(),
                                 operation_lock: profile.backend.operation_lock.clone(),
                                 escalation: self.escalation.clone(),
+                                audit_deployment: profile.audit_deployment(),
                             });
                             if let Err(e) = self.sign_registry.register_pending(
                                 bearer_token.clone(),

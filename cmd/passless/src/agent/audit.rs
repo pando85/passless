@@ -2395,7 +2395,14 @@ mod tests {
             DaemonStartBuilder::new(1234, BackendKind::Local).build(),
             ProfileCreateBuilder::new(test_profile_id()).build(),
             CredentialCreateBuilder::new(test_cred(), "example.com").build(),
-            GrantApproveBuilder::new(test_grant_id(), test_profile_id(), 300).build(),
+            GrantApproveBuilder::new(
+                test_grant_id(),
+                test_profile_id(),
+                &[7u8; 32],
+                vec!["example.com".to_string()],
+                300,
+            )
+            .build(),
         ];
         for event in events {
             let receipt = gate.record(event).unwrap();

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use passless_core::agent::protocol::{
@@ -344,6 +345,9 @@ pub struct SessionBinding {
 /// One bearer session, shared by the sign and registration contexts of its bearer.
 pub struct AgentSession {
     binding: SessionBinding,
+    /// A random identifier that exists only to be hashed into audit records
+    /// ([`Self::audit_id_hash`]); it is not the bearer and grants nothing.
+    audit_id: [u8; 16],
     expires_at: Instant,
     grant_id: OnceLock<GrantId>,
     /// The UID the lease's browser (and so its `sign-proxy` relay) runs as. The sign transport
@@ -372,8 +376,11 @@ impl std::fmt::Debug for AgentSession {
 impl AgentSession {
     pub fn new(binding: SessionBinding) -> Arc<Self> {
         let expires_at = Instant::now() + binding.ttl;
+        let mut audit_id = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut audit_id);
         Arc::new(Self {
             binding,
+            audit_id,
             expires_at,
             grant_id: OnceLock::new(),
             browser_uid: OnceLock::new(),
@@ -386,6 +393,15 @@ impl AgentSession {
 
     pub fn profile_id(&self) -> &ProfileId {
         &self.binding.profile_id
+    }
+
+    /// The session's identity in audit records (ADR 0014 section 12): the hex SHA-256 of its random
+    /// identifier. It correlates the records of one bearer session and reveals nothing else.
+    pub fn audit_id_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"passless-agent-session-audit-id");
+        hasher.update(self.audit_id);
+        hex::encode(hasher.finalize())
     }
 
     pub fn principal_digest(&self) -> &[u8; 32] {

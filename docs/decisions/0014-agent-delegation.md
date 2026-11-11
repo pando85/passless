@@ -670,9 +670,25 @@ credential records or browser profile contents.
 
 Each operation record carries at least: session ID hash and request or escalation ID; profile,
 mode, principal relationship and the real revocation and grant epochs; action, RP ID, origin, top
-origin (null on the proxy path) and cross-origin flag; matched rule (`exact`, `*` or `granted`); decision and evidence source (`agent`
-or absent); credential reference and selection rule; backend and key-provider type; counter before
-and after; terminal result and failure class.
+origin (null on the proxy path) and cross-origin flag; matched rule (`exact` or `*`; `rp_id` names an
+exact rule's RP) and the grant source (`config`, or `granted` when a granted rule upgraded a `request`);
+decision and evidence source (`agent` or absent); credential reference and selection rule; backend
+and key-provider type; counter before and after; terminal result and failure class.
+
+Implementation (P8, schema version 3). The operation records are `policy.allow` (the reservation),
+`policy.deny` and `policy.replay_served` (refusals and served duplicates, which hold no
+reservation) and `operation.terminal`. They all carry the same keys, always present and null when
+they do not apply yet: `session_id_hash`, `request_id`, `escalation_id`, `profile_id`, `mode`,
+`principal_relationship`, `revocation_epoch`, `grant_epoch`, `action`, `rp_id`, `origin`,
+`top_origin`, `cross_origin`, `rule`, `grant_source`, `decision`, `evidence_source`,
+`credential_ref`, `selection_rule`, `backend`, `key_provider`, `counter_before`, `counter_after`,
+`result` and `failure_class`. A reservation and its terminal record share `request_id`. Exactly one
+`operation.terminal` follows every `policy.allow`, on every exit path: the ceremony's single exit
+point writes it, and a drop guard writes it (`failure_class = abandoned`) if the ceremony unwinds.
+After the reservation a failure is the terminal record's `failure_class`, not a second
+`policy.deny`. `result` is `success`, `replay_served`, `denied`, `aborted`, `revoked`, `timeout`,
+`busy` or `error`. The test list `SECTION_12_OPERATION_FIELDS` in `audit_events.rs` is the
+canonical field list that the record types are tested against.
 
 Also recorded: session (grant) request and approval with profile, principal, RP scope and TTL;
 escalations as `requested`, `approved`, `denied`, `expired` and `revoked`; and browser-lease
@@ -885,8 +901,8 @@ References are `file:line` at commit `130eaa5`.
 | Isolated UHID route | **Done (P3).** `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, `interaction.rs`, the endpoint wiring in `runtime.rs`, the agent UHID doctor check and the agent udev rule are removed; a legacy `[device]` key is warned about and ignored (R6). `agent/storage.rs` (ceremony-scoped storage views) is removed too. Residue: the `passless-uhid` crate and `tools/agent-uhid-feasibility` (still used by `tools/agent-validation`; P11). The principal intent protocol was removed in P7 | — |
 | Principal digest at signing | **Done (P5).** The session records the principal digest; sign and registration deny `principal_mismatch` when it differs from the session grant's | — |
 | Policy digest | **Done (P4, P7).** Version 5 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits, the browser fields, `max_granted_rules` and the escalation timeout and cooldown; a profile whose rules are all `deny` loads (B4). Granted rules have a separate `grants_digest` (§8.4) | — |
-| Audit content | No session, operation, origin, credential or result in `PolicyAllowMeta` (`audit_events.rs:659-666`); "generation" is an ID length (`runtime.rs:4079`) | Planned (P8): fields of §12, including `top_origin = null` with `cross_origin` |
-| Escalation audit events | **Done (P7).** `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted` or `server_lost`) and `revoked` (`reason = policy_reload`), plus `granted_rule.add` and `granted_rule.revoke`; a failed `requested` write fails the ceremony | Planned (P8): the §12 fields and the schema bump |
+| Audit content | **Done (P8).** Every operation record carries the §12 fields (`OperationRecord`, schema version 3), including `top_origin = null` with `cross_origin`, the matched `rule` (`exact` or `*`) and `grant_source`, the live epochs, `backend`, `key_provider` and the counters; every reservation has exactly one `operation.terminal` record (`operation_audit.rs`). A same-user profile reports `backend = human`: the runtime is not told which storage kind the human backend uses | — |
+| Escalation audit events | **Done (P7, P8).** `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted` or `server_lost`) and `revoked` (`reason = policy_reload`), plus `granted_rule.add` and `granted_rule.revoke`; a failed `requested` write fails the ceremony. P8: every escalation record carries `origin` and `rule`, `grant.request` and `grant.approve` carry `principal`, the RP scope and the TTL, and the schema version is 3 | — |
 | Interception mechanism | **Done (P6).** Worker-only extension on `chrome.webAuthenticationProxy`; no content script; `main.js` and `broker.js` removed; manifest `key` fixes the extension ID; launch waits for the worker's attached `hello` and opens the start URL only then (B2) | — |
 | Origin source and `clientDataJSON` | **Done (P6).** Origin and `sameOriginWithAncestors` from `remoteDesktopClientOverride`, re-parsed by the daemon; the daemon builds `clientDataJSON` and the response JSON; the worker forwards it verbatim (§11) | — |
 | Conditional mediation and UVPAA | **Done (P6).** Unavailable while attached; `onIsUvpaaRequest` answered `false`; passkey autofill unsupported (§11) | — |

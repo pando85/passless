@@ -36,7 +36,14 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    poisoned operation lock (`main.rs::lock_operation`), because it guards no data.
 5. **The audit gate is a terminal leaf.** `AuditGate::record` may be called with any of the locks
    above held. It never acquires a lock outside the audit gate. Inside it, `append_lock` serializes
-   whole records, including segment rotation.
+   whole records, including segment rotation. A ceremony's records go through one
+   `CeremonyAudit` (`operation_audit.rs`, ADR 0014 section 12): a refusal (`policy.deny`) and the
+   reservation (`policy.allow`) are written where the ceremony stands, as before; the terminal
+   record (`operation.terminal`) is written once by the ceremony's exit point
+   (`SignHandler::sign_parked`, `RegisterHandler::register_parked`) after every lock the ceremony
+   took has been released, or by the audit's drop guard if the ceremony unwinds. `CeremonyAudit`
+   adds no lock: its state is a `RefCell` touched only by the ceremony's own thread, and the epochs
+   it records are atomics.
 6. **Key-use gates.** From the pre-key-use re-check to the end of key use (the signature, or the
    credential write), a ceremony holds the read side of its session's gate and of the revocation
    epoch gate. `AgentSession::revoke` and `PolicyRuntime::bump_revocation_epoch` take the write

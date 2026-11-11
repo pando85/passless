@@ -554,6 +554,8 @@ impl GrantRegistry {
         let request_id = GrantRequestId::new();
         let audit_profile_id = params.profile_id.clone();
         let audit_rp_ids = params.rp_ids.clone();
+        let audit_principal = params.principal_digest;
+        let audit_ttl_secs = params.requested_ttl_secs;
         let request = GrantRequest {
             profile_id: params.profile_id,
             session_id: params.session_id,
@@ -571,8 +573,14 @@ impl GrantRegistry {
         self.pending_requests.insert(request_id.clone(), request);
 
         if let Some(ref sink) = self.audit_sink {
-            let event =
-                GrantRequestBuilder::new(&request_id, audit_profile_id, audit_rp_ids).build();
+            let event = GrantRequestBuilder::new(
+                &request_id,
+                audit_profile_id,
+                &audit_principal,
+                audit_rp_ids,
+                audit_ttl_secs,
+            )
+            .build();
             let _ = sink.record(event);
         }
 
@@ -615,6 +623,8 @@ impl GrantRegistry {
         let ttl = clamp_ttl(request.requested_ttl_secs, request.max_ttl_secs);
         let now = self.clock.monotonic_secs();
         let profile_id = request.profile_id.clone();
+        let audit_principal = request.principal_digest;
+        let audit_rp_ids = request.rp_ids.clone();
 
         let grant_id = GrantId::new();
         let grant = Grant {
@@ -640,7 +650,14 @@ impl GrantRegistry {
         }
 
         if let Some(ref sink) = self.audit_sink {
-            let event = GrantApproveBuilder::new(grant_id.clone(), profile_id, ttl).build();
+            let event = GrantApproveBuilder::new(
+                grant_id.clone(),
+                profile_id,
+                &audit_principal,
+                audit_rp_ids,
+                ttl,
+            )
+            .build();
             let _ = sink.record(event);
         }
 

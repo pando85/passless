@@ -16,13 +16,14 @@ use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
-use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::audit_events::{AuditAction, PolicyDenyReason};
 use super::escalation::{
     EscalationOutcome, EscalationRefusal, EscalationRequest, EscalationService, NoPark, ParkHook,
     WaiterSession,
 };
 use super::granted_rules::PermittingRule;
 use super::lock_order::{self, LockLevel, Tracked};
+use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
 use super::policy_engine::PolicyRuntime;
 use super::register::{RegisterContext, RegisterHandler};
 use super::session::{
@@ -912,6 +913,9 @@ pub struct SignHandler {
     pub operation_lock: Arc<Mutex<()>>,
     /// The escalation coordinator a `request` resolution waits on (ADR 0014 section 8).
     pub escalation: Arc<EscalationService>,
+    /// The deployment axes and backend that every operation record of this handler reports
+    /// (ADR 0014 section 12).
+    pub audit_deployment: AuditDeployment,
 }
 
 /// Client extensions an authentication request may name. `appid` is honored by never matching a
@@ -1033,43 +1037,6 @@ pub(crate) fn aborted_error() -> (PolicyDenyReason, ProtocolError) {
     )
 }
 
-/// What a ceremony's audit records carry about its request (ADR 0014 section 12): the RP ID and
-/// the origin context. On the proxy path the browser never supplies a top origin, so it is
-/// recorded as null.
-#[derive(Clone, Copy)]
-pub(crate) struct AuditTarget<'a> {
-    pub rp_id: &'a str,
-    pub origin: Option<&'a str>,
-    pub top_origin: Option<&'a str>,
-    pub cross_origin: Option<bool>,
-}
-
-impl<'a> AuditTarget<'a> {
-    pub fn of_request(
-        rp_id: &'a str,
-        origin: &'a str,
-        top_origin: Option<&'a str>,
-        cross_origin: bool,
-    ) -> Self {
-        Self {
-            rp_id,
-            origin: Some(origin),
-            top_origin,
-            cross_origin: Some(cross_origin),
-        }
-    }
-
-    /// A record about an RP only (a refused request whose origin is not known).
-    pub fn rp_only(rp_id: &'a str) -> Self {
-        Self {
-            rp_id,
-            origin: None,
-            top_origin: None,
-            cross_origin: None,
-        }
-    }
-}
-
 /// The audit reason and error of a refused escalation (nothing was prompted).
 pub(crate) fn escalation_refusal_error(
     refusal: EscalationRefusal,
@@ -1113,6 +1080,8 @@ pub(crate) struct Escalation<'a> {
     pub origin: &'a str,
     /// The configured rule that resolved to `request`.
     pub rule: &'a RuleIdentity,
+    /// The ceremony's audit: told which escalation the ceremony waits on.
+    pub audit: &'a CeremonyAudit,
 }
 
 /// An escalation request that passed the pre-checks (cooldown, grant cap and store, bus, queue,
@@ -1200,6 +1169,7 @@ impl Escalation<'_> {
             .service
             .join_or_create(request)
             .map_err(escalation_refusal_error)?;
+        self.audit.escalation(waiter.escalation_id().as_str());
 
         let now = Instant::now();
         let mut wait_deadline = deadline;
@@ -1274,30 +1244,29 @@ pub(crate) fn decode_challenge(challenge_b64u: &str) -> Result<Vec<u8>, Protocol
 }
 
 impl SignHandler {
-    fn record_policy_deny(
-        &self,
-        ctx: &SignContext,
-        target: &AuditTarget,
-        reason: PolicyDenyReason,
-    ) {
-        let deny_event = PolicyDenyBuilder::new(
-            ctx.profile_id.clone(),
+    /// A new audit for one ceremony of `ctx` (ADR 0014 section 12).
+    fn ceremony_audit(&self, ctx: &SignContext) -> CeremonyAudit {
+        CeremonyAudit::new(
+            &self.audit_gate,
+            &self.policy_runtime,
+            &self.audit_deployment,
+            &ctx.session,
+            &ctx.profile_id,
             AuditAction::Authenticate,
-            target.rp_id,
-            reason,
         )
-        .origin_context(target.origin, target.top_origin, target.cross_origin)
-        .build();
-        let _ = self.audit_gate.record(deny_event);
+    }
+
+    /// A refusal: a `policy.deny` record before the reservation, a noted failure after it.
+    fn record_policy_deny(&self, target: &AuditTarget, reason: PolicyDenyReason) {
+        target.audit.deny(target, reason);
     }
 
     fn deny(
         &self,
-        ctx: &SignContext,
         target: &AuditTarget,
         (reason, error): (PolicyDenyReason, ProtocolError),
     ) -> ProtocolError {
-        self.record_policy_deny(ctx, target, reason);
+        self.record_policy_deny(target, reason);
         error
     }
 
@@ -1310,9 +1279,9 @@ impl SignHandler {
             .map(normalize_rp_id)
             .filter(|rp| passless_core::agent::config::validate_rp_id(rp).is_ok())
             .unwrap_or_else(|| "unknown".to_string());
+        let audit = self.ceremony_audit(ctx);
         self.record_policy_deny(
-            ctx,
-            &AuditTarget::rp_only(&rp_id),
+            &AuditTarget::rp_only(&audit, &rp_id),
             PolicyDenyReason::BearerRevoked,
         );
     }
@@ -1331,7 +1300,6 @@ impl SignHandler {
     fn check_session(&self, ctx: &SignContext, target: &AuditTarget) -> Result<(), ProtocolError> {
         if ctx.session.profile_id() != &ctx.profile_id {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::SessionMismatch,
@@ -1345,7 +1313,7 @@ impl SignHandler {
         }
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))
     }
 
     /// The session grant is active, was issued to this session's principal, and covers `rp_id`.
@@ -1360,7 +1328,6 @@ impl SignHandler {
             .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
             .ok_or_else(|| {
                 self.deny(
-                    ctx,
                     target,
                     (
                         PolicyDenyReason::GrantNotFound,
@@ -1374,7 +1341,6 @@ impl SignHandler {
             })?;
         if grant.is_revoked {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::GrantRevoked,
@@ -1388,7 +1354,6 @@ impl SignHandler {
         }
         if grant.state != super::grant::GrantState::Active {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::GrantExpired,
@@ -1405,7 +1370,6 @@ impl SignHandler {
             || !constant_time_eq(&grant.principal_digest, ctx.session.principal_digest())
         {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::PrincipalMismatch,
@@ -1422,7 +1386,6 @@ impl SignHandler {
             scope_rp == rp_id || (scope_rp == ANY_RP_ID && rp_id != LOCALHOST_RP_ID)
         }) {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::RpIdNotMatch,
@@ -1474,8 +1437,27 @@ impl SignHandler {
         cancelled: &dyn Fn() -> bool,
         park: &mut dyn ParkHook,
     ) -> Result<PrincipalResponse, ProtocolError> {
+        // The audit is the ceremony's single exit point: whatever way `sign_audited` ends, the
+        // reservation it may have made is closed by exactly one terminal record (a panic is
+        // covered by the audit's drop guard).
+        let audit = self.ceremony_audit(ctx);
+        let outcome = self.sign_audited(ctx, req, deadline, cancelled, park, &audit);
+        audit.conclude(&outcome);
+        outcome
+    }
+
+    fn sign_audited(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+        audit: &CeremonyAudit,
+    ) -> Result<PrincipalResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
         let target = AuditTarget::of_request(
+            audit,
             &normalized_rp,
             &req.origin,
             req.top_origin.as_deref(),
@@ -1507,7 +1489,6 @@ impl SignHandler {
                 )
             };
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     reason,
@@ -1526,10 +1507,10 @@ impl SignHandler {
             &GrantAction::Authenticate,
             &normalized_rp,
         );
+        audit.matched(&matched);
         match matched.action {
             RuleAction::Deny => {
                 return Err(self.deny(
-                    ctx,
                     target,
                     (
                         PolicyDenyReason::ActionNotAllowed,
@@ -1554,7 +1535,6 @@ impl SignHandler {
         // 5. Unsupported options fail with `NotSupportedError` before any budget is claimed.
         if !extensions_supported(&req.extensions, SUPPORTED_GET_EXTENSIONS)? {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::UnsupportedOption,
@@ -1570,7 +1550,7 @@ impl SignHandler {
 
         // The browser already cancelled the request: stop before the replay key is consumed.
         if cancelled() {
-            return Err(self.deny(ctx, target, aborted_error()));
+            return Err(self.deny(target, aborted_error()));
         }
 
         // 6. Replay key, then budget (R1, R4). The budget limit is the live `max_operations`. A
@@ -1593,12 +1573,13 @@ impl SignHandler {
             rp_id: target.rp_id,
             origin: &req.origin,
             rule: &matched.rule,
+            audit,
         };
         let prepared = if matched.action == RuleAction::Request {
             Some(
                 escalation
                     .prepare()
-                    .map_err(|refused| self.deny(ctx, target, refused))?,
+                    .map_err(|refused| self.deny(target, refused))?,
             )
         } else {
             None
@@ -1659,16 +1640,14 @@ impl SignHandler {
                     assertion_outcome(outcome)
                 }
                 // The browser cancelled the duplicate while it waited: audited like any abort.
-                JoinResult::Detached => Err(self.deny(ctx, target, aborted_error())),
+                JoinResult::Detached => Err(self.deny(target, aborted_error())),
                 other => Err(join_failure(other)),
             },
             Claim::Completed(outcome, audit) => {
                 self.serve_duplicate(ctx, target, audit)?;
                 assertion_outcome(outcome)
             }
-            Claim::Rejected(rejection) => {
-                Err(self.deny(ctx, target, claim_rejection_error(rejection)))
-            }
+            Claim::Rejected(rejection) => Err(self.deny(target, claim_rejection_error(rejection))),
         }
     }
 
@@ -1699,7 +1678,7 @@ impl SignHandler {
                     RecommendedAction::Abort,
                 ));
             }
-            Err(denied) => return Err(self.deny(ctx, target, denied)),
+            Err(denied) => return Err(self.deny(target, denied)),
         }
 
         // The approval persisted a grant: the live resolution must now be a granted `allow`.
@@ -1708,7 +1687,6 @@ impl SignHandler {
                 .resolve(&ctx.profile_id, &GrantAction::Authenticate, target.rp_id);
         if approved.action != RuleAction::Allow || !approved.granted {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::PolicyRevoked,
@@ -1726,7 +1704,7 @@ impl SignHandler {
             .unwrap_or(0);
         guard
             .claim_budget(u32::from(max_operations))
-            .map_err(|rejection| self.deny(ctx, target, claim_rejection_error(rejection)))?;
+            .map_err(|rejection| self.deny(target, claim_rejection_error(rejection)))?;
         self.sign_fresh(ctx, req, target, grant, &approved, cancelled, key_used)
     }
 
@@ -1741,9 +1719,9 @@ impl SignHandler {
     ) -> Result<(), ProtocolError> {
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))?;
         if audit {
-            self.record_policy_deny(ctx, target, PolicyDenyReason::ReplayServed);
+            self.record_policy_deny(target, PolicyDenyReason::ReplayServed);
         }
         Ok(())
     }
@@ -1756,7 +1734,6 @@ impl SignHandler {
         activation.activate().map_err(|e| {
             warn!("agent sign: {}", e);
             self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::LeaseActivationFailed,
@@ -1785,6 +1762,8 @@ impl SignHandler {
         key_used: &mut bool,
     ) -> Result<PrincipalResponse, ProtocolError> {
         let normalized_rp = target.rp_id;
+        // The rule that permits this key use (after an escalation: the granted rule).
+        target.audit.matched(matched);
         // `allow` is the only agent evidence: UP and UV come from the validated agent session,
         // never from a rule field or the RP's `userVerification` request (ADR 0014 section 7).
         let up = true;
@@ -1839,7 +1818,7 @@ impl SignHandler {
         let candidates =
             Self::narrow_candidates(candidates, &req.allow_credentials, &matched.selection);
         if candidates.is_empty() && !req.allow_credentials.is_empty() {
-            self.record_policy_deny(ctx, target, PolicyDenyReason::AllowCredentialsMismatch);
+            self.record_policy_deny(target, PolicyDenyReason::AllowCredentialsMismatch);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "allowCredentials does not contain a permitted credential",
@@ -1849,25 +1828,8 @@ impl SignHandler {
 
         let cred_id =
             Self::select_credential(candidates, &matched.selection).inspect_err(|_| {
-                self.record_policy_deny(ctx, target, PolicyDenyReason::CredentialNotMatch);
+                self.record_policy_deny(target, PolicyDenyReason::CredentialNotMatch);
             })?;
-
-        // 8. Durable audit reservation before key use (invariant 16).
-        let allow_event = PolicyAllowBuilder::new(
-            ctx.profile_id.clone(),
-            AuditAction::Authenticate,
-            normalized_rp,
-        )
-        .evidence_sources("allow", "agent", "agent")
-        .origin_context(target.origin, target.top_origin, target.cross_origin)
-        .build();
-        self.audit_gate.record(allow_event).map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "audit record failed",
-                RecommendedAction::Retry,
-            )
-        })?;
 
         let cred = storage.read(&cred_id).map_err(|_| {
             ProtocolError::new(
@@ -1876,8 +1838,19 @@ impl SignHandler {
                 RecommendedAction::FixRequest,
             )
         })?;
+
+        // 8. Durable audit reservation before key use (invariant 16). From here every exit path
+        //    ends in the ceremony's terminal record (`CeremonyAudit::conclude`), carrying the
+        //    credential, how it was selected and the counter before.
+        target.audit.selected(
+            Some(CredentialRef::with_default_domain(&cred.id)),
+            Some(&matched.selection),
+            Some(cred.sign_count),
+        );
+        target.audit.reserve(target)?;
+
         if cred.extensions.cred_protect == Some(3) && !uv {
-            self.record_policy_deny(ctx, target, PolicyDenyReason::UvRequired);
+            self.record_policy_deny(target, PolicyDenyReason::UvRequired);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "credential protection policy requires user verification",
@@ -1926,7 +1899,7 @@ impl SignHandler {
                 cred_random: updated_cred.extensions.cred_random.as_ref(),
             };
             storage.write(cred_ref).map_err(|_| {
-                self.record_policy_deny(ctx, target, PolicyDenyReason::CounterPersistenceFailure);
+                self.record_policy_deny(target, PolicyDenyReason::CounterPersistenceFailure);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "failed to write updated credential",
@@ -1934,6 +1907,7 @@ impl SignHandler {
                 )
             })?;
         }
+        target.audit.counter_after(new_sign_count);
         drop(storage);
 
         let backup_flags = cred.backup_state.flags();
@@ -1955,6 +1929,7 @@ impl SignHandler {
             .key_provider
             .sign(&cred.key, cred.alg, &sig_input)
             .map_err(|_| {
+                target.audit.fail(PolicyDenyReason::SigningFailed);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "signing failed",
@@ -1985,17 +1960,16 @@ impl SignHandler {
     ) -> Result<(), ProtocolError> {
         let rp_id = target.rp_id;
         if cancelled() {
-            return Err(self.deny(ctx, target, aborted_error()));
+            return Err(self.deny(target, aborted_error()));
         }
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))?;
         let matched =
             self.policy_runtime
                 .resolve(&ctx.profile_id, &GrantAction::Authenticate, rp_id);
         if matched.action != RuleAction::Allow {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::PolicyRevoked,
@@ -2013,7 +1987,6 @@ impl SignHandler {
             .is_some_and(|grant| grant.state == super::grant::GrantState::Active);
         if !grant_active {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::GrantRevoked,
@@ -2858,6 +2831,8 @@ pub(crate) mod tests {
             sign_count: AtomicUsize,
             /// Runs inside `sign`, before the signature, on whatever thread signs.
             on_sign: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+            /// Makes `sign` fail after it ran the hook.
+            fail_sign: std::sync::atomic::AtomicBool,
         }
         impl RecordingKeyProvider {
             pub fn new() -> Self {
@@ -2865,7 +2840,11 @@ pub(crate) mod tests {
                     inner: SoftwareCredentialKeyProvider,
                     sign_count: AtomicUsize::new(0),
                     on_sign: Mutex::new(None),
+                    fail_sign: std::sync::atomic::AtomicBool::new(false),
                 }
+            }
+            pub fn set_fail_sign(&self, fail: bool) {
+                self.fail_sign.store(fail, Ordering::Release);
             }
             pub fn sign_calls(&self) -> usize {
                 self.sign_count.load(Ordering::Acquire)
@@ -2898,6 +2877,11 @@ pub(crate) mod tests {
                     hook();
                 }
                 self.sign_count.fetch_add(1, Ordering::AcqRel);
+                if self.fail_sign.load(Ordering::Acquire) {
+                    return Err(CredentialKeyError::PermanentFailure(
+                        "test failure".to_string(),
+                    ));
+                }
                 self.inner.sign(key, algorithm, data)
             }
         }
@@ -3180,6 +3164,7 @@ pub(crate) mod tests {
                     escalation: crate::agent::escalation::test_support::idle_service(
                         self.audit_gate.clone(),
                     ),
+                    audit_deployment: Default::default(),
                 }
             }
 
@@ -3616,7 +3601,13 @@ pub(crate) mod tests {
                 .iter()
                 .filter(|e| {
                     e.get("kind").and_then(|k| k.as_str()).is_some_and(|k| {
-                        k == "policy.allow" || k == "policy.deny" || k == "policy.replay_served"
+                        k == "policy.allow"
+                            || k == "policy.deny"
+                            || k == "policy.replay_served"
+                            // The terminal record of a reservation that failed: its failure
+                            // class is what a `policy.deny` reason was before the terminal
+                            // records existed.
+                            || (k == "operation.terminal" && e["failure_class"].is_string())
                     })
                 })
                 .collect()
@@ -3869,6 +3860,7 @@ pub(crate) mod tests {
                     key_provider: self.key_provider.clone(),
                     operation_lock: self.operation_lock.clone(),
                     escalation: self.escalation.clone(),
+                    audit_deployment: Default::default(),
                 }
             }
 
@@ -3914,7 +3906,10 @@ pub(crate) mod tests {
                     .map(|e| {
                         (
                             e["kind"].as_str().unwrap().to_string(),
-                            e["reason"].as_str().map(str::to_string),
+                            e["reason"]
+                                .as_str()
+                                .or_else(|| e["failure_class"].as_str())
+                                .map(str::to_string),
                         )
                     })
                     .collect()
@@ -4822,6 +4817,7 @@ pub(crate) mod tests {
                     escalation: crate::agent::escalation::test_support::idle_service(
                         self.audit_gate.clone(),
                     ),
+                    audit_deployment: Default::default(),
                 }
             }
 
@@ -5168,7 +5164,10 @@ pub(crate) mod tests {
                 f.policy_records(),
                 vec![
                     ("policy.allow".to_string(), None),
-                    ("policy.deny".to_string(), Some("policy_revoked".into())),
+                    (
+                        "operation.terminal".to_string(),
+                        Some("policy_revoked".into())
+                    ),
                 ]
             );
             // The bearer stays revoked.
@@ -5956,6 +5955,282 @@ pub(crate) mod tests {
             f.prompter.decide(PromptEvent::Approved);
             ceremony.join().unwrap().expect("signs after approval");
         }
+
+        // --- operation records and terminal records (ADR 0014 section 12) ---
+
+        fn records_of_kind<'a>(
+            events: &'a [serde_json::Value],
+            kind: &str,
+        ) -> Vec<&'a serde_json::Value> {
+            events.iter().filter(|e| e["kind"] == kind).collect()
+        }
+
+        /// Every reservation (`policy.allow`) is closed by exactly one `operation.terminal` record
+        /// with the same request ID, written after it. Returns the terminal records.
+        fn assert_one_terminal_per_reservation(
+            events: &[serde_json::Value],
+        ) -> Vec<&serde_json::Value> {
+            let allows = records_of_kind(events, "policy.allow");
+            let terminals = records_of_kind(events, "operation.terminal");
+            assert_eq!(allows.len(), terminals.len(), "{events:#?}");
+            for allow in &allows {
+                let request_id = &allow["request_id"];
+                assert!(
+                    request_id.is_string(),
+                    "a reservation carries its request ID"
+                );
+                let closing = terminals
+                    .iter()
+                    .filter(|t| t["request_id"] == *request_id)
+                    .count();
+                assert_eq!(closing, 1, "exactly one terminal record for {request_id}");
+            }
+            terminals
+        }
+
+        fn test_deployment() -> AuditDeployment {
+            AuditDeployment {
+                mode: Some("same-user".to_string()),
+                principal_relationship: Some("shared-uid".to_string()),
+                backend: Some("human".to_string()),
+                key_provider: Some("software".to_string()),
+            }
+        }
+
+        #[test]
+        fn a_successful_sign_is_one_reservation_and_one_terminal_record_with_every_field() {
+            let mut f = AuditTestFixture::default_allow();
+            // A real counter, so counter_before and counter_after differ.
+            f.security_config.constant_signature_counter = false;
+            let mut handler = f.make_handler();
+            handler.audit_deployment = test_deployment();
+            handler.sign(&f.make_ctx(), &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            let allow = records_of_kind(&events, "policy.allow")[0];
+            let terminal = terminals[0];
+            let credential = serde_json::to_value(cred_ref_of(&[1u8; 32])).unwrap();
+            for record in [allow, terminal] {
+                assert_eq!(record["profile_id"], "test-profile");
+                assert_eq!(record["mode"], "same-user");
+                assert_eq!(record["principal_relationship"], "shared-uid");
+                assert_eq!(record["backend"], "human");
+                assert_eq!(record["key_provider"], "software");
+                assert_eq!(record["action"], "authenticate");
+                assert_eq!(record["rp_id"], "example.com");
+                assert_eq!(record["origin"], "https://example.com");
+                assert!(
+                    record.get("top_origin").is_some_and(|v| v.is_null()),
+                    "top_origin is always written, null on the proxy path"
+                );
+                assert_eq!(record["cross_origin"], false);
+                assert_eq!(record["rule"], "exact", "the matched exact rule");
+                assert_eq!(record["grant_source"], "config");
+                assert_eq!(record["decision"], "allow");
+                assert_eq!(record["evidence_source"], "agent");
+                assert_eq!(record["selection_rule"], "single");
+                assert_eq!(record["credential_ref"], credential);
+                assert_eq!(record["counter_before"], 0);
+                assert!(record["revocation_epoch"].is_u64());
+                assert!(record["grant_epoch"].is_u64());
+                assert_eq!(record["session_id_hash"].as_str().unwrap().len(), 64);
+                assert!(record["escalation_id"].is_null());
+            }
+            assert_eq!(allow["request_id"], terminal["request_id"]);
+            assert_eq!(allow["session_id_hash"], terminal["session_id_hash"]);
+            assert!(allow["result"].is_null() && allow["failure_class"].is_null());
+            assert!(allow["counter_after"].is_null(), "not known at reservation");
+            assert_eq!(terminal["result"], "success");
+            assert!(terminal["failure_class"].is_null());
+            assert_eq!(terminal["counter_after"], 1);
+            assert!(
+                records_of_kind(&events, "policy.deny").is_empty(),
+                "a success writes no refusal"
+            );
+        }
+
+        #[test]
+        fn a_wildcard_match_is_audited_as_rule_star() {
+            let f = AuditTestFixture::from_spec(FixtureSpec {
+                dynamic_grant: true,
+                ..FixtureSpec::new(vec![allow_rule(ANY_RP_ID)], vec!["*"])
+            });
+            f.make_handler().sign(&f.make_ctx(), &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(records_of_kind(&events, "policy.allow")[0]["rule"], "*");
+            assert_eq!(terminals[0]["rule"], "*");
+            assert_eq!(terminals[0]["grant_source"], "config");
+        }
+
+        #[test]
+        fn a_refused_wildcard_request_is_audited_as_rule_star() {
+            // The E2E-12 shape: a wildcard `request` rule with no prompt available is denied.
+            let f = AuditTestFixture::from_spec(FixtureSpec {
+                dynamic_grant: true,
+                ..FixtureSpec::new(vec![request_rule(ANY_RP_ID)], vec!["*"])
+            });
+            f.make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            let events = read_audit_events(&f.audit_dir);
+            let denies = records_of_kind(&events, "policy.deny");
+            assert_eq!(denies.len(), 1, "{events:#?}");
+            assert_eq!(denies[0]["rule"], "*");
+            assert_eq!(denies[0]["decision"], "deny");
+            assert_eq!(denies[0]["result"], "denied");
+            assert_eq!(denies[0]["failure_class"], "escalation_unavailable");
+            assert_eq!(denies[0]["reason"], "escalation_unavailable");
+            assert!(denies[0]["request_id"].is_string());
+            assert!(
+                records_of_kind(&events, "policy.allow").is_empty()
+                    && records_of_kind(&events, "operation.terminal").is_empty(),
+                "a refusal before the reservation owes no terminal record"
+            );
+        }
+
+        #[test]
+        fn a_granted_rule_is_audited_with_its_grant_source() {
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
+            f.granted_rules.set(true);
+            f.make_handler().sign(&f.make_ctx(), &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(terminals[0]["rule"], "exact");
+            assert_eq!(terminals[0]["grant_source"], "granted");
+        }
+
+        #[test]
+        fn a_refusal_before_the_reservation_carries_the_operation_fields_without_a_terminal() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "https://evil.example".to_string();
+            f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            let events = read_audit_events(&f.audit_dir);
+            let denies = records_of_kind(&events, "policy.deny");
+            assert_eq!(denies.len(), 1);
+            let deny = denies[0];
+            assert_eq!(deny["failure_class"], "origin_invalid");
+            assert_eq!(deny["result"], "denied");
+            assert_eq!(deny["origin"], "https://evil.example");
+            assert!(
+                deny["rule"].is_null(),
+                "origin validation precedes resolution"
+            );
+            assert!(deny["credential_ref"].is_null());
+            assert!(deny["session_id_hash"].is_string());
+            assert!(deny["revocation_epoch"].is_u64());
+            assert!(assert_one_terminal_per_reservation(&events).is_empty());
+        }
+
+        /// The single terminal record of the one reservation in `f`'s audit log.
+        fn only_terminal(f: &AuditTestFixture) -> serde_json::Value {
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(terminals.len(), 1, "{events:#?}");
+            assert!(
+                records_of_kind(&events, "policy.deny").is_empty(),
+                "after the reservation a failure is the terminal record, not a second refusal"
+            );
+            terminals[0].clone()
+        }
+
+        #[test]
+        fn a_revocation_before_key_use_ends_in_a_revoked_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let runtime = f.policy_runtime.clone();
+            let changed = test_agent_config(AuditTestFixture::profile_config(&FixtureSpec::new(
+                vec![allow_rule("example.com"), allow_rule("other.example")],
+                vec!["example.com"],
+            )));
+            let _hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                assert!(runtime.reload(&changed).unwrap().changed);
+            });
+            handler.sign(&ctx, &f.make_req()).unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "revoked");
+            assert_eq!(terminal["failure_class"], "policy_revoked");
+            assert!(terminal["counter_after"].is_null(), "no key use");
+        }
+
+        #[test]
+        fn an_abort_after_the_reservation_ends_in_an_aborted_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            // The first check (before the replay key) passes; the re-check before key use sees it.
+            let cancelled = || calls.fetch_add(1, Ordering::AcqRel) >= 1;
+            let deadline = ceremony_deadline(None, Instant::now());
+            f.make_handler()
+                .sign_with(&f.make_ctx(), &f.make_req(), deadline, &cancelled)
+                .unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "aborted");
+            assert_eq!(terminal["failure_class"], "aborted");
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn a_signing_failure_ends_in_an_error_terminal_record() {
+            let mut f = AuditTestFixture::default_allow();
+            f.security_config.constant_signature_counter = false;
+            f.key_provider.set_fail_sign(true);
+            f.make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "error");
+            assert_eq!(terminal["failure_class"], "signing_failed");
+            assert_eq!(terminal["counter_after"], 1, "the counter was persisted");
+        }
+
+        #[test]
+        fn a_withheld_assertion_ends_in_an_error_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(Arc::new(TestActivation {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: true,
+                gate: None,
+            }));
+            f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "error");
+            assert_eq!(terminal["failure_class"], "lease_activation_failed");
+        }
+
+        #[test]
+        fn a_ceremony_that_panics_still_gets_its_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            f.key_provider
+                .set_on_sign(Some(Arc::new(|| panic!("the key provider panicked"))));
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = handler.sign(&ctx, &req);
+            }));
+            assert!(unwound.is_err());
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "error");
+            assert_eq!(terminal["failure_class"], "abandoned");
+        }
+
+        #[test]
+        fn a_served_duplicate_is_not_a_second_reservation() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            assert_eq!(assert_one_terminal_per_reservation(&events).len(), 1);
+            let served = records_of_kind(&events, "policy.replay_served");
+            assert_eq!(served.len(), 1);
+            assert_eq!(served[0]["result"], "replay_served");
+            assert_eq!(served[0]["decision"], "allow");
+        }
     }
 
     mod registration_lease_tests {
@@ -6016,6 +6291,7 @@ pub(crate) mod tests {
                     escalation: crate::agent::escalation::test_support::idle_service(
                         audit_gate.clone(),
                     ),
+                    audit_deployment: Default::default(),
                 });
                 let profile_id = ProfileId::new("test-profile").unwrap();
                 let ctx = RegisterContext::new(profile_id.clone(), test_session(&profile_id));

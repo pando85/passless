@@ -295,6 +295,7 @@ impl AgentRuntime {
             security_config: profile.security_config.clone(),
             operation_lock: profile.backend.operation_lock.clone(),
             escalation: self.escalation.clone(),
+            audit_deployment: profile.audit_deployment(),
         });
         self.sign_registry
             .register_pending_registration(
@@ -494,6 +495,7 @@ impl AgentRuntime {
                 key_provider: profile.backend.key_provider.clone(),
                 operation_lock: profile.backend.operation_lock.clone(),
                 escalation: self.escalation.clone(),
+                audit_deployment: profile.audit_deployment(),
             });
             if let Err(e) = self.sign_registry.register_pending(
                 bearer_token.to_string(),

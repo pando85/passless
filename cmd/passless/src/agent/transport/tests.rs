@@ -184,6 +184,7 @@ impl Fixture {
             escalation: crate::agent::escalation::test_support::idle_service(
                 self.audit_gate.clone(),
             ),
+            audit_deployment: Default::default(),
         });
         let register_handler = Arc::new(RegisterHandler {
             policy_runtime: self.policy_runtime.clone(),
@@ -195,6 +196,7 @@ impl Fixture {
             escalation: crate::agent::escalation::test_support::idle_service(
                 self.audit_gate.clone(),
             ),
+            audit_deployment: Default::default(),
         });
         self.registry
             .register_pending(
@@ -232,11 +234,21 @@ impl Fixture {
     pub fn policy_records(&self) -> Vec<(String, Option<String>)> {
         self.events()
             .iter()
-            .filter(|e| e["kind"].as_str().is_some_and(|k| k.starts_with("policy.")))
+            .filter(|e| {
+                e["kind"].as_str().is_some_and(|k| {
+                    k.starts_with("policy.")
+                        // A reservation that failed ends in a terminal record carrying the failure
+                        // class (the `reason` of a `policy.deny` before terminal records existed).
+                        || (k == "operation.terminal" && e["failure_class"].is_string())
+                })
+            })
             .map(|e| {
                 (
                     e["kind"].as_str().unwrap().to_string(),
-                    e["reason"].as_str().map(str::to_string),
+                    e["reason"]
+                        .as_str()
+                        .or_else(|| e["failure_class"].as_str())
+                        .map(str::to_string),
                 )
             })
             .collect()

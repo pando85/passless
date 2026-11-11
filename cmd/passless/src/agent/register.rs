@@ -13,22 +13,22 @@ use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{
-    AuditAction, EscalationAuditContext, EscalationDenyCause, PolicyAllowBuilder,
-    PolicyDenyBuilder, PolicyDenyReason,
+    AuditAction, EscalationAuditContext, EscalationDenyCause, PolicyDenyReason,
 };
 use super::escalation::{
     EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, WaiterSession,
 };
 use super::lock_order::{self, LockLevel};
+use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
 use super::policy_engine::PolicyRuntime;
 use super::session::{
     AgentSession, CeremonyAction, CeremonyOutcome, CeremonyResult, ChallengeDigest, Claim,
     ClaimGuard, JoinResult, ReplayKey, ceremony_deadline,
 };
 use super::sign::{
-    AuditTarget, Escalation, PreparedEscalation, aborted_error, b64u_decode, b64u_encode,
-    claim_rejection_error, decode_challenge, extensions_supported, join_failure,
-    session_invalid_error, verify_origin_context,
+    Escalation, PreparedEscalation, aborted_error, b64u_decode, b64u_encode, claim_rejection_error,
+    decode_challenge, extensions_supported, join_failure, session_invalid_error,
+    verify_origin_context,
 };
 
 use crate::storage::CredentialStorage;
@@ -77,6 +77,9 @@ pub struct RegisterHandler {
     /// The escalation coordinator a `register = "request"` resolution waits on (ADR 0014
     /// section 8.3).
     pub escalation: Arc<EscalationService>,
+    /// The deployment axes and backend that every operation record of this handler reports
+    /// (ADR 0014 section 12).
+    pub audit_deployment: AuditDeployment,
 }
 
 /// A registration approval is bound to the creating ceremony: its profile, RP and session.
@@ -120,30 +123,29 @@ fn registration_credential_ref(credential_id_b64u: &str) -> Result<CredentialRef
 }
 
 impl RegisterHandler {
-    fn record_policy_deny(
-        &self,
-        ctx: &RegisterContext,
-        target: &AuditTarget,
-        reason: PolicyDenyReason,
-    ) {
-        let deny_event = PolicyDenyBuilder::new(
-            ctx.profile_id.clone(),
+    /// A new audit for one ceremony of `ctx` (ADR 0014 section 12).
+    fn ceremony_audit(&self, ctx: &RegisterContext) -> CeremonyAudit {
+        CeremonyAudit::new(
+            &self.audit_gate,
+            &self.policy_runtime,
+            &self.audit_deployment,
+            &ctx.session,
+            &ctx.profile_id,
             AuditAction::Register,
-            target.rp_id,
-            reason,
         )
-        .origin_context(target.origin, target.top_origin, target.cross_origin)
-        .build();
-        let _ = self.audit_gate.record(deny_event);
+    }
+
+    /// A refusal: a `policy.deny` record before the reservation, a noted failure after it.
+    fn record_policy_deny(&self, target: &AuditTarget, reason: PolicyDenyReason) {
+        target.audit.deny(target, reason);
     }
 
     fn deny(
         &self,
-        ctx: &RegisterContext,
         target: &AuditTarget,
         (reason, error): (PolicyDenyReason, ProtocolError),
     ) -> ProtocolError {
-        self.record_policy_deny(ctx, target, reason);
+        self.record_policy_deny(target, reason);
         error
     }
 
@@ -156,9 +158,9 @@ impl RegisterHandler {
             .map(normalize_rp_id)
             .filter(|rp| passless_core::agent::config::validate_rp_id(rp).is_ok())
             .unwrap_or_else(|| "unknown".to_string());
+        let audit = self.ceremony_audit(ctx);
         self.record_policy_deny(
-            ctx,
-            &AuditTarget::rp_only(&rp_id),
+            &AuditTarget::rp_only(&audit, &rp_id),
             PolicyDenyReason::BearerRevoked,
         );
     }
@@ -173,7 +175,6 @@ impl RegisterHandler {
     ) -> Result<(), ProtocolError> {
         if ctx.session.profile_id() != &ctx.profile_id {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::SessionMismatch,
@@ -187,7 +188,7 @@ impl RegisterHandler {
         }
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))?;
         let Some(grant_id) = ctx.session.grant_id() else {
             return Ok(());
         };
@@ -195,16 +196,15 @@ impl RegisterHandler {
             .policy_runtime
             .resolve_grant_for_sign(&ctx.profile_id, grant_id)
         else {
-            return Err(self.deny(ctx, target, revoked_grant_error()));
+            return Err(self.deny(target, revoked_grant_error()));
         };
         if grant.state != super::grant::GrantState::Active {
-            return Err(self.deny(ctx, target, revoked_grant_error()));
+            return Err(self.deny(target, revoked_grant_error()));
         }
         if grant.profile_id != ctx.profile_id
             || grant.principal_digest != *ctx.session.principal_digest()
         {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::PrincipalMismatch,
@@ -264,8 +264,27 @@ impl RegisterHandler {
         cancelled: &dyn Fn() -> bool,
         park: &mut dyn ParkHook,
     ) -> Result<RegisterCredentialResponse, ProtocolError> {
+        // The audit is the ceremony's single exit point: whatever way `register_audited` ends,
+        // the reservation it may have made is closed by exactly one terminal record (a panic is
+        // covered by the audit's drop guard).
+        let audit = self.ceremony_audit(ctx);
+        let outcome = self.register_audited(ctx, req, deadline, cancelled, park, &audit);
+        audit.conclude(&outcome);
+        outcome
+    }
+
+    fn register_audited(
+        &self,
+        ctx: &RegisterContext,
+        req: &RegisterCredentialRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+        audit: &CeremonyAudit,
+    ) -> Result<RegisterCredentialResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
         let target = AuditTarget::of_request(
+            audit,
             &normalized_rp,
             &req.origin,
             req.top_origin.as_deref(),
@@ -297,7 +316,6 @@ impl RegisterHandler {
                 )
             };
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     reason,
@@ -313,10 +331,10 @@ impl RegisterHandler {
         let matched =
             self.policy_runtime
                 .resolve(&ctx.profile_id, &GrantAction::Register, &normalized_rp);
+        audit.matched(&matched);
         match matched.action {
             RuleAction::Deny => {
                 return Err(self.deny(
-                    ctx,
                     target,
                     (
                         PolicyDenyReason::ActionNotAllowed,
@@ -343,7 +361,6 @@ impl RegisterHandler {
         //    storage is touched (ADR 0014 section 10.3).
         let unsupported = |message: &str| {
             self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::UnsupportedOption,
@@ -375,7 +392,6 @@ impl RegisterHandler {
             .find(|algorithm| self.key_provider.supports_algorithm(*algorithm))
         else {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::AlgorithmUnsupported,
@@ -398,7 +414,7 @@ impl RegisterHandler {
 
         // The browser already cancelled the request: stop before the replay key is consumed.
         if cancelled() {
-            return Err(self.deny(ctx, target, aborted_error()));
+            return Err(self.deny(target, aborted_error()));
         }
 
         // 5. Replay key, then budget (R1, R4): an identical registration never creates a second
@@ -420,12 +436,13 @@ impl RegisterHandler {
             rp_id: target.rp_id,
             origin: &req.origin,
             rule: &matched.rule,
+            audit,
         };
         let prepared = if matched.action == RuleAction::Request {
             Some(
                 escalation
                     .prepare()
-                    .map_err(|refused| self.deny(ctx, target, refused))?,
+                    .map_err(|refused| self.deny(target, refused))?,
             )
         } else {
             None
@@ -494,16 +511,14 @@ impl RegisterHandler {
                     attestation_outcome(outcome)
                 }
                 // The browser cancelled the duplicate while it waited: audited like any abort.
-                JoinResult::Detached => Err(self.deny(ctx, target, aborted_error())),
+                JoinResult::Detached => Err(self.deny(target, aborted_error())),
                 other => Err(join_failure(other)),
             },
             Claim::Completed(outcome, audit) => {
                 self.serve_duplicate(ctx, target, audit)?;
                 attestation_outcome(outcome)
             }
-            Claim::Rejected(rejection) => {
-                Err(self.deny(ctx, target, claim_rejection_error(rejection)))
-            }
+            Claim::Rejected(rejection) => Err(self.deny(target, claim_rejection_error(rejection))),
         }
     }
 
@@ -535,11 +550,10 @@ impl RegisterHandler {
                     RecommendedAction::Abort,
                 ));
             }
-            Err(denied) => return Err(self.deny(ctx, target, denied)),
+            Err(denied) => return Err(self.deny(target, denied)),
         };
         if !approval_matches(&approval, ctx, target.rp_id) {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::PolicyRevoked,
@@ -558,7 +572,7 @@ impl RegisterHandler {
         fresh
             .guard
             .claim_budget(u32::from(max_operations))
-            .map_err(|rejection| self.deny(ctx, target, claim_rejection_error(rejection)))?;
+            .map_err(|rejection| self.deny(target, claim_rejection_error(rejection)))?;
         let response = self.register_fresh(
             ctx,
             req,
@@ -599,6 +613,8 @@ impl RegisterHandler {
                     profile_id: approval.profile().clone(),
                     action: AuditAction::Register,
                     rp_id: approval.rp_id().to_string(),
+                    origin: approval.origin().to_string(),
+                    rule: approval.rule(),
                 };
                 if let Err(audit_error) = self
                     .audit_gate
@@ -624,9 +640,9 @@ impl RegisterHandler {
     ) -> Result<(), ProtocolError> {
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))?;
         if audit {
-            self.record_policy_deny(ctx, target, PolicyDenyReason::ReplayServed);
+            self.record_policy_deny(target, PolicyDenyReason::ReplayServed);
         }
         Ok(())
     }
@@ -642,7 +658,7 @@ impl RegisterHandler {
     ) -> Result<(), ProtocolError> {
         let rp_id = target.rp_id;
         if cancelled() {
-            return Err(self.deny(ctx, target, aborted_error()));
+            return Err(self.deny(target, aborted_error()));
         }
         self.check_session(ctx, target)?;
         let matched = self
@@ -654,7 +670,6 @@ impl RegisterHandler {
             && approval.is_some_and(|approval| approval_matches(approval, ctx, rp_id));
         if matched.action != RuleAction::Allow && !approved {
             return Err(self.deny(
-                ctx,
                 target,
                 (
                     PolicyDenyReason::PolicyRevoked,
@@ -692,7 +707,6 @@ impl RegisterHandler {
                 && storage.read(&excluded_id).is_ok()
             {
                 return Err(self.deny(
-                    ctx,
                     target,
                     (
                         PolicyDenyReason::CredentialExcluded,
@@ -706,19 +720,9 @@ impl RegisterHandler {
             }
         }
 
-        // 7. Durable audit reservation before key use (invariant 16).
-        let allow_event =
-            PolicyAllowBuilder::new(ctx.profile_id.clone(), AuditAction::Register, normalized_rp)
-                .evidence_sources("allow", "agent", "agent")
-                .origin_context(target.origin, target.top_origin, target.cross_origin)
-                .build();
-        self.audit_gate.record(allow_event).map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "audit record failed",
-                RecommendedAction::Retry,
-            )
-        })?;
+        // 7. Durable audit reservation before key use (invariant 16). From here every exit path
+        //    ends in the ceremony's terminal record (`CeremonyAudit::conclude`).
+        target.audit.reserve(target)?;
 
         // 8. Immediately before key use. The key-use gates are held until the credential is
         //    written, so a revocation either precedes this check or waits (review M1).
@@ -731,6 +735,7 @@ impl RegisterHandler {
         // 9. Key generation.
         *key_used = true;
         let generated = self.key_provider.generate(algorithm).map_err(|_| {
+            target.audit.fail(PolicyDenyReason::KeyGenerationFailed);
             ProtocolError::new(
                 ErrorCode::Internal,
                 "key generation failed",
@@ -744,6 +749,7 @@ impl RegisterHandler {
         // Ed25519 bytes), not a COSE_Key; encode it before it goes into the attested credential data.
         let cose_key = cose_key_from_raw_public_key(algorithm, &generated.cose_public_key)
             .map_err(|_| {
+                target.audit.fail(PolicyDenyReason::KeyGenerationFailed);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "key provider returned an unusable public key",
@@ -821,16 +827,21 @@ impl RegisterHandler {
             .session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
         {
-            return Err(self.deny(ctx, target, session_invalid_error(invalid)));
+            return Err(self.deny(target, session_invalid_error(invalid)));
         }
 
         storage.write(cred_ref).map_err(|_| {
+            target.audit.fail(PolicyDenyReason::CredentialWriteFailed);
             ProtocolError::new(
                 ErrorCode::Internal,
                 "failed to write credential to storage",
                 RecommendedAction::Retry,
             )
         })?;
+        target
+            .audit
+            .created(CredentialRef::with_default_domain(&credential_id));
+        target.audit.counter_after(0);
 
         debug!(
             "registered credential for rp={} profile={}",
@@ -1182,6 +1193,7 @@ mod tests {
                 security_config: self.security_config.clone(),
                 operation_lock: self.operation_lock.clone(),
                 escalation: self.escalation.clone(),
+                audit_deployment: Default::default(),
             }
         }
 
@@ -1230,9 +1242,11 @@ mod tests {
             read_audit_events(&self.audit_dir)
                 .into_iter()
                 .filter(|e| {
-                    e.get("kind")
-                        .and_then(|k| k.as_str())
-                        .is_some_and(|k| k == "policy.allow" || k == "policy.deny")
+                    e.get("kind").and_then(|k| k.as_str()).is_some_and(|k| {
+                        k == "policy.allow"
+                            || k == "policy.deny"
+                            || (k == "operation.terminal" && e["failure_class"].is_string())
+                    })
                 })
                 .collect()
         }
@@ -1873,11 +1887,15 @@ mod tests {
     fn deny_reasons(f: &RegisterTestFixture) -> Vec<(String, String)> {
         f.policy_events()
             .iter()
-            .filter(|e| e["kind"] == "policy.deny")
+            .filter(|e| e["kind"] == "policy.deny" || e["kind"] == "operation.terminal")
             .map(|e| {
                 (
                     e["rp_id"].as_str().unwrap_or_default().to_string(),
-                    e["reason"].as_str().unwrap_or_default().to_string(),
+                    e["reason"]
+                        .as_str()
+                        .or_else(|| e["failure_class"].as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                 )
             })
             .collect()
@@ -2351,6 +2369,96 @@ mod tests {
             vec![("example.com".to_string(), "policy_revoked".to_string())]
         );
     }
+    fn records_of_kind(f: &RegisterTestFixture, kind: &str) -> Vec<serde_json::Value> {
+        read_audit_events(&f.audit_dir)
+            .into_iter()
+            .filter(|e| e["kind"] == kind)
+            .collect()
+    }
+
+    #[test]
+    fn a_successful_registration_is_one_reservation_and_one_terminal_record() {
+        let f = RegisterTestFixture::new();
+        let mut handler = f.make_handler();
+        handler.audit_deployment = AuditDeployment {
+            mode: Some("isolated".to_string()),
+            principal_relationship: Some("distinct-uid".to_string()),
+            backend: Some("local".to_string()),
+            key_provider: Some("software".to_string()),
+        };
+        let response = handler.register(&f.make_ctx(), &f.make_req()).unwrap();
+        let allows = records_of_kind(&f, "policy.allow");
+        let terminals = records_of_kind(&f, "operation.terminal");
+        assert_eq!((allows.len(), terminals.len()), (1, 1));
+        let (allow, terminal) = (&allows[0], &terminals[0]);
+        assert_eq!(allow["request_id"], terminal["request_id"]);
+        for record in [allow, terminal] {
+            assert_eq!(record["action"], "register");
+            assert_eq!(record["rp_id"], "example.com");
+            assert_eq!(record["mode"], "isolated");
+            assert_eq!(record["principal_relationship"], "distinct-uid");
+            assert_eq!(record["backend"], "local");
+            assert_eq!(record["key_provider"], "software");
+            assert_eq!(record["rule"], "exact");
+            assert_eq!(record["grant_source"], "config");
+            assert_eq!(record["decision"], "allow");
+            assert_eq!(record["evidence_source"], "agent");
+            assert!(record["selection_rule"].is_null());
+            assert!(record["counter_before"].is_null());
+        }
+        assert!(
+            allow["credential_ref"].is_null(),
+            "the credential does not exist at reservation"
+        );
+        assert_eq!(terminal["result"], "success");
+        assert!(terminal["failure_class"].is_null());
+        assert_eq!(terminal["counter_after"], 0);
+        let id = b64u_decode(&response.credential_id_b64u).unwrap();
+        assert_eq!(
+            terminal["credential_ref"],
+            serde_json::to_value(CredentialRef::with_default_domain(&id)).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_revoked_bearer_is_refused_before_any_reservation() {
+        let f = RegisterTestFixture::new();
+        let handler = f.make_handler();
+        let ctx = f.make_ctx();
+        ctx.revoke();
+        // A revoked bearer is refused before any reservation: one refusal, no terminal record.
+        handler.register(&ctx, &f.make_req()).unwrap_err();
+        assert_eq!(records_of_kind(&f, "policy.deny").len(), 1);
+        assert!(records_of_kind(&f, "operation.terminal").is_empty());
+    }
+
+    #[test]
+    fn a_reload_between_the_reservation_and_key_generation_ends_in_one_terminal_record() {
+        let f = RegisterTestFixture::new();
+        let handler = f.make_handler();
+        let ctx = f.make_ctx();
+        let runtime = f.policy_runtime.clone();
+        let profile_id = f.profile_id.clone();
+        let _hook = crate::agent::session::test_hooks::set_before_key_use(move || {
+            let mut changed = make_registration_profile_config();
+            changed.max_operations = 3;
+            runtime
+                .reload(&agent_config_for(&profile_id, changed))
+                .unwrap();
+        });
+        handler.register(&ctx, &f.make_req()).unwrap_err();
+        assert_eq!(records_of_kind(&f, "policy.allow").len(), 1);
+        let terminals = records_of_kind(&f, "operation.terminal");
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["result"], "revoked");
+        assert_eq!(terminals[0]["failure_class"], "policy_revoked");
+        assert!(terminals[0]["credential_ref"].is_null());
+        assert!(
+            records_of_kind(&f, "policy.deny").is_empty(),
+            "after the reservation a failure is the terminal record, not a second refusal"
+        );
+    }
+
     #[test]
     fn an_excluded_credential_failure_gives_the_budget_back() {
         let f = RegisterTestFixture::new();
@@ -2498,9 +2606,10 @@ mod tests {
         let f = make_fixture_with_config(register_request_config());
         let ctx = f.make_ctx();
         let req = f.make_req();
-        let target = AuditTarget::of_request("example.com", &req.origin, None, false);
-        let err = f
-            .make_handler()
+        let handler = f.make_handler();
+        let audit = handler.ceremony_audit(&ctx);
+        let target = AuditTarget::of_request(&audit, "example.com", &req.origin, None, false);
+        let err = handler
             .recheck_before_key_use(&ctx, &target, None, &|| false)
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);

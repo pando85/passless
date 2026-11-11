@@ -518,6 +518,8 @@ impl Entry {
             profile_id: self.request.profile.clone(),
             action: self.request.audit_action(),
             rp_id: self.request.rp_id.clone(),
+            origin: self.request.origin.clone(),
+            rule: self.request.rule,
         }
     }
 
@@ -933,9 +935,7 @@ impl EscalationService {
                         prompted_at: None,
                         outcome: None,
                     };
-                    let announcement = entry
-                        .audit_context()
-                        .requested(&request.origin, request.rule);
+                    let announcement = entry.audit_context().requested();
                     inner.entries.insert(serial, entry);
                     inner.by_key.insert(key.clone(), serial);
                     inner
@@ -1471,6 +1471,8 @@ impl EscalationService {
             profile_id: approval.profile.clone(),
             action: AuditAction::Register,
             rp_id: approval.rp_id.clone(),
+            origin: approval.origin.clone(),
+            rule: approval.rule,
         };
         let audit_denial = |cause: EscalationDenyCause| {
             if let Err(audit_error) = self.audit.record(context.denied(cause)) {
