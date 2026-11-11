@@ -17,6 +17,8 @@ pub mod escalation;
 pub mod escalation_prompt;
 pub mod grant;
 pub mod granted_rules;
+#[cfg(test)]
+mod grants_invariants;
 pub mod identity;
 pub mod ipc;
 pub mod launcher;
