@@ -30,7 +30,8 @@ scenario({ id: 'E2E-47', title: 'missing extension directory is a launch error; 
 });
 
 // Catalogue E2E-47, unloadable: the launcher's checks pass, but the browser refuses to load the extension (the
-// debug-only PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION makes its manifest ask for a browser version no browser has). The
+// debug-only PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION writes a worker that loads but never connects; a manifest the
+// browser refuses to load would block headed Chromium on a modal dialog before it opens its debugging port). The
 // worker never says hello, so the launch fails closed at the attach timeout, the browser is stopped and no endpoint is
 // handed out.
 scenario({ id: 'E2E-47/unloadable', title: 'an extension the browser cannot load is a launch error; the browser is stopped', ci: true }, async ctx => {

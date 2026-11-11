@@ -23,14 +23,33 @@ const ONE_RP = {
 const cmdline = pid => { try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean); } catch { return []; } };
 const isBwrap = argv => /(^|\/)bwrap$/.test(argv[0] || '');
 
-/** The managed browser's main process in the lease's process tree (not bwrap, not a Chromium child process). */
-function browserMain(leasePid) {
-  const pid = [leasePid, ...descendants(leasePid)].find(p => {
-    const argv = cmdline(p);
-    return !isBwrap(argv) && argv.some(a => a.startsWith('--user-data-dir=')) && !argv.some(a => a.startsWith('--type='));
+/**
+ * Command-line tokens of a process. Chromium rewrites its own argv area at startup, so /proc/<pid>/cmdline of every
+ * Chromium process (the main one and its children alike) is ONE space-joined string, not NUL-separated arguments. Only
+ * whitespace tokenising recovers `--type=...` and `--user-data-dir=...`; anything that inspects individual arguments
+ * (`argv.some(a => a.startsWith(...))`, `argv.includes(...)`) silently sees nothing on a Chromium process.
+ */
+const tokens = pid => cmdline(pid).flatMap(a => a.split(/\s+/)).filter(Boolean);
+const exeOf = pid => { try { return fs.readlinkSync(`/proc/${pid}/exe`); } catch { return ''; } };
+
+/**
+ * The managed browser's main process in the lease's process tree. The lease's pid is bwrap's, and bwrap forks the
+ * browser (lease -> browser main -> zygote/gpu/renderer/utility children, plus the native messaging relay). The main
+ * process is the one that is not bwrap, is not a Chromium child (`--type=`), and runs with this stack's per-lease
+ * `--user-data-dir`; there must be exactly one.
+ */
+function browserMain(leasePid, root) {
+  const tree = [leasePid, ...descendants(leasePid)];
+  const found = tree.filter(p => {
+    if (isBwrap(cmdline(p)) || /(^|\/)bwrap$/.test(exeOf(p))) return false;
+    const argv = tokens(p);
+    return !argv.some(a => a.startsWith('--type=')) && argv.some(a => a.startsWith(`--user-data-dir=${root}`));
   });
-  if (!pid) throw new Error(`no browser process under lease pid ${leasePid}: ${JSON.stringify(descendants(leasePid).map(cmdline))}`);
-  return pid;
+  if (found.length !== 1) {
+    const described = tree.map(p => `${p}:${exeOf(p)}:${tokens(p).slice(0, 3).join(' ')}`);
+    throw new Error(`expected exactly one browser main process under lease pid ${leasePid}, found [${found}]: ${JSON.stringify(described)}`);
+  }
+  return found[0];
 }
 
 /** This user can open `node` for reading and writing (what CTAP over HID needs). */
@@ -54,12 +73,12 @@ scenario({ id: 'E2E-46', title: 'the managed browser runs in a private /dev with
   const bw = cmdline(leasePid);
   assert.deepEqual(bw.slice(1, 8), ['--dev-bind', '/', '/', '--dev', '/dev', '--die-with-parent', '--'], `bwrap argv: ${bw.join(' ')}`);
 
-  const main = browserMain(leasePid);
+  const main = browserMain(leasePid, stack.env.root);
   assert.notEqual(fs.readlinkSync(`/proc/${main}/ns/mnt`), fs.readlinkSync('/proc/self/ns/mnt'), 'the browser has its own mount namespace');
   const dev = fs.readdirSync(`/proc/${main}/root/dev`);
   assert.deepEqual(dev.filter(n => /^hidraw|^uhid$/.test(n)), [], `the browser's /dev has no hidraw or uhid: ${dev.join(' ')}`);
   assert.ok(!fs.existsSync(`/proc/${main}/root${stack.daemon.hidraw}`), 'the human hidraw node is not visible to the browser');
-  assert.ok(!cmdline(main).includes('--no-sandbox'), "Chromium's own sandbox stays on");
+  assert.ok(!tokens(main).includes('--no-sandbox'), "Chromium's own sandbox stays on");
   assert.match(stack.daemon.log().slice(logBefore), /native-path containment required and in place \(private \/dev through bwrap\)/,
     'the daemon logged the containment case');
 

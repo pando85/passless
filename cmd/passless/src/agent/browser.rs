@@ -528,7 +528,15 @@ impl fmt::Display for LaunchError {
                 write!(f, "browser hardening failed: {}", msg)
             }
             LaunchError::CdpDiscoveryTimeout => {
-                write!(f, "timed out waiting for browser CDP endpoint")
+                write!(
+                    f,
+                    "timed out waiting for browser CDP endpoint: the browser never opened its \
+                     debugging port and was stopped. A browser that could not load the passless \
+                     agent extension is a likely cause (headed Chromium shows a blocking \"Error \
+                     Loading Extension\" dialog before it opens the port), or it failed to \
+                     start; check that the browser is Chromium 116 or later, that its display \
+                     is usable, and the daemon log"
+                )
             }
             LaunchError::BrowserExitedBeforeCdp(status) => {
                 write!(f, "browser exited before CDP became ready: {}", status)
@@ -2289,7 +2297,7 @@ fn generate_agent_extension_in(
         .create_file(
             "worker.js",
             0o600,
-            render_worker_script(EXTENSION_WORKER_TEMPLATE, metadata).as_bytes(),
+            extension_worker_source(metadata).as_bytes(),
         )
         .map_err(|e| fail("create worker.js", e))?;
     chown_file(&worker, target_uid, target_gid).map_err(|e| fail("chown worker.js", e))?;
@@ -2314,20 +2322,25 @@ fn generate_agent_extension(
     generate_agent_extension_in(&lease_dir, runtime_dir, metadata, target_uid, target_gid)
 }
 
-/// The manifest to write: the committed one, verbatim. Debug builds only: with
-/// `PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` set it asks for a browser version no browser has, so
-/// the launcher's checks pass but the browser refuses to load the extension (E2E-47/unloadable).
-/// Release builds have no such hook.
+/// The manifest to write: the committed one, verbatim.
 fn extension_manifest() -> String {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION").is_some()
-        && let Ok(mut manifest) =
-            serde_json::from_str::<serde_json::Value>(EXTENSION_MANIFEST_TEMPLATE)
-    {
-        manifest["minimum_chrome_version"] = serde_json::Value::from("9999");
-        return manifest.to_string();
-    }
     EXTENSION_MANIFEST_TEMPLATE.to_string()
+}
+
+/// The service worker source to write for one lease. Debug builds only: with
+/// `PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` set the extension still loads, but its worker does
+/// nothing, so it never connects or attaches the proxy (E2E-47/unloadable): the launcher's checks
+/// pass, the browser starts in headed and headless mode alike, and the launch must fail closed with
+/// the attach error. (A manifest the browser refuses to load would not do: headed Chromium answers
+/// it with a blocking "Error Loading Extension" dialog before it opens its debugging port.)
+/// Release builds have no such hook.
+fn extension_worker_source(metadata: &AgentEndpointMetadata) -> String {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION").is_some() {
+        return "// passless E2E-47/unloadable: this worker never connects and attaches nothing.\n"
+            .to_string();
+    }
+    render_worker_script(EXTENSION_WORKER_TEMPLATE, metadata)
 }
 
 /// Debug and test builds only: lets E2E-47 and the unit tests simulate an extension directory that is
@@ -8003,6 +8016,67 @@ mod tests {
         config.bind_parent_death = false;
         let setup = config.hardening();
         assert!(!setup.bind_parent_death);
+    }
+
+    #[test]
+    fn test_cdp_discovery_timeout_names_the_extension_and_says_the_browser_was_stopped() {
+        let message = LaunchError::CdpDiscoveryTimeout.to_string();
+        assert!(message.contains("timed out waiting for browser CDP endpoint"));
+        assert!(message.contains("extension"), "{message}");
+        assert!(message.contains("was stopped"), "{message}");
+    }
+
+    /// A failed launch (the CDP wait timed out) kills the whole process tree: the wrapper that is
+    /// the lease's pid (bwrap) and the browser it forked, not only the direct child.
+    #[test]
+    fn test_terminate_failed_browser_spawn_kills_the_whole_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pid_file.display()));
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild: i32 = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the grandchild never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0, "grandchild alive");
+
+        terminate_failed_browser_spawn(&mut child);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(grandchild, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The orphaned grandchild is reparented and reaped by init; a zombie still answers kill(0).
+        let state = fs::read_to_string(format!("/proc/{grandchild}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().chars().next()))
+            .flatten();
+        assert!(
+            matches!(state, None | Some('Z')),
+            "the grandchild survived the failed launch: state {state:?}"
+        );
     }
 
     #[test]
