@@ -48,6 +48,7 @@ use passless_core::agent::config::CdpExposeMode;
 
 use crate::storage::CredentialStorage;
 mod browser_ensure;
+mod gates;
 mod interception;
 
 const MAX_WORKERS: usize = 16;
@@ -1007,26 +1008,15 @@ impl AgentRuntime {
 
             let browser_user_resolved = if let Some(ref browser_user) = profile.browser_user {
                 let bu = resolve_user(browser_user)?;
-                if is_root && !cdp_port_mode {
-                    if bu.uid == user.uid {
-                        return Err(RuntimeError::Config(format!(
-                            "profile '{}': browser uid {} must differ from principal uid {}",
-                            name, bu.uid, user.uid
-                        )));
-                    }
-                    if bu.uid == daemon_uid {
-                        return Err(RuntimeError::Config(format!(
-                            "profile '{}': browser uid {} must differ from daemon uid {}",
-                            name, bu.uid, daemon_uid
-                        )));
-                    }
-                    if bu.uid == 0 {
-                        return Err(RuntimeError::Config(format!(
-                            "profile '{}': browser must not be root",
-                            name
-                        )));
-                    }
-                }
+                gates::validate_pipe_browser_user(
+                    name,
+                    is_root,
+                    cdp_port_mode,
+                    bu.uid,
+                    user.uid,
+                    daemon_uid,
+                )
+                .map_err(RuntimeError::Config)?;
                 if let Some(ref runtime_root) = profile.browser_runtime_root {
                     validate_browser_runtime_root_at_startup(runtime_root, bu.uid, name)?;
                 }
@@ -2065,19 +2055,12 @@ impl AgentRuntime {
         })?;
         let mut sessions =
             super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
-        let limit = usize::from(profile.profile_config.max_concurrent_sessions);
-        let unlimited = profile.profile_config.browser_scope == BrowserScope::Profile
-            && profile.profile_config.max_concurrent_sessions == 0;
-        if !unlimited && sessions.len() >= limit {
-            return Err(ProtocolError::new(
-                ErrorCode::Conflict,
-                format!(
-                    "profile '{}' reached max_concurrent_sessions ({})",
-                    profile_id, limit
-                ),
-                RecommendedAction::RetryWithBackoff,
-            ));
-        }
+        gates::check_session_limit(
+            profile_id,
+            sessions.len(),
+            profile.profile_config.max_concurrent_sessions,
+            profile.profile_config.browser_scope,
+        )?;
 
         let program = validate_principal_executable(&command[0], self.daemon_uid)?;
         let args = if command.len() > 1 {
@@ -2589,16 +2572,9 @@ impl AgentRuntime {
                 &self.browser_manager,
                 super::lock_order::LockLevel::BrowserManager,
             );
-            if let Some(false) = browser_mgr.lease_has_cdp_pipes(&lease_id) {
-                // The endpoint is not named here: it is handed out only by the bootstrap, which
-                // withholds it while the lease's interception is degraded (review L1).
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "browser-control is unavailable in port mode; get the CDP endpoint from the \
-                     browser bootstrap",
-                    RecommendedAction::FixRequest,
-                ));
-            }
+            // The endpoint is not named: only the bootstrap hands it out, and it withholds it while
+            // the lease's interception is degraded (review L1).
+            gates::check_browser_control_available(browser_mgr.lease_has_cdp_pipes(&lease_id))?;
         }
 
         let pre_audit = self.audit_gate.record(
