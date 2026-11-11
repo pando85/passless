@@ -34,10 +34,20 @@ pub struct BearerReadiness {
     pub relay_version: Option<String>,
     /// When the last connection of this bearer closed, if one did.
     pub last_disconnect: Option<Instant>,
-    /// Since when the bearer has not been both connected and attached: set by the first hello
-    /// that reports `attached = false` or by a disconnect, cleared by an attached hello. `None`
-    /// while connected and attached. A lease is degraded once this is older than its grace period.
+    /// Since when the bearer has not been intercepting ([`BearerReadiness::intercepting`]): set
+    /// by the first hello that reports `attached = false` or `incognito_allowed = false`, or by a
+    /// disconnect, cleared by a hello that reports both true. `None` while intercepting. A lease
+    /// is degraded once this is older than its grace period.
     pub detached_since: Option<Instant>,
+}
+
+impl BearerReadiness {
+    /// The worker intercepts every context of its browser: it is connected, reports the
+    /// WebAuthn proxy attached, and is allowed in incognito, so off-the-record and CDP-created
+    /// contexts are intercepted too (plan D4, D6.1). Only then is a CDP endpoint handed out.
+    pub fn intercepting(&self) -> bool {
+        self.connected && self.attached && self.incognito_allowed
+    }
 }
 
 struct Entry {
@@ -73,15 +83,14 @@ impl ReadinessRegistry {
             .map(|entry| entry.state.clone())
     }
 
-    /// Block until `bearer` is connected and attached, or until `timeout` passes. Returns the
-    /// state that satisfied the wait, or `None` on timeout.
+    /// Block until `bearer` is intercepting (connected, attached and allowed in incognito), or
+    /// until `timeout` passes. Returns the state that satisfied the wait, or `None` on timeout.
     pub fn wait_attached(&self, bearer: &str, timeout: Duration) -> Option<BearerReadiness> {
         let deadline = Instant::now() + timeout;
         let mut entries = lock_order::lock(&self.entries, LockLevel::TransportReadiness);
         loop {
             if let Some(entry) = entries.get(bearer)
-                && entry.state.connected
-                && entry.state.attached
+                && entry.state.intercepting()
             {
                 return Some(entry.state.clone());
             }
@@ -203,7 +212,9 @@ fn apply_hello(state: &mut BearerReadiness, hello: HelloState) {
     state.incognito_allowed = hello.incognito_allowed;
     state.build_version = hello.build_version;
     state.relay_version = hello.relay_version;
-    state.detached_since = if hello.attached {
+    // Attached but not allowed in incognito counts as detached: off-the-record contexts are not
+    // intercepted, so the lease degrades like one whose attachment was lost.
+    state.detached_since = if hello.attached && hello.incognito_allowed {
         None
     } else {
         state.detached_since.or(Some(Instant::now()))
@@ -230,7 +241,7 @@ mod tests {
     fn hello(attached: bool) -> HelloState {
         HelloState {
             attached,
-            incognito_allowed: false,
+            incognito_allowed: true,
             build_version: None,
             relay_version: None,
         }
@@ -257,5 +268,32 @@ mod tests {
         // An unknown bearer is not created by a repeated hello.
         assert!(!registry.on_repeated_hello("other", 3, hello(true)));
         assert!(registry.status("other").is_none());
+    }
+
+    #[test]
+    fn attached_without_incognito_access_is_not_intercepting() {
+        let registry = ReadinessRegistry::new();
+        registry.on_hello(
+            "b",
+            1,
+            HelloState {
+                attached: true,
+                incognito_allowed: false,
+                build_version: None,
+                relay_version: None,
+            },
+        );
+        let state = registry.status("b").unwrap();
+        assert!(state.connected && state.attached && !state.intercepting());
+        assert!(state.detached_since.is_some(), "counts toward degradation");
+        assert!(
+            registry
+                .wait_attached("b", Duration::from_millis(50))
+                .is_none()
+        );
+        assert!(registry.on_repeated_hello("b", 1, hello(true)));
+        let state = registry.wait_attached("b", Duration::ZERO).unwrap();
+        assert!(state.intercepting());
+        assert_eq!(state.detached_since, None);
     }
 }

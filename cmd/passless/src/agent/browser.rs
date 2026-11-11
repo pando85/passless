@@ -24,9 +24,10 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json;
 
+use super::containment::{ContainmentPlan, ContainmentPolicy, refuse_if_hidraw_accessible};
 use super::launcher::{
     DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NPROC, HardenedChildSetup,
-    close_range_preserving,
+    bind_parent_death, cloexec_except, spawn_on_launcher_thread,
 };
 use super::transport::{BearerReadiness, ReadinessRegistry};
 
@@ -277,11 +278,15 @@ impl Drop for LaunchDirGuard {
 }
 
 pub trait ChildSpawner: Send + Sync {
+    /// Spawn the pipe-mode browser. `containment` is the launch's native-path containment (ADR
+    /// 0014 section 7): the production spawner runs the browser in its private `/dev`, or makes
+    /// the child refuse to exec when its user could open a hidraw node.
     fn spawn_browser(
         &self,
         config: &BrowserConfig,
         profile_dir: &Path,
         cdp: &CdpPipes,
+        containment: &ContainmentPlan,
     ) -> Result<Child, LaunchError>;
 }
 
@@ -293,8 +298,9 @@ impl ChildSpawner for ProductionSpawner {
         config: &BrowserConfig,
         profile_dir: &Path,
         cdp: &CdpPipes,
+        containment: &ContainmentPlan,
     ) -> Result<Child, LaunchError> {
-        spawn_browser_hardened(config, profile_dir, cdp)
+        spawn_browser_hardened(config, profile_dir, cdp, containment)
     }
 }
 
@@ -308,6 +314,7 @@ impl ChildSpawner for FakeSpawner {
         config: &BrowserConfig,
         profile_dir: &Path,
         cdp: &CdpPipes,
+        _containment: &ContainmentPlan,
     ) -> Result<Child, LaunchError> {
         spawn_browser_unhardened(config, profile_dir, cdp)
     }
@@ -323,6 +330,7 @@ impl ChildSpawner for TestSpawner {
         _config: &BrowserConfig,
         _profile_dir: &Path,
         _cdp: &CdpPipes,
+        _containment: &ContainmentPlan,
     ) -> Result<Child, LaunchError> {
         Command::new("/bin/true")
             .stdin(Stdio::null())
@@ -343,6 +351,7 @@ impl ChildSpawner for DirectExecSpawner {
         config: &BrowserConfig,
         _profile_dir: &Path,
         _cdp: &CdpPipes,
+        _containment: &ContainmentPlan,
     ) -> Result<Child, LaunchError> {
         let mut cmd = Command::new(&config.executable);
         for arg in &config.extra_args {
@@ -476,6 +485,12 @@ pub enum LaunchError {
     InvalidCdpEndpoint(String),
     /// The extension worker did not report the WebAuthn proxy attached in time (plan D6 layer 1).
     InterceptionNotAttached(String),
+    /// The extension worker attached the proxy but is not allowed in incognito, so off-the-record
+    /// and CDP-created contexts would not be intercepted (plan D4, R13).
+    IncognitoNotAllowed(String),
+    /// The browser's user could open a hidraw device and no private `/dev` is available (ADR 0014
+    /// section 7, invariant 25). The message says how to fix it.
+    ContainmentRefused(String),
 }
 
 impl fmt::Display for LaunchError {
@@ -525,6 +540,17 @@ impl fmt::Display for LaunchError {
                  the daemon log for sign transport errors",
                 msg
             ),
+            LaunchError::IncognitoNotAllowed(msg) => write!(
+                f,
+                "the passless agent extension is not allowed in incognito ({}), so off-the-record \
+                 and CDP-created browser contexts would not be intercepted and their WebAuthn \
+                 requests could reach the human authenticator; the browser was stopped. The \
+                 launcher seeds Default/Preferences with incognito access for the extension; \
+                 this browser did not honour it (an unsupported browser, or one that enforces \
+                 preference MACs). Use Chromium or Chrome for Testing",
+                msg
+            ),
+            LaunchError::ContainmentRefused(msg) => f.write_str(msg),
         }
     }
 }
@@ -652,7 +678,8 @@ pub const INTERCEPTION_DEGRADED_GRACE: Duration = Duration::from_secs(10);
 /// Whether a lease's WebAuthn requests are intercepted (plan D6 layer 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterceptionState {
-    /// The worker is connected and reports the WebAuthn proxy attached.
+    /// The worker is connected, reports the WebAuthn proxy attached and is allowed in incognito
+    /// ([`BearerReadiness::intercepting`]).
     Attached,
     /// Not attached, but for less than the grace period (the worker is reconnecting), or the
     /// launch has not seen the worker attach yet.
@@ -680,7 +707,7 @@ impl InterceptionState {
         let Some(readiness) = readiness else {
             return Self::Degraded;
         };
-        if readiness.connected && readiness.attached {
+        if readiness.intercepting() {
             return Self::Attached;
         }
         match readiness.detached_since {
@@ -694,6 +721,13 @@ impl fmt::Display for InterceptionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Why a wait for a lease's worker to intercept failed.
+enum AttachFailure {
+    /// Attached, but not allowed in incognito (plan D4: the seed did not take effect).
+    IncognitoNotAllowed(String),
+    Other(String),
 }
 
 /// An interception state change that the runtime logs and audits once (see
@@ -822,6 +856,9 @@ pub struct BrowserProcessManager {
     /// Where the `sign-proxy` relay is; `None` means next to the running executable
     /// (`installed_sign_proxy_path`). Tests point it elsewhere.
     sign_proxy_path: Option<PathBuf>,
+    /// Native-path containment of the browsers it launches (ADR 0014 section 7). Production
+    /// managers use `Auto`; the test constructors turn it off for their fake browsers.
+    containment: ContainmentPolicy,
 }
 
 #[allow(dead_code)]
@@ -836,6 +873,7 @@ impl BrowserProcessManager {
             spawner: Arc::new(FakeSpawner),
             start_url_opener: Arc::new(CdpStartUrlOpener),
             sign_proxy_path: Some(tests::test_sign_proxy_path()),
+            containment: ContainmentPolicy::Off,
         }
     }
 
@@ -849,6 +887,7 @@ impl BrowserProcessManager {
             spawner,
             start_url_opener: Arc::new(CdpStartUrlOpener),
             sign_proxy_path: Some(tests::test_sign_proxy_path()),
+            containment: ContainmentPolicy::Off,
         }
     }
 
@@ -866,6 +905,7 @@ impl BrowserProcessManager {
             spawner: Arc::new(FakeSpawner),
             start_url_opener: Arc::new(CdpStartUrlOpener),
             sign_proxy_path: Some(tests::test_sign_proxy_path()),
+            containment: ContainmentPolicy::Off,
         }
     }
 
@@ -878,6 +918,7 @@ impl BrowserProcessManager {
             spawner: Arc::new(ProductionSpawner),
             start_url_opener: Arc::new(CdpStartUrlOpener),
             sign_proxy_path: None,
+            containment: ContainmentPolicy::Auto,
         }
     }
 
@@ -951,6 +992,7 @@ impl BrowserProcessManager {
             LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
         })?;
 
+        let mut relay_path = None;
         if let Some(metadata) = agent_endpoint {
             let ext_dir = generate_agent_extension(
                 &runtime_dir,
@@ -982,6 +1024,11 @@ impl BrowserProcessManager {
                 )));
             }
             install_native_messaging_manifest(&ext_dir, &sign_proxy, &profile_dir)?;
+            // The extension must also run in off-the-record and CDP-created contexts, or their
+            // requests would go native (ADR 0014 section 4.2); the worker's hello reports whether
+            // this took effect, and the launch fails closed if it did not.
+            seed_incognito_access(&profile_dir, config.target_uid, config.target_gid)?;
+            relay_path = Some(sign_proxy);
         }
 
         let profile_fp = fingerprint_path(&profile_dir).map_err(|e| {
@@ -1008,8 +1055,27 @@ impl BrowserProcessManager {
 
         let is_port_mode = config.cdp_expose == CdpExposeMode::Port;
 
+        // Native-path containment (ADR 0014 section 7, invariant 25): a private /dev through
+        // bwrap whenever it works for the browser's user, else a refusal when that user could
+        // open a hidraw node.
+        let needs_dev_shm = [
+            Some(config.executable.as_path()),
+            Some(config.runtime_root.as_path()),
+            relay_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|path| path.starts_with("/dev/shm"));
+        let hardening = config.hardening();
+        let containment = ContainmentPlan::for_launch(
+            &self.containment,
+            &hardening,
+            is_port_mode && is_trusted_same_user_port_launch(config),
+            needs_dev_shm,
+        );
+
         let (cdp_pipes, mut child, cdp_endpoint_url) = if is_port_mode {
-            let mut child = spawn_browser_port_mode(config, &profile_dir)?;
+            let mut child = spawn_browser_port_mode(config, &profile_dir, &containment)?;
             let discovered = if config.cdp_port > 0 {
                 wait_for_cdp_port(&mut child, config.cdp_port, Duration::from_secs(30))
             } else {
@@ -1022,6 +1088,9 @@ impl BrowserProcessManager {
                     return Err(err);
                 }
             };
+            // The daemon hands out the endpoint, and withholds it while the lease is degraded;
+            // Chromium's own discovery file would let a same-UID agent find the port anyway.
+            hide_devtools_active_port(&profile_dir);
             // An intercepted lease's `cdp-endpoint` file is written only once its worker attached
             // (`await_interception`) and removed while it is degraded; see `sync_cdp_endpoint_file`.
             if agent_endpoint.is_none()
@@ -1039,12 +1108,27 @@ impl BrowserProcessManager {
         } else {
             let cdp =
                 create_cdp_pipes().map_err(|e| LaunchError::PipeCreationFailed(e.to_string()))?;
-            let child = self.spawner.spawn_browser(config, &profile_dir, &cdp)?;
+            let child = self
+                .spawner
+                .spawn_browser(config, &profile_dir, &cdp, &containment)?;
             (Some(cdp), child, None)
         };
 
         let pid = child.id();
         let pgid = pid;
+        if let Some(case) = containment.case_for_log(hardening.target_uid == hardening.daemon_uid) {
+            log::info!(
+                "browser lease {} (pid {}): native-path containment {}{}",
+                lease_id,
+                pid,
+                case,
+                if containment.private_dev() {
+                    " (private /dev through bwrap)"
+                } else {
+                    " (no private /dev; the browser user cannot open any hidraw device)"
+                }
+            );
+        }
         let proc_identity = read_process_identity(pid).ok_or_else(|| {
             LaunchError::SpawnFailed(format!(
                 "failed to read identity of spawned pid {} (cgroup/start_time unavailable)",
@@ -1409,6 +1493,11 @@ impl BrowserProcessManager {
         self.sign_proxy_path = Some(path);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_containment(&mut self, containment: ContainmentPolicy) {
+        self.containment = containment;
+    }
+
     /// Blocks until the extension worker of `lease_id` said hello with `attached = true`, or
     /// `timeout` passed (plan D6 layer 1). A launch reports success only after this returns `Ok`;
     /// it marks the lease's interception confirmed.
@@ -1423,7 +1512,10 @@ impl BrowserProcessManager {
     ) -> Result<BearerReadiness, LaunchError> {
         let state = self
             .wait_for_attach(lease_id, readiness, timeout)
-            .map_err(LaunchError::InterceptionNotAttached)?;
+            .map_err(|failure| match failure {
+                AttachFailure::IncognitoNotAllowed(why) => LaunchError::IncognitoNotAllowed(why),
+                AttachFailure::Other(why) => LaunchError::InterceptionNotAttached(why),
+            })?;
         if let Some(lease) = self.leases.get_mut(lease_id)
             && let Some(interception) = lease.interception.as_mut()
         {
@@ -1441,23 +1533,32 @@ impl BrowserProcessManager {
         timeout: Duration,
     ) -> Result<BearerReadiness, String> {
         self.wait_for_attach(lease_id, readiness, timeout)
+            .map_err(|failure| match failure {
+                AttachFailure::IncognitoNotAllowed(why) | AttachFailure::Other(why) => why,
+            })
     }
 
-    /// Waits in short slices so a browser that exits during the wait ends it at once.
+    /// Waits in short slices so a browser that exits during the wait ends it at once. A worker
+    /// that attached but stays without incognito access for `INCOGNITO_SETTLE` fails the wait
+    /// early: its probe has finished, and the seed did not take effect.
     fn wait_for_attach(
         &mut self,
         lease_id: &BrowserLeaseId,
         readiness: &ReadinessRegistry,
         timeout: Duration,
-    ) -> Result<BearerReadiness, String> {
+    ) -> Result<BearerReadiness, AttachFailure> {
         const SLICE: Duration = Duration::from_millis(250);
+        const INCOGNITO_SETTLE: Duration = Duration::from_secs(3);
         let bearer = self
             .leases
             .get(lease_id)
             .and_then(|lease| lease.interception.as_ref())
             .map(|interception| interception.bearer.clone())
-            .ok_or("the lease was launched without the extension")?;
+            .ok_or_else(|| {
+                AttachFailure::Other("the lease was launched without the extension".to_string())
+            })?;
         let deadline = Instant::now() + timeout;
+        let mut without_incognito_since: Option<Instant> = None;
         loop {
             let slice = deadline
                 .saturating_duration_since(Instant::now())
@@ -1471,15 +1572,35 @@ impl BrowserProcessManager {
                 .and_then(|lease| lease.child.as_mut())
                 && let Ok(Some(status)) = child.try_wait()
             {
-                return Err(format!("the browser exited first ({status})"));
+                return Err(AttachFailure::Other(format!(
+                    "the browser exited first ({status})"
+                )));
+            }
+            let status = readiness.status(&bearer);
+            let attached_without_incognito = status
+                .as_ref()
+                .is_some_and(|s| s.connected && s.attached && !s.incognito_allowed);
+            if attached_without_incognito {
+                let since = *without_incognito_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= INCOGNITO_SETTLE || Instant::now() >= deadline {
+                    return Err(AttachFailure::IncognitoNotAllowed(
+                        "the extension worker reported isAllowedIncognitoAccess() = false"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                without_incognito_since = None;
             }
             if Instant::now() >= deadline {
-                let why = match readiness.status(&bearer) {
+                let why = match status {
                     None => "the extension worker never connected to the daemon",
                     Some(state) if !state.connected => "the extension worker's connection closed",
                     Some(_) => "the extension worker reported attached = false",
                 };
-                return Err(format!("{why} within {:.1} s", timeout.as_secs_f32()));
+                return Err(AttachFailure::Other(format!(
+                    "{why} within {:.1} s",
+                    timeout.as_secs_f32()
+                )));
             }
         }
     }
@@ -2567,16 +2688,19 @@ fn spawn_browser_hardened(
     config: &BrowserConfig,
     profile_dir: &Path,
     cdp: &CdpPipes,
+    containment: &ContainmentPlan,
 ) -> Result<Child, LaunchError> {
     let setup = config.hardening();
     setup
         .validate()
         .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
 
-    let mut cmd = build_browser_command(config, profile_dir)?;
+    let mut cmd = containment.wrap(build_browser_command(config, profile_dir)?);
 
     let fd_read = cdp.browser_from_daemon_read;
     let fd_write = cdp.browser_to_daemon_write;
+    let hidraw_nodes = containment.hidraw_nodes_to_check().to_vec();
+    let parent = std::process::id() as libc::pid_t;
 
     unsafe {
         cmd.pre_exec(move || {
@@ -2604,12 +2728,23 @@ fn spawn_browser_hardened(
                 return Err(io::Error::last_os_error());
             }
 
-            setup.apply(&[0, 1, 2, CDP_FD_READ, CDP_FD_WRITE])
+            setup.apply(&[0, 1, 2, CDP_FD_READ, CDP_FD_WRITE], parent)?;
+            // Evaluated as the browser's UID, after the drop (empty under bwrap).
+            refuse_if_hidraw_accessible(&hidraw_nodes)
         });
     }
 
-    cmd.spawn()
-        .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+    spawn_contained(cmd, containment)
+}
+
+/// Spawn a browser command from the long-lived launcher thread (defect B1: its parent-death
+/// signal must mean "the daemon died", not "the request thread returned"), and turn the child's
+/// containment refusal into its actionable launch error.
+fn spawn_contained(cmd: Command, containment: &ContainmentPlan) -> Result<Child, LaunchError> {
+    spawn_on_launcher_thread(cmd).map_err(|e| match containment.refusal(&e) {
+        Some(message) => LaunchError::ContainmentRefused(message),
+        None => LaunchError::SpawnFailed(e.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -2701,6 +2836,7 @@ fn is_trusted_same_user_port_launch(config: &BrowserConfig) -> bool {
 fn spawn_browser_port_mode(
     config: &BrowserConfig,
     profile_dir: &Path,
+    containment: &ContainmentPlan,
 ) -> Result<Child, LaunchError> {
     let setup = config.hardening();
     setup
@@ -2708,37 +2844,86 @@ fn spawn_browser_port_mode(
         .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
 
     let trusted_same_user = is_trusted_same_user_port_launch(config);
-    let mut cmd = build_browser_command(config, profile_dir)?;
+    let mut cmd = containment.wrap(build_browser_command(config, profile_dir)?);
     cmd.stderr(Stdio::inherit());
 
-    let bind_parent_death = config.bind_parent_death;
+    let bind_parent_death_signal = config.bind_parent_death;
+    let hidraw_nodes = containment.hidraw_nodes_to_check().to_vec();
+    let parent = std::process::id() as libc::pid_t;
 
     unsafe {
         cmd.pre_exec(move || {
             if trusted_same_user {
-                if close_range_preserving(&[0, 1, 2]).is_err() {
-                    return Err(io::Error::last_os_error());
-                }
+                cloexec_except(&[0, 1, 2])?;
 
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
 
-                if bind_parent_death
-                    && libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) < 0
-                {
-                    return Err(io::Error::last_os_error());
+                if bind_parent_death_signal {
+                    bind_parent_death(libc::SIGTERM, parent)?;
                 }
-
-                Ok(())
             } else {
-                setup.apply(&[0, 1, 2])
+                setup.apply(&[0, 1, 2], parent)?;
             }
+            // Evaluated as the browser's UID (empty under bwrap).
+            refuse_if_hidraw_accessible(&hidraw_nodes)
         });
     }
 
-    cmd.spawn()
-        .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+    spawn_contained(cmd, containment)
+}
+
+/// Removes Chromium's `DevToolsActivePort` from a port-mode profile once the daemon has read the
+/// endpoint (plan P10, D6.1): the daemon hands the endpoint out only while the lease is attached,
+/// and the file would let a same-UID agent find the loopback port without asking. This is
+/// discovery hygiene, not a boundary: a same-UID process can still find the browser's listening
+/// socket (`/proc/net/tcp` and its own processes' descriptors), and the file exists from the
+/// browser's start until this call (ADR 0014 section 7).
+fn hide_devtools_active_port(profile_dir: &Path) {
+    match fs::remove_file(profile_dir.join("DevToolsActivePort")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(
+            "cannot remove {}: {e}",
+            profile_dir.join("DevToolsActivePort").display()
+        ),
+    }
+}
+
+/// Seeds the fresh profile so that the interception extension is allowed in incognito, before
+/// the browser's first launch (ADR 0014 section 4.2, plan D4 R13): `Default/Preferences` with
+/// `extensions.settings.<id>.incognito = true`, `<id>` being the ID that the manifest `key` fixes.
+/// Without it, off-the-record profiles and `Target.createBrowserContext` contexts (Playwright
+/// `newContext()`, Playwright MCP `--isolated`, chrome-devtools-mcp `isolatedContext`) are not
+/// intercepted and their requests go native. The worker reports
+/// `chrome.extension.isAllowedIncognitoAccess()` in its hello, and the launch fails closed unless
+/// it is true, so a seed that did not take effect is a launch error.
+fn seed_incognito_access(
+    profile_dir: &Path,
+    target_uid: u32,
+    target_gid: u32,
+) -> Result<(), LaunchError> {
+    let extension_id = compute_extension_id(EXTENSION_MANIFEST_TEMPLATE)?;
+    let default_dir = profile_dir.join("Default");
+    create_lease_dir(&default_dir, RUNTIME_DIR_MODE, target_uid, target_gid).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "create {}: {e}; cannot seed incognito access for the passless agent extension",
+            default_dir.display()
+        ))
+    })?;
+    let preferences = serde_json::json!({
+        "extensions": {"settings": {extension_id: {"incognito": true}}}
+    })
+    .to_string();
+    write_extension_file(
+        &default_dir,
+        "Preferences",
+        &preferences,
+        0o600,
+        target_uid,
+        target_gid,
+    )
 }
 
 fn ensure_browser_running(child: &mut Child) -> Result<(), LaunchError> {
@@ -7673,6 +7858,7 @@ mod tests {
             _config: &BrowserConfig,
             _profile_dir: &Path,
             _cdp: &CdpPipes,
+            _containment: &ContainmentPlan,
         ) -> Result<Child, LaunchError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Command::new("/bin/true")
@@ -7913,6 +8099,7 @@ mod tests {
             config: &BrowserConfig,
             profile_dir: &Path,
             _cdp: &CdpPipes,
+            _containment: &ContainmentPlan,
         ) -> Result<Child, LaunchError> {
             let cmd = build_browser_command(config, profile_dir)?;
             *self.0.lock().unwrap() = cmd
@@ -8227,7 +8414,7 @@ mod tests {
         };
         // Before the launch saw the worker attach the lease is pending, and nothing is polled.
         assert_eq!(state(&launch), InterceptionState::Pending);
-        launch.readiness.simulate_hello(BEARER, 1, true, false);
+        launch.readiness.simulate_hello(BEARER, 1, true, true);
         assert!(
             launch
                 .mgr
@@ -8280,8 +8467,19 @@ mod tests {
                 .is_empty()
         );
 
-        // The worker re-attaches: attached again, reported once.
+        // Attached without incognito access does not end it either (plan D4: off-the-record
+        // contexts would not be intercepted).
         launch.readiness.simulate_hello(BEARER, 2, true, false);
+        assert_eq!(state(&launch), InterceptionState::Degraded);
+        assert!(
+            launch
+                .mgr
+                .poll_interception(&launch.readiness, grace)
+                .is_empty()
+        );
+
+        // The worker re-attaches: attached again, reported once.
+        launch.readiness.simulate_hello(BEARER, 2, true, true);
         assert_eq!(state(&launch), InterceptionState::Attached);
         let transitions = launch.mgr.poll_interception(&launch.readiness, grace);
         assert_eq!(transitions.len(), 1);
@@ -8301,7 +8499,7 @@ mod tests {
         let readiness = |connected, attached, detached_for: Option<u64>| BearerReadiness {
             connected,
             attached,
-            incognito_allowed: false,
+            incognito_allowed: true,
             build_version: None,
             relay_version: None,
             last_disconnect: None,
@@ -8335,6 +8533,247 @@ mod tests {
             InterceptionState::Degraded
         );
         assert_eq!(of(None), InterceptionState::Degraded);
+        // Attached without incognito access is not attached (plan D4).
+        let no_incognito = BearerReadiness {
+            incognito_allowed: false,
+            ..readiness(true, true, None)
+        };
+        assert_eq!(of(Some(no_incognito)), InterceptionState::Degraded);
+    }
+
+    /// Plan D4 fail-closed verification: a worker that attached the proxy but is not allowed in
+    /// incognito fails the launch with the incognito error, early, and the CDP endpoint file is
+    /// never written.
+    #[test]
+    fn test_launch_fails_closed_when_the_extension_is_not_allowed_in_incognito() {
+        let mut launch = intercepted_launch();
+        launch
+            .mgr
+            .leases
+            .get_mut(&launch.lease_id)
+            .unwrap()
+            .cdp_endpoint = Some("ws://127.0.0.1:9333/devtools/browser/abc".to_string());
+        launch.readiness.simulate_hello(BEARER, 1, true, false);
+        let started = Instant::now();
+        let err = launch
+            .mgr
+            .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(20))
+            .unwrap_err();
+        assert!(
+            matches!(err, LaunchError::IncognitoNotAllowed(_)),
+            "{err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "fails once the worker's state settled, not at the attach timeout"
+        );
+        assert!(err.to_string().contains("incognito"), "{err}");
+        let file = launch.mgr.leases[&launch.lease_id]
+            .manifest
+            .runtime_dir
+            .join("cdp-endpoint");
+        assert!(!file.exists(), "no endpoint for a worker without incognito");
+
+        // A worker whose incognito probe finished a moment after its attach is ready.
+        let mut launch = intercepted_launch();
+        let readiness = launch.readiness.clone();
+        let worker = std::thread::spawn(move || {
+            readiness.simulate_hello(BEARER, 1, true, false);
+            std::thread::sleep(Duration::from_millis(300));
+            readiness.simulate_hello(BEARER, 1, true, true);
+        });
+        let state = launch
+            .mgr
+            .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(10))
+            .unwrap();
+        worker.join().unwrap();
+        assert!(state.intercepting());
+    }
+
+    /// A pipe-mode launch through the production spawner, as the daemon does, of a stand-in
+    /// browser (`exec sleep 60`) for the current user, under `containment`.
+    fn production_launch(
+        dir: &Path,
+        containment: ContainmentPolicy,
+    ) -> (BrowserProcessManager, Result<BrowserLeaseId, LaunchError>) {
+        let fake = dir.join("fake-browser");
+        fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut config = test_config(dir);
+        config.executable = fake;
+        config.daemon_uid = uid;
+        config.daemon_gid = gid;
+        config.cdp_expose = CdpExposeMode::Pipe;
+        config.bind_parent_death = true;
+        let mut mgr =
+            BrowserProcessManager::with_spawner(test_clock(), Arc::new(ProductionSpawner));
+        mgr.set_containment(containment);
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: BEARER.to_string(),
+        };
+        let launched = mgr.launch_pending_with_agent_endpoint(
+            &config,
+            test_endpoint_id(),
+            test_profile_id(),
+            Some(&metadata),
+        );
+        (mgr, launched)
+    }
+
+    /// Defect B1 regression (`browser_scope = "session"`): a browser launched with a parent-death
+    /// signal from a short-lived request thread keeps running once that thread has returned,
+    /// because the production spawn forks it on the long-lived launcher thread.
+    #[test]
+    fn test_b1_browser_outlives_the_request_thread_that_launched_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let (mut mgr, lease_id) =
+            std::thread::spawn(move || production_launch(&path, ContainmentPolicy::Off))
+                .join()
+                .unwrap();
+        let lease_id = lease_id.expect("the launch succeeds");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            mgr.check_exits().is_empty(),
+            "the browser must survive the exit of the thread that launched it"
+        );
+        let pid = mgr.snapshot(&lease_id).unwrap().pid;
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let ppid = format!("{}", std::process::id());
+        assert!(
+            status
+                .lines()
+                .any(|l| l.starts_with("PPid:") && l.split_whitespace().nth(1) == Some(&ppid)),
+            "the browser is the daemon's child"
+        );
+        let _ = mgr.terminate(&lease_id);
+    }
+
+    /// ADR 0014 section 7: with bwrap the production spawn runs the browser in a private /dev.
+    #[test]
+    fn test_production_launch_runs_the_browser_under_bwrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let bwrap = crate::agent::containment::tests::fake_bwrap(bin.path());
+        let dev = tempfile::tempdir().unwrap();
+        fs::write(dev.path().join("hidraw0"), b"").unwrap();
+        let (mut mgr, lease_id) = production_launch(
+            dir.path(),
+            ContainmentPolicy::Injected {
+                bwrap: Some(bwrap),
+                dev_dir: dev.path().to_path_buf(),
+            },
+        );
+        let lease_id = lease_id.expect("the launch succeeds under bwrap");
+        // The probe ran `true` (8 arguments); wait for the launch's own run to be recorded.
+        let log = bin.path().join("bwrap.args");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let recorded = loop {
+            let recorded = fs::read_to_string(&log).unwrap_or_default();
+            if recorded.lines().count() > 8 + 7 || Instant::now() >= deadline {
+                break recorded;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let launch_args: Vec<&str> = recorded.lines().skip(8).collect();
+        assert_eq!(
+            &launch_args[..7],
+            [
+                "--dev-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--die-with-parent",
+                "--"
+            ],
+            "{recorded}"
+        );
+        assert!(launch_args[7].ends_with("fake-browser"), "{recorded}");
+        assert!(launch_args.contains(&"--remote-debugging-pipe"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(mgr.check_exits().is_empty(), "the wrapped browser runs");
+        let _ = mgr.terminate(&lease_id);
+    }
+
+    /// ADR 0014 section 7: without bwrap, a browser user that can open a hidraw node is refused
+    /// with an actionable error, and nothing of the launch is left behind.
+    #[test]
+    fn test_production_launch_is_refused_without_bwrap_when_hidraw_is_accessible() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = tempfile::tempdir().unwrap();
+        fs::write(dev.path().join("hidraw3"), b"").unwrap();
+        let (mgr, launched) = production_launch(
+            dir.path(),
+            ContainmentPolicy::Injected {
+                bwrap: None,
+                dev_dir: dev.path().to_path_buf(),
+            },
+        );
+        let err = launched.expect_err("refused");
+        let LaunchError::ContainmentRefused(message) = &err else {
+            panic!("expected the containment refusal, got {err:?}");
+        };
+        assert!(message.contains("hidraw3"), "{message}");
+        assert!(message.contains("bubblewrap"), "{message}");
+        assert_eq!(mgr.lease_count(), 0);
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join("runtime-root"))
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "the runtime dir is removed");
+
+        // With no accessible hidraw node, containment is not required and the launch proceeds.
+        let dir = tempfile::tempdir().unwrap();
+        let empty_dev = tempfile::tempdir().unwrap();
+        let (mut mgr, launched) = production_launch(
+            dir.path(),
+            ContainmentPolicy::Injected {
+                bwrap: None,
+                dev_dir: empty_dev.path().to_path_buf(),
+            },
+        );
+        let lease_id = launched.expect("not required");
+        let _ = mgr.terminate(&lease_id);
+    }
+
+    /// Plan P10 (D6.1): Chromium's DevToolsActivePort is removed once the daemon read it.
+    #[test]
+    fn test_hide_devtools_active_port_removes_the_discovery_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("DevToolsActivePort");
+        fs::write(&file, "9222\n/devtools/browser/x\n").unwrap();
+        hide_devtools_active_port(dir.path());
+        assert!(!file.exists());
+        hide_devtools_active_port(dir.path());
+    }
+
+    /// Plan D4 seeding: the fresh profile allows the extension in incognito before the first
+    /// launch, keyed by the ID that the manifest `key` fixes.
+    #[test]
+    fn test_launch_seeds_incognito_access_for_the_extension() {
+        let launch = intercepted_launch();
+        let profile_dir = &launch.mgr.leases[&launch.lease_id].manifest.profile_dir;
+        let preferences = profile_dir.join("Default").join("Preferences");
+        let seeded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&preferences).unwrap()).unwrap();
+        assert_eq!(
+            seeded,
+            serde_json::json!({"extensions": {"settings": {AGENT_EXTENSION_ID: {"incognito": true}}}})
+        );
+        assert_eq!(
+            fs::metadata(&preferences).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(profile_dir.join("Default"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]
@@ -8418,7 +8857,7 @@ mod tests {
             .join("cdp-endpoint");
         assert!(!file.exists(), "not before the worker attached");
 
-        launch.readiness.simulate_hello(BEARER, 1, true, false);
+        launch.readiness.simulate_hello(BEARER, 1, true, true);
         launch
             .mgr
             .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(1))
@@ -8440,7 +8879,7 @@ mod tests {
         );
         assert!(!file.exists(), "removed while degraded");
 
-        launch.readiness.simulate_hello(BEARER, 2, true, false);
+        launch.readiness.simulate_hello(BEARER, 2, true, true);
         assert_eq!(
             launch.mgr.poll_interception(&launch.readiness, grace).len(),
             1

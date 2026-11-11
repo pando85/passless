@@ -69,6 +69,8 @@ pub struct RuntimeStartParams<'a> {
     pub shutdown: Arc<AtomicBool>,
     /// Where a policy reload re-reads the configuration from. `None` disables reload.
     pub config_source: Option<AgentConfigSource>,
+    /// `PASSLESS_INTERACTION_MODE=automatic` is in force for the human path (R19).
+    pub human_path_automatic: bool,
 }
 
 /// The configuration file a policy reload re-reads and validates (ADR 0014 section 6.4).
@@ -272,6 +274,7 @@ fn reload_policy_from_source(
     source: Option<&AgentConfigSource>,
     current: &AgentConfig,
     policy_runtime: &PolicyRuntime,
+    human_path_automatic: bool,
 ) -> Result<(AgentConfig, super::policy_engine::ReloadOutcome), String> {
     let source =
         source.ok_or_else(|| "the daemon was started without a configuration file".to_string())?;
@@ -279,6 +282,11 @@ fn reload_policy_from_source(
     if let Some(reason) = current.reload_incompatibility(&config) {
         return Err(format!("{} (restart the daemon to apply it)", reason));
     }
+    // R19 holds for a reloaded configuration too: it may not add an `allow` or `request` rule to
+    // a same-user profile while the human path is automatic, unless acknowledged.
+    config
+        .validate_human_path_interaction(human_path_automatic)
+        .map_err(|e| e.to_string())?;
     let outcome = policy_runtime
         .reload(&config)
         .map_err(|e| format!("policy recompile failed: {}", e))?;
@@ -787,6 +795,8 @@ pub struct AgentRuntime {
     granted_rules: Arc<GrantedRulesStore>,
     /// The escalation coordinator every `request` resolution waits on (ADR 0014 section 8).
     escalation: Arc<EscalationService>,
+    /// `PASSLESS_INTERACTION_MODE=automatic` was in force at start; reloads keep R19.
+    human_path_automatic: bool,
 }
 
 impl AgentRuntime {
@@ -801,6 +811,7 @@ impl AgentRuntime {
         security_config: SecurityConfig,
         shutdown: Arc<AtomicBool>,
         config_source: Option<AgentConfigSource>,
+        human_path_automatic: bool,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factories(RuntimeStartParams {
             human_storage,
@@ -812,6 +823,7 @@ impl AgentRuntime {
             security_config,
             shutdown,
             config_source,
+            human_path_automatic,
         })
     }
 
@@ -826,7 +838,14 @@ impl AgentRuntime {
             security_config,
             shutdown,
             config_source,
+            human_path_automatic,
         } = params;
+        // R19 (ADR 0014 section 7): with the human path approving its own prompts, a request
+        // that reached the native path would be signed silently. Refused before anything starts;
+        // the human path stays available.
+        agent_config
+            .validate_human_path_interaction(human_path_automatic)
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
         let human_backend = CredentialBackendHandle::human(
             human_storage,
             human_pin_storage,
@@ -1294,6 +1313,7 @@ impl AgentRuntime {
             sign_readiness,
             granted_rules,
             escalation,
+            human_path_automatic,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -3099,6 +3119,7 @@ impl AgentRuntime {
                 self.config_source.as_ref(),
                 &current,
                 &self.policy_runtime,
+                self.human_path_automatic,
             )
             .map_err(rejected)?;
             self.escalation.set_cooldown(config.escalation_cooldown());
@@ -4048,7 +4069,10 @@ impl AgentRuntime {
                 .browser_cdp_expose
                 .unwrap_or(CdpExposeMode::Pipe),
             cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
-            bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
+            // Every scope: the browser is forked on the long-lived launcher thread, so its
+            // parent-death signal fires only when the daemon dies (defect B1); revocation,
+            // expiry and session end terminate it explicitly.
+            bind_parent_death: true,
         };
 
         let mut browser_manager = super::lock_order::lock(
@@ -4940,10 +4964,22 @@ register = "deny"
         (dir, source, config, runtime)
     }
 
+    /// R19 holds on reload: with the human path automatic, a configuration whose same-user
+    /// profile has an `allow` rule is rejected and the old generation kept.
+    #[test]
+    fn reload_keeps_the_automatic_human_path_guard() {
+        let (_dir, source, config, runtime) = reload_fixture();
+        let err = reload_policy_from_source(Some(&source), &config, &runtime, true).unwrap_err();
+        assert!(err.contains("allow_automatic_human_path"), "{err}");
+        assert_eq!(runtime.generation_number(), 1);
+        assert_eq!(runtime.revocation_epoch(), 1);
+    }
+
     #[test]
     fn reload_with_an_unchanged_file_revokes_nothing() {
         let (_dir, source, config, runtime) = reload_fixture();
-        let (_, outcome) = reload_policy_from_source(Some(&source), &config, &runtime).unwrap();
+        let (_, outcome) =
+            reload_policy_from_source(Some(&source), &config, &runtime, false).unwrap();
         assert!(!outcome.changed);
         assert_eq!(runtime.generation_number(), 1);
         assert_eq!(runtime.revocation_epoch(), 1);
@@ -4957,7 +4993,8 @@ register = "deny"
             &dir.path().join("audit"),
             "max_operations = 5\n",
         );
-        let (next, outcome) = reload_policy_from_source(Some(&source), &config, &runtime).unwrap();
+        let (next, outcome) =
+            reload_policy_from_source(Some(&source), &config, &runtime, false).unwrap();
         assert!(outcome.changed);
         assert_eq!(next.profiles["coding"].max_operations, 5);
         assert_eq!(runtime.generation_number(), 2);
@@ -4980,7 +5017,7 @@ register = "deny"
 
         // Not TOML.
         std::fs::write(&source.path, "[agents\nenabled = ").unwrap();
-        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
         rejected(&runtime);
 
         // TOML, but an unknown rule action.
@@ -4989,7 +5026,7 @@ register = "deny"
             .unwrap()
             .replace("authenticate = \"allow\"", "authenticate = \"maybe\"");
         std::fs::write(&source.path, text).unwrap();
-        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
         rejected(&runtime);
 
         // Valid, but fails `AgentConfig::validate` (max_operations out of range).
@@ -4998,7 +5035,7 @@ register = "deny"
             &dir.path().join("audit"),
             "max_operations = 0\n",
         );
-        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
         rejected(&runtime);
 
         // A change only a restart can apply.
@@ -5013,17 +5050,17 @@ register = "deny"
             1,
         );
         std::fs::write(&source.path, text).unwrap();
-        let err = reload_policy_from_source(Some(&source), &config, &runtime).unwrap_err();
+        let err = reload_policy_from_source(Some(&source), &config, &runtime, false).unwrap_err();
         assert!(err.contains("restart"), "{err}");
         rejected(&runtime);
 
         // A missing file.
         std::fs::remove_file(&source.path).unwrap();
-        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
         rejected(&runtime);
 
         // No configuration file at all.
-        assert!(reload_policy_from_source(None, &config, &runtime).is_err());
+        assert!(reload_policy_from_source(None, &config, &runtime, false).is_err());
         rejected(&runtime);
     }
 

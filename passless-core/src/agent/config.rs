@@ -1219,6 +1219,13 @@ pub struct AgentConfig {
     /// Seconds during which a denied or expired escalation key is denied without a prompt.
     #[serde(default = "default_escalation_cooldown")]
     pub escalation_cooldown: u64,
+
+    /// Accept running agents while `PASSLESS_INTERACTION_MODE=automatic` auto-approves the human
+    /// authenticator's prompts (ADR 0014 section 7, R19). Without it, the daemon refuses to start
+    /// agents in that mode when any same-user profile has an `allow` or `request` rule, because a
+    /// request from a managed browser that reached the native path would be signed silently.
+    #[serde(default)]
+    pub allow_automatic_human_path: bool,
 }
 
 /// Default global cap on concurrent agent ceremony requests.
@@ -1314,6 +1321,7 @@ impl Default for AgentConfig {
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: DEFAULT_ESCALATION_COOLDOWN_SECS,
+            allow_automatic_human_path: false,
         }
     }
 }
@@ -1348,6 +1356,49 @@ impl AgentConfig {
             .filter(|path| path.is_absolute())
             .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))?;
         Some(base.join("passless").join("agent"))
+    }
+
+    /// The same-user profiles with an `allow` or `request` rule for either action: with the human
+    /// path in automatic interaction mode, a request of theirs that reached the native path would
+    /// be signed without anybody approving it (ADR 0014 section 7, R19).
+    pub fn profiles_exposed_to_automatic_human_path(&self) -> Vec<&str> {
+        self.profiles
+            .iter()
+            .filter(|(_, profile)| profile.mode == AgentMode::SameUser)
+            .filter(|(_, profile)| {
+                profile.rules.iter().any(|rule| {
+                    [rule.authenticate, rule.register]
+                        .iter()
+                        .any(|action| matches!(action, RuleAction::Allow | RuleAction::Request))
+                })
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// R19: refuse agents while the human path is in automatic interaction mode
+    /// (`PASSLESS_INTERACTION_MODE=automatic`) and a same-user profile has an `allow` or
+    /// `request` rule, unless `allow_automatic_human_path` acknowledges it.
+    pub fn validate_human_path_interaction(&self, human_path_automatic: bool) -> Result<()> {
+        if !human_path_automatic || self.allow_automatic_human_path {
+            return Ok(());
+        }
+        let exposed = self.profiles_exposed_to_automatic_human_path();
+        if exposed.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Config(format!(
+            "PASSLESS_INTERACTION_MODE=automatic approves the human authenticator's prompts \
+             without user interaction, and same-user agent profile(s) {} have allow or request \
+             rules: a WebAuthn request from a managed browser that reached the native path would \
+             be signed silently. Unset PASSLESS_INTERACTION_MODE (or set it to desktop), or set \
+             agents.allow_automatic_human_path = true to accept this",
+            exposed
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
 
     /// The escalation timeout cap, if configured.
@@ -2091,6 +2142,7 @@ mod tests {
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2165,6 +2217,7 @@ product_id = 22136
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2189,6 +2242,60 @@ product_id = 22136
         let profile = make_isolated_profile();
         let pid = ProfileId::new("test").unwrap();
         assert!(profile.validate(&pid).is_ok());
+    }
+
+    /// R19 (ADR 0014 section 7): automatic interaction mode on the human path refuses agents
+    /// when a same-user profile has an `allow` or `request` rule, unless acknowledged.
+    #[test]
+    fn automatic_human_path_refuses_same_user_allow_and_request_rules_unless_acknowledged() {
+        let parse = |extra: &str, mode: &str, authenticate: &str, register: &str| -> AgentConfig {
+            toml::from_str(&format!(
+                r#"
+enabled = true
+{extra}
+
+[profiles.agent]
+mode = "{mode}"
+principal_user = "alice"
+
+[[profiles.agent.rules]]
+rp_id = "example.com"
+authenticate = "{authenticate}"
+register = "{register}"
+"#
+            ))
+            .unwrap()
+        };
+        for (authenticate, register) in [("allow", "deny"), ("request", "deny"), ("deny", "allow")]
+        {
+            let config = parse("", "same-user", authenticate, register);
+            assert_eq!(config.profiles_exposed_to_automatic_human_path(), ["agent"]);
+            let err = config
+                .validate_human_path_interaction(true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("allow_automatic_human_path"), "{err}");
+            assert!(err.contains("'agent'"), "{err}");
+            assert!(config.validate_human_path_interaction(false).is_ok());
+            let acknowledged = parse(
+                "allow_automatic_human_path = true",
+                "same-user",
+                authenticate,
+                register,
+            );
+            assert!(acknowledged.validate_human_path_interaction(true).is_ok());
+        }
+        // Deny-only same-user profiles and isolated profiles are not exposed.
+        let deny_only = parse("", "same-user", "deny", "deny");
+        assert!(deny_only.validate_human_path_interaction(true).is_ok());
+        let isolated = parse("", "isolated", "allow", "deny");
+        assert!(
+            isolated
+                .profiles_exposed_to_automatic_human_path()
+                .is_empty()
+        );
+        assert!(isolated.validate_human_path_interaction(true).is_ok());
+        assert!(!AgentConfig::default().allow_automatic_human_path);
     }
 
     #[test]
@@ -2308,6 +2415,7 @@ verbose = false
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2359,6 +2467,7 @@ verbose = false
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2404,6 +2513,7 @@ product_id = 2
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles: BTreeMap::new(),
@@ -2422,6 +2532,7 @@ product_id = 2
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: false,
             profiles: BTreeMap::new(),
@@ -2468,6 +2579,7 @@ product_id = 2
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2644,6 +2756,7 @@ backend_type = "local"
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2705,6 +2818,7 @@ backend_type = "local"
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2758,6 +2872,7 @@ backend_type = "local"
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3136,6 +3251,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3244,6 +3360,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3293,6 +3410,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             state_dir: None,
             escalation_timeout: None,
             escalation_cooldown: 600,
+            allow_automatic_human_path: false,
             limits: Default::default(),
             enabled: true,
             profiles,

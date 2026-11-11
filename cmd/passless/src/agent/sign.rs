@@ -3036,6 +3036,7 @@ pub(crate) mod tests {
                 state_dir: None,
                 escalation_timeout: None,
                 escalation_cooldown: 600,
+                allow_automatic_human_path: false,
                 limits: Default::default(),
                 enabled: true,
                 profiles,

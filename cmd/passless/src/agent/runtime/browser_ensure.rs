@@ -261,7 +261,10 @@ impl AgentRuntime {
             daemon_gid: profile.daemon_gid,
             cdp_expose: CdpExposeMode::Port,
             cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
-            bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
+            // Every scope: the browser is forked on the long-lived launcher thread, so its
+            // parent-death signal fires only when the daemon dies (defect B1); revocation,
+            // expiry and session end terminate it explicitly.
+            bind_parent_death: true,
         };
 
         // The browser's relay must be able to reach a sign socket of its own UID; refuse up front

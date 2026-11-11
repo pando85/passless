@@ -183,8 +183,8 @@ fn require_attached(
         ProtocolError::new(
             ErrorCode::Conflict,
             "the managed browser's WebAuthn interception is degraded: its passless extension \
-             worker is not attached, so the CDP endpoint is withheld until it re-attaches \
-             (see `passless agent browser-status`)",
+             worker is not attached, or is not allowed in incognito, so the CDP endpoint is \
+             withheld until it re-attaches (see `passless agent browser-status`)",
             RecommendedAction::RetryWithBackoff,
         )
     };
@@ -322,11 +322,17 @@ mod tests {
         assert!(err.message.contains("degraded"), "{}", err.message);
         assert!(err.message.contains("withheld"), "{}", err.message);
 
+        // Attached without incognito access is still withheld (plan D4, D6.1).
         f.readiness.simulate_hello(BEARER, 2, true, false);
+        let err = require_attached(&mut f.mgr, &f.readiness, &f.lease_id, GRACE).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("incognito"), "{}", err.message);
+
+        f.readiness.simulate_hello(BEARER, 2, true, true);
         let (state, incognito) =
             require_attached(&mut f.mgr, &f.readiness, &f.lease_id, GRACE).unwrap();
         assert_eq!(state, InterceptionState::Attached);
-        assert!(!incognito);
+        assert!(incognito);
     }
 
     #[test]

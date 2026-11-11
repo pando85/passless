@@ -684,22 +684,34 @@ impl HardenedChildSetup {
         self.target_uid == self.daemon_uid && self.target_gid == self.daemon_gid
     }
 
+    /// Pre-exec setup of a hardened child (a principal or a managed browser):
+    ///
+    /// 1. for another user, every inherited descriptor except `preserved_fds` is marked
+    ///    close-on-exec (not closed: Rust's exec-error pipe must survive until exec, so that a
+    ///    failing step below, or the exec itself, reaches `Command::spawn`);
+    /// 2. `setsid`;
+    /// 3. for another user, `setgroups(0)`, `setgid`, `setuid`, irreversibly;
+    /// 4. `PR_SET_PDEATHSIG(SIGTERM)` when `bind_parent_death`, **after** the credential change,
+    ///    which clears it, then a check that `parent` is still the parent (it may have died before
+    ///    the signal was armed). The signal follows the *thread* that forked the child, so a child
+    ///    that must outlive the request that started it is spawned from the long-lived launcher
+    ///    thread ([`spawn_on_launcher_thread`], defect B1);
+    /// 5. `PR_SET_NO_NEW_PRIVS`, then the rlimits for another user.
+    ///
     /// # Safety
     ///
     /// Must be called in the forked child before `exec`. `preserved_fds` must
     /// contain only descriptors intentionally transferred to the principal.
-    pub unsafe fn apply(&self, preserved_fds: &[RawFd]) -> Result<(), io::Error> {
+    pub unsafe fn apply(
+        &self,
+        preserved_fds: &[RawFd],
+        parent: libc::pid_t,
+    ) -> Result<(), io::Error> {
         if !self.same_user() {
-            unsafe { close_range_preserving(preserved_fds)? };
+            unsafe { cloexec_except(preserved_fds)? };
         }
 
         if unsafe { libc::setsid() } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        if self.bind_parent_death
-            && unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) } < 0
-        {
             return Err(io::Error::last_os_error());
         }
 
@@ -715,6 +727,10 @@ impl HardenedChildSetup {
             if unsafe { libc::setuid(self.target_uid) } < 0 {
                 return Err(io::Error::last_os_error());
             }
+        }
+
+        if self.bind_parent_death {
+            unsafe { bind_parent_death(libc::SIGTERM, parent)? };
         }
 
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
@@ -794,12 +810,7 @@ impl HardenedChildSetup {
                 }
             }
 
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) < 0 {
-                return last_error();
-            }
-            if libc::getppid() != parent {
-                return Err(io::Error::from_raw_os_error(libc::ESRCH));
-            }
+            bind_parent_death(libc::SIGKILL, parent)?;
 
             let no_core = libc::rlimit {
                 rlim_cur: 0,
@@ -864,112 +875,153 @@ unsafe fn mark_inherited_cloexec() -> Result<(), io::Error> {
     Ok(())
 }
 
-pub(crate) unsafe fn close_range_preserving(preserved: &[RawFd]) -> Result<(), io::Error> {
-    let mut sorted: Vec<RawFd> = preserved.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-
-    let nofile_cap = get_nofile_limit();
-    let close_range_available = {
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-            )
-        };
-        ret >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS)
-    };
-
-    if sorted.is_empty() {
-        if close_range_available {
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    0 as libc::c_ulong,
-                    !0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                )
-            };
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        } else {
-            for fd in 0..nofile_cap {
-                unsafe { libc::close(fd) };
-            }
+/// Arm `PR_SET_PDEATHSIG(signal)` and confirm that `parent` is still this process's parent: if it
+/// died before the signal was armed, the signal will never come, so the child refuses to run
+/// (`ESRCH`). Call it after any credential change, which clears the parent-death signal.
+/// Async-signal-safe.
+///
+/// # Safety
+///
+/// Must only be called in a forked child before `exec`.
+pub(crate) unsafe fn bind_parent_death(
+    signal: libc::c_int,
+    parent: libc::pid_t,
+) -> Result<(), io::Error> {
+    // SAFETY: plain syscalls on this process.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, signal, 0, 0, 0) < 0 {
+            return Err(io::Error::last_os_error());
         }
-        return Ok(());
-    }
-
-    if let Some(&first) = sorted.first()
-        && first > 0
-    {
-        if close_range_available {
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    0 as libc::c_ulong,
-                    (first - 1) as libc::c_ulong,
-                    0 as libc::c_ulong,
-                )
-            };
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        } else {
-            for fd in 0..first {
-                unsafe { libc::close(fd) };
-            }
+        if libc::getppid() != parent {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
         }
     }
-
-    for window in sorted.windows(2) {
-        let lo = window[0] + 1;
-        let hi = window[1] - 1;
-        if lo <= hi {
-            if close_range_available {
-                let ret = unsafe {
-                    libc::syscall(
-                        libc::SYS_close_range,
-                        lo as libc::c_ulong,
-                        hi as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    )
-                };
-                if ret < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            } else {
-                for fd in lo..=hi {
-                    unsafe { libc::close(fd) };
-                }
-            }
-        }
-    }
-
-    if let Some(&last) = sorted.last() {
-        if close_range_available {
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    (last + 1) as libc::c_ulong,
-                    !0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                )
-            };
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        } else {
-            for fd in (last + 1)..nofile_cap {
-                unsafe { libc::close(fd) };
-            }
-        }
-    }
-
     Ok(())
+}
+
+/// Mark every descriptor except `preserved` close-on-exec, so that only `preserved` survives the
+/// exec while the runtime's exec-error pipe stays usable until then (a pre-exec failure then
+/// surfaces as a `Command::spawn` error instead of a child that exits at once). `preserved` must
+/// not be close-on-exec itself. Uses `CLOSE_RANGE_CLOEXEC` (Linux 5.11), else a per-descriptor
+/// `FD_CLOEXEC` loop up to the descriptor limit. Async-signal-safe; allocates nothing.
+///
+/// # Safety
+///
+/// Must only be called in a forked child before `exec`.
+pub(crate) unsafe fn cloexec_except(preserved: &[RawFd]) -> Result<(), io::Error> {
+    // Gaps between the preserved descriptors, without sorting (no allocation): for each candidate
+    // gap start `lo` (0 and every preserved fd + 1), the gap ends just before the next preserved
+    // descriptor above it.
+    let next_preserved_above =
+        |fd: RawFd| -> Option<RawFd> { preserved.iter().copied().filter(|&p| p >= fd).min() };
+    let mut starts = [0 as RawFd; 16];
+    if preserved.len() + 1 > starts.len() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut count = 1;
+    for &p in preserved {
+        starts[count] = p + 1;
+        count += 1;
+    }
+    for &lo in &starts[..count] {
+        if preserved.contains(&lo) {
+            continue;
+        }
+        let hi = match next_preserved_above(lo) {
+            Some(p) => p - 1,
+            None => RawFd::MAX,
+        };
+        if lo > hi {
+            continue;
+        }
+        // SAFETY: plain syscalls on this process.
+        unsafe { cloexec_range(lo, hi)? };
+    }
+    Ok(())
+}
+
+/// Mark `lo..=hi` close-on-exec. Async-signal-safe.
+///
+/// # Safety
+///
+/// Must only be called in a forked child before `exec`.
+unsafe fn cloexec_range(lo: RawFd, hi: RawFd) -> Result<(), io::Error> {
+    // SAFETY: plain syscalls on this process.
+    unsafe {
+        let ret = libc::syscall(
+            libc::SYS_close_range,
+            lo as libc::c_ulong,
+            if hi == RawFd::MAX {
+                !0 as libc::c_ulong
+            } else {
+                hi as libc::c_ulong
+            },
+            CLOSE_RANGE_CLOEXEC,
+        );
+        if ret >= 0 {
+            return Ok(());
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINVAL) | Some(libc::ENOSYS) => {
+                let end = hi.min(get_nofile_limit().saturating_sub(1));
+                let mut fd = lo;
+                while fd <= end {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                    fd += 1;
+                }
+                Ok(())
+            }
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+/// One job of the launcher thread: a command to spawn, and where to send the result.
+type LauncherJob = (Command, std::sync::mpsc::Sender<io::Result<Child>>);
+
+/// Spawn `command` from the daemon's long-lived launcher thread and return the child.
+///
+/// Linux delivers `PR_SET_PDEATHSIG` when the *thread* that forked the child exits, not the
+/// process. A managed browser spawned from a short-lived IPC handler thread was therefore killed as
+/// soon as that request returned (defect B1, `browser_scope = "session"`), and `bwrap
+/// --die-with-parent` has the same tie to its forking thread. Every child whose parent-death signal
+/// must mean "the daemon died" is forked here instead: the thread is started on first use and lives
+/// as long as the process, so the signal fires only when the daemon itself exits. The browser's
+/// lifetime is otherwise bounded by its lease (revocation, expiry, principal exit and shutdown
+/// terminate it explicitly).
+///
+/// The caller blocks until the spawn returned (one `fork`/`exec`); the thread takes no lock, so
+/// this wait may happen under any lock (LOCKING.md, "Known bounded waits").
+pub(crate) fn spawn_on_launcher_thread(command: Command) -> io::Result<Child> {
+    static LAUNCHER: std::sync::OnceLock<Result<std::sync::mpsc::Sender<LauncherJob>, String>> =
+        std::sync::OnceLock::new();
+    let sender = LAUNCHER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<LauncherJob>();
+            std::thread::Builder::new()
+                .name("browser-launcher".to_string())
+                .spawn(move || {
+                    // The sender lives in the static, so `recv` never fails and this thread never
+                    // exits before the process does.
+                    while let Ok((mut command, reply)) = rx.recv() {
+                        let _ = reply.send(command.spawn());
+                    }
+                })
+                .map(|_| tx)
+                .map_err(|e| format!("cannot start the launcher thread: {e}"))
+        })
+        .as_ref()
+        .map_err(|why| io::Error::other(why.clone()))?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    sender
+        .send((command, reply_tx))
+        .map_err(|_| io::Error::other("the launcher thread is gone"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| io::Error::other("the launcher thread dropped the spawn"))?
 }
 
 pub fn dup_fd_cloexec(fd: RawFd) -> Result<OwnedFd, LauncherError> {
@@ -1279,6 +1331,7 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
         cmd.stderr(Stdio::from(stderr_fd));
     }
 
+    let parent = std::process::id() as libc::pid_t;
     unsafe {
         cmd.pre_exec(move || {
             if child_fd != CONTROL_FD {
@@ -1287,8 +1340,11 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
                 }
                 libc::close(child_fd);
             }
+            if libc::fcntl(CONTROL_FD, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-            setup.apply(&[0, 1, 2, CONTROL_FD])
+            setup.apply(&[0, 1, 2, CONTROL_FD], parent)
         });
     }
 
@@ -2829,5 +2885,136 @@ mod tests {
 
         let err = verify_process_ancestry(999, &session_identity, dir.path()).unwrap_err();
         assert!(matches!(err, LauncherError::ProcRead { .. }));
+    }
+
+    fn same_user_setup(bind_parent_death: bool) -> HardenedChildSetup {
+        HardenedChildSetup {
+            target_uid: unsafe { libc::getuid() },
+            target_gid: unsafe { libc::getgid() },
+            daemon_uid: unsafe { libc::getuid() },
+            daemon_gid: unsafe { libc::getgid() },
+            rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
+            rlimit_nproc: DEFAULT_RLIMIT_NPROC,
+            rlimit_core: DEFAULT_RLIMIT_CORE,
+            rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death,
+        }
+    }
+
+    #[test]
+    fn hardened_child_arms_the_parent_death_signal_and_checks_the_parent() {
+        // The parent check runs after the parent-death signal is armed (after any credential
+        // change, which would clear it): a wrong parent fails the spawn with ESRCH.
+        let setup = same_user_setup(true);
+        let mut command = Command::new("/bin/true");
+        // SAFETY: `apply` is async-signal-safe and runs pre-exec.
+        unsafe {
+            command.pre_exec(move || setup.apply(&[0, 1, 2], 0));
+        }
+        let err = command
+            .spawn()
+            .expect_err("a failing pre_exec step must fail the spawn");
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "{err}");
+
+        let setup = same_user_setup(true);
+        let parent = std::process::id() as libc::pid_t;
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "grep -q . /proc/self/status"])
+            .stdout(Stdio::null());
+        // SAFETY: as above.
+        unsafe {
+            command.pre_exec(move || setup.apply(&[0, 1, 2], parent));
+        }
+        let status = command.status().expect("the real parent passes the check");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn cloexec_except_keeps_only_the_preserved_descriptors_across_exec() {
+        let keep = fs::File::open("/dev/null").unwrap();
+        let drop_ = fs::File::open("/dev/null").unwrap();
+        let (keep_fd, drop_fd) = (keep.as_raw_fd(), drop_.as_raw_fd());
+        // Neither is close-on-exec now: only `cloexec_except` decides which one survives.
+        for fd in [keep_fd, drop_fd] {
+            assert!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } >= 0);
+        }
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                &format!("test -e /proc/self/fd/{keep_fd} && ! test -e /proc/self/fd/{drop_fd}"),
+            ])
+            .stdin(Stdio::null());
+        // SAFETY: `cloexec_except` is async-signal-safe and runs pre-exec.
+        unsafe {
+            command.pre_exec(move || cloexec_except(&[0, 1, 2, keep_fd]));
+        }
+        let status = command.status().unwrap();
+        assert!(
+            status.success(),
+            "only the preserved descriptor survives the exec"
+        );
+        drop((keep, drop_));
+    }
+
+    /// Whether `pid` is alive (and not a zombie) right now.
+    fn alive(pid: u32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+            })
+            .is_some_and(|state| state != "Z" && state != "X")
+    }
+
+    /// A `sleep 30` whose pre-exec arms `PR_SET_PDEATHSIG(SIGTERM)` as the browser spawn does.
+    fn sleeper_with_parent_death_signal() -> Command {
+        let parent = std::process::id() as libc::pid_t;
+        let mut command = Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: `bind_parent_death` is async-signal-safe and runs pre-exec.
+        unsafe {
+            command.pre_exec(move || bind_parent_death(libc::SIGTERM, parent));
+        }
+        command
+    }
+
+    /// Defect B1 regression: a browser spawned for a request on a short-lived IPC handler thread
+    /// must outlive that thread. The control shows that the test detects B1: a child forked
+    /// directly on such a thread gets its parent-death signal as soon as the thread exits.
+    #[test]
+    fn a_child_spawned_on_the_launcher_thread_outlives_the_requesting_thread() {
+        let mut direct = std::thread::spawn(|| sleeper_with_parent_death_signal().spawn())
+            .join()
+            .unwrap()
+            .unwrap();
+        let mut launched =
+            std::thread::spawn(|| spawn_on_launcher_thread(sleeper_with_parent_death_signal()))
+                .join()
+                .unwrap()
+                .unwrap();
+
+        // The control dies of SIGTERM once its forking thread is gone (wait reaps it).
+        let control = direct.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&control),
+            Some(libc::SIGTERM),
+            "control: PDEATHSIG follows the forking thread ({control})"
+        );
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            alive(launched.id()),
+            "a child of the launcher thread survives the request thread's exit"
+        );
+        assert!(launched.try_wait().unwrap().is_none());
+        let _ = launched.kill();
+        let _ = launched.wait();
     }
 }

@@ -218,6 +218,7 @@ fn spawn_agent_runtime(
                 security_config,
                 shutdown_for_runtime.clone(),
                 config_source,
+                notification::human_path_is_automatic(),
             ) {
                 Ok(runtime) => {
                     while !shutdown_for_runtime.load(Ordering::Relaxed) {
