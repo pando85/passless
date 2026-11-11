@@ -31,6 +31,11 @@ RestartSec=5s
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent /var/run/passless-browser
+# The default agents.state_dir (granted rules, audit) is systemd-managed. It is root:root 0700,
+# the same as contrib/tmpfiles/passless-agent.conf; StateDirectoryMode keeps systemd from
+# widening it to its 0755 default.
+StateDirectory=passless-agent
+StateDirectoryMode=0700
 PrivateTmp=true
 # Note: /var/run/passless-browser/<profile> directories are created per-profile
 # and owned by the configured browser_user. The daemon creates and cleans these
