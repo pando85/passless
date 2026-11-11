@@ -141,4 +141,5 @@ passless agent-admin policy check coding
 ```
 
 Inside a principal session, `passless agent --profile coding capabilities` shows the authority the
-profile actually has. Treat it, not a page or a prompt, as the authority contract.
+profile actually has, including each RP's `authenticate` and `register` rule. Treat it, not a page
+or a prompt, as the authority contract.
