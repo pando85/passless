@@ -29,10 +29,14 @@ const CHROME_DEVTOOLS_PACKAGE: &str = "chrome-devtools-mcp";
 #[derive(Serialize)]
 struct BrowserOutput<'a> {
     /// The CDP HTTP endpoint (`http://127.0.0.1:<port>`): what `connectOverCDP`, browser-use
-    /// `cdp_url`, `agent-browser --cdp` and `--browserUrl` take.
-    endpoint: &'a str,
-    /// The browser's `ws://` endpoint.
-    ws_endpoint: &'a str,
+    /// `cdp_url`, `agent-browser --cdp` and `--browserUrl` take. `null` in pipe mode.
+    endpoint: Option<&'a str>,
+    /// The browser's `ws://` endpoint. `null` in pipe mode.
+    ws_endpoint: Option<&'a str>,
+    /// `port` or `pipe`. In pipe mode CDP only goes through `browser-control`.
+    cdp_exposure: &'a str,
+    /// The command that drives a pipe-mode browser; `null` in port mode.
+    control_command: Option<String>,
     profile: &'a str,
     status: &'a str,
     shared_browser_context: bool,
@@ -114,11 +118,13 @@ fn ensure_once(
     profile: &str,
     url: Option<&str>,
     headed: bool,
+    direct_cdp: bool,
 ) -> std::result::Result<BrowserStatusResponse, ClientError> {
     let mut client = principal_client(profile)?;
     match client.request(PrincipalRequest::EnsureBrowser {
         start_url: url.map(ToOwned::to_owned),
         headed,
+        direct_cdp,
     })? {
         PrincipalResponse::BrowserEnsured(status) => Ok(status),
         _ => Err(ClientError::Io(std::io::Error::other(
@@ -128,21 +134,23 @@ fn ensure_once(
 }
 
 fn ensure(profile: &str, url: Option<&str>, headed: bool) -> Result<BrowserStatusResponse> {
-    ensure_once(profile, url, headed).map_err(|e| Error::Other(e.to_string()))
+    ensure_once(profile, url, headed, false).map_err(|e| Error::Other(e.to_string()))
 }
 
 /// [`ensure`] that keeps asking while the daemon answers `Conflict`: a degraded lease (its worker
 /// is re-attaching) refuses to hand out its endpoint until the worker is back, for up to the
-/// daemon's grace period, then the browser is replaced.
+/// daemon's grace period, then the browser is replaced. `direct_cdp` says that the caller can only
+/// use an endpoint, which a pipe-mode profile refuses before it starts a browser.
 fn ensure_waiting(
     profile: &str,
     url: Option<&str>,
     headed: bool,
+    direct_cdp: bool,
     timeout: Duration,
 ) -> Result<BrowserStatusResponse> {
     let deadline = Instant::now() + timeout;
     loop {
-        match ensure_once(profile, url, headed) {
+        match ensure_once(profile, url, headed, direct_cdp) {
             Ok(status) => return Ok(status),
             Err(ClientError::Protocol(e))
                 if e.code == passless_core::agent::protocol::ErrorCode::Conflict
@@ -199,13 +207,69 @@ pub struct BrowserFlags {
     pub url: Option<String>,
 }
 
+/// Whether the daemon ensured a pipe-mode browser: CDP only through `browser-control`.
+fn is_pipe_mode(status: &BrowserStatusResponse) -> bool {
+    status.cdp_exposure.as_deref() == Some("pipe")
+}
+
+/// The command that drives a pipe-mode browser of `profile`.
+fn control_command(profile: &str) -> String {
+    format!("passless agent browser-control --profile {profile} --request '<CDP JSON>'")
+}
+
+/// What `agent browser` prints for a pipe-mode browser: how to drive it (the daemon holds the CDP
+/// pipes, so there is no endpoint), or the JSON envelope with `endpoint` null. `--env` has no
+/// endpoint to put into a variable and is an error.
+fn render_pipe_browser(
+    profile: &str,
+    status: &BrowserStatusResponse,
+    flags: &BrowserFlags,
+) -> Result<String> {
+    if flags.env {
+        return Err(Error::Other(format!(
+            "profile '{profile}' uses browser_cdp_expose = \"pipe\": the browser is running, but \
+             it has no CDP endpoint to export. Drive it with `{}`; tools that need an endpoint \
+             (Playwright, chrome-devtools-mcp) need browser_cdp_expose = \"port\"",
+            control_command(profile)
+        )));
+    }
+    if flags.json {
+        return serde_json::to_string(&serde_json::json!({
+            "version": "1",
+            "status": "ok",
+            "data": BrowserOutput {
+                endpoint: None,
+                ws_endpoint: None,
+                cdp_exposure: "pipe",
+                control_command: Some(control_command(profile)),
+                profile,
+                status: &status.status,
+                shared_browser_context: status.shared_browser_context.unwrap_or(false),
+                interception: status.interception.as_deref().unwrap_or("unknown"),
+                incognito_allowed: status.incognito_allowed.unwrap_or(false),
+            },
+        }))
+        .map_err(|e| Error::Other(e.to_string()));
+    }
+    Ok(format!(
+        "pipe mode: the browser is running ({}, interception: {}) and has no CDP endpoint; drive it \
+         with `{}`",
+        status.status,
+        status.interception.as_deref().unwrap_or("unknown"),
+        control_command(profile)
+    ))
+}
+
 /// The text printed for the endpoint: the bare URL, `PASSLESS_CDP_URL=<url>`, or the JSON
-/// envelope.
+/// envelope. A pipe-mode browser has no endpoint ([`render_pipe_browser`]).
 fn render_browser(
     profile: &str,
     status: &BrowserStatusResponse,
     flags: &BrowserFlags,
 ) -> Result<String> {
+    if is_pipe_mode(status) {
+        return render_pipe_browser(profile, status, flags);
+    }
     let ws = status
         .cdp_endpoint
         .as_deref()
@@ -218,8 +282,10 @@ fn render_browser(
             "version": "1",
             "status": "ok",
             "data": BrowserOutput {
-                endpoint: &endpoint,
-                ws_endpoint: ws,
+                endpoint: Some(&endpoint),
+                ws_endpoint: Some(ws),
+                cdp_exposure: "port",
+                control_command: None,
                 profile,
                 status: &status.status,
                 shared_browser_context: status.shared_browser_context.unwrap_or(false),
@@ -250,7 +316,13 @@ pub fn dispatch_browser(profile: Option<&str>, flags: &BrowserFlags) -> Result<(
         )));
     }
     let mut status = if flags.wait {
-        ensure_waiting(profile, flags.url.as_deref(), flags.headed, WAIT_TIMEOUT)?
+        ensure_waiting(
+            profile,
+            flags.url.as_deref(),
+            flags.headed,
+            false,
+            WAIT_TIMEOUT,
+        )?
     } else {
         ensure(profile, flags.url.as_deref(), flags.headed)?
     };
@@ -503,7 +575,10 @@ fn run_chrome_devtools(
     package: Option<&str>,
     extra: &[String],
 ) -> Result<()> {
-    let status = wait_intercepting(profile, ensure_waiting(profile, url, false, WAIT_TIMEOUT)?)?;
+    let status = wait_intercepting(
+        profile,
+        ensure_waiting(profile, url, false, true, WAIT_TIMEOUT)?,
+    )?;
     let ws = status
         .cdp_endpoint
         .as_deref()
@@ -589,6 +664,15 @@ mod tests {
             shared_browser_context: Some(true),
             interception: Some(interception.into()),
             incognito_allowed: Some(incognito),
+            cdp_exposure: Some("port".into()),
+        }
+    }
+
+    fn pipe_status() -> BrowserStatusResponse {
+        BrowserStatusResponse {
+            cdp_endpoint: None,
+            cdp_exposure: Some("pipe".into()),
+            ..status("attached", true)
         }
     }
 
@@ -635,9 +719,55 @@ mod tests {
         assert_eq!(json["data"]["profile"], "p");
         assert_eq!(json["data"]["interception"], "attached");
         assert_eq!(json["data"]["incognito_allowed"], true);
+        assert_eq!(json["data"]["cdp_exposure"], "port");
+        assert!(json["data"]["control_command"].is_null());
         let mut none = status.clone();
         none.cdp_endpoint = None;
         assert!(render_browser("p", &none, &flags(false, false)).is_err());
+    }
+
+    #[test]
+    fn a_pipe_mode_browser_prints_how_to_drive_it_instead_of_an_endpoint() {
+        let flags = |json, env| BrowserFlags {
+            json,
+            env,
+            wait: false,
+            headed: false,
+            url: None,
+        };
+        let status = pipe_status();
+        assert!(is_pipe_mode(&status));
+        assert!(!is_pipe_mode(&self::status("attached", true)));
+
+        let plain = render_browser("coding", &status, &flags(false, false)).unwrap();
+        assert!(plain.contains("no CDP endpoint"), "{plain}");
+        assert!(
+            plain.contains("passless agent browser-control --profile coding"),
+            "{plain}"
+        );
+        assert!(!plain.contains("http://"), "{plain}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_browser("coding", &status, &flags(true, false)).unwrap())
+                .unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["data"]["endpoint"].is_null());
+        assert!(json["data"]["ws_endpoint"].is_null());
+        assert_eq!(json["data"]["cdp_exposure"], "pipe");
+        assert!(
+            json["data"]["control_command"]
+                .as_str()
+                .unwrap()
+                .contains("browser-control --profile coding")
+        );
+        assert_eq!(json["data"]["interception"], "attached");
+
+        // `--env` has nothing to export.
+        let err = render_browser("coding", &status, &flags(false, true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no CDP endpoint to export"), "{err}");
+        assert!(err.contains("browser-control"), "{err}");
     }
 
     #[test]

@@ -469,6 +469,12 @@ pub enum PrincipalRequest {
         /// profile sets no `browser_command` (that command carries its own flags).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         headed: bool,
+        /// The caller can only use a CDP endpoint (the Playwright bootstrap, the chrome-devtools
+        /// adapter). A pipe-mode profile has none, so the daemon refuses before it starts a
+        /// browser nobody could reach. `agent browser` leaves it out: in pipe mode it drives the
+        /// browser through `browser-control`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        direct_cdp: bool,
     },
     BrowserControl {
         request_json: String,
@@ -906,6 +912,10 @@ pub struct BrowserStatusResponse {
     /// The extension's last reported `isAllowedIncognitoAccess()` (enforced from P10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incognito_allowed: Option<bool>,
+    /// How CDP reaches the lease's browser: `pipe` (only through `browser-control`, no endpoint)
+    /// or `port` (the loopback `cdp_endpoint`). Absent when there is no browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_exposure: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

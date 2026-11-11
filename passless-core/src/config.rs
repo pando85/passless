@@ -1394,14 +1394,16 @@ pub enum AgentCommand {
         #[arg(long, value_name = "MS", default_value = "5000")]
         timeout_ms: u32,
     },
-    /// Ensure the managed browser of this principal and print its CDP endpoint
+    /// Ensure the managed browser of this principal and print how to reach it
     ///
     /// Idempotent: the browser is started on the first call and the same endpoint is printed
     /// while it runs (the profile's `browser_scope` decides whether sessions share it). The
     /// endpoint is withheld until the interception extension is attached and allowed in
-    /// incognito, so a printed endpoint is always an intercepted browser. Requires
-    /// `browser_cdp_expose = "port"` on the profile. It must run inside a principal session of
-    /// the profile (the browser is closed when that session ends), e.g. an agent started with
+    /// incognito, so a printed endpoint is always an intercepted browser. With
+    /// `browser_cdp_expose = "port"` the CDP endpoint is printed. In pipe mode (the default)
+    /// there is no endpoint: the browser is ensured and CDP goes through
+    /// `passless agent browser-control`. It must run inside a principal session of the profile
+    /// (the browser is closed when that session ends), e.g. an agent started with
     /// `passless agent run --profile P -- <command>`.
     Browser {
         /// Print JSON ({endpoint, ...}) instead of the bare endpoint URL

@@ -81,7 +81,11 @@ control of the browser and every site in it. The browser removes its `DevToolsAc
 Passless has the address, and the endpoint is only handed out after interception is confirmed, but a
 same-user process can still scan loopback ports. Use port mode only where the local environment is
 trusted with the whole browser session. The alternative, `browser_cdp_expose = "pipe"`, keeps CDP
-daemon-mediated but external tools cannot attach.
+daemon-mediated but external tools cannot attach: the agent starts its browser with
+`passless agent browser` and drives it through `passless agent browser-control`
+([Operations](operations.md#driving-a-pipe-mode-browser)). Pipe mode separates the browser from the
+agent only under a root daemon with a distinct `browser_user`; under a non-root daemon the browser runs
+as the daemon user.
 
 Each managed browser starts from a fresh, empty profile (no saved passwords, sync or platform
 passkeys). A session lasts at most `max_session_ttl`, then the browser is closed and its profile

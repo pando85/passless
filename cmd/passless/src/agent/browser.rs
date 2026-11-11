@@ -616,6 +616,9 @@ pub enum CdpError {
     TooManyMessages,
     /// The pipe-mode extension filter refused the request (`cdp_filter.rs`, review M3).
     Denied(String),
+    /// Another `browser-control` call of this lease is still waiting for its answer. The pipe is
+    /// one stream: two calls would take each other's responses.
+    Busy,
 }
 
 impl fmt::Display for CdpError {
@@ -631,6 +634,10 @@ impl fmt::Display for CdpError {
             Self::ResponseTooLarge => write!(f, "CDP response exceeds size limit"),
             Self::TooManyMessages => write!(f, "CDP response exceeds message count limit"),
             Self::Denied(reason) => write!(f, "CDP request denied: {}", reason),
+            Self::Busy => write!(
+                f,
+                "another browser-control call of this browser is still running"
+            ),
         }
     }
 }
@@ -640,6 +647,50 @@ impl std::error::Error for CdpError {}
 #[derive(Debug)]
 pub struct CdpRoundTripResult {
     pub messages: Vec<String>,
+}
+
+/// A `browser-control` call that has written its request and is collecting the answer
+/// ([`BrowserProcessManager::cdp_begin`], [`BrowserProcessManager::cdp_step`]).
+#[derive(Debug)]
+pub struct CdpCall {
+    request_id: Option<serde_json::Number>,
+    deadline: Instant,
+    messages: Vec<String>,
+    total_bytes: usize,
+}
+
+/// How long one [`cdp_round_trip_shared`] step holds the browser manager before it lets go.
+const CDP_STEP_SLICE: Duration = Duration::from_millis(50);
+/// The pause between two steps, so that a thread waiting for the manager gets it.
+const CDP_STEP_GAP: Duration = Duration::from_millis(2);
+
+/// One `browser-control` round trip that does not hold the browser manager while it waits.
+///
+/// The browser's answer can take as long as the agent's timeout (a `Runtime.evaluate` with
+/// `awaitPromise` waits for a WebAuthn ceremony), and that ceremony needs the manager to activate
+/// the lease after its first assertion. So the call takes the manager only for its steps (the
+/// request, then slices of at most [`CDP_STEP_SLICE`] reading the pipe) and releases it in
+/// between, as the runtime loop and every other launch, status and activation need it too. The
+/// lease's `cdp_busy` flag keeps a second call from reading the first one's answer meanwhile.
+pub fn cdp_round_trip_shared(
+    manager: &std::sync::Mutex<BrowserProcessManager>,
+    lease_id: &BrowserLeaseId,
+    request_json: &str,
+    timeout: Duration,
+) -> Result<CdpRoundTripResult, CdpError> {
+    let lock = || {
+        crate::agent::lock_order::lock(manager, crate::agent::lock_order::LockLevel::BrowserManager)
+    };
+    let mut call = lock().cdp_begin(lease_id, request_json, timeout, true)?;
+    let result = loop {
+        match lock().cdp_step(lease_id, &mut call, CDP_STEP_SLICE) {
+            Ok(Some(result)) => break Ok(result),
+            Ok(None) => std::thread::sleep(CDP_STEP_GAP),
+            Err(e) => break Err(e),
+        }
+    };
+    lock().cdp_end(lease_id);
+    result
 }
 
 #[derive(Debug)]
@@ -675,6 +726,8 @@ pub struct BrowserLease {
     pub cdp: Option<DaemonCdpEndpoints>,
     pub cdp_buffer: VecDeque<String>,
     pub cdp_read_buf: Vec<u8>,
+    /// A `browser-control` call is waiting for its answer on the pipe.
+    cdp_busy: bool,
     /// Keeps the agent's pipe-mode CDP traffic away from the Passless extension (review M3).
     cdp_filter: ExtensionCdpFilter,
     pub child_reaped: bool,
@@ -1260,6 +1313,7 @@ impl BrowserProcessManager {
             cdp: daemon_endpoints,
             cdp_buffer: VecDeque::new(),
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
+            cdp_busy: false,
             cdp_filter: ExtensionCdpFilter::new(AGENT_EXTENSION_ID),
             child_reaped: false,
             cdp_endpoint: cdp_endpoint_url,
@@ -1933,6 +1987,27 @@ impl BrowserProcessManager {
         timeout: Duration,
         from_agent: bool,
     ) -> Result<CdpRoundTripResult, CdpError> {
+        let mut call = self.cdp_begin(lease_id, request_json, timeout, from_agent)?;
+        let result = loop {
+            match self.cdp_step(lease_id, &mut call, Duration::MAX) {
+                Ok(Some(result)) => break Ok(result),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.cdp_end(lease_id);
+        result
+    }
+
+    /// Check and write a CDP request and mark the lease busy; [`Self::cdp_step`] collects the
+    /// answer and [`Self::cdp_end`] must follow, whatever the outcome.
+    pub fn cdp_begin(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        request_json: &str,
+        timeout: Duration,
+        from_agent: bool,
+    ) -> Result<CdpCall, CdpError> {
         validate_cdp_request(request_json)?;
 
         let timeout = clamp_cdp_timeout(timeout);
@@ -1947,6 +2022,9 @@ impl BrowserProcessManager {
         }
         if entry.cdp.is_none() {
             return Err(CdpError::NoCdpEndpoints);
+        }
+        if entry.cdp_busy {
+            return Err(CdpError::Busy);
         }
 
         let deadline = Instant::now() + timeout;
@@ -1969,17 +2047,42 @@ impl BrowserProcessManager {
         }
 
         write_cdp_frame(entry, request_json)?;
+        entry.cdp_busy = true;
 
-        let request_id = extract_cdp_id(request_json);
-        let mut collected_messages: Vec<String> = Vec::new();
-        let mut total_bytes: usize = 0;
+        Ok(CdpCall {
+            request_id: extract_cdp_id(request_json),
+            deadline,
+            messages: Vec::new(),
+            total_bytes: 0,
+        })
+    }
+
+    /// Read the answer of `call` for at most `slice` (and until its deadline). `Ok(None)`: not
+    /// answered yet. Everything the agent receives passes the extension filter.
+    pub fn cdp_step(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        call: &mut CdpCall,
+        slice: Duration,
+    ) -> Result<Option<CdpRoundTripResult>, CdpError> {
+        let entry = self
+            .leases
+            .get_mut(lease_id)
+            .ok_or(CdpError::LeaseNotFound)?;
+        if entry.state.is_terminal() {
+            return Err(CdpError::BrowserExited);
+        }
+        let step_deadline = Instant::now()
+            .checked_add(slice)
+            .map_or(call.deadline, |end| end.min(call.deadline));
 
         loop {
             let raw = match entry.cdp_buffer.pop_front() {
                 Some(buffered) => buffered,
-                None => match read_cdp_message(entry, deadline)? {
+                None => match read_cdp_message(entry, step_deadline)? {
                     Some(message) => message,
-                    None => return Err(CdpError::Timeout),
+                    None if Instant::now() >= call.deadline => return Err(CdpError::Timeout),
+                    None => return Ok(None),
                 },
             };
             let message = match entry.cdp_filter.inbound(&raw) {
@@ -1991,22 +2094,30 @@ impl BrowserProcessManager {
                     continue;
                 }
             };
-            if collected_messages.len() >= CDP_MAX_RESPONSE_MESSAGES {
+            if call.messages.len() >= CDP_MAX_RESPONSE_MESSAGES {
                 return Err(CdpError::TooManyMessages);
             }
-            if total_bytes + message.len() > CDP_MAX_RESPONSE_TOTAL_BYTES {
+            if call.total_bytes + message.len() > CDP_MAX_RESPONSE_TOTAL_BYTES {
                 return Err(CdpError::ResponseTooLarge);
             }
-            let found_response = request_id
+            let found_response = call
+                .request_id
                 .as_ref()
                 .is_some_and(|rid| cdp_message_has_id(&message, rid));
-            total_bytes += message.len();
-            collected_messages.push(message);
+            call.total_bytes += message.len();
+            call.messages.push(message);
             if found_response {
-                return Ok(CdpRoundTripResult {
-                    messages: collected_messages,
-                });
+                return Ok(Some(CdpRoundTripResult {
+                    messages: std::mem::take(&mut call.messages),
+                }));
             }
+        }
+    }
+
+    /// Release the lease for the next call (also after a failed one).
+    pub fn cdp_end(&mut self, lease_id: &BrowserLeaseId) {
+        if let Some(entry) = self.leases.get_mut(lease_id) {
+            entry.cdp_busy = false;
         }
     }
 
@@ -6634,6 +6745,63 @@ mod tests {
             "attached": false,
             "canAccessOpener": false,
         })
+    }
+
+    #[test]
+    fn test_shared_cdp_round_trip_does_not_hold_the_manager_while_it_waits() {
+        // `Runtime.evaluate` with `awaitPromise` waits for a WebAuthn ceremony, and the ceremony
+        // needs the browser manager (lease activation) before the browser can answer. The wait
+        // must not hold the manager, and a second call meanwhile is refused as busy.
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let (daemon_write, daemon_read, mut fake_browser_read, mut fake_browser_write) =
+            create_fake_cdp_pair();
+        let lease_id = inject_lease_with_fake_cdp(&mut mgr, daemon_write, daemon_read);
+        let manager = Arc::new(Mutex::new(mgr));
+
+        let (manager_taken_tx, manager_taken_rx) = std::sync::mpsc::channel();
+        let browser = {
+            let manager = manager.clone();
+            let lease_id = lease_id.clone();
+            std::thread::spawn(move || {
+                let request = read_frames(&mut fake_browser_read, 1).remove(0);
+                // The "ceremony": it takes the manager, as `BrowserLeaseActivation` does, and the
+                // browser answers only afterwards.
+                let guard = manager.lock().unwrap();
+                assert!(guard.snapshot(&lease_id).is_some());
+                // A second call while the first waits is refused, not mixed up with it.
+                let second = make_cdp_request(8, "Page.reload");
+                let mut guard = guard;
+                assert!(matches!(
+                    guard.cdp_begin(&lease_id, &second, Duration::from_secs(1), true),
+                    Err(CdpError::Busy)
+                ));
+                drop(guard);
+                manager_taken_tx.send(()).unwrap();
+                write_frame(
+                    &mut fake_browser_write,
+                    &serde_json::json!({"id": request["id"], "result": {"result": {"value": 1}}}),
+                );
+            })
+        };
+        let evaluate = make_cdp_request(7, "Runtime.evaluate");
+        let messages =
+            cdp_round_trip_shared(&manager, &lease_id, &evaluate, Duration::from_secs(10))
+                .unwrap()
+                .messages;
+        browser.join().unwrap();
+        manager_taken_rx.try_recv().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains(r#""id":7"#));
+        // The lease is free again (the fake browser is gone, so a new call fails on the pipe,
+        // not as busy).
+        let next = make_cdp_request(9, "Page.reload");
+        assert!(!matches!(
+            manager
+                .lock()
+                .unwrap()
+                .cdp_begin(&lease_id, &next, Duration::from_secs(1), true),
+            Err(CdpError::Busy)
+        ));
     }
 
     #[test]

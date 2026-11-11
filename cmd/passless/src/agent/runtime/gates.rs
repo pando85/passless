@@ -3,8 +3,10 @@
 //! browser user, `browser-control` in port mode).
 
 use passless_core::agent::ProfileId;
-use passless_core::agent::config::BrowserScope;
+use passless_core::agent::config::{BrowserScope, CdpExposeMode};
 use passless_core::agent::protocol::{ErrorCode, ProtocolError, RecommendedAction};
+
+use crate::agent::browser::InterceptionState;
 
 /// Refuse a new principal when `live` sessions already fill `max_concurrent_sessions`.
 ///
@@ -78,6 +80,63 @@ pub(super) fn check_browser_control_available(
         ));
     }
     Ok(())
+}
+
+/// `EnsureBrowser` from a caller that can only use a CDP endpoint (`direct_cdp`: the Playwright
+/// bootstrap, the chrome-devtools adapter) is refused for a pipe-mode profile before a browser is
+/// started, because a pipe-mode browser has no endpoint to give. Every other caller (`agent
+/// browser`) is served in both modes: pipe mode ensures the lease and CDP goes through
+/// `browser-control` (ADR 0014 section 4.3).
+pub(super) fn check_ensure_browser_mode(
+    mode: CdpExposeMode,
+    direct_cdp: bool,
+) -> Result<(), ProtocolError> {
+    if direct_cdp && mode != CdpExposeMode::Port {
+        return Err(ProtocolError::new(
+            ErrorCode::Forbidden,
+            "Playwright browser discovery requires browser_cdp_expose = 'port' (trusted agents \
+             only); in pipe mode run `passless agent browser` and drive the browser with \
+             `passless agent browser-control`",
+            RecommendedAction::FixRequest,
+        ));
+    }
+    Ok(())
+}
+
+/// How a live lease is reached in `mode`, `None` when it cannot be used in that mode (a stale
+/// lease, or one launched under the other mode before a reload). `Some(Some(endpoint))` is a
+/// port-mode lease with its loopback endpoint; `Some(None)` is a pipe-mode lease with its CDP
+/// pipes, which has no endpoint: only `browser-control` reaches it.
+pub(super) fn cdp_access(
+    mode: CdpExposeMode,
+    endpoint: Option<String>,
+    has_cdp_pipes: Option<bool>,
+) -> Option<Option<String>> {
+    match mode {
+        CdpExposeMode::Port => endpoint.map(Some),
+        CdpExposeMode::Pipe => (has_cdp_pipes == Some(true)).then_some(None),
+    }
+}
+
+/// `browser-control` is refused while the lease's WebAuthn interception is degraded (or the lease
+/// has no extension record), like the port-mode bootstrap withholds its endpoint: the daemon
+/// cannot confirm that the browser's ceremonies reach it. A lease that is reconnecting within its
+/// grace period (`Pending`) is served: the proxy attachment outlives the worker, and a request
+/// wakes it (interception.rs), so `browser-control` need not wait for the re-attach as the
+/// bootstrap does while it holds the browser manager.
+pub(super) fn check_control_interception(
+    state: Option<InterceptionState>,
+) -> Result<(), ProtocolError> {
+    match state {
+        Some(InterceptionState::Attached | InterceptionState::Pending) => Ok(()),
+        Some(InterceptionState::Degraded) | None => Err(ProtocolError::new(
+            ErrorCode::Conflict,
+            "the managed browser's WebAuthn interception is degraded: its passless extension \
+             worker is not attached, or is not allowed in incognito, so browser-control is \
+             refused until it re-attaches (see `passless agent browser-status`)",
+            RecommendedAction::RetryWithBackoff,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +224,59 @@ mod tests {
         // handling.
         assert!(check_browser_control_available(Some(true)).is_ok());
         assert!(check_browser_control_available(None).is_ok());
+    }
+
+    #[test]
+    fn a_direct_cdp_caller_is_refused_in_pipe_mode_only() {
+        let refused = check_ensure_browser_mode(CdpExposeMode::Pipe, true).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+        assert!(
+            refused
+                .message
+                .contains("requires browser_cdp_expose = 'port'"),
+            "{}",
+            refused.message
+        );
+        assert!(refused.message.contains("browser-control"));
+        // `agent browser` (no direct CDP) is served in both modes, and port mode serves everyone.
+        assert!(check_ensure_browser_mode(CdpExposeMode::Pipe, false).is_ok());
+        assert!(check_ensure_browser_mode(CdpExposeMode::Port, false).is_ok());
+        assert!(check_ensure_browser_mode(CdpExposeMode::Port, true).is_ok());
+    }
+
+    #[test]
+    fn a_lease_is_reachable_through_the_channel_of_the_mode_in_force() {
+        let endpoint = || Some("ws://127.0.0.1:1/devtools/browser/x".to_string());
+        // Port mode: the endpoint, nothing else.
+        assert_eq!(
+            cdp_access(CdpExposeMode::Port, endpoint(), Some(false)),
+            Some(endpoint())
+        );
+        assert_eq!(cdp_access(CdpExposeMode::Port, None, Some(true)), None);
+        // Pipe mode: the pipes, no endpoint.
+        assert_eq!(
+            cdp_access(CdpExposeMode::Pipe, None, Some(true)),
+            Some(None)
+        );
+        assert_eq!(
+            cdp_access(CdpExposeMode::Pipe, endpoint(), Some(false)),
+            None
+        );
+        assert_eq!(cdp_access(CdpExposeMode::Pipe, None, None), None);
+    }
+
+    #[test]
+    fn browser_control_needs_an_attached_or_reconnecting_worker() {
+        assert!(check_control_interception(Some(InterceptionState::Attached)).is_ok());
+        assert!(check_control_interception(Some(InterceptionState::Pending)).is_ok());
+        for state in [Some(InterceptionState::Degraded), None] {
+            let refused = check_control_interception(state).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::Conflict);
+            assert_eq!(
+                refused.recommended_action,
+                RecommendedAction::RetryWithBackoff
+            );
+            assert!(refused.message.contains("degraded"), "{}", refused.message);
+        }
     }
 }

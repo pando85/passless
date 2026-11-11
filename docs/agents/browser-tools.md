@@ -5,8 +5,9 @@
 Passless starts and owns the browser: a managed Chromium with the interception extension, one per
 principal session. Your tool attaches to it over CDP. Never start a second browser: a browser the
 daemon did not start has no interception, and its WebAuthn calls go to whatever authenticator the
-browser finds. All recipes below need the profile to set `browser_cdp_expose = "port"` (see
-[Quick start](quick-start.md)).
+browser finds. The recipes below need the profile to set `browser_cdp_expose = "port"` (see
+[Quick start](quick-start.md)); with the default `pipe` the browser has no endpoint and the agent
+drives it through `passless agent browser-control` ([Pipe mode](#pipe-mode)).
 
 The browser belongs to a principal session and closes when that session ends. A tool that runs
 inside the session (started by `passless agent run --profile P -- <command>`) can ask for the
@@ -113,6 +114,28 @@ const stagehand = new Stagehand({
 The browser-use and agent-browser APIs change between releases; the scenarios in
 `tests/agent-e2e/scenarios/e2e-38-39-optional-tools.test.js` show the calls the tests make. A tool
 that launches its own Chromium instead of attaching defeats Passless and gets no passkeys.
+
+## Pipe mode
+
+With `browser_cdp_expose = "pipe"` (the default) the daemon keeps the browser's CDP pipes: there is no
+endpoint, so Playwright, chrome-devtools-mcp, browser-use and the other tools above cannot attach, and
+`passless agent mcp ...` refuses the profile. Inside a principal session `passless agent browser`
+still starts the session's browser, waits for interception with `--wait`, and prints how to drive it
+(`--json` prints `endpoint: null` and a `control_command`; `--env` fails, there is nothing to export).
+The agent then sends each CDP command through the daemon:
+
+```bash
+passless agent run --profile coding -- /bin/sh -c '
+  passless agent browser --wait --url https://github.com/login
+  passless agent browser-control --request "{\"id\":1,\"method\":\"Target.getTargets\"}"'
+```
+
+Every command is audited and the daemon's filter keeps the agent away from the Passless extension (its
+worker, `chrome-extension:` and `chrome:` URLs): see [Operations](operations.md#driving-a-pipe-mode-browser).
+Ordinary page CDP works: navigate (`Page.navigate`), evaluate (`Runtime.evaluate`), and
+the page's `navigator.credentials.get()` is signed on the agent path. A passkey login through
+`browser-control` is exercised by E2E-52. Use `port` for the tools above, accepting that the agent
+then holds an unmediated CDP connection ([Containment](containment.md#cdp-port-mode)).
 
 ## Limits
 

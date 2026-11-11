@@ -374,6 +374,60 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_mode_lease_is_reached_through_its_pipes_and_has_no_endpoint() {
+        let f = attached_lease();
+        // `EnsureBrowser` in pipe mode returns no endpoint but accepts the lease...
+        assert_eq!(
+            super::super::browser_ensure::lease_cdp_access(
+                &f.mgr,
+                &f.lease_id,
+                CdpExposeMode::Pipe
+            ),
+            Some(None)
+        );
+        // ...and a lease launched in pipe mode is stale once the profile is in port mode.
+        assert_eq!(
+            super::super::browser_ensure::lease_cdp_access(
+                &f.mgr,
+                &f.lease_id,
+                CdpExposeMode::Port
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_control_follows_the_interception_of_its_lease() {
+        let f = attached_lease();
+        let state = |f: &Fixture| {
+            f.mgr
+                .interception_state(&f.lease_id, &f.readiness, GRACE)
+                .map(|(state, _)| state)
+        };
+        let control = |f: &Fixture| super::super::gates::check_control_interception(state(f));
+        assert!(control(&f).is_ok());
+
+        // Reconnecting within the grace period: served, without waiting.
+        f.readiness.simulate_disconnect(BEARER, 1);
+        assert_eq!(state(&f), Some(InterceptionState::Pending));
+        assert!(control(&f).is_ok());
+
+        // Detached for longer than the grace period: refused until the worker re-attaches.
+        f.readiness
+            .backdate_detached(BEARER, GRACE + Duration::from_secs(1));
+        let err = control(&f).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("browser-control"), "{}", err.message);
+
+        // Attached without incognito access is refused too (plan D4, D6.1).
+        f.readiness.simulate_hello(BEARER, 2, true, false);
+        assert!(control(&f).is_err());
+
+        f.readiness.simulate_hello(BEARER, 2, true, true);
+        assert!(control(&f).is_ok());
+    }
+
+    #[test]
     fn a_browser_of_the_daemon_uid_uses_the_daemon_socket() {
         let daemon = Path::new("/run/agent/sign/sock");
         let none = HashMap::new();

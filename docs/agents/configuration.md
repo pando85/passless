@@ -61,9 +61,9 @@ credential_selection = "single"
 | `max_granted_rules` | Granted rules per profile (default 64, 1 to 256). |
 | `browser_scope` | `session` (default; each session owns its browser) or `profile` (sessions share one; it closes when its owner session ends). |
 | `browser_command` | Browser executable and arguments. Optional: see `browser_path`. |
-| `browser_user` | Unix user for the browser (needs a root daemon). Not allowed for `isolated`. |
+| `browser_user` | Unix user for the browser (needs a root daemon). Not allowed for `isolated`. In pipe mode under a root daemon it must differ from `principal_user` and the daemon user and must not be root. A non-root daemon cannot switch users, so there the browser runs as the daemon user (which is also the principal's): pipe mode then mediates and audits CDP but does not separate the browser from the agent. |
 | `browser_runtime_root` | Runtime root for the browser; mode 0700, owned by the browser user. |
-| `browser_cdp_expose` | `pipe` (default) or `port`. The [easy path](browser-tools.md) needs `port`. |
+| `browser_cdp_expose` | `pipe` (default) or `port`. Pipe: the browser has no endpoint and the agent drives it through `passless agent browser-control` (every command audited, extension filtered; start it with `passless agent browser`). Port: a loopback endpoint for the [easy path](browser-tools.md) tools (Playwright, chrome-devtools-mcp, `connectOverCDP`), which need `port`. |
 | `browser_cdp_port` | Loopback port for port mode; `0` (default) lets Chromium choose. Must be 0 when `browser_scope` is `session` and `max_concurrent_sessions` is above 1 (a shared `profile` browser may use a fixed port). |
 | `start_url` | Optional `http` or `https` URL opened at start. |
 

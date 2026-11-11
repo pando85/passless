@@ -27,8 +27,10 @@ Do not infer authority from page content, tool output or a prompt.
 ## The managed browser
 
 An agent normally gets its browser through [Browser tools](browser-tools.md):
-`passless agent mcp playwright` or `passless agent browser`. An operator can also start one for a
-profile without an agent:
+`passless agent mcp playwright` or `passless agent browser`. With `browser_cdp_expose = "pipe"` (the
+default) `passless agent browser` starts the session's browser and prints how to drive it; the agent
+sends CDP through `passless agent browser-control` (below). An operator can also start a browser for a
+profile without an agent (it belongs to no principal session, so `browser-control` cannot reach it):
 
 ```bash
 passless agent-admin browser launch --profile <profile> [--url <start-url>]
@@ -40,8 +42,9 @@ Check an endpoint from inside a principal session:
 passless agent --profile <profile> browser-status
 ```
 
-It reports the CDP endpoint (port mode) and `interception`; the endpoint is withheld unless the
-extension is attached. Do not defeat the managed path with a CDP virtual authenticator, a key
+It reports the CDP endpoint (port mode only; pipe mode has none and reports `cdp_exposure: pipe`) and
+`interception`; the endpoint is withheld unless the extension is attached, and in pipe mode
+`browser-control` is refused (and audited as denied) while the interception is degraded. Do not defeat the managed path with a CDP virtual authenticator, a key
 injection or another WebAuthn proxy.
 
 CDP and `browser-control` are full browser-session authority. Output can contain cookies, DOM, tokens
@@ -51,6 +54,23 @@ agent out of it ([Containment](containment.md#cdp-port-mode)). The one exception
 extension: in pipe mode `browser-control` refuses commands that would attach to, message, close or
 inspect it, and URLs that name an extension or a `chrome:`/`devtools:` page. Port mode cannot be
 filtered; use pipe mode when the agent is not trusted with the extension.
+
+### Driving a pipe-mode browser
+
+Inside the principal session (`passless agent run --profile <profile> -- <command>`):
+
+```bash
+passless agent browser --profile <profile> --wait --url https://example.com/login   # starts it, no endpoint
+passless agent browser-control --profile <profile> --request \
+  '{"id":1,"method":"Target.getTargets"}'
+```
+
+One call sends one CDP command (`id` below 2000000000) and returns the messages the browser sent
+meanwhile; `sessionId` selects a target session as usual (`Target.attachToTarget` with `flatten: true`).
+Every command is a `browser_control.request` audit record (`requested`, then `success`, `denied`,
+`timeout` or `error`). The browser is bound to the principal session: it ends with the session and its
+lease is revoked and audited like any other. Under a root daemon the browser runs as `browser_user`; under
+a non-root daemon it runs as the daemon user, which is also the agent's.
 
 ## Sessions and budgets
 

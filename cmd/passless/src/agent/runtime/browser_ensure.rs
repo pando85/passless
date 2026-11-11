@@ -8,7 +8,7 @@ use passless_core::agent::protocol::{
 };
 use passless_core::agent::{BrowserLeaseId, BrowserScope, PrincipalSessionId, ProfileId};
 
-use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease};
+use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease, gates};
 use crate::agent::audit_events::RevokeReason;
 use crate::agent::browser::{
     BrowserConfig, INTERCEPTION_ATTACH_TIMEOUT, InterceptionState, LeaseState,
@@ -22,11 +22,22 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ACTIVE_TTL_SECS: u64 = 86_400;
 
 impl AgentRuntime {
-    /// Ensure that the verified principal owns a live trusted-port browser.
+    /// Ensure that the verified principal owns a live managed browser, in the profile's CDP mode.
+    ///
+    /// Port mode returns the loopback CDP endpoint. Pipe mode (the default) returns none: the
+    /// browser's CDP pipes stay with the daemon and the principal drives the browser through
+    /// `browser-control` (ADR 0014 section 4.3). Everything else is the same for both modes: the
+    /// principal checks of `handle_principal`, the interception gate (no result before the
+    /// worker attached and is allowed in incognito), the grants and bearers bound to the session,
+    /// the B1 lifetime and the lease audit records.
     ///
     /// For session-scoped profiles, each session gets its own browser lease.
     /// For profile-scoped profiles, sessions on the same profile share a single browser.
     /// The lifecycle lock makes concurrent Playwright discovery requests single-flight.
+    ///
+    /// `direct_cdp` is set by callers that can only use an endpoint; a pipe-mode profile refuses
+    /// them before anything is started.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_ensure_browser(
         &self,
         profile_id: &ProfileId,
@@ -34,20 +45,15 @@ impl AgentRuntime {
         process_digest: &ProcessIdentityDigest,
         start_url: Option<&str>,
         headed: bool,
+        direct_cdp: bool,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        if profile
-            .profile_config
-            .browser_cdp_expose
-            .unwrap_or_default()
-            != CdpExposeMode::Port
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "Playwright browser discovery requires browser_cdp_expose = 'port' (trusted agents only)",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // Rules, limits, the CDP mode and the session TTL come from the configuration in force,
+        // which a policy reload may have replaced since the daemon started (ADR 0014 section 6.4).
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
+        let mode = profile_config.browser_cdp_expose.unwrap_or_default();
+        gates::check_ensure_browser_mode(mode, direct_cdp)?;
 
         let _lifecycle = crate::agent::lock_order::lock(
             &profile.lifecycle_lock,
@@ -79,9 +85,9 @@ impl AgentRuntime {
                         snapshot.state,
                         LeaseState::Active | LeaseState::AuthenticationPending
                     )
-                    && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
+                    && let Some(endpoint) = lease_cdp_access(&browser_manager, &lease_id, mode)
                 {
-                    // A degraded lease's endpoint is withheld until its worker re-attaches.
+                    // A degraded lease is withheld until its worker re-attaches.
                     let (interception, incognito_allowed) =
                         self.require_attached_interception(&mut browser_manager, &lease_id)?;
                     {
@@ -117,6 +123,7 @@ impl AgentRuntime {
                     return Ok(browser_ensured(
                         snapshot.state.to_string(),
                         endpoint,
+                        mode,
                         true,
                         interception,
                         incognito_allowed,
@@ -157,14 +164,15 @@ impl AgentRuntime {
                     snapshot.state,
                     LeaseState::Active | LeaseState::AuthenticationPending
                 )
-                && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
+                && let Some(endpoint) = lease_cdp_access(&browser_manager, &lease_id, mode)
             {
-                // A degraded lease's endpoint is withheld until its worker re-attaches.
+                // A degraded lease is withheld until its worker re-attaches.
                 let (interception, incognito_allowed) =
                     self.require_attached_interception(&mut browser_manager, &lease_id)?;
                 return Ok(browser_ensured(
                     snapshot.state.to_string(),
                     endpoint,
+                    mode,
                     false,
                     interception,
                     incognito_allowed,
@@ -190,10 +198,6 @@ impl AgentRuntime {
         // Other sessions (and admin-launched browsers) may have live leases for the same
         // authority profile. They are intentionally outside this principal's ownership namespace.
 
-        // Rules, limits and session TTL come from the configuration in force, which a policy reload
-        // may have replaced since the daemon started (ADR 0014 section 6.4).
-        let live_config = self.live_profile_config(profile);
-        let profile_config = &live_config;
         // The browser binary: the profile's `browser_command`, else `agents.browser_path`, else
         // auto-detection. Branded Google Chrome and chrome-headless-shell are refused (R14), and a
         // distinct-UID principal only gets a root-owned, principal-unwritable binary (V-H7).
@@ -224,8 +228,11 @@ impl AgentRuntime {
             target_gid: profile.browser_gid.unwrap_or(profile.daemon_gid),
             daemon_uid: profile.daemon_uid,
             daemon_gid: profile.daemon_gid,
-            cdp_expose: CdpExposeMode::Port,
-            cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
+            cdp_expose: mode,
+            cdp_port: match mode {
+                CdpExposeMode::Port => profile_config.browser_cdp_port.unwrap_or(0),
+                CdpExposeMode::Pipe => 0,
+            },
             // Every scope: the browser is forked on the long-lived launcher thread, so its
             // parent-death signal fires only when the daemon dies (defect B1); revocation,
             // expiry and session end terminate it explicitly.
@@ -416,7 +423,8 @@ impl AgentRuntime {
                     )
                 })?;
             // This is an internal approval, not admin IPC. The request reached this point only
-            // after principal capability/peer/process verification and explicit trusted port mode.
+            // after principal capability/peer/process verification. Pipe mode mediates every CDP
+            // command (`browser-control`); port mode is the explicitly trusted mode.
             let grant_id = self
                 .policy_runtime
                 .admin_approve_grant(&request_id, &crate::agent::identity::admin_authority())
@@ -488,16 +496,17 @@ impl AgentRuntime {
             }
         }
 
-        let endpoint = browser_manager
-            .lease_cdp_endpoint(lease_id)
-            .flatten()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "port-mode browser did not expose a CDP endpoint",
-                    RecommendedAction::Abort,
-                )
-            })?;
+        let mode = config.cdp_expose;
+        let endpoint = lease_cdp_access(browser_manager, lease_id, mode).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                match mode {
+                    CdpExposeMode::Port => "port-mode browser did not expose a CDP endpoint",
+                    CdpExposeMode::Pipe => "pipe-mode browser did not open its CDP pipes",
+                },
+                RecommendedAction::Abort,
+            )
+        })?;
 
         profile
             .active_browser
@@ -548,6 +557,7 @@ impl AgentRuntime {
         Ok(browser_ensured(
             LeaseState::AuthenticationPending.to_string(),
             endpoint,
+            mode,
             profile_config.browser_scope == BrowserScope::Profile,
             InterceptionState::Attached,
             readiness.incognito_allowed,
@@ -555,9 +565,24 @@ impl AgentRuntime {
     }
 }
 
+/// The lease's CDP channel in `mode` (see [`gates::cdp_access`]): `Some(Some(endpoint))` in port
+/// mode, `Some(None)` for a pipe-mode lease, `None` when it has none for that mode.
+pub(super) fn lease_cdp_access(
+    browser_manager: &crate::agent::browser::BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+    mode: CdpExposeMode,
+) -> Option<Option<String>> {
+    gates::cdp_access(
+        mode,
+        browser_manager.lease_cdp_endpoint(lease_id).flatten(),
+        browser_manager.lease_has_cdp_pipes(lease_id),
+    )
+}
+
 fn browser_ensured(
     status: String,
-    endpoint: String,
+    endpoint: Option<String>,
+    mode: CdpExposeMode,
     shared: bool,
     interception: InterceptionState,
     incognito_allowed: bool,
@@ -565,9 +590,10 @@ fn browser_ensured(
     PrincipalResponse::BrowserEnsured(BrowserStatusResponse {
         running: true,
         status,
-        cdp_endpoint: Some(endpoint),
+        cdp_endpoint: endpoint,
         shared_browser_context: if shared { Some(true) } else { None },
         interception: Some(interception.to_string()),
         incognito_allowed: Some(incognito_allowed),
+        cdp_exposure: Some(mode.to_string()),
     })
 }

@@ -197,7 +197,7 @@ impl ExtensionCdpFilter {
             .pointer("/result/targetInfo")
             .is_some_and(|info| self.is_extension_target(info));
         if extension {
-            self.targets.insert(target_id);
+            self.remember_extension_target(target_id);
         }
         extension
     }
@@ -249,7 +249,7 @@ impl ExtensionCdpFilter {
                     && self.is_extension_target(info)
                 {
                     if let Some(target) = info.get("targetId").and_then(Value::as_str) {
-                        self.targets.insert(target);
+                        self.remember_extension_target(target);
                     }
                     return hidden();
                 }
@@ -282,7 +282,7 @@ impl ExtensionCdpFilter {
             .pointer("/targetInfo/targetId")
             .and_then(Value::as_str)
         {
-            self.targets.insert(target);
+            self.remember_extension_target(target);
         }
         let Some(session) = params.get("sessionId").and_then(Value::as_str) else {
             return Inbound::Drop {
@@ -307,6 +307,16 @@ impl ExtensionCdpFilter {
             .1,
         );
         Inbound::Drop { commands }
+    }
+
+    /// Remember `target` as an extension target. Logged at debug level (the target ID is not a
+    /// secret: the filter refuses every command that names it, and the E2E harness reads it here
+    /// to attack it).
+    fn remember_extension_target(&mut self, target: &str) {
+        if !self.targets.contains(target) {
+            log::debug!("cdp filter: hid extension target {target}");
+        }
+        self.targets.insert(target);
     }
 
     fn take_pending(&mut self, id: u64) -> Option<String> {
@@ -341,7 +351,7 @@ impl ExtensionCdpFilter {
                     !extension
                 });
                 for target in &hidden {
-                    self.targets.insert(target);
+                    self.remember_extension_target(target);
                 }
                 !hidden.is_empty()
             }
@@ -356,7 +366,7 @@ impl ExtensionCdpFilter {
                     .pointer("/result/targetInfo/targetId")
                     .and_then(Value::as_str)
                 {
-                    self.targets.insert(target);
+                    self.remember_extension_target(target);
                 }
                 let id = message.get("id").cloned().unwrap_or(Value::Null);
                 *message = json!({

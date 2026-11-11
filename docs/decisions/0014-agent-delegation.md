@@ -187,6 +187,35 @@ bearer gates lazy startup only; it does not protect Chromium's listener.
 In both modes the WebAuthn ceremony is mediated by the daemon; CDP exposure decides only who holds
 authenticated browser-session authority.
 
+**Principal launch path (pipe mode).** A principal in a principal session ensures its browser with
+the same `EnsureBrowser` request as in port mode (`passless agent browser`). In pipe mode the
+daemon starts the browser with `--remote-debugging-pipe`, keeps the pipes, and answers with no
+endpoint and `cdp_exposure = "pipe"`; the principal then drives the browser with `browser-control`.
+Everything else is the port path: the principal checks of the principal interface, the readiness
+gate (no answer before the worker attached with incognito access allowed), the lease's containment,
+the session grant and bearers bound to the session and lease, the B1 lifetime (the browser is
+forked on the launcher thread and ends with its session, revocation or expiry), and the lease
+audit records (`browser_lease.launch` with `cdp_expose = "pipe"`, then `revoke` and `cleanup`).
+`browser-control` acts on the lease its session owns and is refused, with a `denied` record,
+while the lease's interception is degraded (the same condition under which the port-mode
+bootstrap withholds its endpoint); a worker that is reconnecting within its grace period is
+served. A caller that can only use an endpoint (the Playwright bootstrap, the chrome-devtools
+adapter) sends `direct_cdp = true` and a pipe-mode profile refuses it before anything starts.
+`browser-control` does not hold the browser manager while it waits for the browser's answer (it
+takes it for the request and for 50 ms reading steps): a `Runtime.evaluate` with `awaitPromise`
+that waits for a WebAuthn ceremony would otherwise block the ceremony's own lease activation, which
+needs the manager, until the call timed out. One call per lease runs at a time; a second gets a
+`Busy` error. With `browser_scope = "profile"` the sessions of a profile share one browser and its
+pipe, so they see each other's targets and events.
+
+`browser_user` must differ from `principal_user` (and from the daemon user, and must not be
+root) only under a root daemon, where the browser is a separate Unix user that the principal
+cannot reach (`runtime/gates.rs`, checked at startup). A non-root daemon cannot switch users: the
+principal, the daemon and the browser are then one UID, the browser runs as the daemon user, and
+what pipe mode adds is mediation and audit of every CDP command and the extension filter, not
+isolation of the browser process from the principal (who can then read its profile and signal it).
+Treat that deployment as the shared-UID case of §13.
+
 **Extension filter (pipe mode).** CDP can attach to any target, the extension's service worker
 included: a session on it could read the daemon bearer, send requests with a forged
 `remoteDesktopClientOverride.origin` or `sameOriginWithAncestors`, or call
@@ -215,10 +244,9 @@ auto-attach with `waitForDebuggerOnStart` stays paused until the next call (avai
 agent's own ceremonies only). The filter does not restrict `file:` URLs, so the agent can read what
 the browser user can read, the extension's `worker.js` and its bearer included; the bearer alone
 does not pass the sign socket's peer-UID check when the browser runs as another user (§4.4), and in
-a shared-UID deployment the agent can read that file directly anyway. As implemented, no principal
-path launches a pipe-mode browser yet (`EnsureBrowser` serves port mode only, and an admin launch
-binds no principal session), so the filter is tested against a scripted browser pipe and E2E-52
-stays XFAIL until one does. Port mode has no such filter:
+a shared-UID deployment the agent can read that file directly anyway. The filter is tested against a scripted
+browser pipe (`browser.rs`, `cdp_filter.rs`) and against a real browser by E2E-52, which also
+attacks the worker by its target ID. Port mode has no such filter:
 Chromium's listener is reached directly and the bootstrap never relays frames (§7, §15).
 
 ### 4.4 Extension and transport
@@ -1116,7 +1144,8 @@ References are `file:line` at commit `130eaa5`.
 | Incognito and CDP-created contexts | **Done (P10a).** The launcher seeds the fresh profile's `Default/Preferences` with `extensions.settings.<id>.incognito = true` for the manifest-key extension ID (`seed_incognito_access`, `browser.rs`); the worker reports `isAllowedIncognitoAccess()` in its hello; a worker that is attached but not allowed in incognito is not intercepting (`BearerReadiness::intercepting`, `transport/readiness.rs`), so the launch fails (`LaunchError::IncognitoNotAllowed`) and the bootstrap withholds the endpoint (E2E-45/cdp-context) | — |
 | Native-path containment | **Done (P10a)** for the launcher: the browser runs under `bwrap --dev-bind / / --dev /dev --die-with-parent` whenever `bwrap` works for the browser's user (`ContainmentPlan`, `containment.rs`; `/dev/shm` is bound through only when a path the browser needs lives there); otherwise the child refuses to exec when `faccessat2(AT_EACCESS, R_OK \| W_OK)` finds an openable `/dev/hidraw*`, or cannot tell, after the credential drop (`LaunchError::ContainmentRefused`; the child lists `/dev` with `getdents64`); `containment::assess` reports the case. Port mode removes `DevToolsActivePort` after discovery. Review fixes: daemon writes into lease and sign-socket directories go through pinned directory handles (`safe_fs.rs`; lease and extension directories stay the daemon's, only the profile is handed over), a distinct-UID browser gets Chromium-sized rlimits, and `bwrap` must live on a path no other user can write. E2E-45, 46, 46/refused, 47 | — (`passless doctor --agents` reports the case per profile, P10b) |
 | Automatic interaction mode with agents | **Done (P10a).** Agents refuse to start, and a reload is rejected, when `PASSLESS_INTERACTION_MODE=automatic` and a same-user profile has an `allow` or `request` rule, unless `agents.allow_automatic_human_path = true` (`AgentConfig::validate_human_path_interaction`); the human path stays up (E2E-44/startup-refusal) | — (`passless doctor --agents` flags it, P10b) |
-| Agent browser CLI | **Done (P10b).** `passless agent browser [--json] [--env] [--wait] [--headed] [--url]` runs inside a principal session (the browser belongs to the session and closes with it; from a plain shell it explains this instead of starting a browser that would die at once). It sends `EnsureBrowser` (idempotent per session, shared per profile with `browser_scope = "profile"`), whose endpoint is already withheld until the worker attached and incognito access is confirmed (`--wait` re-checks `BrowserStatus`), and prints the loopback HTTP endpoint (`http://127.0.0.1:<port>`) or `PASSLESS_CDP_URL=...`. The default browser flag is `--headless=new` unless the profile's `browser_command` sets its own; `--headed` omits it. Needs `browser_cdp_expose = "port"`. E2E-37 | — |
+| Agent browser CLI | **Done (P10b).** `passless agent browser [--json] [--env] [--wait] [--headed] [--url]` runs inside a principal session (the browser belongs to the session and closes with it; from a plain shell it explains this instead of starting a browser that would die at once). It sends `EnsureBrowser` (idempotent per session, shared per profile with `browser_scope = "profile"`), whose endpoint is already withheld until the worker attached and incognito access is confirmed (`--wait` re-checks `BrowserStatus`), and prints the loopback HTTP endpoint (`http://127.0.0.1:<port>`) or `PASSLESS_CDP_URL=...`. The default browser flag is `--headless=new` unless the profile's `browser_command` sets its own; `--headed` omits it. Needs `browser_cdp_expose = "port"` for an endpoint; in pipe mode (the default) it ensures the same session-bound browser and prints how to drive it (`passless agent browser-control`, `--json` has `endpoint = null` and `control_command`, `--env` is an error). E2E-37 (port), E2E-52 (pipe) | — |
+| Pipe-mode principal browser | **Done.** `EnsureBrowser` serves both CDP modes (`runtime/browser_ensure.rs`): pipe mode returns no endpoint and `cdp_exposure = "pipe"`, with the same gates, session binding, B1 lifetime and lease audit as port mode; `browser-control` additionally refuses a degraded lease (`gates::check_control_interception`); the MCP adapters send `direct_cdp` and keep requiring port mode (§4.3). Supersedes the V-H7 "port-mode only" easy path: its binary-selection concern is covered by `resolve_browser_launch`, which both modes share. E2E-52 | — |
 | MCP adapters and client config | **Done (P10b).** `passless agent mcp playwright [-- args]` runs `npx --yes @playwright/mcp --cdp-endpoint <bootstrap>`, the bootstrap bearer going in `PLAYWRIGHT_MCP_CDP_HEADERS` (never in argv), with the browser started lazily on the first discovery request (the existing authenticated loopback bootstrap); `agent mcp chrome-devtools` runs `npx --yes chrome-devtools-mcp --browserUrl <endpoint>` and ensures the browser when it starts, because puppeteer requests `<browserUrl>/json/version` at the URL's root and cannot send the bearer header (an unauthenticated lazy endpoint would let any local process start the browser). Both resolve `npx` in the caller's `PATH` and re-run themselves in a principal session; `--package` pins the npm package, `--npx` names npx. `agent playwright-mcp` stays as a hidden alias for one release. `agent mcp --print-config {claude-code,opencode,cursor,vscode}` prints a ready entry (formats checked against each client's documentation: `mcpServers` for Claude Code `.mcp.json` and Cursor `.cursor/mcp.json`, `servers` for VS Code `.vscode/mcp.json`, `mcp.servers.<name>` with a `command` array for opencode's current schema; older opencode releases keep the name directly under `mcp`). E2E-34, 35, 36 | **Done (P11)** for the docs: `docs/agents/browser-tools.md` documents Stagehand `cdpUrl` (untested), browser-use and agent-browser. Their scenarios (E2E-38, E2E-39) are local and optional and skip when the tool is absent; they have not been run |
 | `passless doctor --agents` | **Done (P10b).** Host checks with no daemon: per profile the browser binary (kind, version, source, the extension's minimum Chrome) and the containment case (`containment::assess`); once the extension and native host manifest (rendered into a scratch directory and verified), the notification bus (the prompt child's bus: name owner and `actions`), the state directory (private, the daemon user's) and the automatic-interaction guard (R19). Exits 1 when a check fails. E2E-41 | — |
 | Shared browser ownership (P5 review L5) | **Done (P10b).** A `browser_scope = "profile"` browser records its owner session; when the owner exits the browser closes even if other sessions are attached (the worker's bearer, grant and bearer session are the owner's), and the others launch their own on their next `EnsureBrowser`. Rebinding the worker's baked-in bearer to another principal is not possible. While the owner lives, the sessions that attach later ride on its grant (`runtime.rs`, LOCKING.md) | — |

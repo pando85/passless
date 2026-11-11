@@ -16,6 +16,7 @@ mod tests {
         let request = PrincipalRequest::EnsureBrowser {
             start_url: None,
             headed: false,
+            direct_cdp: false,
         };
         request.validate().unwrap();
 
@@ -29,6 +30,7 @@ mod tests {
         let headed = PrincipalRequest::EnsureBrowser {
             start_url: None,
             headed: true,
+            direct_cdp: false,
         };
         headed.validate().unwrap();
         let json = serde_json::to_string(&headed).unwrap();
@@ -47,6 +49,7 @@ mod tests {
             PrincipalRequest::EnsureBrowser {
                 start_url: Some("https://example.com/".to_string()),
                 headed: false,
+                direct_cdp: false,
             }
         );
         let json = serde_json::to_string(&old).unwrap();
@@ -58,6 +61,7 @@ mod tests {
         PrincipalRequest::EnsureBrowser {
             start_url: Some("https://example.com/".to_string()),
             headed: false,
+            direct_cdp: false,
         }
         .validate()
         .unwrap();
@@ -65,6 +69,7 @@ mod tests {
         let empty = PrincipalRequest::EnsureBrowser {
             start_url: Some(String::new()),
             headed: false,
+            direct_cdp: false,
         }
         .validate()
         .unwrap_err();
@@ -73,6 +78,7 @@ mod tests {
         let oversized = PrincipalRequest::EnsureBrowser {
             start_url: Some(format!("https://example.com/{}", "a".repeat(4096))),
             headed: false,
+            direct_cdp: false,
         }
         .validate()
         .unwrap_err();
@@ -91,10 +97,63 @@ mod tests {
             shared_browser_context: None,
             interception: Some("attached".to_string()),
             incognito_allowed: Some(true),
+            cdp_exposure: Some("port".to_string()),
         });
 
         let json = serde_json::to_string(&response).unwrap();
         let decoded: PrincipalResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn direct_cdp_is_optional_on_the_wire() {
+        let direct = PrincipalRequest::EnsureBrowser {
+            start_url: None,
+            headed: false,
+            direct_cdp: true,
+        };
+        direct.validate().unwrap();
+        let json = serde_json::to_string(&direct).unwrap();
+        assert!(json.contains("\"direct_cdp\":true"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<PrincipalRequest>(&json).unwrap(),
+            direct
+        );
+
+        // The default (`agent browser`) is not sent, and a request without the field leaves it off.
+        let plain = PrincipalRequest::EnsureBrowser {
+            start_url: None,
+            headed: false,
+            direct_cdp: false,
+        };
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("direct_cdp")
+        );
+        assert_eq!(
+            serde_json::from_str::<PrincipalRequest>(r#"{"ensure_browser":{}}"#).unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn a_pipe_mode_browser_round_trips_without_an_endpoint() {
+        let response = PrincipalResponse::BrowserEnsured(BrowserStatusResponse {
+            running: true,
+            status: "authentication_pending".to_string(),
+            cdp_endpoint: None,
+            shared_browser_context: None,
+            interception: Some("attached".to_string()),
+            incognito_allowed: Some(true),
+            cdp_exposure: Some("pipe".to_string()),
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("cdp_endpoint"), "{json}");
+        assert!(json.contains("\"cdp_exposure\":\"pipe\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<PrincipalResponse>(&json).unwrap(),
+            response
+        );
     }
 }

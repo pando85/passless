@@ -48,9 +48,14 @@ Run `passless agent-admin profile check <profile>`.
   `passless doctor --agents` for the extension and native host, and the daemon log.
 - `agent browser ... must run inside a principal session`: start your agent with
   `passless agent run --profile <profile> -- <absolute command>`, or use `passless agent mcp ...`.
-- `Playwright browser discovery requires browser_cdp_expose = 'port'`: set `browser_cdp_expose =
-  "port"` on the profile if direct local control of the browser is acceptable
-  ([Containment](containment.md#cdp-port-mode)).
+- `Playwright browser discovery requires browser_cdp_expose = 'port'`: the adapter needs an endpoint,
+  which a pipe-mode profile does not have. Set `browser_cdp_expose = "port"` on the profile if direct
+  local control of the browser is acceptable ([Containment](containment.md#cdp-port-mode)), or run
+  `passless agent browser` and drive the browser with `passless agent browser-control`.
+- `browser-control` fails with `the managed browser's WebAuthn interception is degraded`: the extension
+  worker is not attached (or not allowed in incognito); retry after a moment, or see
+  `passless doctor --agents`. `no browser lease associated with this principal session`: run
+  `passless agent browser` first, in the same principal session.
 - A browser owned by another session: end it with `passless agent-admin principals revoke <id>
   --confirm`.
 - Do not add `--remote-debugging-*` or `--load-extension` flags to `browser_command`: Passless owns
@@ -99,7 +104,7 @@ reported by `profile check`. A granted rule is inert if the config rule is `deny
 ## A tool cannot connect to CDP
 
 The endpoint is printed only for an intercepted browser, by `passless agent browser --wait`. Port mode
-(`browser_cdp_expose = "port"`) is required. A tool that launches its own Chromium instead of
+(`browser_cdp_expose = "port"`) is required; in pipe mode there is no endpoint (use `browser-control`). A tool that launches its own Chromium instead of
 attaching gets no passkeys. See [Browser tools](browser-tools.md).
 
 ## Other

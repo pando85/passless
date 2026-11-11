@@ -2501,6 +2501,13 @@ impl AgentRuntime {
             );
             if let Some(snapshot) = browser_mgr.snapshot(&lease_id) {
                 let cdp_endpoint = browser_mgr.lease_cdp_endpoint(&lease_id).flatten();
+                let cdp_exposure = browser_mgr.lease_has_cdp_pipes(&lease_id).map(|pipes| {
+                    if pipes {
+                        CdpExposeMode::Pipe.to_string()
+                    } else {
+                        CdpExposeMode::Port.to_string()
+                    }
+                });
                 let shared_browser_context =
                     if profile.profile_config.browser_scope == BrowserScope::Profile {
                         let shared = profile.shared_browsers.lock().ok();
@@ -2528,6 +2535,7 @@ impl AgentRuntime {
                         shared_browser_context,
                         interception,
                         incognito_allowed,
+                        cdp_exposure,
                     },
                 ));
             }
@@ -2541,6 +2549,7 @@ impl AgentRuntime {
                 shared_browser_context: None,
                 interception: None,
                 incognito_allowed: None,
+                cdp_exposure: None,
             },
         ))
     }
@@ -2577,6 +2586,27 @@ impl AgentRuntime {
             // The endpoint is not named: only the bootstrap hands it out, and it withholds it while
             // the lease's interception is degraded (review L1).
             gates::check_browser_control_available(browser_mgr.lease_has_cdp_pipes(&lease_id))?;
+            // The same readiness gate as the port-mode bootstrap: no CDP while the daemon cannot
+            // confirm that the browser's WebAuthn requests are intercepted.
+            let interception = browser_mgr
+                .interception_state(
+                    &lease_id,
+                    &self.sign_readiness,
+                    super::browser::INTERCEPTION_DEGRADED_GRACE,
+                )
+                .map(|(state, _)| state);
+            if let Err(refused) = gates::check_control_interception(interception) {
+                let _ = self.audit_gate.record(
+                    super::audit_events::BrowserControlRequestBuilder::new(
+                        profile_id.clone(),
+                        lease_id.clone(),
+                        &cdp_method,
+                        super::audit_events::BrowserControlOutcome::Denied,
+                    )
+                    .build(),
+                );
+                return Err(refused);
+            }
         }
 
         let pre_audit = self.audit_gate.record(
@@ -2599,8 +2629,8 @@ impl AgentRuntime {
 
         let timeout = Duration::from_millis(timeout_ms as u64);
 
-        let result = {
-            let mut browser_mgr = super::lock_order::lock(
+        {
+            let browser_mgr = super::lock_order::lock(
                 &self.browser_manager,
                 super::lock_order::LockLevel::BrowserManager,
             );
@@ -2645,9 +2675,16 @@ impl AgentRuntime {
                     RecommendedAction::Abort,
                 ));
             }
+        }
 
-            browser_mgr.cdp_round_trip(&lease_id, request_json, timeout)
-        };
+        // The wait for the answer does not hold the browser manager: a `Runtime.evaluate` that
+        // awaits a WebAuthn ceremony needs it to activate the lease (LOCKING.md, rank 30).
+        let result = super::browser::cdp_round_trip_shared(
+            &self.browser_manager,
+            &lease_id,
+            request_json,
+            timeout,
+        );
 
         match result {
             Ok(cdp_result) => {
@@ -4479,12 +4516,17 @@ impl PrincipalHandler for AgentRuntime {
             PrincipalRequest::BrowserStatus => {
                 self.handle_browser_status(&profile_id, &managed.session_id, profile)
             }
-            PrincipalRequest::EnsureBrowser { start_url, headed } => self.handle_ensure_browser(
+            PrincipalRequest::EnsureBrowser {
+                start_url,
+                headed,
+                direct_cdp,
+            } => self.handle_ensure_browser(
                 &profile_id,
                 &managed.session_id,
                 &managed.process_digest,
                 start_url.as_deref(),
                 *headed,
+                *direct_cdp,
                 profile,
             ),
             PrincipalRequest::BrowserControl {

@@ -176,6 +176,9 @@ fn ensure_browser(
         .request(PrincipalRequest::EnsureBrowser {
             headed,
             start_url: start_url.map(ToOwned::to_owned),
+            // The bootstrap hands out an endpoint, which a pipe-mode browser has none of: the
+            // daemon refuses before it starts a browser nobody could reach.
+            direct_cdp: true,
         })
         .map_err(|e| e.to_string())?;
     match response {
