@@ -13,13 +13,12 @@ use log::{debug, info, warn};
 use passless_core::agent::protocol::{
     AdminRequest, AdminResponse, AuthorityBrowser, AuthorityCeremony, AuthorityCredentialScope,
     AuthorityIdentity, AuthorityRisk, AuthorityRpRule, AuthoritySession, DoctorResponse,
-    EffectiveAuthority, ErrorCode, PeerCred, PrincipalCapabilities, PrincipalInstructions,
-    PrincipalLaunchedResponse, PrincipalRequest, PrincipalResponse, PrincipalWaitResponse,
-    ProtocolError, RecommendedAction,
+    EffectiveAuthority, ErrorCode, PeerCred, PrincipalInstructions, PrincipalLaunchedResponse,
+    PrincipalRequest, PrincipalResponse, PrincipalWaitResponse, ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, BrowserScope, DaemonStatus,
-    EndpointId, EndpointStatusResponse, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
+    GrantId, PrincipalSessionId, ProfileId,
 };
 use passless_core::config::SecurityConfig;
 
@@ -91,19 +90,6 @@ impl AgentConfigSource {
             .map_err(|e| e.format_cli())?;
         Ok(config)
     }
-}
-
-#[allow(dead_code)]
-struct RequestDelegationParams<'a> {
-    profile_id: &'a ProfileId,
-    session_id: &'a PrincipalSessionId,
-    endpoint_id: &'a EndpointId,
-    rp_id: &'a str,
-    credential_ref: &'a passless_core::agent::CredentialRef,
-    max_session_ttl: u64,
-    principal_reason: Option<String>,
-    profile: &'a ProfileRuntime,
-    session_digest: &'a super::identity::ProcessIdentityDigest,
 }
 
 /// Open the granted-rules store under the effective `agents.state_dir`. Without a state directory
@@ -409,7 +395,6 @@ pub struct ProfileRuntime {
     pub profile_id: ProfileId,
     pub uid: u32,
     pub gid: u32,
-    pub endpoint_id: Mutex<Option<EndpointId>>,
     pub lifecycle_lock: Mutex<()>,
     pub security_config: SecurityConfig,
     pub operation_lock: Arc<Mutex<()>>,
@@ -430,12 +415,10 @@ pub struct ProfileRuntime {
 
 impl core::fmt::Debug for ProfileRuntime {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let eid = self.endpoint_id.lock().unwrap().clone();
         f.debug_struct("ProfileRuntime")
             .field("profile_name", &self.profile_name)
             .field("uid", &self.uid)
             .field("gid", &self.gid)
-            .field("endpoint_id", &eid)
             .field("mode", &self.mode)
             .field("daemon_uid", &self.daemon_uid)
             .field("daemon_gid", &self.daemon_gid)
@@ -488,7 +471,6 @@ pub enum RuntimeError {
     UserResolve { user: String, detail: String },
     Audit(String),
     Ipc(String),
-    Endpoint(String),
     Storage(String),
     Policy(String),
     Service(String),
@@ -503,7 +485,6 @@ impl std::fmt::Display for RuntimeError {
             }
             Self::Audit(msg) => write!(f, "audit subsystem error: {}", msg),
             Self::Ipc(msg) => write!(f, "IPC error: {}", msg),
-            Self::Endpoint(msg) => write!(f, "endpoint error: {}", msg),
             Self::Storage(msg) => write!(f, "storage error: {}", msg),
             Self::Policy(msg) => write!(f, "policy error: {}", msg),
             Self::Service(msg) => write!(f, "service error: {}", msg),
@@ -1273,7 +1254,6 @@ impl AgentRuntime {
                 }
             };
 
-            // The endpoint id is a logical handle for grants and intents; no device backs it.
             profiles.insert(
                 profile_id.clone(),
                 ProfileRuntime {
@@ -1281,7 +1261,6 @@ impl AgentRuntime {
                     profile_id: profile_id.clone(),
                     uid: resolved.uid,
                     gid: resolved.gid,
-                    endpoint_id: Mutex::new(Some(EndpointId::new())),
                     lifecycle_lock: Mutex::new(()),
                     security_config: security_config.clone(),
                     operation_lock: backend.operation_lock.clone(),
@@ -1377,7 +1356,6 @@ impl AgentRuntime {
             self.worker_tracker.reap_finished();
             self.reap_expired_sessions();
             self.prune_completed_sessions();
-            self.cleanup_expired_pending();
 
             {
                 let mut browser_mgr = super::lock_order::lock(
@@ -2460,10 +2438,6 @@ impl AgentRuntime {
         }
     }
 
-    fn cleanup_expired_pending(&self) {
-        let _ = self.policy_runtime.cleanup_expired_pending();
-    }
-
     fn prune_completed_sessions(&self) {
         let mut completed_map = self.completed_sessions.lock().unwrap();
         Self::prune_completed_before_insert(&mut completed_map);
@@ -2484,90 +2458,6 @@ impl AgentRuntime {
                 drop(managed.session);
             }
         }
-    }
-
-    fn handle_request_delegation(
-        &self,
-        _params: RequestDelegationParams<'_>,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        Err(ProtocolError::new(
-            ErrorCode::Forbidden,
-            "request delegation is not supported; the delegated mode was removed (agents sign through the managed browser: see `passless agent mcp --help`)",
-            RecommendedAction::FixRequest,
-        ))
-    }
-
-    fn handle_show_delegation(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        _profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        Ok(PrincipalResponse::DelegationStatus {
-            request_id: request_id.clone(),
-            state: status.to_delegation_state(),
-        })
-    }
-
-    fn handle_cancel_delegation(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let _lifecycle = super::lock_order::lock(
-            &profile.lifecycle_lock,
-            super::lock_order::LockLevel::ProfileLifecycle,
-        );
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        let grant_request_id = status.grant_request_id;
-
-        if let Some(ref grant_req_id) = grant_request_id
-            && let Some(grant_id) = self
-                .policy_runtime
-                .resolved_grant_id_for_request(&status.profile_id, grant_req_id)
-        {
-            let _ = self.policy_runtime.revoke_grant_by_id(&grant_id);
-        }
-
-        let _ = self
-            .policy_runtime
-            .principal_cancel_pending(request_id, session_id);
-
-        Ok(PrincipalResponse::DelegationCancelled)
     }
 
     fn handle_list_credentials(
@@ -2914,7 +2804,6 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
     ) -> passless_core::agent::ProfileDiagnosticReport {
         let enabled = profile.enabled.load(Ordering::Acquire);
-        let endpoint_has_id = profile.endpoint_id.lock().unwrap().is_some();
 
         let browser_lease_state = {
             let active = profile.active_browser.lock().unwrap();
@@ -2954,7 +2843,6 @@ impl AgentRuntime {
                 profile_id,
                 enabled,
                 mode: profile.mode,
-                endpoint_has_id,
                 browser_lease_state: browser_lease_state.as_deref(),
                 policy_generation: policy_gen,
                 audit_gate: &self.audit_gate,
@@ -3032,14 +2920,6 @@ impl AgentRuntime {
                 RecommendedAction::FixRequest,
             )
         })?;
-
-        {
-            // The endpoint id is a logical handle for grants and intents; no device backs it.
-            let mut eid_guard = profile.endpoint_id.lock().unwrap();
-            if eid_guard.is_none() {
-                *eid_guard = Some(EndpointId::new());
-            }
-        }
 
         profile.enabled.store(true, Ordering::Release);
 
@@ -3979,94 +3859,6 @@ impl AgentRuntime {
         ))
     }
 
-    fn handle_admin_request_delegation(
-        &self,
-        profile_id: &ProfileId,
-        rp_id: &str,
-        credential_ref: &passless_core::agent::CredentialRef,
-        max_session_ttl: u64,
-        reason: Option<&str>,
-    ) -> Result<AdminResponse, ProtocolError> {
-        let profile = self.profiles.get(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                format!("profile '{}' not found", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-
-        let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                "no session slot for profile",
-                RecommendedAction::Abort,
-            )
-        })?;
-
-        let managed_guard =
-            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
-        let managed = match managed_guard.as_slice() {
-            [managed] => managed,
-            [] => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "no active principal session for this profile; launch one first with `passless agent run`",
-                    RecommendedAction::FixRequest,
-                ));
-            }
-            _ => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "multiple principal sessions are active; issue this request from the target principal session",
-                    RecommendedAction::FixRequest,
-                ));
-            }
-        };
-
-        let _lifecycle = super::lock_order::lock(
-            &profile.lifecycle_lock,
-            super::lock_order::LockLevel::ProfileLifecycle,
-        );
-        {
-            let eid_guard = profile.endpoint_id.lock().unwrap();
-            if eid_guard.is_none() {
-                drop(eid_guard);
-                let eid = passless_core::agent::EndpointId::new();
-                info!(
-                    "Profile '{}' endpoint id (agents have no UHID device): {}",
-                    profile_id.as_str(),
-                    eid.as_str()
-                );
-                let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                *eid_guard = Some(eid);
-            }
-        }
-        let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
-
-        let resp = self.handle_request_delegation(RequestDelegationParams {
-            profile_id,
-            session_id: &managed.session_id,
-            endpoint_id: &eid,
-            rp_id,
-            credential_ref,
-            max_session_ttl,
-            principal_reason: reason.map(|s| s.to_string()),
-            profile,
-            session_digest: &managed.process_digest,
-        })?;
-
-        match resp {
-            PrincipalResponse::DelegationRequested { request_id } => {
-                Ok(AdminResponse::DelegationRequested { request_id })
-            }
-            _ => Err(ProtocolError::new(
-                ErrorCode::Internal,
-                "unexpected response from delegation handler",
-                RecommendedAction::Retry,
-            )),
-        }
-    }
-
     fn handle_launch_browser(
         &self,
         profile_id: &ProfileId,
@@ -4076,14 +3868,6 @@ impl AgentRuntime {
             ProtocolError::new(
                 ErrorCode::NotFound,
                 format!("profile '{}' not found", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-
-        let endpoint_id = profile.endpoint_id.lock().unwrap().clone().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                format!("profile '{}' has no active endpoint", profile_id),
                 RecommendedAction::FixRequest,
             )
         })?;
@@ -4228,7 +4012,6 @@ impl AgentRuntime {
 
         let lease_id = match browser_manager.launch_pending_with_agent_endpoint(
             &config,
-            endpoint_id.clone(),
             profile_id.clone(),
             Some(&metadata),
         ) {
@@ -4334,7 +4117,6 @@ impl AgentRuntime {
             let grant_params = super::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id,
-                endpoint_id: endpoint_id.clone(),
                 principal_digest: [0u8; 32],
                 rp_ids: config.rp_ids.clone(),
                 credentials: if dynamic_credential_scope {
@@ -4543,19 +4325,6 @@ impl AdminHandler for AgentRuntime {
             AdminRequest::ClearGrantedRules { profile_id } => {
                 self.handle_clear_granted_rules(profile_id)
             }
-            AdminRequest::RequestDelegation {
-                profile_id,
-                rp_id,
-                credential_ref,
-                max_session_ttl,
-                reason,
-            } => self.handle_admin_request_delegation(
-                profile_id,
-                rp_id,
-                credential_ref,
-                *max_session_ttl,
-                reason.as_deref(),
-            ),
             AdminRequest::LaunchBrowser {
                 profile_id,
                 start_url,
@@ -4682,16 +4451,6 @@ impl PrincipalHandler for AgentRuntime {
                     credential_count,
                 }))
             }
-            PrincipalRequest::Capabilities => {
-                let mode_str = format!("{:?}", profile.mode);
-                let live_config = self.live_profile_config(profile);
-                Ok(PrincipalResponse::Capabilities(PrincipalCapabilities {
-                    profile_id: profile_id.to_string(),
-                    mode: mode_str,
-                    allowed_rp_ids: live_config.allowed_rp_ids(),
-                    registration_allowed: live_config.allows_registration(),
-                }))
-            }
             PrincipalRequest::Authority => Ok(PrincipalResponse::Authority(
                 self.build_effective_authority(&profile_id, profile, managed),
             )),
@@ -4710,47 +4469,6 @@ impl PrincipalHandler for AgentRuntime {
                     checks: report.checks,
                 }))
             }
-            // Agent ceremonies run only through the browser extension (ADR 0014 section 5); the
-            // per-ceremony intent hand-off belonged to the removed UHID route.
-            PrincipalRequest::RequestDelegation {
-                profile_id: _req_profile_id,
-                rp_id,
-                credential_ref,
-                max_session_ttl,
-                reason,
-            } => {
-                let _lifecycle = super::lock_order::lock(
-                    &profile.lifecycle_lock,
-                    super::lock_order::LockLevel::ProfileLifecycle,
-                );
-                {
-                    let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                    if eid_guard.is_none() {
-                        *eid_guard = Some(EndpointId::new());
-                    }
-                }
-                let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
-                self.handle_request_delegation(RequestDelegationParams {
-                    profile_id: &profile_id,
-                    session_id: &managed.session_id,
-                    endpoint_id: &eid,
-                    rp_id,
-                    credential_ref,
-                    max_session_ttl: *max_session_ttl,
-                    principal_reason: reason.clone(),
-                    profile,
-                    session_digest: &managed.process_digest,
-                })
-            }
-            PrincipalRequest::ShowDelegation { request_id } => {
-                self.handle_show_delegation(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::WaitDelegation { request_id } => {
-                self.handle_show_delegation(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::CancelDelegation { request_id } => {
-                self.handle_cancel_delegation(&profile_id, &managed.session_id, request_id, profile)
-            }
             PrincipalRequest::ListCredentials {
                 profile_id: _req_profile_id,
             } => self.handle_list_credentials(&profile_id, profile),
@@ -4765,15 +4483,6 @@ impl PrincipalHandler for AgentRuntime {
                 *headed,
                 profile,
             ),
-            PrincipalRequest::EndpointStatus => {
-                // Agents have no device endpoint; the id is only a logical handle.
-                let eid = profile.endpoint_id.lock().unwrap().clone();
-                Ok(PrincipalResponse::EndpointStatus(EndpointStatusResponse {
-                    endpoint_id: eid.unwrap_or_else(EndpointId::new),
-                    status: "extension".into(),
-                    connected: false,
-                }))
-            }
             PrincipalRequest::BrowserControl {
                 request_json,
                 timeout_ms,
@@ -4784,11 +4493,6 @@ impl PrincipalHandler for AgentRuntime {
                 *timeout_ms,
                 profile,
             ),
-            PrincipalRequest::SignAssertion(_req) => Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "sign assertions are not available; the delegated mode was removed (agents sign through the managed browser: see `passless agent mcp --help`)",
-                RecommendedAction::FixRequest,
-            )),
         }
     }
 }
@@ -5334,78 +5038,6 @@ register = "deny"
     }
 
     #[test]
-    fn endpoint_id_mutex_can_store_and_retrieve() {
-        let eid: Mutex<Option<EndpointId>> = Mutex::new(None);
-        let new_id = EndpointId::new();
-        *eid.lock().unwrap() = Some(new_id.clone());
-        assert_eq!(eid.lock().unwrap().as_ref().unwrap(), &new_id);
-    }
-
-    #[test]
-    fn endpoint_id_mutex_take_clears_to_none() {
-        let eid: Mutex<Option<EndpointId>> = Mutex::new(Some(EndpointId::new()));
-        let taken = eid.lock().unwrap().take();
-        assert!(taken.is_some());
-        assert!(eid.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn lifecycle_lock_is_independent_of_endpoint_id() {
-        let lifecycle_lock: Mutex<()> = Mutex::new(());
-        let eid: Mutex<Option<EndpointId>> = Mutex::new(None);
-
-        {
-            let _lifecycle = lifecycle_lock.lock().unwrap();
-            assert!(eid.lock().unwrap().is_none());
-            *eid.lock().unwrap() = Some(EndpointId::new());
-        }
-
-        {
-            let _lifecycle = lifecycle_lock.lock().unwrap();
-            assert!(eid.lock().unwrap().is_some());
-        }
-    }
-
-    #[test]
-    fn no_duplicate_endpoint_under_concurrent_lifecycle_lock() {
-        use std::sync::atomic::AtomicUsize;
-
-        let lifecycle_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-        let eid: Arc<Mutex<Option<EndpointId>>> = Arc::new(Mutex::new(None));
-        let create_count = Arc::new(AtomicUsize::new(0));
-
-        let threads: Vec<_> = (0..4)
-            .map(|_| {
-                let lock = lifecycle_lock.clone();
-                let eid_mutex = eid.clone();
-                let count = create_count.clone();
-                std::thread::spawn(move || {
-                    let _lifecycle = lock.lock().unwrap();
-                    let should_create = {
-                        let guard = eid_mutex.lock().unwrap();
-                        guard.is_none()
-                    };
-                    if should_create {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        *eid_mutex.lock().unwrap() = Some(EndpointId::new());
-                    }
-                })
-            })
-            .collect();
-
-        for t in threads {
-            t.join().unwrap();
-        }
-
-        assert_eq!(
-            create_count.load(Ordering::SeqCst),
-            1,
-            "endpoint should be created exactly once under lifecycle lock"
-        );
-        assert!(eid.lock().unwrap().is_some());
-    }
-
-    #[test]
     fn shared_attach_same_session_twice_keeps_refcount_one() {
         let profile_id = ProfileId::new("test-shared").unwrap();
         let session = PrincipalSessionId::new();
@@ -5674,9 +5306,7 @@ register = "deny"
             Arc::new(super::super::browser::MockClock::new()),
             Arc::new(super::super::browser::DirectExecSpawner),
         );
-        let lease_id = manager
-            .launch(&config, EndpointId::new(), profile.clone())
-            .unwrap();
+        let lease_id = manager.launch(&config, profile.clone()).unwrap();
         (manager, lease_id)
     }
 

@@ -195,7 +195,6 @@ fn dispatch_profile(output: OutputFormat, action: &AdminProfileAction) -> Result
                         println!("profile_id: {}", report.profile_id);
                         println!("enabled: {}", report.enabled);
                         println!("mode: {}", report.mode);
-                        println!("endpoint_state: {}", report.endpoint_state);
                         if let Some(ref lease) = report.browser_lease_state {
                             println!("browser_lease_state: {}", lease);
                         }
@@ -1619,13 +1618,12 @@ mod tests {
     #[test]
     fn profile_diagnostic_report_serializes_to_json() {
         use passless_core::agent::ProfileDiagnosticReport;
-        use passless_core::agent::protocol::{DoctorCheck, EndpointDiagnosticState};
+        use passless_core::agent::protocol::DoctorCheck;
 
         let report = ProfileDiagnosticReport {
             profile_id: "test".into(),
             enabled: true,
             mode: "Isolated".into(),
-            endpoint_state: EndpointDiagnosticState::Ready,
             browser_lease_state: None,
             policy_generation: 42,
             audit_gate_healthy: true,

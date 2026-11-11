@@ -8,15 +8,14 @@ use passless_core::agent::config::{ANY_RP_ID, validate_rp_id};
 use passless_core::agent::protocol::GrantAction;
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
-    EndpointId, GrantId, GrantSource, MatchedRule, NoGrantedRules, PendingRequestId, Policy,
-    PolicyAction, PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId,
-    RuleAction, resolve_rules,
+    GrantId, GrantSource, MatchedRule, NoGrantedRules, Policy, PolicyAction, PolicyDigest,
+    PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId, RuleAction, resolve_rules,
 };
 
 use super::audit::AuditGate;
 use super::browser::Clock;
-use super::grant::{GrantError, GrantRegistry, GrantRequestId, GrantRequestParams};
-use super::identity::{AdminAuthority, ProcessIdentityDigest};
+use super::grant::{GrantError, GrantRegistry, GrantRequestParams};
+use super::identity::AdminAuthority;
 use super::lock_order::{self, LockLevel, Tracked};
 
 #[derive(Debug, Clone)]
@@ -162,92 +161,6 @@ pub struct GrantSignSnapshot {
     pub is_revoked: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingState {
-    Waiting,
-    Approved,
-    Denied,
-    TimedOut,
-    Cancelled,
-}
-
-impl PendingState {
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Denied | Self::TimedOut | Self::Cancelled)
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Waiting => "waiting",
-            Self::Approved => "approved",
-            Self::Denied => "denied",
-            Self::TimedOut => "timed_out",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
-impl fmt::Display for PendingState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
-    }
-}
-
-pub struct PendingPrincipalRequest {
-    id: PendingRequestId,
-    profile_id: ProfileId,
-    session_id: PrincipalSessionId,
-    endpoint_id: EndpointId,
-    process_digest: ProcessIdentityDigest,
-    policy_generation: PolicyGenerationId,
-    policy_digest: PolicyDigest,
-    action: GrantAction,
-    rp_id: String,
-    credential_ref: Option<CredentialRef>,
-    grant_request_id: Option<GrantRequestId>,
-    state: PendingState,
-    created_at_mono: u64,
-    deadline_mono: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingCreateError {
-    GrantRequestFailed(GrantError),
-    DuplicatePending,
-    Internal(String),
-}
-
-impl fmt::Display for PendingCreateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::GrantRequestFailed(e) => write!(f, "grant request failed: {}", e),
-            Self::DuplicatePending => write!(f, "duplicate pending request for this tuple"),
-            Self::Internal(s) => write!(f, "internal error: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for PendingCreateError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingCancelError {
-    NotFound,
-    AlreadyResolved,
-    SessionMismatch,
-}
-
-impl fmt::Display for PendingCancelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "pending request not found"),
-            Self::AlreadyResolved => write!(f, "pending request already resolved"),
-            Self::SessionMismatch => write!(f, "session mismatch for cancel"),
-        }
-    }
-}
-
-impl std::error::Error for PendingCancelError {}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyRuntimeError {
     Compilation(String),
@@ -270,7 +183,6 @@ impl std::error::Error for PolicyRuntimeError {}
 pub struct PolicyRuntime {
     current: RwLock<Arc<PolicyGenerationSnapshot>>,
     grants: Mutex<HashMap<String, GrantRegistry>>,
-    pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
     audit_gate: Option<Arc<AuditGate>>,
     /// The granted-rules store consulted to upgrade a `request` (ADR 0014 sections 6.2 and 8.4).
@@ -332,7 +244,6 @@ impl PolicyRuntime {
         Ok(Self {
             current: RwLock::new(gen_arc),
             grants: Mutex::new(grant_registries),
-            pending_requests: Mutex::new(HashMap::new()),
             clock,
             audit_gate,
             granted_rules: Arc::new(NoGrantedRules),
@@ -510,12 +421,6 @@ impl PolicyRuntime {
 
     fn lock_grants(&self) -> Tracked<MutexGuard<'_, HashMap<String, GrantRegistry>>> {
         lock_order::lock(&self.grants, LockLevel::Policy)
-    }
-
-    fn lock_pending_requests(
-        &self,
-    ) -> Tracked<MutexGuard<'_, HashMap<String, PendingPrincipalRequest>>> {
-        lock_order::lock(&self.pending_requests, LockLevel::Policy)
     }
 
     /// The live revocation epoch (ADR 0014 section 6.4).
@@ -716,7 +621,7 @@ impl PolicyRuntime {
     /// A reload whose digest is unchanged is a no-op: the generation, the session grants and the
     /// revocation epoch stay as they are, so live sessions continue. A reload that changes the
     /// effective policy compiles a new generation, replaces the session-grant registries, cancels
-    /// pending delegation requests and bumps the revocation epoch, which revokes every bearer session (ADR 0014
+    /// and bumps the revocation epoch, which revokes every bearer session (ADR 0014
     /// sections 6.4 and 9, invariant 18). An invalid configuration leaves everything untouched.
     pub fn reload(&self, config: &AgentConfig) -> Result<ReloadOutcome, PolicyRuntimeError> {
         let _reload = lock_order::lock(&self.reload_lock, LockLevel::PolicyReload);
@@ -750,11 +655,6 @@ impl PolicyRuntime {
         }
 
         // Each policy lock is taken alone (LOCKING.md): no policy guard is held across another.
-        for pr in self.lock_pending_requests().values_mut() {
-            if pr.state == PendingState::Waiting {
-                pr.state = PendingState::Cancelled;
-            }
-        }
         *self.lock_grants() = new_registries;
         {
             let _level = lock_order::enter(LockLevel::Policy);
@@ -774,26 +674,6 @@ impl PolicyRuntime {
             changed: true,
             revocation_epoch,
         })
-    }
-
-    /// Withdraw the grant requests of pending principal requests that were just cancelled or
-    /// timed out. Runs after the `pending_requests` guard is released.
-    fn abandon_pending(&self, abandoned: Vec<(ProfileId, Option<GrantRequestId>)>) {
-        if abandoned.is_empty() {
-            return;
-        }
-        let authority = super::identity::admin_authority();
-        let mut grants_map = self.lock_grants();
-        for (profile_id, grant_request_id) in &abandoned {
-            if let Some(grant_request_id) = grant_request_id
-                && let Some(grants) = grants_map.get_mut(profile_id.as_str())
-            {
-                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
-                    let _ = grants.revoke_grant(&grant_id, &authority);
-                }
-                let _ = grants.cancel_request(grant_request_id);
-            }
-        }
     }
 
     pub fn admin_request_grant(
@@ -892,20 +772,10 @@ impl PolicyRuntime {
     }
 
     pub fn principal_exit(&self, session_id: &PrincipalSessionId) {
-        {
-            let mut grants_map = self.lock_grants();
-            for grants in grants_map.values_mut() {
-                grants.on_principal_exit(session_id);
-                grants.cancel_claims_for_session(session_id);
-            }
-        }
-        {
-            let mut pending_requests = self.lock_pending_requests();
-            for pr in pending_requests.values_mut() {
-                if pr.session_id == *session_id && pr.state == PendingState::Waiting {
-                    pr.state = PendingState::Cancelled;
-                }
-            }
+        let mut grants_map = self.lock_grants();
+        for grants in grants_map.values_mut() {
+            grants.on_principal_exit(session_id);
+            grants.cancel_claims_for_session(session_id);
         }
     }
 
@@ -913,226 +783,7 @@ impl PolicyRuntime {
     pub fn admin_authority(&self) -> AdminAuthority {
         super::identity::admin_authority()
     }
-
-    pub fn principal_create_pending_delegated(
-        &self,
-        params: PendingDelegationParams,
-        grant_params: GrantRequestParams,
-    ) -> Result<(PendingRequestId, super::grant::GrantRequestId), PendingCreateError> {
-        let now_mono = self.clock.monotonic_secs();
-        let ttl_ms = params.ttl_ms.unwrap_or(300_000);
-        let ttl_secs = ttl_ms.div_ceil(1000);
-
-        let normalized_rp = params.rp_id.trim().to_ascii_lowercase();
-        let PendingDelegationParams {
-            profile_id,
-            session_id,
-            endpoint_id,
-            process_digest,
-            policy_generation,
-            policy_digest,
-            action,
-            credential_ref,
-            ..
-        } = params;
-
-        let grant_request_id =
-            {
-                let profile_key = profile_id.as_str().to_string();
-                let mut grants_map = self.lock_grants();
-                let grants = grants_map.get_mut(&profile_key).ok_or(
-                    PendingCreateError::GrantRequestFailed(GrantError::ProfileMismatch),
-                )?;
-                grants
-                    .request_grant(grant_params)
-                    .map_err(PendingCreateError::GrantRequestFailed)?
-            };
-
-        let pending_id = PendingRequestId::new();
-
-        let request = PendingPrincipalRequest {
-            id: pending_id.clone(),
-            profile_id,
-            session_id,
-            endpoint_id,
-            process_digest,
-            policy_generation,
-            policy_digest,
-            action,
-            rp_id: normalized_rp,
-            credential_ref,
-            grant_request_id: Some(grant_request_id.clone()),
-            state: PendingState::Waiting,
-            created_at_mono: now_mono,
-            deadline_mono: now_mono.saturating_add(ttl_secs),
-        };
-
-        let mut pending_requests = self.lock_pending_requests();
-        pending_requests.insert(pending_id.as_str().to_string(), request);
-        Ok((pending_id, grant_request_id))
-    }
-
-    pub fn principal_cancel_pending(
-        &self,
-        pending_id: &PendingRequestId,
-        session_id: &PrincipalSessionId,
-    ) -> Result<(), PendingCancelError> {
-        let mut pending_requests = self.lock_pending_requests();
-        let request = pending_requests
-            .get_mut(pending_id.as_str())
-            .ok_or(PendingCancelError::NotFound)?;
-
-        if request.state != PendingState::Waiting {
-            return Err(PendingCancelError::AlreadyResolved);
-        }
-
-        if request.session_id != *session_id {
-            return Err(PendingCancelError::SessionMismatch);
-        }
-
-        request.state = PendingState::Cancelled;
-        let abandoned = vec![(request.profile_id.clone(), request.grant_request_id.clone())];
-        drop(pending_requests);
-        self.abandon_pending(abandoned);
-
-        Ok(())
-    }
-
-    pub fn principal_pending_status(
-        &self,
-        pending_id: &PendingRequestId,
-        session_id: &PrincipalSessionId,
-    ) -> Result<PendingStatusSnapshot, PendingStatusError> {
-        let pending_requests = self.lock_pending_requests();
-        let request = pending_requests
-            .get(pending_id.as_str())
-            .ok_or(PendingStatusError::NotFound)?;
-
-        if request.session_id != *session_id {
-            return Err(PendingStatusError::SessionMismatch);
-        }
-
-        let now_mono = self.clock.monotonic_secs();
-        let effective_state =
-            if request.state == PendingState::Waiting && now_mono >= request.deadline_mono {
-                PendingState::TimedOut
-            } else {
-                request.state
-            };
-
-        Ok(PendingStatusSnapshot {
-            id: request.id.clone(),
-            state: effective_state,
-            profile_id: request.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: request.policy_generation.clone(),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-            grant_request_id: request.grant_request_id.clone(),
-            created_at_mono: request.created_at_mono,
-            deadline_mono: request.deadline_mono,
-        })
-    }
-
-    pub fn cleanup_expired_pending(&self) -> Vec<PendingRequestId> {
-        let now_mono = self.clock.monotonic_secs();
-        let mut expired = Vec::new();
-        let mut abandoned = Vec::new();
-        for request in self.lock_pending_requests().values_mut() {
-            if request.state == PendingState::Waiting && now_mono >= request.deadline_mono {
-                request.state = PendingState::TimedOut;
-                expired.push(request.id.clone());
-                abandoned.push((request.profile_id.clone(), request.grant_request_id.clone()));
-            }
-        }
-        self.abandon_pending(abandoned);
-        expired
-    }
-
-    pub fn cancel_pending_for_session(&self, session_id: &PrincipalSessionId) {
-        let mut abandoned = Vec::new();
-        for request in self.lock_pending_requests().values_mut() {
-            if request.session_id == *session_id && request.state == PendingState::Waiting {
-                request.state = PendingState::Cancelled;
-                abandoned.push((request.profile_id.clone(), request.grant_request_id.clone()));
-            }
-        }
-        self.abandon_pending(abandoned);
-    }
 }
-
-/// The request half of a pending delegation (the grant request is separate).
-pub struct PendingDelegationParams {
-    pub profile_id: ProfileId,
-    pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
-    pub process_digest: ProcessIdentityDigest,
-    pub action: GrantAction,
-    pub rp_id: String,
-    pub credential_ref: Option<CredentialRef>,
-    pub policy_generation: PolicyGenerationId,
-    pub policy_digest: PolicyDigest,
-    pub ttl_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingStatusSnapshot {
-    pub id: PendingRequestId,
-    pub state: PendingState,
-    pub profile_id: ProfileId,
-    pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
-    pub process_digest: ProcessIdentityDigest,
-    pub policy_generation: PolicyGenerationId,
-    pub policy_digest: PolicyDigest,
-    pub action: GrantAction,
-    pub rp_id: String,
-    pub credential_ref: Option<CredentialRef>,
-    pub grant_request_id: Option<GrantRequestId>,
-    pub created_at_mono: u64,
-    pub deadline_mono: u64,
-}
-
-impl PendingStatusSnapshot {
-    pub fn is_terminal(&self) -> bool {
-        self.state.is_terminal()
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.state == PendingState::TimedOut
-    }
-
-    pub fn to_delegation_state(&self) -> passless_core::agent::protocol::DelegationState {
-        match self.state {
-            PendingState::Waiting => passless_core::agent::protocol::DelegationState::Pending,
-            PendingState::Approved => passless_core::agent::protocol::DelegationState::Approved,
-            PendingState::Denied => passless_core::agent::protocol::DelegationState::Denied,
-            PendingState::TimedOut => passless_core::agent::protocol::DelegationState::Expired,
-            PendingState::Cancelled => passless_core::agent::protocol::DelegationState::Cancelled,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingStatusError {
-    NotFound,
-    SessionMismatch,
-}
-
-impl std::fmt::Display for PendingStatusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "pending request not found"),
-            Self::SessionMismatch => write!(f, "session mismatch for pending request"),
-        }
-    }
-}
-
-impl std::error::Error for PendingStatusError {}
 
 #[cfg(test)]
 mod tests {
@@ -1147,7 +798,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::browser::Clock;
-    use super::super::identity::ProcessIdentityDigest;
     use passless_core::agent::protocol::GrantAction;
 
     struct MockClock {
@@ -1167,10 +817,6 @@ mod tests {
                     offset: Duration::ZERO,
                 }),
             }
-        }
-
-        fn advance(&self, d: Duration) {
-            self.inner.lock().unwrap().offset += d;
         }
     }
 
@@ -1192,7 +838,7 @@ mod tests {
     fn make_isolated_config(
         profile_name: &str,
         rp_ids: Vec<&str>,
-        registration_allowed: bool,
+        register_allowed: bool,
     ) -> AgentConfig {
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -1216,7 +862,7 @@ mod tests {
                     .into_iter()
                     .map(|rp_id| AgentRpRule {
                         rp_id: rp_id.to_string(),
-                        register: if registration_allowed {
+                        register: if register_allowed {
                             RuleAction::Allow
                         } else {
                             RuleAction::Deny
@@ -1255,39 +901,6 @@ mod tests {
         let clock = test_clock();
         let runtime = PolicyRuntime::new(config, clock.clone(), None).unwrap();
         (runtime, clock)
-    }
-
-    /// Register a waiting delegation request directly (the principal path is refused by the
-    /// runtime; the pending-request bookkeeping is what these tests exercise).
-    fn insert_pending(
-        runtime: &PolicyRuntime,
-        profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        ttl_ms: u64,
-    ) -> PendingRequestId {
-        let generation = runtime.current_generation();
-        let now_mono = runtime.clock.monotonic_secs();
-        let id = PendingRequestId::new();
-        runtime.lock_pending_requests().insert(
-            id.as_str().to_string(),
-            PendingPrincipalRequest {
-                id: id.clone(),
-                profile_id: profile_id.clone(),
-                session_id: session_id.clone(),
-                endpoint_id: EndpointId::new(),
-                process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                action: GrantAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                grant_request_id: None,
-                state: PendingState::Waiting,
-                created_at_mono: now_mono,
-                deadline_mono: now_mono.saturating_add(ttl_ms.div_ceil(1000)),
-            },
-        );
-        id
     }
 
     fn rule(rp_id: &str, authenticate: RuleAction, register: RuleAction) -> AgentRpRule {
@@ -1712,7 +1325,6 @@ mod tests {
                 GrantRequestParams {
                     profile_id: pid.clone(),
                     session_id: PrincipalSessionId::new(),
-                    endpoint_id: EndpointId::new(),
                     principal_digest: [3u8; 32],
                     rp_ids: vec!["example.com".to_string()],
                     credentials: Vec::new(),
@@ -1753,7 +1365,6 @@ mod tests {
         let params = |ttl| GrantRequestParams {
             profile_id: pid.clone(),
             session_id: PrincipalSessionId::new(),
-            endpoint_id: EndpointId::new(),
             principal_digest: [0u8; 32],
             rp_ids: vec!["example.com".to_string()],
             credentials: Vec::new(),
@@ -1874,168 +1485,5 @@ mod tests {
             .unwrap()
             .digest;
         assert_ne!(d1, d2);
-    }
-
-    #[test]
-    fn test_principal_cancel_pending() {
-        let config = make_isolated_config("cancelpending", vec!["example.com"], true);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("cancelpending").unwrap();
-        let session = PrincipalSessionId::new();
-
-        let pending_id = insert_pending(&runtime, &pid, &session, 60_000);
-
-        let result = runtime.principal_cancel_pending(&pending_id, &session);
-        assert!(result.is_ok());
-
-        let pr = runtime.pending_requests.lock().unwrap();
-        let req = pr.get(pending_id.as_str()).unwrap();
-        assert_eq!(req.state, PendingState::Cancelled);
-    }
-
-    #[test]
-    fn test_cancel_pending_wrong_session() {
-        let config = make_isolated_config("cancelwrong", vec!["example.com"], true);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("cancelwrong").unwrap();
-        let session = PrincipalSessionId::new();
-        let wrong_session = PrincipalSessionId::new();
-
-        let pending_id = insert_pending(&runtime, &pid, &session, 60_000);
-
-        let result = runtime.principal_cancel_pending(&pending_id, &wrong_session);
-        assert_eq!(result, Err(PendingCancelError::SessionMismatch));
-    }
-
-    #[test]
-    fn test_reload_cancels_pending_requests() {
-        let config1 = make_isolated_config("reloadcancel", vec!["example.com"], true);
-        let (runtime, _clock) = make_runtime(&config1);
-        let pid = ProfileId::new("reloadcancel").unwrap();
-        let session = PrincipalSessionId::new();
-
-        let _pending_id = insert_pending(&runtime, &pid, &session, 60_000);
-
-        let config2 = make_isolated_config("reloadcancel", vec!["example.com", "github.com"], true);
-        runtime.reload(&config2).unwrap();
-
-        let pr = runtime.pending_requests.lock().unwrap();
-        let values: Vec<_> = pr.values().collect();
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].state, PendingState::Cancelled);
-    }
-
-    #[test]
-    fn test_principal_exit_cancels_pending() {
-        let config = make_isolated_config("exitcancel", vec!["example.com"], true);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("exitcancel").unwrap();
-        let session = PrincipalSessionId::new();
-
-        let _pending_id = insert_pending(&runtime, &pid, &session, 60_000);
-
-        runtime.principal_exit(&session);
-
-        let pr = runtime.pending_requests.lock().unwrap();
-        let values: Vec<_> = pr.values().collect();
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].state, PendingState::Cancelled);
-    }
-
-    #[test]
-    fn test_principal_pending_status_wrong_session() {
-        let config = make_isolated_config("status_wrong_sess", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("status_wrong_sess").unwrap();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let wrong_session = passless_core::agent::PrincipalSessionId::new();
-
-        let pending_id = insert_pending(&runtime, &pid, &session, 60_000);
-
-        let result = runtime.principal_pending_status(&pending_id, &wrong_session);
-        assert!(matches!(result, Err(PendingStatusError::SessionMismatch)));
-    }
-
-    #[test]
-    fn test_principal_pending_status_not_found() {
-        let config = make_isolated_config("status_notfound", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let fake_id = PendingRequestId::new();
-        let session = passless_core::agent::PrincipalSessionId::new();
-
-        let result = runtime.principal_pending_status(&fake_id, &session);
-        assert!(matches!(result, Err(PendingStatusError::NotFound)));
-    }
-
-    #[test]
-    fn test_principal_pending_status_expiry() {
-        let config = make_isolated_config("status_expiry", vec!["example.com"], false);
-        let (runtime, clock) = make_runtime(&config);
-        let pid = ProfileId::new("status_expiry").unwrap();
-        let session = passless_core::agent::PrincipalSessionId::new();
-
-        let pending_id = insert_pending(&runtime, &pid, &session, 5_000);
-
-        let status = runtime
-            .principal_pending_status(&pending_id, &session)
-            .unwrap();
-        assert_eq!(status.state, PendingState::Waiting);
-
-        clock.advance(Duration::from_secs(10));
-
-        let status = runtime
-            .principal_pending_status(&pending_id, &session)
-            .unwrap();
-        assert_eq!(status.state, PendingState::TimedOut);
-        assert!(status.is_terminal());
-        assert!(status.is_expired());
-    }
-
-    #[test]
-    fn test_cleanup_expired_pending() {
-        let config = make_isolated_config("cleanup_exp", vec!["example.com"], false);
-        let (runtime, clock) = make_runtime(&config);
-        let pid = ProfileId::new("cleanup_exp").unwrap();
-        let session = passless_core::agent::PrincipalSessionId::new();
-
-        let pending_id = insert_pending(&runtime, &pid, &session, 5_000);
-
-        let expired = runtime.cleanup_expired_pending();
-        assert!(expired.is_empty());
-
-        clock.advance(Duration::from_secs(10));
-
-        let expired = runtime.cleanup_expired_pending();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0], pending_id);
-
-        let status = runtime
-            .principal_pending_status(&pending_id, &session)
-            .unwrap();
-        assert_eq!(status.state, PendingState::TimedOut);
-    }
-
-    #[test]
-    fn test_pending_status_mapping_delegation_state() {
-        let snapshot = PendingStatusSnapshot {
-            id: PendingRequestId::new(),
-            state: PendingState::Approved,
-            profile_id: ProfileId::new("test").unwrap(),
-            session_id: passless_core::agent::PrincipalSessionId::new(),
-            endpoint_id: passless_core::agent::EndpointId::new(),
-            process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
-            policy_generation: PolicyGenerationId::new(),
-            policy_digest: PolicyDigest::from_cbor_bytes(b"test"),
-            action: GrantAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            grant_request_id: None,
-            created_at_mono: 0,
-            deadline_mono: 100,
-        };
-        assert_eq!(
-            snapshot.to_delegation_state(),
-            passless_core::agent::protocol::DelegationState::Approved
-        );
     }
 }

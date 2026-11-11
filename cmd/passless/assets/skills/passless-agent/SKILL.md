@@ -74,4 +74,4 @@ repository. Do not try to fix it by launching your own browser or editing Passle
 
 For more: `docs/agents/quick-start.md`, `docs/agents/rules.md`, `docs/agents/browser-tools.md`. Inside a
 Passless principal session `passless agent --profile <profile> capabilities` shows the authority your
-profile has.
+profile has: for each RP the `authenticate` and `register` rule (`allow`, `request` or `deny`).

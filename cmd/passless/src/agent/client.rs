@@ -3,7 +3,6 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use passless_core::agent::ProfileId;
 use passless_core::agent::protocol::{
@@ -21,8 +20,6 @@ const PRINCIPAL_ROOT_NAME: &str = "principal";
 const PROFILE_SOCKET_NAME: &str = "sock";
 const ENV_RUNTIME_DIR: &str = "PASSLESS_AGENT_RUNTIME_DIR";
 const BASE_DIR_MODE: u32 = 0o700;
-const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_WAIT_POLL: Duration = Duration::from_millis(100);
 const ADMIN_SOCK_MODE: u32 = 0o600;
 const PROFILE_SOCK_MODE: u32 = 0o660;
 
@@ -530,56 +527,6 @@ impl PrincipalClient {
     }
 }
 
-pub enum WaitTarget {
-    Delegation,
-}
-
-pub fn wait_with_poll<F>(
-    target: WaitTarget,
-    request_id: &passless_core::agent::PendingRequestId,
-    timeout: Option<Duration>,
-    poll_interval: Option<Duration>,
-    mut poll_fn: F,
-) -> Result<(), ClientError>
-where
-    F: FnMut() -> Result<bool, ClientError>,
-{
-    let deadline = Instant::now()
-        .checked_add(timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT))
-        .ok_or(ClientError::Timeout)?;
-    let interval = poll_interval.unwrap_or(DEFAULT_WAIT_POLL);
-
-    let _ = target;
-    let _ = request_id;
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ClientError::Timeout);
-        }
-
-        if poll_fn()? {
-            return Ok(());
-        }
-
-        cancellation_safe_sleep(interval, deadline)?;
-    }
-}
-
-fn cancellation_safe_sleep(duration: Duration, deadline: Instant) -> Result<(), ClientError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or(Duration::ZERO);
-    let sleep_dur = duration.min(remaining);
-    if sleep_dur.is_zero() {
-        return Err(ClientError::Timeout);
-    }
-    std::thread::sleep(sleep_dur);
-    if Instant::now() >= deadline {
-        return Err(ClientError::Timeout);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub fn admin_socket_addr(base: &Path) -> PathBuf {
     admin_socket_path(base)
@@ -596,7 +543,8 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     use passless_core::agent::protocol::{CAPABILITY_PROOF_BYTES, PrincipalResponseFrame};
     use passless_core::agent::{DaemonStatus, ProfileId};
@@ -1107,51 +1055,6 @@ mod tests {
         assert!(result.is_err());
 
         resp.join().unwrap();
-    }
-
-    #[test]
-    fn test_wait_with_poll_immediate_success() {
-        let req_id = passless_core::agent::PendingRequestId::new();
-        let result = wait_with_poll(
-            WaitTarget::Delegation,
-            &req_id,
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_millis(10)),
-            || Ok(true),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_wait_with_poll_timeout() {
-        let req_id = passless_core::agent::PendingRequestId::new();
-        let result = wait_with_poll(
-            WaitTarget::Delegation,
-            &req_id,
-            Some(Duration::from_millis(50)),
-            Some(Duration::from_millis(10)),
-            || Ok(false),
-        );
-        assert!(matches!(result, Err(ClientError::Timeout)));
-    }
-
-    #[test]
-    fn test_wait_with_poll_eventual_success() {
-        let req_id = passless_core::agent::PendingRequestId::new();
-        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counter_clone = counter.clone();
-        let result = wait_with_poll(
-            WaitTarget::Delegation,
-            &req_id,
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_millis(10)),
-            move || {
-                let n = counter_clone.fetch_add(1, Ordering::SeqCst);
-                Ok(n >= 2)
-            },
-        );
-        assert!(result.is_ok());
-        assert!(counter.load(Ordering::SeqCst) >= 3);
     }
 
     #[test]

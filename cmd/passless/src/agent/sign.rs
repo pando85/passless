@@ -3113,13 +3113,11 @@ pub(crate) mod tests {
                     Arc::new(PolicyRuntime::new(&agent_config, clock.clone(), None).unwrap());
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
-                let endpoint_id = passless_core::agent::EndpointId::new();
 
                 let grant_req_id = policy_runtime
                     .admin_request_grant(GrantRequestParams {
                         profile_id: profile_id.clone(),
                         session_id: session_id.clone(),
-                        endpoint_id: endpoint_id.clone(),
                         principal_digest: [0u8; 32],
                         rp_ids: vec!["example.com".to_string()],
                         credentials: vec![cred_ref.clone()],
@@ -3241,7 +3239,6 @@ pub(crate) mod tests {
                 .admin_request_dynamic_grant(GrantRequestParams {
                     profile_id: f.profile_id.clone(),
                     session_id: passless_core::agent::PrincipalSessionId::new(),
-                    endpoint_id: passless_core::agent::EndpointId::new(),
                     principal_digest: [0u8; 32],
                     rp_ids: vec!["example.com".to_string()],
                     credentials: vec![],
@@ -3817,7 +3814,6 @@ pub(crate) mod tests {
                 let params = GrantRequestParams {
                     profile_id: profile_id.clone(),
                     session_id: passless_core::agent::PrincipalSessionId::new(),
-                    endpoint_id: passless_core::agent::EndpointId::new(),
                     principal_digest: [0u8; 32],
                     rp_ids: spec.grant_rp_ids.iter().map(|s| s.to_string()).collect(),
                     credentials: if spec.dynamic_grant {
@@ -4115,7 +4111,6 @@ pub(crate) mod tests {
                 .sign(&f.make_ctx(), &f.make_req())
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
-            assert_ne!(err.code, ErrorCode::InteractionRequired);
             assert!(err.message.contains("escalation is unavailable"));
             assert_eq!(f.key_provider.sign_calls(), 0, "no signature");
             assert_eq!(
@@ -4171,7 +4166,6 @@ pub(crate) mod tests {
             let ctx = f.make_ctx();
             let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
-            assert_ne!(err.code, ErrorCode::InteractionRequired);
             assert_eq!(
                 crate::agent::transport::wire_error_code(err.code),
                 "forbidden"

@@ -1367,15 +1367,10 @@ pub enum PinAction {
 pub enum AgentCommand {
     /// Run health diagnostics
     Doctor,
-    /// Show principal capabilities
+    /// Show the profile's effective authority (per-RP rules, credential scope, session limits)
     Capabilities,
     /// Show principal instructions
     Instructions,
-    /// Delegation management
-    Delegation {
-        #[command(subcommand)]
-        action: AgentDelegationAction,
-    },
     /// Credential queries
     Credential {
         #[command(subcommand)]
@@ -1383,8 +1378,6 @@ pub enum AgentCommand {
     },
     /// Show browser bridge status
     BrowserStatus,
-    /// Show endpoint status
-    EndpointStatus,
     /// Send a CDP command to the managed browser session
     ///
     /// WARNING: This is the full browser-session authority interface.
@@ -1525,51 +1518,6 @@ pub enum McpConfigTarget {
     Cursor,
     /// `.vscode/mcp.json`
     Vscode,
-}
-
-/// Agent delegation actions
-#[cfg(feature = "agent")]
-#[derive(Subcommand, Debug, Clone)]
-pub enum AgentDelegationAction {
-    /// Request a new delegation
-    Request {
-        /// Relying party ID
-        #[arg(long, value_name = "RP_ID")]
-        rp: String,
-        /// Credential reference (hex)
-        #[arg(long, value_name = "CREDENTIAL_REF")]
-        credential: String,
-        /// Session TTL in seconds
-        #[arg(long, value_name = "SECONDS")]
-        session_ttl: u64,
-        /// Reason for the delegation
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-    },
-    /// Show delegation status
-    Show {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
-    /// Wait for delegation to reach terminal state
-    Wait {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-        /// Timeout in seconds
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<u64>,
-        /// Poll interval in milliseconds
-        #[arg(long, value_name = "MS")]
-        poll_interval: Option<u64>,
-    },
-    /// Cancel a pending delegation
-    Cancel {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
 }
 
 /// Agent credential actions
@@ -2174,7 +2122,6 @@ mod tests {
             "grants",
             "sessions",
             "principals",
-            "delegation",
             "doctor",
             "capabilities",
             "instructions",

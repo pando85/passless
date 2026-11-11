@@ -16,8 +16,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    acquisitions are tracked by `lock_order.rs`.
 2. **Policy locks are leaves.** No policy guard is held across any other acquisition, including
    another policy lock. `PolicyRuntime` helpers that touch several of its maps take them one after
-   another and release each before the next (`abandon_pending`, `principal_cancel_pending`,
-   `cleanup_expired_pending`, `cancel_pending_for_session`, `principal_exit`, `reload`).
+   another and release each before the next (`principal_exit`, `reload`).
    The only policy lock held across others is `reload_lock`, which ranks below them.
 3. **No lock across a wait on a human, an escalation or a join.** A joined duplicate waits on its
    in-flight slot's condvar holding no other lock, and suspends its request permit for the wait
@@ -61,7 +60,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 20 T | Backend operation lock | `backend.rs` (`CredentialBackendHandle.operation_lock`); the human one in `main.rs` (`ServiceHandler.operation_lock`) | See rule 4. Admin credential handlers take it before storage. |
 | 25 | Human `ServiceHandler.service` | `main.rs` | Human CTAP path only: operation lock, then service, then storage. |
 | 30 T | `BrowserProcessManager` | `runtime.rs` (`AgentRuntime.browser_manager`) | Launch, status, control, cleanup and the runtime loop. During a ceremony it is taken only by `BrowserLeaseActivation::activate`, after the operation lock is released, and only until the lease is active. |
-| 35 | Profile bookkeeping: `endpoint_id`, `active_browser`, `shared_browsers` | `runtime.rs` (`ProfileRuntime`) | Short sections, under `browser_manager` on the launch path. They never nest with each other. |
+| 35 | Profile bookkeeping: `active_browser`, `shared_browsers` | `runtime.rs` (`ProfileRuntime`) | Short sections, under `browser_manager` on the launch path. They never nest with each other. |
 | 40 T | Backend credential storage, and `pin_storage` | `backend.rs`, `runtime.rs` (`ProfileRuntime.credential_storage`) | The browser launch reads storage under `browser_manager`. Ceremonies release storage before key use (see "Fixed in P5"). |
 | 45 T | `AgentRuntime::agent_config` (`RwLock`) | `runtime.rs` | Read for the live profile configuration on launch. A reload holds the write guard across `PolicyRuntime::reload` and releases it before closing browsers. |
 | 50 T | `SignContextRegistry` maps: `entries`, `registration_entries`, `revoked_registrations`, `revoked_signs` | `sign.rs` | They never nest. Each guard is released before the next map is locked and before a session is revoked. |
@@ -72,7 +71,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 66 T | `AgentSession::key_use` gate (`RwLock`) | `session.rs` | Rule 6. Read by a ceremony from the re-check to the end of key use; write by `AgentSession::revoke` (called after registry guards are released or, in `revoke_all`, under them). |
 | 68 T | `PolicyRuntime::reload_lock` | `policy_engine.rs` | Serializes reloads. It is held across the epoch gate and the policy locks of rank 70. |
 | 69 T | `PolicyRuntime::key_use_gate` (`RwLock`) | `policy_engine.rs` | Rule 6. Read by a ceremony after its session gate; write by `bump_revocation_epoch` (under `reload_lock` on a reload). |
-| 70 T | `PolicyRuntime`: `current` (`RwLock`), `grants`, `pending_requests` | `policy_engine.rs` | Leaves (rule 2). `grants` may call the audit gate. |
+| 70 T | `PolicyRuntime`: `current` (`RwLock`), `grants` | `policy_engine.rs` | Leaves (rule 2). `grants` may call the audit gate. |
 | 71 T | `GrantedRulesStore::views` (`RwLock`) | `granted_rules.rs` | A leaf. Read by resolution (after the policy guard of rank 70 is released) and by the admin `grants` handlers; written by a store write under its writer (64). |
 | 72 T | `ReadinessRegistry::entries` and its condvar | `transport/readiness.rs` | A leaf. The hello path records into it and the launch path reads or waits on it (`status`, `wait_attached`), possibly holding `lifecycle_lock` (10) and `browser_manager` (30). Waiters park on its condvar holding nothing else. The hello path never takes the lifecycle lock or the browser manager. |
 | 74 T | Sign transport: `Shared::connections` and each `Connection::in_flight` | `transport/mod.rs` | Leaves; they never nest with each other. Short map sections only: a connection to supersede is cloned out before it is closed. |
@@ -211,7 +210,8 @@ revocation is closing it) is closed there and a fresh browser launched.
 - **Revocation between re-check and key use** (P5 review M1). The key-use gates (rule 6).
 - **Nested policy locks.** `pending` and `pending_requests` were held while `intents` and `grants`
   were locked. These policy locks are now flat (`intents` and `pending` were removed with the
-  principal intent protocol in P7).
+  principal intent protocol in P7, and `pending_requests` with the principal delegation
+  protocol).
 
 ## Shared browser ownership (P10b, L5)
 

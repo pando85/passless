@@ -1548,7 +1548,6 @@ mod tests {
             .register(&f.make_ctx(), &f.make_req())
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
-        assert_ne!(err.code, ErrorCode::InteractionRequired);
         assert!(err.message.contains("escalation is unavailable"));
         assert_eq!(f.prompter.shown(), 0);
         assert_eq!(
@@ -2323,7 +2322,6 @@ mod tests {
                 crate::agent::grant::GrantRequestParams {
                     profile_id: f.profile_id.clone(),
                     session_id: passless_core::agent::PrincipalSessionId::new(),
-                    endpoint_id: passless_core::agent::EndpointId::new(),
                     principal_digest: [5u8; 32],
                     rp_ids: vec!["example.com".to_string()],
                     credentials: vec![],

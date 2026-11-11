@@ -197,25 +197,6 @@ impl AgentRuntime {
         // Other sessions (and admin-launched browsers) may have live leases for the same
         // authority profile. They are intentionally outside this principal's ownership namespace.
 
-        let endpoint_id = profile
-            .endpoint_id
-            .lock()
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "endpoint lock poisoned",
-                    RecommendedAction::Abort,
-                )
-            })?
-            .clone()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::NotFound,
-                    format!("profile '{}' has no active endpoint", profile_id),
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
         // Rules, limits and session TTL come from the configuration in force, which a policy reload
         // may have replaced since the daemon started (ADR 0014 section 6.4).
         let live_config = self.live_profile_config(profile);
@@ -311,7 +292,6 @@ impl AgentRuntime {
         };
         let lease_id = match browser_manager.launch_pending_with_agent_endpoint(
             &config,
-            endpoint_id.clone(),
             profile_id.clone(),
             Some(&metadata),
         ) {
@@ -333,7 +313,6 @@ impl AgentRuntime {
             &session,
             profile,
             &config,
-            &endpoint_id,
             &bearer_token,
             &lease_id,
             &mut browser_manager,
@@ -360,7 +339,6 @@ impl AgentRuntime {
         session: &Arc<crate::agent::session::AgentSession>,
         profile: &ProfileRuntime,
         config: &BrowserConfig,
-        endpoint_id: &passless_core::agent::EndpointId,
         bearer_token: &str,
         lease_id: &BrowserLeaseId,
         browser_manager: &mut crate::agent::browser::BrowserProcessManager,
@@ -423,7 +401,6 @@ impl AgentRuntime {
             let params = crate::agent::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id: session_id.clone(),
-                endpoint_id: endpoint_id.clone(),
                 principal_digest: *process_digest.as_bytes(),
                 rp_ids: config.rp_ids.clone(),
                 credentials: if dynamic_credential_scope {

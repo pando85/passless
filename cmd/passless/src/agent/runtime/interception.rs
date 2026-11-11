@@ -226,8 +226,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use passless_core::agent::ProfileId;
     use passless_core::agent::config::CdpExposeMode;
-    use passless_core::agent::{EndpointId, ProfileId};
 
     use super::*;
     use crate::agent::browser::{
@@ -284,7 +284,6 @@ mod tests {
         let lease_id = mgr
             .launch_pending_with_agent_endpoint(
                 &config,
-                EndpointId::new(),
                 ProfileId::new("test-profile").unwrap(),
                 Some(&metadata),
             )

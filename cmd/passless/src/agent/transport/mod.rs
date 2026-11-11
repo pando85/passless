@@ -165,7 +165,6 @@ pub fn wire_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::Conflict => "conflict",
         ErrorCode::InvalidState => "invalid_state",
         ErrorCode::Replayed => "replayed_operation",
-        ErrorCode::InteractionRequired => "human_interaction_required",
         ErrorCode::BudgetExhausted => "operation_budget_exhausted",
         ErrorCode::Busy => "busy",
         ErrorCode::Timeout => "operation_timeout",

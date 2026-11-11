@@ -18,9 +18,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use passless_core::agent::config::{CdpExposeMode, LOCALHOST_RP_ID};
-use passless_core::agent::{
-    AgentRpRule, BrowserLeaseId, EndpointId, ProfileId, RuleAction, rule_for_host,
-};
+use passless_core::agent::{AgentRpRule, BrowserLeaseId, ProfileId, RuleAction, rule_for_host};
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -214,7 +212,6 @@ pub struct ProfileFingerprint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserManifest {
     pub lease_id: String,
-    pub endpoint_id: String,
     pub profile_id: String,
     pub pid: u32,
     pub pgid: u32,
@@ -224,7 +221,6 @@ pub struct BrowserManifest {
     pub profile_dir: PathBuf,
     pub created_monotonic_secs: u64,
     pub ttl_monotonic_secs: u64,
-    pub endpoint_scope: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,7 +640,6 @@ pub struct TerminateResult {
 #[derive(Debug)]
 pub struct BrowserLease {
     pub id: BrowserLeaseId,
-    pub endpoint_id: EndpointId,
     pub profile_id: ProfileId,
     pub state: LeaseState,
     pub manifest: BrowserManifest,
@@ -856,8 +851,6 @@ fn open_url_over_devtools_http(ws_endpoint: &str, url: &str) -> Result<(), Strin
 pub struct LeaseSnapshot {
     #[allow(dead_code)]
     pub id: BrowserLeaseId,
-    #[allow(dead_code)]
-    pub endpoint_id: EndpointId,
     pub profile_id: ProfileId,
     pub state: LeaseState,
     #[allow(dead_code)]
@@ -946,10 +939,9 @@ impl BrowserProcessManager {
     pub fn launch(
         &mut self,
         config: &BrowserConfig,
-        endpoint_id: EndpointId,
         profile_id: ProfileId,
     ) -> Result<BrowserLeaseId, LaunchError> {
-        let lease_id = self.launch_pending(config, endpoint_id, profile_id)?;
+        let lease_id = self.launch_pending(config, profile_id)?;
         let session_ttl = clamp_ttl(config.ttl);
         self.activate_after_assertion(&lease_id, session_ttl)
             .map_err(|e| LaunchError::SpawnFailed(format!("immediate activation failed: {}", e)))?;
@@ -959,16 +951,14 @@ impl BrowserProcessManager {
     pub fn launch_pending(
         &mut self,
         config: &BrowserConfig,
-        endpoint_id: EndpointId,
         profile_id: ProfileId,
     ) -> Result<BrowserLeaseId, LaunchError> {
-        self.launch_pending_with_agent_endpoint(config, endpoint_id, profile_id, None)
+        self.launch_pending_with_agent_endpoint(config, profile_id, None)
     }
 
     pub fn launch_pending_with_agent_endpoint(
         &mut self,
         config: &BrowserConfig,
-        endpoint_id: EndpointId,
         profile_id: ProfileId,
         agent_endpoint: Option<&AgentEndpointMetadata>,
     ) -> Result<BrowserLeaseId, LaunchError> {
@@ -1210,7 +1200,6 @@ impl BrowserProcessManager {
 
         let manifest = BrowserManifest {
             lease_id: lease_id.as_str().to_string(),
-            endpoint_id: endpoint_id.as_str().to_string(),
             profile_id: profile_id.as_str().to_string(),
             pid,
             pgid,
@@ -1220,7 +1209,6 @@ impl BrowserProcessManager {
             profile_dir: profile_dir.clone(),
             created_monotonic_secs: monotonic_secs,
             ttl_monotonic_secs: login_clamped.as_secs(),
-            endpoint_scope: endpoint_id.as_str().to_string(),
         };
 
         write_manifest_atomic(&lease_dir, &runtime_dir, &manifest)?;
@@ -1237,7 +1225,6 @@ impl BrowserProcessManager {
 
         let lease = BrowserLease {
             id: lease_id.clone(),
-            endpoint_id,
             profile_id,
             state: LeaseState::AuthenticationPending,
             manifest,
@@ -1754,7 +1741,6 @@ impl BrowserProcessManager {
 
         Some(LeaseSnapshot {
             id: lease.id.clone(),
-            endpoint_id: lease.endpoint_id.clone(),
             profile_id: lease.profile_id.clone(),
             state: lease.state,
             pid: lease.manifest.pid,
@@ -3735,10 +3721,6 @@ mod tests {
         root
     }
 
-    fn test_endpoint_id() -> EndpointId {
-        EndpointId::new()
-    }
-
     fn test_profile_id() -> ProfileId {
         ProfileId::new("test-profile").unwrap()
     }
@@ -4343,7 +4325,6 @@ mod tests {
     fn test_manifest_serialization_roundtrip() {
         let manifest = BrowserManifest {
             lease_id: "abc123".to_string(),
-            endpoint_id: "ep1".to_string(),
             profile_id: "prof1".to_string(),
             pid: 12345,
             pgid: 12345,
@@ -4360,7 +4341,6 @@ mod tests {
             profile_dir: PathBuf::from("/tmp/runtime/profile"),
             created_monotonic_secs: 42,
             ttl_monotonic_secs: 300,
-            endpoint_scope: "ep1".to_string(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: BrowserManifest = serde_json::from_str(&json).unwrap();
@@ -4407,9 +4387,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let snap = mgr.snapshot(&lease_id).unwrap();
         assert_eq!(snap.state, LeaseState::Active);
@@ -4432,9 +4410,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let result = mgr.revoke(&lease_id).unwrap();
         assert_eq!(result, LeaseState::Revoked);
         assert_eq!(mgr.snapshot(&lease_id).unwrap().state, LeaseState::Revoked);
@@ -4447,9 +4423,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.revoke(&lease_id).unwrap();
         let result = mgr.revoke(&lease_id);
         assert!(matches!(
@@ -4465,9 +4439,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let result = mgr.principal_exit(&lease_id).unwrap();
         assert_eq!(result, LeaseState::PrincipalExit);
     }
@@ -4479,9 +4451,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let result = mgr.daemon_shutdown(&lease_id).unwrap();
         assert_eq!(result, LeaseState::DaemonShutdown);
     }
@@ -4493,9 +4463,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.revoke(&lease_id).unwrap();
         let result = mgr.daemon_shutdown(&lease_id).unwrap();
         assert_eq!(result, LeaseState::DaemonShutdown);
@@ -4508,9 +4476,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let result = mgr.mark_browser_exit(&lease_id).unwrap();
         assert_eq!(result, LeaseState::BrowserExit);
     }
@@ -4531,9 +4497,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(Arc::clone(&clock) as Arc<dyn Clock>);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let result = mgr.terminate(&lease_id).unwrap();
         assert!(result.elapsed < Duration::from_secs(30));
     }
@@ -4545,9 +4509,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.terminate(&lease_id).unwrap();
         let result = mgr.terminate(&lease_id).unwrap();
         assert!(result.exit_status.is_none());
@@ -4561,9 +4523,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
         assert!(runtime_dir.exists());
 
@@ -4580,9 +4540,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let profile_dir = mgr.leases[&lease_id].manifest.profile_dir.clone();
         let runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
 
@@ -4605,9 +4563,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let profile_dir = mgr.leases[&lease_id].manifest.profile_dir.clone();
 
         mgr.terminate(&lease_id).unwrap();
@@ -4627,9 +4583,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.ttl = Duration::from_secs(10);
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.active_count(), 1);
 
         clock.advance(Duration::from_secs(11));
@@ -4648,9 +4602,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.ttl = Duration::from_secs(10);
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.revoke(&lease_id).unwrap();
 
         clock.advance(Duration::from_secs(11));
@@ -4667,9 +4619,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.ttl = Duration::from_secs(100);
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let remaining1 = mgr.snapshot(&lease_id).unwrap().ttl_remaining_secs;
 
         clock.advance(Duration::from_secs(30));
@@ -4684,12 +4634,8 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let _id1 = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
-        let _id2 = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let _id1 = mgr.launch(&config, test_profile_id()).unwrap();
+        let _id2 = mgr.launch(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.list_snapshots().len(), 2);
     }
 
@@ -4703,9 +4649,7 @@ mod tests {
         config.executable = std::path::PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
         assert!(snapshot.is_some());
@@ -4731,9 +4675,7 @@ mod tests {
         config.executable = std::path::PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
 
-        let _lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let _lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let other_profile = ProfileId::new("other-profile").unwrap();
         let snapshot = mgr.find_live_lease_for_profile(&other_profile);
@@ -4750,9 +4692,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.revoke(&lease_id).unwrap();
 
         let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
@@ -4769,9 +4709,7 @@ mod tests {
         config.start_url = None;
         config.extra_args = vec![];
 
-        let _lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let _lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -4790,9 +4728,7 @@ mod tests {
         config.start_url = None;
         config.extra_args = vec!["60".to_string()];
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
         assert!(snapshot.is_some());
@@ -4813,9 +4749,7 @@ mod tests {
         config.start_url = Some("https://example.com".to_string());
         config.extra_args = vec!["60".to_string()];
 
-        let first_lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let first_lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let first_snapshot = mgr.find_live_lease_for_profile(&test_profile_id());
         assert!(first_snapshot.is_some());
@@ -4845,9 +4779,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.lease_count(), 1);
         let removed = mgr.remove(&lease_id);
         assert!(removed.is_some());
@@ -4993,7 +4925,7 @@ mod tests {
             let c = config.clone();
             handles.push(std::thread::spawn(move || {
                 let mut mgr = m.lock().unwrap();
-                mgr.launch(&c, test_endpoint_id(), test_profile_id())
+                mgr.launch(&c, test_profile_id())
             }));
         }
 
@@ -5029,9 +4961,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert!(mgr.terminate(&lease_id).is_ok());
         assert!(mgr.cleanup(&lease_id).is_ok());
     }
@@ -5043,9 +4973,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert!(mgr.revoke(&lease_id).is_ok());
         let second = mgr.revoke(&lease_id);
         assert!(matches!(
@@ -5062,9 +4990,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.ttl = Duration::from_secs(5);
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         clock.advance(Duration::from_secs(6));
         let expired = mgr.check_expired();
@@ -5084,9 +5010,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.snapshot(&lease_id).unwrap().state, LeaseState::Active);
 
         mgr.revoke(&lease_id).unwrap();
@@ -5107,9 +5031,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.mark_browser_exit(&lease_id).unwrap();
         assert_eq!(
             mgr.snapshot(&lease_id).unwrap().state,
@@ -5128,9 +5050,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.principal_exit(&lease_id).unwrap();
         assert_eq!(
             mgr.snapshot(&lease_id).unwrap().state,
@@ -5152,7 +5072,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.start_url = Some("http://insecure.example.com".to_string());
 
-        let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
+        let result = mgr.launch(&config, test_profile_id());
         assert!(matches!(result, Err(LaunchError::InvalidStartUrl(_))));
     }
 
@@ -5164,9 +5084,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.start_url = Some("https://example.com/dashboard".to_string());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.snapshot(&lease_id).unwrap().state, LeaseState::Active);
     }
 
@@ -5180,7 +5098,7 @@ mod tests {
         config.start_url_rules = start_url_test_rules(&[("other.com", RuleAction::Allow)]);
         config.start_url = Some("https://example.com/dashboard".to_string());
 
-        let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
+        let result = mgr.launch(&config, test_profile_id());
         assert!(matches!(result, Err(LaunchError::InvalidStartUrl(_))));
     }
 
@@ -5194,12 +5112,8 @@ mod tests {
         assert_eq!(mgr.lease_count(), 0);
         assert_eq!(mgr.active_count(), 0);
 
-        let id1 = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
-        let id2 = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let id1 = mgr.launch(&config, test_profile_id()).unwrap();
+        let id2 = mgr.launch(&config, test_profile_id()).unwrap();
 
         assert_eq!(mgr.lease_count(), 2);
         assert_eq!(mgr.active_count(), 2);
@@ -5264,9 +5178,7 @@ mod tests {
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let pid = mgr.leases[&lease_id].manifest.pid;
 
         std::thread::sleep(Duration::from_millis(200));
@@ -5291,9 +5203,7 @@ mod tests {
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let pid = mgr.leases[&lease_id].manifest.pid;
 
         // Give the process a moment to fully initialize
@@ -5349,9 +5259,7 @@ mod tests {
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["5".to_string()];
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let lease = &mgr.leases[&lease_id];
         let cdp = lease.cdp.as_ref().unwrap();
@@ -5388,7 +5296,6 @@ mod tests {
 
         let manifest = BrowserManifest {
             lease_id: "test".to_string(),
-            endpoint_id: "ep".to_string(),
             profile_id: "prof".to_string(),
             pid: 42,
             pgid: 42,
@@ -5402,7 +5309,6 @@ mod tests {
             profile_dir: lease_dir.join("profile"),
             created_monotonic_secs: 0,
             ttl_monotonic_secs: 300,
-            endpoint_scope: "ep".to_string(),
         };
 
         write_manifest_atomic_at(&lease_dir, &manifest).unwrap();
@@ -5436,9 +5342,7 @@ mod tests {
         config.executable = PathBuf::from("/bin/sleep");
         config.extra_args = vec!["60".to_string()];
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         std::thread::sleep(Duration::from_millis(100));
 
@@ -5475,9 +5379,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
         let profile_dir = mgr.leases[&lease_id].manifest.profile_dir.clone();
 
@@ -5529,7 +5431,7 @@ mod tests {
             bind_parent_death: true,
         };
 
-        let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
+        let result = mgr.launch(&config, test_profile_id());
         assert!(matches!(result, Err(LaunchError::RuntimeRootInvalid(_))));
     }
 
@@ -5560,7 +5462,7 @@ mod tests {
             bind_parent_death: true,
         };
 
-        let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
+        let result = mgr.launch(&config, test_profile_id());
         assert!(matches!(result, Err(LaunchError::RuntimeRootInvalid(_))));
     }
 
@@ -5632,7 +5534,7 @@ mod tests {
         config.target_uid = my_uid + 1;
         config.target_gid = my_uid + 1;
 
-        let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
+        let result = mgr.launch(&config, test_profile_id());
         assert!(matches!(result, Err(LaunchError::HardeningFailed(_))));
     }
 
@@ -5647,7 +5549,7 @@ mod tests {
         config.target_gid = 1001;
         config.daemon_gid = 0;
 
-        let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
+        let result = mgr.launch(&config, test_profile_id());
         assert!(matches!(
             result,
             Err(LaunchError::HardeningFailed(_)) | Err(LaunchError::RuntimeRootInvalid(_))
@@ -5702,9 +5604,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::with_spawner(clock, Arc::new(FakeSpawner));
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         let snap = mgr.snapshot(&lease_id).unwrap();
         assert_eq!(snap.state, LeaseState::Active);
         assert!(snap.pid > 0);
@@ -5770,9 +5670,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let snap = mgr.snapshot(&lease_id).unwrap();
         assert_eq!(snap.state, LeaseState::AuthenticationPending);
@@ -5788,9 +5686,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let snap = mgr.snapshot(&lease_id).unwrap();
         let lease = &mgr.leases[&lease_id];
@@ -5809,9 +5705,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(Arc::clone(&clock) as Arc<dyn Clock>);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         assert_eq!(
             mgr.snapshot(&lease_id).unwrap().state,
             LeaseState::AuthenticationPending
@@ -5833,9 +5727,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(Arc::clone(&clock) as Arc<dyn Clock>);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         clock.advance(Duration::from_secs(10));
         let remaining_before = mgr.snapshot(&lease_id).unwrap().ttl_remaining_secs;
@@ -5864,9 +5756,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.snapshot(&lease_id).unwrap().state, LeaseState::Active);
 
         let result = mgr.activate_after_assertion(&lease_id, Duration::from_secs(300));
@@ -5885,9 +5775,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let first = mgr.activate_after_assertion(&lease_id, Duration::from_secs(300));
         assert!(first.is_ok());
@@ -5909,9 +5797,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.login_timeout = Duration::from_secs(30);
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         assert_eq!(
             mgr.snapshot(&lease_id).unwrap().state,
             LeaseState::AuthenticationPending
@@ -5931,9 +5817,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.login_timeout = Duration::from_secs(15);
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         assert_eq!(mgr.pending_count(), 1);
 
         clock.advance(Duration::from_secs(16));
@@ -5952,9 +5836,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.login_timeout = Duration::from_secs(60);
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         clock.advance(Duration::from_secs(61));
 
@@ -5977,8 +5859,7 @@ mod tests {
 
         let lease_id = {
             let mut m = mgr.lock().unwrap();
-            m.launch_pending(&config, test_endpoint_id(), test_profile_id())
-                .unwrap()
+            m.launch_pending(&config, test_profile_id()).unwrap()
         };
 
         let mut handles = Vec::new();
@@ -6011,9 +5892,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(Arc::clone(&clock) as Arc<dyn Clock>);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         mgr.activate_after_assertion(&lease_id, Duration::from_secs(60))
             .unwrap();
 
@@ -6033,9 +5912,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         assert_eq!(
             mgr.snapshot(&lease_id).unwrap().state,
             LeaseState::AuthenticationPending
@@ -6056,9 +5933,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let result = mgr.mark_browser_exit(&lease_id).unwrap();
         assert_eq!(result, LeaseState::BrowserExit);
@@ -6071,9 +5946,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let result = mgr.principal_exit(&lease_id).unwrap();
         assert_eq!(result, LeaseState::PrincipalExit);
@@ -6086,9 +5959,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let result = mgr.daemon_shutdown(&lease_id).unwrap();
         assert_eq!(result, LeaseState::DaemonShutdown);
@@ -6101,9 +5972,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         mgr.revoke(&lease_id).unwrap();
 
         let result = mgr.activate_after_assertion(&lease_id, Duration::from_secs(300));
@@ -6122,9 +5991,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
         let runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
         assert!(runtime_dir.exists());
 
@@ -6142,9 +6009,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let snap = mgr.snapshot(&lease_id).unwrap();
         assert_eq!(snap.state, LeaseState::Active);
@@ -6159,9 +6024,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(Arc::clone(&clock) as Arc<dyn Clock>);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         mgr.activate_after_assertion(&lease_id, Duration::from_secs(0))
             .unwrap();
@@ -6177,9 +6040,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(Arc::clone(&clock) as Arc<dyn Clock>);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         mgr.activate_after_assertion(&lease_id, Duration::from_secs(MAX_TTL_CLAMP_SECS + 9999))
             .unwrap();
@@ -6195,12 +6056,8 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let id1 = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
-        let id2 = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let id1 = mgr.launch_pending(&config, test_profile_id()).unwrap();
+        let id2 = mgr.launch(&config, test_profile_id()).unwrap();
 
         assert_eq!(mgr.lease_count(), 2);
         assert_eq!(mgr.active_count(), 1);
@@ -6267,9 +6124,7 @@ mod tests {
     ) -> BrowserLeaseId {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         let entry = mgr.leases.get_mut(&lease_id).unwrap();
         entry.cdp = Some(DaemonCdpEndpoints {
@@ -6454,9 +6309,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
         mgr.revoke(&lease_id).unwrap();
 
         let req = make_cdp_request(1, "Page.navigate");
@@ -6679,9 +6532,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/true");
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -6702,9 +6553,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/true");
 
-        let _lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let _lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -6723,9 +6572,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/true");
 
-        let _lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let _lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -6744,9 +6591,7 @@ mod tests {
         let mut config = test_config(dir.path());
         config.executable = PathBuf::from("/bin/true");
 
-        let lease_id = mgr
-            .launch(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch(&config, test_profile_id()).unwrap();
 
         mgr.revoke(&lease_id).unwrap();
 
@@ -7454,9 +7299,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let lease = &mgr.leases[&lease_id];
         let runtime_dir = &lease.manifest.runtime_dir;
@@ -7474,12 +7317,7 @@ mod tests {
         let config = test_config(dir.path());
 
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                None,
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), None)
             .unwrap();
 
         let lease = &mgr.leases[&lease_id];
@@ -7499,12 +7337,7 @@ mod tests {
             bearer_token: "deadbeef".to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
 
         let lease = &mgr.leases[&lease_id];
@@ -7531,12 +7364,7 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
 
         let lease = &mgr.leases[&lease_id];
@@ -7564,12 +7392,7 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
 
         let lease = &mgr.leases[&lease_id];
@@ -7593,9 +7416,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let config = test_config(dir.path());
 
-        let lease_id = mgr
-            .launch_pending(&config, test_endpoint_id(), test_profile_id())
-            .unwrap();
+        let lease_id = mgr.launch_pending(&config, test_profile_id()).unwrap();
 
         let lease = &mgr.leases[&lease_id];
         let profile_dir = &lease.manifest.profile_dir;
@@ -7676,12 +7497,7 @@ mod tests {
         config.extra_args = vec!["60".to_string()];
 
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
         let runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
         let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
@@ -7710,12 +7526,7 @@ mod tests {
             bearer_token: "quarantine-token-abc".to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
         let _runtime_dir = mgr.leases[&lease_id].manifest.runtime_dir.clone();
         let profile_dir = mgr.leases[&lease_id].manifest.profile_dir.clone();
@@ -8055,12 +7866,8 @@ mod tests {
         };
 
         OMIT_EXTENSION.with(|c| c.set(true));
-        let result = mgr.launch_pending_with_agent_endpoint(
-            &config,
-            test_endpoint_id(),
-            test_profile_id(),
-            Some(&metadata),
-        );
+        let result =
+            mgr.launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata));
         OMIT_EXTENSION.with(|c| c.set(false));
 
         let err = result.unwrap_err();
@@ -8095,12 +7902,7 @@ mod tests {
         };
 
         let err = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap_err();
         assert!(matches!(err, LaunchError::InvalidStartUrl(_)), "{err}");
         assert_no_lease_dirs(&config.runtime_root);
@@ -8116,12 +7918,7 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
         assert!(mgr.leases[&lease_id].manifest.runtime_dir.is_dir());
     }
@@ -8370,12 +8167,7 @@ mod tests {
             bearer_token: BEARER.to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
         let argv = argv.lock().unwrap().clone();
         InterceptedLaunch {
@@ -8547,12 +8339,7 @@ mod tests {
             bearer_token: BEARER.to_string(),
         };
         let lease_id = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap();
         let readiness = ReadinessRegistry::new();
         let started = Instant::now();
@@ -8568,11 +8355,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = BrowserProcessManager::new(test_clock());
         let lease_id = mgr
-            .launch_pending(
-                &test_config(dir.path()),
-                test_endpoint_id(),
-                test_profile_id(),
-            )
+            .launch_pending(&test_config(dir.path()), test_profile_id())
             .unwrap();
         let readiness = ReadinessRegistry::new();
         assert!(
@@ -8797,12 +8580,8 @@ mod tests {
             socket_path: "/tmp/test/sock".to_string(),
             bearer_token: BEARER.to_string(),
         };
-        let launched = mgr.launch_pending_with_agent_endpoint(
-            &config,
-            test_endpoint_id(),
-            test_profile_id(),
-            Some(&metadata),
-        );
+        let launched =
+            mgr.launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata));
         (mgr, launched)
     }
 
@@ -8983,12 +8762,7 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let err = mgr
-            .launch_pending_with_agent_endpoint(
-                &config,
-                test_endpoint_id(),
-                test_profile_id(),
-                Some(&metadata),
-            )
+            .launch_pending_with_agent_endpoint(&config, test_profile_id(), Some(&metadata))
             .unwrap_err();
         assert!(matches!(err, LaunchError::ExtensionSetupFailed(_)), "{err}");
         assert!(err.to_string().contains("sign-proxy"), "{err}");

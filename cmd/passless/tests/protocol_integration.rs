@@ -66,7 +66,7 @@ fn admin_ping_round_trip_through_codec() {
 
 #[test]
 fn principal_frame_round_trip_through_codec() {
-    let action = PrincipalRequest::Capabilities;
+    let action = PrincipalRequest::Authority;
     let frame = RequestFrame::Principal(PrincipalRequestFrame::new(42, action, valid_proof()));
     let encoded = SeqpacketCodec::encode(&frame).unwrap();
     let decoded: RequestFrame = SeqpacketCodec::decode(&encoded).unwrap();

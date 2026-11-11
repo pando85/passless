@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use passless_core::agent::config::ANY_RP_ID;
 use passless_core::agent::{
-    CredentialRef, EndpointId, GrantId, PolicyDigest, PolicyGenerationId, PrincipalSessionId,
-    ProfileId,
+    CredentialRef, GrantId, PolicyDigest, PolicyGenerationId, PrincipalSessionId, ProfileId,
 };
 
 use super::audit::AuditGate;
@@ -291,7 +290,6 @@ fn validate_rp_ids(rp_ids: &[String]) -> Result<BTreeSet<String>, GrantError> {
 pub struct GrantRequestParams {
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
     pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credentials: Vec<CredentialRef>,
@@ -302,7 +300,6 @@ pub struct GrantRequestParams {
 pub struct GrantRequest {
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
     pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credentials: Vec<CredentialRef>,
@@ -319,7 +316,6 @@ pub struct Grant {
     pub id: GrantId,
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
     pub principal_digest: [u8; 32],
     pub policy_generation: PolicyGenerationId,
     pub policy_digest: PolicyDigest,
@@ -429,7 +425,6 @@ pub struct GrantDetails {
 pub struct GrantQueryParams<'a> {
     pub profile_id: &'a ProfileId,
     pub session_id: &'a PrincipalSessionId,
-    pub endpoint_id: &'a EndpointId,
     pub principal_digest: &'a [u8; 32],
     pub policy_generation: &'a PolicyGenerationId,
     pub policy_digest: &'a PolicyDigest,
@@ -559,7 +554,6 @@ impl GrantRegistry {
         let request = GrantRequest {
             profile_id: params.profile_id,
             session_id: params.session_id,
-            endpoint_id: params.endpoint_id,
             principal_digest: params.principal_digest,
             rp_ids: params.rp_ids,
             credentials: cred_set.sorted,
@@ -631,7 +625,6 @@ impl GrantRegistry {
             id: grant_id.clone(),
             profile_id: profile_id.clone(),
             session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
             principal_digest: request.principal_digest,
             policy_generation: self.policy_generation.clone(),
             policy_digest: self.policy_digest.clone(),
@@ -843,7 +836,6 @@ impl GrantRegistry {
                 g.state() == GrantState::Active
                     && g.profile_id == *query.profile_id
                     && g.session_id == *query.session_id
-                    && g.endpoint_id == *query.endpoint_id
                     && g.principal_digest == *query.principal_digest
                     && g.policy_generation == *query.policy_generation
                     && g.policy_digest == *query.policy_digest
@@ -1098,10 +1090,6 @@ mod tests {
         PrincipalSessionId::new()
     }
 
-    fn test_endpoint_id() -> EndpointId {
-        EndpointId::new()
-    }
-
     fn test_policy_gen() -> PolicyGenerationId {
         PolicyGenerationId::new()
     }
@@ -1153,7 +1141,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids,
                 credentials: creds,
@@ -1353,7 +1340,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session.clone(),
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![test_cred(b"c1")],
@@ -1374,7 +1360,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![test_cred(b"c1")],
@@ -1632,7 +1617,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: ProfileId::new("profile-a").unwrap(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![cred.clone()],
@@ -1659,7 +1643,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: ProfileId::new("profile-b").unwrap(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(2000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![cred.clone()],
@@ -1848,7 +1831,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![test_cred(b"c2")],
@@ -1868,7 +1850,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["*.example.com".to_string()],
             credentials: vec![test_cred(b"c1")],
@@ -1889,7 +1870,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![test_cred(b"c1")],
@@ -1917,7 +1897,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session,
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![test_cred(b"c1")],
@@ -2128,7 +2107,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec![],
             credentials: vec![test_cred(b"c1")],
@@ -2146,7 +2124,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![],
@@ -2198,7 +2175,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![test_cred(b"c1")],
@@ -2236,7 +2212,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: rps,
             credentials: vec![test_cred(b"c1")],
@@ -2380,7 +2355,6 @@ mod tests {
             .request_dynamic_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![],

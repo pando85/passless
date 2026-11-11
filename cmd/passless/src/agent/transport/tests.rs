@@ -117,7 +117,6 @@ impl Fixture {
             .admin_request_dynamic_grant(GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id: passless_core::agent::PrincipalSessionId::new(),
-                endpoint_id: passless_core::agent::EndpointId::new(),
                 principal_digest: [0u8; 32],
                 rp_ids: vec![RP_ID.to_string()],
                 credentials: vec![],

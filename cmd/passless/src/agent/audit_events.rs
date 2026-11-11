@@ -4,7 +4,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use passless_core::agent::{
-    BrowserLeaseId, CredentialRef, EndpointId, GrantId, IntentId, PrincipalSessionId, ProfileId,
+    BrowserLeaseId, CredentialRef, GrantId, IntentId, PrincipalSessionId, ProfileId,
 };
 
 use super::grant::{CeremonyId, GrantRequestId};
@@ -171,7 +171,7 @@ const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
     ),
     (
         "browser_lease.launch",
-        &["lease_id", "profile_id", "endpoint_id", "cdp_expose"],
+        &["lease_id", "profile_id", "cdp_expose"],
     ),
     ("browser_lease.revoke", &["lease_id", "reason"]),
     ("browser_lease.expire", &["lease_id"]),
@@ -756,21 +756,23 @@ pub struct ProfileFailMeta {
     reason: FailReason,
 }
 
+/// Payload of an `endpoint.*` record written before the isolated UHID route was removed (ADR 0014
+/// section 5). Nothing emits these any more; the variants stay so that old logs still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointCreateMeta {
-    endpoint_id: EndpointId,
+    endpoint_id: String,
     profile_id: ProfileId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointDestroyMeta {
-    endpoint_id: EndpointId,
+    endpoint_id: String,
     profile_id: ProfileId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointFailMeta {
-    endpoint_id: EndpointId,
+    endpoint_id: String,
     profile_id: ProfileId,
     reason: FailReason,
 }
@@ -800,7 +802,6 @@ pub struct PrincipalExitMeta {
 pub struct BrowserLeaseLaunchMeta {
     lease_id: BrowserLeaseId,
     profile_id: ProfileId,
-    endpoint_id: EndpointId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cdp_expose: Option<String>,
 }
@@ -1823,72 +1824,6 @@ impl ProfileFailBuilder {
     }
 }
 
-pub struct EndpointCreateBuilder {
-    endpoint_id: EndpointId,
-    profile_id: ProfileId,
-}
-
-impl EndpointCreateBuilder {
-    pub fn new(endpoint_id: EndpointId, profile_id: ProfileId) -> Self {
-        Self {
-            endpoint_id,
-            profile_id,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::EndpointCreate(EndpointCreateMeta {
-            endpoint_id: self.endpoint_id,
-            profile_id: self.profile_id,
-        }))
-    }
-}
-
-pub struct EndpointDestroyBuilder {
-    endpoint_id: EndpointId,
-    profile_id: ProfileId,
-}
-
-impl EndpointDestroyBuilder {
-    pub fn new(endpoint_id: EndpointId, profile_id: ProfileId) -> Self {
-        Self {
-            endpoint_id,
-            profile_id,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::EndpointDestroy(EndpointDestroyMeta {
-            endpoint_id: self.endpoint_id,
-            profile_id: self.profile_id,
-        }))
-    }
-}
-
-pub struct EndpointFailBuilder {
-    endpoint_id: EndpointId,
-    profile_id: ProfileId,
-    reason: FailReason,
-}
-
-impl EndpointFailBuilder {
-    pub fn new(endpoint_id: EndpointId, profile_id: ProfileId, reason: FailReason) -> Self {
-        Self {
-            endpoint_id,
-            profile_id,
-            reason,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::EndpointFail(EndpointFailMeta {
-            endpoint_id: self.endpoint_id,
-            profile_id: self.profile_id,
-            reason: self.reason,
-        }))
-    }
-}
-
 pub struct PrincipalLaunchBuilder {
     session_id: PrincipalSessionId,
     profile_id: ProfileId,
@@ -1964,16 +1899,14 @@ impl PrincipalExitBuilder {
 pub struct BrowserLeaseLaunchBuilder {
     lease_id: BrowserLeaseId,
     profile_id: ProfileId,
-    endpoint_id: EndpointId,
     cdp_expose: Option<String>,
 }
 
 impl BrowserLeaseLaunchBuilder {
-    pub fn new(lease_id: BrowserLeaseId, profile_id: ProfileId, endpoint_id: EndpointId) -> Self {
+    pub fn new(lease_id: BrowserLeaseId, profile_id: ProfileId) -> Self {
         Self {
             lease_id,
             profile_id,
-            endpoint_id,
             cdp_expose: None,
         }
     }
@@ -1987,7 +1920,6 @@ impl BrowserLeaseLaunchBuilder {
         AuditEvent::new(AuditPayload::BrowserLeaseLaunch(BrowserLeaseLaunchMeta {
             lease_id: self.lease_id,
             profile_id: self.profile_id,
-            endpoint_id: self.endpoint_id,
             cdp_expose: self.cdp_expose,
         }))
     }
@@ -3293,10 +3225,6 @@ mod tests {
         ProfileId::new("test-profile").unwrap()
     }
 
-    fn test_endpoint_id() -> EndpointId {
-        EndpointId::new()
-    }
-
     fn test_session_id() -> PrincipalSessionId {
         PrincipalSessionId::new()
     }
@@ -3324,6 +3252,21 @@ mod tests {
         if let Some(pid) = pid {
             payload["profile_id"] = serde_json::to_value(pid).unwrap();
             payload["action"] = serde_json::json!("register");
+        }
+        AuditEvent::new(serde_json::from_value(payload).unwrap())
+    }
+
+    /// An `endpoint.*` record as written before the isolated UHID route was removed (ADR 0014
+    /// section 5). Nothing emits these any more; the payload variants stay so that old logs still
+    /// deserialize.
+    fn historic_endpoint_event(kind: &str, pid: &ProfileId) -> AuditEvent {
+        let mut payload = serde_json::json!({
+            "kind": kind,
+            "endpoint_id": "ep-historic",
+            "profile_id": pid,
+        });
+        if kind == "endpoint.fail" {
+            payload["reason"] = serde_json::json!("timeout");
         }
         AuditEvent::new(serde_json::from_value(payload).unwrap())
     }
@@ -3359,7 +3302,6 @@ mod tests {
 
     fn all_test_events() -> Vec<AuditEvent> {
         let pid = test_profile_id();
-        let eid = test_endpoint_id();
         let sid = test_session_id();
         let iid = test_intent_id();
         let gid = test_grant_id();
@@ -3376,13 +3318,13 @@ mod tests {
             ProfileCreateBuilder::new(pid.clone()).build(),
             ProfileDestroyBuilder::new(pid.clone()).build(),
             ProfileFailBuilder::new(pid.clone(), FailReason::InternalError).build(),
-            EndpointCreateBuilder::new(eid.clone(), pid.clone()).build(),
-            EndpointDestroyBuilder::new(eid.clone(), pid.clone()).build(),
-            EndpointFailBuilder::new(eid.clone(), pid.clone(), FailReason::Timeout).build(),
+            historic_endpoint_event("endpoint.create", &pid),
+            historic_endpoint_event("endpoint.destroy", &pid),
+            historic_endpoint_event("endpoint.fail", &pid),
             PrincipalLaunchBuilder::new(sid.clone(), pid.clone(), 1000).build(),
             PrincipalDenyBuilder::new(sid.clone(), pid.clone(), DenyReason::PolicyDenied).build(),
             PrincipalExitBuilder::new(sid.clone(), pid.clone(), ExitReason::Normal).build(),
-            BrowserLeaseLaunchBuilder::new(lid.clone(), pid.clone(), eid.clone())
+            BrowserLeaseLaunchBuilder::new(lid.clone(), pid.clone())
                 .with_cdp_expose("pipe".to_string())
                 .build(),
             BrowserLeaseRevokeBuilder::new(lid.clone(), RevokeReason::AdminRevoked).build(),

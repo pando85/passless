@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use passless_core::agent::protocol::{DoctorCheck, EndpointDiagnosticState};
+use passless_core::agent::protocol::DoctorCheck;
 use passless_core::agent::{AgentConfig, AgentMode, AgentProfileConfig, ProfileId, RuleAction};
 
 use super::audit::AuditGate;
@@ -530,7 +530,6 @@ pub struct ProfileDiagnosticParams<'a> {
     pub profile_id: &'a ProfileId,
     pub enabled: bool,
     pub mode: AgentMode,
-    pub endpoint_has_id: bool,
     pub browser_lease_state: Option<&'a str>,
     pub policy_generation: u64,
     pub audit_gate: &'a AuditGate,
@@ -546,7 +545,6 @@ pub fn build_profile_diagnostic_report(
         profile_id,
         enabled,
         mode,
-        endpoint_has_id,
         browser_lease_state,
         policy_generation,
         audit_gate,
@@ -554,23 +552,6 @@ pub fn build_profile_diagnostic_report(
         pin_set,
         require_uv,
     } = params;
-    let endpoint_state = match mode {
-        AgentMode::SameUser => {
-            if endpoint_has_id {
-                EndpointDiagnosticState::Ready
-            } else {
-                EndpointDiagnosticState::Unavailable
-            }
-        }
-        AgentMode::Isolated => {
-            if endpoint_has_id {
-                EndpointDiagnosticState::Ready
-            } else {
-                EndpointDiagnosticState::Unavailable
-            }
-        }
-    };
-
     let audit_ok = audit_gate.ping();
 
     let mut checks = Vec::new();
@@ -583,12 +564,6 @@ pub fn build_profile_diagnostic_report(
         } else {
             "profile is disabled".into()
         },
-    });
-
-    checks.push(DoctorCheck {
-        name: "endpoint".into(),
-        passed: !matches!(endpoint_state, EndpointDiagnosticState::Unavailable),
-        message: format!("endpoint state: {}", endpoint_state),
     });
 
     if let Some(lease_state) = browser_lease_state {
@@ -643,7 +618,6 @@ pub fn build_profile_diagnostic_report(
         profile_id: profile_id.to_string(),
         enabled,
         mode: mode_str,
-        endpoint_state,
         browser_lease_state: browser_lease_state.map(|s| s.to_string()),
         policy_generation,
         audit_gate_healthy: audit_ok,
@@ -1053,7 +1027,6 @@ mod tests {
             profile_id: &pid,
             enabled: true,
             mode: AgentMode::Isolated,
-            endpoint_has_id: true,
             browser_lease_state: None,
             policy_generation: 5,
             audit_gate: &audit,
@@ -1063,7 +1036,6 @@ mod tests {
         });
 
         assert!(report.is_healthy());
-        assert_eq!(report.endpoint_state, EndpointDiagnosticState::Ready);
         assert!(report.audit_gate_healthy);
         assert_eq!(report.policy_generation, 5);
         assert!(report.pin_storage_available);
@@ -1081,7 +1053,6 @@ mod tests {
             profile_id: &pid,
             enabled: false,
             mode: AgentMode::Isolated,
-            endpoint_has_id: false,
             browser_lease_state: None,
             policy_generation: 0,
             audit_gate: &audit,
@@ -1091,7 +1062,6 @@ mod tests {
         });
 
         assert!(!report.is_healthy());
-        assert_eq!(report.endpoint_state, EndpointDiagnosticState::Unavailable);
     }
 
     #[test]
@@ -1105,7 +1075,6 @@ mod tests {
             profile_id: &pid,
             enabled: true,
             mode: AgentMode::Isolated,
-            endpoint_has_id: true,
             browser_lease_state: None,
             policy_generation: 1,
             audit_gate: &audit,
@@ -1131,7 +1100,6 @@ mod tests {
             profile_id: &pid,
             enabled: true,
             mode: AgentMode::Isolated,
-            endpoint_has_id: true,
             browser_lease_state: None,
             policy_generation: 1,
             audit_gate: &audit,
