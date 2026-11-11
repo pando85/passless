@@ -32,6 +32,7 @@ impl AgentRuntime {
         session_id: &PrincipalSessionId,
         process_digest: &ProcessIdentityDigest,
         start_url: Option<&str>,
+        headed: bool,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
         if profile
@@ -219,20 +220,10 @@ impl AgentRuntime {
         // may have replaced since the daemon started (ADR 0014 section 6.4).
         let live_config = self.live_profile_config(profile);
         let profile_config = &live_config;
-        let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::BadRequest,
-                format!("profile '{}' has no browser_command configured", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-        if browser_command.is_empty() {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "browser_command must contain an executable",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // The browser binary: the profile's `browser_command`, else `agents.browser_path`, else
+        // auto-detection. Branded Google Chrome and chrome-headless-shell are refused (R14), and a
+        // distinct-UID principal only gets a root-owned, principal-unwritable binary (V-H7).
+        let launch = self.resolve_browser_launch(profile, profile_config, headed)?;
 
         let runtime_root = profile_config
             .browser_runtime_root
@@ -245,11 +236,11 @@ impl AgentRuntime {
             });
         let rp_ids = profile_config.rule_rp_ids();
         let config = BrowserConfig {
-            executable: PathBuf::from(&browser_command[0]),
+            executable: launch.executable,
             start_url: start_url
                 .map(str::to_owned)
                 .or_else(|| profile_config.start_url.clone()),
-            extra_args: browser_command[1..].to_vec(),
+            extra_args: launch.extra_args,
             runtime_root,
             ttl: BROWSER_TTL,
             login_timeout: LOGIN_TIMEOUT,
@@ -576,6 +567,7 @@ impl AgentRuntime {
                     profile_id.clone(),
                     SharedBrowserLease {
                         lease_id: lease_id.clone(),
+                        owner_session: session_id.clone(),
                         ref_count: 1,
                         attached_sessions: attached,
                     },

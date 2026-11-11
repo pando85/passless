@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::io::BufReader;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -30,7 +29,11 @@ pub fn try_run_as_principal(
     }
 }
 
-fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Result<()> {
+pub(super) fn run_as_principal(
+    profile: &str,
+    url: Option<&str>,
+    command: &[PathBuf],
+) -> Result<()> {
     if command.is_empty() {
         return Err(Error::Other(
             "playwright-mcp requires an executable after '--'".to_string(),
@@ -52,7 +55,7 @@ fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Re
     let shared_browser = profile_uses_shared_browser(profile);
     let profile_for_bootstrap = profile_owned.clone();
     let bootstrap = CdpBootstrap::start(token.clone(), move || {
-        let (endpoint, _) = ensure_browser(&profile_for_bootstrap, start_url.as_deref())?;
+        let (endpoint, _) = ensure_browser(&profile_for_bootstrap, start_url.as_deref(), false)?;
         Ok(endpoint)
     })
     .map_err(|e| Error::Other(e.to_string()))?;
@@ -79,50 +82,49 @@ fn run_as_principal(profile: &str, url: Option<&str>, command: &[PathBuf]) -> Re
     // The Playwright process needs browser authority, not Passless principal IPC authority.
     // Close the inherited capability fd before exec and arrange for the MCP child to die if the
     // principal wrapper disappears unexpectedly.
-    unsafe {
-        child_command.pre_exec(|| {
-            let _ = libc::close(crate::agent::launcher::CONTROL_FD);
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    super::agent_browser::spawn_without_capability(&mut child_command);
+    let result = supervise(child_command, "Playwright MCP", executable);
+    drop(bootstrap);
+    result
+}
 
+/// Run an MCP server child to completion; its exit status is ours.
+pub(super) fn supervise(
+    mut child_command: Command,
+    label: &str,
+    executable: &std::path::Path,
+) -> Result<()> {
     let mut child = child_command.spawn().map_err(|e| {
         Error::Other(format!(
-            "failed to start Playwright MCP executable '{}': {e}",
+            "failed to start {label} executable '{}': {e}",
             executable.display()
         ))
     })?;
 
     let status = child
         .wait()
-        .map_err(|e| Error::Other(format!("failed waiting for Playwright MCP: {e}")))?;
-    drop(bootstrap);
+        .map_err(|e| Error::Other(format!("failed waiting for {label}: {e}")))?;
 
     if status.success() {
         Ok(())
     } else if let Some(code) = status.code() {
-        Err(Error::Other(format!(
-            "Playwright MCP exited with code {code}"
-        )))
+        Err(Error::Other(format!("{label} exited with code {code}")))
     } else {
-        Err(Error::Other(
-            "Playwright MCP terminated by signal".to_string(),
-        ))
+        Err(Error::Other(format!("{label} terminated by signal")))
     }
 }
 
 fn ensure_browser(
     profile: &str,
     start_url: Option<&str>,
+    headed: bool,
 ) -> std::result::Result<(String, bool), String> {
     let base = resolve_runtime_base().map_err(|e| e.to_string())?;
     let mut client =
         PrincipalClient::connect_launched(&base, profile).map_err(|e| e.to_string())?;
     let response = client
         .request(PrincipalRequest::EnsureBrowser {
+            headed,
             start_url: start_url.map(ToOwned::to_owned),
         })
         .map_err(|e| e.to_string())?;

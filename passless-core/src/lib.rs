@@ -14,7 +14,7 @@ pub use config::{
     AdminAuditAction, AdminAuditExportFormat, AdminBrowserAction, AdminCredentialAction,
     AdminGrantAction, AdminGrantsAction, AdminPolicyAction, AdminPrincipalsAction,
     AdminProfileAction, AdminSessionsAction, AgentAdminAction, AgentCommand, AgentCredentialAction,
-    AgentDelegationAction,
+    AgentDelegationAction, McpAdapter, McpAdapterKind, McpConfigTarget,
 };
 pub use config::{
     AgentSkillScope, AgentSkillTarget, AppConfig, Args, BackendConfig, ClientAction, Commands,

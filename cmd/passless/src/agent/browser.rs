@@ -2403,6 +2403,68 @@ pub fn extension_id_of_dir(ext_dir: &Path) -> Result<String, LaunchError> {
     compute_extension_id(&String::from_utf8_lossy(&manifest))
 }
 
+/// What [`extension_self_check`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtensionSelfCheck {
+    /// The extension ID the committed manifest key gives (the one the native host admits).
+    pub id: String,
+    /// The `minimum_chrome_version` of the manifest, as a major version.
+    pub minimum_chrome_major: Option<u64>,
+}
+
+/// `passless doctor --agents`: render the interception extension and the native messaging host
+/// manifest the way a launch does, into the fresh directory `scratch`, and verify them
+/// (`verify_extension_dir`, the manifest's key and ID, the host manifest for `sign_proxy`). It
+/// starts no browser. Nothing is written outside `scratch`.
+pub(crate) fn extension_self_check(
+    scratch: &Path,
+    sign_proxy: &Path,
+) -> Result<ExtensionSelfCheck, String> {
+    let fail = |what: &str, e: &dyn fmt::Display| format!("{what}: {e}");
+    let lease = Dir::open_path(scratch).map_err(|e| fail("open the scratch directory", &e))?;
+    // SAFETY: no preconditions.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let metadata = AgentEndpointMetadata {
+        socket_path: "/nonexistent/passless-doctor/sock".into(),
+        bearer_token: "doctor".into(),
+    };
+    let ext_dir = generate_agent_extension_in(&lease, scratch, &metadata, uid, gid)
+        .map_err(|e| fail("render the extension", &e))?;
+    let ext = lease
+        .open_dir(AGENT_EXTENSION_DIR)
+        .map_err(|e| fail("open the rendered extension", &e))?;
+    verify_extension_dir_in(&ext, &ext_dir, uid)
+        .map_err(|e| fail("verify the rendered extension", &e))?;
+    let id = extension_id_of_dir(&ext_dir).map_err(|e| fail("compute the extension ID", &e))?;
+    if id != AGENT_EXTENSION_ID {
+        return Err(format!(
+            "the extension ID is {id}, not the {AGENT_EXTENSION_ID} the native host and the \
+             incognito seed expect; reinstall passless"
+        ));
+    }
+    let profile = lease
+        .create_dir("profile", RUNTIME_DIR_MODE)
+        .map_err(|e| fail("create the scratch profile", &e))?;
+    install_native_messaging_manifest_in(&profile, sign_proxy)
+        .map_err(|e| fail("render the native messaging host manifest", &e))?;
+    let minimum_chrome_major =
+        serde_json::from_str::<serde_json::Value>(EXTENSION_MANIFEST_TEMPLATE)
+            .ok()
+            .and_then(|manifest| {
+                manifest
+                    .get("minimum_chrome_version")?
+                    .as_str()?
+                    .split('.')
+                    .next()?
+                    .parse()
+                    .ok()
+            });
+    Ok(ExtensionSelfCheck {
+        id,
+        minimum_chrome_major,
+    })
+}
+
 /// Where the launcher expects the `sign-proxy` relay: next to the running executable. `None` if
 /// the executable's path is unknown.
 pub(crate) fn installed_sign_proxy_path() -> Option<PathBuf> {

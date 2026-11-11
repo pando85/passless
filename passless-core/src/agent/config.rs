@@ -1147,12 +1147,6 @@ impl AgentProfileConfig {
                         profile_id
                     )));
                 }
-                if self.browser_runtime_root.is_some() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': isolated mode must not specify browser_runtime_root",
-                        profile_id
-                    )));
-                }
             }
         }
 
@@ -1226,6 +1220,15 @@ pub struct AgentConfig {
     /// request from a managed browser that reached the native path would be signed silently.
     #[serde(default)]
     pub allow_automatic_human_path: bool,
+
+    /// Browser binary the managed browser runs when a profile sets no `browser_command`
+    /// (ADR 0014 section 4.2, R14). Unset: the daemon picks the first supported browser it finds
+    /// (Playwright Chromium, then Chrome for Testing, then the distribution's `chromium`). Branded
+    /// Google Chrome and `chrome-headless-shell` are refused: neither can load the interception
+    /// extension. With a distinct-UID principal the binary must be owned by root and not writable
+    /// by the principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_path: Option<PathBuf>,
 }
 
 /// Default global cap on concurrent agent ceremony requests.
@@ -1322,6 +1325,7 @@ impl Default for AgentConfig {
             escalation_timeout: None,
             escalation_cooldown: DEFAULT_ESCALATION_COOLDOWN_SECS,
             allow_automatic_human_path: false,
+            browser_path: None,
         }
     }
 }
@@ -2143,6 +2147,7 @@ mod tests {
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2218,6 +2223,7 @@ product_id = 22136
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2416,6 +2422,7 @@ verbose = false
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2468,6 +2475,7 @@ verbose = false
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2514,6 +2522,7 @@ product_id = 2
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles: BTreeMap::new(),
@@ -2533,6 +2542,7 @@ product_id = 2
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: false,
             profiles: BTreeMap::new(),
@@ -2580,6 +2590,7 @@ product_id = 2
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2757,6 +2768,7 @@ backend_type = "local"
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2819,6 +2831,7 @@ backend_type = "local"
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2873,6 +2886,7 @@ backend_type = "local"
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3252,6 +3266,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3361,6 +3376,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3411,6 +3427,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             escalation_timeout: None,
             escalation_cooldown: 600,
             allow_automatic_human_path: false,
+            browser_path: None,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -3460,13 +3477,18 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         assert!(err.to_string().contains("browser_user"));
     }
 
+    /// Defect B7: an isolated profile could not set `browser_runtime_root`, so its browser was
+    /// stuck with the default `$XDG_RUNTIME_DIR/passless/browser`. The runtime root says where the
+    /// browser's per-lease directories live; it does not depend on where the credentials are.
     #[test]
-    fn test_isolated_mode_rejects_browser_runtime_root() {
+    fn test_isolated_mode_accepts_browser_runtime_root() {
         let mut profile = make_isolated_profile();
         profile.browser_runtime_root = Some(PathBuf::from("/var/run/browser"));
         let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_runtime_root"));
+        profile.validate(&pid).unwrap();
+        // The restrictions that remain: an isolated profile still has no separate browser user.
+        profile.browser_user = Some("browser-user".to_string());
+        assert!(profile.validate(&pid).is_err());
     }
 
     #[cfg(feature = "tpm")]

@@ -828,6 +828,24 @@ pub enum Commands {
         #[command(subcommand)]
         action: AgentAdminAction,
     },
+    /// Check this host (does not need a running daemon)
+    #[cfg(feature = "agent")]
+    Doctor {
+        /// Check the agent browser path: a supported browser binary, the interception extension,
+        /// the native messaging host manifest, the notification bus, the state directory and the
+        /// containment of the native WebAuthn path
+        #[arg(long)]
+        agents: bool,
+
+        /// Output format: plain (default) or json
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FORMAT",
+            default_value = "plain"
+        )]
+        output: OutputFormat,
+    },
     /// Agent principal and session commands
     #[cfg(feature = "agent")]
     Agent {
@@ -1383,7 +1401,47 @@ pub enum AgentCommand {
         #[arg(long, value_name = "MS", default_value = "5000")]
         timeout_ms: u32,
     },
+    /// Ensure the managed browser of this principal and print its CDP endpoint
+    ///
+    /// Idempotent: the browser is started on the first call and the same endpoint is printed
+    /// while it runs (the profile's `browser_scope` decides whether sessions share it). The
+    /// endpoint is withheld until the interception extension is attached and allowed in
+    /// incognito, so a printed endpoint is always an intercepted browser. Requires
+    /// `browser_cdp_expose = "port"` on the profile. Not run from a principal session, the
+    /// command starts one for the profile (like `agent run`).
+    Browser {
+        /// Print JSON ({endpoint, ...}) instead of the bare endpoint URL
+        #[arg(long, conflicts_with = "env")]
+        json: bool,
+        /// Print `PASSLESS_CDP_URL=<endpoint>`, for `eval` or a dotenv file
+        #[arg(long)]
+        env: bool,
+        /// Block until the browser is intercepting (attached, incognito allowed) before printing
+        #[arg(long)]
+        wait: bool,
+        /// Start a headed browser instead of the default `--headless=new`
+        #[arg(long)]
+        headed: bool,
+        /// Open this URL once interception is attached
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// MCP server adapters for the managed browser (stdio launchers)
+    #[command(args_conflicts_with_subcommands = true)]
+    Mcp {
+        /// Print a ready-to-paste MCP server entry for a client instead of running a server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
+        /// The adapter the printed entry runs
+        #[arg(long, value_enum, default_value_t = McpAdapterKind::Playwright, requires = "print_config")]
+        server: McpAdapterKind,
+        #[command(subcommand)]
+        adapter: Option<McpAdapter>,
+    },
     /// Run Playwright MCP with lazy access to the profile's trusted CDP browser
+    ///
+    /// Deprecated alias of `agent mcp playwright`, kept for one release.
+    #[command(hide = true)]
     PlaywrightMcp {
         /// Profile to bind the Playwright session to
         #[arg(long, value_name = "PROFILE")]
@@ -1404,6 +1462,68 @@ pub enum AgentCommand {
         #[arg(last = true, required = true)]
         command: Vec<std::path::PathBuf>,
     },
+}
+
+/// An MCP server the adapters run against the managed browser.
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum McpAdapter {
+    /// Run `npx @playwright/mcp --cdp-endpoint <url>` (the endpoint is resolved on first use)
+    Playwright {
+        /// npm package to run (default `@playwright/mcp`; pin a version here)
+        #[arg(long, value_name = "SPEC")]
+        package: Option<String>,
+        /// npx executable (default: `npx` from PATH)
+        #[arg(long, value_name = "PATH")]
+        npx: Option<std::path::PathBuf>,
+        /// Open this URL once interception is attached
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Extra arguments for @playwright/mcp (after `--`)
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
+    /// Run `npx chrome-devtools-mcp --browserUrl <url>`
+    ///
+    /// The browser starts when the server starts: puppeteer asks `<browserUrl>/json/version`
+    /// at the root of the URL and cannot send the bootstrap's bearer header, so a lazy,
+    /// authenticated discovery endpoint is not possible.
+    ChromeDevtools {
+        /// npm package to run (default `chrome-devtools-mcp`; pin a version here)
+        #[arg(long, value_name = "SPEC")]
+        package: Option<String>,
+        /// npx executable (default: `npx` from PATH)
+        #[arg(long, value_name = "PATH")]
+        npx: Option<std::path::PathBuf>,
+        /// Open this URL once interception is attached
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Extra arguments for chrome-devtools-mcp (after `--`)
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
+}
+
+/// Which adapter `agent mcp --print-config` prints an entry for.
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAdapterKind {
+    Playwright,
+    ChromeDevtools,
+}
+
+/// MCP clients `agent mcp --print-config` knows the configuration format of.
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConfigTarget {
+    /// `.mcp.json` / `claude mcp add-json`
+    ClaudeCode,
+    /// `opencode.json`
+    Opencode,
+    /// `.cursor/mcp.json`
+    Cursor,
+    /// `.vscode/mcp.json`
+    Vscode,
 }
 
 /// Agent delegation actions
@@ -1765,6 +1885,149 @@ mod tests {
             Some(Commands::Agent {
                 action: AgentCommand::Doctor,
                 ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_browser_parses() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "--profile",
+            "p",
+            "browser",
+            "--json",
+            "--wait",
+            "--headed",
+        ])
+        .unwrap();
+        let Some(Commands::Agent {
+            profile,
+            action:
+                AgentCommand::Browser {
+                    json,
+                    env,
+                    wait,
+                    headed,
+                    url,
+                },
+            ..
+        }) = args.command
+        else {
+            panic!("not agent browser");
+        };
+        assert_eq!(profile.as_deref(), Some("p"));
+        assert!(json && wait && headed && !env && url.is_none());
+        // `--profile` after the subcommand works too (it is global), and `--json` excludes `--env`.
+        let args =
+            Args::try_parse_from(["passless", "agent", "browser", "--env", "--profile", "p"])
+                .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Browser { env: true, .. },
+                ..
+            })
+        ));
+        assert!(Args::try_parse_from(["passless", "agent", "browser", "--json", "--env"]).is_err());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_mcp_parses() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "p",
+            "--",
+            "--isolated",
+        ])
+        .unwrap();
+        let Some(Commands::Agent {
+            action:
+                AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::Playwright { extra, .. }),
+                    print_config: None,
+                    ..
+                },
+            profile,
+            ..
+        }) = args.command
+        else {
+            panic!("not agent mcp playwright");
+        };
+        assert_eq!(profile.as_deref(), Some("p"));
+        assert_eq!(extra, ["--isolated"]);
+
+        let args = Args::try_parse_from(["passless", "agent", "mcp", "chrome-devtools"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::ChromeDevtools { .. }),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        for (name, target) in [
+            ("claude-code", McpConfigTarget::ClaudeCode),
+            ("opencode", McpConfigTarget::Opencode),
+            ("cursor", McpConfigTarget::Cursor),
+            ("vscode", McpConfigTarget::Vscode),
+        ] {
+            let args = Args::try_parse_from([
+                "passless",
+                "agent",
+                "--profile",
+                "p",
+                "mcp",
+                "--print-config",
+                name,
+            ])
+            .unwrap();
+            assert!(matches!(
+                args.command,
+                Some(Commands::Agent {
+                    action: AgentCommand::Mcp { print_config: Some(t), adapter: None, .. },
+                    ..
+                }) if t == target
+            ));
+        }
+        assert!(
+            Args::try_parse_from(["passless", "agent", "mcp", "--print-config", "emacs"]).is_err()
+        );
+        // The old name still parses (hidden alias, one release).
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "playwright-mcp",
+                "--profile",
+                "p",
+                "--",
+                "/usr/bin/npx",
+                "x",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_doctor_agents_parses() {
+        let args = Args::try_parse_from(["passless", "doctor", "--agents", "-o", "json"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Doctor {
+                agents: true,
+                output: OutputFormat::Json
             })
         ));
     }

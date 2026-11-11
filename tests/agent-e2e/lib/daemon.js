@@ -57,8 +57,8 @@ function renderConfig(env, o) {
     if (p.max_granted_rules !== undefined) b.push(`max_granted_rules = ${p.max_granted_rules}`);
     if (p.credential_selection) b.push(`credential_selection = ${q(p.credential_selection)}`);
     b.push(`browser_command = ${tomlValue([o.browserExe, ...(o.browserArgs || [])])}`);
-    // Isolated profiles must not set browser_runtime_root; the daemon then uses $XDG_RUNTIME_DIR/passless/browser.
-    if (mode === 'same-user') b.push(`browser_runtime_root = ${q(path.join(env.dirs.run, 'browser'))}`);
+    // Isolated profiles take browser_runtime_root too (defect B7, fixed in P10b).
+    b.push(`browser_runtime_root = ${q(path.join(env.dirs.run, 'browser'))}`);
     // browser_scope = "profile" by default: it was the only scope that survived its launch before defect B1 was
     // fixed in P10 (PR_SET_PDEATHSIG follows the thread that forked the browser, which was the short-lived IPC
     // handler thread). The daemon now forks browsers on a long-lived launcher thread; E2E-46/session-scope runs

@@ -324,6 +324,11 @@ pub struct ActiveBrowserLease {
 
 pub struct SharedBrowserLease {
     pub lease_id: BrowserLeaseId,
+    /// The principal session that launched the browser. The worker's bearer, the session grant
+    /// and the bearer session behind the lease are the owner's: a session that attaches later
+    /// (`browser_scope = "profile"`) rides on them. So the browser lives only as long as its
+    /// owner (see [`detach_session_from_shared`]).
+    pub owner_session: PrincipalSessionId,
     pub ref_count: usize,
     pub attached_sessions: std::collections::HashSet<PrincipalSessionId>,
 }
@@ -359,7 +364,13 @@ fn detach_session_from_shared(
         return SharedDetachOutcome::Keep;
     }
     lease.sync_ref_count();
-    if lease.ref_count == 0 {
+    // The last session out closes the browser. So does the owner, even when others remain: the
+    // bearer the worker holds, and the grant and bearer session behind it, are the owner's
+    // (revoked with its exit), so the browser could no longer intercept for the sessions left
+    // (P5 review L5). They are detached from it and launch their own on their next `EnsureBrowser`,
+    // with a bearer and grant bound to themselves; rebinding the worker's baked-in bearer to
+    // another principal is not possible.
+    if lease.ref_count == 0 || lease.owner_session == *session_id {
         let lease_id = lease.lease_id.clone();
         shared.remove(profile_id);
         SharedDetachOutcome::Terminate(lease_id)
@@ -1686,6 +1697,11 @@ impl AgentRuntime {
                 }
             };
             if let Some(lease_id) = should_terminate {
+                // Sessions still attached to the closing browser (the owner left first) lose it;
+                // their next `EnsureBrowser` launches one bound to themselves.
+                if let Ok(mut active) = profile.active_browser.lock() {
+                    active.retain(|_, other| other.lease_id != lease_id);
+                }
                 self.revoke_sign_context_for_lease(&lease_id);
                 let mut browser_mgr = super::lock_order::lock(
                     &self.browser_manager,
@@ -1710,6 +1726,47 @@ impl AgentRuntime {
             let _ = browser_mgr.cleanup(&active.lease_id);
             browser_mgr.remove(&active.lease_id);
         }
+    }
+
+    /// What the managed browser of `profile` runs (ADR 0014 section 4.2, R14, V-H7), see
+    /// [`super::browser_select::resolve_launch`]. Branded Google Chrome and chrome-headless-shell
+    /// are refused with an actionable error. Runs `<browser> --version` (bounded at 10 s).
+    pub(super) fn resolve_browser_launch(
+        &self,
+        profile: &ProfileRuntime,
+        profile_config: &AgentProfileConfig,
+        headed: bool,
+    ) -> Result<super::browser_select::BrowserLaunch, ProtocolError> {
+        let browser_path = {
+            let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+            self.agent_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .browser_path
+                .clone()
+        };
+        let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
+        let home = super::browser_select::home_dir_of_uid(browser_uid);
+        let distinct_uid = profile.uid != profile.daemon_uid;
+        super::browser_select::resolve_launch(
+            profile_config.browser_command.as_deref(),
+            browser_path.as_deref(),
+            home.as_deref(),
+            distinct_uid,
+            headed,
+            &super::browser_select::run_version,
+        )
+        .map_err(|e| {
+            log::warn!(
+                "profile '{}': no usable browser: {e}",
+                profile.profile_id.as_str()
+            );
+            ProtocolError::new(
+                ErrorCode::BadRequest,
+                format!("profile '{}': {e}", profile.profile_id.as_str()),
+                RecommendedAction::FixRequest,
+            )
+        })
     }
 
     /// The profile's configuration as currently in force (a policy reload replaces it).
@@ -4033,16 +4090,10 @@ impl AgentRuntime {
 
         let profile_config = &profile.profile_config;
 
-        let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::BadRequest,
-                format!("profile '{}' has no browser_command configured", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-
-        let executable = PathBuf::from(&browser_command[0]);
-        let extra_args = browser_command[1..].to_vec();
+        // The same selection and refusals as the principal's `EnsureBrowser` (R14, V-H7).
+        let launch = self.resolve_browser_launch(profile, profile_config, false)?;
+        let executable = launch.executable;
+        let extra_args = launch.extra_args;
 
         let runtime_root = profile_config
             .browser_runtime_root
@@ -4706,11 +4757,12 @@ impl PrincipalHandler for AgentRuntime {
             PrincipalRequest::BrowserStatus => {
                 self.handle_browser_status(&profile_id, &managed.session_id, profile)
             }
-            PrincipalRequest::EnsureBrowser { start_url } => self.handle_ensure_browser(
+            PrincipalRequest::EnsureBrowser { start_url, headed } => self.handle_ensure_browser(
                 &profile_id,
                 &managed.session_id,
                 &managed.process_digest,
                 start_url.as_deref(),
+                *headed,
                 profile,
             ),
             PrincipalRequest::EndpointStatus => {
@@ -5353,6 +5405,7 @@ register = "deny"
         attached.insert(session.clone());
         let mut lease = SharedBrowserLease {
             lease_id,
+            owner_session: PrincipalSessionId::new(),
             ref_count: 1,
             attached_sessions: attached,
         };
@@ -5370,6 +5423,7 @@ register = "deny"
         let lease_id = BrowserLeaseId::new();
         let mut lease = SharedBrowserLease {
             lease_id,
+            owner_session: PrincipalSessionId::new(),
             ref_count: 0,
             attached_sessions: std::collections::HashSet::new(),
         };
@@ -5390,13 +5444,15 @@ register = "deny"
         attached.insert(session_b.clone());
         let lease = SharedBrowserLease {
             lease_id: lease_id.clone(),
+            owner_session: session_a.clone(),
             ref_count: 2,
             attached_sessions: attached,
         };
         let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
         shared.insert(profile_id.clone(), lease);
 
-        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session_a);
+        // The attached (non-owner) session leaves: the owner keeps the browser.
+        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session_b);
         assert!(matches!(outcome, SharedDetachOutcome::Keep));
         assert!(shared.contains_key(&profile_id));
         assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
@@ -5405,8 +5461,47 @@ register = "deny"
                 .get(&profile_id)
                 .unwrap()
                 .attached_sessions
-                .contains(&session_b)
+                .contains(&session_a)
         );
+    }
+
+    /// P5 review L5: the bearer, grant and bearer session behind a shared browser are its
+    /// owner's. When the owner exits while another principal is still attached, the browser is
+    /// closed (the other principal launches its own, bound to itself) instead of staying up with
+    /// a bearer whose grant is gone.
+    #[test]
+    fn shared_owner_exit_closes_the_browser_even_when_another_session_remains() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let owner = PrincipalSessionId::new();
+        let second = PrincipalSessionId::new();
+        let lease_id = BrowserLeaseId::new();
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(owner.clone());
+        attached.insert(second.clone());
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: lease_id.clone(),
+                owner_session: owner.clone(),
+                ref_count: 2,
+                attached_sessions: attached,
+            },
+        );
+
+        match detach_session_from_shared(&mut shared, &profile_id, &owner) {
+            SharedDetachOutcome::Terminate(closed) => assert_eq!(closed, lease_id),
+            SharedDetachOutcome::Keep => panic!("the owner's exit must close the shared browser"),
+        }
+        assert!(
+            !shared.contains_key(&profile_id),
+            "the closed browser is no longer offered to the session that remains"
+        );
+        // The remaining session's own later exit finds nothing to close.
+        assert!(matches!(
+            detach_session_from_shared(&mut shared, &profile_id, &second),
+            SharedDetachOutcome::Keep
+        ));
     }
 
     #[test]
@@ -5419,6 +5514,7 @@ register = "deny"
         attached.insert(session_a.clone());
         let lease = SharedBrowserLease {
             lease_id: lease_id.clone(),
+            owner_session: PrincipalSessionId::new(),
             ref_count: 1,
             attached_sessions: attached,
         };
@@ -5439,6 +5535,7 @@ register = "deny"
         attached.insert(session.clone());
         let lease = SharedBrowserLease {
             lease_id: lease_id.clone(),
+            owner_session: PrincipalSessionId::new(),
             ref_count: 1,
             attached_sessions: attached,
         };
@@ -5464,6 +5561,7 @@ register = "deny"
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: lease_id.clone(),
+                owner_session: PrincipalSessionId::new(),
                 ref_count: 2,
                 attached_sessions: attached,
             },
@@ -5484,6 +5582,7 @@ register = "deny"
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: new_lease_id.clone(),
+                owner_session: PrincipalSessionId::new(),
                 ref_count: 1,
                 attached_sessions: std::collections::HashSet::new(),
             },
@@ -5516,6 +5615,7 @@ register = "deny"
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: lease_id.clone(),
+                owner_session: PrincipalSessionId::new(),
                 ref_count: 1,
                 attached_sessions: std::collections::HashSet::new(),
             },

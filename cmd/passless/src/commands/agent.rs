@@ -110,6 +110,34 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
             profile: run_profile,
             command,
         } => dispatch_run(output, run_profile, command),
+        AgentCommand::Browser {
+            json,
+            env,
+            wait,
+            headed,
+            url,
+        } => super::agent_browser::dispatch_browser(
+            profile,
+            output,
+            &super::agent_browser::BrowserFlags {
+                json: *json,
+                env: *env,
+                wait: *wait,
+                headed: *headed,
+                url: url.clone(),
+            },
+        ),
+        AgentCommand::Mcp {
+            print_config,
+            server,
+            adapter,
+        } => super::agent_browser::dispatch_mcp(
+            profile,
+            output,
+            *print_config,
+            *server,
+            adapter.as_ref(),
+        ),
         _ => {
             let profile = profile.ok_or_else(|| {
                 Error::Other("--profile is required for principal commands".to_string())
@@ -127,7 +155,10 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
                     request_file,
                     timeout_ms,
                 } => dispatch_browser_control(output, profile, request, request_file, *timeout_ms),
-                AgentCommand::PlaywrightMcp { .. } | AgentCommand::Run { .. } => unreachable!(),
+                AgentCommand::PlaywrightMcp { .. }
+                | AgentCommand::Run { .. }
+                | AgentCommand::Browser { .. }
+                | AgentCommand::Mcp { .. } => unreachable!(),
             }
         }
     }
@@ -708,6 +739,17 @@ fn read_cdp_request_file(path: &Path) -> Result<String> {
 }
 
 fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Result<()> {
+    run_in_principal_session(output, profile, command, false)
+}
+
+/// Start `command` in a new principal session of `profile` (or exec it directly when this
+/// process already is one) and wait for it. `quiet` suppresses the session notice on stderr.
+pub(super) fn run_in_principal_session(
+    output: OutputFormat,
+    profile: &str,
+    command: &[PathBuf],
+    quiet: bool,
+) -> Result<()> {
     let control_fd = crate::agent::launcher::CONTROL_FD;
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(control_fd, &mut stat) } == 0
@@ -737,7 +779,8 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
         AdminResponse::PrincipalLaunched(launched) => {
             let session_id = launched.session_id.clone();
 
-            if output == OutputFormat::Json {
+            if quiet {
+            } else if output == OutputFormat::Json {
                 eprintln!(
                     "{}",
                     serde_json::to_string(&Envelope {

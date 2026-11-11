@@ -13,7 +13,10 @@ mod tests {
 
     #[test]
     fn ensure_browser_round_trips_without_start_url() {
-        let request = PrincipalRequest::EnsureBrowser { start_url: None };
+        let request = PrincipalRequest::EnsureBrowser {
+            start_url: None,
+            headed: false,
+        };
         request.validate().unwrap();
 
         let json = serde_json::to_string(&request).unwrap();
@@ -22,15 +25,46 @@ mod tests {
     }
 
     #[test]
+    fn ensure_browser_headed_is_optional_on_the_wire() {
+        let headed = PrincipalRequest::EnsureBrowser {
+            start_url: None,
+            headed: true,
+        };
+        headed.validate().unwrap();
+        let json = serde_json::to_string(&headed).unwrap();
+        assert!(json.contains("\"headed\":true"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<PrincipalRequest>(&json).unwrap(),
+            headed
+        );
+
+        // A request without the field (an older client) is headless, and headless is not sent.
+        let old: PrincipalRequest =
+            serde_json::from_str(r#"{"ensure_browser":{"start_url":"https://example.com/"}}"#)
+                .unwrap();
+        assert_eq!(
+            old,
+            PrincipalRequest::EnsureBrowser {
+                start_url: Some("https://example.com/".to_string()),
+                headed: false,
+            }
+        );
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("headed"), "{json}");
+    }
+
+    #[test]
     fn ensure_browser_validates_start_url_bounds() {
         PrincipalRequest::EnsureBrowser {
             start_url: Some("https://example.com/".to_string()),
+            headed: false,
         }
         .validate()
         .unwrap();
 
         let empty = PrincipalRequest::EnsureBrowser {
             start_url: Some(String::new()),
+            headed: false,
         }
         .validate()
         .unwrap_err();
@@ -38,6 +72,7 @@ mod tests {
 
         let oversized = PrincipalRequest::EnsureBrowser {
             start_url: Some(format!("https://example.com/{}", "a".repeat(4096))),
+            headed: false,
         }
         .validate()
         .unwrap_err();

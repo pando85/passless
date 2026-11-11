@@ -498,6 +498,10 @@ pub enum PrincipalRequest {
     EnsureBrowser {
         #[serde(skip_serializing_if = "Option::is_none")]
         start_url: Option<String>,
+        /// Start a headed browser instead of the default `--headless=new`. Honoured only when the
+        /// profile sets no `browser_command` (that command carries its own flags).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        headed: bool,
     },
     EndpointStatus,
     BrowserControl {
@@ -1432,7 +1436,7 @@ impl Validate for PrincipalRequest {
             | Self::WaitDelegation { .. }
             | Self::CancelDelegation { .. } => {}
             Self::ListCredentials { .. } => {}
-            Self::EnsureBrowser { start_url } => {
+            Self::EnsureBrowser { start_url, .. } => {
                 if let Some(url) = start_url {
                     check_str(url, "start_url", MAX_START_URL_LEN, &mut errors);
                 }

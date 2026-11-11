@@ -106,13 +106,36 @@ fn isolated_mode_rejects_browser_user() {
     assert!(err.to_string().contains("browser_user"));
 }
 
+/// Defect B7: an isolated profile may set `browser_runtime_root` (it only says where the
+/// browser's per-lease directories live), and the setting survives a TOML round trip.
 #[test]
-fn isolated_mode_rejects_browser_runtime_root() {
+fn isolated_mode_accepts_browser_runtime_root() {
     let mut profile = isolated_profile();
     profile.browser_runtime_root = Some(PathBuf::from("/tmp/x"));
     let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("browser_runtime_root"));
+    profile.validate(&pid).unwrap();
+
+    let toml = r#"
+        enabled = true
+        [profiles.iso]
+        mode = "isolated"
+        principal_user = "agent"
+        browser_runtime_root = "/run/passless-agent/iso"
+        [profiles.iso.storage.local]
+        path = "/tmp/iso/credentials"
+        pin_path = "/tmp/iso/pin"
+        [[profiles.iso.rules]]
+        rp_id = "example.com"
+        authenticate = "allow"
+        register = "deny"
+    "#;
+    let config: passless_core::agent::AgentConfig = toml::from_str(toml).unwrap();
+    let iso = &config.profiles["iso"];
+    iso.validate(&pid).unwrap();
+    assert_eq!(
+        iso.browser_runtime_root,
+        Some(PathBuf::from("/run/passless-agent/iso"))
+    );
 }
 
 #[test]
@@ -132,6 +155,7 @@ fn agent_config_disabled_skips_validation() {
         escalation_timeout: None,
         escalation_cooldown: 600,
         allow_automatic_human_path: false,
+        browser_path: None,
         limits: Default::default(),
         enabled: false,
         profiles: BTreeMap::new(),
@@ -150,6 +174,7 @@ fn agent_config_enabled_requires_audit_path() {
         escalation_timeout: None,
         escalation_cooldown: 600,
         allow_automatic_human_path: false,
+        browser_path: None,
         limits: Default::default(),
         enabled: true,
         profiles: BTreeMap::new(),
@@ -184,6 +209,7 @@ fn agent_config_detects_overlapping_storage_paths() {
         escalation_timeout: None,
         escalation_cooldown: 600,
         allow_automatic_human_path: false,
+        browser_path: None,
         limits: Default::default(),
         enabled: true,
         profiles,
@@ -220,6 +246,7 @@ fn agent_config_accepts_profiles_sharing_a_legacy_device_identity() {
         escalation_timeout: None,
         escalation_cooldown: 600,
         allow_automatic_human_path: false,
+        browser_path: None,
         limits: Default::default(),
         enabled: true,
         profiles,
@@ -255,6 +282,7 @@ fn agent_config_detects_overlap_with_human_backend() {
         escalation_timeout: None,
         escalation_cooldown: 600,
         allow_automatic_human_path: false,
+        browser_path: None,
         limits: Default::default(),
         enabled: true,
         profiles,

@@ -353,6 +353,13 @@ fn run() -> Result<()> {
     let cli_args = CliArgs::parse();
     let mut args = cli_args.args;
 
+    // `doctor` loads the configuration itself (it needs no daemon).
+    #[cfg(feature = "agent")]
+    if let Some(Commands::Doctor { agents, output }) = &args.command {
+        let (agents, output) = (*agents, *output);
+        return commands::doctor::dispatch(&mut args, agents, output);
+    }
+
     // Handle subcommands first
     if let Some(command) = &args.command {
         return match command {
@@ -435,6 +442,8 @@ fn run() -> Result<()> {
             Commands::AgentAdmin { output, action } => {
                 commands::agent_admin::dispatch_admin(*output, action)
             }
+            #[cfg(feature = "agent")]
+            Commands::Doctor { .. } => unreachable!("handled above"),
             #[cfg(feature = "agent")]
             Commands::Agent {
                 profile,
