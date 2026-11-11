@@ -10,6 +10,9 @@ use passless_core::{Error, Result};
 use crate::agent::cdp_bootstrap::CdpBootstrap;
 use crate::agent::client::{ClientError, PrincipalClient, resolve_runtime_base};
 
+/// How often the adapters check that the browser they were given is still there.
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Try to run the Playwright MCP integration in the current process.
 ///
 /// `Ok(None)` means this process is not a launched principal and the caller should re-launch
@@ -61,23 +64,16 @@ pub(super) fn run_as_principal(
     .map_err(|e| Error::Other(e.to_string()))?;
 
     let bootstrap_endpoint = bootstrap.endpoint();
-    let mut child_command = Command::new(executable);
-    child_command.args(command.iter().skip(1));
-
     let has_shared_flag = command.iter().skip(1).any(|arg| {
         arg.to_str()
             .is_some_and(|s| s == "--shared-browser-context")
     });
-
-    child_command
-        .arg("--cdp-endpoint")
-        .arg(&bootstrap_endpoint)
-        .arg("--cdp-header")
-        .arg(format!("Authorization: Bearer {token}"));
-
-    if shared_browser && !has_shared_flag {
-        child_command.arg("--shared-browser-context");
-    }
+    let mut child_command = playwright_command(
+        command,
+        &bootstrap_endpoint,
+        &token,
+        shared_browser && !has_shared_flag,
+    );
 
     // The Playwright process needs browser authority, not Passless principal IPC authority.
     // Close the inherited capability fd before exec and arrange for the MCP child to die if the
@@ -88,11 +84,48 @@ pub(super) fn run_as_principal(
     result
 }
 
+/// The `@playwright/mcp` command: the user's arguments, the bootstrap as `--cdp-endpoint`, and the
+/// bootstrap's bearer through `PLAYWRIGHT_MCP_CDP_HEADERS`, never as an argument: argv is readable
+/// by every local user through `/proc/<pid>/cmdline`, the environment only by the process's owner.
+/// The directory of the executable (npx) goes first in the child's `PATH`, so that a node that
+/// lives next to it (nvm, fnm, a prefix install) is found.
+fn playwright_command(
+    command: &[PathBuf],
+    endpoint: &str,
+    token: &str,
+    add_shared_flag: bool,
+) -> Command {
+    let mut child = Command::new(&command[0]);
+    child.args(command.iter().skip(1));
+    child.arg("--cdp-endpoint").arg(endpoint);
+    child.env(
+        "PLAYWRIGHT_MCP_CDP_HEADERS",
+        format!("Authorization: Bearer {token}"),
+    );
+    if add_shared_flag {
+        child.arg("--shared-browser-context");
+    }
+    super::agent_browser::prepend_path_dir(&mut child, command[0].parent());
+    child
+}
+
 /// Run an MCP server child to completion; its exit status is ours.
 pub(super) fn supervise(
+    child_command: Command,
+    label: &str,
+    executable: &std::path::Path,
+) -> Result<()> {
+    supervise_watching(child_command, label, executable, &mut || true)
+}
+
+/// [`supervise`], also polling `browser_alive` every couple of seconds: when it reports the
+/// browser gone, the child is stopped and an error returned, so that an MCP client restarts the
+/// adapter and gets a fresh endpoint.
+pub(super) fn supervise_watching(
     mut child_command: Command,
     label: &str,
     executable: &std::path::Path,
+    browser_alive: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
     let mut child = child_command.spawn().map_err(|e| {
         Error::Other(format!(
@@ -101,9 +134,26 @@ pub(super) fn supervise(
         ))
     })?;
 
-    let status = child
-        .wait()
-        .map_err(|e| Error::Other(format!("failed waiting for {label}: {e}")))?;
+    let mut last_check = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => return Err(Error::Other(format!("failed waiting for {label}: {e}"))),
+        }
+        if last_check.elapsed() >= WATCH_INTERVAL {
+            last_check = std::time::Instant::now();
+            if !browser_alive() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Other(format!(
+                    "the managed browser is gone (it was closed, or its owning session ended); \
+                     stopped {label}: your MCP client restarts it with a fresh endpoint"
+                )));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
 
     if status.success() {
         Ok(())
@@ -146,6 +196,14 @@ fn profile_uses_shared_browser(profile: &str) -> bool {
         .is_some_and(|p| p.browser_scope == BrowserScope::Profile)
 }
 
+/// The names of the profiles in the agent configuration (`PASSLESS_CONFIG` or the default file);
+/// empty when it cannot be read.
+pub(super) fn configured_profile_names() -> Vec<String> {
+    load_agent_config()
+        .map(|config| config.profiles.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn load_agent_config() -> Option<AgentConfig> {
     let config_path = std::env::var("PASSLESS_CONFIG")
         .ok()
@@ -180,6 +238,85 @@ mod tests {
         // manufacture a principal capability fd in this unit test.
         let command: Vec<PathBuf> = Vec::new();
         assert!(command.is_empty());
+    }
+
+    #[test]
+    fn the_bearer_never_appears_in_the_childs_argv() {
+        let token = "s3cr3t-bearer-token-value";
+        let command = vec![
+            PathBuf::from("/opt/node/bin/npx"),
+            PathBuf::from("--yes"),
+            PathBuf::from("@playwright/mcp"),
+        ];
+        let child = playwright_command(&command, "http://127.0.0.1:4242", token, true);
+        let argv: Vec<String> = child
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.iter()
+                .all(|a| !a.contains(token) && !a.contains("Bearer")),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "--cdp-header"), "{argv:?}");
+        assert_eq!(
+            argv,
+            [
+                "--yes",
+                "@playwright/mcp",
+                "--cdp-endpoint",
+                "http://127.0.0.1:4242",
+                "--shared-browser-context"
+            ]
+        );
+        let env: std::collections::HashMap<_, _> = child
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env["PLAYWRIGHT_MCP_CDP_HEADERS"].as_deref(),
+            Some("Authorization: Bearer s3cr3t-bearer-token-value")
+        );
+        // npx's directory leads the child's PATH.
+        assert!(
+            env["PATH"].as_deref().unwrap().starts_with("/opt/node/bin"),
+            "{env:?}"
+        );
+    }
+
+    #[test]
+    fn a_vanished_browser_stops_the_server_with_an_actionable_error() {
+        let mut sleeper = Command::new("/bin/sleep");
+        sleeper.arg("30");
+        let started = std::time::Instant::now();
+        let err = supervise_watching(
+            sleeper,
+            "test MCP",
+            std::path::Path::new("/bin/sleep"),
+            &mut || false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("browser is gone"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the child was stopped"
+        );
+        // A browser that stays up lets the child finish on its own.
+        let mut quick = Command::new("/bin/true");
+        quick.arg("x");
+        supervise_watching(
+            quick,
+            "test MCP",
+            std::path::Path::new("/bin/true"),
+            &mut || true,
+        )
+        .unwrap();
     }
 
     #[test]

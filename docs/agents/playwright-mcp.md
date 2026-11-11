@@ -1,6 +1,12 @@
 # Playwright MCP
 
-> `passless agent mcp playwright --profile <name> [-- <@playwright/mcp args>]` is the current form (it runs `npx @playwright/mcp` itself; `--package` pins the version, `--npx` names npx), and `passless agent mcp --print-config <claude-code|opencode|cursor|vscode>` prints the client entry. `passless agent mcp chrome-devtools` and `passless agent browser` are the same easy path for chrome-devtools-mcp and for any CDP client. The `agent playwright-mcp` command below is a hidden alias kept for one release; the full rewrite of this guide is P11.
+> `passless agent mcp playwright [--profile <name>] [-- <@playwright/mcp args>]` is the current form; the older `agent playwright-mcp` below is a hidden alias kept for one release, and the full rewrite of this guide is P11.
+>
+> - **Profile.** `--profile` may be left out when one profile is configured, or when the command runs inside a principal session (the profile whose daemon socket accepts it); with several candidates it asks for `--profile`.
+> - **Pinning.** The adapter runs `npx --yes <package> ...`. Pin the version with `--package @playwright/mcp@0.0.85` (or `--package chrome-devtools-mcp@1.12.0`); without it npx takes whatever the registry serves. `--npx <abs path>` names npx; by default it is the first `npx` on your `PATH`, which must be an executable regular file that group and others cannot write. Its directory is put first in the server's `PATH`, so a node installed next to it (nvm, fnm) is found.
+> - **Bearer.** The bootstrap's bearer reaches `@playwright/mcp` through `PLAYWRIGHT_MCP_CDP_HEADERS`, never as an argument (arguments are readable by every local user).
+> - **`agent mcp chrome-devtools`.** It ensures the browser when it starts (puppeteer cannot send the bearer header, so discovery cannot be lazy and authenticated), runs `npx --yes chrome-devtools-mcp --browserUrl <endpoint> --no-usage-statistics`, and exits when the browser's debugging port stops answering (the browser was closed, or its owning session ended). The MCP client restarts the server, which ensures a browser again and passes the new URL.
+> - **Other clients.** `passless agent mcp --print-config <claude-code|opencode|cursor|vscode>` prints the server entry; `passless agent browser` (inside a principal session) prints the CDP endpoint for any CDP client, `--wait` blocks until the browser is intercepting.
 
 Passless can run Playwright MCP against a managed Chromium browser without proxying Chrome DevTools Protocol (CDP) traffic.
 

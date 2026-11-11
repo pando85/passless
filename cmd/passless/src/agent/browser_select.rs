@@ -552,6 +552,19 @@ fn resolve_command(command: &str) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// An explicitly named browser that is neither Chromium nor Chrome for Testing (Edge, Brave, a
+/// wrapper script, ...) is accepted but was never probed.
+fn warn_if_unprobed(info: &BrowserInfo) {
+    if info.kind == BrowserKind::Unknown {
+        log::warn!(
+            "browser {} ({}) is not Chromium or Chrome for Testing: passless has not probed it, and \
+             the interception extension may not load; the launch fails closed if it does not attach",
+            info.path.display(),
+            info.version
+        );
+    }
+}
+
 /// What a managed browser is started with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserLaunch {
@@ -592,8 +605,11 @@ pub fn resolve_launch(
     {
         let executable = resolve_command(executable);
         let info = check_binary(&executable, trust, version_of)?;
+        warn_if_unprobed(&info);
+        // The canonical path that was checked is the one that runs, not a name that could resolve
+        // to something else between the check and the spawn.
         return Ok(BrowserLaunch {
-            executable,
+            executable: info.path.clone(),
             extra_args: args.to_vec(),
             info,
             source: Source::Explicit,
@@ -605,6 +621,7 @@ pub fn resolve_launch(
         trust,
         version_of,
     )?;
+    warn_if_unprobed(&info);
     let mut extra_args = Vec::new();
     if !headed {
         extra_args.push("--headless=new".to_string());
@@ -634,6 +651,9 @@ mod tests {
         let launch = resolve_launch(Some(&command), None, None, false, false, &versions).unwrap();
         assert_eq!(launch.extra_args, ["--window-size=800,600"]);
         assert_eq!(launch.source, Source::Explicit);
+        // The canonical binary that was checked is what runs.
+        assert_eq!(launch.executable, fs::canonicalize(&chromium).unwrap());
+        assert_eq!(launch.executable, launch.info.path);
 
         // No profile command: agents.browser_path, headless by default and headed on request.
         let launch = resolve_launch(None, Some(&chromium), None, false, false, &versions).unwrap();

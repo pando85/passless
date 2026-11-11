@@ -59,6 +59,48 @@ fn principal_client(profile: &str) -> std::result::Result<PrincipalClient, Clien
     PrincipalClient::connect_launched(&base, profile)
 }
 
+/// The profile a command applies to: `--profile`, else the only configured profile, else (inside
+/// a principal session) the one profile whose daemon socket accepts this session. Several
+/// candidates and no way to tell is an error that names them.
+fn resolve_profile(explicit: Option<&str>) -> Result<String> {
+    if let Some(profile) = explicit {
+        return Ok(profile.to_string());
+    }
+    let names = super::playwright_mcp::configured_profile_names();
+    choose_profile(&names, &|name: &str| {
+        principal_client(name).is_ok_and(|mut client| {
+            matches!(
+                client.request(PrincipalRequest::Ping),
+                Ok(PrincipalResponse::Pong)
+            )
+        })
+    })
+}
+
+/// The pure part of [`resolve_profile`]: `accepts(name)` says whether this process is a session
+/// of that profile (only asked when there is more than one).
+fn choose_profile(names: &[String], accepts: &dyn Fn(&str) -> bool) -> Result<String> {
+    match names {
+        [] => Err(Error::Other(
+            "no agent profile is configured (or the configuration cannot be read: see \
+             PASSLESS_CONFIG); pass --profile <name>"
+                .to_string(),
+        )),
+        [only] => Ok(only.clone()),
+        several => {
+            let mine: Vec<&String> = several.iter().filter(|name| accepts(name)).collect();
+            match mine.as_slice() {
+                [one] => Ok((*one).clone()),
+                _ => Err(Error::Other(format!(
+                    "several agent profiles are configured ({}) and this is not a session of \
+                     exactly one of them; pass --profile <name>",
+                    several.join(", ")
+                ))),
+            }
+        }
+    }
+}
+
 /// Whether this process holds a principal session's capability descriptor.
 fn in_principal_session(profile: &str) -> Result<bool> {
     match principal_client(profile) {
@@ -68,19 +110,49 @@ fn in_principal_session(profile: &str) -> Result<bool> {
     }
 }
 
-fn ensure(profile: &str, url: Option<&str>, headed: bool) -> Result<BrowserStatusResponse> {
-    let mut client = principal_client(profile).map_err(|e| Error::Other(e.to_string()))?;
-    match client
-        .request(PrincipalRequest::EnsureBrowser {
-            start_url: url.map(ToOwned::to_owned),
-            headed,
-        })
-        .map_err(|e| Error::Other(e.to_string()))?
-    {
+fn ensure_once(
+    profile: &str,
+    url: Option<&str>,
+    headed: bool,
+) -> std::result::Result<BrowserStatusResponse, ClientError> {
+    let mut client = principal_client(profile)?;
+    match client.request(PrincipalRequest::EnsureBrowser {
+        start_url: url.map(ToOwned::to_owned),
+        headed,
+    })? {
         PrincipalResponse::BrowserEnsured(status) => Ok(status),
-        _ => Err(Error::Other(
-            "the agent returned an unexpected EnsureBrowser response".into(),
-        )),
+        _ => Err(ClientError::Io(std::io::Error::other(
+            "the agent returned an unexpected EnsureBrowser response",
+        ))),
+    }
+}
+
+fn ensure(profile: &str, url: Option<&str>, headed: bool) -> Result<BrowserStatusResponse> {
+    ensure_once(profile, url, headed).map_err(|e| Error::Other(e.to_string()))
+}
+
+/// [`ensure`] that keeps asking while the daemon answers `Conflict`: a degraded lease (its worker
+/// is re-attaching) refuses to hand out its endpoint until the worker is back, for up to the
+/// daemon's grace period, then the browser is replaced.
+fn ensure_waiting(
+    profile: &str,
+    url: Option<&str>,
+    headed: bool,
+    timeout: Duration,
+) -> Result<BrowserStatusResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match ensure_once(profile, url, headed) {
+            Ok(status) => return Ok(status),
+            Err(ClientError::Protocol(e))
+                if e.code == passless_core::agent::protocol::ErrorCode::Conflict
+                    && Instant::now() < deadline =>
+            {
+                log::debug!("EnsureBrowser: {}; retrying", e.message);
+                std::thread::sleep(WAIT_POLL);
+            }
+            Err(e) => return Err(Error::Other(e.to_string())),
+        }
     }
 }
 
@@ -165,8 +237,7 @@ fn render_browser(
 
 /// `passless agent browser`.
 pub fn dispatch_browser(profile: Option<&str>, flags: &BrowserFlags) -> Result<()> {
-    let profile = profile
-        .ok_or_else(|| Error::Other("--profile is required for `agent browser`".to_string()))?;
+    let profile = &resolve_profile(profile)?;
     if !in_principal_session(profile)? {
         // Not relaunched in a session of its own like the MCP adapters: the browser belongs to the
         // principal session and is closed when it ends, so a browser started here would die as
@@ -178,7 +249,11 @@ pub fn dispatch_browser(profile: Option<&str>, flags: &BrowserFlags) -> Result<(
              `passless agent mcp playwright|chrome-devtools`, which keep a session of their own"
         )));
     }
-    let mut status = ensure(profile, flags.url.as_deref(), flags.headed)?;
+    let mut status = if flags.wait {
+        ensure_waiting(profile, flags.url.as_deref(), flags.headed, WAIT_TIMEOUT)?
+    } else {
+        ensure(profile, flags.url.as_deref(), flags.headed)?
+    };
     if flags.wait {
         status = wait_intercepting(profile, status)?;
     }
@@ -196,6 +271,29 @@ fn relaunch(output: OutputFormat, profile: &str, args: Vec<String>) -> Result<()
     super::agent::run_in_principal_session(output, profile, &command, true)
 }
 
+/// `npx` must be an executable regular file that nobody but its owner can write: the adapter runs
+/// it with the principal's browser authority.
+fn check_npx(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::Other(format!("npx '{}' is not usable: {e}", path.display())))?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(Error::Other(format!(
+            "npx '{}' is not an executable regular file",
+            path.display()
+        )));
+    }
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Err(Error::Other(format!(
+            "npx '{}' is writable by group or others (mode {:o}); refusing to run it with browser \
+             authority: fix its permissions or pass another --npx",
+            path.display(),
+            meta.permissions().mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_npx(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         if !path.is_absolute() {
@@ -204,9 +302,10 @@ fn resolve_npx(explicit: Option<&Path>) -> Result<PathBuf> {
                 path.display()
             )));
         }
+        check_npx(path)?;
         return Ok(path.to_path_buf());
     }
-    std::env::var_os("PATH")
+    let found = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .filter(|dir| dir.is_absolute())
@@ -217,7 +316,25 @@ fn resolve_npx(explicit: Option<&Path>) -> Result<PathBuf> {
                 "npx was not found in PATH: install Node.js (it ships npx) or pass --npx <path>"
                     .to_string(),
             )
-        })
+        })?;
+    check_npx(&found)?;
+    Ok(found)
+}
+
+/// Put `dir` first in `command`'s `PATH` (the current `PATH` otherwise unchanged): `npx` starts
+/// `node` by name, and a node installed next to it (nvm, fnm, a prefix) is not on the daemon's
+/// `PATH`, which a principal session inherits.
+pub(super) fn prepend_path_dir(command: &mut Command, dir: Option<&Path>) {
+    let Some(dir) = dir.filter(|dir| dir.is_absolute()) else {
+        return;
+    };
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
 }
 
 /// The npx command line of an adapter: `npx --yes <package> <args...>`. `--yes` because the
@@ -285,9 +402,8 @@ fn print_config(
     target: McpConfigTarget,
     adapter: McpAdapterKind,
 ) -> Result<()> {
-    let profile = profile.ok_or_else(|| {
-        Error::Other("--profile is required to print an MCP server entry".to_string())
-    })?;
+    // The entry names its profile explicitly, so it keeps working when more are added later.
+    let profile = &resolve_profile(profile)?;
     let config = render_client_config(target, profile, adapter);
     println!(
         "{}",
@@ -321,8 +437,7 @@ pub fn dispatch_mcp(
                 .to_string(),
         ));
     };
-    let profile =
-        profile.ok_or_else(|| Error::Other("--profile is required for `agent mcp`".to_string()))?;
+    let profile = &resolve_profile(profile)?;
     let (kind, package, npx, url, extra) = match adapter {
         McpAdapter::Playwright {
             package,
@@ -388,20 +503,61 @@ fn run_chrome_devtools(
     package: Option<&str>,
     extra: &[String],
 ) -> Result<()> {
-    let status = wait_intercepting(profile, ensure(profile, url, false)?)?;
+    let status = wait_intercepting(profile, ensure_waiting(profile, url, false, WAIT_TIMEOUT)?)?;
     let ws = status
         .cdp_endpoint
         .as_deref()
         .ok_or_else(|| Error::Other("the agent returned no CDP endpoint".into()))?;
     let endpoint = http_endpoint(ws)
         .ok_or_else(|| Error::Other("the agent returned a non-loopback CDP endpoint".into()))?;
-    let mut args = vec!["--browserUrl".to_string(), endpoint];
-    args.extend(extra.iter().cloned());
+    let args = chrome_devtools_args(&endpoint, extra);
     let command = npx_command(npx, package.unwrap_or(CHROME_DEVTOOLS_PACKAGE), &args);
     let mut child = Command::new(&command[0]);
     child.args(&command[1..]);
+    prepend_path_dir(&mut child, command[0].parent());
     spawn_without_capability(&mut child);
-    super::playwright_mcp::supervise(child, "chrome-devtools-mcp", &command[0])
+    // The server is bound to this browser's websocket: when the browser is gone (closed, or its
+    // owning session ended) the server would only fail every call, so it exits and the MCP
+    // client restarts it, which ensures a browser again and passes the new URL.
+    let addr = endpoint_addr(&endpoint);
+    let mut misses = 0;
+    super::playwright_mcp::supervise_watching(
+        child,
+        "chrome-devtools-mcp",
+        &command[0],
+        &mut || {
+            let Some(addr) = addr else { return true };
+            misses = if endpoint_alive(&addr) { 0 } else { misses + 1 };
+            misses < 2
+        },
+    )
+}
+
+/// `--browserUrl <endpoint>`, telemetry off (Google collects usage statistics by default; an
+/// MCP server started on a principal's behalf should not report), then the user's arguments,
+/// which can still override it.
+fn chrome_devtools_args(endpoint: &str, extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--browserUrl".to_string(),
+        endpoint.to_string(),
+        "--no-usage-statistics".to_string(),
+    ];
+    args.extend(extra.iter().cloned());
+    args
+}
+
+fn endpoint_addr(endpoint: &str) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let url = url::Url::parse(endpoint).ok()?;
+    (url.host_str()?, url.port()?)
+        .to_socket_addrs()
+        .ok()?
+        .next()
+}
+
+/// Whether something still accepts connections at the browser's debugging port.
+fn endpoint_alive(addr: &std::net::SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok()
 }
 
 /// The MCP server needs browser authority, not the principal capability: close the descriptor
@@ -493,6 +649,103 @@ mod tests {
     }
 
     #[test]
+    fn npx_must_be_an_executable_regular_file_nobody_else_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let npx = dir.path().join("npx");
+        std::fs::write(&npx, "#!/bin/sh\n").unwrap();
+        let mode = |m| std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o755);
+        assert_eq!(resolve_npx(Some(&npx)).unwrap(), npx);
+        for writable in [0o775, 0o757, 0o777] {
+            mode(writable);
+            let err = resolve_npx(Some(&npx)).unwrap_err().to_string();
+            assert!(
+                err.contains("writable by group or others"),
+                "{writable:o}: {err}"
+            );
+        }
+        mode(0o644);
+        let err = resolve_npx(Some(&npx)).unwrap_err().to_string();
+        assert!(err.contains("not an executable regular file"), "{err}");
+        // A directory, and a missing file.
+        assert!(resolve_npx(Some(dir.path())).is_err());
+        assert!(resolve_npx(Some(&dir.path().join("absent"))).is_err());
+        // A symlink to a good file is fine; the file's mode counts.
+        mode(0o755);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&npx, &link).unwrap();
+        assert!(resolve_npx(Some(&link)).is_ok());
+    }
+
+    #[test]
+    fn the_adapters_path_gets_npxs_directory_first() {
+        let mut command = Command::new("/opt/node/bin/npx");
+        prepend_path_dir(&mut command, Path::new("/opt/node/bin/npx").parent());
+        let path = command
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(path.starts_with("/opt/node/bin:"), "{path}");
+        // A relative directory is ignored.
+        let mut command = Command::new("npx");
+        prepend_path_dir(&mut command, Some(Path::new("bin")));
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn chrome_devtools_runs_with_telemetry_off_and_user_arguments_last() {
+        assert_eq!(
+            chrome_devtools_args("http://127.0.0.1:9", &["--slim".into()]),
+            [
+                "--browserUrl",
+                "http://127.0.0.1:9",
+                "--no-usage-statistics",
+                "--slim"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_browser_watch_sees_a_closed_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        assert!(endpoint_alive(&endpoint_addr(&endpoint).unwrap()));
+        drop(listener);
+        // Another test may take the freed port at once; a port nobody listens on exists soon.
+        let dead = (0..20).any(|_| {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            !endpoint_alive(&addr)
+        });
+        assert!(dead, "a closed port is reported as gone");
+        assert_eq!(endpoint_addr("not a url"), None);
+    }
+
+    #[test]
+    fn the_profile_defaults_to_the_only_one_or_the_session_s_own() {
+        let one = vec!["coding".to_string()];
+        assert_eq!(choose_profile(&one, &|_| false).unwrap(), "coding");
+        let two = vec!["coding".to_string(), "review".to_string()];
+        // Several profiles: the session's own is the one that accepts it.
+        assert_eq!(choose_profile(&two, &|n| n == "review").unwrap(), "review");
+        // Ambiguous (a plain shell, or accepted by both): an error naming the candidates.
+        for accepts in [false, true] {
+            let err = choose_profile(&two, &|_| accepts).unwrap_err().to_string();
+            assert!(
+                err.contains("coding, review") && err.contains("--profile"),
+                "{err}"
+            );
+        }
+        let err = choose_profile(&[], &|_| true).unwrap_err().to_string();
+        assert!(err.contains("no agent profile"), "{err}");
+    }
+
+    #[test]
     fn the_npx_command_installs_without_asking_and_keeps_extra_arguments() {
         let command = npx_command(
             Path::new("/usr/bin/npx"),
@@ -513,10 +766,6 @@ mod tests {
             ]
         );
         assert!(resolve_npx(Some(Path::new("npx"))).is_err());
-        assert_eq!(
-            resolve_npx(Some(Path::new("/opt/node/bin/npx"))).unwrap(),
-            PathBuf::from("/opt/node/bin/npx")
-        );
     }
 
     #[test]

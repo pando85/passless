@@ -44,6 +44,11 @@ pub enum ClientError {
         detail: String,
     },
     NoControlFd,
+    /// The agent socket is not there, or nothing listens on it: the daemon is not running (or
+    /// runs without agents).
+    DaemonNotRunning {
+        socket: PathBuf,
+    },
     WrongSocketType {
         detail: String,
     },
@@ -70,6 +75,13 @@ impl fmt::Display for ClientError {
             Self::VersionMismatch(e) => write!(f, "version mismatch: {}", e),
             Self::UnsafePath { detail } => write!(f, "unsafe path: {}", detail),
             Self::NoControlFd => write!(f, "CONTROL_FD (fd 3) not available"),
+            Self::DaemonNotRunning { socket } => write!(
+                f,
+                "the passless daemon is not running, or runs without agents: no agent socket at {} \
+                 (start `passless` with `[agents] enabled = true`, then retry; XDG_RUNTIME_DIR and \
+                 PASSLESS_AGENT_RUNTIME_DIR must be the daemon's)",
+                socket.display()
+            ),
             Self::WrongSocketType { detail } => write!(f, "wrong socket type: {}", detail),
             Self::MissingCapability { detail } => write!(f, "missing capability: {}", detail),
             Self::Timeout => write!(f, "operation timed out"),
@@ -182,8 +194,16 @@ fn validate_socket_parent_no_symlink(path: &Path) -> Result<(), ClientError> {
         detail: "socket path has no parent".to_string(),
     })?;
 
-    let meta = std::fs::symlink_metadata(parent).map_err(|e| ClientError::UnsafePath {
-        detail: format!("cannot stat parent {:?}: {}", parent, e),
+    let meta = std::fs::symlink_metadata(parent).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            ClientError::DaemonNotRunning {
+                socket: path.to_path_buf(),
+            }
+        } else {
+            ClientError::UnsafePath {
+                detail: format!("cannot stat parent {:?}: {}", parent, e),
+            }
+        }
     })?;
 
     if meta.file_type().is_symlink() {
@@ -198,8 +218,16 @@ fn validate_socket_parent_no_symlink(path: &Path) -> Result<(), ClientError> {
 fn validate_socket_path_safe(path: &Path, expected_mode: u32) -> Result<(), ClientError> {
     validate_socket_parent_no_symlink(path)?;
 
-    let meta = std::fs::symlink_metadata(path).map_err(|e| ClientError::UnsafePath {
-        detail: format!("cannot stat socket {:?}: {}", path, e),
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            ClientError::DaemonNotRunning {
+                socket: path.to_path_buf(),
+            }
+        } else {
+            ClientError::UnsafePath {
+                detail: format!("cannot stat socket {:?}: {}", path, e),
+            }
+        }
     })?;
 
     if meta.file_type().is_symlink() {
@@ -255,7 +283,17 @@ fn connect_seqpacket(path: &Path) -> Result<OwnedFd, ClientError> {
         )
     };
     if ret < 0 {
-        return Err(ClientError::Io(io::Error::last_os_error()));
+        let err = io::Error::last_os_error();
+        // A socket file nobody listens on is a daemon that exited.
+        if matches!(
+            err.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        ) {
+            return Err(ClientError::DaemonNotRunning {
+                socket: path.to_path_buf(),
+            });
+        }
+        return Err(ClientError::Io(err));
     }
 
     Ok(owned)
@@ -418,12 +456,9 @@ impl PrincipalClient {
             return Err(ClientError::NoControlFd);
         }
         if (stat.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
-            return Err(ClientError::WrongSocketType {
-                detail: format!(
-                    "CONTROL_FD is mode {:o}, expected SEQPACKET socket",
-                    stat.st_mode & libc::S_IFMT
-                ),
-            });
+            // Something else sits on descriptor 3 (an inherited file or pipe): this is not a
+            // principal session, so the caller wraps itself in one like any plain shell would.
+            return Err(ClientError::NoControlFd);
         }
 
         let sock_type = unsafe {
@@ -1117,6 +1152,27 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(counter.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn a_missing_socket_says_the_daemon_is_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        // The directory is not there at all (the daemon never ran), or is there without a socket.
+        for sock in [
+            dir.path().join("nope/admin.sock"),
+            dir.path().join("admin.sock"),
+        ] {
+            let err = validate_socket_path_safe(&sock, 0o600).unwrap_err();
+            assert!(matches!(err, ClientError::DaemonNotRunning { .. }), "{err}");
+            let text = err.to_string();
+            assert!(text.contains("daemon is not running"), "{text}");
+            assert!(!text.contains("unsafe path"), "{text}");
+        }
+        // A stale socket file nobody listens on.
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let err = connect_seqpacket(&stale).unwrap_err();
+        assert!(matches!(err, ClientError::DaemonNotRunning { .. }), "{err}");
     }
 
     #[test]
