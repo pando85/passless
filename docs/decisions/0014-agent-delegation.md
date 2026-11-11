@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-11-10
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Implemented in P2 to P11; the rows of [Implementation status](#19-implementation-status) that are not done are listed there, and the final verification gate (P12) is pending
+- **Implementation status:** Implemented in P2 to P11; the two accepted residuals (unfocused-tab registration; the evaluated systemd directives) are marked as such in [Implementation status](#19-implementation-status), and the final verification gate (P12) is pending
 - **Amended:** 2026-11-11, with maintainer-resolved decisions and the results of the browser and
   environment spikes (see [History](#20-history))
 
@@ -174,8 +174,10 @@ defines runtime isolation.
 
 Port mode is a reduced-security mode. A loopback TCP listener has no Unix-user ACL; the
 randomized DevTools path and the 0600 `cdp-endpoint` file are discovery hygiene, not a boundary.
-With `max_concurrent_sessions > 1`, `browser_cdp_port` must be 0. `browser-control` is unavailable
-in port mode.
+With `browser_scope = "session"` and `max_concurrent_sessions > 1`, `browser_cdp_port` must be 0:
+each session gets its own browser and two of them cannot bind one fixed port. With
+`browser_scope = "profile"` there is a single shared browser per profile, so a fixed port is
+allowed whatever `max_concurrent_sessions` is. `browser-control` is unavailable in port mode.
 
 Playwright MCP uses a Passless HTTP bootstrap on an ephemeral loopback port: `GET /json/version`
 authenticates an ephemeral bearer, runs the principal-scoped `EnsureBrowser` after full principal
@@ -356,7 +358,8 @@ through exactly one rule, and a wildcard match is audited as `rule = "*"`.
 - Same-user registration (`register = "allow"` or `"request"`) requires an exact RP and the
   profile listed in `acknowledge_same_user_registration`.
 - The legacy evidence tables `{authorization, user_presence, user_verification}` and presets
-  parse for one minor release with a deprecation warning: `deny` → `deny`; `autonomous` and
+  parse with a deprecation warning until the release after next (plan R8, then removed):
+  `deny` → `deny`; `autonomous` and
   `allow+agent+agent` (or the `policy` alias) → `allow`; `supervised` and `confirm+*` →
   `request`. Any other combination, including `allow` with human or `none` evidence, fails
   startup with a migration message.
@@ -457,8 +460,9 @@ For an `allow` decision the daemon sets UP=1 and UV=1 only after validating that
 This is authenticator-local verification of the agent as the authenticator user. The RP cannot
 tell agent UV from human UV; the audit always labels the evidence `agent`. Rules carry no evidence
 fields, and an RP's `userVerification` request never sets UV by itself. Credential `credProtect`
-is evaluated against this evidence; agent UV satisfies level 3 only because the operator chose
-`allow`.
+is evaluated against this evidence (level 2 needs UV unless the request names the credential in
+`allowCredentials`; level 3 always needs UV); agent UV satisfies them only because the operator
+chose `allow`.
 
 ## 8. Escalation and granted rules
 
@@ -684,8 +688,11 @@ profile backend. It is denied unless the exact rule says `allow` (or an escalati
   `webauthn.create`, from the validated request (§11), with attestation format `none`;
 - writes the credential before returning.
 
-Unsupported requirements (resident-key, attestation, extensions) return `NotSupportedError` before
-storage mutation instead of being dropped.
+Unsupported requirements (enterprise attestation, extensions, a `platform` authenticator
+attachment, no common algorithm) return `NotSupportedError` before storage mutation instead of
+being dropped. `authenticatorSelection.residentKey` and `requireResidentKey` are type-checked and
+then accepted at every value, because every agent credential is discoverable and so satisfies all
+of them.
 
 **Authority.** Same-user `register = "allow"` requires only an exact RP rule plus the profile
 listed in `acknowledge_same_user_registration`. Passless has no operator-minted, one-shot
@@ -841,8 +848,11 @@ Exceptions and recovery:
 Also recorded: session (grant) request and approval with profile, principal, RP scope and TTL;
 escalations as `requested`, `approved`, `denied`, `expired` and `revoked`; and browser-lease
 creation, expiry, revocation, exit and cleanup. An escalation that ends by timeout or by abort is
-recorded as `expired` with `reason = timeout` or `reason = aborted`; `revoked` is used only for
-operator revocation.
+recorded as `expired` with `reason = timeout` or `reason = aborted`. An escalation whose notification
+server went away while the prompt was shown is `expired` with `reason = server_lost` (no cooldown,
+but it counts toward the V-M2 withdrawal limit). `revoked` is used only when policy changes under a
+pending escalation, with `reason = policy_reload` (a configuration reload, or revoking or clearing
+granted rules); it is never written for a timeout or an abort.
 
 ## 13. Deployment axes and hardening scope
 
@@ -1005,7 +1015,7 @@ reservation (§12).
   containment of the managed browser needs `bwrap` with unprivileged user namespaces or a UID that
   cannot open hidraw nodes; only Chromium and Chrome for Testing are supported browsers.
 - **Migration:** `supervised` and `confirm` rules become `request`; existing configs keep working
-  with warnings for one minor release (§6.4).
+  with warnings until the release after next (plan R8; §6.4).
 
 ## 17. Alternatives considered
 
@@ -1074,7 +1084,7 @@ References are `file:line` at commit `130eaa5`.
 | Budget claim order | **Done (P5).** Origin and RP validation, session grant and principal binding, resolve, unsupported options, then replay key, then budget; rejected requests never claim budget. `request` (P7) runs the escalation pre-checks, takes the replay key without budget, and claims the budget only after approval (`AgentSession::claim_key`, `ClaimGuard::claim_budget`) | — |
 | Replay | **Done (P5).** `SHA-256(action ‖ rp_id ‖ origin ‖ top_origin ‖ challenge)` with length-prefixed fields and a presence tag for `top_origin` (`session.rs`); per bearer session; a duplicate joins the in-flight request until its own deadline (an aborted duplicate detaches alone) or gets the original outcome for 120 s; a reused challenge under another key is rejected; failures consume the key | — |
 | Registration bearers | **Done (P3).** Bound to the browser lease and revoked by `revoke_by_lease`; a late use is refused with `401 invalid_bearer` and audited as `policy.deny(reason=bearer_revoked)` (the first 16 per window in full, the rest as a `suppressed` count, §12) | — |
-| Operator-minted enrollment grants (#411) | **Done (P3).** `RegistrationGrantRegistry`, the `RequestRegistration` admin request, its CLI and handler are removed; registration authority is the exact-RP `register = "allow"` rule (`register = "request"` denies with audit until P7); a wildcard rule never permits registration | — |
+| Operator-minted enrollment grants (#411) | **Done (P3).** `RegistrationGrantRegistry`, the `RequestRegistration` admin request, its CLI and handler are removed; registration authority is the exact-RP `register = "allow"` rule, or one human-approved registration through `register = "request"` (§8.3, P7); a wildcard rule never permits registration | — |
 | Isolated UHID route | **Done (P3).** `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, `interaction.rs`, the endpoint wiring in `runtime.rs`, the agent UHID doctor check and the agent udev rule are removed; a legacy `[device]` key is warned about and ignored (R6). `agent/storage.rs` (ceremony-scoped storage views) is removed too. The `passless-uhid` crate and `tools/agent-uhid-feasibility` were removed in P11: the controlled RP, the lab udev policy and the permission probes moved to `tools/agent-validation`. The principal intent protocol was removed in P7. A cleanup after P11 removed the leftovers: `passless agent endpoint-status` and the `endpoint_id` plumbing (grants, leases, the browser manifest, the profile report), the principal delegation protocol (`passless agent delegation`, the `RequestDelegation`, `ShowDelegation`, `WaitDelegation`, `CancelDelegation` and `SignAssertion` principal requests, the pending-request registry in `policy_engine.rs`), `ErrorCode::InteractionRequired` and the legacy `Capabilities` principal request with its `registration_allowed` field (`passless agent capabilities` prints the `Authority` response, which carries each RP's `authenticate` and `register` rule). The `endpoint.*` and `intent.*` audit record kinds stay readable for old logs | — |
 | Principal digest at signing | **Done (P5).** The session records the principal digest; sign and registration deny `principal_mismatch` when it differs from the session grant's | — |
 | Policy digest | **Done (P4, P7).** Version 5 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits, the browser fields, `max_granted_rules` and the escalation timeout and cooldown; a profile whose rules are all `deny` loads (B4). Granted rules have a separate `grants_digest` (§8.4) | — |
@@ -1088,7 +1098,7 @@ References are `file:line` at commit `130eaa5`.
 | Extension cache | **Done (P6).** In-flight requests tracked by the browser-supplied request ID (§11) | — |
 | Unsupported options | **Done (P5).** Unsupported extensions, enterprise attestation and no supported algorithm return `NotSupportedError` before budget or storage; `excludeCredentials` matches return `InvalidStateError`; origin failures `SecurityError`; daemon errors carry the DOMException name and `busy` (R11 caps) maps to `NotAllowedError` | — |
 | Transport | **Done (P6).** `connectNative` port, framed relay, one multiplexed connection per worker with keepalive both ways; per-browser-UID sockets and a `SO_PEERCRED` check at `hello` (§4.4) | — |
-| Unfocused-tab registration | **Not done: documented limitation (P6, P11).** Orphan credential; the audit records it and `agent-admin credential delete` removes it. The adapters are stdio launchers that start Playwright MCP or chrome-devtools-mcp and never drive a page, so they cannot raise a tab. The mitigation is guidance: `docs/agents/browser-tools.md` and the `passless-agent` skill tell the agent to bring the page to the front before `create()` | Adapters bring the page to the front (§11): open, needs a CDP client in the adapter or a tool-level option |
+| Unfocused-tab registration | **Accepted residual: a documented limitation (P6, P11), not open work for this ADR.** Orphan credential; the audit records it and `agent-admin credential delete` removes it. The adapters are stdio launchers that start Playwright MCP or chrome-devtools-mcp and never drive a page, so they cannot raise a tab. The mitigation is guidance: `docs/agents/browser-tools.md` and the `passless-agent` skill tell the agent to bring the page to the front before `create()` | Adapters bring the page to the front (§11): open, needs a CDP client in the adapter or a tool-level option |
 | Escalation, granted-rules store, grants CLI | **Done (P7).** `agent/granted_rules.rs` (fail-closed load, atomic write, epochs), installed as the policy runtime's grant source; `agent-admin grants list/revoke/clear`. `agent/escalation.rs` coordinates escalations (join, per-profile prompt and FIFO of 8, cooldown, V-M2 rate limit, waiter caps); `sign.rs`/`register.rs` pre-check, take the replay key, park with no lock held, then re-resolve to a granted `allow` and claim the budget; a reload that changes the policy cancels pending escalations (§8.1) | — |
 | Registration escalation | **Done (P7).** Not joinable (`escalation_busy`); the one-use `RegistrationApproval` is bound to the creating ceremony and required by its pre-key-use re-check; after the credential write `authenticate = allow` is persisted with `kind = registration` and the credential reference, which joins the configured pinned set; a failed grant write keeps the credential and is audited (§8.3) | — |
 | Abort handling and in-flight tracking | **Done (P6)** for the worker: pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11). **Done (P7):** withdrawn or aborted escalations are rate-limited, 3 per key per 10 minutes, then cooldown; an abort within 2 s of the deadline counts as a timeout (§8.1) | — |
@@ -1110,12 +1120,12 @@ References are `file:line` at commit `130eaa5`.
 | User guides | **Done (P11).** `docs/agents/` is rewritten around the easy path (`quick-start.md`, `browser-tools.md`, `rules.md`, `containment.md`, `migration.md`), `docs/AGENT_REGISTRATION*.md`, `docs/PERMISSIONS.md` and `docs/security/FURTHER_ANALYSIS.md` (a status per item) match the code, and the bundled `passless-agent` skill is rewritten around `agent mcp playwright`. The legacy rule vocabulary appears only in `docs/agents/migration.md` | — |
 | Backend separation | **Done (before ADR 0014).** `CredentialBackendHandle`, `CredentialNamespace` (`backend.rs:18-73`) | — |
 | Audit before key use | **Done (before ADR 0014).** Fsynced, hash-chained append (`audit.rs:163-164`, `audit.rs:1258`); allow record gates signing (`sign.rs:1516`) | — |
-| `credProtect` | **Done (before ADR 0014).** Levels 2 and 3 enforced (`sign.rs:1468`, `sign.rs:1531`) | — |
+| `credProtect` | **Done (P5; levels corrected in the verification gate).** `cred_protect::satisfied` (`cmd/passless/src/agent/cred_protect.rs`) is evaluated in the sign path after the credential is read and before key use: level 3 needs UV, level 2 needs UV unless `allowCredentials` names the credential, level 1 and no level need none, an unknown level is treated as 3. Agent evidence is UV = true under `allow`, so every level is satisfied on the agent path and only the operator's choice of `allow` satisfies level 3 (§7); the check keeps that true if evidence ever carried no UV (invariant 15). Before the gate only level 3 was checked. Unit tests cover levels 1 to 3 with and without `allowCredentials`. Agent registration creates credentials without a `credProtect` level (the extension is not offered, §10.3), so the check protects credentials created elsewhere that a same-user profile can read | — |
 | Agents off by default | **Done (before ADR 0014).** `AgentConfig.enabled` defaults to false (`config.rs:989`) | — |
 | D-Bus sender validation | **Done (before ADR 0014; P7).** zbus match on server unique name, others rejected; since P7 in the prompt child (`escalation_prompt.rs`) | — |
 | Session (grant) audit events | **Done (before ADR 0014).** Request and approve recorded (`grant.rs:571`, `grant.rs:639`) | — |
 | Shared-UID spawn hygiene | **Done.** Inherited descriptors marked close-on-exec and `PR_SET_PDEATHSIG` armed after any credential drop, with a parent re-check (`HardenedChildSetup::apply`, `launcher.rs`); browsers forked on the long-lived launcher thread (`spawn_on_launcher_thread`), so a `browser_scope = "session"` browser no longer dies with the IPC thread that launched it (defect B1, P10a; E2E-46/session-scope) | — |
-| Distinct-UID systemd baseline | **Done** for the baseline directives (`contrib/systemd/passless-agent.service:64-71`). **Not done:** the evaluated directives (`PrivateDevices`, namespaces, seccomp, `SystemCallFilter`, `CapabilityBoundingSet`) | Evaluated directives including `PrivateDevices`, namespaces, seccomp (§13): open backlog in `docs/security/FURTHER_ANALYSIS.md` (C-2, H-2, H-3); a hardening backlog for the root multi-principal unit, not a blocker for the agent path |
+| Distinct-UID systemd baseline | **Done** for the baseline directives (the "additive controls" block of `contrib/systemd/passless-agent.service`, asserted by `cmd/passless/tests/systemd_unit_baseline.rs`). **Accepted residual, not open work for this ADR:** the evaluated directives (`PrivateDevices`, namespaces, seccomp, `SystemCallFilter`, `CapabilityBoundingSet`) | Evaluated directives including `PrivateDevices`, namespaces, seccomp (§13): open backlog in `docs/security/FURTHER_ANALYSIS.md` (C-2, H-2, H-3); a hardening backlog for the root multi-principal unit, not a blocker for the agent path |
 
 ## 20. History
 

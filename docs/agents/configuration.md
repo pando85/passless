@@ -64,7 +64,7 @@ credential_selection = "single"
 | `browser_user` | Unix user for the browser (needs a root daemon). Not allowed for `isolated`. |
 | `browser_runtime_root` | Runtime root for the browser; mode 0700, owned by the browser user. |
 | `browser_cdp_expose` | `pipe` (default) or `port`. The [easy path](browser-tools.md) needs `port`. |
-| `browser_cdp_port` | Loopback port for port mode; `0` (default) lets Chromium choose. Must be 0 when `max_concurrent_sessions` is above 1. |
+| `browser_cdp_port` | Loopback port for port mode; `0` (default) lets Chromium choose. Must be 0 when `browser_scope` is `session` and `max_concurrent_sessions` is above 1 (a shared `profile` browser may use a fixed port). |
 | `start_url` | Optional `http` or `https` URL opened at start. |
 
 `max_grant_ttl` is a compatibility bound on session grants. The daemon rejects Chromium

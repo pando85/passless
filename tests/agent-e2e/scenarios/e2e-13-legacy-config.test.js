@@ -4,7 +4,7 @@ const { authenticate, policyEvents, assertVerifiedAssertion, assertInterceptionA
 const { DaemonStartError } = require('../lib/daemon');
 
 // Catalogue: a legacy config warns and maps; `allow` with human (or none) evidence fails startup (ADR 0014 6.4,
-// plan R8). The legacy vocabulary is accepted for one minor release:
+// plan R8). The legacy vocabulary is accepted until the release after next:
 //   `autonomous` -> allow, `supervised` and `confirm` evidence tables -> request, allow+agent+agent -> allow.
 // The daemon logs one deprecation warning per mapped rule field at load, and `passless agent-admin profile check`
 // (the doctor report) shows them as `config_deprecation` checks.

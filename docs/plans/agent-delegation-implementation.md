@@ -47,7 +47,7 @@ Defaults are applied until answered.
 | M1 | Commit each verified phase locally on the branch? | Yes: local Conventional Commits, no push, no PR |
 | M2 | Run E2E tests against a public RP (webauthn.io) with throwaway users? | No: local RP only |
 | M3 | Switch the maintainer's opencode/Claude Code Playwright MCP config and delete the stale `~/.local/bin/playwright-mcp-passless`? | No: document only |
-| M4 | Version bump or release? | None. Legacy config is accepted with a warning for one minor release. |
+| M4 | Version bump or release? | None. Legacy config is accepted with a warning until the release after next (R8). |
 
 ### Orchestrator resolutions
 
@@ -682,7 +682,7 @@ local-full only.
 | E2E-17 C | Abort via `AbortSignal` mid-request | Daemon receives abort; no signature; audit aborted |
 | E2E-18 | Service worker stopped (CDP `ServiceWorker.stopWorker`) between requests | Next request reconnects and succeeds |
 | E2E-19 | Worker killed during a pending request | Page gets `NotAllowedError`; daemon cancels; no orphaned escalation |
-| E2E-20 C | Long wait: escalation approved after 6 min | Ceremony completes (proves past the 5-min MV3 limit) |
+| E2E-20 | Long wait: escalation approved after 6 min (local-full only: it takes 6 min per variant, so it is not in the CI subset) | Ceremony completes (proves past the 5-min MV3 limit) |
 | E2E-21 | Page `timeout` 3 min with no approval | Fails at about 3 min; notification withdrawn |
 | E2E-22 | 20 concurrent ceremonies across tabs | No silent drops; caps return explicit `busy` |
 | E2E-23 C | `request` approved | Ceremony continues; grant persisted; next ceremony needs no prompt |
@@ -704,10 +704,10 @@ local-full only.
 | E2E-39 | agent-browser `--cdp` | Success (local, optional) |
 | E2E-40 | Headed (Xvfb) and `--headless=new` × Chromium, PW Chromium, Chrome for Testing | Core flows E2E-01, 23, 34 pass on every combination |
 | E2E-41 C | `agents.browser_path` set to Google Chrome or headless-shell | Launch refused with an actionable error |
-| E2E-42 | Real `dunst` with `dunstctl action` approval | Approval works with a real notification server |
+| E2E-42 | Real `dunst` with `dunstctl action` approval | Approval works with a real notification server (local, optional: SKIP-OPT when `dunst` is not installed) |
 | E2E-43 | Human authenticator concurrently in use (same-user) during a pending escalation | Human CTAP operation is not blocked |
 | E2E-44 | `PASSLESS_INTERACTION_MODE=automatic` with a `request` rule | Escalation still prompts or denies; never auto-approved. Agents refuse to start without `allow_automatic_human_path` (R19). |
-| E2E-45 C | Request while the extension worker is stopped or before attach; conditional-mediation request; request from a CDP-created context; extension unloaded (for example `chrome.runtime.reload()` leaves it unloaded) | Never reaches the human device: the human authenticator records no CTAP request, and the page gets `NotAllowedError` or no-op |
+| E2E-45 C | Request while the extension worker is stopped or before attach; conditional-mediation request; request from a CDP-created context | Never reaches the human device: the human authenticator records no CTAP request, and the page gets `NotAllowedError` or no-op |
 | E2E-46 C | Managed browser process | Cannot open any `/dev/hidraw*` (probe inside the browser sandbox namespace), or `doctor` warns on hosts without userns |
 | E2E-47 C | Extension directory missing or unloadable | Launch fails with an actionable error; no browser without interception |
 | E2E-48 C | Escalation waiters beyond the per-session or per-profile cap; `allow` ceremonies of another profile run concurrently | Caps enforced; other profiles unaffected; no pool exhaustion |
@@ -715,6 +715,20 @@ local-full only.
 | E2E-50 C | Repeated abort at the last second | Rate limit then cooldown (V-M2) |
 | E2E-51 | `create()` from an unfocused tab (an older tab in front of the new one) | The page gets `NotAllowedError`; the audit shows the registration; the documented cleanup (the operator deletes the orphan credential) removes it |
 | E2E-52 C | Pipe mode: `browser-control` tries to reach the extension worker (target list, auto-attach, extension and `chrome:` URLs, `Extensions`, `exposeDevToolsProtocol`, stopping workers) | The worker is never listed or handed out, every attempt is refused and audited as denied, and a `get()` driven through `browser-control` is still intercepted (review M3). XFAIL until a principal can launch a pipe-mode browser (`EnsureBrowser` is port-only) |
+
+**E2E-45, extension unloaded after attach: not testable end to end, by decision.** The original
+catalogue line asked for a request after the extension is unloaded (for example by
+`chrome.runtime.reload()`). No product path unloads the extension (the worker never calls
+`chrome.runtime.reload()`, D1), the harness has no supported way to unload it from outside (the
+harness's CDP access to the extension's targets is being closed off), and a debug-only hook in the
+daemon that unloads it would be product code that no release build runs and no review gate
+exercises. The case is covered at the layers that decide its outcome instead: a worker that goes
+away drops its sign-transport connection, the lease's interception degrades, and the CDP endpoint
+is withheld after the grace period (`test_interception_degrades_after_the_grace_period_and_is_reported_once`,
+`bootstrap_refuses_a_degraded_lease_until_it_re_attaches`, ADR 0014 section 7); a launch without the
+extension never happens (E2E-47, `E2E-47/unloadable`); and whatever the browser then does natively
+cannot reach the human device (E2E-46, D6 layer 3). Traceability: item E-12 and invariant 25 in
+the [traceability audit](agent-delegation-traceability.md).
 
 ## Traceability matrix
 
@@ -815,7 +829,8 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 
 ## Final gate
 
-- Every row of the traceability matrix is Verified with links to test names.
+- Every row of the traceability matrix is Verified with links to test names. The audit artifact is
+  [agent-delegation-traceability.md](agent-delegation-traceability.md).
 - Full local E2E matrix (`make test-agent-e2e-full`): all scenarios pass. The only allowed skips
   are optional tools that are not installed, and each one must be reported.
 - CI-equivalent run: fmt, clippy, `cargo test --all-features` on x86_64, `make
@@ -824,7 +839,11 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
   code and test evidence. No open critical or high findings.
 - Human-path regression: `make test-e2e`, with agents compiled and disabled, plus a manual check
   that the restored `passless.service` works. The maintainer restarts it.
-- The ADR §19 table is updated to all Done, and its status line reflects that.
+- The ADR §19 table is updated to all Done, and its status line reflects that. Two rows are
+  accepted residuals, not open work, and stay marked as such: *Unfocused-tab registration* (a
+  documented limitation, ADR §11) and the *evaluated* directives of *Distinct-UID systemd baseline*
+  (an open hardening backlog, ADR §13). "All Done" means every other row; these two are the
+  documented limitations the final status line names.
 
 ## Progress log
 

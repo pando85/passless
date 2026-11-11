@@ -2909,7 +2909,7 @@ impl AgentRuntime {
                 self.granted_rules.profile(profile_id).as_deref(),
             ));
         }
-        // Deprecated config vocabulary is accepted with a warning for one minor release (plan R8):
+        // Deprecated config vocabulary is accepted with a warning until the release after next (plan R8):
         // a warning never makes the profile unhealthy, so the check passes and carries the text.
         for warning in profile.profile_config.deprecation_warnings(profile_id) {
             report.checks.push(passless_core::agent::DoctorCheck {

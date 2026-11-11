@@ -335,7 +335,7 @@ struct LegacyCeremonyFields {
 }
 
 /// A rule action as written in a config file: the new words, or the legacy aliases and evidence
-/// tables that are still accepted for one minor release.
+/// tables that are still accepted until the release after next (plan R8).
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RuleActionRepr {
