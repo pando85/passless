@@ -1,8 +1,10 @@
 //! `passless doctor --agents`: host checks for the agent browser path (ADR 0014 section 4.2 and
 //! plan D4).
 //!
-//! It inspects the host and the configuration; it starts no browser, needs no running daemon and
-//! changes nothing outside a scratch directory it removes again. Per profile: the browser binary
+//! It inspects the host and the configuration; it starts no browser, needs no running daemon for
+//! the host checks and changes nothing outside a scratch directory it removes again. When agents
+//! are configured enabled it also pings the daemon's admin socket (`agent_subsystem`) and fails
+//! if the daemon is not serving them. Per profile: the browser binary
 //! (supported and trusted for the profile's deployment) and the containment case of the browser's
 //! user. Once: the interception extension and native messaging host manifest render and verify,
 //! the notification bus answers, the state directory is private and the automatic-interaction
@@ -13,11 +15,12 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use passless_core::agent::protocol::DoctorCheck;
+use passless_core::agent::protocol::{AdminRequest, AdminResponse, DoctorCheck, ProtocolError};
 use passless_core::agent::{AgentConfig, AgentProfileConfig};
 
 use super::browser::{self, ExtensionSelfCheck};
 use super::browser_select::{self, BrowserLaunch};
+use super::client::{AdminClient, ClientError, resolve_runtime_base};
 use super::containment::{self, ContainmentCase, ContainmentPolicy, ContainmentReport};
 use super::launcher::HardenedChildSetup;
 use super::prompt;
@@ -412,6 +415,78 @@ fn probe_notification_server(address: &str) -> Result<String, String> {
         .unwrap_or_else(|_| Err("the bus did not answer within 8 s".to_string()))
 }
 
+/// Ask the daemon's admin socket below `base` for a `Ping`, bounded in time: a daemon that
+/// accepts and never answers must not hang the doctor.
+pub fn probe_agent_subsystem(base: &Path) -> Result<(), ClientError> {
+    let base = base.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = AdminClient::connect(&base).and_then(|mut client| {
+            match client.request(AdminRequest::Ping)? {
+                AdminResponse::Pong => Ok(()),
+                _ => Err(ClientError::Protocol(ProtocolError::malformed(
+                    "unexpected reply to ping",
+                ))),
+            }
+        });
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(AGENT_PROBE_TIMEOUT)
+        .unwrap_or(Err(ClientError::Timeout))
+}
+
+/// How long [`probe_agent_subsystem`] waits for the daemon.
+const AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The daemon side of an enabled agent configuration: its admin socket is there and answers. A
+/// daemon that runs without agents (the subsystem failed to start, `agents.enabled` was edited
+/// after the start) or does not run at all has no such socket, and every `agent-admin` and
+/// `agent` command fails with "no agent socket"; the host checks above can all pass meanwhile.
+/// A socket that exists but cannot be opened by this user (a root daemon) is not a failure of the
+/// daemon, so that case is only a warning.
+pub fn agent_subsystem_check(probe: Result<(), ClientError>) -> DoctorCheck {
+    let name = "agent_subsystem";
+    match probe {
+        Ok(()) => check(
+            name,
+            true,
+            "the daemon's agent subsystem answers on its admin socket",
+        ),
+        Err(ClientError::DaemonNotRunning { socket }) => check(
+            name,
+            false,
+            format!(
+                "agents are enabled, but nothing answers on the admin socket {}: the daemon is \
+                 not running, or it runs without agents. Restart it (`systemctl --user restart \
+                 passless`) and read its log for \"Agent subsystem failed to start\"; it cannot \
+                 serve any agent request until then",
+                socket.display()
+            ),
+        ),
+        Err(ClientError::Timeout) => check(
+            name,
+            false,
+            format!(
+                "the daemon's admin socket accepted a connection but did not answer within {} s",
+                AGENT_PROBE_TIMEOUT.as_secs()
+            ),
+        ),
+        Err(ClientError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => check(
+            name,
+            true,
+            format!(
+                "warning: this user cannot open the daemon's admin socket ({e}); run the doctor \
+                 as the daemon's user to check that the agent subsystem answers"
+            ),
+        ),
+        Err(other) => check(
+            name,
+            false,
+            format!("the daemon's agent subsystem does not answer: {other}"),
+        ),
+    }
+}
+
 /// A fresh private directory under the temporary directory, removed on drop.
 struct ScratchDir(PathBuf);
 
@@ -477,6 +552,15 @@ pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
             false,
             "no agent profiles are configured ([agents.profiles.<name>])",
         ));
+    }
+
+    // Agents enabled and profiles configured: the daemon must be serving them. The host checks
+    // below need no daemon, but a daemon without its agent subsystem is not a healthy setup.
+    if config.enabled && !config.profiles.is_empty() {
+        checks.push(match resolve_runtime_base() {
+            Ok(base) => agent_subsystem_check(probe_agent_subsystem(&base)),
+            Err(e) => check("agent_subsystem", false, e.to_string()),
+        });
     }
 
     // Extension and host manifest, rendered into a scratch directory that is removed again.
@@ -666,6 +750,105 @@ mod tests {
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(!state_dir_check(Some(&link), euid).passed);
         assert!(!state_dir_check(None, euid).passed);
+    }
+
+    #[test]
+    fn the_agent_subsystem_check_fails_when_the_admin_socket_is_absent_or_silent() {
+        let ok = agent_subsystem_check(Ok(()));
+        assert!(ok.passed, "{ok:?}");
+        assert_eq!(ok.name, "agent_subsystem");
+
+        let absent = agent_subsystem_check(Err(ClientError::DaemonNotRunning {
+            socket: PathBuf::from("/run/user/1000/agent/admin/admin.sock"),
+        }));
+        assert!(!absent.passed, "{absent:?}");
+        assert!(
+            absent.message.contains("Agent subsystem failed to start"),
+            "{absent:?}"
+        );
+        assert!(absent.message.contains("admin.sock"), "{absent:?}");
+
+        let silent = agent_subsystem_check(Err(ClientError::Timeout));
+        assert!(!silent.passed, "{silent:?}");
+        assert!(silent.message.contains("did not answer"), "{silent:?}");
+
+        let other = agent_subsystem_check(Err(ClientError::UnsafePath {
+            detail: "mode is 755".into(),
+        }));
+        assert!(!other.passed, "{other:?}");
+
+        // A root daemon's socket this user cannot open is not the daemon's failure.
+        let denied = agent_subsystem_check(Err(ClientError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ))));
+        assert!(
+            denied.passed && denied.message.starts_with("warning:"),
+            "{denied:?}"
+        );
+    }
+
+    struct PongHandler;
+
+    impl crate::agent::ipc::AdminHandler for PongHandler {
+        fn handle_admin(
+            &self,
+            _request: &AdminRequest,
+            _cred: &passless_core::agent::PeerCred,
+            _ctx: &crate::agent::ipc::AdminRequestContext,
+        ) -> Result<AdminResponse, ProtocolError> {
+            Ok(AdminResponse::Pong)
+        }
+    }
+
+    /// The probe against a daemon-less directory (the defect: doctor said healthy) and against a
+    /// real admin socket of a live server.
+    #[test]
+    fn the_probe_tells_a_missing_daemon_from_a_serving_one() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use crate::agent::ipc::{IpcServer, RuntimeDir};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("agent");
+        let missing = agent_subsystem_check(probe_agent_subsystem(&base));
+        assert!(!missing.passed, "{missing:?}");
+
+        // SAFETY: no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let runtime_dir = RuntimeDir::create(&base, uid, gid, &BTreeMap::new()).unwrap();
+        let server = Arc::new(
+            IpcServer::bind(
+                runtime_dir,
+                BTreeMap::new(),
+                Arc::new(AtomicBool::new(false)),
+                PathBuf::from("/proc"),
+            )
+            .unwrap(),
+        );
+        let serving = Arc::clone(&server);
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match serving.accept_admin_connection() {
+                    Ok(Some(fd)) => {
+                        let _ = serving.handle_one_admin(fd, &PongHandler);
+                        return;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => return,
+                }
+            }
+        });
+        let alive = agent_subsystem_check(probe_agent_subsystem(&base));
+        assert!(alive.passed, "{alive:?}");
+        handle.join().unwrap();
+
+        // A listener that accepts into the backlog and never answers: reported, not hung.
+        let silent = agent_subsystem_check(probe_agent_subsystem(&base));
+        assert!(!silent.passed, "{silent:?}");
+        assert!(silent.message.contains("did not answer"), "{silent:?}");
     }
 
     #[test]

@@ -17,6 +17,7 @@ use passless_core::agent::protocol::{
 
 use super::deployment::{PrincipalUidError, validate_principal_uid};
 use super::launcher::{PeerIdentity, capture_peer_identity_double_read};
+use super::safe_fs::Dir;
 
 const ADMIN_DIR_NAME: &str = "admin";
 const ADMIN_SOCKET_NAME: &str = "admin.sock";
@@ -278,6 +279,196 @@ impl RuntimeDir {
         let _ = std::fs::remove_dir(&self.admin_dir);
         let _ = std::fs::remove_dir(&self.principal_root);
         let _ = std::fs::remove_dir(&self.base);
+    }
+
+    /// [`RuntimeDir::cleanup`], and then everything else below the base: the directory is the
+    /// daemon's own (`<runtime dir>/agent`, mode 0700), and what other parts of it put there (the
+    /// sign transport's directory) made the `remove_dir` of the base fail and left it behind to
+    /// block the next start. Removal goes through a pinned handle that follows no symlink and
+    /// only touches a directory the daemon still owns.
+    pub fn remove_all(&self) {
+        self.cleanup();
+        if let Err(e) = remove_owned_tree(&self.base, self.daemon_uid) {
+            log::warn!("could not remove {}: {e}", self.base.display());
+        }
+    }
+
+    /// Reclaim the runtime directory `base` an earlier daemon left behind (a kill, a crash, a
+    /// shutdown that did not clean up), before [`RuntimeDir::create`] needs the path.
+    ///
+    /// Returns `Ok(false)` when there is nothing there. The directory is removed only when it is
+    /// plainly ours and nobody serves it: a real directory (a symlink or a file is refused, never
+    /// followed or removed), owned by `owner` with mode 0700, none of whose sockets answers a
+    /// connection. The daemon holds the daemon-wide lock when it gets here, so a second daemon of
+    /// the same user cannot be alive; the sockets are the second line, for a daemon that does not
+    /// share the lock. Anything else is an error that says what is in the way.
+    pub fn reclaim_stale(base: &Path, owner: u32) -> Result<bool, IpcError> {
+        let (Some(parent), Some(name)) = (base.parent(), base.file_name().and_then(|n| n.to_str()))
+        else {
+            return Err(IpcError::UnsafePath {
+                detail: format!("{} has no parent directory", base.display()),
+            });
+        };
+        let parent_dir = match std::fs::canonicalize(parent) {
+            Ok(real) => Dir::open_path(&real)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let dir = match parent_dir.open_dir(name) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(IpcError::UnsafePath {
+                    detail: format!(
+                        "{} exists but is a symlink or not a directory ({e}); remove it \
+                         yourself if it is not in use",
+                        base.display()
+                    ),
+                });
+            }
+        };
+        let st = dir.stat()?;
+        let mode = st.st_mode & 0o777;
+        if st.st_uid != owner || mode != BASE_DIR_MODE {
+            return Err(IpcError::UnsafePath {
+                detail: format!(
+                    "{} is owned by uid {} with mode {:o}, not by uid {owner} with mode {:o}: \
+                     refusing to remove it; remove it yourself if it is not in use",
+                    base.display(),
+                    st.st_uid,
+                    mode,
+                    BASE_DIR_MODE
+                ),
+            });
+        }
+        for (path, kind) in probe_targets(base) {
+            match probe_listener(&path, kind) {
+                Probe::Dead => {}
+                Probe::Live => {
+                    return Err(IpcError::UnsafePath {
+                        detail: format!(
+                            "{} is in use: another passless daemon answers on {}",
+                            base.display(),
+                            path.display()
+                        ),
+                    });
+                }
+                Probe::Unknown(e) => {
+                    return Err(IpcError::UnsafePath {
+                        detail: format!(
+                            "cannot tell whether {} is in use ({e}); refusing to remove it",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+        }
+        drop(dir);
+        parent_dir.remove_tree(name)?;
+        Ok(true)
+    }
+}
+
+/// Remove the tree at `base` if it is a real directory owned by `owner` (never through a symlink).
+fn remove_owned_tree(base: &Path, owner: u32) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(());
+    };
+    let parent_dir = match std::fs::canonicalize(parent) {
+        Ok(real) => Dir::open_path(&real)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    match parent_dir.open_dir(name) {
+        Ok(dir) if dir.stat()?.st_uid == owner => parent_dir.remove_tree(name),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "no longer owned by the daemon",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The socket types a runtime directory's listeners use.
+#[derive(Clone, Copy)]
+enum ListenerKind {
+    SeqPacket,
+    Stream,
+}
+
+/// The sockets a daemon binds below its runtime directory `base`: the admin socket, one per
+/// profile, and the sign transport's.
+fn probe_targets(base: &Path) -> Vec<(PathBuf, ListenerKind)> {
+    let mut targets = vec![
+        (
+            base.join(ADMIN_DIR_NAME).join(ADMIN_SOCKET_NAME),
+            ListenerKind::SeqPacket,
+        ),
+        (base.join("sign").join("sock"), ListenerKind::Stream),
+    ];
+    if let Ok(entries) = std::fs::read_dir(base.join(PRINCIPAL_ROOT_NAME)) {
+        for entry in entries.flatten() {
+            targets.push((
+                entry.path().join(PROFILE_SOCKET_NAME),
+                ListenerKind::SeqPacket,
+            ));
+        }
+    }
+    targets
+}
+
+enum Probe {
+    /// Nothing there, or nobody listens: a socket file an exited daemon left.
+    Dead,
+    /// A listener accepted the connection (or has a full backlog).
+    Live,
+    Unknown(io::Error),
+}
+
+/// Connect to the socket at `path` and drop the connection at once.
+fn probe_listener(path: &Path, kind: ListenerKind) -> Probe {
+    let socket_type = match kind {
+        ListenerKind::SeqPacket => libc::SOCK_SEQPACKET,
+        ListenerKind::Stream => libc::SOCK_STREAM,
+    };
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // SAFETY: `sockaddr_un` is plain data.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() {
+        return Probe::Unknown(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (i, &b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = b as libc::c_char;
+    }
+    // SAFETY: a plain syscall; the result is checked.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, socket_type | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Probe::Unknown(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor this function owns.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `addr` is a valid `sockaddr_un`; the result is checked.
+    let ret = unsafe {
+        libc::connect(
+            owned.as_raw_fd(),
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        return Probe::Live;
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ECONNREFUSED | libc::ENOENT | libc::ENOTDIR) => Probe::Dead,
+        Some(libc::EAGAIN) => Probe::Live,
+        _ => Probe::Unknown(err),
     }
 }
 
@@ -621,6 +812,15 @@ impl IpcServer {
             cancel: Arc::new(AtomicBool::new(false)),
             conn_counter: ConnectionCounter::new(MAX_CONCURRENT_CONNECTIONS),
             proc_root: PathBuf::from("/proc"),
+        }
+    }
+
+    /// Remove the runtime directory's sockets and directories now, at a graceful shutdown after
+    /// every user of the listeners has stopped, instead of leaving them to a drop that may never
+    /// run.
+    pub fn remove_runtime_dir(&self) {
+        if let Some(runtime_dir) = &self._runtime_dir {
+            runtime_dir.remove_all();
         }
     }
 
@@ -1041,6 +1241,7 @@ mod tests {
         AdminRequestFrame, AdminResponseFrame, CAPABILITY_PROOF_BYTES, CURRENT_VERSION,
         MAX_MESSAGE_SIZE, PrincipalCapabilityProof, PrincipalRequestFrame, PrincipalResponseFrame,
     };
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::RawFd;
 
     struct TestAdminHandler;
@@ -2132,6 +2333,143 @@ mod tests {
         runtime_dir.cleanup();
 
         assert!(unrelated.exists());
+    }
+
+    /// A graceful shutdown leaves no `agent` directory behind: the sign transport's directory in it
+    /// used to keep the base alive, and the next start then failed with "File exists".
+    #[test]
+    fn test_graceful_shutdown_removes_the_whole_runtime_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("agent");
+        let profile_map = make_profile_map(&[("test", my_uid(), my_gid())]);
+        let runtime_dir = RuntimeDir::create(&base, my_uid(), my_gid(), &profile_map).unwrap();
+        let server = IpcServer::bind(
+            runtime_dir,
+            profile_map,
+            Arc::new(AtomicBool::new(false)),
+            PathBuf::from("/proc"),
+        )
+        .unwrap();
+        // What the sign transport adds next to the IPC directories.
+        std::fs::create_dir_all(base.join("sign").join("1000")).unwrap();
+        std::fs::write(base.join("sign").join("sock"), b"").unwrap();
+
+        server.remove_runtime_dir();
+        assert!(!base.exists(), "the whole directory is gone");
+        // Idempotent: the drop that follows finds nothing.
+        server.remove_runtime_dir();
+        drop(server);
+        assert!(tmp.path().exists());
+    }
+
+    /// An `agent` directory left by a daemon that was killed (sockets bound, nobody listening).
+    fn leave_stale_runtime_dir(base: &Path) {
+        let profile_map = make_profile_map(&[("test", my_uid(), my_gid())]);
+        let runtime_dir = RuntimeDir::create(base, my_uid(), my_gid(), &profile_map).unwrap();
+        let admin = create_seqpacket_listener(
+            runtime_dir.admin_socket_path(),
+            my_uid(),
+            my_gid(),
+            ADMIN_SOCK_MODE,
+        )
+        .unwrap();
+        let profile_sock = base.join("principal").join("test").join("sock");
+        let profile =
+            create_seqpacket_listener(&profile_sock, my_uid(), my_gid(), PROFILE_SOCK_MODE)
+                .unwrap();
+        std::fs::create_dir(base.join("sign")).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(base.join("sign").join("sock")).unwrap());
+        // A kill closes the listeners and runs no cleanup: the socket files stay.
+        drop(admin);
+        drop(profile);
+        std::mem::forget(runtime_dir);
+    }
+
+    #[test]
+    fn test_a_stale_runtime_dir_is_reclaimed_and_create_works_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("agent");
+        // Nothing there: nothing to do.
+        assert!(!RuntimeDir::reclaim_stale(&base, my_uid()).unwrap());
+
+        leave_stale_runtime_dir(&base);
+        let profile_map = make_profile_map(&[("test", my_uid(), my_gid())]);
+        let err = RuntimeDir::create(&base, my_uid(), my_gid(), &profile_map)
+            .err()
+            .expect("the defect: a stale directory blocks the create");
+        assert!(err.to_string().contains("File exists"), "{err}");
+
+        assert!(RuntimeDir::reclaim_stale(&base, my_uid()).unwrap());
+        assert!(!base.exists());
+        let runtime_dir = RuntimeDir::create(&base, my_uid(), my_gid(), &profile_map).unwrap();
+        assert!(runtime_dir.admin_dir_path().exists());
+    }
+
+    #[test]
+    fn test_a_runtime_dir_a_live_daemon_serves_is_not_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("agent");
+        let profile_map = make_profile_map(&[("test", my_uid(), my_gid())]);
+        let runtime_dir = RuntimeDir::create(&base, my_uid(), my_gid(), &profile_map).unwrap();
+        let _server = IpcServer::bind(
+            runtime_dir,
+            profile_map,
+            Arc::new(AtomicBool::new(false)),
+            PathBuf::from("/proc"),
+        )
+        .unwrap();
+        let err = RuntimeDir::reclaim_stale(&base, my_uid()).unwrap_err();
+        assert!(err.to_string().contains("in use"), "{err}");
+        assert!(base.join("admin").join("admin.sock").exists());
+
+        // The sign transport alone being served is enough as well.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("agent");
+        std::fs::create_dir_all(base.join("sign")).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(base.join("sign").join("sock")).unwrap();
+        let err = RuntimeDir::reclaim_stale(&base, my_uid()).unwrap_err();
+        assert!(err.to_string().contains("in use"), "{err}");
+    }
+
+    #[test]
+    fn test_reclaim_refuses_what_is_not_plainly_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), b"keep").unwrap();
+
+        // A symlink: not followed, not removed.
+        let link = tmp.path().join("agent");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let err = RuntimeDir::reclaim_stale(&link, my_uid()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(elsewhere.join("keep").exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        std::fs::remove_file(&link).unwrap();
+
+        // A file in the way.
+        std::fs::write(&link, b"x").unwrap();
+        assert!(RuntimeDir::reclaim_stale(&link, my_uid()).is_err());
+        assert!(link.exists());
+        std::fs::remove_file(&link).unwrap();
+
+        // The wrong mode, and the wrong owner.
+        let base = tmp.path().join("agent");
+        leave_stale_runtime_dir(&base);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = RuntimeDir::reclaim_stale(&base, my_uid()).unwrap_err();
+        assert!(err.to_string().contains("refusing to remove"), "{err}");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = RuntimeDir::reclaim_stale(&base, my_uid().wrapping_add(1)).unwrap_err();
+        assert!(err.to_string().contains("refusing to remove"), "{err}");
+        assert!(base.join("admin").exists(), "left untouched");
+
+        // A symlink inside the stale tree is removed as a link, its target kept.
+        std::os::unix::fs::symlink(&elsewhere, base.join("sign").join("link")).unwrap();
+        assert!(RuntimeDir::reclaim_stale(&base, my_uid()).unwrap());
+        assert!(elsewhere.join("keep").exists());
     }
 
     #[test]

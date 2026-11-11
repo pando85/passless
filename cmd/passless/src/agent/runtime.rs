@@ -1234,6 +1234,20 @@ impl AgentRuntime {
             let runtime_base = daemon_runtime_base()?;
 
             let agent_runtime_dir = runtime_base.join("agent");
+            // A directory an earlier daemon left behind (it was killed, or crashed) would make
+            // the create below fail with "File exists" and leave the daemon without agents.
+            if RuntimeDir::reclaim_stale(&agent_runtime_dir, daemon_uid).map_err(|e| {
+                RuntimeError::Ipc(format!(
+                    "cannot reclaim the stale runtime dir {}: {}",
+                    agent_runtime_dir.display(),
+                    e
+                ))
+            })? {
+                info!(
+                    "Removed the stale agent runtime directory {} left by an earlier run",
+                    agent_runtime_dir.display()
+                );
+            }
             let runtime_dir =
                 RuntimeDir::create(&agent_runtime_dir, daemon_uid, daemon_gid, &profile_access)
                     .map_err(|e| {
@@ -1865,6 +1879,10 @@ impl AgentRuntime {
 
         let stop_event = DaemonStopBuilder::new(StopReason::GracefulShutdown, 0).build();
         let _ = self.audit_gate.record(stop_event);
+
+        // Every listener user has stopped: take the sockets and directories away, so that the
+        // next start does not find them (the drop of the server may never run).
+        self.ipc_server.remove_runtime_dir();
 
         info!("Agent runtime shutdown complete");
     }
