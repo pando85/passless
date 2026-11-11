@@ -223,23 +223,40 @@ included: a session on it could read the daemon bearer, send requests with a for
 against the fixed extension ID (`cdp_filter.rs`, review M3):
 
 - it refuses the `Extensions` domain, `Target.exposeDevToolsProtocol` (it would give page script an
-  unfiltered CDP channel), and `ServiceWorker.inspectWorker`, `stopWorker` and `stopAllWorkers`,
-  which name workers by version and cannot be attributed without tracking every registration;
-- it refuses a command whose `targetId` is an extension target (the daemon asks the browser with
-  its own `Target.getTargetInfo` before it forwards one naming a target it does not know; no answer
-  in time refuses the command), whose `sessionId` is a session on one, or whose parameters name an
-  extension (`chrome-extension:`, the extension ID) or a browser-internal page (`chrome:`,
-  `devtools:`, from which the extension could be inspected or disabled), after URL-style
-  normalization (tabs and newlines dropped, percent escapes decoded once, lowercase);
-- it hides extension targets: `Target.getTargets` results lose them, and their target events are
-  dropped. An auto-attach (`Target.setAutoAttach`, as Playwright and Puppeteer send it with
-  `flatten: true`) that reaches the worker is not shown; the daemon resumes the worker if it waits
-  for a debugger and detaches that session, and the client never learns of it;
-- it reserves request IDs from 2000000000 for the daemon and swallows the answers to its own
-  commands.
+  unfiltered CDP channel), `Target.sendMessageToTarget` and `Target.attachToBrowserTarget` (the
+  agent already holds the browser session), and `ServiceWorker.inspectWorker`, `stopWorker` and
+  `stopAllWorkers`, which name workers by version and cannot be attributed without tracking every
+  registration;
+- it allows only flat sessions: `Target.attachToTarget` and `Target.setAutoAttach` must say
+  `flatten: true` (as Playwright and Puppeteer do). A non-flat session tunnels its commands
+  through a JSON string in `Target.sendMessageToTarget`, whose escapes a check of the outer request
+  never decodes (review H1); its inbound counterpart, `Target.receivedMessageFromTarget`, is
+  dropped;
+- it refuses a command whose `targetId` is an extension target, or that runs on a session of one.
+  The filter maps every session to its target (from `Target.attachedToTarget` events and
+  `Target.attachToTarget` responses), refuses a session it never saw created, and before it
+  forwards a command that names a target or runs on a session it asks the browser what that
+  target is now, with its own `Target.getTargetInfo` (no answer in time refuses the command). A
+  target found to be an extension target, by a lookup, a target event or a target list, has every
+  session on it refused and detached (review H2);
+- it refuses a command whose parameters name an extension (`chrome-extension:`, the extension ID)
+  or a browser-internal page (`chrome:`, `chrome-untrusted:`, `chrome-search:`, `devtools:`,
+  `chrome-devtools:`, and `about:` other than `about:blank` and `about:srcdoc`, because Chromium
+  maps `about:inspect` and the like to `chrome://` pages; review M-a), after URL-style
+  normalization (tabs and newlines dropped, `\uXXXX`/`\xHH` and percent escapes decoded once,
+  lowercase). A string that is itself JSON is parsed and searched as well;
+- it hides extension targets: every response's `targetInfos` lose them and a `targetInfo` of one
+  becomes an error, whatever command the response answers, and their target events are dropped. An
+  auto-attach that reaches the worker is not shown; the daemon resumes the worker if it waits for a
+  debugger and detaches that session, and the client never learns of it;
+- it forwards the request it checked, re-serialized, never the agent's raw text, so the browser's
+  JSON parser cannot read something else (duplicate keys, escapes; review M-b); it reserves
+  request IDs from 2000000000 for the daemon, swallows the answers to its own commands and drops a
+  browser message it cannot parse.
 
-A refusal is a `Forbidden` error, audited as a `denied` browser-control record. The filter's view
-is updated only while a `browser-control` call reads the pipe, so a worker that restarts under an
+A refusal is a `Forbidden` error, audited as a `denied` browser-control record. Every command on
+a session costs one extra pipe round trip for the lookup. The filter's view is updated only while a
+`browser-control` call reads the pipe, so a worker that restarts under an
 auto-attach with `waitForDebuggerOnStart` stays paused until the next call (availability of the
 agent's own ceremonies only). The filter does not restrict `file:` URLs, so the agent can read what
 the browser user can read, the extension's `worker.js` and its bearer included; the bearer alone
@@ -771,7 +788,10 @@ so the audit records `top_origin = null` together with `cross_origin` (§12). A 
 **Who can forge it.** A page cannot; a CDP client that reaches the extension's worker can (it can
 evaluate code there and call the sign transport with any request details). In pipe mode the daemon
 filters CDP so that the agent cannot reach the worker or any other extension or browser-internal
-page (§4.3). In port mode it cannot, so there the origin report is only as trustworthy as the CDP
+page (§4.3): it allows only flat sessions, ties every session to its target and re-checks that
+target before each command on it, and forwards only the request it checked. The filter is the
+boundary here, so it fails closed: an unknown session, an unanswered lookup, an unparsable message
+or a full tracking table is a refusal. In port mode it cannot, so there the origin report is only as trustworthy as the CDP
 client, and it is the daemon's own checks that hold: the origin is validated against the RP ID,
 the rules, the budget and the replay key apply, and a proxy the client detaches leaves only the
 contained native path (§7). A forged origin therefore gives no more than the agent could obtain by
@@ -1028,7 +1048,7 @@ reservation (§12).
 | Same-user ceremonies delay the human path | The operation lock is held only for the bounded key-use section, never across a wait on a human, an escalation or the browser | A same-user ceremony holds the human operation lock while it walks the whole human store to find the RP's credentials (selection, reservation, key use); with the `pass` backend that decrypts every credential, so a large store makes each ceremony slow and a human request waits behind it. A latency residual, not a confidentiality one; `isolated` profiles have their own lock and store (`docs/agents/same-user.md`) |
 | Page floods the audit log or the replay table | Refusal records are coalesced per session, RP, action and reason with a `suppressed` count (§12); the replay table is capped and refuses with `busy` rather than evicting an entry that protects "never sign twice" (§9) | A page can fill its own session's replay table for 120 seconds, so that session's new requests get `busy` until old entries leave the outcome window; other sessions are unaffected |
 | Extension reports a false origin | Origin taken only from the browser-supplied `remoteDesktopClientOverride`, which a page cannot forge; the daemon builds `clientDataJSON`; cross-origin frames fail closed | Browser and extension are in the TCB; the top origin is not available |
-| Agent drives the extension worker over CDP (reads the bearer, forges the origin, detaches the proxy) | Pipe mode: `browser-control` refuses attaching to, messaging, closing or inspecting extension targets, hides them from target lists and auto-attach, and refuses extension and browser-internal URLs (§4.3); in both modes the daemon validates the origin against the RP ID, rules, budget and replay, and containment covers a detached proxy | Port mode: unfiltered, so the origin report is as trustworthy as the CDP client (§7, §11); pipe mode: a worker paused by an auto-attach waits for the next `browser-control` call, and `file:` navigations can read the extension's files (the bearer alone does not pass the sign socket's peer-UID check of a distinct-UID browser) |
+| Agent drives the extension worker over CDP (reads the bearer, forges the origin, detaches the proxy) | Pipe mode: `browser-control` allows only flat sessions, maps each session to its target and looks the target up before every command on it, refuses attaching to, messaging, closing or inspecting extension targets, hides them from target lists and auto-attach, refuses extension and browser-internal URLs (`about:` aliases and nested JSON included), and forwards only the request it checked, re-serialized (§4.3); in both modes the daemon validates the origin against the RP ID, rules, budget and replay, and containment covers a detached proxy | Port mode: unfiltered, so the origin report is as trustworthy as the CDP client (§7, §11); pipe mode: a worker paused by an auto-attach waits for the next `browser-control` call, and `file:` navigations can read the extension's files (the bearer alone does not pass the sign socket's peer-UID check of a distinct-UID browser) |
 | Registration completes but the page gets `NotAllowedError` (unfocused tab) | The audit records the registration; the operator deletes the orphan credential; adapters bring the page to the front | An orphan credential can remain until deleted |
 | Stale registration authority | Registration bearers revoked with the lease; escalation bound to the waiting ceremony's session | — |
 | Unwanted autonomous registration | Separate rule, exact RP, acknowledgement, exclude checks, audit | A broad registration rule grants broad power |

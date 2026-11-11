@@ -200,12 +200,9 @@ scenario({
 // The tightened filter rules (a review of cdp_filter.rs): every session is flat (`flatten: true`, as Playwright and
 // Puppeteer attach), so a non-flat attach, a non-flat auto-attach and the legacy `Target.sendMessageToTarget` relay are
 // refused even for an ordinary page, and so are `about:` pages other than about:blank and about:srcdoc.
-// XFAIL until those cdp_filter.rs commits land; remove the tag then (the run reports XPASS as a failure).
+// (Review H1 and M-a, cdp_filter.rs.)
 scenario({
   id: 'E2E-52/strict', title: 'pipe mode: non-flat sessions, sendMessageToTarget and about: pages are refused', ci: true,
-  xfailUntil: 'cdp-filter-tightening',
-  xfailReason: 'the filter does not yet refuse non-flat attaches, sendMessageToTarget or about: pages',
-  xfailMatch: /was not refused/,
 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

@@ -2029,28 +2029,41 @@ impl BrowserProcessManager {
 
         let deadline = Instant::now() + timeout;
 
-        if from_agent {
+        // What goes to the browser. For the agent it is the request the filter checked,
+        // re-serialized: never the raw text, which another JSON parser could read differently
+        // (duplicate keys, escapes; review M-b).
+        let forwarded = if from_agent {
             let request: serde_json::Value = serde_json::from_str(request_json)
                 .map_err(|e| CdpError::InvalidRequest(format!("invalid JSON: {}", e)))?;
-            match entry.cdp_filter.check_request(&request) {
-                RequestVerdict::Forward => {}
+            let verdict = entry.cdp_filter.check_request(&request);
+            let lookups = match verdict {
+                RequestVerdict::Forward => Vec::new(),
                 RequestVerdict::Deny(reason) => return Err(CdpError::Denied(reason)),
-                RequestVerdict::LookupTarget(target) => {
-                    if lookup_extension_target(entry, &target, deadline)? {
-                        return Err(CdpError::Denied(
-                            "the target is the Passless extension".to_string(),
-                        ));
-                    }
+                RequestVerdict::LookupTargets(targets) => targets,
+            };
+            for target in lookups {
+                let extension = lookup_extension_target(entry, &target, deadline)?;
+                // A target found to be the extension's has its sessions detached now.
+                for command in entry.cdp_filter.take_commands() {
+                    write_cdp_frame(entry, &command)?;
+                }
+                if extension {
+                    return Err(CdpError::Denied(
+                        "the target is the Passless extension".to_string(),
+                    ));
                 }
             }
             entry.cdp_filter.note_forwarded(&request);
-        }
+            request.to_string()
+        } else {
+            request_json.to_string()
+        };
 
-        write_cdp_frame(entry, request_json)?;
+        write_cdp_frame(entry, &forwarded)?;
         entry.cdp_busy = true;
 
         Ok(CdpCall {
-            request_id: extract_cdp_id(request_json),
+            request_id: extract_cdp_id(&forwarded),
             deadline,
             messages: Vec::new(),
             total_bytes: 0,
@@ -2085,14 +2098,13 @@ impl BrowserProcessManager {
                     None => return Ok(None),
                 },
             };
-            let message = match entry.cdp_filter.inbound(&raw) {
+            let inbound = entry.cdp_filter.inbound(&raw);
+            for command in entry.cdp_filter.take_commands() {
+                write_cdp_frame(entry, &command)?;
+            }
+            let message = match inbound {
                 Inbound::Deliver(message) => message,
-                Inbound::Drop { commands } => {
-                    for command in commands {
-                        write_cdp_frame(entry, &command)?;
-                    }
-                    continue;
-                }
+                Inbound::Drop => continue,
             };
             if call.messages.len() >= CDP_MAX_RESPONSE_MESSAGES {
                 return Err(CdpError::TooManyMessages);
@@ -6915,6 +6927,104 @@ mod tests {
         assert_eq!(daemon_commands[1]["params"]["sessionId"], "WORKER-SESSION");
 
         let evaluate = r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"1"},"sessionId":"WORKER-SESSION"}"#;
+        assert!(matches!(
+            mgr.cdp_round_trip(&lease_id, evaluate, Duration::from_secs(1)),
+            Err(CdpError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn test_cdp_round_trip_forwards_the_checked_request_not_the_raw_text() {
+        // Review M-b: duplicate keys. serde_json keeps the last `params`, a parser that keeps the
+        // first would see `chrome://extensions`. The browser receives the request the filter
+        // checked, re-serialized, so both read the same thing.
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let (daemon_write, daemon_read, mut fake_browser_read, mut fake_browser_write) =
+            create_fake_cdp_pair();
+        let lease_id = inject_lease_with_fake_cdp(&mut mgr, daemon_write, daemon_read);
+        let browser = std::thread::spawn(move || {
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !raw.contains(&0) {
+                let n = fake_browser_read.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            raw.pop();
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"id": 1, "result": {"frameId": "F"}}),
+            );
+            String::from_utf8(raw).unwrap()
+        });
+        let duplicate = r#"{"id":1,"method":"Page.navigate","params":{"url":"chrome://extensions"},"params":{"url":"https://rp.test/"}}"#;
+        mgr.cdp_round_trip(&lease_id, duplicate, Duration::from_secs(5))
+            .unwrap();
+        let forwarded = browser.join().unwrap();
+        assert!(!forwarded.contains("chrome://"), "{forwarded}");
+        assert_eq!(forwarded.matches("\"params\"").count(), 1, "{forwarded}");
+        let forwarded: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+        assert_eq!(forwarded["params"]["url"], "https://rp.test/");
+    }
+
+    #[test]
+    fn test_cdp_round_trip_refuses_a_session_whose_target_became_the_extension() {
+        // Review H2: page `PAGE` was auto-attached as session `S`; it then turned into an
+        // extension page. A command on `S` makes the daemon look the session's target up, which
+        // refuses it and detaches `S`; the command never reaches the browser.
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let (daemon_write, daemon_read, mut fake_browser_read, mut fake_browser_write) =
+            create_fake_cdp_pair();
+        let lease_id = inject_lease_with_fake_cdp(&mut mgr, daemon_write, daemon_read);
+        let mut page = serde_json::json!({"targetId": "PAGE", "type": "page", "title": "",
+                                          "url": "https://rp.test/", "attached": true});
+        let attached = serde_json::json!({"method": "Target.attachedToTarget", "params": {
+            "sessionId": "S", "targetInfo": page.clone(), "waitingForDebugger": false}});
+        let browser = std::thread::spawn(move || {
+            let request = read_frames(&mut fake_browser_read, 1).remove(0);
+            write_frame(&mut fake_browser_write, &attached);
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"id": request["id"], "result": {}}),
+            );
+            (fake_browser_read, fake_browser_write)
+        });
+        let auto_attach = make_cdp_request_with_params(
+            1,
+            "Target.setAutoAttach",
+            r#"{"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}"#,
+        );
+        let messages = mgr
+            .cdp_round_trip(&lease_id, &auto_attach, Duration::from_secs(5))
+            .unwrap()
+            .messages;
+        assert_eq!(
+            messages.len(),
+            2,
+            "the page session is the agent's: {messages:?}"
+        );
+        let (mut fake_browser_read, mut fake_browser_write) = browser.join().unwrap();
+
+        page["url"] =
+            serde_json::Value::String(format!("chrome-extension://{AGENT_EXTENSION_ID}/x.html"));
+        let browser = std::thread::spawn(move || {
+            let lookup = read_frames(&mut fake_browser_read, 1).remove(0);
+            assert_eq!(lookup["method"], "Target.getTargetInfo");
+            assert_eq!(lookup["params"]["targetId"], "PAGE");
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"id": lookup["id"], "result": {"targetInfo": page}}),
+            );
+            read_frames(&mut fake_browser_read, 1).remove(0)
+        });
+        let evaluate =
+            r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"1"},"sessionId":"S"}"#;
+        let result = mgr.cdp_round_trip(&lease_id, evaluate, Duration::from_secs(5));
+        let detach = browser.join().unwrap();
+        assert!(matches!(&result, Err(CdpError::Denied(_))), "{result:?}");
+        assert_eq!(detach["method"], "Target.detachFromTarget");
+        assert_eq!(detach["params"]["sessionId"], "S");
+        // Refused from now on without another lookup.
         assert!(matches!(
             mgr.cdp_round_trip(&lease_id, evaluate, Duration::from_secs(1)),
             Err(CdpError::Denied(_))

@@ -255,6 +255,12 @@ held across another, and the order of the table above is unchanged.
   launch runs it before taking the manager.
 - A revocation waits for a key use that already passed its re-check (rule 6): one signature or
   one credential write.
+- A pipe-mode `browser-control` request is checked and written under `browser_manager` (30)
+  (`cdp_begin`). That includes the extension filter's own `Target.getTargetInfo` lookups
+  (`cdp_filter.rs`), which the browser answers itself, never through a WebAuthn ceremony, within
+  the call's CDP deadline (at most 30 s). The filter's detaches are written under the manager too,
+  in `cdp_begin` and in the 50 ms read slices. The filter is plain state on the lease and takes no
+  lock.
 - The human CTAP path holds the operation lock across a whole CTAP command, including its
   user-presence prompt. Agent ceremonies of same-user profiles queue behind it (rule 4 keeps the
   reverse from happening).
