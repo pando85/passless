@@ -33,10 +33,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install udev and tss2 for TPM support
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y libudev-dev libtss2-dev && break || sleep 10
-          done
+        run: .ci/install-apt-packages.sh libudev-dev libtss2-dev
 
       - name: Install stable toolchain
         shell: bash
@@ -56,10 +53,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install system dependencies
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm && break || sleep 10
-          done
+        run: .ci/install-apt-packages.sh dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm
 
       - name: Install stable toolchain
         shell: bash
@@ -84,10 +78,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install system dependencies
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y libudev-dev && break || sleep 10
-          done
+        run: .ci/install-apt-packages.sh libudev-dev
 
       - name: Install nightly toolchain
         shell: bash
@@ -113,10 +104,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install udev and tss2
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y libudev-dev libtss2-dev && break || sleep 10
-          done
+        run: .ci/install-apt-packages.sh libudev-dev libtss2-dev
 
       - name: Install Rust toolchain
         shell: bash
@@ -161,10 +149,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install udev and tss2
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y libudev-dev libtss2-dev && break || sleep 10
-          done
+        run: .ci/install-apt-packages.sh libudev-dev libtss2-dev
 
       - name: Install Rust toolchain
         shell: bash

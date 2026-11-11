@@ -42,3 +42,13 @@ repos:
         types: [rust]
         pass_filenames: false
         args: ["--all-targets", "--", "-D", "warnings"]
+
+  - repo: local
+    hooks:
+      - id: ci-script-tests
+        name: ci script tests
+        description: Test CI helper scripts (e.g. install-apt-packages.sh)
+        entry: bash .ci/tests/test-install-apt-packages.sh
+        language: system
+        files: ^\.ci/(install-apt-packages\.sh|tests/test-install-apt-packages\.sh)$
+        pass_filenames: false
