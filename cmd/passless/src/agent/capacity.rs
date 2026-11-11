@@ -483,4 +483,63 @@ mod tests {
         drop(permits);
         assert_eq!(conn.active(), 0);
     }
+
+    #[test]
+    fn a_duplicate_joined_to_a_parked_original_holds_no_request_slot() {
+        use super::super::session::{
+            CeremonyAction, CeremonyResult, ChallengeDigest, Claim, JoinResult, ReplayKey,
+        };
+        use passless_core::agent::protocol::PrincipalResponse;
+
+        let limiter = RequestLimiter::new(limits(4, 4, 4));
+        let connection = ConnectionSlots::new();
+        let session = session();
+        let key = ReplayKey::derive(
+            CeremonyAction::Authenticate,
+            "rp.test",
+            "https://rp.test",
+            None,
+            b"c",
+        );
+        let digest = ChallengeDigest::of(b"c");
+        let Claim::Fresh(original) = session.claim_key(key, digest, Instant::now()) else {
+            panic!("expected a fresh claim");
+        };
+        let Claim::Join(slot, _) = session.claim_key(key, digest, Instant::now()) else {
+            panic!("expected a join");
+        };
+        let mut permit = limiter.try_acquire(&connection, &session).unwrap();
+        assert_eq!(session.active_requests().load(Ordering::Acquire), 1);
+
+        let waiter = std::thread::spawn(move || {
+            let result = slot.join(
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+                &mut permit,
+            );
+            (result, permit)
+        });
+        let started = Instant::now();
+        while session.active_requests().load(Ordering::Acquire) != 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "slot never freed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(limiter.active(), 0);
+        assert_eq!(connection.active(), 0);
+        // The freed slot is usable by another request while the duplicate waits.
+        assert!(limiter.try_acquire(&connection, &session).is_ok());
+
+        original.complete(&Ok(CeremonyResult::Assertion(Box::new(
+            PrincipalResponse::Pong,
+        ))));
+        let (result, permit) = waiter.join().unwrap();
+        assert!(matches!(result, JoinResult::Completed(Ok(_))));
+        // Resumed after the wait; released on drop.
+        assert_eq!(session.active_requests().load(Ordering::Acquire), 1);
+        drop(permit);
+        assert_eq!(session.active_requests().load(Ordering::Acquire), 0);
+    }
 }

@@ -5,7 +5,7 @@ use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
 use passless_core::agent::protocol::{
-    ErrorCode, IntentAction, ProtocolError, RecommendedAction, RegisterCredentialRequest,
+    ErrorCode, GrantAction, ProtocolError, RecommendedAction, RegisterCredentialRequest,
     RegisterCredentialResponse,
 };
 use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
@@ -312,7 +312,7 @@ impl RegisterHandler {
         //    registration (section 6.3): `resolve` never matches the wildcard for `register`.
         let matched =
             self.policy_runtime
-                .resolve(&ctx.profile_id, &IntentAction::Register, &normalized_rp);
+                .resolve(&ctx.profile_id, &GrantAction::Register, &normalized_rp);
         match matched.action {
             RuleAction::Deny => {
                 return Err(self.deny(
@@ -488,7 +488,7 @@ impl RegisterHandler {
                 }
                 outcome
             }
-            Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled) {
+            Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled, park) {
                 JoinResult::Completed(outcome) => {
                     self.serve_duplicate(ctx, target, audit)?;
                     attestation_outcome(outcome)
@@ -647,7 +647,7 @@ impl RegisterHandler {
         self.check_session(ctx, target)?;
         let matched = self
             .policy_runtime
-            .resolve(&ctx.profile_id, &IntentAction::Register, rp_id);
+            .resolve(&ctx.profile_id, &GrantAction::Register, rp_id);
         // A configured `request` permits key use only with this ceremony's own approval (ADR 0014
         // section 8.3).
         let approved = matched.configured == RuleAction::Request
@@ -2448,7 +2448,7 @@ mod tests {
         // `authenticate` for the RP is now a granted allow; registration still escalates.
         let auth =
             f.policy_runtime
-                .resolve(&f.profile_id, &IntentAction::Authenticate, "example.com");
+                .resolve(&f.profile_id, &GrantAction::Authenticate, "example.com");
         assert!(auth.granted && auth.action == RuleAction::Allow);
 
         let second = register_on_thread(&f, &ctx, req_with_challenge(&f, b"second"));
@@ -2551,7 +2551,7 @@ mod tests {
         // The next authentication escalates again.
         let auth =
             f.policy_runtime
-                .resolve(&f.profile_id, &IntentAction::Authenticate, "example.com");
+                .resolve(&f.profile_id, &GrantAction::Authenticate, "example.com");
         assert_eq!(auth.action, RuleAction::Request);
     }
 }

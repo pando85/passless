@@ -67,7 +67,8 @@ Helpers (`lib/helpers.js`): `escalationEvents`, `grantedRuleEvents`, `denyReason
 Quirks: the escalation pre-check runs before the replay key, so a refusal (cooldown, caps, unavailable) consumes neither;
 a deny, expiry or abort after the wait started consumes the key, so every retry uses a fresh challenge (the page helpers
 fetch new RP options per call). `PASSLESS_INTERACTION_MODE=automatic` has no effect on escalation (E2E-44). After a grant
-revocation the managed browser keeps running with a revoked bearer, so a scenario restarts the browser (E2E-31).
+revocation or clear the daemon terminates the managed browsers (the admin-launched one too) and audits late use of the
+old bearer as `bearer_revoked`, so a scenario launches a fresh browser (E2E-31).
 
 CI subset: E2E-23, 24, 25, 27, 28, 29, 31, 48, 50 (about 5 to 15 s each). Full matrix only: E2E-20/escalation (6 min
 approval), 21 (3 min timeout), 26, 30, 43, 44, 49. E2E-26 proves sequential prompting in arrival order with four RPs; the queue

@@ -2,11 +2,13 @@
 const fs = require('node:fs');
 
 const { scenario, assert } = require('../lib/scenario');
-const { escalationEvents, grantedRuleEvents, denyReasons, grantsStore, authenticate, assertVerifiedAssertion, assertInterceptionActive, TRANSPORT_LOG, logMatches, waitFor } = require('../lib/helpers');
+const { escalationEvents, grantedRuleEvents, denyReasons, grantsStore, authenticate, assertVerifiedAssertion, assertInterceptionActive, extensionEndpoint, FramedClient, signRequest, policyEvents, auditEvents, TRANSPORT_LOG, logMatches, waitFor } = require('../lib/helpers');
+const { stopExtensionWorker } = require('../lib/browser');
 const { requestProfile } = require('../lib/escalation');
 
 // ADR 0014 section 8.4 and the WP1 admin CLI: `agent-admin grants list|revoke|clear`. A revocation bumps the revocation epoch
-// (active sessions die), so the browser is launched again before the next ceremony, which prompts again. A store file that
+// (active sessions die and the daemon terminates their browsers), so a fresh browser is launched before the next ceremony,
+// which prompts again. A store file that
 // does not parse, or that group/other can read, disables grants for the profile: escalation is then denied
 // `grants_unavailable`, and `agent-admin profile check` (the doctor report) lists a failed `granted_rules` check. The store
 // is read at daemon start, so those files are put in place before a daemon restart.
@@ -19,15 +21,21 @@ const grantRules = async (stack, profile = 'agent') => {
 };
 const rpsOf = p => p.rules.map(r => r.rp_id).sort();
 
-// A revocation revokes the bearers but leaves the managed browser running: `browser launch` would hand back that browser
-// with its dead bearer (and no start-URL tab). The operator restarts the browser; the harness kills it the way E2E-11 does
-// and waits for the daemon to notice.
-async function restartBrowser(stack, b, rp) {
-  const crashes = () => stack.daemon.audit().then(a => a.filter(e => (e.event || e).kind === 'browser_lease.crash').length);
-  const before = await crashes();
-  stack.env.killTree(b.lease.pid);
-  await waitFor('the daemon to record the browser exit', async () => (await crashes()) > before);
-  return stack.open('agent', `${rp.origin}/sw`);
+// A revocation (and a clear) bumps the revocation epoch: the daemon revokes every stale bearer and terminates its browser,
+// the admin-launched one included. The scenario waits for the browser process to go, then launches a fresh one: it has a
+// new bearer and the start-URL tab (a relaunch that handed back the dead browser would not).
+const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+async function assertBrowserTerminated(b, what) {
+  await waitFor(`the daemon to terminate the browser after ${what}`, () => !pidAlive(b.lease.pid));
+}
+async function relaunchBrowser(stack, old, rp, what) {
+  await assertBrowserTerminated(old, what);
+  const audit = await stack.daemon.audit();
+  assert.ok(auditEvents(audit).some(e => e.kind === 'browser_lease.revoke'), `${what}: the lease revocation is audited`);
+  const fresh = await stack.open('agent', `${rp.origin}/sw`);
+  assert.notEqual(fresh.lease.pid, old.lease.pid, `${what}: a fresh browser, not the revoked one`);
+  assert.ok(fresh.page.url().startsWith(rp.origin), `${what}: the fresh browser has the start URL, at ${fresh.page.url()}`);
+  return fresh;
 }
 
 scenario({ id: 'E2E-31', title: 'grants CLI: list, revoke, clear; revocation kills sessions; a damaged store gives grants_unavailable and a doctor failure', ci: true, timeoutMs: 240000 }, async ctx => {
@@ -55,19 +63,37 @@ scenario({ id: 'E2E-31', title: 'grants CLI: list, revoke, clear; revocation kil
   assert.ok(listed.rules.every(r => r.action === 'authenticate' && r.kind === 'escalation' && r.rule === 'exact'), JSON.stringify(listed.rules));
   assert.deepEqual((await stack.daemon.adminJson('grants', 'list')).profiles.map(p => p.profile_id), ['agent'], 'list without --profile covers every profile');
 
-  // revoke one RP: the session dies, the next ceremony at that RP prompts again, the other grant survives
+  // The harness holds the browser's bearer over the daemon's wire protocol (as E2E-11 does), with the worker stopped so
+  // this client is the bearer's only connection: after the revocation it proves the bearer is refused and audited.
+  const endpoint = await extensionEndpoint(b);
+  await stopExtensionWorker(b.browser);
+  await waitFor('the daemon to see the worker connection close', () => logMatches(stack.daemon.log(), TRANSPORT_LOG.closed).length >= 1);
+  const oldClient = await FramedClient.connect(endpoint.socketPath);
+  assert.equal((await oldClient.hello(endpoint)).type, 'hello', 'the live bearer is accepted');
+
+  // revoke one RP: every session dies and the browser is terminated, the next ceremony at that RP prompts again, the other
+  // grant survives
   const revoked = await stack.daemon.adminJson('grants', 'revoke', '--profile', 'agent', '--rp', 'rp-a.test', '--confirm');
   assert.equal(revoked.revoked, 1, JSON.stringify(revoked));
   assert.deepEqual(rpsOf(await grantRules(stack)), ['rp-b.test']);
   assert.deepEqual(grantsStore(stack).grants.map(g => g.rp_id), ['rp-b.test'], 'the store file follows');
   assert.deepEqual(grantedRuleEvents(await stack.daemon.audit(), 'revoke').map(e => e.rp_id), ['rp-a.test']);
-  const stale = await authenticate(b.page, { username: 'bob' });
-  assert.equal(stale.ok, false, `the revoked session must not sign: ${JSON.stringify(stale)}`);
-  assert.equal(stale.name, 'NotAllowedError');
   assert.equal(notified(), 2, 'a revoked session does not prompt');
-  assert.deepEqual(logMatches(stack.daemon.log(), TRANSPORT_LOG.refused).map(m => m[2]), ['unauthorized'], 'the transport refused the revoked bearer');
+  // The old bearer is dead: a request on it is refused and audited `bearer_revoked`, never silently `unauthorized`.
+  let auditSnapshot = await stack.daemon.audit();
+  const refusals = () => policyEvents(auditSnapshot, 'policy.deny').filter(e => e.profile_id === 'agent' && e.reason === 'bearer_revoked');
+  assert.equal(refusals().length, 0, 'nothing was refused before the harness used the old bearer');
+  const late = await oldClient.request(2, 'get', signRequest({ origin: rpB.origin, rpId: 'rp-b.test' }));
+  assert.equal(late.type, 'result', JSON.stringify(late));
+  assert.equal(late.ok, false, `the revoked bearer must not sign: ${JSON.stringify(late)}`);
+  assert.equal(late.error.code, 'unauthorized', JSON.stringify(late));
+  assert.equal(late.error.dom, 'NotAllowedError', JSON.stringify(late));
+  oldClient.close();
+  auditSnapshot = await stack.daemon.audit();
+  assert.deepEqual(refusals().map(e => [e.action, e.rp_id]), [['authenticate', 'rp-b.test']], JSON.stringify(auditSnapshot.map(e => (e.event || e).kind)));
+  assert.equal(notified(), 2, 'a refused request does not prompt');
 
-  b = await restartBrowser(stack, b, rpA);
+  b = await relaunchBrowser(stack, b, rpA, 'revoking one RP');
   assertInterceptionActive(b);
   assertVerifiedAssertion(rpA, await authenticate(b.page, { username: 'alice' }), { username: 'alice' });
   assert.equal(notified(), 3, 'the revoked RP prompts again');
@@ -81,7 +107,7 @@ scenario({ id: 'E2E-31', title: 'grants CLI: list, revoke, clear; revocation kil
   assert.equal(cleared.revoked, 2, JSON.stringify(cleared));
   assert.deepEqual((await grantRules(stack)).rules, []);
   assert.deepEqual(grantsStore(stack).grants, []);
-  b = await restartBrowser(stack, b, rpB);
+  b = await relaunchBrowser(stack, b, rpB, 'clearing every grant');
   assertVerifiedAssertion(rpB, await authenticate(b.page, { username: 'bob' }), { username: 'bob' });
   assert.equal(notified(), 4, 'after clear every RP prompts again');
 

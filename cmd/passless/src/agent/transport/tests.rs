@@ -820,6 +820,46 @@ fn a_revoked_registration_bearer_is_refused_per_request_and_audited() {
 }
 
 #[test]
+fn a_sign_bearer_revoked_by_a_policy_change_is_refused_and_audited() {
+    let f = Fixture::new(true);
+    let server = TestServer::start(f.registry.clone());
+    let token = f.bearer(Some("lease"));
+    let mut client = server.connect();
+    client.hello(&token);
+    client.request(1, "get", &get_body(b"before"));
+    assert_eq!(client.result()["ok"], true);
+
+    // What a grant revocation or a reload does: bump the epoch, drop the stale bearers.
+    let epoch = f.policy_runtime.bump_revocation_epoch();
+    let stale = f.registry.revoke_stale_sessions(epoch);
+    assert_eq!(stale.lease_ids, vec!["lease".to_string()]);
+
+    // The late request is refused up front, and audited as a revoked bearer, not left silent.
+    client.request(2, "get", &get_body(b"after"));
+    assert_eq!(error_code(&client.result()).0, "unauthorized");
+    assert_eq!(f.key_provider.sign_calls(), 1);
+    let denies: Vec<Value> = f
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "policy.deny")
+        .collect();
+    assert_eq!(denies.len(), 1, "{denies:?}");
+    assert_eq!(denies[0]["reason"], "bearer_revoked");
+    assert_eq!(denies[0]["action"], "authenticate");
+    assert_eq!(denies[0]["rp_id"], RP_ID);
+
+    // A new connection with the dead bearer is refused at hello, once per attempt.
+    let mut late = server.connect();
+    assert_eq!(late.hello_with(&token, true)["code"], "unauthorized");
+    let denies = f
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "policy.deny")
+        .count();
+    assert_eq!(denies, 2);
+}
+
+#[test]
 fn a_revocation_epoch_change_refuses_the_next_request() {
     let f = Fixture::new(true);
     let server = TestServer::start(f.registry.clone());
@@ -979,8 +1019,16 @@ fn identical_requests_are_coalesced_into_one_signature() {
     for id in 1..=4 {
         client.request(id, "get", &body);
     }
-    server.wait_admitted(4);
+    // The original holds its permit; the joined duplicates suspend theirs while they wait, so
+    // they do not hold request slots (they are bounded per key instead).
+    server.wait_admitted(1);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    while server.limiter.active() != 1 || server.limiter.active_for_profile(&f.profile_id) != 1 {
+        assert!(Instant::now() < deadline, "duplicates kept their permits");
+        thread::sleep(Duration::from_millis(10));
+    }
     thread::sleep(Duration::from_millis(200));
+    assert_eq!(server.limiter.active(), 1);
     drop(op);
     let bodies: Vec<String> = (0..4)
         .map(|_| client.result()["body"].as_str().unwrap().to_string())

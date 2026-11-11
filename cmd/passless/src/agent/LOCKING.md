@@ -20,7 +20,8 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    `cleanup_expired_pending`, `cancel_pending_for_session`, `principal_exit`, `reload`).
    The only policy lock held across others is `reload_lock`, which ranks below them.
 3. **No lock across a wait on a human, an escalation or a join.** A joined duplicate waits on its
-   in-flight slot's condvar holding no other lock. An escalation waiter (`Waiter::wait`) holds no
+   in-flight slot's condvar holding no other lock, and suspends its request permit for the wait
+   (atomic counters, at most four duplicates per slot; `InFlight::join`). An escalation waiter (`Waiter::wait`) holds no
    lock either: it parks on the escalation mutex's condvar, which is a leaf, and wakes at least
    every 250 ms to re-check its cancellation, deadline and session with the mutex released.
 4. **The backend operation lock is held only for the bounded key-use section.** In same-user mode
@@ -56,7 +57,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 35 | Profile bookkeeping: `endpoint_id`, `active_browser`, `shared_browsers` | `runtime.rs` (`ProfileRuntime`) | Short sections, under `browser_manager` on the launch path. They never nest with each other. |
 | 40 T | Backend credential storage, and `pin_storage` | `backend.rs`, `runtime.rs` (`ProfileRuntime.credential_storage`) | The browser launch reads storage under `browser_manager`. Ceremonies release storage before key use (see "Fixed in P5"). |
 | 45 T | `AgentRuntime::agent_config` (`RwLock`) | `runtime.rs` | Read for the live profile configuration on launch. A reload holds the write guard across `PolicyRuntime::reload` and releases it before closing browsers. |
-| 50 T | `SignContextRegistry` maps: `entries`, `registration_entries`, `revoked_registrations` | `sign.rs` | They never nest. Each guard is released before the next map is locked and before a session is revoked. |
+| 50 T | `SignContextRegistry` maps: `entries`, `registration_entries`, `revoked_registrations`, `revoked_signs` | `sign.rs` | They never nest. Each guard is released before the next map is locked and before a session is revoked. |
 | 55 T | `RequestLimiter::profiles` | `capacity.rs` | Per-profile request counters; a short section with nothing nested. |
 | 60 T | `AgentSession::state` (replay table and budget) | `session.rs` | Taken by `claim`, `record_completion` and `operations_used`. Never held across the in-flight slot. |
 | 64 T | `GrantedRulesStore::writers[profile]` | `granted_rules.rs` | One per profile. Held across the store file write, its reload and the view swap (71); released before the grant or revocation epoch is bumped. |
@@ -83,7 +84,8 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 
 - Steps 1 to 6 (session, origin, grant, resolve, options, replay key and budget) take only leaf
   locks, one at a time: policy (70), granted-rules view (71), session (60) and audit (90).
-- A duplicate then joins the in-flight slot (65), holding nothing else.
+- A duplicate then joins the in-flight slot (65), holding nothing else. Its request permit is
+  suspended while it waits (an original parked on an escalation can take minutes), resumed after.
 - **Parked wait** (`request`, ADR 0014 section 8.1). The escalation pre-checks read the
   granted-rules view (71) and take the escalation mutex (80), one at a time, before the replay
   key. The replay key is taken without budget (`claim_key`: session, 60). A fresh key then calls
@@ -146,7 +148,9 @@ events (90).
 held across the file write; under it the view is read and then swapped (71), one at a time. The
 writer is released before `bump_grant_epoch` (an atomic) or `bump_revocation_epoch` (the epoch
 gate, 69). After a revoke or clear the admin handler revokes stale sessions and closes browsers
-exactly as a reload does (steps 4 and 5 below).
+exactly as a reload does (`revoke_stale_bearers_and_close_browsers`, below). A clear also calls
+`EscalationService::cancel_profile` (escalation mutex 80, then the prompt driver table 82) after
+the store call has returned, with no lock held.
 
 **Escalation** (`EscalationService`; the ceremony side is the parked wait above). `join_or_create`
 reads the granted-rules view (71) through the grant writer and takes the escalation mutex (80)
@@ -173,8 +177,18 @@ withdraws the prompts (82).
 1. `agent_config` write (45);
 2. `reload_lock` (68);
 3. each policy lock in turn (70);
-4. then everything is released, and `revoke_stale_sessions` takes the registry maps (50);
-5. finally browser cleanup takes the bookkeeping locks and `browser_manager`.
+4. then everything is released, and `revoke_stale_sessions` takes the registry maps (50), one at a
+   time: it removes the stale sign and registration bearers, records them in the `revoked_*`
+   tombstone maps (so a late use is audited as `policy.deny(bearer_revoked)`, bounded per bearer)
+   and returns the leases they were bound to;
+5. `close_revoked_leases` takes `browser_manager` (30) and revokes, terminates, cleans up and
+   audits each returned lease (the audit gate, 90, under the browser manager: rule 5). A lease
+   an admin launched lives only in the manager, so it is closed here and not by the bookkeeping;
+6. finally browser cleanup takes the bookkeeping locks and `browser_manager`.
+
+The admin `browser launch` (`handle_launch_browser`), holding `browser_manager` (30), asks the
+registry (50) whether a live bearer is bound to the lease it found. A live lease with none (a
+revocation is closing it) is closed there and a fresh browser launched.
 
 ## Fixed in P5
 

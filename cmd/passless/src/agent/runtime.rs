@@ -162,6 +162,106 @@ fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> Protocol
     ProtocolError::new(code, error.to_string(), RecommendedAction::FixRequest)
 }
 
+/// The RP ID of an admin revoke request, normalized as the granted-rules store normalizes it
+/// (`validate_rp_id`), so the `granted_rule.revoke` audit names the rule that was removed. An
+/// invalid one is a bad request.
+fn normalize_admin_rp_id(raw: &str) -> Result<String, ProtocolError> {
+    passless_core::agent::validate_rp_id(raw).map_err(|e| {
+        ProtocolError::new(
+            ErrorCode::BadRequest,
+            format!("invalid RP ID: {e}"),
+            RecommendedAction::FixRequest,
+        )
+    })
+}
+
+/// Remove every granted rule of `profile_id` and audit it. An approval in flight may write its
+/// grant after the clear, so the profile's escalations are cancelled once the store has been
+/// cleared: a late approval is compensated (`escalation.revoked`, reason `policy_reload`) and its
+/// prompt is withdrawn. No lock is held on entry; the caller revokes the stale sessions.
+pub(crate) fn clear_granted_rules(
+    store: &GrantedRulesStore,
+    policy_runtime: &PolicyRuntime,
+    escalation: &EscalationService,
+    audit_gate: &AuditGate,
+    profile_id: &ProfileId,
+) -> Result<super::granted_rules::RevokeOutcome, ProtocolError> {
+    let outcome = store
+        .clear(policy_runtime, profile_id)
+        .map_err(granted_rules_error)?;
+    escalation.cancel_profile(profile_id);
+    if outcome.revoked > 0 {
+        let event = super::audit_events::GrantedRuleRevokeBuilder::new(
+            profile_id.clone(),
+            None,
+            outcome.revoked,
+        )
+        .build();
+        let _ = audit_gate.record(event);
+    }
+    Ok(outcome)
+}
+
+/// Close the leases named by `lease_ids` (see [`close_lease_audited`]); a lease that is already
+/// gone, or an id that does not parse, is skipped.
+fn close_leases_by_id(
+    audit_gate: &AuditGate,
+    sign_registry: &SignContextRegistry,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_ids: &[String],
+) {
+    for raw in lease_ids {
+        if let Ok(lease_id) = raw.parse::<BrowserLeaseId>() {
+            close_lease_audited(audit_gate, sign_registry, browser_mgr, &lease_id);
+        }
+    }
+}
+
+/// Revoke, terminate and clean up one lease and audit it: `browser.lease.revoke` (reason
+/// `policy_reload`, the reason a grant revocation shares with a reload), then the cleanup outcome.
+/// The audit gate is a terminal leaf, so it may be called under the browser manager.
+fn close_lease_audited(
+    audit_gate: &AuditGate,
+    sign_registry: &SignContextRegistry,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+) {
+    sign_registry.revoke_by_lease(lease_id.as_str());
+    if browser_mgr.revoke(lease_id).is_ok() {
+        let _ = audit_gate.record(
+            super::audit_events::BrowserLeaseRevokeBuilder::new(
+                lease_id.clone(),
+                super::audit_events::RevokeReason::PolicyReload,
+            )
+            .build(),
+        );
+    }
+    let _ = browser_mgr.terminate(lease_id);
+    let quarantine = match browser_mgr.cleanup(lease_id) {
+        Ok(super::browser::CleanupSafety::Clean) => None,
+        Ok(super::browser::CleanupSafety::Quarantined { .. }) => {
+            Some(super::audit_events::QuarantineReason::IntegrityViolation)
+        }
+        Ok(super::browser::CleanupSafety::Failed { .. }) => {
+            Some(super::audit_events::QuarantineReason::ManifestTampered)
+        }
+        // Already gone: nothing was closed, nothing to audit.
+        Err(_) => {
+            browser_mgr.remove(lease_id);
+            return;
+        }
+    };
+    let _ = audit_gate
+        .record(super::audit_events::BrowserLeaseCleanupBuilder::new(lease_id.clone()).build());
+    if let Some(reason) = quarantine {
+        let _ = audit_gate.record(
+            super::audit_events::BrowserLeaseQuarantineBuilder::new(lease_id.clone(), reason)
+                .build(),
+        );
+    }
+    browser_mgr.remove(lease_id);
+}
+
 /// Re-read and validate the configuration file, check it can replace `current` without a restart,
 /// and apply it to `policy_runtime`. On any error nothing changes: the old generation, sessions and
 /// revocation epoch stay in force (ADR 0014 section 6.4).
@@ -1639,6 +1739,39 @@ impl AgentRuntime {
         })
     }
 
+    /// The revocation epoch moved (a policy reload or a grant revocation): drop the stale bearers
+    /// (remembering them, so a late use is audited as `bearer_revoked`), then close every browser
+    /// that held one. The leases the stale bearers were bound to are terminated, cleaned up and
+    /// audited through the browser manager even when no profile bookkeeping names them (an
+    /// admin-launched lease lives only there); the profiles' tracked browsers are closed after.
+    /// Returns how many bearers were revoked. No lock is held on entry (LOCKING.md: reload).
+    fn revoke_stale_bearers_and_close_browsers(&self, current_epoch: u64) -> usize {
+        let stale = self.sign_registry.revoke_stale_sessions(current_epoch);
+        self.close_revoked_leases(&stale.lease_ids);
+        for profile in self.profiles.values() {
+            self.cleanup_all_browsers_for_profile(profile);
+        }
+        stale.revoked
+    }
+
+    /// Revoke, terminate, clean up and audit the leases named by `lease_ids` (a lease that is
+    /// already gone is skipped).
+    fn close_revoked_leases(&self, lease_ids: &[String]) {
+        if lease_ids.is_empty() {
+            return;
+        }
+        let mut browser_mgr = super::lock_order::lock(
+            &self.browser_manager,
+            super::lock_order::LockLevel::BrowserManager,
+        );
+        close_leases_by_id(
+            &self.audit_gate,
+            &self.sign_registry,
+            &mut browser_mgr,
+            lease_ids,
+        );
+    }
+
     fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime) {
         let mut leases: Vec<BrowserLeaseId> = profile
             .active_browser
@@ -3017,16 +3150,11 @@ impl AgentRuntime {
             for profile in self.profiles.keys() {
                 self.escalation.cancel_profile(profile);
             }
-            let revoked = self
-                .sign_registry
-                .revoke_stale_sessions(outcome.revocation_epoch);
+            let revoked = self.revoke_stale_bearers_and_close_browsers(outcome.revocation_epoch);
             info!(
                 "policy reloaded: generation {}, revocation epoch {}; {} bearer(s) revoked",
                 outcome.generation, outcome.revocation_epoch, revoked
             );
-            for profile in self.profiles.values() {
-                self.cleanup_all_browsers_for_profile(profile);
-            }
         } else {
             info!(
                 "policy reloaded: unchanged (generation {}); sessions kept",
@@ -3099,14 +3227,16 @@ impl AgentRuntime {
         &self,
         profile_id: &ProfileId,
         rp_id: &str,
-        action: &passless_core::agent::IntentAction,
+        action: &passless_core::agent::GrantAction,
     ) -> Result<AdminResponse, ProtocolError> {
         self.require_profile(profile_id)?;
+        let rp_id = normalize_admin_rp_id(rp_id)?;
+        let rp_id = rp_id.as_str();
         let action = match action {
-            passless_core::agent::IntentAction::Authenticate => {
+            passless_core::agent::GrantAction::Authenticate => {
                 super::granted_rules::GrantedAction::Authenticate
             }
-            passless_core::agent::IntentAction::Register => {
+            passless_core::agent::GrantAction::Register => {
                 return Err(ProtocolError::new(
                     ErrorCode::BadRequest,
                     "only authenticate rules are granted; registration is never granted",
@@ -3120,7 +3250,7 @@ impl AgentRuntime {
             .map_err(granted_rules_error)?;
         let event = super::audit_events::GrantedRuleRevokeBuilder::new(
             profile_id.clone(),
-            Some(rp_id.trim().to_ascii_lowercase()),
+            Some(rp_id.to_string()),
             outcome.revoked,
         )
         .build();
@@ -3137,18 +3267,14 @@ impl AgentRuntime {
         profile_id: &ProfileId,
     ) -> Result<AdminResponse, ProtocolError> {
         self.require_profile(profile_id)?;
-        let outcome = self
-            .granted_rules
-            .clear(&self.policy_runtime, profile_id)
-            .map_err(granted_rules_error)?;
+        let outcome = clear_granted_rules(
+            &self.granted_rules,
+            &self.policy_runtime,
+            &self.escalation,
+            &self.audit_gate,
+            profile_id,
+        )?;
         if outcome.revoked > 0 {
-            let event = super::audit_events::GrantedRuleRevokeBuilder::new(
-                profile_id.clone(),
-                None,
-                outcome.revoked,
-            )
-            .build();
-            let _ = self.audit_gate.record(event);
             self.revoke_sessions_after_grant_revocation(outcome);
         }
         Ok(AdminResponse::GrantedRulesRevoked {
@@ -3159,16 +3285,11 @@ impl AgentRuntime {
     /// The revocation epoch moved: revoke the stale bearers and close their browsers, as a reload
     /// that changed the policy does (the epoch is global, so every profile is affected).
     fn revoke_sessions_after_grant_revocation(&self, outcome: super::granted_rules::RevokeOutcome) {
-        let revoked = self
-            .sign_registry
-            .revoke_stale_sessions(outcome.revocation_epoch);
+        let revoked = self.revoke_stale_bearers_and_close_browsers(outcome.revocation_epoch);
         info!(
             "granted rules revoked: {} rule(s), revocation epoch {}; {} bearer(s) revoked",
             outcome.revoked, outcome.revocation_epoch, revoked
         );
-        for profile in self.profiles.values() {
-            self.cleanup_all_browsers_for_profile(profile);
-        }
     }
 
     fn handle_admin_list_credentials(
@@ -3194,7 +3315,7 @@ impl AgentRuntime {
                     .policy_runtime
                     .resolve(
                         &profile.profile_id,
-                        &passless_core::agent::protocol::IntentAction::Authenticate,
+                        &passless_core::agent::protocol::GrantAction::Authenticate,
                         rp,
                     )
                     .rule
@@ -3964,6 +4085,21 @@ impl AgentRuntime {
             &self.browser_manager,
             super::lock_order::LockLevel::BrowserManager,
         );
+
+        // A live lease whose bearers were all revoked (a grant revocation or a reload is closing
+        // it) is not reusable: close it here and launch a fresh browser.
+        if let Some(stale) = browser_manager.find_live_lease_for_profile(profile_id)
+            && !self
+                .sign_registry
+                .has_live_bearer_for_lease(stale.id.as_str())
+        {
+            close_lease_audited(
+                &self.audit_gate,
+                &self.sign_registry,
+                &mut browser_manager,
+                &stale.id,
+            );
+        }
 
         if let Some(existing_snapshot) = browser_manager.find_live_lease_for_profile(profile_id) {
             let cdp_endpoint = browser_manager
@@ -5280,5 +5416,138 @@ register = "deny"
 
         assert!(cleared, "matching lease should be removed on exit");
         assert!(!shared.contains_key(&profile_id));
+    }
+
+    /// A lease of `profile` running `/bin/sleep`, known only to the browser manager.
+    fn launch_sleeping_lease(
+        dir: &std::path::Path,
+        profile: &ProfileId,
+    ) -> (BrowserProcessManager, BrowserLeaseId) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = dir.join("runtime-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/bin/sleep"),
+            start_url: None,
+            extra_args: vec!["60".to_string()],
+            runtime_root: root,
+            ttl: Duration::from_secs(300),
+            login_timeout: Duration::from_secs(300),
+            rp_ids: vec!["example.com".to_string()],
+            start_url_rules: Vec::new(),
+            target_uid: unsafe { libc::getuid() },
+            target_gid: unsafe { libc::getgid() },
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::default(),
+            cdp_port: 9222,
+            bind_parent_death: true,
+        };
+        let mut manager = BrowserProcessManager::with_spawner(
+            Arc::new(super::super::browser::MockClock::new()),
+            Arc::new(super::super::browser::DirectExecSpawner),
+        );
+        let lease_id = manager
+            .launch(&config, EndpointId::new(), profile.clone())
+            .unwrap();
+        (manager, lease_id)
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[test]
+    fn admin_revoke_rp_ids_are_normalized_like_the_store_and_invalid_ones_rejected() {
+        assert_eq!(
+            normalize_admin_rp_id("  Example.COM ").unwrap(),
+            "example.com"
+        );
+        for bad in [
+            "",
+            "   ",
+            "https://example.com",
+            "example.com/path",
+            "example.com:8443",
+        ] {
+            let err = normalize_admin_rp_id(bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_bearers_lease_is_terminated_and_audited_though_only_the_manager_holds_it() {
+        use super::super::audit::test_support::read_audit_events;
+        use super::super::sign::tests::sign_handler_tests::TestFixture;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_gate = AuditGate::open(&audit_dir).unwrap();
+
+        let fixture = TestFixture::new(true);
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id) = launch_sleeping_lease(dir.path(), &profile);
+        let pid = manager.snapshot(&lease_id).unwrap().pid;
+        assert!(process_alive(pid));
+
+        // An admin-launched lease: a bearer bound to it in the registry, and nothing in any
+        // profile's bookkeeping.
+        let registry = SignContextRegistry::new();
+        let ctx = fixture.make_ctx();
+        let token = super::super::sign::generate_bearer_token().unwrap();
+        registry
+            .register_pending(token.clone(), ctx.clone(), Arc::new(fixture.make_handler()))
+            .unwrap();
+        registry.bind_lease(&token, lease_id.to_string()).unwrap();
+        assert!(registry.has_live_bearer_for_lease(lease_id.as_str()));
+
+        // The grant revocation bumped the epoch: the bearer is stale.
+        let stale = registry.revoke_stale_sessions(ctx.session.revocation_epoch() + 1);
+        assert_eq!(stale.lease_ids, vec![lease_id.to_string()]);
+        // Until the lease is closed it is live in the manager but no bearer guards it: an admin
+        // launch must not hand it out (`handle_launch_browser` checks exactly this).
+        assert!(!registry.has_live_bearer_for_lease(lease_id.as_str()));
+        assert!(manager.find_live_lease_for_profile(&profile).is_some());
+
+        close_leases_by_id(&audit_gate, &registry, &mut manager, &stale.lease_ids);
+
+        assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
+        assert!(manager.find_live_lease_for_profile(&profile).is_none());
+        let started = Instant::now();
+        while process_alive(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "browser not terminated"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let kinds: Vec<String> = read_audit_events(&audit_dir)
+            .iter()
+            .filter_map(|e| e["kind"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            kinds.contains(&"browser_lease.revoke".to_string()),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"browser_lease.cleanup".to_string()),
+            "{kinds:?}"
+        );
+
+        // The late bearer is remembered, so its use is audited, not silently unauthorized.
+        assert!(registry.lookup_revoked_sign(&token).is_some());
+
+        // Closing a lease that is already gone, or an id that is not one, is harmless.
+        close_leases_by_id(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &[lease_id.to_string(), "not-a-lease".to_string()],
+        );
     }
 }

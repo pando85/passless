@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use passless_core::agent::config::{ANY_RP_ID, validate_rp_id};
-use passless_core::agent::protocol::IntentAction;
+use passless_core::agent::protocol::GrantAction;
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
     EndpointId, GrantId, GrantSource, MatchedRule, NoGrantedRules, PendingRequestId, Policy,
@@ -70,10 +70,10 @@ impl PolicySnapshot {
             .any(|id| normalized.ends_with(&format!(".{}", id)))
     }
 
-    pub fn action_allowed(&self, action: &IntentAction) -> bool {
+    pub fn action_allowed(&self, action: &GrantAction) -> bool {
         let action_str = match action {
-            IntentAction::Register => "register",
-            IntentAction::Authenticate => "authenticate",
+            GrantAction::Register => "register",
+            GrantAction::Authenticate => "authenticate",
         };
         self.allowed_actions.contains(action_str)
     }
@@ -81,7 +81,7 @@ impl PolicySnapshot {
     /// Resolve `(action, rp_id)` over this snapshot's rules (ADR 0014 section 6.2).
     pub fn resolve(
         &self,
-        action: &IntentAction,
+        action: &GrantAction,
         rp_id: &str,
         grants: &dyn GrantSource,
     ) -> MatchedRule {
@@ -95,10 +95,10 @@ impl PolicySnapshot {
     }
 }
 
-fn policy_action(action: &IntentAction) -> PolicyAction {
+fn policy_action(action: &GrantAction) -> PolicyAction {
     match action {
-        IntentAction::Register => PolicyAction::Register,
-        IntentAction::Authenticate => PolicyAction::Authenticate,
+        GrantAction::Register => PolicyAction::Register,
+        GrantAction::Authenticate => PolicyAction::Authenticate,
     }
 }
 
@@ -201,7 +201,7 @@ pub struct PendingPrincipalRequest {
     process_digest: ProcessIdentityDigest,
     policy_generation: PolicyGenerationId,
     policy_digest: PolicyDigest,
-    action: IntentAction,
+    action: GrantAction,
     rp_id: String,
     credential_ref: Option<CredentialRef>,
     grant_request_id: Option<GrantRequestId>,
@@ -587,7 +587,7 @@ impl PolicyRuntime {
     pub fn resolve(
         &self,
         profile_id: &ProfileId,
-        action: &IntentAction,
+        action: &GrantAction,
         rp_id: &str,
     ) -> MatchedRule {
         let generation = self.current_generation();
@@ -1071,7 +1071,7 @@ pub struct PendingDelegationParams {
     pub session_id: PrincipalSessionId,
     pub endpoint_id: EndpointId,
     pub process_digest: ProcessIdentityDigest,
-    pub action: IntentAction,
+    pub action: GrantAction,
     pub rp_id: String,
     pub credential_ref: Option<CredentialRef>,
     pub policy_generation: PolicyGenerationId,
@@ -1089,7 +1089,7 @@ pub struct PendingStatusSnapshot {
     pub process_digest: ProcessIdentityDigest,
     pub policy_generation: PolicyGenerationId,
     pub policy_digest: PolicyDigest,
-    pub action: IntentAction,
+    pub action: GrantAction,
     pub rp_id: String,
     pub credential_ref: Option<CredentialRef>,
     pub grant_request_id: Option<GrantRequestId>,
@@ -1148,7 +1148,7 @@ mod tests {
 
     use super::super::browser::Clock;
     use super::super::identity::ProcessIdentityDigest;
-    use passless_core::agent::protocol::IntentAction;
+    use passless_core::agent::protocol::GrantAction;
 
     struct MockClock {
         inner: Mutex<MockInner>,
@@ -1276,7 +1276,7 @@ mod tests {
                 process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
                 policy_generation: generation.generation_id.clone(),
                 policy_digest: generation.digest.clone(),
-                action: IntentAction::Authenticate,
+                action: GrantAction::Authenticate,
                 rp_id: "example.com".to_string(),
                 credential_ref: None,
                 grant_request_id: None,
@@ -1361,16 +1361,16 @@ mod tests {
 
         let (runtime, _clock) = make_runtime(&config);
         let pid = ProfileId::new("rules").unwrap();
-        let auth = runtime.resolve(&pid, &IntentAction::Authenticate, "example.com");
+        let auth = runtime.resolve(&pid, &GrantAction::Authenticate, "example.com");
         assert_eq!(auth.action, RuleAction::Allow);
         assert_eq!(auth.rule, RuleIdentity::Exact("example.com".to_string()));
-        let reg = runtime.resolve(&pid, &IntentAction::Register, "example.com");
+        let reg = runtime.resolve(&pid, &GrantAction::Register, "example.com");
         assert_eq!(reg.action, RuleAction::Deny);
 
         let generation = runtime.current_generation();
         let snapshot = &generation.snapshots[0];
-        assert!(snapshot.action_allowed(&IntentAction::Authenticate));
-        assert!(!snapshot.action_allowed(&IntentAction::Register));
+        assert!(snapshot.action_allowed(&GrantAction::Authenticate));
+        assert!(!snapshot.action_allowed(&GrantAction::Register));
     }
 
     #[test]
@@ -1390,7 +1390,7 @@ mod tests {
 
         let (runtime, _clock) = make_runtime(&config);
         let pid = ProfileId::new("alldeny").unwrap();
-        for action in [IntentAction::Authenticate, IntentAction::Register] {
+        for action in [GrantAction::Authenticate, GrantAction::Register] {
             assert_eq!(
                 runtime.resolve(&pid, &action, "example.com").action,
                 RuleAction::Deny
@@ -1422,25 +1422,25 @@ mod tests {
         assert!(snapshot.is_rp_exact_match("github.com"));
         assert!(!snapshot.is_rp_exact_match("com"));
 
-        let github = runtime.resolve(&pid, &IntentAction::Authenticate, "github.com");
+        let github = runtime.resolve(&pid, &GrantAction::Authenticate, "github.com");
         assert_eq!(github.action, RuleAction::Allow);
         assert!(github.is_wildcard());
         assert_eq!(github.audit_rule(), Some("*"));
 
-        let bank = runtime.resolve(&pid, &IntentAction::Authenticate, "bank.example.com");
+        let bank = runtime.resolve(&pid, &GrantAction::Authenticate, "bank.example.com");
         assert_eq!(bank.configured, RuleAction::Request);
         assert_eq!(bank.action, RuleAction::Request);
         assert_eq!(bank.audit_rule(), Some("bank.example.com"));
 
         assert_eq!(
             runtime
-                .resolve(&pid, &IntentAction::Register, "github.com")
+                .resolve(&pid, &GrantAction::Register, "github.com")
                 .action,
             RuleAction::Deny
         );
         assert_eq!(
             runtime
-                .resolve(&pid, &IntentAction::Authenticate, "com")
+                .resolve(&pid, &GrantAction::Authenticate, "com")
                 .action,
             RuleAction::Deny
         );
@@ -1458,13 +1458,13 @@ mod tests {
         let (runtime, _clock) = make_runtime(&config);
         let pid = ProfileId::new("prec").unwrap();
 
-        let blocked = runtime.resolve(&pid, &IntentAction::Authenticate, "blocked.example.com");
+        let blocked = runtime.resolve(&pid, &GrantAction::Authenticate, "blocked.example.com");
         assert_eq!(blocked.action, RuleAction::Deny);
         assert_eq!(
             blocked.rule,
             RuleIdentity::Exact("blocked.example.com".to_string())
         );
-        let other = runtime.resolve(&pid, &IntentAction::Authenticate, "other.example.com");
+        let other = runtime.resolve(&pid, &GrantAction::Authenticate, "other.example.com");
         assert_eq!(other.action, RuleAction::Allow);
         assert_eq!(other.rule, RuleIdentity::Wildcard);
     }
@@ -1489,7 +1489,7 @@ mod tests {
                 ("granted", "wild.example.com"),
             ]));
         let pid = ProfileId::new("granted").unwrap();
-        let auth = IntentAction::Authenticate;
+        let auth = GrantAction::Authenticate;
 
         // An exact `request` rule with a matching grant becomes `allow`.
         let github = runtime.resolve(&pid, &auth, "github.com");
@@ -1534,11 +1534,11 @@ mod tests {
             ]));
         let pid = ProfileId::new("orphan").unwrap();
 
-        let denied = runtime.resolve(&pid, &IntentAction::Authenticate, "denied.example.com");
+        let denied = runtime.resolve(&pid, &GrantAction::Authenticate, "denied.example.com");
         assert_eq!(denied.action, RuleAction::Deny);
         assert!(!denied.granted);
 
-        let removed = runtime.resolve(&pid, &IntentAction::Authenticate, "removed.example.com");
+        let removed = runtime.resolve(&pid, &GrantAction::Authenticate, "removed.example.com");
         assert_eq!(removed.action, RuleAction::Deny);
         assert_eq!(removed.rule, RuleIdentity::None);
         assert!(!removed.granted);
@@ -1554,7 +1554,7 @@ mod tests {
             .unwrap()
             .with_grant_source(TestGrants::of(&[("regreq", "example.com")]));
         let pid = ProfileId::new("regreq").unwrap();
-        let reg = runtime.resolve(&pid, &IntentAction::Register, "example.com");
+        let reg = runtime.resolve(&pid, &GrantAction::Register, "example.com");
         assert_eq!(reg.action, RuleAction::Request);
         assert!(!reg.granted);
     }
@@ -1571,7 +1571,7 @@ mod tests {
         let pid = ProfileId::new("p_one").unwrap();
         assert_eq!(
             runtime
-                .resolve(&pid, &IntentAction::Authenticate, "example.com")
+                .resolve(&pid, &GrantAction::Authenticate, "example.com")
                 .action,
             RuleAction::Request
         );
@@ -1587,13 +1587,13 @@ mod tests {
         let pid = ProfileId::new("wildlocal").unwrap();
         assert_eq!(
             runtime
-                .resolve(&pid, &IntentAction::Authenticate, "localhost")
+                .resolve(&pid, &GrantAction::Authenticate, "localhost")
                 .action,
             RuleAction::Deny
         );
         assert_eq!(
             runtime
-                .resolve(&pid, &IntentAction::Register, "example.com")
+                .resolve(&pid, &GrantAction::Register, "example.com")
                 .action,
             RuleAction::Deny
         );
@@ -1616,9 +1616,9 @@ mod tests {
         let (runtime, _clock) = make_runtime(&config);
         let pid = ProfileId::new("wildsel").unwrap();
 
-        let wild = runtime.resolve(&pid, &IntentAction::Authenticate, "any.example.com");
+        let wild = runtime.resolve(&pid, &GrantAction::Authenticate, "any.example.com");
         assert_eq!(wild.selection, CredentialSelection::Single);
-        let exact = runtime.resolve(&pid, &IntentAction::Authenticate, "exact.example.com");
+        let exact = runtime.resolve(&pid, &GrantAction::Authenticate, "exact.example.com");
         assert_eq!(exact.selection, CredentialSelection::Newest);
     }
 
@@ -1627,7 +1627,7 @@ mod tests {
         let config = make_isolated_config("known", vec!["example.com"], false);
         let (runtime, _clock) = make_runtime(&config);
         let unknown = ProfileId::new("unknown").unwrap();
-        for action in [IntentAction::Authenticate, IntentAction::Register] {
+        for action in [GrantAction::Authenticate, GrantAction::Register] {
             let matched = runtime.resolve(&unknown, &action, "example.com");
             assert_eq!(matched.action, RuleAction::Deny);
             assert_eq!(matched.rule, RuleIdentity::None);
@@ -1640,7 +1640,7 @@ mod tests {
         let allow = make_isolated_config("live", vec!["example.com"], false);
         let (runtime, _clock) = make_runtime(&allow);
         let pid = ProfileId::new("live").unwrap();
-        let auth = IntentAction::Authenticate;
+        let auth = GrantAction::Authenticate;
         assert_eq!(
             runtime.resolve(&pid, &auth, "example.com").action,
             RuleAction::Allow
@@ -2024,7 +2024,7 @@ mod tests {
             process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
             policy_generation: PolicyGenerationId::new(),
             policy_digest: PolicyDigest::from_cbor_bytes(b"test"),
-            action: IntentAction::Authenticate,
+            action: GrantAction::Authenticate,
             rp_id: "example.com".to_string(),
             credential_ref: None,
             grant_request_id: None,

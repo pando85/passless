@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use passless_core::agent::config::{ANY_RP_ID, CredentialSelection, LOCALHOST_RP_ID};
 use passless_core::agent::protocol::{
-    ErrorCode, IntentAction, PrincipalResponse, ProtocolError, RecommendedAction,
+    ErrorCode, GrantAction, PrincipalResponse, ProtocolError, RecommendedAction,
     SignAssertionRequest, SignAssertionResponse,
 };
 use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
@@ -282,6 +282,7 @@ pub struct SignContextRegistry {
     entries: Mutex<HashMap<String, LeaseEntry>>,
     registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
     revoked_registrations: Mutex<RevokedRegistrations>,
+    revoked_signs: Mutex<RevokedSigns>,
 }
 
 /// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
@@ -294,7 +295,7 @@ pub struct RegistrationLeaseEntry {
     pub lease_id: Option<String>,
 }
 
-/// Most revoked registration bearers remembered so a late use can be refused and audited.
+/// Most revoked bearers of each kind remembered so a late use can be refused and audited.
 const MAX_REVOKED_REGISTRATIONS: usize = 256;
 /// Refusals recorded per revoked bearer; later attempts are still refused but not audited again,
 /// so a browser holding an old bearer cannot flood the audit log.
@@ -318,14 +319,45 @@ impl RevokedRegistration {
     }
 }
 
-#[derive(Default)]
-struct RevokedRegistrations {
-    order: std::collections::VecDeque<String>,
-    entries: HashMap<String, RevokedRegistration>,
+/// What is kept of a revoked sign bearer: enough to audit a late use, never to serve it.
+#[derive(Clone)]
+pub struct RevokedSign {
+    context: SignContext,
+    handler: Arc<SignHandler>,
+    refusals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl RevokedRegistrations {
-    fn remember(&mut self, token: String, entry: &RegistrationLeaseEntry) {
+impl RevokedSign {
+    /// Audit a refused authentication (bounded per bearer, see
+    /// `MAX_AUDITED_REFUSALS_PER_BEARER`). `rp_id` is the untrusted RP ID of the refused request,
+    /// if it named one.
+    pub fn refuse(&self, rp_id: Option<&str>) {
+        if self.refusals.fetch_add(1, Ordering::AcqRel) < MAX_AUDITED_REFUSALS_PER_BEARER {
+            self.handler.refuse_revoked_bearer(&self.context, rp_id);
+        }
+    }
+}
+
+/// The most recently revoked bearers of one kind, oldest evicted first.
+struct RevokedRing<T> {
+    order: std::collections::VecDeque<String>,
+    entries: HashMap<String, T>,
+}
+
+impl<T> Default for RevokedRing<T> {
+    fn default() -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+}
+
+type RevokedRegistrations = RevokedRing<RevokedRegistration>;
+type RevokedSigns = RevokedRing<RevokedSign>;
+
+impl<T> RevokedRing<T> {
+    fn remember(&mut self, token: String, entry: T) {
         if self.entries.contains_key(&token) {
             return;
         }
@@ -335,7 +367,23 @@ impl RevokedRegistrations {
             }
         }
         self.order.push_back(token.clone());
-        self.entries.insert(
+        self.entries.insert(token, entry);
+    }
+
+    fn find(&self, token: &str) -> Option<&T> {
+        let mut found = None;
+        for (k, v) in self.entries.iter() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                found = Some(v);
+            }
+        }
+        found
+    }
+}
+
+impl RevokedRegistrations {
+    fn remember_registration(&mut self, token: String, entry: &RegistrationLeaseEntry) {
+        self.remember(
             token,
             RevokedRegistration {
                 context: entry.context.clone(),
@@ -344,6 +392,27 @@ impl RevokedRegistrations {
             },
         );
     }
+}
+
+impl RevokedSigns {
+    fn remember_sign(&mut self, token: String, entry: &LeaseEntry) {
+        self.remember(
+            token,
+            RevokedSign {
+                context: entry.context.clone(),
+                handler: entry.handler.clone(),
+                refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+        );
+    }
+}
+
+/// The bearers a stale-session revocation removed: how many, and the browser leases they were
+/// bound to (each of which the caller must terminate).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StaleRevocation {
+    pub revoked: usize,
+    pub lease_ids: Vec<String>,
 }
 
 /// A bearer looked up for a request: the sign or the registration context behind it.
@@ -389,6 +458,7 @@ impl SignContextRegistry {
             entries: Mutex::new(HashMap::new()),
             registration_entries: Mutex::new(HashMap::new()),
             revoked_registrations: Mutex::new(RevokedRegistrations::default()),
+            revoked_signs: Mutex::new(RevokedSigns::default()),
         }
     }
 
@@ -404,6 +474,10 @@ impl SignContextRegistry {
 
     fn lock_revoked_registrations(&self) -> Tracked<MutexGuard<'_, RevokedRegistrations>> {
         lock_order::lock(&self.revoked_registrations, LockLevel::SignRegistry)
+    }
+
+    fn lock_revoked_signs(&self) -> Tracked<MutexGuard<'_, RevokedSigns>> {
+        lock_order::lock(&self.revoked_signs, LockLevel::SignRegistry)
     }
 
     /// The session already registered for `token` by the other context kind, if any.
@@ -502,14 +576,25 @@ impl SignContextRegistry {
 
     /// A registration bearer that was revoked; used only to refuse and audit a late registration.
     pub fn lookup_revoked_registration(&self, token: &str) -> Option<RevokedRegistration> {
-        let revoked = self.lock_revoked_registrations();
-        let mut found = None;
-        for (k, v) in revoked.entries.iter() {
-            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
-                found = Some(v);
-            }
-        }
-        found.cloned()
+        self.lock_revoked_registrations().find(token).cloned()
+    }
+
+    /// A sign bearer that was revoked; used only to refuse and audit a late authentication.
+    pub fn lookup_revoked_sign(&self, token: &str) -> Option<RevokedSign> {
+        self.lock_revoked_signs().find(token).cloned()
+    }
+
+    /// Whether a live (bound, not revoked) sign or registration bearer exists for `lease_id`.
+    pub fn has_live_bearer_for_lease(&self, lease_id: &str) -> bool {
+        let signed = self
+            .lock_entries()
+            .values()
+            .any(|e| e.lease_id.as_deref() == Some(lease_id));
+        signed
+            || self
+                .lock_registration_entries()
+                .values()
+                .any(|e| e.lease_id.as_deref() == Some(lease_id))
     }
 
     pub fn revoke_registration(&self, token: &str) -> bool {
@@ -520,7 +605,7 @@ impl SignContextRegistry {
         // Fail any request of this bearer that is already past authentication.
         entry.context.session.revoke();
         self.lock_revoked_registrations()
-            .remember(token.to_string(), &entry);
+            .remember_registration(token.to_string(), &entry);
         true
     }
 
@@ -568,9 +653,12 @@ impl SignContextRegistry {
     }
 
     pub fn revoke(&self, token: &str) -> bool {
-        match self.lock_entries().remove(token) {
+        let removed = self.lock_entries().remove(token);
+        match removed {
             Some(entry) => {
                 entry.context.session.revoke();
+                self.lock_revoked_signs()
+                    .remember_sign(token.to_string(), &entry);
                 true
             }
             None => false,
@@ -578,19 +666,22 @@ impl SignContextRegistry {
     }
 
     pub fn revoke_by_lease(&self, lease_id: &str) -> usize {
-        let removed: Vec<LeaseEntry> = {
+        let removed: Vec<(String, LeaseEntry)> = {
             let mut map = self.lock_entries();
             let keys: Vec<String> = map
                 .iter()
                 .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
                 .map(|(k, _)| k.clone())
                 .collect();
-            keys.iter().filter_map(|k| map.remove(k)).collect()
+            keys.into_iter()
+                .filter_map(|k| map.remove(&k).map(|entry| (k, entry)))
+                .collect()
         };
         let mut count = removed.len();
-        for entry in &removed {
+        for (_, entry) in &removed {
             entry.context.session.revoke();
         }
+        self.remember_revoked_signs(removed);
 
         // Registration bearers die with the lease too.
         let registration_keys: Vec<String> = self
@@ -607,35 +698,58 @@ impl SignContextRegistry {
         count
     }
 
+    /// Remember revoked sign bearers so a late use is refused and audited. Takes the tombstone
+    /// map after the entries guard is released (the registry maps never nest).
+    fn remember_revoked_signs(&self, removed: Vec<(String, LeaseEntry)>) {
+        if removed.is_empty() {
+            return;
+        }
+        let mut revoked = self.lock_revoked_signs();
+        for (token, entry) in &removed {
+            revoked.remember_sign(token.clone(), entry);
+        }
+    }
+
     /// Revoke every bearer whose session was created before `current_epoch` (a policy reload or a
     /// revocation bumped it). In-flight requests of those bearers fail before key use because they
-    /// re-check the epoch; this also drops the entries so the bearers are refused up front.
-    pub fn revoke_stale_sessions(&self, current_epoch: u64) -> usize {
-        let stale_sign: Vec<LeaseEntry> = {
+    /// re-check the epoch; this also drops the entries so the bearers are refused up front, and
+    /// remembers them so a late use is audited as `bearer_revoked`. The caller must terminate the
+    /// returned leases: the bearers no longer guard them.
+    pub fn revoke_stale_sessions(&self, current_epoch: u64) -> StaleRevocation {
+        let stale_sign: Vec<(String, LeaseEntry)> = {
             let mut map = self.lock_entries();
             let keys: Vec<String> = map
                 .iter()
                 .filter(|(_, e)| e.context.session.revocation_epoch() != current_epoch)
                 .map(|(k, _)| k.clone())
                 .collect();
-            keys.iter().filter_map(|k| map.remove(k)).collect()
+            keys.into_iter()
+                .filter_map(|k| map.remove(&k).map(|entry| (k, entry)))
+                .collect()
         };
-        for entry in &stale_sign {
+        let mut lease_ids: Vec<String> = Vec::new();
+        for (_, entry) in &stale_sign {
             entry.context.session.revoke();
+            lease_ids.extend(entry.lease_id.clone());
         }
-        let stale_registration: Vec<String> = self
+        let revoked_signs = stale_sign.len();
+        self.remember_revoked_signs(stale_sign);
+        let stale_registration: Vec<(String, Option<String>)> = self
             .lock_registration_entries()
             .iter()
             .filter(|(_, e)| e.context.session.revocation_epoch() != current_epoch)
-            .map(|(k, _)| k.clone())
+            .map(|(k, e)| (k.clone(), e.lease_id.clone()))
             .collect();
-        let mut count = stale_sign.len();
-        for key in stale_registration {
+        let mut revoked = revoked_signs;
+        for (key, lease_id) in stale_registration {
             if self.revoke_registration(&key) {
-                count += 1;
+                revoked += 1;
+                lease_ids.extend(lease_id);
             }
         }
-        count
+        lease_ids.sort();
+        lease_ids.dedup();
+        StaleRevocation { revoked, lease_ids }
     }
 
     pub fn revoke_all(&self) {
@@ -646,6 +760,7 @@ impl SignContextRegistry {
             entry.1.context.session.revoke();
         }
         *self.lock_revoked_registrations() = RevokedRegistrations::default();
+        *self.lock_revoked_signs() = RevokedSigns::default();
     }
 
     pub fn len(&self) -> usize {
@@ -1068,7 +1183,9 @@ impl Escalation<'_> {
     /// ceremony's capacity permit for the wait.
     ///
     /// The wait ends at the earliest of `deadline` (the transport's Chromium-clamped ceremony
-    /// deadline), `agents.escalation_timeout` and the session's expiry. An abort within
+    /// deadline) and `agents.escalation_timeout`. The session's expiry is not a deadline: the
+    /// waiter notices it through `still_valid` and reports `SessionInvalid` (`session_expired`,
+    /// no cooldown), not a timeout. An abort within
     /// [`super::escalation::DEADLINE_ABORT_GRACE`] of that point counts as a timeout (plan P7
     /// gap 8).
     pub fn wait(
@@ -1085,7 +1202,7 @@ impl Escalation<'_> {
             .map_err(escalation_refusal_error)?;
 
         let now = Instant::now();
-        let mut wait_deadline = deadline.min(self.session.expires_at());
+        let mut wait_deadline = deadline;
         if let Some(timeout) = timeout {
             wait_deadline = wait_deadline.min(now + timeout);
         }
@@ -1182,6 +1299,22 @@ impl SignHandler {
     ) -> ProtocolError {
         self.record_policy_deny(ctx, target, reason);
         error
+    }
+
+    /// Refuse and audit an authentication made with a bearer that was revoked (browser exit,
+    /// lease revocation or a policy change). The request never reaches policy or key use.
+    /// `rp_id` is the RP ID the refused request named, if any.
+    pub fn refuse_revoked_bearer(&self, ctx: &SignContext, rp_id: Option<&str>) {
+        // The request is untrusted: only a syntactically valid RP ID is recorded.
+        let rp_id = rp_id
+            .map(normalize_rp_id)
+            .filter(|rp| passless_core::agent::config::validate_rp_id(rp).is_ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        self.record_policy_deny(
+            ctx,
+            &AuditTarget::rp_only(&rp_id),
+            PolicyDenyReason::BearerRevoked,
+        );
     }
 
     /// Authenticate with the default ceremony deadline and no cancellation (tests and direct use).
@@ -1390,7 +1523,7 @@ impl SignHandler {
         //    copy of the profile configuration frozen into the session (plan R16).
         let matched = self.policy_runtime.resolve(
             &ctx.profile_id,
-            &IntentAction::Authenticate,
+            &GrantAction::Authenticate,
             &normalized_rp,
         );
         match matched.action {
@@ -1520,7 +1653,7 @@ impl SignHandler {
                 }
                 outcome
             }
-            Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled) {
+            Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled, park) {
                 JoinResult::Completed(outcome) => {
                     self.serve_duplicate(ctx, target, audit)?;
                     assertion_outcome(outcome)
@@ -1572,7 +1705,7 @@ impl SignHandler {
         // The approval persisted a grant: the live resolution must now be a granted `allow`.
         let approved =
             self.policy_runtime
-                .resolve(&ctx.profile_id, &IntentAction::Authenticate, target.rp_id);
+                .resolve(&ctx.profile_id, &GrantAction::Authenticate, target.rp_id);
         if approved.action != RuleAction::Allow || !approved.granted {
             return Err(self.deny(
                 ctx,
@@ -1859,7 +1992,7 @@ impl SignHandler {
             .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
         let matched =
             self.policy_runtime
-                .resolve(&ctx.profile_id, &IntentAction::Authenticate, rp_id);
+                .resolve(&ctx.profile_id, &GrantAction::Authenticate, rp_id);
         if matched.action != RuleAction::Allow {
             return Err(self.deny(
                 ctx,
@@ -2568,7 +2701,16 @@ pub(crate) mod tests {
                 .bind_lease(token, format!("lease-{token}"))
                 .unwrap();
         }
-        assert_eq!(registry.revoke_stale_sessions(2), 1);
+        let revoked = registry.revoke_stale_sessions(2);
+        assert_eq!(revoked.revoked, 1);
+        assert_eq!(revoked.lease_ids, vec![format!("lease-{stale}")]);
+        assert!(registry.has_live_bearer_for_lease(&format!("lease-{current}")));
+        assert!(!registry.has_live_bearer_for_lease(&format!("lease-{stale}")));
+        assert!(
+            registry.lookup_revoked_sign(&stale).is_some(),
+            "a stale bearer is remembered so a late use is audited"
+        );
+        assert!(registry.lookup_revoked_sign(&current).is_none());
         assert!(registry.lookup_bound(&stale).is_none());
         assert!(stale_ctx.session.is_revoked());
         assert!(registry.lookup_bound(&current).is_some());
@@ -5558,6 +5700,97 @@ pub(crate) mod tests {
             let err = ceremony.join().unwrap().unwrap_err();
             assert_eq!(err.code, ErrorCode::Unauthorized);
             assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn session_expiry_while_parked_is_session_expired_and_sets_no_cooldown() {
+            let f = escalation_fixture();
+            let mut ctx = f.make_ctx();
+            ctx.session = AgentSession::new(super::super::super::session::SessionBinding {
+                profile_id: f.profile_id.clone(),
+                principal_digest: [0u8; 32],
+                revocation_epoch: f.policy_runtime.revocation_epoch(),
+                ttl: Duration::from_millis(600),
+            });
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let err = ceremony.join().unwrap().unwrap_err();
+            // The session expired: not a timeout (`escalation_expired`, which starts a cooldown).
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.reasons(), vec!["session_expired".to_string()]);
+            assert_eq!(ctx.session.operations_used(), 0);
+            // No cooldown: a new session asks the same question and is prompted again.
+            let fresh = f.make_ctx();
+            let second = sign_on_thread(&f, &fresh, f.req_with_challenge(b"after-expiry"));
+            f.prompter.wait_shown(2);
+            f.prompter.decide(PromptEvent::Approved);
+            second
+                .join()
+                .unwrap()
+                .expect("the new session is prompted and signs");
+        }
+
+        #[test]
+        fn a_revoked_sign_bearer_is_remembered_and_its_late_use_is_audited_boundedly() {
+            let f = AuditTestFixture::default_allow();
+            let registry = SignContextRegistry::new();
+            let ctx = f.make_ctx();
+            let token = generate_bearer_token().unwrap();
+            registry
+                .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                .unwrap();
+            registry
+                .bind_lease(&token, "lease-sign".to_string())
+                .unwrap();
+            assert!(registry.lookup_revoked_sign(&token).is_none());
+
+            let epoch = f.policy_runtime.bump_revocation_epoch();
+            let stale = registry.revoke_stale_sessions(epoch);
+            assert_eq!(stale.revoked, 1);
+            assert_eq!(stale.lease_ids, vec!["lease-sign".to_string()]);
+            assert!(registry.lookup_bound(&token).is_none());
+
+            let revoked = registry.lookup_revoked_sign(&token).expect("remembered");
+            for _ in 0..MAX_AUDITED_REFUSALS_PER_BEARER + 4 {
+                revoked.refuse(Some(" Example.COM "));
+            }
+            let reasons = f.reasons();
+            assert_eq!(
+                reasons.len(),
+                MAX_AUDITED_REFUSALS_PER_BEARER,
+                "{reasons:?}"
+            );
+            assert!(reasons.iter().all(|r| r == "bearer_revoked"));
+            let events = read_audit_events(&f.audit_dir);
+            let deny = find_policy_events(&events);
+            assert_eq!(deny[0]["action"], "authenticate");
+            assert_eq!(deny[0]["rp_id"], "example.com");
+        }
+
+        #[test]
+        fn a_grants_clear_cancels_the_waiting_escalation() {
+            // What `handle_clear_granted_rules` does: clear the store, then cancel the profile's
+            // escalations, so an approval in flight cannot persist a grant after the clear.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let outcome = crate::agent::runtime::clear_granted_rules(
+                &f.store,
+                &f.policy_runtime,
+                &f.escalation,
+                &f.audit_gate,
+                &f.profile_id,
+            )
+            .expect("clear succeeds on an empty store");
+            assert_eq!(outcome.revoked, 0);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.prompter.withdrawn(), 1);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+            assert_eq!(granted(&f), 0);
             assert_eq!(f.key_provider.sign_calls(), 0);
         }
 

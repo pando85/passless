@@ -415,7 +415,7 @@ pub enum AdminRequest {
     RevokeGrantedRule {
         profile_id: ProfileId,
         rp_id: String,
-        action: IntentAction,
+        action: GrantAction,
     },
     /// Revoke every granted rule of a profile.
     ClearGrantedRules {
@@ -507,9 +507,12 @@ pub enum PrincipalRequest {
     SignAssertion(SignAssertionRequest),
 }
 
+/// The action a rule or a granted rule applies to. The wire form is `register` or `authenticate`
+/// (it was `IntentAction` before the principal intent protocol was removed; the names on the wire
+/// did not change).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub enum IntentAction {
+pub enum GrantAction {
     Register,
     Authenticate,
 }
@@ -2094,7 +2097,7 @@ mod tests {
             AdminRequest::RevokeGrantedRule {
                 profile_id: profile_id.clone(),
                 rp_id: "example.com".into(),
-                action: IntentAction::Authenticate,
+                action: GrantAction::Authenticate,
             },
             AdminRequest::ClearGrantedRules { profile_id },
         ]
@@ -2110,7 +2113,7 @@ mod tests {
         let empty_rp = AdminRequest::RevokeGrantedRule {
             profile_id: ProfileId::new("agent").unwrap(),
             rp_id: String::new(),
-            action: IntentAction::Authenticate,
+            action: GrantAction::Authenticate,
         };
         assert!(empty_rp.validate().is_err());
     }

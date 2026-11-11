@@ -28,6 +28,7 @@ use passless_core::agent::protocol::{
 };
 use passless_core::agent::{GrantId, ProfileId};
 
+use super::escalation::ParkHook;
 use super::lock_order::{self, LockLevel};
 
 /// How long a completed outcome is returned to an identical duplicate (ADR 0014 section 9).
@@ -44,6 +45,10 @@ pub const MAX_CEREMONY_TIMEOUT: Duration = Duration::from_secs(20 * 3600);
 /// Served duplicates of one replay key that are audited; later ones are still served, not audited,
 /// so a page that resubmits in a loop cannot flood the audit log.
 pub const MAX_AUDITED_SERVES_PER_KEY: u32 = 16;
+/// Joined duplicates of one in-flight ceremony whose request permit is suspended while they wait.
+/// Suspending frees the permit's capacity slots, so it is bounded per slot: a duplicate beyond
+/// this keeps its permit and the request caps bound it, as they bound any other request.
+pub const MAX_SUSPENDED_DUPLICATES_PER_KEY: usize = 4;
 /// How often a joined duplicate re-checks its cancellation while it waits.
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -144,6 +149,21 @@ fn internal_failure(message: &str) -> ProtocolError {
 pub struct InFlight {
     outcome: Mutex<Option<CeremonyOutcome>>,
     done: Condvar,
+    /// Duplicates waiting here with their request permit suspended.
+    suspended: AtomicUsize,
+}
+
+/// A duplicate waiting with its request permit suspended. Resumes the permit when dropped.
+struct SuspendedDuplicate<'a> {
+    in_flight: &'a InFlight,
+    hook: &'a mut dyn ParkHook,
+}
+
+impl Drop for SuspendedDuplicate<'_> {
+    fn drop(&mut self) {
+        self.hook.resume();
+        self.in_flight.suspended.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// What a joined duplicate gets.
@@ -162,7 +182,40 @@ impl InFlight {
         Self {
             outcome: Mutex::new(None),
             done: Condvar::new(),
+            suspended: AtomicUsize::new(0),
         }
+    }
+
+    /// Suspend the duplicate's request permit for the wait, unless the outcome is already there or
+    /// [`MAX_SUSPENDED_DUPLICATES_PER_KEY`] duplicates are already suspended on this slot. The
+    /// permit is resumed when the returned guard drops, also on unwinding.
+    fn suspend_duplicate<'a>(
+        &'a self,
+        hook: &'a mut dyn ParkHook,
+    ) -> Option<SuspendedDuplicate<'a>> {
+        if lock_order::lock(&self.outcome, LockLevel::InFlight).is_some() {
+            return None;
+        }
+        let mut current = self.suspended.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_SUSPENDED_DUPLICATES_PER_KEY {
+                return None;
+            }
+            match self.suspended.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        hook.suspend();
+        Some(SuspendedDuplicate {
+            in_flight: self,
+            hook,
+        })
     }
 
     fn publish(&self, outcome: CeremonyOutcome) {
@@ -176,10 +229,17 @@ impl InFlight {
 
     /// Wait for the original's outcome until `deadline`, checking `cancelled` between waits.
     /// Waiting never holds any lock but this slot's, and a detached duplicate leaves the original
-    /// running (V-L1).
-    pub fn join(&self, deadline: Instant, cancelled: &dyn Fn() -> bool) -> JoinResult {
+    /// running (V-L1). `park` suspends the duplicate's request permit while it waits (the
+    /// original may be parked on an escalation for minutes), resuming it afterwards.
+    pub fn join(
+        &self,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+    ) -> JoinResult {
         #[cfg(test)]
         test_hooks::on_join();
+        let _suspended = self.suspend_duplicate(park);
         loop {
             {
                 let slot = lock_order::lock(&self.outcome, LockLevel::InFlight);
@@ -633,7 +693,25 @@ pub(crate) mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+    use super::super::escalation::NoPark;
     use super::*;
+
+    /// Counts the suspensions and resumptions of a duplicate's permit.
+    #[derive(Default)]
+    struct CountingPark {
+        suspended: Arc<AtomicUsize>,
+        resumed: Arc<AtomicUsize>,
+    }
+
+    impl ParkHook for CountingPark {
+        fn suspend(&mut self) {
+            self.suspended.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn resume(&mut self) {
+            self.resumed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn binding(epoch: u64) -> SessionBinding {
         SessionBinding {
@@ -819,15 +897,23 @@ mod tests {
             panic!("expected a join");
         };
         // A duplicate that is cancelled detaches; the original is not affected.
-        let detached = slot.join(Instant::now() + Duration::from_secs(5), &|| true);
+        let detached = slot.join(
+            Instant::now() + Duration::from_secs(5),
+            &|| true,
+            &mut NoPark,
+        );
         assert!(matches!(detached, JoinResult::Detached));
-        let expired = slot.join(Instant::now(), &|| false);
+        let expired = slot.join(Instant::now(), &|| false, &mut NoPark);
         assert!(matches!(expired, JoinResult::DeadlineExceeded));
 
         let waiter = {
             let slot = slot.clone();
             std::thread::spawn(move || {
-                slot.join(Instant::now() + Duration::from_secs(10), &|| false)
+                slot.join(
+                    Instant::now() + Duration::from_secs(10),
+                    &|| false,
+                    &mut NoPark,
+                )
             })
         };
         std::thread::sleep(Duration::from_millis(50));
@@ -861,5 +947,78 @@ mod tests {
             ceremony_deadline(Some(u64::MAX), now),
             now + MAX_CEREMONY_TIMEOUT
         );
+    }
+
+    #[test]
+    fn a_joined_duplicate_suspends_its_permit_while_it_waits_and_resumes_it() {
+        let session = AgentSession::new(binding(1));
+        let (k, c) = key(CeremonyAction::Authenticate, "rp.test", b"c-park");
+        let Claim::Fresh(guard) = session.claim(k, c, 4, Instant::now()) else {
+            panic!("expected a fresh claim");
+        };
+        let Claim::Join(slot, _) = session.claim(k, c, 4, Instant::now()) else {
+            panic!("expected a join");
+        };
+        let park = CountingPark::default();
+        let (suspended, resumed) = (park.suspended.clone(), park.resumed.clone());
+        let waiter = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                let mut park = park;
+                slot.join(
+                    Instant::now() + Duration::from_secs(10),
+                    &|| false,
+                    &mut park,
+                )
+            })
+        };
+        let started = Instant::now();
+        while suspended.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "never suspended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Parked: the permit is suspended and not yet resumed.
+        assert_eq!(resumed.load(Ordering::SeqCst), 0);
+        guard.complete(&ok_outcome());
+        assert!(matches!(
+            waiter.join().unwrap(),
+            JoinResult::Completed(Ok(_))
+        ));
+        assert_eq!(suspended.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed.load(Ordering::SeqCst), 1);
+        assert_eq!(slot.suspended.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn suspended_duplicates_are_bounded_per_key_and_a_finished_slot_suspends_none() {
+        let slot = InFlight::new();
+        let mut parks: Vec<CountingPark> = (0..MAX_SUSPENDED_DUPLICATES_PER_KEY + 1)
+            .map(|_| CountingPark::default())
+            .collect();
+        let mut guards = Vec::new();
+        let mut iter = parks.iter_mut();
+        for _ in 0..MAX_SUSPENDED_DUPLICATES_PER_KEY {
+            guards.push(slot.suspend_duplicate(iter.next().unwrap()).unwrap());
+        }
+        let over = iter.next().unwrap();
+        assert!(slot.suspend_duplicate(over).is_none());
+        drop(guards);
+        assert_eq!(slot.suspended.load(Ordering::SeqCst), 0);
+        for park in &parks[..MAX_SUSPENDED_DUPLICATES_PER_KEY] {
+            assert_eq!(park.resumed.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            parks[MAX_SUSPENDED_DUPLICATES_PER_KEY]
+                .suspended
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        slot.publish(ok_outcome());
+        let mut park = CountingPark::default();
+        assert!(slot.suspend_duplicate(&mut park).is_none());
     }
 }

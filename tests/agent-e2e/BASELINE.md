@@ -18,9 +18,9 @@ and scenarios `2eff086`, `ccf6c0c`). Debug build, `--features agent`, no Rust ch
 - Gaps: E2E-26 proves sequential, in-order prompting with four RPs; the queue bound (1 active + 8 queued) needs several bearer
   sessions of one profile, which the harness cannot create (admin launch returns the profile's live lease; session-scoped browsers
   are killed after launch, B1), so the bound is covered by the coordinator unit tests.
-- Observed, not changed: after `agent-admin grants revoke|clear` the bearers are revoked but the managed browser keeps running,
-  and `browser launch` hands it back with the dead bearer (no start-URL tab); requests are refused `unauthorized` without a
-  `policy.deny` audit record. E2E-31 restarts the browser (killed, then launched again) as an operator would.
+- Fixed (review): `agent-admin grants revoke|clear` now terminates the managed browsers (the admin-launched one too),
+  `browser launch` then gives a fresh browser with the start-URL tab, and a request on the old bearer is refused and audited
+  `policy.deny(bearer_revoked)`. E2E-31 asserts all three (not yet re-run on the matrix).
 - E2E-20/escalation, filter id with a slash: `AGENT_E2E_FILTER=E2E-20/escalation` runs the scenario but `report.js` reports
   "matched no scenario" (exit 1); filter by `E2E-20` instead.
 

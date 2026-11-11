@@ -560,7 +560,9 @@ impl Shared {
         let Some(entry) = self.registry.lookup_for_hello(&bearer) else {
             // A bearer revoked with its browser lease is refused like an unknown one, but the
             // attempt is audited (bounded per bearer).
-            if let Some(revoked) = self.registry.lookup_revoked_registration(&bearer) {
+            if let Some(revoked) = self.registry.lookup_revoked_sign(&bearer) {
+                revoked.refuse(None);
+            } else if let Some(revoked) = self.registry.lookup_revoked_registration(&bearer) {
                 revoked.refuse(None);
             }
             return Err("unauthorized");
@@ -711,10 +713,15 @@ impl Shared {
 
         // Re-validate the bearer from scratch on every request (plan V-M5).
         let entry = match op {
-            Op::Get => self
-                .registry
-                .lookup_bound(&peer.bearer)
-                .map(BearerEntry::Sign),
+            Op::Get => match self.registry.lookup_bound(&peer.bearer) {
+                Some(entry) => Some(BearerEntry::Sign(entry)),
+                None => {
+                    if let Some(revoked) = self.registry.lookup_revoked_sign(&peer.bearer) {
+                        revoked.refuse(webauthn::refused_rp_id(op, body).as_deref());
+                    }
+                    None
+                }
+            },
             Op::Create => match self.registry.lookup_registration(&peer.bearer) {
                 Some(entry) => Some(BearerEntry::Register(entry)),
                 None => {

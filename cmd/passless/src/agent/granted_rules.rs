@@ -807,7 +807,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
-    use passless_core::agent::protocol::IntentAction;
+    use passless_core::agent::protocol::GrantAction;
     use passless_core::agent::{AgentConfig, RuleAction};
 
     use crate::agent::browser::SystemClock;
@@ -1287,16 +1287,16 @@ rule = "exact"
             .unwrap()
             .with_grant_source(store.clone());
 
-        let granted = policy.resolve(&profile(), &IntentAction::Authenticate, "example.com");
+        let granted = policy.resolve(&profile(), &GrantAction::Authenticate, "example.com");
         assert_eq!(granted.configured, RuleAction::Request);
         assert_eq!(granted.action, RuleAction::Allow);
         assert!(granted.granted);
 
-        let other = policy.resolve(&profile(), &IntentAction::Authenticate, "other.example");
+        let other = policy.resolve(&profile(), &GrantAction::Authenticate, "other.example");
         assert_eq!(other.action, RuleAction::Request);
         assert!(!other.granted);
 
-        let register = policy.resolve(&profile(), &IntentAction::Register, "example.com");
+        let register = policy.resolve(&profile(), &GrantAction::Register, "example.com");
         assert_eq!(register.action, RuleAction::Deny);
 
         // Revoking the grant takes the upgrade away on the next resolution.
@@ -1308,7 +1308,7 @@ rule = "exact"
                 GrantedAction::Authenticate,
             )
             .unwrap();
-        let revoked = policy.resolve(&profile(), &IntentAction::Authenticate, "example.com");
+        let revoked = policy.resolve(&profile(), &GrantAction::Authenticate, "example.com");
         assert_eq!(revoked.action, RuleAction::Request);
     }
 

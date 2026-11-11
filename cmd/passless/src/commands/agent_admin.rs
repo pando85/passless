@@ -561,7 +561,7 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
                 rp_id: rp_id.clone(),
                 action: match action {
                     AdminGrantAction::Authenticate => {
-                        passless_core::agent::IntentAction::Authenticate
+                        passless_core::agent::GrantAction::Authenticate
                     }
                 },
             }
