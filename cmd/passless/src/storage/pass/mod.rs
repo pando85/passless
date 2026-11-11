@@ -889,6 +889,50 @@ mod tests {
         fs::write(dir.join(".gpg-id"), content).unwrap();
     }
 
+    /// Install an executable fake `gpg` shell script at `path`.
+    ///
+    /// Tests run on parallel threads of one process. While this thread holds the
+    /// script open for writing, another thread's `fork` can briefly inherit that
+    /// write descriptor, and `exec` of a file with a writer fails with ETXTBSY
+    /// ("Text file busy") until that child has exec'd. The script therefore
+    /// answers a probe argument immediately, and this helper only returns once a
+    /// probe run has been spawned successfully, so the code under test never
+    /// races the fork window.
+    #[cfg(unix)]
+    fn write_fake_gpg(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PROBE_ARG: &str = "--passless-test-probe";
+        const ETXTBSY: i32 = 26;
+
+        let body = body
+            .strip_prefix("#!/bin/sh\n")
+            .expect("fake gpg script must start with #!/bin/sh");
+        let script = format!("#!/bin/sh\n[ \"$1\" = '{PROBE_ARG}' ] && exit 0\n{body}");
+
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match Command::new(path).arg(PROBE_ARG).status() {
+                Ok(status) => {
+                    assert!(status.success(), "fake gpg probe failed: {status}");
+                    return;
+                }
+                Err(error)
+                    if error.raw_os_error() == Some(ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("failed to probe fake gpg: {error}"),
+            }
+        }
+    }
+
     fn create_adapter(store_root: &Path) -> PassStorageAdapter {
         PassStorageAdapter {
             store_path: store_root.to_path_buf(),
@@ -942,8 +986,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gnupg_affinity_reuses_successful_key_for_same_recipient_policy() {
-        use std::os::unix::fs::PermissionsExt;
-
         const KEY2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -985,10 +1027,7 @@ exit 2
             log = log.display(),
             key = KEY2,
         );
-        fs::write(&fake_gpg, script).unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        write_fake_gpg(&fake_gpg, &script);
 
         let target = target_dir.join("aa.gpg");
         let mut adapter = create_adapter(root);
@@ -1021,8 +1060,6 @@ exit 2
     #[cfg(unix)]
     #[test]
     fn gnupg_affinity_is_invalidated_when_gpg_id_policy_changes() {
-        use std::os::unix::fs::PermissionsExt;
-
         const KEY2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1048,10 +1085,7 @@ printf plaintext
             log = log.display(),
             key = KEY2,
         );
-        fs::write(&fake_gpg, script).unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        write_fake_gpg(&fake_gpg, &script);
 
         let target = target_dir.join("aa.gpg");
         let mut adapter = create_adapter(root);
@@ -1324,8 +1358,6 @@ printf plaintext
     #[cfg(unix)]
     #[test]
     fn gnupg_encrypt_forwards_recipient_selectors_verbatim_and_in_order() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake_gpg = dir.path().join("gpg");
         let args_file = dir.path().join("args");
@@ -1334,10 +1366,7 @@ printf plaintext
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat >/dev/null\nexit 0\n",
             args_file.display()
         );
-        fs::write(&fake_gpg, script).unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        write_fake_gpg(&fake_gpg, &script);
 
         let recipients = vec![
             "alice@example.com".to_string(),
@@ -1372,18 +1401,12 @@ printf plaintext
     #[cfg(unix)]
     #[test]
     fn gnupg_encrypt_propagates_recipient_rejection() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake_gpg = dir.path().join("gpg");
-        fs::write(
+        write_fake_gpg(
             &fake_gpg,
             "#!/bin/sh\ncat >/dev/null\necho 'gpg: error reading key: No public key' >&2\nexit 2\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        );
 
         let recipients = vec!["definitely-not-a-real-recipient".to_string()];
         let error = encrypt_with_gnupg_binary(
