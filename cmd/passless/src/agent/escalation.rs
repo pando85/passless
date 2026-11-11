@@ -10,11 +10,15 @@
 //!   creating ceremony.
 //! - Each profile shows at most one prompt at a time; other keys wait in a FIFO bounded at
 //!   [`MAX_QUEUED_PER_PROFILE`]. Overflow is refused with `escalation_queue_full`.
-//! - Waiters are capped per session ([`MAX_WAITERS_PER_SESSION`]), per profile
-//!   ([`MAX_WAITERS_PER_PROFILE`]) and globally ([`MAX_WAITERS_GLOBAL`]).
+//! - Waiters are capped per session ([`MAX_WAITERS_PER_SESSION`]) and per profile
+//!   ([`MAX_WAITERS_PER_PROFILE`]); a profile at its cap never affects another. The global bound
+//!   ([`MAX_WAITERS_GLOBAL`]) is a safety limit on parked threads, sized so that no realistic
+//!   number of profiles reaches it.
 //! - A deny or a timeout starts the key's cooldown. Withdrawals (the last waiter left, or the
 //!   notification server went away) are rate-limited (V-M2): the third within
-//!   [`WITHDRAWAL_WINDOW`] starts the cooldown too.
+//!   [`WITHDRAWAL_WINDOW`] starts the cooldown too. The cooldown map never evicts a live cooldown
+//!   (review L1): when it is full, new escalations are refused
+//!   ([`EscalationRefusal::TrackingFull`]) instead.
 //! - When the last waiter leaves, a queued entry is dequeued and an active prompt is withdrawn at
 //!   once; `escalation.expired` is recorded with `reason = aborted` (or `timeout`).
 //!
@@ -70,15 +74,20 @@ use super::session::{AgentSession, CeremonyAction};
 pub const MAX_QUEUED_PER_PROFILE: usize = 8;
 /// Escalation waiters per bearer session.
 pub const MAX_WAITERS_PER_SESSION: usize = 4;
-/// Escalation waiters per profile.
+/// Escalation waiters per profile. This is the cap that isolates profiles from each other
+/// (ADR 0014 section 8.2: a profile at its cap leaves other profiles unaffected).
 pub const MAX_WAITERS_PER_PROFILE: usize = 16;
-/// Escalation waiters in the whole daemon (bounds the parked ceremony threads).
-pub const MAX_WAITERS_GLOBAL: usize = 64;
+/// Escalation waiters in the whole daemon: a safety bound on the parked ceremony threads, not a
+/// fairness limit. It is 64 times [`MAX_WAITERS_PER_PROFILE`], so one profile (or a few) can never
+/// starve another of waiters; it is reached only if 64 profiles are each saturated at once.
+pub const MAX_WAITERS_GLOBAL: usize = 1024;
 /// The V-M2 window: the third withdrawal of a key within it starts the key's cooldown.
 pub const WITHDRAWAL_WINDOW: Duration = Duration::from_secs(600);
 /// Withdrawals within [`WITHDRAWAL_WINDOW`] that start the cooldown.
 pub const WITHDRAWALS_BEFORE_COOLDOWN: usize = 3;
-/// Keys each of the cooldown and withdrawal maps tracks; beyond it the oldest entry is evicted.
+/// Keys each of the cooldown and withdrawal maps tracks. The withdrawal map evicts its oldest
+/// entry beyond it. The cooldown map never evicts a live cooldown (a human's deny must hold):
+/// when live cooldowns plus live escalations reach it, new escalations are refused.
 pub const MAX_TRACKED_KEYS: usize = 4096;
 /// Longest a waiter parks before it re-checks its cancellation, deadline and session.
 pub const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -199,6 +208,9 @@ pub enum EscalationRefusal {
     QueueFull,
     /// A per-session, per-profile or global waiter cap is reached.
     WaiterCap,
+    /// The cooldown table is full of live cooldowns (review L1): no new escalation is admitted
+    /// until one expires, so that no live cooldown is ever evicted.
+    TrackingFull,
     /// A registration escalation for the key is already pending.
     Busy,
     /// The profile holds `max_granted_rules` grants.
@@ -216,6 +228,7 @@ impl EscalationRefusal {
             Self::Cooldown => PolicyDenyReason::EscalationCooldown,
             Self::QueueFull => PolicyDenyReason::EscalationQueueFull,
             Self::WaiterCap => PolicyDenyReason::EscalationWaiterCap,
+            Self::TrackingFull => PolicyDenyReason::EscalationTrackingFull,
             Self::Busy => PolicyDenyReason::EscalationBusy,
             Self::GrantCapReached => PolicyDenyReason::GrantCapReached,
             Self::GrantsUnavailable => PolicyDenyReason::GrantsUnavailable,
@@ -583,20 +596,25 @@ impl Inner {
 
     fn start_cooldown(&mut self, key: &EscalationKey, now: MonotonicTime, cooldown: Duration) {
         self.withdrawals.remove(key);
-        // Prune on every insert, so the map holds live cooldowns only, then cap it.
+        // Prune on every insert, so the map holds live cooldowns only. A live cooldown is never
+        // evicted (review L1): an agent with a broad `request` rule could otherwise push out the
+        // cooldown a human's deny just set. The size is bounded at admission instead (`admit`
+        // refuses a new escalation while live cooldowns plus live escalations fill the table),
+        // and a cooldown only ever starts for a key that has a live escalation, so this insert
+        // always has room.
         self.cooldown.retain(|_, until| now < *until);
-        if !self.cooldown.contains_key(key) && self.cooldown.len() >= MAX_TRACKED_KEYS {
-            // Nothing is expired after the prune: the oldest cooldown overall goes.
-            let oldest = self
-                .cooldown
-                .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                self.cooldown.remove(&oldest);
-            }
-        }
         self.cooldown.insert(key.clone(), later(now, cooldown));
+    }
+
+    /// Whether the cooldown table has no room for another escalation: every live cooldown, plus a
+    /// slot for each live escalation (which may end in a cooldown), fills it. Expired cooldowns
+    /// are pruned first, so an entry that ran out frees its slot.
+    fn tracking_full(&mut self, now: MonotonicTime) -> bool {
+        if self.cooldown.len() + self.by_key.len() < MAX_TRACKED_KEYS {
+            return false;
+        }
+        self.cooldown.retain(|_, until| now < *until);
+        self.cooldown.len() + self.by_key.len() >= MAX_TRACKED_KEYS
     }
 
     /// Count a withdrawal of `key` (V-M2); the third within the window starts the cooldown.
@@ -633,6 +651,9 @@ impl Inner {
         }
     }
 
+    /// The per-session and per-profile caps (ADR 0014 section 8.2: a profile at its cap does not
+    /// affect another) and the global safety bound, which is far above what the per-profile caps
+    /// of a realistic number of profiles add up to.
     fn check_waiter_caps(
         &self,
         profile: &ProfileId,
@@ -669,6 +690,11 @@ impl Inner {
             }
             self.check_waiter_caps(&request.profile, request.session)?;
             return Ok(Some(serial));
+        }
+        // A new escalation may end in a cooldown: refuse it while the table is full of live ones
+        // rather than evict one (review L1).
+        if self.tracking_full(now) {
+            return Err(EscalationRefusal::TrackingFull);
         }
         if let Some(slot) = self.profiles.get(&request.profile) {
             let pending = slot.queue.len() + usize::from(slot.active.is_some());
@@ -2574,8 +2600,34 @@ mod tests {
             .join_or_create(request("q", "a.example", 6))
             .unwrap();
         drop(other);
-        // Fill the global cap with profiles of 16 waiters each.
-        for p in 0..3 {
+        // Review L3: saturated profiles never starve another one. Many profiles at their own cap
+        // (far more than the old shared cap of 64 allowed) leave a fresh profile able to wait.
+        for p in 0..8 {
+            for session in 0..4 {
+                for _ in 0..MAX_WAITERS_PER_SESSION {
+                    held.push(
+                        h.service
+                            .join_or_create(request(
+                                &format!("s{p}"),
+                                "a.example",
+                                5000 + p * 10 + session,
+                            ))
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+        assert!(held.len() > 64);
+        let fresh = h
+            .service
+            .join_or_create(request("newcomer", "a.example", 6000))
+            .expect("a saturated profile does not affect another");
+        drop(fresh);
+        for _ in 0..8 * 4 * MAX_WAITERS_PER_SESSION {
+            held.pop();
+        }
+        // Fill the global safety bound with profiles of 16 waiters each.
+        for p in 0..63 {
             for session in 0..4 {
                 for _ in 0..MAX_WAITERS_PER_SESSION {
                     held.push(
@@ -3218,27 +3270,70 @@ mod tests {
         assert_eq!(inner.cooldown.len(), 1);
         assert!(inner.cooldown.contains_key(&key(2)));
 
-        // Past the cap the oldest cooldown goes; a refresh of a present key evicts nothing.
+        // An expired entry is dropped on the next insert.
         let long = Duration::from_secs(3_600);
         let mut inner = Inner::default();
         for index in 0..MAX_TRACKED_KEYS {
             inner.start_cooldown(&key(index), at(1_000 + index as u64), long);
         }
         assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
-        inner.start_cooldown(&key(MAX_TRACKED_KEYS - 1), at(9_000), long);
-        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
-        assert!(inner.cooldown.contains_key(&key(0)));
-        for index in MAX_TRACKED_KEYS..MAX_TRACKED_KEYS + 10 {
-            inner.start_cooldown(&key(index), at(10_000 + index as u64), long);
-            assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
-        }
-        assert!(!inner.cooldown.contains_key(&key(0)));
-        assert!(!inner.cooldown.contains_key(&key(9)));
-        assert!(inner.cooldown.contains_key(&key(10)));
-        assert!(inner.cooldown.contains_key(&key(MAX_TRACKED_KEYS + 9)));
-        // An expired entry is dropped before a live one is evicted.
         inner.start_cooldown(&key(99_999), at(10_000_000 + 3_600_000), long);
         assert_eq!(inner.cooldown.len(), 1);
+    }
+
+    /// Review L1: a live cooldown is never evicted. The table refuses new escalations when it is
+    /// full, so an agent with a broad `request` rule cannot push out a cooldown the human just
+    /// set by denying.
+    #[test]
+    fn a_full_cooldown_table_refuses_new_escalations_and_evicts_nothing() {
+        let long = Duration::from_secs(3_600);
+        let mut inner = Inner::default();
+        for index in 0..MAX_TRACKED_KEYS {
+            inner.start_cooldown(&key(index), at(1_000 + index as u64), long);
+        }
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        let now = at(60_000);
+
+        // A new key is refused, not admitted at the expense of an old cooldown.
+        let fresh = request("p", "fresh.example", 1);
+        assert_eq!(
+            inner.admit(&fresh, &fresh.key(), now),
+            Err(EscalationRefusal::TrackingFull)
+        );
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        // The oldest cooldown (the human's deny, say) is untouched and still refuses its key.
+        assert!(inner.in_cooldown(&key(0), now));
+        let oldest = request("p", "0.example", 1);
+        assert_eq!(
+            inner.admit(&oldest, &oldest.key(), now),
+            Err(EscalationRefusal::Cooldown)
+        );
+        // A refresh of a present key evicts nothing either.
+        inner.start_cooldown(&key(MAX_TRACKED_KEYS - 1), at(70_000), long);
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        assert!(inner.cooldown.contains_key(&key(0)));
+
+        // Once cooldowns expire the table has room again.
+        let after = at(1_000 + 3_600_000 + MAX_TRACKED_KEYS as u64 + 1);
+        assert!(matches!(inner.admit(&fresh, &fresh.key(), after), Ok(None)));
+    }
+
+    /// Live escalations count against the table too: each may end in a cooldown, and that insert
+    /// must never need an eviction.
+    #[test]
+    fn live_escalations_count_against_the_cooldown_table() {
+        let mut inner = Inner::default();
+        let long = Duration::from_secs(3_600);
+        for index in 0..MAX_TRACKED_KEYS - 1 {
+            inner.start_cooldown(&key(index), at(1_000), long);
+        }
+        // One slot left: the next key takes it as a live escalation.
+        inner.by_key.insert(key(MAX_TRACKED_KEYS), 1);
+        let next = request("p", "next.example", 1);
+        assert_eq!(
+            inner.admit(&next, &next.key(), at(2_000)),
+            Err(EscalationRefusal::TrackingFull)
+        );
     }
 
     #[test]

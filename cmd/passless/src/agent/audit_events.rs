@@ -74,8 +74,8 @@ const SECTION_12_OPERATION_EXTRAS: &[(&str, &[&str])] = &[
         "policy.allow",
         &["authorization", "user_presence", "user_verification"],
     ),
-    ("policy.deny", &["reason"]),
-    ("policy.replay_served", &["reason"]),
+    ("policy.deny", &["reason", "suppressed"]),
+    ("policy.replay_served", &["reason", "suppressed"]),
     ("operation.terminal", &[]),
 ];
 
@@ -595,7 +595,7 @@ impl BackendKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
     Register,
@@ -971,6 +971,12 @@ pub struct PolicyDenyMeta {
     #[serde(flatten)]
     op: Box<OperationRecord>,
     reason: PolicyDenyReason,
+    /// Null on an ordinary record. On a coalesced `policy.deny` summary (ADR 0014 section 12) it
+    /// is the number of further refusals of the same session, RP, action and reason that were
+    /// not written individually since the last record of that key. Always null on
+    /// `policy.replay_served`.
+    #[serde(default)]
+    suppressed: Option<u64>,
 }
 
 /// The terminal record of a reservation: the common operation fields with the final result.
@@ -1025,7 +1031,11 @@ impl OperationResult {
             | R::SessionExpired
             | R::StaleGeneration => Self::Revoked,
             R::EscalationExpired | R::JoinTimeout => Self::Timeout,
-            R::EscalationBusy | R::EscalationQueueFull | R::EscalationWaiterCap => Self::Busy,
+            R::EscalationBusy
+            | R::EscalationQueueFull
+            | R::EscalationWaiterCap
+            | R::EscalationTrackingFull
+            | R::ReplayTableFull => Self::Busy,
             R::ReplayServed => Self::ReplayServed,
             R::AuditFailure
             | R::CounterPersistenceFailure
@@ -1165,6 +1175,13 @@ impl OperationRecord {
         self
     }
 
+    /// Name another RP ID (a coalesced summary that covers refusals of several RPs names
+    /// `unknown`).
+    pub fn with_rp_id(mut self, rp_id: &str) -> Self {
+        self.rp_id = rp_id.to_string();
+        self
+    }
+
     pub fn session(mut self, session_id_hash: Option<String>, request_id: Option<String>) -> Self {
         self.session_id_hash = session_id_hash;
         self.request_id = request_id;
@@ -1272,7 +1289,7 @@ pub struct TransportVersionSkewMeta {
     relay_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyDenyReason {
     DefaultDeny,
@@ -1301,6 +1318,13 @@ pub enum PolicyDenyReason {
     EscalationQueueFull,
     /// A waiter cap was reached: per session, per profile or global (ADR 0014 section 8.2).
     EscalationWaiterCap,
+    /// The escalation cooldown table is full of live cooldowns, so no new escalation is admitted
+    /// until one expires; no live cooldown is evicted (review L1).
+    EscalationTrackingFull,
+    /// The session's replay table is full of entries that are in flight or still inside the
+    /// outcome window, so the request is refused as busy rather than evicting an entry (ADR 0014
+    /// section 9).
+    ReplayTableFull,
     /// A registration escalation for the same profile and RP is already pending; registration
     /// escalations are not joinable (ADR 0014 section 8.3).
     EscalationBusy,
@@ -2293,6 +2317,7 @@ impl PolicyAllowBuilder {
 pub struct PolicyDenyBuilder {
     op: OperationRecord,
     reason: PolicyDenyReason,
+    suppressed: Option<u64>,
 }
 
 impl PolicyDenyBuilder {
@@ -2305,7 +2330,15 @@ impl PolicyDenyBuilder {
         Self {
             op: OperationRecord::new(profile_id, action, rp_id),
             reason,
+            suppressed: None,
         }
+    }
+
+    /// Make this a coalesced summary: `count` further refusals of its key were not written
+    /// individually (ADR 0014 section 12).
+    pub fn suppressed(mut self, count: u64) -> Self {
+        self.suppressed = Some(count);
+        self
     }
 
     /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
@@ -2341,6 +2374,7 @@ impl PolicyDenyBuilder {
         let meta = PolicyDenyMeta {
             op: Box::new(op),
             reason: self.reason,
+            suppressed: if replay { None } else { self.suppressed },
         };
         if replay {
             AuditEvent::new(AuditPayload::PolicyReplayServed(meta))
@@ -3712,6 +3746,8 @@ mod tests {
             (R::EscalationExpired, OperationResult::Timeout),
             (R::EscalationQueueFull, OperationResult::Busy),
             (R::EscalationWaiterCap, OperationResult::Busy),
+            (R::EscalationTrackingFull, OperationResult::Busy),
+            (R::ReplayTableFull, OperationResult::Busy),
             (R::EscalationDenied, OperationResult::Denied),
             (R::ActionNotAllowed, OperationResult::Denied),
             (R::OriginInvalid, OperationResult::Denied),

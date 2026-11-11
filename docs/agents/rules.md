@@ -41,7 +41,10 @@ A `request` rule raises an escalation when the agent makes a request:
    denied without a prompt.
 
 Other limits: one prompt per profile at a time, a bounded queue behind it, and a cap on waiting
-requests (4 per session, 16 per profile, 64 in all). A request over a limit is denied and audited. If
+requests (4 per session and 16 per profile; one profile at its limit does not affect another, and a
+global bound of 1024 only protects the daemon's threads). A request over a limit is denied and
+audited. When the table of cooldowns is full, new escalations are refused instead of evicting a
+cooldown. If
 no notification server with action support is running, a `request` is denied immediately and audited;
 `passless doctor --agents` warns about this. Headless hosts should use explicit `allow` rules.
 
