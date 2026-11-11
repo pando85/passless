@@ -35,6 +35,7 @@ async function waitForPage(context, url, timeoutMs = 15000) {
  * @param {object|false} [o.notify]            {script:[...]} or false to skip the double (the private bus then has no
  *                                             notification server: escalation is denied `escalation_unavailable`)
  * @param {object} [o.agents]                  raw `[agents]` keys, e.g. {escalation_cooldown: 2}
+ * @param {string} [o.browserScope]            `browser_scope` of every profile (default "profile")
  * @param {object} [o.daemonEnv]
  */
 async function createStack(label, variant, o) {
@@ -53,6 +54,7 @@ async function createStack(label, variant, o) {
       profiles,
       limits: o.limits,
       agents: o.agents,
+      browserScope: o.browserScope,
       browserExe: variant.browser.exe,
       browserArgs: [...variantArgs(variant), ...rpBrowserArgs(rpList)],
       env: o.daemonEnv,

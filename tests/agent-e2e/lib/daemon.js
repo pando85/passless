@@ -38,6 +38,7 @@ function tomlValue(v) {
  * @param {string} o.browserExe
  * @param {object} [o.limits]  `[agents.limits]` keys
  * @param {object} [o.agents]  extra raw `[agents]` keys (`escalation_cooldown`, `escalation_timeout`, `state_dir`, ...)
+ * @param {string} [o.browserScope]  `browser_scope` of every profile (default "profile", see below)
  * Per profile: `max_granted_rules`.
  */
 function renderConfig(env, o) {
@@ -58,10 +59,11 @@ function renderConfig(env, o) {
     b.push(`browser_command = ${tomlValue([o.browserExe, ...(o.browserArgs || [])])}`);
     // Isolated profiles must not set browser_runtime_root; the daemon then uses $XDG_RUNTIME_DIR/passless/browser.
     if (mode === 'same-user') b.push(`browser_runtime_root = ${q(path.join(env.dirs.run, 'browser'))}`);
-    // browser_scope = "profile": with the default "session" scope the browser gets PR_SET_PDEATHSIG, which
-    // Linux delivers when the *thread* that spawned it exits, i.e. the short-lived IPC handler thread of
-    // `agent-admin browser launch`. The browser would be SIGTERMed right after launch (baseline finding).
-    b.push('browser_scope = "profile"', 'browser_cdp_expose = "port"', 'browser_cdp_port = 0');
+    // browser_scope = "profile" by default: it was the only scope that survived its launch before defect B1 was
+    // fixed in P10 (PR_SET_PDEATHSIG follows the thread that forked the browser, which was the short-lived IPC
+    // handler thread). The daemon now forks browsers on a long-lived launcher thread; E2E-46/session-scope runs
+    // `browserScope: 'session'` as the B1 regression.
+    b.push(`browser_scope = ${q(o.browserScope || 'profile')}`, 'browser_cdp_expose = "port"', 'browser_cdp_port = 0');
     if (mode === 'isolated') {
       const base = path.join(env.dirs.work, 'iso', name);
       fs.mkdirSync(path.join(base, 'credentials'), { recursive: true, mode: 0o700 });

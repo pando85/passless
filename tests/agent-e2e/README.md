@@ -73,12 +73,19 @@ old bearer as `bearer_revoked`, so a scenario launches a fresh browser (E2E-31).
 CI subset: E2E-23, 24, 25, 27, 28, 29, 31, 48, 50 (about 5 to 15 s each). Full matrix only: E2E-20/escalation (6 min
 approval), 21 (3 min timeout), 26, 30, 43, 44, 49. E2E-26 proves sequential prompting in arrival order with four RPs; the queue
 bound (1 active + 8 queued) needs several bearer sessions of one profile, which the harness cannot create (admin launch
-returns the profile's live lease; `browser_scope = "session"` browsers are killed after launch, B1), so the bound is covered by
-the coordinator unit tests. E2E-44/startup-refusal stays `xfailUntil: 'P10'` (R19).
+returns the profile's live lease), so the bound is covered by the coordinator unit tests. E2E-44 sets
+`agents.allow_automatic_human_path`; E2E-44/startup-refusal proves agents refuse to start without it (R19).
+
+Containment (P10a): every managed browser runs under `bwrap --dev-bind / / --dev /dev --die-with-parent` (E2E-46 reads its
+`/dev` through `/proc/<pid>/root`); E2E-46/refused disables bwrap and expects the launch refusal; E2E-46/session-scope is the
+defect B1 regression (`browserScope: 'session'`; every other scenario uses `browser_scope = "profile"`). E2E-45/cdp-context
+relies on the incognito seed; E2E-47/unloadable waits out the 30 s attach timeout.
 
 Debug-build daemon hooks (set through `daemonEnv`): `PASSLESS_E2E_HOLD_REQUEST_MS` holds each request before its
 ceremony (an abort or disconnect then lands before key use), `PASSLESS_E2E_HOLD_RESULT_MS` holds each successful
-result after key use.
+result after key use, `PASSLESS_E2E_OMIT_AGENT_EXTENSION` drops the generated extension directory (E2E-47),
+`PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` writes a manifest the browser refuses to load (E2E-47/unloadable) and
+`PASSLESS_E2E_DISABLE_BWRAP` makes the launcher treat bwrap as unavailable (E2E-46/refused).
 
 ## Expected failures
 

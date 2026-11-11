@@ -10,8 +10,9 @@ const { requestProfile, start, settle, waitForEscalation } = require('../lib/esc
 //
 // What it cannot prove end to end: the queue bound itself. Overflowing 1 active + 8 queued needs 10 distinct keys, which
 // needs at least three bearer sessions of one profile (4 waiters each). The harness launches a browser through
-// `agent-admin browser launch`, which returns the profile's existing live lease (one bearer session per profile), and a
-// `browser_scope = "session"` browser is killed right after launch (defect B1, P10). The bound and the FIFO order are covered
+// `agent-admin browser launch`, which returns the profile's existing live lease (one bearer session per profile; defect
+// B1, which killed `browser_scope = "session"` browsers, is fixed in P10, but several principal sessions need the P10b
+// `passless agent browser` path). The bound and the FIFO order are covered
 // by the coordinator unit tests (`escalation.rs`: queue overflow, FIFO, dequeue); the caps that E2E can reach are in E2E-48.
 const HOSTS = ['rp-a.test', 'rp-b.test', 'rp-c.test', 'rp-d.test'];
 

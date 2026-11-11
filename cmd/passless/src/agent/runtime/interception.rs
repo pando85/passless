@@ -18,12 +18,19 @@
 //! outlives the worker, so while the extension stays loaded a request wakes a stopped or
 //! disconnected worker and is delivered to it. Only a lost or failed attachment (the worker
 //! reports `attached = false`) would leave requests to the browser's native path; containing that
-//! case is the `bwrap` layer (plan D6 layer 3, P10), not this one.
+//! case is the private `/dev` (plan D6 layer 3, `containment.rs`), not this layer.
 //!
-//! Withholding the endpoint is advisory in port mode until P10: the browser's own
-//! `DevToolsActivePort` file in the profile stays readable by a same-UID agent, which can find the
-//! loopback port without asking the daemon. The `cdp-endpoint` file the daemon writes into the
-//! lease directory exists only while the lease is attached.
+//! "Attached" includes incognito access (plan D4): a worker that reports
+//! `isAllowedIncognitoAccess() = false` would leave off-the-record and CDP-created contexts
+//! unintercepted, so its launch fails and its endpoint is withheld like a degraded one.
+//!
+//! In port mode the withholding is discovery hygiene, not a boundary: the launcher removes
+//! Chromium's `DevToolsActivePort` from the profile once it has read the endpoint, and the
+//! `cdp-endpoint` file the daemon writes into the lease directory exists only while the lease is
+//! attached, but a same-UID agent can still find the loopback listener (`/proc/net/tcp` and the
+//! descriptors of its own processes) and DevTools' `/json/version` names the WebSocket URL. Port
+//! mode trusts the local environment (ADR 0014 section 4.3); what a request that bypasses the
+//! extension could reach is bounded by the private `/dev` either way.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -215,10 +215,14 @@ revocation is closing it) is closed there and a fresh browser launched.
 
 ## Known bounded waits (not deadlocks)
 
-- `browser_manager` is held across a browser launch (up to the CDP discovery timeout of about
-  30 s, then up to `INTERCEPTION_ATTACH_TIMEOUT`, 30 s, for the worker to attach), across the
-  bootstrap's wait for a reconnecting worker (at most the 10 s degraded grace period) and across
-  `terminate` (up to about 8 s). The first sign of a lease waits for it to
+- `browser_manager` is held across a browser launch and across `terminate` (up to about 8 s). A
+  launch runs the containment probe (`bwrap` run once as the browser's user, at most 10 s,
+  `containment.rs`), then the spawn, which is handed to the long-lived launcher thread and waited
+  for over a channel (`spawn_on_launcher_thread`, defect B1; that thread takes no lock, so the
+  hand-off adds no lock edge and the lock order is unchanged), then up to the CDP discovery timeout
+  of about 30 s and up to `INTERCEPTION_ATTACH_TIMEOUT`, 30 s, for the worker to attach. It is also
+  held across the bootstrap's wait for a reconnecting worker (at most the 10 s degraded grace
+  period). The first sign of a lease waits for it to
   activate the lease, holding no backend lock, so the human CTAP path is not delayed.
 - A revocation waits for a key use that already passed its re-check (rule 6): one signature or
   one credential write.

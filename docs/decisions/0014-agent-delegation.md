@@ -353,7 +353,11 @@ on the filesystem and the UID:
   and Chrome for Testing are verified before they are supported under containment).
 - The private `/dev` is required, and the launcher refuses to start the browser without it, when
   the browser's UID could open any `/dev/hidraw*` (no `bwrap`, or no unprivileged user namespaces,
-  means refusal).
+  means refusal). The check is `faccessat(AT_EACCESS, R_OK | W_OK)` over every `/dev/hidraw*`, run
+  in the child that would exec the browser, after its credential drop, so it is evaluated as the
+  browser's UID and groups; whether `bwrap` works is probed as that user too. The browser is forked
+  on a long-lived launcher thread: its parent-death signal, and `bwrap --die-with-parent`, follow
+  the forking thread, so a browser forked on a request thread would die when the request returned.
 - In a distinct-UID deployment where the browser user cannot open any hidraw node, containment is
   not required. `passless doctor` reports which case applies: required and in place, in place as
   defence in depth, not required, or refused.
@@ -363,9 +367,13 @@ on the filesystem and the UID:
   disconnected, or has reported `attached = false`, for longer than a 10-second grace period.
   Degraded does not mean that requests go native: the attachment is browser-side state, and while
   the extension stays loaded a request wakes the worker (§11). Only a lost or failed attachment
-  leaves the native path, which the private `/dev` contains. In port mode the withholding is
-  advisory until that containment lands, because the browser's `DevToolsActivePort` stays readable
-  by a same-UID agent.
+  leaves the native path, which the private `/dev` contains. A worker that is not allowed in
+  incognito (§4.2) counts as not attached: the launch fails and the endpoint is withheld. In port
+  mode the withholding is discovery hygiene, not a boundary: the launcher removes the browser's
+  `DevToolsActivePort` once it has read the endpoint, but a same-UID agent can still find the
+  loopback listener (socket tables and its own processes' descriptors) and read the WebSocket URL
+  from DevTools' `/json/version`. Port mode already trusts the local environment (§4.3); the
+  private `/dev` bounds what a request that bypasses the extension can reach.
 
 `PASSLESS_INTERACTION_MODE=automatic` (PR #505) affects only the human CTAP path and never approves
 an escalation. Because it would let a request that reaches the native path be signed silently, the
@@ -734,7 +742,9 @@ can ptrace the daemon, read its memory and descriptors, and reach the sign socke
 attempt OS isolation here; the boundary is policy, session limits and audit, like ssh-agent or
 gpg-agent. Omitting `PR_SET_NO_NEW_PRIVS` in the same-UID port-mode spawn is intentional (it would
 break Chromium's sandbox helper). Spawn hygiene is reliability, not security: the same-UID spawn
-closes inherited daemon descriptors and sets `PR_SET_PDEATHSIG`; rlimits are optional. The user unit's
+marks inherited daemon descriptors close-on-exec and sets `PR_SET_PDEATHSIG` from the long-lived
+launcher thread, so the browser dies with the daemon and not with the request that launched it;
+rlimits are optional. The user unit's
 `systemd-analyze security` score is accepted. Namespace and seccomp work does not apply. The
 human/agent boundary still applies, so escalation integrity (§8.2) is in scope, with one residual
 risk: a same-UID agent can drive the user's notification server and approve its own escalation
@@ -938,10 +948,10 @@ References are `file:line` at commit `130eaa5`.
 | Granted-rules location | **Done (P7).** `agents.state_dir` with unit-specific defaults; `agents.notify_user` validated (§8.2, §8.4) | — |
 | CLI naming | **Done (P7).** Granted rules under `passless agent-admin grants`; session grants under `agent-admin sessions` and principal sessions under `agent-admin principals`, with the old `delegation` and `session` names as hidden aliases for one release (§8.4) | — |
 | Same-UID self-approval | Not documented | Planned (P11): documented residual risk; `notify_user` differs from every principal and browser user (§8.2, §13, §15) |
-| Supported browsers | No detection; the launcher can start with `--disable-extensions` (`browser.rs:2040-2044`) | Planned (P2, P10): launch error without the extension; Chromium and Chrome for Testing accepted; branded Chrome and `chrome-headless-shell` rejected; root-owned binaries only in distinct-UID deployments (§4.2) |
-| Incognito and CDP-created contexts | The extension is not active in them; requests go native | Planned (P10): `Default/Preferences` seeded with `incognito = true` for the manifest-key extension ID; startup verification fails closed (§4.2) |
-| Native-path containment | A request the extension does not handle can reach the human UHID device | Planned (P2, P6, P10): fail closed; private `/dev` through `bwrap` whenever available, required (launcher refusal) when the browser UID can open hidraw; invariant 25 (§7) |
-| Automatic interaction mode with agents | Not guarded | Planned (P10): agents refuse to start unless `agents.allow_automatic_human_path = true`; `doctor` flags it (§7) |
+| Supported browsers | **Done (P2):** a missing or unloadable extension is a launch error (`verify_extension_dir`; E2E-47, and E2E-47/unloadable since P10a). No browser detection yet. P10a verified Chromium 156, Playwright Chromium (Chrome for Testing 155) and Chrome for Testing 157, headed and `--headless=new`, under the private `/dev` (Chromium's own sandbox on, extension and proxy attach, incognito seed honoured) | Planned (P10b): Chromium and Chrome for Testing accepted; branded Chrome and `chrome-headless-shell` rejected; root-owned binaries only in distinct-UID deployments (§4.2) |
+| Incognito and CDP-created contexts | **Done (P10a).** The launcher seeds the fresh profile's `Default/Preferences` with `extensions.settings.<id>.incognito = true` for the manifest-key extension ID (`seed_incognito_access`, `browser.rs`); the worker reports `isAllowedIncognitoAccess()` in its hello; a worker that is attached but not allowed in incognito is not intercepting (`BearerReadiness::intercepting`, `transport/readiness.rs`), so the launch fails (`LaunchError::IncognitoNotAllowed`) and the bootstrap withholds the endpoint (E2E-45/cdp-context) | — |
+| Native-path containment | **Done (P10a)** for the launcher: the browser runs under `bwrap --dev-bind / / --dev /dev --die-with-parent` whenever `bwrap` works for the browser's user (`ContainmentPlan`, `containment.rs`; `/dev/shm` is bound through only when a path the browser needs lives there); otherwise the child refuses to exec when `faccessat(AT_EACCESS, R_OK \| W_OK)` finds an openable `/dev/hidraw*`, after the credential drop (`LaunchError::ContainmentRefused`); `containment::assess` reports the case. Port mode removes `DevToolsActivePort` after discovery. E2E-45, 46, 46/refused, 47 | Planned (P10b): `passless doctor --agents` reports the case (§7) |
+| Automatic interaction mode with agents | **Done (P10a).** Agents refuse to start, and a reload is rejected, when `PASSLESS_INTERACTION_MODE=automatic` and a same-user profile has an `allow` or `request` rule, unless `agents.allow_automatic_human_path = true` (`AgentConfig::validate_human_path_interaction`); the human path stays up (E2E-44/startup-refusal) | Planned (P10b): `doctor` flags it (§7) |
 | Principal relationship | **Done (P9).** One `PrincipalRelationship` type (`deployment.rs`) derives `shared-uid` or `distinct-uid` from the principal UID against the daemon UID; audit records (`principal_relationship`, next to `mode`) and `passless doctor` (`deployment_axes` check per profile) use it. The shared-UID `isolated` warning is a passing `isolated_shared_uid` doctor check and a `warn` log line at daemon start. A shared-UID principal is no longer a fatal start-up check: only a root principal is (`principal_not_root`) | — |
 | User guides | Describe `confirm`, presets, `registration_allowed` | Planned (P11): rewrite when the code lands |
 | Backend separation | **Done.** `CredentialBackendHandle`, `CredentialNamespace` (`backend.rs:18-73`) | — |
@@ -950,7 +960,7 @@ References are `file:line` at commit `130eaa5`.
 | Agents off by default | **Done.** `AgentConfig.enabled` defaults to false (`config.rs:989`) | — |
 | D-Bus sender validation | **Done.** zbus match on server unique name, others rejected; since P7 in the prompt child (`escalation_prompt.rs`) | — |
 | Session (grant) audit events | **Done.** Request and approve recorded (`grant.rs:571`, `grant.rs:639`) | — |
-| Shared-UID spawn hygiene | **Done.** FD closure and `PR_SET_PDEATHSIG` (`browser.rs:2248-2257`) | — |
+| Shared-UID spawn hygiene | **Done.** Inherited descriptors marked close-on-exec and `PR_SET_PDEATHSIG` armed after any credential drop, with a parent re-check (`HardenedChildSetup::apply`, `launcher.rs`); browsers forked on the long-lived launcher thread (`spawn_on_launcher_thread`), so a `browser_scope = "session"` browser no longer dies with the IPC thread that launched it (defect B1, P10a; E2E-46/session-scope) | — |
 | Distinct-UID systemd baseline | **Done.** Baseline directives (`contrib/systemd/passless-agent.service:64-71`) | Evaluated directives including `PrivateDevices`, namespaces, seccomp (§13) |
 
 ## 20. History

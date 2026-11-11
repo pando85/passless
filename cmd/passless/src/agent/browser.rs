@@ -2328,7 +2328,7 @@ fn generate_agent_extension(
     write_extension_file(
         &ext_dir,
         "manifest.json",
-        EXTENSION_MANIFEST_TEMPLATE,
+        &extension_manifest(),
         0o644,
         target_uid,
         target_gid,
@@ -2347,6 +2347,22 @@ fn generate_agent_extension(
     }
 
     Ok(ext_dir)
+}
+
+/// The manifest to write: the committed one, verbatim. Debug builds only: with
+/// `PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` set it asks for a browser version no browser has, so
+/// the launcher's checks pass but the browser refuses to load the extension (E2E-47/unloadable).
+/// Release builds have no such hook.
+fn extension_manifest() -> String {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION").is_some()
+        && let Ok(mut manifest) =
+            serde_json::from_str::<serde_json::Value>(EXTENSION_MANIFEST_TEMPLATE)
+    {
+        manifest["minimum_chrome_version"] = serde_json::Value::from("9999");
+        return manifest.to_string();
+    }
+    EXTENSION_MANIFEST_TEMPLATE.to_string()
 }
 
 /// Debug and test builds only: lets E2E-47 and the unit tests simulate an extension directory that is

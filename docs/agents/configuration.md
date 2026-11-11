@@ -33,6 +33,10 @@ audit_path = "/var/lib/passless-agent/audit"
   decision; unset, the ceremony's own timeout applies. 1 to 72000.
 - `escalation_cooldown` (seconds, default 600): how long a denied or expired escalation key is
   denied without a prompt. 60 to 86400 (debug builds accept 1).
+- `allow_automatic_human_path` (default false): with `PASSLESS_INTERACTION_MODE=automatic` the
+  human authenticator approves its own prompts, so a request from a managed browser that reached
+  the native path would be signed silently. Agents then refuse to start (and a reload is
+  rejected) while any same-user profile has an `allow` or `request` rule, unless this is `true`.
 
 ## Profile structure
 
@@ -247,6 +251,13 @@ be isolated between human credentials and agent credentials.
 Agents have no UHID or hidraw device (they use the browser extension path only), so profiles need no
 `[device]` table. A legacy `[agents.profiles.<id>.device]` table is still parsed, logged as deprecated
 and ignored.
+
+The managed browser itself must never reach the human authenticator's hidraw device (ADR 0014
+section 7). The daemon runs it under `bwrap` (bubblewrap) with a private `/dev` that has no
+`hidraw*` and no `uhid` whenever `bwrap` works for the browser's user, which needs unprivileged
+user namespaces. Without it, a launch is refused when the browser's user can open any
+`/dev/hidraw*`: install bubblewrap, or set `browser_user` to a user that cannot open hidraw
+devices. Inside the private `/dev` the browser renders without the GPU (`/dev/dri` is hidden).
 
 ## CDP exposure
 

@@ -15,9 +15,10 @@ const { stopExtensionWorker, extensionWorkerTargets } = require('../lib/browser'
 // - conditional mediation: isConditionalMediationAvailable() is false and a conditional get() is rejected at once with
 //   NotAllowedError, without reaching the daemon;
 // - worker stopped: the request wakes the worker and the proxy handles it (agent path, audited allow).
-// E2E-45/cdp-context (P10): a page in a CDP-created browser context (Target.createBrowserContext).
-// Not covered: an unloaded extension (chrome.runtime.reload()); no product path unloads it (plan D1), and D6 layer 3
-// (no device access) is what contains it.
+// E2E-45/cdp-context: a page in a CDP-created browser context (Target.createBrowserContext), intercepted because the
+// launcher seeds incognito access for the extension (plan D4) and the launch requires the worker to report it.
+// Not covered here: an unloaded extension (chrome.runtime.reload()); no product path unloads it (plan D1), and D6
+// layer 3 (no device access, E2E-46) is what contains it.
 scenario({ id: 'E2E-45', title: 'never native: before attach, conditional mediation, worker stopped', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
@@ -105,16 +106,12 @@ async function evaluateInTarget(cdp, targetId, expression, timeoutMs = 20000) {
 }
 
 // A page in a CDP-created browser context (Target.createBrowserContext, as an agent's CDP client may create) is an
-// off-the-record profile: the proxy covers it only once the daemon seeds incognito access for the extension (plan D4,
-// P10). Until then such a request would go NATIVE, i.e. to every FIDO hidraw device this user can open (including a
-// real Passless instance or security key). So the scenario never issues a ceremony there unless the proxy is proven
-// attached: it first asks isConditionalMediationAvailable() (false only under the proxy, true natively; spike Q6) and
-// fails before any get() when it is true. That failure is the expected one until P10.
-scenario({
-  id: 'E2E-45/cdp-context', title: 'never native: request from a CDP-created browser context', ci: true,
-  xfailUntil: 'P10', xfailMatch: /CDP-created context is not intercepted/,
-  xfailReason: 'incognito access is seeded in P10; until then a CDP-created context is not covered by the WebAuthn proxy',
-}, async ctx => {
+// off-the-record profile: the proxy covers it only because the daemon seeds incognito access for the extension (plan
+// D4) and refuses the launch unless the worker reports isAllowedIncognitoAccess() = true. Without that such a request
+// would go native (contained by the private /dev, E2E-46). The scenario still never issues a ceremony there unless the
+// proxy is proven attached: it first asks isConditionalMediationAvailable() (false only under the proxy, true
+// natively; spike Q6) and fails before any get() when it is true.
+scenario({ id: 'E2E-45/cdp-context', title: 'never native: request from a CDP-created browser context', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },
@@ -124,6 +121,7 @@ scenario({
   const logBefore = stack.daemon.log().length;
   const b = await stack.open('agent', `${rp.origin}/raw`);
   assertInterceptionActive(b);
+  assert.equal(b.lease.incognito_allowed, true, `the launch reports incognito access: ${JSON.stringify(b.lease)}`);
 
   const cdp = await b.browser.newBrowserCDPSession();
   const { browserContextId } = await cdp.send('Target.createBrowserContext', {});

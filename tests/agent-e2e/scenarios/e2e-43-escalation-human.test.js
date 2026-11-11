@@ -32,8 +32,13 @@ scenario({ id: 'E2E-43', title: 'a human ceremony completes while an escalation 
 
 // PASSLESS_INTERACTION_MODE=automatic approves only the daemon's own human UHID path (cmd/passless/src/notification.rs).
 // Escalation never reads it: the agent request still prompts, and with nobody approving it is never auto-approved.
+// The operator acknowledges the combination (`agents.allow_automatic_human_path`, R19); without it agents refuse to
+// start (E2E-44/startup-refusal).
 scenario({ id: 'E2E-44', title: 'automatic interaction mode never auto-approves an escalation' }, async ctx => {
-  const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['deny:500'] }, daemonEnv: { PASSLESS_INTERACTION_MODE: 'automatic' } });
+  const stack = await ctx.stack({
+    ...ONE_RP, notify: { script: ['deny:500'] }, agents: { allow_automatic_human_path: true },
+    daemonEnv: { PASSLESS_INTERACTION_MODE: 'automatic' },
+  });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
   const b = await stack.open('agent', `${rp.origin}/raw`);
@@ -54,11 +59,10 @@ scenario({ id: 'E2E-44', title: 'automatic interaction mode never auto-approves 
   assert.equal(storeFingerprint(stack.daemon), fingerprint, 'nothing was signed');
 });
 
-// R19 (P10): a daemon whose human path is automatic must refuse to run the agent subsystem unless
-// `agents.allow_automatic_human_path` says so. Today it starts with agents enabled regardless.
+// R19: a daemon whose human path is automatic refuses to run the agent subsystem while a same-user profile has an
+// `allow` or `request` rule, unless `agents.allow_automatic_human_path` says so. The human path stays up.
 scenario({
   id: 'E2E-44/startup-refusal', title: 'agents refuse to start in automatic interaction mode without agents.allow_automatic_human_path',
-  xfailUntil: 'P10', xfailMatch: /the daemon must refuse to start the agent subsystem/, xfailReason: 'R19: the startup refusal for automatic mode arrives in P10; the daemon starts with agents enabled today',
 }, async ctx => {
   let error = null;
   try {
@@ -66,4 +70,5 @@ scenario({
   } catch (e) { error = e; }
   assert.ok(error instanceof DaemonStartError, `the daemon must refuse to start the agent subsystem in automatic mode, but it started${error ? `: ${error.message}` : ''}`);
   assert.match(error.message, /allow_automatic_human_path/);
+  assert.match(error.message, /agent subsystem failed to start/i, 'the agent subsystem, not the daemon, refuses');
 });
