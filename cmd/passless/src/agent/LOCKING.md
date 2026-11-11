@@ -159,8 +159,9 @@ held across the file write; under it the view is read and then swapped (71), one
 writer is released before `bump_grant_epoch` (an atomic) or `bump_revocation_epoch` (the epoch
 gate, 69). After a revoke or clear the admin handler revokes stale sessions and closes browsers
 exactly as a reload does (`revoke_stale_bearers_and_close_browsers`, below). A clear also calls
-`EscalationService::cancel_profile` (escalation mutex 80, then the prompt driver table 82) after
-the store call has returned, with no lock held.
+`EscalationService::cancel_profile`, and a revoke `EscalationService::cancel_rp` for its RP
+(escalation mutex 80, then the prompt driver table 82), after the store call has returned, with
+no lock held. The lock order is unchanged.
 
 **Escalation** (`EscalationService`; the ceremony side is the parked wait above). `join_or_create`
 reads the granted-rules view (71) through the grant writer and takes the escalation mutex (80)

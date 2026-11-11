@@ -193,6 +193,35 @@ pub(crate) fn clear_granted_rules(
     Ok(outcome)
 }
 
+/// Revoke the granted rule of one RP and audit it. As with [`clear_granted_rules`], an approval in
+/// flight for that RP may write its grant after the revocation, so the RP's escalations (any
+/// action) are cancelled once the store call has returned: a late approval is compensated and its
+/// prompt withdrawn (review L2). No lock is held on entry (LOCKING.md, "Granted rules"); the
+/// caller revokes the stale sessions.
+pub(crate) fn revoke_granted_rule(
+    store: &GrantedRulesStore,
+    policy_runtime: &PolicyRuntime,
+    escalation: &EscalationService,
+    audit_gate: &AuditGate,
+    profile_id: &ProfileId,
+    rp_id: &str,
+    action: super::granted_rules::GrantedAction,
+) -> Result<super::granted_rules::RevokeOutcome, ProtocolError> {
+    let revoked = store.revoke(policy_runtime, profile_id, rp_id, action);
+    // Also when nothing was stored: an approval between its last re-check and its store write
+    // would otherwise persist the grant the operator just asked to be gone.
+    escalation.cancel_rp(profile_id, rp_id);
+    let outcome = revoked.map_err(granted_rules_error)?;
+    let event = super::audit_events::GrantedRuleRevokeBuilder::new(
+        profile_id.clone(),
+        Some(rp_id.to_string()),
+        outcome.revoked,
+    )
+    .build();
+    let _ = audit_gate.record(event);
+    Ok(outcome)
+}
+
 /// Close the leases named by `lease_ids` (see [`close_lease_audited`]); a lease that is already
 /// gone, or an id that does not parse, is skipped.
 fn close_leases_by_id(
@@ -3162,17 +3191,15 @@ impl AgentRuntime {
                 ));
             }
         };
-        let outcome = self
-            .granted_rules
-            .revoke(&self.policy_runtime, profile_id, rp_id, action)
-            .map_err(granted_rules_error)?;
-        let event = super::audit_events::GrantedRuleRevokeBuilder::new(
-            profile_id.clone(),
-            Some(rp_id.to_string()),
-            outcome.revoked,
-        )
-        .build();
-        let _ = self.audit_gate.record(event);
+        let outcome = revoke_granted_rule(
+            &self.granted_rules,
+            &self.policy_runtime,
+            &self.escalation,
+            &self.audit_gate,
+            profile_id,
+            rp_id,
+            action,
+        )?;
         self.revoke_sessions_after_grant_revocation(outcome);
         Ok(AdminResponse::GrantedRulesRevoked {
             revoked: outcome.revoked as u32,

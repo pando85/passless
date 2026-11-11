@@ -1417,6 +1417,18 @@ impl EscalationService {
     /// recorded as `escalation.revoked` with `reason = policy_reload`; their waiters see
     /// [`EscalationOutcome::Revoked`].
     pub fn cancel_profile(&self, profile: &ProfileId) {
+        self.cancel_where(profile, |_| true);
+    }
+
+    /// Cancel every pending escalation of `profile` for `rp_id` (any action) after `grants revoke`
+    /// removed its granted rule, so a late approval cannot persist the grant again (review L2).
+    /// Recorded and observed like [`Self::cancel_profile`]; the profile's other escalations stay,
+    /// and a queued one is prompted if the cancelled one held the prompt.
+    pub fn cancel_rp(&self, profile: &ProfileId, rp_id: &str) {
+        self.cancel_where(profile, |request| request.rp_id == rp_id);
+    }
+
+    fn cancel_where(&self, profile: &ProfileId, matches: impl Fn(&EscalationRequest) -> bool) {
         let mut effects = Vec::new();
         {
             let mut inner = self.lock();
@@ -1424,7 +1436,9 @@ impl EscalationService {
                 .entries
                 .iter()
                 .filter(|(_, entry)| {
-                    entry.request.profile == *profile && !entry.state.is_terminal()
+                    entry.request.profile == *profile
+                        && matches(&entry.request)
+                        && !entry.state.is_terminal()
                 })
                 .map(|(serial, _)| *serial)
                 .collect();
@@ -1446,10 +1460,13 @@ impl EscalationService {
                             .revoked(EscalationRevokeReason::PolicyReload),
                     ));
                 }
-                info!("escalation {}: revoked by a policy reload", entry.id);
+                info!("escalation {}: revoked by a policy change", entry.id);
                 inner.unlink(serial);
                 inner.collect(serial);
             }
+            // The profile's remaining queued escalations (a `cancel_rp` leaves them) get the
+            // prompt slot; after a whole-profile cancel the queue is empty and this does nothing.
+            inner.pump(profile, self.clock.now(), &mut effects);
             self.changed.notify_all();
         }
         self.run(effects);
@@ -3041,6 +3058,62 @@ mod tests {
             .join_or_create(request("p", "a.example", 1))
             .unwrap();
         assert_eq!(h.prompter.shown().len(), 3);
+    }
+
+    #[test]
+    fn cancel_rp_revokes_only_that_rps_escalations_and_prompts_the_next() {
+        // Review L2: `grants revoke` cancels the revoked RP's escalations, of any action.
+        let h = harness();
+        let active = park(
+            h.service
+                .join_or_create(request("p", "a.example", 1))
+                .unwrap(),
+        );
+        let queued = h
+            .service
+            .join_or_create(request("p", "b.example", 2))
+            .unwrap();
+        let other_profile = h
+            .service
+            .join_or_create(request("q", "a.example", 3))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(h.prompter.shown().len(), 2);
+        h.service.cancel_rp(&profile("p"), "a.example");
+        assert!(matches!(
+            active.join().unwrap(),
+            EscalationOutcome::Revoked { .. }
+        ));
+        assert_eq!(h.audit.count("escalation.revoked"), 1);
+        assert_eq!(h.prompter.withdrawn().len(), 1);
+        // The profile's queued escalation for another RP takes the prompt slot.
+        assert_eq!(
+            h.service.state_of(&request("p", "b.example", 2).key()),
+            Some(EscalationState::Prompting)
+        );
+        assert_eq!(h.prompter.shown().len(), 3);
+        // Another profile's escalation for the same RP is untouched.
+        assert_eq!(
+            h.service.state_of(&request("q", "a.example", 3).key()),
+            Some(EscalationState::Prompting)
+        );
+        drop((queued, other_profile));
+    }
+
+    #[test]
+    fn a_grant_revoke_after_the_store_write_revokes_the_grant_again() {
+        // Review L2: the approval wrote its grant, then the operator revoked that RP before the
+        // approval published. The late approval must not leave the grant behind.
+        let h = harness();
+        let service = Arc::clone(&h.service);
+        *h.grants.after_add.lock().unwrap() = Some(Arc::new(move || {
+            service.cancel_rp(&profile("p"), "a.example")
+        }));
+        let outcome = approve_and_join(&h, "a.example");
+        assert!(matches!(outcome, EscalationOutcome::Revoked { .. }));
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 1);
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+        assert_eq!(h.audit.last("granted_rule.revoke")["rp_id"], "a.example");
     }
 
     #[test]

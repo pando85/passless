@@ -524,7 +524,9 @@ fails after approval, nothing is persisted.
   commands live under `passless agent-admin`: `grants list [--profile P]`,
   `grants revoke --profile P --rp R [--action A] --confirm` and
   `grants clear --profile P --confirm`, over the admin socket. Revocation is audited
-  (`granted_rule.revoke`). Session grants (§9) are administered with `agent-admin sessions …` and
+  (`granted_rule.revoke`). Both cancel the pending escalations they cover (a revoke those of its
+  RP, of any action; a clear those of the profile), so an approval in flight cannot persist the
+  grant again: it is compensated and recorded as `escalation.revoked`. Session grants (§9) are administered with `agent-admin sessions …` and
   principal sessions with `agent-admin principals …`; their former spellings `delegation` and
   `session` remain hidden aliases for one release.
 - **Lifetime:** permanent until revoked or made inert by a config change (§6.2); no TTL.

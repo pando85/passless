@@ -5794,6 +5794,35 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn a_grants_revoke_cancels_the_waiting_escalation_for_that_rp() {
+            // Review L2. What `handle_revoke_granted_rule` does: revoke the RP's grant, then cancel
+            // the RP's escalations, so an approval in flight cannot persist the grant again. The
+            // store holds no grant yet (the approval has not written it): the revoke reports
+            // nothing to revoke, and the escalation is cancelled all the same.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let revoked = crate::agent::runtime::revoke_granted_rule(
+                &f.store,
+                &f.policy_runtime,
+                &f.escalation,
+                &f.audit_gate,
+                &f.profile_id,
+                "example.com",
+                crate::agent::granted_rules::GrantedAction::Authenticate,
+            );
+            assert_eq!(revoked.unwrap_err().code, ErrorCode::NotFound);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.prompter.withdrawn(), 1);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
         fn an_added_grant_bumps_only_the_grant_epoch() {
             let f = escalation_fixture();
             let ctx = f.make_ctx();
