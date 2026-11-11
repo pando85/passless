@@ -2932,14 +2932,30 @@ fn seed_incognito_access(
         "extensions": {"settings": {extension_id: {"incognito": true}}}
     })
     .to_string();
-    write_extension_file(
-        &default_dir,
-        "Preferences",
-        &preferences,
-        0o600,
-        target_uid,
-        target_gid,
-    )
+    // The profile is fresh: the file must not exist, and a symlink planted in its place (the
+    // directory belongs to the browser user) is refused rather than followed.
+    let path = default_dir.join("Preferences");
+    let fail = |what: &str, e: io::Error| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "{what} {}: {e}; cannot seed incognito access for the passless agent extension",
+            path.display()
+        ))
+    };
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| fail("create", e))?;
+    (&file)
+        .write_all(preferences.as_bytes())
+        .map_err(|e| fail("write", e))?;
+    // SAFETY: fchown on a descriptor this function owns.
+    if unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) } != 0 {
+        return Err(fail("chown", io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn ensure_browser_running(child: &mut Child) -> Result<(), LaunchError> {
