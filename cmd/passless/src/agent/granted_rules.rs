@@ -612,8 +612,8 @@ fn check_dir(dir: &Path, owner_uid: u32) -> Result<(), String> {
             meta.uid(),
             owner_uid
         )),
-        Ok(meta) if meta.mode() & 0o022 != 0 => Err(format!(
-            "{} has mode {:04o}; it must not be writable by group or others (0700)",
+        Ok(meta) if meta.mode() & 0o077 != 0 => Err(format!(
+            "{} has mode {:04o}; it must not be accessible to group or others (0700)",
             dir.display(),
             meta.mode() & 0o7777
         )),
@@ -1051,6 +1051,25 @@ rule = "exact"
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path(), VALID, 0o640);
         assert_disabled(tmp.path(), "mode 0640");
+    }
+
+    #[test]
+    fn store_directory_must_be_owner_only() {
+        for mode in [0o755, 0o750, 0o705, 0o770, 0o777, 0o722] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = seed(tmp.path(), VALID, 0o600);
+            let dir = path.parent().unwrap();
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert_disabled(tmp.path(), &format!("mode {mode:04o}"));
+            let err = write_atomically(dir, &profile(), b"x", unsafe { libc::geteuid() })
+                .expect_err("a group- or world-accessible directory is not written");
+            assert!(err.to_string().contains("(0700)"), "{err}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = seed(tmp.path(), VALID, 0o600);
+        let dir = path.parent().unwrap();
+        assert!(check_dir(dir, unsafe { libc::geteuid() }).is_ok());
+        assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
     }
 
     #[test]

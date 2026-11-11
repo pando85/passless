@@ -760,7 +760,8 @@ impl HardenedChildSetup {
 
     /// Pre-exec setup of the escalation prompt child (ADR 0014 section 8.2):
     ///
-    /// 1. close every inherited descriptor above stdio;
+    /// 1. mark every inherited descriptor above stdio close-on-exec (not closed: the runtime's
+    ///    exec-error pipe must survive until exec, or a failing step would look like a spawn);
     /// 2. when the target differs from the daemon (a root daemon): `setgroups(0)`, `setresgid`,
     ///    `setresuid` to the target, irreversibly;
     /// 3. `PR_SET_PDEATHSIG(SIGKILL)`, after the credential change (which clears it), then
@@ -777,20 +778,9 @@ impl HardenedChildSetup {
 
         // SAFETY: plain syscalls on this process; no memory is shared with the parent.
         unsafe {
-            let closed = libc::syscall(
-                libc::SYS_close_range,
-                3 as libc::c_ulong,
-                !0 as libc::c_ulong,
-                0 as libc::c_ulong,
-            );
-            if closed < 0 {
-                if io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS) {
-                    return last_error();
-                }
-                for fd in 3..get_nofile_limit() {
-                    libc::close(fd);
-                }
-            }
+            // Mark, not close: Rust's CLOEXEC error-report pipe must stay open until exec so a
+            // failure below (or of the exec itself) reaches `Command::spawn`.
+            mark_inherited_cloexec()?;
 
             if !self.same_user() {
                 if libc::setgroups(0, std::ptr::null()) < 0 {
@@ -824,6 +814,54 @@ impl HardenedChildSetup {
         }
         Ok(())
     }
+}
+
+/// Mark every descriptor above stdio close-on-exec, so none survives the exec but the ones
+/// the runtime itself needs until then (the `Command` error-report pipe) stay open.
+///
+/// Uses `CLOSE_RANGE_CLOEXEC`; a kernel that rejects the flag (`EINVAL`, before Linux 5.11)
+/// gets a plain `close_range`, and one without the syscall (`ENOSYS`) a per-descriptor
+/// `FD_CLOEXEC` loop. Async-signal-safe.
+///
+/// # Safety
+///
+/// Must only be called in a forked child before `exec`.
+unsafe fn mark_inherited_cloexec() -> Result<(), io::Error> {
+    // SAFETY: plain syscalls on this process.
+    unsafe {
+        let marked = libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_ulong,
+            !0 as libc::c_ulong,
+            CLOSE_RANGE_CLOEXEC,
+        );
+        if marked >= 0 {
+            return Ok(());
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINVAL) => {
+                let closed = libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_ulong,
+                    !0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
+                if closed < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Some(libc::ENOSYS) => {
+                for fd in 3..get_nofile_limit() {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) unsafe fn close_range_preserving(preserved: &[RawFd]) -> Result<(), io::Error> {
@@ -945,6 +983,9 @@ pub fn dup_fd_cloexec(fd: RawFd) -> Result<OwnedFd, LauncherError> {
 }
 
 pub const CLOSE_RANGE_FALLBACK_CAP: RawFd = 4096;
+
+/// `CLOSE_RANGE_CLOEXEC` (Linux 5.11): mark the range close-on-exec instead of closing it.
+const CLOSE_RANGE_CLOEXEC: libc::c_ulong = 4;
 
 fn get_nofile_limit() -> RawFd {
     let mut rlim = libc::rlimit {
@@ -1558,6 +1599,32 @@ mod tests {
         }
         let flags = unsafe { libc::fcntl(original_fd, libc::F_GETFD) };
         assert!(flags >= 0, "original fd was closed when dup was dropped");
+    }
+
+    #[test]
+    fn prompt_child_pre_exec_failure_surfaces_as_a_spawn_error() {
+        use std::os::unix::process::CommandExt;
+        let setup = HardenedChildSetup {
+            target_uid: unsafe { libc::getuid() },
+            target_gid: unsafe { libc::getgid() },
+            daemon_uid: unsafe { libc::getuid() },
+            daemon_gid: unsafe { libc::getgid() },
+            rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
+            rlimit_nproc: DEFAULT_RLIMIT_NPROC,
+            rlimit_core: DEFAULT_RLIMIT_CORE,
+            rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
+        };
+        // No process is pid 0's child: the parent check after the descriptor step fails.
+        let mut command = std::process::Command::new("/bin/true");
+        // SAFETY: `apply_prompt_child` is async-signal-safe and runs pre-exec.
+        unsafe {
+            command.pre_exec(move || setup.apply_prompt_child(0));
+        }
+        let err = command
+            .spawn()
+            .expect_err("a failing pre_exec step must fail the spawn");
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH), "{err}");
     }
 
     #[test]

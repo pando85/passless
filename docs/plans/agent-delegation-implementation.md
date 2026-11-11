@@ -62,7 +62,7 @@ Rows marked *amended* were applied to the ADR in phase P0b.
 | R4 | Claim timing (revised by V-H2) | Order: origin/RP check → resolve → (if `request`) cooldown, grant cap, bus and queue checks → replay key → wait → budget claimed after approval. For `allow`: replay key, then budget, before audit. Rejected requests never consume budget. | amended §9 |
 | R5 | Several ceremonies waiting on one `register` escalation | **Superseded by V-M3.** Registration escalations are not joinable. The one-use token is bound to the creating ceremony, and a concurrent duplicate is denied. | amended §8.3 (V-M3) |
 | R6 | Legacy isolated `device` key and agent udev rule | Warn and ignore for one release. Remove the agent UHID udev and systemd device access. | — |
-| R7 | CLI naming collision | Granted rules use `passless agent grants`. The existing session-grant commands move to `passless agent sessions`, with a hidden alias for one release. | amended §8.4 |
+| R7 | CLI naming collision | Granted rules use `passless agent-admin grants`. The existing session-grant commands move to `passless agent sessions`, with a hidden alias for one release. | amended §8.4 |
 | R8 | Deprecation channel | A startup warning plus a `passless doctor` warning. Legacy parsing is removed in the release after next. | — |
 | R9 | Aborted escalation audit | `escalation_expired` with `reason = timeout or aborted`. `escalation_revoked` is only for operator revocation. | amended §12 |
 | R10 | Pinned `credential_refs` and a registration grant | The credential ref of a registration-kind grant joins the pinned set for that RP. | amended §8.3 |
@@ -468,7 +468,7 @@ global orchestration rules.
 | P4 | Policy schema and resolution: `RuleAction`, legacy mapping and warnings, validation, digest, `resolve()` with `MatchedRule`, numeric generation, pinning before `allowCredentials` | §6, §10.1 | sonnet | opus | L |
 | P5 | Sessions and replay: check order, replay key with coalescing (R1), principal digest, reload revocation, `NotSupportedError`, DOMException names, capacity caps (R11) | §9, §10.2, §10.3 | opus | opus | M |
 | P6 | Interception and transport: D1 (proxy), D2 (connectNative relay, framing, keepalive, abort, reconnect) and D6.1 (always-attached readiness, degraded lease); removal of the HTTP endpoints | §4.4, §11 | opus | opus | L |
-| P7 | Escalation (D3), granted-rules store, `passless agent grants`, `agent sessions` rename, `prompt.rs` fixes, `notify_user` and `state_dir` | §8 | opus | opus | L |
+| P7 | Escalation (D3), granted-rules store, `passless agent-admin grants`, `agent sessions` rename, `prompt.rs` fixes, `notify_user` and `state_dir` | §8 | opus | opus | L |
 | P8 | Audit: §12 fields, terminal records, escalation events, schema bump | §12 | sonnet | sonnet | M |
 | P9 | Deployment axes: `PrincipalRelationship` in doctor and audit, shared-UID `isolated` warning, doctor test rework | §13 | sonnet | sonnet | S |
 | P10 | Agent-browser integration (D4) and containment (D6.3, D6.4): `agent browser`, browser detection and rejection, incognito enablement, bwrap hidraw hiding, automatic-mode guard, MCP adapters, `--print-config`, `doctor --agents` | §4.2, §7 | sonnet | opus | L |

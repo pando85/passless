@@ -12,7 +12,10 @@ use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
-use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::audit_events::{
+    AuditAction, EscalationAuditContext, EscalationDenyCause, PolicyAllowBuilder,
+    PolicyDenyBuilder, PolicyDenyReason,
+};
 use super::escalation::{
     EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, WaiterSession,
 };
@@ -103,6 +106,17 @@ fn attestation_outcome(
         )),
         Err(e) => Err(e),
     }
+}
+
+/// The credential reference a registration grant binds to; an undecodable or empty credential id
+/// is an error, never an empty reference.
+fn registration_credential_ref(credential_id_b64u: &str) -> Result<CredentialRef, String> {
+    let credential_id = b64u_decode(credential_id_b64u)
+        .map_err(|e| format!("the credential id does not decode: {e}"))?;
+    if credential_id.is_empty() {
+        return Err("the credential id is empty".to_string());
+    }
+    Ok(CredentialRef::with_default_domain(&credential_id))
 }
 
 impl RegisterHandler {
@@ -561,16 +575,41 @@ impl RegisterHandler {
             .policy_runtime
             .escalation_profile(&ctx.profile_id)
             .map_or(0, |profile| profile.max_granted_rules);
-        let credential_id = b64u_decode(&response.credential_id_b64u).unwrap_or_default();
-        if let Err(e) = self.escalation.record_registration_grant(
-            &approval,
-            CredentialRef::with_default_domain(&credential_id),
-            max_granted_rules,
-        ) {
-            warn!(
-                "agent register: credential for rp={} kept without a registration grant: {}",
-                target.rp_id, e
-            );
+        match registration_credential_ref(&response.credential_id_b64u) {
+            Ok(credential_ref) => {
+                if let Err(e) = self.escalation.record_registration_grant(
+                    &approval,
+                    credential_ref,
+                    max_granted_rules,
+                ) {
+                    warn!(
+                        "agent register: credential for rp={} kept without a registration grant: {}",
+                        target.rp_id, e
+                    );
+                }
+            }
+            Err(e) => {
+                // Never persist a grant bound to an empty credential reference.
+                warn!(
+                    "agent register: credential for rp={} kept without a registration grant: {}",
+                    target.rp_id, e
+                );
+                let context = EscalationAuditContext {
+                    escalation_id: approval.escalation_id().as_str().to_string(),
+                    profile_id: approval.profile().clone(),
+                    action: AuditAction::Register,
+                    rp_id: approval.rp_id().to_string(),
+                };
+                if let Err(audit_error) = self
+                    .audit_gate
+                    .record(context.denied(EscalationDenyCause::GrantWriteFailed))
+                {
+                    warn!(
+                        "agent register: the failed grant write could not be audited: {}",
+                        audit_error
+                    );
+                }
+            }
         }
         Ok(response)
     }
@@ -2466,6 +2505,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
         assert_eq!(deny_reasons(&f).last().unwrap().1, "policy_revoked");
+    }
+
+    #[test]
+    fn test_registration_credential_ref_rejects_undecodable_and_empty_ids() {
+        assert!(registration_credential_ref("!!not base64!!").is_err());
+        assert!(registration_credential_ref("").is_err());
+        let id = b"\x01\x02\x03";
+        assert_eq!(
+            registration_credential_ref(&b64u_encode(id)).unwrap(),
+            CredentialRef::with_default_domain(id)
+        );
     }
 
     #[test]

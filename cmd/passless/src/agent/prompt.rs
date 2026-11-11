@@ -385,6 +385,9 @@ pub struct NotificationPrompter {
     timing: Timing,
     /// Per-profile driver channels (`LockLevel::PromptDriver`, a leaf: only sends under it).
     drivers: Mutex<HashMap<ProfileId, Sender<DriverMessage>>>,
+    /// Test seam: make driver-thread spawns fail.
+    #[cfg(test)]
+    fail_driver_spawn: std::sync::atomic::AtomicBool,
 }
 
 impl NotificationPrompter {
@@ -404,7 +407,26 @@ impl NotificationPrompter {
             spawner,
             timing,
             drivers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_driver_spawn: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn spawn_driver(
+        &self,
+        profile: &ProfileId,
+        body: impl FnOnce() + Send + 'static,
+    ) -> io::Result<thread::JoinHandle<()>> {
+        #[cfg(test)]
+        if self
+            .fail_driver_spawn
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected spawn failure"));
+        }
+        thread::Builder::new()
+            .name(format!("prompt-{}", profile))
+            .spawn(body)
     }
 
     /// Send `message` to `profile`'s driver, starting the driver on first use. A `Show` carries
@@ -427,10 +449,11 @@ impl NotificationPrompter {
         }
         let spawner = Arc::clone(&self.spawner);
         let timing = self.timing;
-        if let Err(e) = thread::Builder::new()
-            .name(format!("prompt-{}", profile))
-            .spawn(move || drive(receiver, spawner, timing))
-        {
+        let spawned = self.spawn_driver(profile, move || drive(receiver, spawner, timing));
+        if let Err(e) = spawned {
+            // The sink may re-enter the prompter (a withdrawal, the next queued prompt), which
+            // takes this lock again: never report while holding it.
+            drop(drivers);
             warn!("prompt: cannot start the driver of '{}': {}", profile, e);
             if let DriverMessage::Show { ticket, sink, .. } = message {
                 report(&sink, &ticket, PromptEvent::Failed(e.to_string()));
@@ -1597,6 +1620,94 @@ mod dbus_tests {
             sink.wait_for(1),
             [PromptEvent::Failed("no_server".to_string())]
         );
+    }
+
+    /// A spawner whose children never start.
+    struct RefusingSpawner;
+
+    impl PromptChildSpawner for RefusingSpawner {
+        fn available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn spawn(&self) -> Result<PromptChild, String> {
+            Err("refused".to_string())
+        }
+    }
+
+    /// On its first report, re-enters the prompter like the escalation coordinator can.
+    struct ReentrantSink {
+        prompter: StdMutex<Option<Arc<NotificationPrompter>>>,
+        events: StdMutex<Vec<PromptEvent>>,
+        reentered: std::sync::atomic::AtomicBool,
+    }
+
+    impl PromptSink for ReentrantSink {
+        fn prompt_event(&self, failed: &PromptTicket, event: PromptEvent) {
+            self.events.lock().unwrap().push(event);
+            if self
+                .reentered
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let prompter = self.prompter.lock().unwrap().clone().unwrap();
+            // The withdrawal and the next queued prompt both take the driver lock.
+            prompter.withdraw(failed);
+            prompter
+                .fail_driver_spawn
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let next: Weak<dyn PromptSink> = Weak::<RecordingSink>::new();
+            prompter.show(ticket(failed.seq + 1), fields(), next);
+        }
+    }
+
+    #[test]
+    fn a_failed_driver_spawn_reports_without_holding_the_driver_lock() {
+        let prompter = Arc::new(NotificationPrompter::with_timing(
+            Arc::new(RefusingSpawner),
+            Timing {
+                shown_timeout: SHOWN_TIMEOUT,
+                withdraw_grace: Duration::from_millis(300),
+                min_review_delay: MIN_REVIEW_DELAY,
+            },
+        ));
+        prompter
+            .fail_driver_spawn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let sink = Arc::new(ReentrantSink {
+            prompter: StdMutex::new(Some(prompter.clone())),
+            events: StdMutex::default(),
+            reentered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+        let runner = {
+            let sink = sink.clone();
+            let prompter = prompter.clone();
+            thread::spawn(move || {
+                let weak: Weak<dyn PromptSink> = Arc::downgrade(&sink) as Weak<dyn PromptSink>;
+                prompter.show(ticket(1), fields(), weak);
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(EVENT_WAIT).is_ok(),
+            "deadlock: the spawn failure was reported under the driver lock"
+        );
+        runner.join().unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            matches!(events.as_slice(), [PromptEvent::Failed(m)] if m.contains("injected")),
+            "{events:?}"
+        );
+        // The queued prompt got a working driver (its child refuses to spawn).
+        let profile = ticket(1).profile;
+        let start = Instant::now();
+        while !prompter.drivers.lock().unwrap().contains_key(&profile) {
+            assert!(start.elapsed() < EVENT_WAIT, "no driver started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        *sink.prompter.lock().unwrap() = None;
     }
 
     /// A child that never answers.

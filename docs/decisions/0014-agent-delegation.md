@@ -317,8 +317,9 @@ through exactly one rule, and a wildcard match is audited as `rule = "*"`.
   startup with a migration message.
 - The legacy profile fields `rp_ids`, `registration_allowed`, `require_uv` and
   `human_verification_prompt` are removed; a config using them fails with a migration message.
-- The policy digest covers every rule field, profile-level `credential_selection`, every
-  acknowledgement, and the granted-rules store content (§8.4).
+- The policy digest covers every rule field, profile-level `credential_selection` and every
+  acknowledgement. It does not cover the granted-rules store, which has its own `grants_digest`
+  (§8.4).
 - A ceremony resolves against the live configuration plus the granted-rules store, never against a
   copy of the profile configuration frozen into the session. Change is tracked by two monotonic
   counters: the *revocation epoch*, bumped by a config reload, a grant revocation and a config
@@ -411,7 +412,7 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
    has no expiry and is withdrawn when the ceremony ends, aborts or times out. The transport
    requirement is in §4.4.
 6. On approval the daemon writes `escalation_approved`, atomically persists the granted rule,
-   bumps the policy generation, then re-resolves and continues the original ceremony as `allow`.
+   bumps the grant epoch, then re-resolves and continues the original ceremony as `allow`.
 7. On denial or timeout it writes `escalation_denied` or `escalation_expired`, fails the
    ceremony, and starts a cooldown for that key (default 10 minutes) during which new requests
    are denied without prompting. When a waiting ceremony is aborted it stops waiting; when the last
