@@ -2928,6 +2928,10 @@ impl AgentRuntime {
                 profile_config,
                 euid,
             ));
+            report.checks.push(super::doctor_grants::inert_grants_check(
+                profile_config,
+                self.granted_rules.profile(profile_id).as_deref(),
+            ));
         }
         // Deprecated config vocabulary is accepted with a warning for one minor release (plan R8):
         // a warning never makes the profile unhealthy, so the check passes and carries the text.

@@ -75,7 +75,10 @@ passless agent-admin grants clear --profile coding --confirm
 Revoking a grant revokes every active agent session (the next request prompts again), the same as a
 policy change. Adding a grant does not. Use the RP's own controls too: revoking locally does not log
 the agent out of the site. A store that is malformed or has the wrong owner or mode disables grants
-for that profile and `passless doctor` reports it. (`--confirm` is the real flag of the
+for that profile and `passless doctor` reports it. A grant is inert, never consulted, when no rule
+reaches its RP, its rule is now `deny`, or its rule is now `allow`; `passless doctor --agents` and
+`agent-admin profile check` list those as orphaned (a warning), and `doctor --agents` also lists the
+stores of profiles that no longer exist. (`--confirm` is the real flag of the
 destructive admin commands; without it they refuse.)
 
 ## Registration

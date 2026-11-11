@@ -11,6 +11,7 @@ pub mod containment;
 pub mod deployment;
 pub mod doctor;
 pub mod doctor_agents;
+pub mod doctor_grants;
 pub mod escalation;
 pub mod escalation_prompt;
 pub mod grant;

@@ -538,6 +538,8 @@ pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
         config.effective_state_dir(euid).as_deref(),
         euid,
     ));
+    // Granted rules no rule can reach any more, and stores of profiles that are gone.
+    checks.extend(super::doctor_grants::run(config, euid));
     checks.push(interaction_mode_check(
         config,
         std::env::var("PASSLESS_INTERACTION_MODE")

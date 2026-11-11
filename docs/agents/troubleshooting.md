@@ -93,7 +93,8 @@ revokes sessions.
 
 See [Rules](rules.md). `passless agent-admin grants list --profile <profile>` shows what was approved;
 a store that is malformed or has the wrong owner or mode disables grants for that profile and is
-reported by `profile check`. A granted rule is inert if the config rule is `deny` or gone.
+reported by `profile check`. A granted rule is inert if the config rule is `deny`, `allow` or gone;
+`profile check` and `doctor --agents` report those as orphaned grants.
 
 ## A tool cannot connect to CDP
 
