@@ -1,5 +1,50 @@
 # E2E baseline
 
+## P7 (escalation), 2026-11-11
+
+Branch `feat/agent-delegation-adr-0014` at `ccf6c0c` (daemon escalation from `69b5700`, `262fb04`, `dd7da60`, `63153b8`; harness
+and scenarios `2eff086`, `ccf6c0c`). Debug build, `--features agent`, no Rust changes in the E2E work.
+
+- Command: `AGENT_E2E_MATRIX=full AGENT_E2E_BROWSERS=chromium,pw-chromium,cft AGENT_E2E_HEADLESS=both AGENT_E2E_TIMEOUT=7200 tests/agent-e2e/run.sh`:
+  exit 0, PASS=266 (264 scenario results and the 2 smoke checks), XFAIL=18, FAIL=0. Per variant: 44 PASS, 3 XFAIL.
+  `make test-agent-e2e` (CI subset): exit 0, PASS=30, XFAIL=2.
+- New in P7: E2E-20/escalation (approval after 6 min) and E2E-21 (3 min timeout, `expired(timeout)`) un-XFAILed; E2E-23 to 31,
+  43, 44, 48, 49, 50 added. CI subset: 23, 24, 25, 27, 28, 29, 31, 48, 50. Full only: 20/escalation (about 6 min per variant),
+  21 (about 3 min), 26, 30, 43, 44, 49.
+- E2E-09 and E2E-13 now run with `notify: false` (no notification server: `escalation_unavailable`); E2E-12 uses `deny:500` and
+  asserts `escalation.requested` with `rule = "*"`.
+- Remaining XFAILs (all variants): E2E-12/audit-rule (P8, no `rule` in `policy.*` audit events), E2E-44/startup-refusal
+  (P10, R19: the daemon starts agents in automatic interaction mode), E2E-45/cdp-context (P10).
+- Gaps: E2E-26 proves sequential, in-order prompting with four RPs; the queue bound (1 active + 8 queued) needs several bearer
+  sessions of one profile, which the harness cannot create (admin launch returns the profile's live lease; session-scoped browsers
+  are killed after launch, B1), so the bound is covered by the coordinator unit tests.
+- Observed, not changed: after `agent-admin grants revoke|clear` the bearers are revoked but the managed browser keeps running,
+  and `browser launch` hands it back with the dead bearer (no start-URL tab); requests are refused `unauthorized` without a
+  `policy.deny` audit record. E2E-31 restarts the browser (killed, then launched again) as an operator would.
+- E2E-20/escalation, filter id with a slash: `AGENT_E2E_FILTER=E2E-20/escalation` runs the scenario but `report.js` reports
+  "matched no scenario" (exit 1); filter by `E2E-20` instead.
+
+| Scenario | chromium headed | chromium headless | pw-chromium headed | pw-chromium headless | cft headed | cft headless |
+|---|---|---|---|---|---|---|
+| E2E-01 to E2E-22 (as in P6 below; E2E-09, 12, 13 reworked, 20/escalation and 21 now PASS) | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-12/audit-rule (until P8) | XFAIL | XFAIL | XFAIL | XFAIL | XFAIL | XFAIL |
+| E2E-23 grant, no second prompt | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-24 deny, cooldown | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-25 two tabs, one prompt | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-26 queued prompts in order | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-27 registration escalation | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-28 daemon-only notification text | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-29 spoofed ActionInvoked | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-30 no notification server | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-31 grants CLI, damaged store | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-43 human ceremony during escalation | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-44 automatic mode never auto-approves | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-44/startup-refusal (until P10) | XFAIL | XFAIL | XFAIL | XFAIL | XFAIL | XFAIL |
+| E2E-45/cdp-context (until P10) | XFAIL | XFAIL | XFAIL | XFAIL | XFAIL | XFAIL |
+| E2E-48 waiter cap, other profile unaffected | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-49 notification server lost | PASS | PASS | PASS | PASS | PASS | PASS |
+| E2E-50 three aborts, cooldown | PASS | PASS | PASS | PASS | PASS | PASS |
+
 ## P6 (interception and transport), 2026-11-11
 
 Branch `feat/agent-delegation-adr-0014` at HEAD `db0e03c` plus the uncommitted P6 working tree (proxy-only extension,
