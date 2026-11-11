@@ -40,12 +40,20 @@ use log::warn;
 ///   the human path itself produces; an iteration cursor left mid-way is reset by the next
 ///   `read_first`.
 /// - Inside an adapter method (code the human path runs too), a credential file is written
-///   atomically (temporary file and rename, or GnuPG writing the target) before the in-memory
-///   index is updated and the cached entry dropped: memory is a cache of the files, never the
-///   other way round. A panic before the rename changes nothing; after it, at worst the index
-///   lacks the new credential until the next start, or a cached copy of the previous contents
-///   lives until `CREDENTIAL_CACHE_TTL` expires. A pass Git-sync bracket left open defers the Git
-///   commit. None of these corrupts a credential or a key, or grants anything.
+///   atomically before the in-memory index is updated: `local` and `tpm` write a temporary file
+///   and rename it (`util::atomic_write_in_dir`), and `pass` has GnuPG encrypt to a temporary file
+///   in the same directory that is fsynced and renamed over the target
+///   (`pass::encrypt_with_gnupg_binary`; GnuPG's own `--output <target>` truncates in place and is
+///   not used on the target). The index is memory built from the files, never the other way round.
+///   A panic before the rename changes nothing; after it, at worst the index lacks the new
+///   credential until the next start. The `pass` and `tpm` backends also cache decrypted
+///   credentials (the `local` backend has no cache): a panic after the rename can leave a cached
+///   copy of the previous contents until `CREDENTIAL_CACHE_TTL` expires. None of these corrupts
+///   a credential or a key, or grants anything.
+/// - The `pass` Git-sync coordinator ends a one-call (implicit) operation from a drop guard, so a
+///   panic cannot leave its depth counter raised, and it recovers its own poisoned lock. A panic
+///   inside the human path's explicit operation bracket (`main.rs`, `handle_command`) is not
+///   unwound that way; it only matters for unwind builds, since release builds abort.
 pub fn lock_shared_storage<S: ?Sized>(storage: &Mutex<S>) -> MutexGuard<'_, S> {
     storage.lock().unwrap_or_else(|poisoned| {
         warn!("credential storage lock was poisoned by a panicked thread; recovering");

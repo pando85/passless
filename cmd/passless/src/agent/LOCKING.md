@@ -34,7 +34,8 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    (`BrowserLeaseActivation`), and only until it has succeeded once. The human path recovers a
    poisoned operation lock (`main.rs::lock_operation`), because it guards no data, and a
    poisoned credential storage or PIN storage lock (`storage::lock_shared_storage`,
-   `pin_storage::lock_pin_storage`; the soundness argument is on those functions). Release builds
+   `pin_storage::lock_pin_storage`; the soundness argument is on those functions), and the TPM
+   context and pass Git-sync state locks inside the backends (see the table). Release builds
    abort on panic, so the code that runs under these locks on the agent side is kept panic-free
    (no `expect`, `unwrap` or fallible indexing; ADR 0014 section 14, invariant 23).
 5. **The audit gate is a terminal leaf.** `AuditGate::record` may be called with any of the locks
@@ -85,9 +86,10 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 76 T | A transport connection's write mutex (`Connection::writer`) | `transport/mod.rs` | A leaf. Held across one frame write, bounded by the 5 s write timeout. `closed` is set under it, so no frame follows a close. |
 | 80 T | `EscalationService::inner` and its condvar `changed` | `escalation.rs` | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters park on its condvar holding nothing else and call their `cancelled`/`still_valid` checks with it released. No audit record, store write, prompt show or withdrawal and no D-Bus call happens under it: state changes are made under it and their effects run after it is released. |
 | 82 T | `NotificationPrompter::drivers` (per-profile driver channels) | `prompt.rs` | A leaf: only a channel send (and, on first use, a thread spawn) happens under it. Called by the escalation service after its mutex is released. A failed driver spawn is reported to the sink only after this lock is dropped, because the sink re-enters the prompter (a withdrawal, the next queued prompt). |
-| 85 T | `RefusalLedger::inner` (per session) | `refusal_ledger.rs` | A leaf (final review M2). `CeremonyAudit::deny` counts a refusal under it and releases it before any record is written; the pending summaries it returns (and `AgentSession::revoke`'s flush, and the ledger's drop) are written after it is released. Ranked above the key-use gates (66, 69) and the policy locks because a refusal can be raised with a key-use gate held; below the audit gate. Only the closure that builds a summary template runs under it, and it takes no lock (atomics). |
+| 85 T | `RefusalLedger::inner` (per session) | `refusal_ledger.rs` | A leaf (final review M2). `CeremonyAudit::deny` counts a refusal under it and releases it before any record is written; the pending summaries it returns (and `AgentSession::revoke`'s flush, and the ledger's drop) are written after it is released. Ranked above the key-use gates (66, 69) and the policy locks because a refusal can be raised with a key-use gate held; below the audit gate. Only the closure that builds a summary template runs under it, and it takes no lock (atomics). The runtime loop also sweeps the ledgers of tombstoned (revoked) sessions about once a second (`SignContextRegistry::flush_due_revoked_refusals`): it copies the ledger handles out under the tombstone maps (50) and then flushes each, so the audit gate is never reached under a registry lock (review L5). |
 | 90 | `AuditGate`: `append_lock`, then `sequence`, `last_hash`, `writer`, `current_segment(_name)`, `segment_index`, `anchor`, `anchor_inode`, `segment_file_ino` | `audit.rs` | Terminal leaf (rule 5). |
-| — | TPM `Context` mutex | `storage/tpm/portable/provider.rs` | A leaf inside the TPM key provider. It is released before the provider returns. |
+| — | TPM `Context` mutex | `storage/tpm/portable/provider.rs`, `parent.rs`, `storage/tpm/mod.rs` | A leaf inside the TPM key provider and the TPM storage adapter. It is released before the call returns. A poisoned lock is recovered (`portable::context::lock_context`): the context is reusable after a failed call, the session settings are cleared and any transient objects the unwound call left loaded are flushed. |
+| — | `PassGitSync` state | `storage/pass/sync.rs` | A leaf inside the pass backend. Recovered when poisoned. A one-call (implicit) Git-sync operation ends from a drop guard (`ImplicitOperation`), so a panic cannot leave its depth counter raised. |
 | — | `runtime_loop`, `sign_server_handle`, `WorkerTracker.handles`, `completed_sessions` | `runtime.rs` | Join-handle and bookkeeping locks. They never nest with the locks above. A `join()` under them only joins threads that do not take them. |
 | — | Prompt child: `Inbox::state` | `escalation_prompt.rs` | A separate process (the re-executed prompt child, or the validation probe). A leaf: it guards the stdin line queue and is never held across an await or another lock. |
 | — | Relay (`sign-proxy`): `Relay::output`, `Relay::in_flight` | `bin/sign-proxy.rs` | A separate process. The two never nest: an id is retired or drained under `in_flight`, which is released before a frame is written under `output`. |
@@ -112,8 +114,8 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
   re-resolves (policy 70, view 71), claims the budget (session 60) and continues as a fresh key
   below. `the_human_operation_lock_is_free_while_a_waiter_is_parked` (`sign.rs`) takes the human
   operation lock and storage under the debug lock-order checks while a waiter is parked.
-- A fresh key takes the operation lock (20), then storage (40). Under both it reads the
-  granted-rules view (71) for the credentials registration grants pinned, and takes policy (70)
+- A fresh key takes the operation lock (20), then storage (40). Under both it reads the RP's own
+  credentials (`ByRp`; no other RP's credential is read), reads the granted-rules view (71) for the credentials registration grants pinned, and takes policy (70)
   and audit (90) for the reservation. For the pre-key-use re-check it takes the session gate
   (66) and the epoch gate (69), then policy (70) to re-resolve.
 - The counter is written, storage is released, and the key provider signs. Then the gates and
@@ -188,7 +190,9 @@ recorded (90). A panic anywhere in the approval finishes the entry as denied fro
 (escalation mutex, then the audit gate, one at a time). The cooldown and withdrawal maps are
 pruned on every insert and capped at 4096 entries each, under the same mutex. The withdrawal map
 evicts its oldest entry past the cap; the cooldown map never evicts a live cooldown: admission
-refuses a new escalation while live cooldowns plus live escalations fill it (review L1). Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
+refuses a new escalation while live cooldowns plus live escalations fill it (review L1). The count is
+also per profile (256 live cooldowns plus live escalations each; review M-e), so a profile at its
+quota is refused alone and the global 4096 is only a backstop. Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
 is released. A reload that changed the policy calls `cancel_profile` after the configuration
 lock (45) and `reload_lock` (68) are released: it takes the escalation mutex (80) and then
 withdraws the prompts (82).
@@ -264,8 +268,13 @@ held across another, and the order of the table above is unchanged.
 - The human CTAP path holds the operation lock across a whole CTAP command, including its
   user-presence prompt. Agent ceremonies of same-user profiles queue behind it (rule 4 keeps the
   reverse from happening).
-- A same-user ceremony holds the human operation lock (and storage) while it walks the whole human
-  store for the RP's credentials (`SignHandler::sign_fresh`, `RegisterHandler::register_fresh`).
-  With the `pass` backend that decrypts every credential, so a large store makes the section long
-  and a human CTAP command queues behind it (final review M4). A latency residual, documented in
-  ADR 0014 section 15 and `docs/agents/same-user.md`.
+- A same-user sign holds the human operation lock (and storage) while it reads the target RP's
+  credentials (`SignHandler::sign_fresh`: one `ByRp` read, then a `ByRp` read per candidate in
+  `resolve_credential_id`, as the RP ID is normalized the way the storage indexes key it; review
+  M-f). Credentials of other RPs are never read or decrypted. With the `pass` backend that still
+  decrypts each of the RP's own credentials (a GPG operation each), so an RP with many credentials
+  makes the section longer and a human CTAP command queues behind it (final review M4). Pinning
+  `credential_refs` does not skip the `ByRp` read of the RP. `RegisterHandler::register_fresh`
+  does not walk the store: it reads only the credential IDs named by `excludeCredentials`, each by
+  ID and then within the request's RP. A latency residual, documented in ADR 0014 section 15 and
+  `docs/agents/same-user.md`.

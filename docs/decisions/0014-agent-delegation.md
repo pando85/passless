@@ -574,10 +574,14 @@ chose `allow`.
   starve one profile through another (final security review L3).
 - The cooldown table (default 10 minutes per denied key) holds at most 4096 keys and never evicts
   a live cooldown, so a broad `request` rule cannot push out the cooldown that a human's deny just
-  set. Live cooldowns plus live escalations count against the 4096: when the table is full, a new
-  escalation is refused (`policy.deny`, `escalation_tracking_full`, result `busy`) until one
-  expires (review L1). The withdrawal counter table is bounded separately and evicts its oldest
-  entry; that only resets a rate-limit count.
+  set. Live cooldowns plus live escalations count against it, per profile and globally: a profile
+  may hold at most 256, and when it is at that quota its new escalations are refused
+  (`policy.deny`, `escalation_tracking_full`, result `busy`) until one of its entries expires
+  (reviews L1 and M-e). The quota is per profile, so a hostile page behind a broad `request` rule
+  can fill only its own profile's share and other profiles still escalate. The global 4096 (16
+  times the quota) is a backstop that is reached only if 16 profiles are saturated at once. The
+  withdrawal counter table is bounded separately and evicts its oldest entry; that only resets a
+  rate-limit count.
 - The budget claim happens only after origin and policy validation, and for a `request` rule only
   after approval (§9).
 - A same-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, or a replaced
@@ -877,8 +881,14 @@ reason)`, whose summary names `rp_id = "unknown"`, so rotating RP IDs does not d
 No refusal is lost: it is either a record or part of a `suppressed` count. The one gap is a daemon
 killed while a count is pending (fewer than 1024 refusals per key). A served duplicate
 (`policy.replay_served`) keeps its own cap of 16 per replay key and is not a refusal. A late use
-of a revoked bearer is a refusal of that bearer's session and is coalesced the same way. The
-refusal ledger's lock is a leaf below the audit gate (`LOCKING.md`).
+of a revoked bearer is a refusal of that bearer's session and is coalesced the same way. A revoked
+session's ledger is flushed when it is revoked, but the tombstone keeps the session alive to audit
+later use, so refusals counted after that flush are written by a sweep: the runtime loop writes the
+pending count of every tombstoned session about once a second, once the key's window (60 seconds)
+has ended, without needing another refusal (review L5). The residual is a daemon killed within
+that window plus one sweep interval of such a refusal; a bearer's tombstone that is evicted from
+the ring, or a clean exit, writes its count as well. The refusal ledger's lock is a leaf below the
+audit gate (`LOCKING.md`).
 
 Exceptions and recovery:
 
@@ -1022,7 +1032,16 @@ unwinding agent panic harmless in debug and test builds and in any future unwind
 (`an_agent_panic_under_the_shared_locks_leaves_the_human_path_working`). Switching release
 builds to `panic = "unwind"` with `catch_unwind` around ceremonies was considered and not
 adopted: a panic is a bug that should stay loud, the human path cannot use `catch_unwind`
-itself, and recovered locks are sound without it. The residual is a panic inside a dependency
+itself, and recovered locks are sound without it. The soundness of a recovered lock rests on the
+backends writing a credential atomically: `local` and `tpm` rename a complete temporary file, and
+`pass` has GnuPG encrypt to a temporary file in the same directory that is fsynced and renamed over
+the target (GnuPG's own `--output <target>` truncates in place and is not used on the target), so
+a panic leaves either the previous file or the complete new one. The `local` backend has no
+credential cache; `pass` and `tpm` cache decrypted credentials for a bounded time, so a panic after
+a write can leave a stale cached copy until it expires. The TPM context lock and the `pass`
+Git-sync lock are recovered the same way (the TPM recovery also flushes transient objects the
+unwound call left loaded), and a one-call Git-sync operation ends from a drop guard, so a panic
+cannot stop Git sync. The residual is a panic inside a dependency
 (`soft_fido2`, `serde_json`, `ciborium`), which still ends the daemon until systemd restarts it;
 it is an availability failure, never a weakened check, and startup recovery closes any open audit
 reservation (§12).
@@ -1045,7 +1064,7 @@ reservation (§12).
 | Wildcard or ambiguity picks the wrong account | Pinning before `allowCredentials`; forced `single` under `*` | `first-matching` is deliberately less specific |
 | Counter races corrupt human credentials | Shared handle and operation lock | Backend-specific crash consistency |
 | Agent ceremony panics while holding the human locks | Panic-free agent code under the shared locks; the human path recovers poisoned operation, storage and PIN locks (§14, invariant 23) | Release builds abort: a panic in a dependency restarts the daemon (systemd `Restart=on-failure`) |
-| Same-user ceremonies delay the human path | The operation lock is held only for the bounded key-use section, never across a wait on a human, an escalation or the browser | A same-user ceremony holds the human operation lock while it walks the whole human store to find the RP's credentials (selection, reservation, key use); with the `pass` backend that decrypts every credential, so a large store makes each ceremony slow and a human request waits behind it. A latency residual, not a confidentiality one; `isolated` profiles have their own lock and store (`docs/agents/same-user.md`) |
+| Same-user ceremonies delay the human path | The operation lock is held only for the bounded key-use section, never across a wait on a human, an escalation or the browser | A same-user sign holds the human operation lock while it reads the target RP's credentials (selection, reservation, key use); credentials of other RPs are never read, and a registration reads only the IDs in its exclude list. With the `pass` backend that decrypts each of the RP's own credentials, so an RP with many passkeys makes each ceremony slower and a human request waits behind it; pinning does not skip the read. A latency residual, not a confidentiality one; `isolated` profiles have their own lock and store (`docs/agents/same-user.md`) |
 | Page floods the audit log or the replay table | Refusal records are coalesced per session, RP, action and reason with a `suppressed` count (§12); the replay table is capped and refuses with `busy` rather than evicting an entry that protects "never sign twice" (§9) | A page can fill its own session's replay table for 120 seconds, so that session's new requests get `busy` until old entries leave the outcome window; other sessions are unaffected |
 | Extension reports a false origin | Origin taken only from the browser-supplied `remoteDesktopClientOverride`, which a page cannot forge; the daemon builds `clientDataJSON`; cross-origin frames fail closed | Browser and extension are in the TCB; the top origin is not available |
 | Agent drives the extension worker over CDP (reads the bearer, forges the origin, detaches the proxy) | Pipe mode: `browser-control` allows only flat sessions, maps each session to its target and looks the target up before every command on it, refuses attaching to, messaging, closing or inspecting extension targets, hides them from target lists and auto-attach, refuses extension and browser-internal URLs (`about:` aliases and nested JSON included), and forwards only the request it checked, re-serialized (§4.3); in both modes the daemon validates the origin against the RP ID, rules, budget and replay, and containment covers a detached proxy | Port mode: unfiltered, so the origin report is as trustworthy as the CDP client (§7, §11); pipe mode: a worker paused by an auto-attach waits for the next `browser-control` call, and `file:` navigations can read the extension's files (the bearer alone does not pass the sign socket's peer-UID check of a distinct-UID browser) |

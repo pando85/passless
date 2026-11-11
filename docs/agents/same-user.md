@@ -58,13 +58,14 @@ Keep `register = "deny"` after enrollment. See [Rules](rules.md#registration).
 ## Latency
 
 A same-user ceremony holds your authenticator's operation lock while it looks for the credential:
-it walks your whole human store to find the site's credentials before it signs. With the `pass`
-backend that walk decrypts every credential in the store (one GPG operation each), so a large store
-makes each agent ceremony slow, and a request made through your own authenticator (the physical
-path) waits behind it for that time. `local` and `tpm` stores are much cheaper. Pinning
-`credential_refs` does not avoid the walk. Keep a same-user store small, or use an `isolated`
-profile with its own store, when ceremony latency matters. This is a latency residual, not a
-security one; see the ADR's
+a sign reads the credentials stored for the site's RP ID before it signs, and no other site's
+credentials. With the `pass` backend that read decrypts each of the site's own credentials (one GPG
+operation each), so a site with many passkeys makes each agent ceremony slower, and a request made
+through your own authenticator (the physical path) waits behind it for that time. `local` and `tpm`
+stores are much cheaper. Pinning `credential_refs` does not skip that read. A registration reads
+only the credential IDs in its exclude list. Keep the number of passkeys per site small, or use an
+`isolated` profile with its own store, when ceremony latency matters. This is a latency residual,
+not a security one; see the ADR's
 [threat table](../decisions/0014-agent-delegation.md#15-threats-and-residual-risk).
 
 ## Who approves prompts
