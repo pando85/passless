@@ -1771,7 +1771,15 @@ impl SignHandler {
 
         let credential_scope = if grant.credential_refs.is_empty() {
             let mut discovered = Vec::new();
-            if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::None) {
+            // Only this RP's credentials are read (review M-f): `ByRp` is how
+            // `resolve_credential_id` looks them up too. The storage indexes are keyed by the RP
+            // ID as stored, which is what the browser sent (a lowercase hostname), and
+            // `normalized_rp` is trimmed and lowercased, so a credential this finds is one
+            // `resolve_credential_id` finds. A whole-store walk would decrypt every credential
+            // under the human locks (a GPG operation or a TPM unseal each).
+            if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::ByRp(
+                normalized_rp.to_string(),
+            )) {
                 loop {
                     if credential.rp.id.eq_ignore_ascii_case(normalized_rp) {
                         discovered.push(CredentialRef::with_default_domain(&credential.id));
@@ -2898,6 +2906,9 @@ pub(crate) mod tests {
             write_count: AtomicU64,
             /// Remaining matches of the iteration started by the last `read_first`.
             queue: std::collections::VecDeque<soft_fido2::Credential>,
+            /// The RP ID of every credential `read_first` and `read_next` handed out (a backend
+            /// reads, and for `pass` decrypts, each of them).
+            iterated_rps: Mutex<Vec<String>>,
         }
         impl WriteCountingStorage {
             pub fn new() -> Self {
@@ -2905,7 +2916,17 @@ pub(crate) mod tests {
                     creds: Mutex::new(Vec::new()),
                     write_count: AtomicU64::new(0),
                     queue: std::collections::VecDeque::new(),
+                    iterated_rps: Mutex::new(Vec::new()),
                 }
+            }
+            pub fn iterated_rps(&self) -> Vec<String> {
+                self.iterated_rps.lock().unwrap().clone()
+            }
+            pub fn clear_iterated(&self) {
+                self.iterated_rps.lock().unwrap().clear();
+            }
+            fn note_iterated(&self, cred: &soft_fido2::Credential) {
+                self.iterated_rps.lock().unwrap().push(cred.rp.id.clone());
             }
             pub fn writes(&self) -> u64 {
                 self.write_count.load(Ordering::Acquire)
@@ -2933,10 +2954,14 @@ pub(crate) mod tests {
                     }
                 };
                 self.queue = matches.into();
-                self.queue.pop_front().ok_or(soft_fido2::Error::Other)
+                let first = self.queue.pop_front().ok_or(soft_fido2::Error::Other)?;
+                self.note_iterated(&first);
+                Ok(first)
             }
             fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
-                self.queue.pop_front().ok_or(soft_fido2::Error::Other)
+                let next = self.queue.pop_front().ok_or(soft_fido2::Error::Other)?;
+                self.note_iterated(&next);
+                Ok(next)
             }
             fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
                 self.creds
@@ -5395,6 +5420,46 @@ pub(crate) mod tests {
             assert!(handler.sign(&ctx, &f.req_with_challenge(b"x")).is_err());
             drop(hook);
             assert!(super::super::super::lock_order::held_levels().is_empty());
+        }
+
+        /// Review M-f: with no pins the sign path reads only the target RP's credentials. A
+        /// whole-store walk would decrypt every unrelated credential (`pass`) or unseal it (TPM)
+        /// under the human operation and storage locks.
+        #[test]
+        fn sign_path_reads_only_the_target_rps_credentials() {
+            let f = AuditTestFixture::default_allow();
+            let storage = get_write_counting_storage(&f.storage);
+            for (index, rp) in ["other.example", "third.example", "fourth.example"]
+                .iter()
+                .enumerate()
+            {
+                for extra in 0..2u8 {
+                    storage.add_cred(soft_fido2::Credential {
+                        id: vec![0xC0 + index as u8, extra, 7],
+                        rp: RelyingParty::new((*rp).into()),
+                        user: User::new(vec![extra]),
+                        sign_count: 0,
+                        alg: -7,
+                        key: SoftwareCredentialKeyProvider.generate(-7).unwrap().key,
+                        created: 1,
+                        discoverable: true,
+                        backup_state: CredentialBackupState::NotEligible,
+                        extensions: soft_fido2::Extensions::default(),
+                    });
+                }
+            }
+            assert!(storage.count_credentials() >= 7);
+            storage.clear_iterated();
+
+            f.make_handler().sign(&f.make_ctx(), &f.make_req()).unwrap();
+
+            let read = storage.iterated_rps();
+            assert!(!read.is_empty(), "the target RP's credentials are read");
+            assert!(
+                read.iter().all(|rp| rp == "example.com"),
+                "only the target RP's credentials may be iterated, got {read:?}"
+            );
+            assert_eq!(f.key_provider.sign_calls(), 1);
         }
 
         // --- P5 review: H1, M1, M2, L3 and negatives ---
