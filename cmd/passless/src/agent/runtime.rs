@@ -62,6 +62,8 @@ pub struct RuntimeStartParams<'a> {
     pub human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
     pub human_operation_lock: Arc<Mutex<()>>,
     pub human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
+    /// The storage kind of the human backend (the one same-user profiles share), for audit records.
+    pub human_backend_kind: BackendKind,
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
     pub shutdown: Arc<AtomicBool>,
@@ -393,6 +395,8 @@ pub struct ProfileRuntime {
     pub security_config: SecurityConfig,
     pub operation_lock: Arc<Mutex<()>>,
     pub mode: AgentMode,
+    /// The storage kind this profile's operations use (audit records, ADR 0014 section 12).
+    pub backend_kind: BackendKind,
     pub profile_config: AgentProfileConfig,
     pub active_browser: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>>,
     pub shared_browsers: Mutex<HashMap<ProfileId, SharedBrowserLease>>,
@@ -425,23 +429,32 @@ impl core::fmt::Debug for ProfileRuntime {
 impl ProfileRuntime {
     /// What this profile's operation records say about the deployment (ADR 0014 sections 5, 12
     /// and 13): the identity mode, the principal relationship (the principal's UID against the
-    /// daemon's), the backend and the key provider. A same-user profile reports the shared
-    /// `human` backend: the runtime is not told which storage kind the human backend uses.
+    /// daemon's), the storage kind and the key provider.
     pub fn audit_deployment(&self) -> AuditDeployment {
-        use passless_core::agent::config::AgentStorageConfig;
-        let backend = match (self.mode, self.profile_config.storage.as_ref()) {
-            (AgentMode::Isolated, Some(AgentStorageConfig::Local { .. })) => "local",
-            (AgentMode::Isolated, Some(AgentStorageConfig::Pass { .. })) => "pass",
-            #[cfg(feature = "tpm")]
-            (AgentMode::Isolated, Some(AgentStorageConfig::Tpm { .. })) => "tpm",
-            _ => "human",
-        };
         AuditDeployment::new(
             self.mode,
             self.uid == self.daemon_uid,
-            backend,
+            self.backend_kind,
             &*self.backend.key_provider,
         )
+    }
+}
+
+/// The storage kind a profile's operations use: a same-user profile shares the human backend, so it
+/// reports the human backend's kind; an isolated profile reports its own storage's kind (and the
+/// human kind if its storage is missing, which profile start-up rejects anyway).
+pub fn profile_backend_kind(
+    mode: AgentMode,
+    human_backend_kind: BackendKind,
+    storage: Option<&passless_core::agent::config::AgentStorageConfig>,
+) -> BackendKind {
+    use passless_core::agent::config::AgentStorageConfig;
+    match (mode, storage) {
+        (AgentMode::Isolated, Some(AgentStorageConfig::Local { .. })) => BackendKind::Local,
+        (AgentMode::Isolated, Some(AgentStorageConfig::Pass { .. })) => BackendKind::Pass,
+        #[cfg(feature = "tpm")]
+        (AgentMode::Isolated, Some(AgentStorageConfig::Tpm { .. })) => BackendKind::Tpm,
+        _ => human_backend_kind,
     }
 }
 
@@ -778,6 +791,7 @@ impl AgentRuntime {
         human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
         human_operation_lock: Arc<Mutex<()>>,
         human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
+        human_backend_kind: BackendKind,
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
         shutdown: Arc<AtomicBool>,
@@ -788,6 +802,7 @@ impl AgentRuntime {
             human_pin_storage,
             human_operation_lock,
             human_key_provider,
+            human_backend_kind,
             agent_config,
             security_config,
             shutdown,
@@ -801,6 +816,7 @@ impl AgentRuntime {
             human_pin_storage,
             human_operation_lock,
             human_key_provider,
+            human_backend_kind,
             agent_config,
             security_config,
             shutdown,
@@ -826,7 +842,7 @@ impl AgentRuntime {
                 .map_err(|e| RuntimeError::Audit(format!("failed to open audit gate: {}", e)))?,
         );
 
-        let start_event = DaemonStartBuilder::new(std::process::id(), BackendKind::Local).build();
+        let start_event = DaemonStartBuilder::new(std::process::id(), human_backend_kind).build();
         let _ = audit_gate.record(start_event);
 
         let granted_rules = Arc::new(open_granted_rules(agent_config));
@@ -1304,6 +1320,11 @@ impl AgentRuntime {
                     security_config: security_config.clone(),
                     operation_lock: backend.operation_lock.clone(),
                     mode: profile.mode,
+                    backend_kind: profile_backend_kind(
+                        profile.mode,
+                        human_backend_kind,
+                        profile.storage.as_ref(),
+                    ),
                     profile_config: profile.clone(),
                     active_browser: Mutex::new(HashMap::new()),
                     shared_browsers: Mutex::new(HashMap::new()),
@@ -4789,6 +4810,80 @@ fn find_credential_by_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- audit: the backend kind of a profile ---
+
+    #[test]
+    fn a_same_user_profile_reports_the_human_backends_real_storage_kind() {
+        for human in [BackendKind::Local, BackendKind::Pass, BackendKind::Tpm] {
+            assert_eq!(
+                profile_backend_kind(AgentMode::SameUser, human, None),
+                human,
+                "same-user shares the human backend"
+            );
+            // A same-user profile has no storage of its own; a stray one is not consulted.
+            let stray = passless_core::agent::config::AgentStorageConfig::Local {
+                path: "/x".into(),
+                pin_path: "/y".into(),
+            };
+            assert_eq!(
+                profile_backend_kind(AgentMode::SameUser, human, Some(&stray)),
+                human
+            );
+        }
+    }
+
+    #[test]
+    fn an_isolated_profile_reports_its_own_storage_kind() {
+        use passless_core::agent::config::AgentStorageConfig;
+        let local = AgentStorageConfig::Local {
+            path: "/x".into(),
+            pin_path: "/y".into(),
+        };
+        let pass = AgentStorageConfig::Pass {
+            store_path: "/s".into(),
+            path: "p".to_string(),
+            gpg_backend: "gnupg-bin".to_string(),
+            pin_path: "/y".into(),
+            git_sync: false,
+            git_auto_push: false,
+        };
+        // The human backend's kind does not leak into an isolated profile.
+        assert_eq!(
+            profile_backend_kind(AgentMode::Isolated, BackendKind::Tpm, Some(&local)),
+            BackendKind::Local
+        );
+        assert_eq!(
+            profile_backend_kind(AgentMode::Isolated, BackendKind::Local, Some(&pass)),
+            BackendKind::Pass
+        );
+        #[cfg(feature = "tpm")]
+        {
+            let tpm = AgentStorageConfig::Tpm {
+                path: "/t".into(),
+                tcti: "device:/dev/tpmrm0".to_string(),
+                pin_path: "/y".into(),
+                portable: false,
+            };
+            assert_eq!(
+                profile_backend_kind(AgentMode::Isolated, BackendKind::Local, Some(&tpm)),
+                BackendKind::Tpm
+            );
+        }
+    }
+
+    #[test]
+    fn the_audit_deployment_carries_the_backend_kind_name() {
+        let deployment = AuditDeployment::new(
+            AgentMode::SameUser,
+            true,
+            BackendKind::Pass,
+            &soft_fido2::SoftwareCredentialKeyProvider,
+        );
+        assert_eq!(deployment.backend.as_deref(), Some("pass"));
+        assert_eq!(deployment.mode.as_deref(), Some("same-user"));
+        assert_eq!(deployment.key_provider.as_deref(), Some("software"));
+    }
 
     // --- admin credential delete: storage errors are not "not found" ---
 

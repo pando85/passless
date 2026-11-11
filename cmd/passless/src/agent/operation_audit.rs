@@ -30,8 +30,8 @@ use passless_core::agent::{AgentMode, CredentialRef, MatchedRule, ProfileId, Rul
 
 use super::audit::AuditGate;
 use super::audit_events::{
-    AuditAction, OperationRecord, OperationTerminalBuilder, PolicyAllowBuilder, PolicyDenyBuilder,
-    PolicyDenyReason, RuleGrantSource,
+    AuditAction, BackendKind, OperationRecord, OperationTerminalBuilder, PolicyAllowBuilder,
+    PolicyDenyBuilder, PolicyDenyReason, RuleGrantSource,
 };
 use super::policy_engine::PolicyRuntime;
 use super::session::AgentSession;
@@ -44,7 +44,8 @@ pub struct AuditDeployment {
     pub mode: Option<String>,
     /// `shared-uid` or `distinct-uid`, from the principal UID against the daemon UID.
     pub principal_relationship: Option<String>,
-    /// `human` (the human backend a same-user profile shares), `local`, `pass` or `tpm`.
+    /// The storage kind: `local`, `pass` or `tpm` (the human backend's kind for a same-user
+    /// profile, the profile's own storage for an isolated one).
     pub backend: Option<String>,
     /// `software` or the portable key provider's name (`tpm`).
     pub key_provider: Option<String>,
@@ -54,7 +55,7 @@ impl AuditDeployment {
     pub fn new(
         mode: AgentMode,
         shared_uid: bool,
-        backend: &str,
+        backend: BackendKind,
         key_provider: &dyn soft_fido2::CredentialKeyProvider,
     ) -> Self {
         let provider_id = key_provider.provider_id();
@@ -84,7 +85,7 @@ impl AuditDeployment {
                 }
                 .to_string(),
             ),
-            backend: Some(backend.to_string()),
+            backend: Some(backend.as_str().to_string()),
             key_provider: Some(key_provider),
         }
     }

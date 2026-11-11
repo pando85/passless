@@ -552,6 +552,17 @@ pub enum BackendKind {
     Tpm,
 }
 
+impl BackendKind {
+    /// The name audit records carry (`local`, `pass` or `tpm`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Pass => "pass",
+            Self::Tpm => "tpm",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
@@ -1038,7 +1049,8 @@ pub struct OperationRecord {
     credential_ref: Option<CredentialRef>,
     #[serde(default)]
     selection_rule: Option<String>,
-    /// The backend the operation used (`human`, `local`, `pass` or `tpm`).
+    /// The storage backend the operation used (`local`, `pass` or `tpm`): the human backend's
+    /// kind for a same-user profile, the profile's own storage kind for an isolated one.
     #[serde(default)]
     backend: Option<String>,
     /// The key provider type (`software` or `tpm`).
@@ -3278,7 +3290,7 @@ mod tests {
             .deployment(
                 Some("same-user".to_string()),
                 Some("shared-uid".to_string()),
-                Some("human".to_string()),
+                Some("local".to_string()),
                 Some("software".to_string()),
             )
             .epochs(3, 2)

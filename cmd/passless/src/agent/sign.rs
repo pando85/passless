@@ -1804,11 +1804,15 @@ impl SignHandler {
         };
 
         let mut candidates = Vec::new();
+        // The counter of every candidate as this selection read it (the operation lock is held, so
+        // it cannot change before key use): the reservation's `counter_before` needs no second read.
+        let mut counters_before = HashMap::new();
         for credential_ref in &credential_scope {
             if let Ok(credential_id) =
                 Self::resolve_credential_id(&mut storage, credential_ref, normalized_rp)
                 && let Ok(credential) = storage.read(&credential_id)
             {
+                counters_before.insert(credential_id.clone(), credential.sign_count);
                 candidates.push((credential_id, credential_ref.clone(), credential.created));
             }
         }
@@ -1831,23 +1835,25 @@ impl SignHandler {
                 self.record_policy_deny(target, PolicyDenyReason::CredentialNotMatch);
             })?;
 
+        // 8. Durable audit reservation before key use (invariant 16). From here every exit path
+        //    ends in the ceremony's terminal record (`CeremonyAudit::conclude`), carrying the
+        //    credential, how it was selected and the counter before. The credential is read for
+        //    key use only after the reservation, as before P8.
+        target.audit.selected(
+            Some(CredentialRef::with_default_domain(&cred_id)),
+            Some(&matched.selection),
+            counters_before.get(&cred_id).copied(),
+        );
+        target.audit.reserve(target)?;
+
         let cred = storage.read(&cred_id).map_err(|_| {
+            target.audit.fail(PolicyDenyReason::CredentialUnavailable);
             ProtocolError::new(
                 ErrorCode::NotFound,
                 "credential not found in storage",
                 RecommendedAction::FixRequest,
             )
         })?;
-
-        // 8. Durable audit reservation before key use (invariant 16). From here every exit path
-        //    ends in the ceremony's terminal record (`CeremonyAudit::conclude`), carrying the
-        //    credential, how it was selected and the counter before.
-        target.audit.selected(
-            Some(CredentialRef::with_default_domain(&cred.id)),
-            Some(&matched.selection),
-            Some(cred.sign_count),
-        );
-        target.audit.reserve(target)?;
 
         if cred.extensions.cred_protect == Some(3) && !uv {
             self.record_policy_deny(target, PolicyDenyReason::UvRequired);
@@ -5992,7 +5998,7 @@ pub(crate) mod tests {
             AuditDeployment {
                 mode: Some("same-user".to_string()),
                 principal_relationship: Some("shared-uid".to_string()),
-                backend: Some("human".to_string()),
+                backend: Some("local".to_string()),
                 key_provider: Some("software".to_string()),
             }
         }
@@ -6014,7 +6020,7 @@ pub(crate) mod tests {
                 assert_eq!(record["profile_id"], "test-profile");
                 assert_eq!(record["mode"], "same-user");
                 assert_eq!(record["principal_relationship"], "shared-uid");
-                assert_eq!(record["backend"], "human");
+                assert_eq!(record["backend"], "local");
                 assert_eq!(record["key_provider"], "software");
                 assert_eq!(record["action"], "authenticate");
                 assert_eq!(record["rp_id"], "example.com");

@@ -102,7 +102,7 @@ scenario({ id: 'E2E-32', title: 'audit content for allow, deny, escalation: ever
       assert.equal(record.profile_id, 'agent');
       assert.equal(record.mode, 'same-user');
       assert.ok(['shared-uid', 'distinct-uid'].includes(record.principal_relationship), record.principal_relationship);
-      assert.equal(record.backend, 'human', 'a same-user profile uses the human backend');
+      assert.equal(record.backend, 'local', 'a same-user profile reports the human backend\'s storage kind (the harness daemon runs --backend-type local)');
       assert.equal(record.key_provider, 'software');
       assert.ok(Number.isInteger(record.revocation_epoch) && Number.isInteger(record.grant_epoch), 'the real epochs');
       assert.equal(record.top_origin, null, 'top_origin is null on the proxy path');
