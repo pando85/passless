@@ -13,7 +13,8 @@ const { stopExtensionWorker } = require('../lib/browser');
 //   - a `create` on the connection that is still open is answered `unauthorized` (the bearer is re-validated per
 //     request; the connection is not dropped) and audited `policy.deny(reason=bearer_revoked, rp_id=rp-a.test)`;
 //   - a new connection's `hello` with the old bearer is refused `unauthorized` and closed, and audited
-//     `policy.deny(reason=bearer_revoked)` with an unknown RP ID (a hello names none).
+//     `policy.deny(reason=bearer_revoked)` with an unknown RP ID (a hello names none) and the `authenticate` action
+//     (the revoked sign bearer is looked up first; the hello names no action).
 // No credential is created after the exit.
 //
 // The profile also carries a legacy `[device]` table: it must be warned about and ignored (R6, B6).
@@ -67,8 +68,11 @@ scenario({ id: 'E2E-11', title: 'registration after browser exit with the old be
   assert.deepEqual(stack.daemon.humanStore(), humanBefore, 'the human store must be untouched');
 
   const audit = await stack.daemon.audit();
-  const refusals = policyEvents(audit, 'policy.deny').filter(e => e.profile_id === 'iso' && e.action === 'register');
-  assert.deepEqual(refusals.map(e => [e.reason, e.rp_id]), [['bearer_revoked', 'rp-a.test'], ['bearer_revoked', 'unknown']],
+  // A hello names no action: the daemon audits it against the revoked sign bearer (checked first), so it carries
+  // `authenticate`; the refused `create` request is audited as `register`.
+  const refusals = policyEvents(audit, 'policy.deny').filter(e => e.profile_id === 'iso');
+  assert.deepEqual(refusals.map(e => [e.action, e.reason, e.rp_id]),
+    [['register', 'bearer_revoked', 'rp-a.test'], ['authenticate', 'bearer_revoked', 'unknown']],
     `expected the request and the hello refusals, audit: ${JSON.stringify(audit.map(e => (e.event || e).kind))}`);
   assert.equal(policyEvents(audit, 'policy.allow').filter(e => e.action === 'register').length, 1, 'only the live registration was allowed');
   assertNoNotification(stack);
