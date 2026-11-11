@@ -14,13 +14,18 @@ const run = (bin, args, env) => new Promise(resolve => {
   execFile(bin, args, { env, timeout: 60000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => resolve({ code: error ? (error.code ?? 1) : 0, stdout, stderr }));
 });
 
-/** A stand-in browser: executable script that prints `versionLine` for --version and refuses to do anything else. */
+/**
+ * A stand-in browser: an executable script that prints `versionLine` for --version and, on any other call, records that it
+ * was started (a marker file next to it) and fails. A refused browser must never be started, not even once.
+ */
 function fakeBrowser(dir, rel, versionLine) {
   const file = path.join(dir, rel);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo ${JSON.stringify(versionLine)}; exit 0; fi\necho "refused browser was started" >&2\nexit 99\n`, { mode: 0o755 });
+  const marker = markerOf(file);
+  fs.writeFileSync(file, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo ${JSON.stringify(versionLine)}; exit 0; fi\ntouch ${JSON.stringify(marker)}\necho "refused browser was started" >&2\nexit 99\n`, { mode: 0o755 });
   return file;
 }
+const markerOf = file => `${file}.started`;
 
 // Catalogue E2E-41 (R14): `agents.browser_path` naming branded Google Chrome or chrome-headless-shell is refused with an
 // actionable error, and no browser starts. Neither can load the interception extension: branded Chrome ignores
@@ -55,6 +60,7 @@ scenario({ id: 'E2E-41', title: '`agents.browser_path` set to Google Chrome or c
       assert.doesNotMatch(out, /cdp_endpoint/, `${c.name}: no endpoint may be handed out`);
     }
     assert.deepEqual(browserProcesses(stack, processesMentioning), [], `${c.name}: a browser process exists`);
+    assert.ok(!fs.existsSync(markerOf(c.exe)), `${c.name}: the refused browser was started (marker file written)`);
 
     const doctor = await run(stack.daemon.bin, ['doctor', '--agents', '-o', 'json'], stack.daemon.cliEnv);
     assert.equal(doctor.code, 1, `${c.name}: doctor --agents fails: ${doctor.stdout}${doctor.stderr}`);

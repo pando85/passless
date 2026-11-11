@@ -70,3 +70,25 @@ scenario({ id: 'E2E-35', title: 'Playwright MCP with --isolated: the CDP-created
   assert.equal((await extensionWorkerTargets(b.browser)).length, 1, 'the extension worker runs once');
   await cdp.detach();
 });
+
+// P10b review L3: the default npx resolution, as a real MCP client configuration runs it: no `--npx`, `npx` found on the
+// client's PATH (here a symlink to the harness shim in a directory of its own), and that directory forwarded first into
+// the principal session's PATH, whose daemon environment need not have it (an nvm-installed node).
+scenario({ id: 'E2E-34/default-npx', title: 'Playwright MCP without --npx: npx from PATH, its directory forwarded', ci: true }, async ctx => {
+  const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
+  const rp = stack.rp.a;
+  await stack.seedHuman(rp, 'alice');
+
+  const mcp = stack.adapter('playwright', { profile: 'agent', defaultNpx: true });
+  assert.ok(!mcp.args.includes('--npx'), `the client configuration names no npx: ${mcp.args.join(' ')}`);
+  await mcp.client.initialize();
+  const nav = await mcp.client.callTool('browser_navigate', { url: `${rp.origin}/sw` }, 120000);
+  assert.ok(!nav.isError, toolText(nav));
+  assertVerifiedAssertion(rp, evalJson(await mcp.client.callTool('browser_evaluate', { function: authenticateFn('alice') })), { username: 'alice' });
+  await assertAgentAllowed(stack, { rpId: 'rp-a.test', n: 1 });
+
+  const calls = mcp.npxCalls();
+  assert.equal(calls.length, 1, `npx from PATH ran once: ${JSON.stringify(calls)}`);
+  assert.deepEqual(calls[0].slice(0, 2), ['--yes', '@playwright/mcp']);
+  assert.deepEqual(mcp.npxPathHeads(), [mcp.shimDir], "npx's directory leads the PATH the adapter gave the server");
+});

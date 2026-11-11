@@ -22,16 +22,30 @@ const shq = s => `'${String(s).replace(/'/g, "'\\''")}'`;
  * @param {'playwright'|'chrome-devtools'} kind
  * @param {{profile: string, flags?: string[], extra?: string[]}} o  `flags` go before `--`, `extra` after it (to the MCP server)
  */
-function startAdapter(stack, kind, { profile, flags = [], extra = [] }) {
+function startAdapter(stack, kind, { profile, flags = [], extra = [], defaultNpx = false }) {
   if (!ADAPTERS.includes(kind)) throw new Error(`unknown adapter ${kind}`);
   const daemon = stack.daemon;
-  const args = ['agent', 'mcp', kind, '--profile', profile, '--npx', NPX_SHIM, ...flags, ...(extra.length ? ['--', ...extra] : [])];
-  const client = McpClient.start({ command: daemon.bin, args, env: daemon.cliEnv, cwd: stack.env.dirs.work });
+  let env = daemon.cliEnv;
+  let npxArgs = ['--npx', NPX_SHIM];
+  let shimDir = null;
+  if (defaultNpx) {
+    // As a real client config would: no --npx, `npx` found on the client's PATH.
+    shimDir = path.join(stack.env.dirs.work, 'npx-on-path');
+    fs.mkdirSync(shimDir, { recursive: true });
+    const link = path.join(shimDir, 'npx');
+    if (!fs.existsSync(link)) fs.symlinkSync(NPX_SHIM, link);
+    env = { ...env, PATH: `${shimDir}:${env.PATH}` };
+    npxArgs = [];
+  }
+  const args = ['agent', 'mcp', kind, '--profile', profile, ...npxArgs, ...flags, ...(extra.length ? ['--', ...extra] : [])];
+  const client = McpClient.start({ command: daemon.bin, args, env, cwd: stack.env.dirs.work });
   const log = path.join(stack.env.dirs.logs, 'npx.jsonl');
   return {
-    client, kind, args,
+    client, kind, args, shimDir,
     /** Argv of every npx invocation of this run (bearer values redacted), oldest first. */
     npxCalls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []),
+    /** The first PATH entry of every npx invocation (what the adapter forwarded). */
+    npxPathHeads: () => (fs.existsSync(`${log}.path`) ? fs.readFileSync(`${log}.path`, 'utf8').split('\n').filter(Boolean) : []),
     close: () => client.close(),
   };
 }

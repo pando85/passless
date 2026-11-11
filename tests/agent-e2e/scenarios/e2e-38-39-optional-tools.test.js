@@ -11,6 +11,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { execFile, spawnSync } = require('node:child_process');
 
 const { scenario, assert, skipOptional } = require('../lib/scenario');
@@ -35,7 +36,11 @@ function findOnPath(name, extraDirs = []) {
 scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (local, optional)', ci: false }, async ctx => {
   const python = process.env.AGENT_E2E_BROWSER_USE_PYTHON || findOnPath('python3');
   if (!python) skipOptional('no python3');
-  if (spawnSync(python, ['-I', '-c', 'import browser_use'], { encoding: 'utf8' }).status !== 0) {
+  // Detection with the user's own site-packages (plain `python3 -c`, not `-I`, which ignores the user site) in a clean
+  // environment; the run keeps the scenario's temp HOME and only points PYTHONUSERBASE at the real user base.
+  const userBase = process.env.PYTHONUSERBASE || path.join(os.homedir(), '.local');
+  const cleanEnv = { PATH: process.env.PATH, HOME: os.homedir(), PYTHONUSERBASE: userBase };
+  if (spawnSync(python, ['-c', 'import browser_use'], { encoding: 'utf8', env: cleanEnv }).status !== 0) {
     skipOptional('browser-use is not installed (pip install browser-use, or set AGENT_E2E_BROWSER_USE_PYTHON)');
   }
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
@@ -58,7 +63,7 @@ scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (
       '        await browser.stop()',
       'asyncio.run(main(sys.argv[1], sys.argv[2], sys.argv[3]))',
     ].join('\n'));
-    const r = await run(python, ['-I', script, url, `${rp.origin}/sw`, authenticateFn('alice')], { env: { ...stack.daemon.cliEnv, ANONYMIZED_TELEMETRY: 'false' } });
+    const r = await run(python, [script, url, `${rp.origin}/sw`, authenticateFn('alice')], { env: { ...stack.daemon.cliEnv, PYTHONUSERBASE: userBase, ANONYMIZED_TELEMETRY: 'false' } });
     assert.equal(r.code, 0, `browser-use failed: ${r.stderr.slice(-800)}`);
     const line = r.stdout.split('\n').find(l => l.startsWith('RESULT:'));
     assert.ok(line, `no result line: ${r.stdout.slice(-400)}`);

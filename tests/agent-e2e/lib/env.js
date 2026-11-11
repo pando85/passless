@@ -160,6 +160,9 @@ function createEnv(label = 'scenario') {
     TMPDIR: dirs.work,
     // Never let a child (e.g. @playwright/mcp) fall back to the shared ~/.cache/ms-playwright.
     PLAYWRIGHT_BROWSERS_PATH: path.join(require('./paths').CACHE_DIR, 'ms-playwright'),
+    // chrome-devtools-mcp reports usage statistics to Google and checks the npm registry for updates by default.
+    CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: '1',
+    CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1',
     PASSLESS_CONFIG: path.join(dirs.config, 'passless', 'config.toml'),
     PASSLESS_BACKEND_TYPE: 'local',
     PASSLESS_LOCAL_PATH: dirs.store,

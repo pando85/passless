@@ -14,6 +14,8 @@ const argv = process.argv.slice(2);
 if (process.env.AGENT_E2E_NPX_LOG) {
   const redacted = argv.map(a => a.replace(/(Bearer )\S+/, '$1<redacted>'));
   fs.appendFileSync(process.env.AGENT_E2E_NPX_LOG, JSON.stringify(redacted) + '\n');
+  // The first PATH entry the adapter gave this process (it forwards npx's own directory, so an nvm node is found).
+  fs.appendFileSync(`${process.env.AGENT_E2E_NPX_LOG}.path`, `${(process.env.PATH || '').split(':')[0]}\n`);
 }
 
 let i = 0;
