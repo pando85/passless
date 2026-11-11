@@ -42,6 +42,14 @@ the same keys; keys that do not apply yet are `null`:
 A reservation and its terminal record share `request_id`. Evidence is always `agent`: agent-derived
 UP and UV are never recorded, or described, as human interaction.
 
+`policy.deny` and `policy.replay_served` also carry `reason` and `suppressed`. A page can loop a
+refused request, so refusals are coalesced per session, RP, action and reason: the first 16 in a
+60 second window are written in full, and the rest are counted. The count is written as one
+`policy.deny` with `suppressed` set to the number of refusals it stands for (its `origin` fields are
+null; an RP the session no longer tracks is named `unknown`). The count is written when the next
+window starts, when it reaches 1024, and when the session is revoked or dropped. Every refusal is
+either a record or part of a count. `suppressed` is null on every other record.
+
 ## Other records
 
 - Escalation: `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted`

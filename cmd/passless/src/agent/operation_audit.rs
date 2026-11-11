@@ -20,6 +20,7 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::time::Instant;
 
 use log::warn;
 use rand::RngCore;
@@ -35,6 +36,7 @@ use super::audit_events::{
 };
 use super::deployment::PrincipalRelationship;
 use super::policy_engine::PolicyRuntime;
+use super::refusal_ledger::{RefusalKey, RefusalLedger, SummaryTemplate};
 use super::session::AgentSession;
 
 /// What an audit record says about where an operation ran (ADR 0014 sections 5 and 13): the two
@@ -158,6 +160,8 @@ pub(crate) struct CeremonyAudit {
     request_id: String,
     profile_id: ProfileId,
     action: AuditAction,
+    /// The session's refusal ledger (review M2).
+    refusals: Arc<RefusalLedger>,
     state: RefCell<State>,
 }
 
@@ -180,6 +184,7 @@ impl CeremonyAudit {
             request_id: format!("req-{}", hex::encode(id)),
             profile_id: profile_id.clone(),
             action,
+            refusals: session.refusals().clone(),
             state: RefCell::new(State::default()),
         }
     }
@@ -276,6 +281,12 @@ impl CeremonyAudit {
     /// A refusal. Before the reservation it is a `policy.deny` record (or `policy.replay_served`
     /// for a duplicate that was served); after it, the failure is only noted and the terminal
     /// record carries it.
+    ///
+    /// Refusals are coalesced per `(session, RP ID, action, reason)` (review M2): the first
+    /// [`super::refusal_ledger::FULL_RECORDS_PER_WINDOW`] of a window are written in full, the rest
+    /// are counted and written as one summary (`suppressed`), so a page that loops a refused
+    /// request cannot flood the fsynced log. A served duplicate (`ReplayServed`) is not a
+    /// refusal and keeps its own per-key cap.
     pub fn deny(&self, target: &AuditTarget, reason: PolicyDenyReason) {
         let event = {
             let mut state = self.state.borrow_mut();
@@ -284,6 +295,25 @@ impl CeremonyAudit {
                 return;
             }
             let op = self.base(&state, &Self::snapshot(target));
+            drop(state);
+            if reason != PolicyDenyReason::ReplayServed {
+                let key = RefusalKey::new(self.action, target.rp_id, reason);
+                let admission = self.refusals.admit(key, Instant::now(), || {
+                    // A summary may span several origins: it names none.
+                    SummaryTemplate {
+                        gate: self.gate.clone(),
+                        profile_id: self.profile_id.clone(),
+                        op: op.clone().origin_context(None, None, None),
+                    }
+                });
+                // Pending summaries first, so the log stays in order.
+                for summary in admission.summaries {
+                    summary.write();
+                }
+                if !admission.write_in_full {
+                    return;
+                }
+            }
             PolicyDenyBuilder::new(self.profile_id.clone(), self.action, target.rp_id, reason)
                 .operation(op)
                 .build()

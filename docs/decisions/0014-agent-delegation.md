@@ -518,8 +518,17 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
   queue; overflow is denied.
 - Waiting ceremonies are parked: they hold no lock and no request-cap slot (the transport permit
   is suspended for the wait), only their sleeping request thread (amended in P7). At most 4
-  escalation waiters exist per session, 16 per profile and 64 in all; a ceremony beyond a cap is
-  denied and audited, and other profiles are unaffected.
+  escalation waiters exist per session and 16 per profile; a ceremony beyond a cap is denied and
+  audited, and other profiles are unaffected (a profile at its cap never uses up another's). A
+  global bound of 1024 waiters is a safety limit on parked threads only: it is 64 times the
+  profile cap, so it is reached only if 64 profiles are saturated at once and cannot be used to
+  starve one profile through another (final security review L3).
+- The cooldown table (default 10 minutes per denied key) holds at most 4096 keys and never evicts
+  a live cooldown, so a broad `request` rule cannot push out the cooldown that a human's deny just
+  set. Live cooldowns plus live escalations count against the 4096: when the table is full, a new
+  escalation is refused (`policy.deny`, `escalation_tracking_full`, result `busy`) until one
+  expires (review L1). The withdrawal counter table is bounded separately and evicts its oldest
+  entry; that only resets a rate-limit count.
 - The budget claim happens only after origin and policy validation, and for a `request` rule only
   after approval (§9).
 - A same-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, or a replaced
@@ -554,7 +563,11 @@ fails after approval, nothing is persisted.
   `registration`), `granted_at`, approving `request_id`, origin at request time, and the
   permitting config rule (`exact` or `*`).
 - **Write:** temporary file, fsync, rename, fsync directory. A failed write fails the approval and
-  the ceremony is denied.
+  the ceremony is denied. The store directory is opened once as a pinned handle (`safe_fs::Dir`:
+  `openat` with `O_NOFOLLOW` below its parent, owner and mode checked on the descriptor), and the
+  exclusive temporary file, the `renameat`, the fsync and the reload all go through it, so a
+  symlink planted in its place is refused and a path swap cannot redirect a write (review L4). The
+  state directory above it is the operator's and is resolved once.
 - **Read:** loaded at startup and after every write. A malformed or wrongly owned store disables
   grants for that profile (fail closed) and is reported by `passless doctor` (`agent-admin
   profile check`). The store has its own `grants_digest`, reported next to the policy digest;
@@ -608,6 +621,16 @@ The normative model is a bearer session, not a per-operation state machine.
   completion the duplicate receives the original result for 120 seconds, in the same session only.
   Any other repeat is rejected. Failures consume the key. This accommodates relying parties that
   resubmit an identical request (Kanidm).
+- **Bounded table.** Entries live for the session, so the table is capped at 8192 keys (twice the
+  largest `max_operations`, 4096, because every signed key claims budget). When a fresh key finds
+  it full, the daemon forgets the oldest completed entries that are older than the 120 second
+  outcome window and never reached key use, together with their challenges. It never forgets an
+  entry that is in flight, inside the outcome window, or that used a key, so a request that was
+  signed once is never signed again, however long the session lives. If nothing can be forgotten
+  the request is refused with `busy` and recommended action `retry_with_backoff`, audited as
+  `policy.deny` with reason `replay_table_full` (result `busy`). It consumes no budget and does
+  not consume its replay key (review M2). Without the cap an allowed RP with no matching
+  credential left one permanent entry per fresh challenge.
 - **Revocation.** Browser exit, lease revocation, principal death, TTL expiry, config reload and
   grant revocation revoke both sign and registration bearers. Registration authority on the
   extension path is the session bearer itself; there is no separate registration grant (§10.3).
@@ -774,6 +797,29 @@ After the reservation a failure is the terminal record's `failure_class`, not a 
 `busy` or `error`. The test list `SECTION_12_OPERATION_FIELDS` in `audit_events.rs` is the
 canonical field list that the record types are tested against.
 
+**Coalesced refusals** (final security review M2). Every record is fsynced, and a page can loop a
+refused request, so refusals are coalesced per `(session, RP ID, action, reason)` rather than
+written one for one. The first 16 of a key in a 60 second window are written in full, as above.
+Later ones are counted, not written. The count is written as one `policy.deny` summary whose
+`suppressed` field is the number of refusals it stands for (the field is present on every
+`policy.deny` and `policy.replay_served` record, null on all but a summary):
+
+- when the window has ended and the key is refused again (the next window then starts with 16 full
+  records again);
+- when the pending count reaches 1024, inside the window;
+- when the session is revoked, and, at the latest, when it is dropped (a clean daemon exit).
+
+A summary is a `policy.deny` record with the same operation fields as the refusals it summarizes
+(`request_id` and the epochs are those of the latest one), `origin`, `top_origin` and
+`cross_origin` null (a summary may span several origins), and the same `reason` and `result`. A
+session tracks at most 64 keys; refusals beyond that share one overflow key per `(action,
+reason)`, whose summary names `rp_id = "unknown"`, so rotating RP IDs does not defeat the bound.
+No refusal is lost: it is either a record or part of a `suppressed` count. The one gap is a daemon
+killed while a count is pending (fewer than 1024 refusals per key). A served duplicate
+(`policy.replay_served`) keeps its own cap of 16 per replay key and is not a refusal. A late use
+of a revoked bearer is a refusal of that bearer's session and is coalesced the same way. The
+refusal ledger's lock is a leaf below the audit gate (`LOCKING.md`).
+
 Exceptions and recovery:
 
 - **A killed daemon.** A daemon exit or SIGKILL between a reservation and its terminal record
@@ -936,6 +982,8 @@ reservation (§12).
 | Wildcard or ambiguity picks the wrong account | Pinning before `allowCredentials`; forced `single` under `*` | `first-matching` is deliberately less specific |
 | Counter races corrupt human credentials | Shared handle and operation lock | Backend-specific crash consistency |
 | Agent ceremony panics while holding the human locks | Panic-free agent code under the shared locks; the human path recovers poisoned operation, storage and PIN locks (§14, invariant 23) | Release builds abort: a panic in a dependency restarts the daemon (systemd `Restart=on-failure`) |
+| Same-user ceremonies delay the human path | The operation lock is held only for the bounded key-use section, never across a wait on a human, an escalation or the browser | A same-user ceremony holds the human operation lock while it walks the whole human store to find the RP's credentials (selection, reservation, key use); with the `pass` backend that decrypts every credential, so a large store makes each ceremony slow and a human request waits behind it. A latency residual, not a confidentiality one; `isolated` profiles have their own lock and store (`docs/agents/same-user.md`) |
+| Page floods the audit log or the replay table | Refusal records are coalesced per session, RP, action and reason with a `suppressed` count (§12); the replay table is capped and refuses with `busy` rather than evicting an entry that protects "never sign twice" (§9) | A page can fill its own session's replay table for 120 seconds, so that session's new requests get `busy` until old entries leave the outcome window; other sessions are unaffected |
 | Extension reports a false origin | Origin taken only from the browser-supplied `remoteDesktopClientOverride`, which a page cannot forge; the daemon builds `clientDataJSON`; cross-origin frames fail closed | Browser and extension are in the TCB; the top origin is not available |
 | Agent drives the extension worker over CDP (reads the bearer, forges the origin, detaches the proxy) | Pipe mode: `browser-control` refuses attaching to, messaging, closing or inspecting extension targets, hides them from target lists and auto-attach, and refuses extension and browser-internal URLs (§4.3); in both modes the daemon validates the origin against the RP ID, rules, budget and replay, and containment covers a detached proxy | Port mode: unfiltered, so the origin report is as trustworthy as the CDP client (§7, §11); pipe mode: a worker paused by an auto-attach waits for the next `browser-control` call, and `file:` navigations can read the extension's files (the bearer alone does not pass the sign socket's peer-UID check of a distinct-UID browser) |
 | Registration completes but the page gets `NotAllowedError` (unfocused tab) | The audit records the registration; the operator deletes the orphan credential; adapters bring the page to the front | An orphan credential can remain until deleted |
@@ -1025,7 +1073,7 @@ References are `file:line` at commit `130eaa5`.
 | Epochs and live resolution | **Done (P5).** A revocation epoch (bumped by a reload that changes the digest; P7 bumps it on grant revocation) and a grant epoch (P7 bumps it when a grant is added; never revokes). Sessions record the revocation epoch at creation and are checked against it on every request and again immediately before key use, together with a live re-resolve (invariant 13). Reload re-reads and validates the configuration file; an invalid file or a restart-only change keeps the old generation and returns an error; an unchanged digest revokes nothing. `max_operations` is read from the live policy | — |
 | Budget claim order | **Done (P5).** Origin and RP validation, session grant and principal binding, resolve, unsupported options, then replay key, then budget; rejected requests never claim budget. `request` (P7) runs the escalation pre-checks, takes the replay key without budget, and claims the budget only after approval (`AgentSession::claim_key`, `ClaimGuard::claim_budget`) | — |
 | Replay | **Done (P5).** `SHA-256(action ‖ rp_id ‖ origin ‖ top_origin ‖ challenge)` with length-prefixed fields and a presence tag for `top_origin` (`session.rs`); per bearer session; a duplicate joins the in-flight request until its own deadline (an aborted duplicate detaches alone) or gets the original outcome for 120 s; a reused challenge under another key is rejected; failures consume the key | — |
-| Registration bearers | **Done (P3).** Bound to the browser lease and revoked by `revoke_by_lease`; a late use is refused with `401 invalid_bearer` and audited as `policy.deny(reason=bearer_revoked)` (at most 16 records per bearer) | — |
+| Registration bearers | **Done (P3).** Bound to the browser lease and revoked by `revoke_by_lease`; a late use is refused with `401 invalid_bearer` and audited as `policy.deny(reason=bearer_revoked)` (the first 16 per window in full, the rest as a `suppressed` count, §12) | — |
 | Operator-minted enrollment grants (#411) | **Done (P3).** `RegistrationGrantRegistry`, the `RequestRegistration` admin request, its CLI and handler are removed; registration authority is the exact-RP `register = "allow"` rule (`register = "request"` denies with audit until P7); a wildcard rule never permits registration | — |
 | Isolated UHID route | **Done (P3).** `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, `interaction.rs`, the endpoint wiring in `runtime.rs`, the agent UHID doctor check and the agent udev rule are removed; a legacy `[device]` key is warned about and ignored (R6). `agent/storage.rs` (ceremony-scoped storage views) is removed too. The `passless-uhid` crate and `tools/agent-uhid-feasibility` were removed in P11: the controlled RP, the lab udev policy and the permission probes moved to `tools/agent-validation`. The principal intent protocol was removed in P7. A cleanup after P11 removed the leftovers: `passless agent endpoint-status` and the `endpoint_id` plumbing (grants, leases, the browser manifest, the profile report), the principal delegation protocol (`passless agent delegation`, the `RequestDelegation`, `ShowDelegation`, `WaitDelegation`, `CancelDelegation` and `SignAssertion` principal requests, the pending-request registry in `policy_engine.rs`), `ErrorCode::InteractionRequired` and the legacy `Capabilities` principal request with its `registration_allowed` field (`passless agent capabilities` prints the `Authority` response, which carries each RP's `authenticate` and `register` rule). The `endpoint.*` and `intent.*` audit record kinds stay readable for old logs | — |
 | Principal digest at signing | **Done (P5).** The session records the principal digest; sign and registration deny `principal_mismatch` when it differs from the session grant's | — |

@@ -22,6 +22,7 @@ pub mod lock_order;
 pub mod operation_audit;
 pub mod policy_engine;
 pub mod prompt;
+pub mod refusal_ledger;
 pub mod register;
 pub mod runtime;
 pub mod safe_fs;

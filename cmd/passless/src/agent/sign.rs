@@ -297,25 +297,21 @@ pub struct RegistrationLeaseEntry {
 
 /// Most revoked bearers of each kind remembered so a late use can be refused and audited.
 const MAX_REVOKED_REGISTRATIONS: usize = 256;
-/// Refusals recorded per revoked bearer; later attempts are still refused but not audited again,
-/// so a browser holding an old bearer cannot flood the audit log.
-const MAX_AUDITED_REFUSALS_PER_BEARER: usize = 16;
 
 /// What is kept of a revoked registration bearer: enough to audit a late use, never to serve it.
 #[derive(Clone)]
 pub struct RevokedRegistration {
     context: RegisterContext,
     handler: Arc<RegisterHandler>,
-    refusals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RevokedRegistration {
-    /// Audit a refused registration (bounded per bearer, see `MAX_AUDITED_REFUSALS_PER_BEARER`).
-    /// `rp_id` is the untrusted RP ID of the refused request, if it named one.
+    /// Audit a refused registration. The session's refusal ledger coalesces a flood into a
+    /// bounded number of records plus a `suppressed` count (review M2), so a browser holding an
+    /// old bearer cannot flood the audit log and no refusal is lost. `rp_id` is the untrusted RP
+    /// ID of the refused request, if it named one.
     pub fn refuse(&self, rp_id: Option<&str>) {
-        if self.refusals.fetch_add(1, Ordering::AcqRel) < MAX_AUDITED_REFUSALS_PER_BEARER {
-            self.handler.refuse_revoked_bearer(&self.context, rp_id);
-        }
+        self.handler.refuse_revoked_bearer(&self.context, rp_id);
     }
 }
 
@@ -324,17 +320,15 @@ impl RevokedRegistration {
 pub struct RevokedSign {
     context: SignContext,
     handler: Arc<SignHandler>,
-    refusals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RevokedSign {
-    /// Audit a refused authentication (bounded per bearer, see
-    /// `MAX_AUDITED_REFUSALS_PER_BEARER`). `rp_id` is the untrusted RP ID of the refused request,
-    /// if it named one.
+    /// Audit a refused authentication. The session's refusal ledger coalesces a flood into a
+    /// bounded number of records plus a `suppressed` count (review M2), so a browser holding an
+    /// old bearer cannot flood the audit log and no refusal is lost. `rp_id` is the untrusted RP
+    /// ID of the refused request, if it named one.
     pub fn refuse(&self, rp_id: Option<&str>) {
-        if self.refusals.fetch_add(1, Ordering::AcqRel) < MAX_AUDITED_REFUSALS_PER_BEARER {
-            self.handler.refuse_revoked_bearer(&self.context, rp_id);
-        }
+        self.handler.refuse_revoked_bearer(&self.context, rp_id);
     }
 }
 
@@ -388,7 +382,6 @@ impl RevokedRegistrations {
             RevokedRegistration {
                 context: entry.context.clone(),
                 handler: entry.handler.clone(),
-                refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
         );
     }
@@ -401,7 +394,6 @@ impl RevokedSigns {
             RevokedSign {
                 context: entry.context.clone(),
                 handler: entry.handler.clone(),
-                refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
         );
     }
@@ -1003,6 +995,14 @@ pub(crate) fn claim_rejection_error(
                 ErrorCode::BudgetExhausted,
                 "session operation budget exhausted",
                 RecommendedAction::Abort,
+            ),
+        ),
+        ClaimRejection::TableFull => (
+            PolicyDenyReason::ReplayTableFull,
+            ProtocolError::new(
+                ErrorCode::Busy,
+                "too many recent requests in this session; retry later",
+                RecommendedAction::RetryWithBackoff,
             ),
         ),
     }
@@ -4017,6 +4017,135 @@ pub(crate) mod tests {
             assert_eq!(last["reason"], "rp_id_not_match");
         }
 
+        /// The policy.deny records of the fixture's audit log, oldest first.
+        fn deny_records(f: &AuditTestFixture) -> Vec<serde_json::Value> {
+            read_audit_events(&f.audit_dir)
+                .into_iter()
+                .filter(|e| e["kind"] == "policy.deny")
+                .collect()
+        }
+
+        /// Review M2: a page that loops a refused request writes a bounded number of records, and
+        /// every refusal stays accounted for.
+        #[test]
+        fn a_flood_of_refusals_is_coalesced_and_still_accounted_for() {
+            use crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW;
+
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let flood = 200usize;
+            for n in 0..flood {
+                let mut req = f.make_req();
+                req.rp_id = "unlisted.example".to_string();
+                req.origin = "https://unlisted.example".to_string();
+                req.challenge_b64u = b64u_encode(format!("challenge-{n}").as_bytes());
+                assert!(handler.sign(&ctx, &req).is_err());
+            }
+            let written = deny_records(&f);
+            assert_eq!(
+                written.len(),
+                FULL_RECORDS_PER_WINDOW as usize,
+                "{written:#?}"
+            );
+            assert!(written.iter().all(|r| r["suppressed"].is_null()));
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // Another RP is a key of its own: it still gets its full records.
+            let mut other = f.make_req();
+            other.rp_id = "other.example".to_string();
+            other.origin = "https://other.example".to_string();
+            assert!(handler.sign(&ctx, &other).is_err());
+            assert_eq!(deny_records(&f).len(), FULL_RECORDS_PER_WINDOW as usize + 1);
+
+            // Revoking the session writes the pending count: nothing is lost.
+            ctx.session.revoke();
+            let written = deny_records(&f);
+            let accounted: u64 = written
+                .iter()
+                .map(|r| r["suppressed"].as_u64().unwrap_or(1))
+                .sum();
+            assert_eq!(accounted, flood as u64 + 1, "{written:#?}");
+            let summary = written
+                .iter()
+                .find(|r| !r["suppressed"].is_null())
+                .expect("a summary record");
+            assert_eq!(
+                summary["suppressed"],
+                flood as u64 - u64::from(FULL_RECORDS_PER_WINDOW)
+            );
+            assert_eq!(summary["rp_id"], "unlisted.example");
+            assert_eq!(summary["profile_id"], "test-profile");
+            assert_eq!(summary["action"], "authenticate");
+            assert!(summary["session_id_hash"].is_string());
+        }
+
+        /// Review M2: refusals of a session are coalesced per session, so another session of the
+        /// same profile is not silenced by a flooding one.
+        #[test]
+        fn refusal_coalescing_is_per_session() {
+            use crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW;
+
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let (flooder, quiet) = (f.make_ctx(), f.make_ctx());
+            for n in 0..(FULL_RECORDS_PER_WINDOW as usize + 10) {
+                let mut req = f.make_req();
+                req.rp_id = "unlisted.example".to_string();
+                req.origin = "https://unlisted.example".to_string();
+                req.challenge_b64u = b64u_encode(format!("flood-{n}").as_bytes());
+                assert!(handler.sign(&flooder, &req).is_err());
+            }
+            let before = deny_records(&f).len();
+            assert_eq!(before, FULL_RECORDS_PER_WINDOW as usize);
+            let mut req = f.make_req();
+            req.rp_id = "unlisted.example".to_string();
+            req.origin = "https://unlisted.example".to_string();
+            assert!(handler.sign(&quiet, &req).is_err());
+            assert_eq!(deny_records(&f).len(), before + 1);
+        }
+
+        /// Review M2: for an RP that is allowed but has no matching credential, each fresh
+        /// challenge used to leave a replay entry for the session's lifetime. The table is
+        /// bounded, and a request that finds it full of entries it may not evict is refused as
+        /// busy, with an audit record and without key use.
+        #[test]
+        fn the_replay_table_is_bounded_and_refuses_when_full() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            ctx.session.set_replay_capacity(8);
+            for n in 0..8 {
+                let mut req = f.make_req();
+                req.allow_credentials = vec!["d3Jvbmc".to_string()];
+                req.challenge_b64u = b64u_encode(format!("c-{n}").as_bytes());
+                let err = handler.sign(&ctx, &req).unwrap_err();
+                assert_eq!(err.code, ErrorCode::Forbidden, "request {n}");
+            }
+            assert_eq!(ctx.session.replay_entries(), 8);
+            assert_eq!(ctx.session.challenge_entries(), 8);
+
+            // All eight completed within the 120 s outcome window: nothing may be evicted.
+            let mut req = f.make_req();
+            req.allow_credentials = vec!["d3Jvbmc".to_string()];
+            req.challenge_b64u = b64u_encode(b"one-too-many");
+            let err = handler.sign(&ctx, &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Busy);
+            assert_eq!(ctx.session.replay_entries(), 8);
+            assert_eq!(ctx.session.challenge_entries(), 8);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            let last = deny_records(&f).pop().unwrap();
+            assert_eq!(last["reason"], "replay_table_full");
+            assert_eq!(last["result"], "busy");
+
+            // A duplicate of a completed request still gets its original outcome.
+            let mut dup = f.make_req();
+            dup.allow_credentials = vec!["d3Jvbmc".to_string()];
+            dup.challenge_b64u = b64u_encode(b"c-0");
+            let err = handler.sign(&ctx, &dup).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+        }
+
         #[test]
         fn audit_deny_event_on_credential_mismatch() {
             let f = AuditTestFixture::default_allow();
@@ -5751,16 +5880,24 @@ pub(crate) mod tests {
             assert!(registry.lookup_bound(&token).is_none());
 
             let revoked = registry.lookup_revoked_sign(&token).expect("remembered");
-            for _ in 0..MAX_AUDITED_REFUSALS_PER_BEARER + 4 {
+            let full = crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW as usize;
+            for _ in 0..full + 4 {
                 revoked.refuse(Some(" Example.COM "));
             }
             let reasons = f.reasons();
-            assert_eq!(
-                reasons.len(),
-                MAX_AUDITED_REFUSALS_PER_BEARER,
-                "{reasons:?}"
-            );
+            assert_eq!(reasons.len(), full, "{reasons:?}");
             assert!(reasons.iter().all(|r| r == "bearer_revoked"));
+            // The four refusals past the bound are counted, not lost: the count is written when
+            // the session's ledger is flushed (at the latest when the session is dropped).
+            ctx.session.refusals().flush();
+            let summaries: Vec<_> = read_audit_events(&f.audit_dir)
+                .into_iter()
+                .filter(|e| e["kind"] == "policy.deny" && !e["suppressed"].is_null())
+                .collect();
+            assert_eq!(summaries.len(), 1, "{summaries:?}");
+            assert_eq!(summaries[0]["suppressed"], 4);
+            assert_eq!(summaries[0]["reason"], "bearer_revoked");
+            assert_eq!(summaries[0]["rp_id"], "example.com");
             let events = read_audit_events(&f.audit_dir);
             let deny = find_policy_events(&events);
             assert_eq!(deny[0]["action"], "authenticate");
@@ -6660,7 +6797,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn refusals_of_a_revoked_bearer_are_audited_at_most_a_bounded_number_of_times() {
+        fn refusals_of_a_revoked_bearer_are_coalesced_into_a_bounded_number_of_records() {
             let rig = Rig::new();
             let server = TestServer::start(rig.registry.clone());
             let token = rig.bearer(Some("lease-flood"));
@@ -6668,7 +6805,8 @@ pub(crate) mod tests {
             client.hello(&token);
             rig.registry.revoke_by_lease("lease-flood");
 
-            let attempts = MAX_AUDITED_REFUSALS_PER_BEARER + 4;
+            let full = crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW as usize;
+            let attempts = full + 4;
             for i in 0..attempts {
                 client.request(
                     i as u32 + 1,
@@ -6678,7 +6816,8 @@ pub(crate) mod tests {
                 let refused = client.result();
                 assert_eq!(refused["error"]["code"], "unauthorized", "{refused:?}");
             }
-            assert_eq!(rig.policy_denies().len(), MAX_AUDITED_REFUSALS_PER_BEARER);
+            // The rest are counted and written as one summary when the session ends.
+            assert_eq!(rig.policy_denies().len(), full);
             assert_eq!(rig.credential_count(), 0);
         }
 

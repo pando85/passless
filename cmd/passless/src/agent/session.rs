@@ -31,6 +31,7 @@ use passless_core::agent::{GrantId, ProfileId};
 
 use super::escalation::ParkHook;
 use super::lock_order::{self, LockLevel};
+use super::refusal_ledger::RefusalLedger;
 
 /// How long a completed outcome is returned to an identical duplicate (ADR 0014 section 9).
 pub const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(120);
@@ -270,6 +271,10 @@ enum ReplayEntry {
     Completed {
         outcome: Option<CeremonyOutcome>,
         at: Instant,
+        /// Whether a key was used (or may have been: an unknown outcome counts as used). Only an
+        /// entry that never reached key use can be forgotten, so "never sign twice" holds
+        /// however long the session lives.
+        key_used: bool,
     },
 }
 
@@ -285,7 +290,7 @@ struct SessionState {
 impl SessionState {
     fn expire_outcomes(&mut self, now: Instant) {
         for entry in self.replay.values_mut() {
-            if let ReplayEntry::Completed { outcome, at } = entry
+            if let ReplayEntry::Completed { outcome, at, .. } = entry
                 && outcome.is_some()
                 && now.duration_since(*at) > COMPLETED_OUTCOME_TTL
             {
@@ -293,7 +298,36 @@ impl SessionState {
             }
         }
     }
+
+    /// Make room for one more replay entry within `capacity` (review M2). The oldest completed
+    /// entries that are past the outcome window and never reached key use are forgotten; an
+    /// in-flight entry, an entry inside the window and an entry that used a key are never
+    /// evicted, so a request that was signed once is never signed again. Returns whether there is
+    /// room. Forgotten keys also leave `challenges` and `served`.
+    fn make_room(&mut self, capacity: usize, now: Instant) -> bool {
+        if self.replay.len() < capacity {
+            return true;
+        }
+        self.replay.retain(|_, entry| match entry {
+            ReplayEntry::Completed { at, key_used, .. } => {
+                *key_used || now.saturating_duration_since(*at) <= COMPLETED_OUTCOME_TTL
+            }
+            ReplayEntry::InFlight(_) => true,
+        });
+        let replay = &self.replay;
+        self.challenges.retain(|_, key| replay.contains_key(key));
+        self.served.retain(|key, _| replay.contains_key(key));
+        self.replay.len() < capacity
+    }
 }
+
+/// Replay entries one session keeps (the replay table and, one for one, the challenge table).
+/// Entries are kept for the session's lifetime because a key that was signed must never be signed
+/// again. Each signed key claims budget, which the daemon caps at 4096 operations, so this leaves
+/// room for as many more entries that ended without key use. A request that finds the table full
+/// of entries it may not evict (in flight, inside the 120 s outcome window, or signed) is refused
+/// as busy (review M2).
+pub const MAX_REPLAY_ENTRIES: usize = 8192;
 
 /// Why a claim was refused. None of these consumes budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +338,9 @@ pub enum ClaimRejection {
     ChallengeReused,
     /// The live operation budget is used up.
     BudgetExhausted,
+    /// The replay table is full of entries that may not be evicted yet (in flight, inside the
+    /// outcome window, or signed): the request is refused as busy, never by evicting one.
+    TableFull,
 }
 
 /// The result of checking a replay key and claiming budget, in that order (R4).
@@ -359,6 +396,10 @@ pub struct AgentSession {
     browser_uid: OnceLock<u32>,
     revoked: AtomicBool,
     state: Mutex<SessionState>,
+    /// The replay entries this session keeps ([`MAX_REPLAY_ENTRIES`]; tests lower it).
+    replay_capacity: AtomicUsize,
+    /// Coalesces this session's refusal audit records (ADR 0014 section 12).
+    refusals: Arc<RefusalLedger>,
     active_requests: AtomicUsize,
     /// Key-use gate (review M1). A ceremony holds the read side from its pre-key-use re-check
     /// until key use has finished; [`Self::revoke`] takes the write side, so once it returns no
@@ -391,6 +432,8 @@ impl AgentSession {
             browser_uid: OnceLock::new(),
             revoked: AtomicBool::new(false),
             state: Mutex::new(SessionState::default()),
+            replay_capacity: AtomicUsize::new(MAX_REPLAY_ENTRIES),
+            refusals: Arc::new(RefusalLedger::default()),
             active_requests: AtomicUsize::new(0),
             key_use: RwLock::new(()),
         })
@@ -440,8 +483,40 @@ impl AgentSession {
     /// Revoke the bearer. Waits for an operation that is between its pre-key-use re-check and the
     /// end of key use; every later re-check sees the revocation.
     pub fn revoke(&self) {
-        let _gate = lock_order::write(&self.key_use, LockLevel::SessionKeyUse);
-        self.revoked.store(true, Ordering::Release);
+        {
+            let _gate = lock_order::write(&self.key_use, LockLevel::SessionKeyUse);
+            self.revoked.store(true, Ordering::Release);
+        }
+        // The session's pending refusal counts are written now, not left for its drop (a revoked
+        // bearer can stay in the tombstone ring for a long time).
+        self.refusals.flush();
+    }
+
+    /// The ledger that coalesces this session's refusal records (ADR 0014 section 12).
+    pub fn refusals(&self) -> &Arc<RefusalLedger> {
+        &self.refusals
+    }
+
+    /// Lower the replay table's capacity (tests).
+    #[cfg(test)]
+    pub(crate) fn set_replay_capacity(&self, capacity: usize) {
+        self.replay_capacity.store(capacity, Ordering::Release);
+    }
+
+    /// Replay entries currently held (tests).
+    #[cfg(test)]
+    pub(crate) fn replay_entries(&self) -> usize {
+        lock_order::lock(&self.state, LockLevel::Session)
+            .replay
+            .len()
+    }
+
+    /// Challenge-table entries currently held (tests).
+    #[cfg(test)]
+    pub(crate) fn challenge_entries(&self) -> usize {
+        lock_order::lock(&self.state, LockLevel::Session)
+            .challenges
+            .len()
     }
 
     /// Hold off revocation of this session until the guard is dropped (review M1). Taken right
@@ -552,6 +627,13 @@ impl AgentSession {
         if state.challenges.get(&challenge).is_some_and(|k| *k != key) {
             return Claim::Rejected(ClaimRejection::ChallengeReused);
         }
+        // A fresh key needs a slot. Forget the oldest completed entries that never reached key
+        // use and are past the outcome window; if none can go, refuse rather than evict an entry
+        // that protects "never sign twice" (review M2).
+        let capacity = self.replay_capacity.load(Ordering::Acquire);
+        if !state.make_room(capacity, now) {
+            return Claim::Rejected(ClaimRejection::TableFull);
+        }
         if let Some(max_operations) = max_operations {
             if state.operations_used >= max_operations {
                 return Claim::Rejected(ClaimRejection::BudgetExhausted);
@@ -584,7 +666,13 @@ impl AgentSession {
         Ok(())
     }
 
-    fn record_completion(&self, key: ReplayKey, outcome: CeremonyOutcome, refund: bool) {
+    fn record_completion(
+        &self,
+        key: ReplayKey,
+        outcome: CeremonyOutcome,
+        refund: bool,
+        key_used: bool,
+    ) {
         let mut state = lock_order::lock(&self.state, LockLevel::Session);
         if refund {
             state.operations_used = state.operations_used.saturating_sub(1);
@@ -594,6 +682,7 @@ impl AgentSession {
             ReplayEntry::Completed {
                 outcome: Some(outcome),
                 at: Instant::now(),
+                key_used,
             },
         );
     }
@@ -631,7 +720,7 @@ impl ClaimGuard {
 
     /// Complete after key use: the operation stays counted against the budget.
     pub fn complete(mut self, outcome: &CeremonyOutcome) {
-        self.finish(outcome.clone(), false);
+        self.finish(outcome.clone(), false, true);
     }
 
     /// Complete a ceremony that ended before key use (review M2): the replay key stays consumed
@@ -639,27 +728,32 @@ impl ClaimGuard {
     /// budget.
     pub fn complete_without_key_use(mut self, outcome: &CeremonyOutcome) {
         let refund = self.budget_claimed;
-        self.finish(outcome.clone(), refund);
+        self.finish(outcome.clone(), refund, false);
     }
 
-    fn finish(&mut self, outcome: CeremonyOutcome, refund: bool) {
+    /// `key_used` is whether a key was (or may have been) used: only an entry that never reached
+    /// key use may be forgotten when the replay table is full.
+    fn finish(&mut self, outcome: CeremonyOutcome, refund: bool, key_used: bool) {
         if self.done {
             return;
         }
         self.done = true;
         // The slot first, then the table: never both at once.
         self.in_flight.publish(outcome.clone());
-        self.session.record_completion(self.key, outcome, refund);
+        self.session
+            .record_completion(self.key, outcome, refund, key_used);
     }
 }
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
         if !self.done {
-            // Whether a key was used is unknown here: keep the operation counted.
+            // Whether a key was used is unknown here: keep the operation counted and the entry
+            // unevictable.
             self.finish(
                 Err(internal_failure("ceremony ended without an outcome")),
                 false,
+                true,
             );
         }
     }
@@ -1051,5 +1145,152 @@ mod tests {
         slot.publish(ok_outcome());
         let mut park = CountingPark::default();
         assert!(slot.suspend_duplicate(&mut park).is_none());
+    }
+
+    fn numbered(n: usize) -> (ReplayKey, ChallengeDigest) {
+        key(
+            CeremonyAction::Authenticate,
+            "rp.test",
+            format!("c{n}").as_bytes(),
+        )
+    }
+
+    /// Fill `session` with `count` entries that ended without key use.
+    fn fill_without_key_use(session: &Arc<AgentSession>, count: usize, now: Instant) {
+        for n in 0..count {
+            let (k, c) = numbered(n);
+            let Claim::Fresh(guard) = session.claim(k, c, 1_000_000, now) else {
+                panic!("entry {n} should be fresh");
+            };
+            guard.complete_without_key_use(&Ok(CeremonyResult::Assertion(Box::new(
+                PrincipalResponse::Pong,
+            ))));
+        }
+    }
+
+    #[test]
+    fn a_full_replay_table_refuses_while_every_entry_is_inside_the_window() {
+        let session = AgentSession::new(binding(1));
+        session.set_replay_capacity(4);
+        let now = Instant::now();
+        fill_without_key_use(&session, 4, now);
+        assert_eq!(session.replay_entries(), 4);
+
+        let (k, c) = numbered(99);
+        assert!(matches!(
+            session.claim(k, c, 1_000_000, now + Duration::from_secs(10)),
+            Claim::Rejected(ClaimRejection::TableFull)
+        ));
+        // Nothing was evicted, nothing was claimed, and the refused key is not consumed.
+        assert_eq!(session.replay_entries(), 4);
+        assert_eq!(session.challenge_entries(), 4);
+        assert_eq!(session.operations_used(), 0);
+        // A duplicate of a completed entry inside the window still gets its outcome.
+        let (k0, c0) = numbered(0);
+        assert!(matches!(
+            session.claim(k0, c0, 1_000_000, now + Duration::from_secs(10)),
+            Claim::Completed(..)
+        ));
+    }
+
+    #[test]
+    fn a_full_replay_table_refuses_while_an_entry_is_in_flight() {
+        let session = AgentSession::new(binding(1));
+        session.set_replay_capacity(3);
+        let now = Instant::now();
+        fill_without_key_use(&session, 2, now);
+        let (k, c) = numbered(50);
+        let Claim::Fresh(in_flight) = session.claim_key(k, c, now) else {
+            panic!("a fresh key");
+        };
+        // Long past the window: the two completed entries may go, the in-flight one may not.
+        let later = now + COMPLETED_OUTCOME_TTL * 2;
+        let (k2, c2) = numbered(51);
+        assert!(matches!(session.claim_key(k2, c2, later), Claim::Fresh(_)));
+        assert!(session.replay_entries() <= 3);
+        assert!(
+            matches!(session.claim_key(k, c, later), Claim::Join(..)),
+            "the in-flight entry survived the eviction"
+        );
+        drop(in_flight);
+    }
+
+    #[test]
+    fn old_completed_entries_without_key_use_are_evicted_to_make_room() {
+        let session = AgentSession::new(binding(1));
+        session.set_replay_capacity(4);
+        let now = Instant::now();
+        fill_without_key_use(&session, 4, now);
+
+        let later = now + COMPLETED_OUTCOME_TTL + Duration::from_secs(1);
+        let (k, c) = numbered(99);
+        let Claim::Fresh(guard) = session.claim(k, c, 1_000_000, later) else {
+            panic!("entries past the outcome window make room");
+        };
+        // The four old entries went, with their challenges; the new one is in flight.
+        assert_eq!(session.replay_entries(), 1);
+        assert_eq!(session.challenge_entries(), 1);
+        drop(guard);
+        // The table stays bounded however many requests follow.
+        let mut at = later;
+        for n in 100..140 {
+            at += COMPLETED_OUTCOME_TTL + Duration::from_secs(1);
+            let (k, c) = numbered(n);
+            let Claim::Fresh(guard) = session.claim(k, c, 1_000_000, at) else {
+                panic!("entry {n} should be fresh");
+            };
+            guard.complete_without_key_use(&ok_outcome());
+            assert!(session.replay_entries() <= 4);
+            assert!(session.challenge_entries() <= 4);
+        }
+    }
+
+    /// "Never sign twice": an entry that reached key use is never forgotten, however old, so the
+    /// table refuses instead.
+    #[test]
+    fn an_entry_that_used_a_key_is_never_evicted() {
+        let session = AgentSession::new(binding(1));
+        session.set_replay_capacity(3);
+        let now = Instant::now();
+        let mut used = Vec::new();
+        for n in 0..3 {
+            let (k, c) = numbered(n);
+            let Claim::Fresh(guard) = session.claim(k, c, 1_000_000, now) else {
+                panic!("fresh");
+            };
+            guard.complete(&ok_outcome());
+            used.push((k, c));
+        }
+        let much_later = now + COMPLETED_OUTCOME_TTL * 100;
+        let (k, c) = numbered(99);
+        assert!(matches!(
+            session.claim(k, c, 1_000_000, much_later),
+            Claim::Rejected(ClaimRejection::TableFull)
+        ));
+        // Each signed key is still refused as a replay, long after its outcome expired.
+        for (k, c) in used {
+            assert!(matches!(
+                session.claim(k, c, 1_000_000, much_later),
+                Claim::Rejected(ClaimRejection::Replayed)
+            ));
+        }
+        assert_eq!(session.operations_used(), 3);
+    }
+
+    #[test]
+    fn a_dropped_claim_is_unevictable_because_key_use_is_unknown() {
+        let session = AgentSession::new(binding(1));
+        session.set_replay_capacity(1);
+        let now = Instant::now();
+        let (k, c) = numbered(0);
+        let Claim::Fresh(guard) = session.claim(k, c, 1_000_000, now) else {
+            panic!("fresh");
+        };
+        drop(guard);
+        let (k2, c2) = numbered(1);
+        assert!(matches!(
+            session.claim(k2, c2, 1_000_000, now + COMPLETED_OUTCOME_TTL * 2),
+            Claim::Rejected(ClaimRejection::TableFull)
+        ));
     }
 }

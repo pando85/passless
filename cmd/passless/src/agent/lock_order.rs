@@ -62,6 +62,10 @@ pub enum LockLevel {
     /// The notification prompt driver's per-profile channel table (`NotificationPrompter`). A
     /// leaf: only channel sends happen under it.
     PromptDriver = 82,
+    /// A session's refusal ledger (`refusal_ledger::RefusalLedger`). A leaf: only counters change
+    /// under it, and the records it summarizes are written after it is released. Ranked above
+    /// every lock a refusal can be raised under, and below the audit gate.
+    RefusalLedger = 85,
 }
 
 impl LockLevel {
@@ -76,6 +80,7 @@ impl LockLevel {
                 | Self::TransportWrite
                 | Self::Escalation
                 | Self::PromptDriver
+                | Self::RefusalLedger
         )
     }
 }
@@ -285,6 +290,27 @@ mod tests {
         let driver = Mutex::new(());
         let _escalation = lock(&escalation, LockLevel::Escalation);
         let _driver = lock(&driver, LockLevel::PromptDriver);
+    }
+
+    #[test]
+    fn refusal_ledger_ranks_above_the_key_use_gates_and_is_a_leaf() {
+        let gate = RwLock::new(());
+        let ledger = Mutex::new(());
+        let _gate = read(&gate, LockLevel::SessionKeyUse);
+        let _ledger = lock(&ledger, LockLevel::RefusalLedger);
+        assert_eq!(
+            held_levels(),
+            vec![LockLevel::SessionKeyUse, LockLevel::RefusalLedger]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn refusal_ledger_is_a_leaf() {
+        let ledger = Mutex::new(());
+        let other = Mutex::new(());
+        let _ledger = lock(&ledger, LockLevel::RefusalLedger);
+        let _escalation = lock(&other, LockLevel::Escalation);
     }
 
     #[test]

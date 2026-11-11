@@ -45,8 +45,11 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    record (`operation.terminal`) is written once by the ceremony's exit point
    (`SignHandler::sign_parked`, `RegisterHandler::register_parked`) after every lock the ceremony
    took has been released, or by the audit's drop guard if the ceremony unwinds. `CeremonyAudit`
-   adds no lock: its state is a `RefCell` touched only by the ceremony's own thread, and the epochs
-   it records are atomics.
+   adds no lock of its own: its state is a `RefCell` touched only by the ceremony's own thread, and
+   the epochs it records are atomics. A refusal passes through the session's refusal ledger
+   (rank 85, a leaf, `refusal_ledger.rs`) to be coalesced; the ledger only counts under its mutex
+   and every record it leads to (the refusal in full, or a summary) is written after the mutex is
+   released.
 6. **Key-use gates.** From the pre-key-use re-check to the end of key use (the signature, or the
    credential write), a ceremony holds the read side of its session's gate and of the revocation
    epoch gate. `AgentSession::revoke` and `PolicyRuntime::bump_revocation_epoch` take the write
@@ -82,6 +85,7 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 76 T | A transport connection's write mutex (`Connection::writer`) | `transport/mod.rs` | A leaf. Held across one frame write, bounded by the 5 s write timeout. `closed` is set under it, so no frame follows a close. |
 | 80 T | `EscalationService::inner` and its condvar `changed` | `escalation.rs` | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters park on its condvar holding nothing else and call their `cancelled`/`still_valid` checks with it released. No audit record, store write, prompt show or withdrawal and no D-Bus call happens under it: state changes are made under it and their effects run after it is released. |
 | 82 T | `NotificationPrompter::drivers` (per-profile driver channels) | `prompt.rs` | A leaf: only a channel send (and, on first use, a thread spawn) happens under it. Called by the escalation service after its mutex is released. A failed driver spawn is reported to the sink only after this lock is dropped, because the sink re-enters the prompter (a withdrawal, the next queued prompt). |
+| 85 T | `RefusalLedger::inner` (per session) | `refusal_ledger.rs` | A leaf (final review M2). `CeremonyAudit::deny` counts a refusal under it and releases it before any record is written; the pending summaries it returns (and `AgentSession::revoke`'s flush, and the ledger's drop) are written after it is released. Ranked above the key-use gates (66, 69) and the policy locks because a refusal can be raised with a key-use gate held; below the audit gate. Only the closure that builds a summary template runs under it, and it takes no lock (atomics). |
 | 90 | `AuditGate`: `append_lock`, then `sequence`, `last_hash`, `writer`, `current_segment(_name)`, `segment_index`, `anchor`, `anchor_inode`, `segment_file_ino` | `audit.rs` | Terminal leaf (rule 5). |
 | — | TPM `Context` mutex | `storage/tpm/portable/provider.rs` | A leaf inside the TPM key provider. It is released before the provider returns. |
 | — | `runtime_loop`, `sign_server_handle`, `WorkerTracker.handles`, `completed_sessions` | `runtime.rs` | Join-handle and bookkeeping locks. They never nest with the locks above. A `join()` under them only joins threads that do not take them. |
@@ -178,7 +182,9 @@ is revoked again after the mutex is released (`GrantedRulesStore::revoke_request
 view 71; the revocation epoch is bumped after the writer is released) and `granted_rule.revoke` is
 recorded (90). A panic anywhere in the approval finishes the entry as denied from a drop guard
 (escalation mutex, then the audit gate, one at a time). The cooldown and withdrawal maps are
-pruned on every insert and capped at 4096 entries each, under the same mutex. Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
+pruned on every insert and capped at 4096 entries each, under the same mutex. The withdrawal map
+evicts its oldest entry past the cap; the cooldown map never evicts a live cooldown: admission
+refuses a new escalation while live cooldowns plus live escalations fill it (review L1). Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
 is released. A reload that changed the policy calls `cancel_profile` after the configuration
 lock (45) and `reload_lock` (68) are released: it takes the escalation mutex (80) and then
 withdraws the prompts (82).
@@ -248,3 +254,8 @@ held across another, and the order of the table above is unchanged.
 - The human CTAP path holds the operation lock across a whole CTAP command, including its
   user-presence prompt. Agent ceremonies of same-user profiles queue behind it (rule 4 keeps the
   reverse from happening).
+- A same-user ceremony holds the human operation lock (and storage) while it walks the whole human
+  store for the RP's credentials (`SignHandler::sign_fresh`, `RegisterHandler::register_fresh`).
+  With the `pass` backend that decrypts every credential, so a large store makes the section long
+  and a human CTAP command queues behind it (final review M4). A latency residual, documented in
+  ADR 0014 section 15 and `docs/agents/same-user.md`.
