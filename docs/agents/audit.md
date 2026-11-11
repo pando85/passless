@@ -23,8 +23,10 @@ passless agent-admin audit verify
 passless agent-admin audit export --format json   # or csv
 ```
 
-`verify` checks chain integrity across rotations. Exports hold no secrets, but RP IDs, denials and
-timing are still sensitive account metadata.
+`verify` checks chain integrity across rotations. `export` prints a JSON envelope with the entry
+count and the `path` of the export, `<audit_path>/audit-export-<unix time>.jsonl` (`.csv` for
+`--format csv`); the entries are in that file, one JSON object per line. Exports hold no secrets, but
+RP IDs, denials and timing are still sensitive account metadata.
 
 ## Operation records
 

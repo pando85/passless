@@ -47,6 +47,12 @@ first discovery request from Playwright MCP, not when the server starts.
   argument.
 
 `--print-config` prints an entry only. To pass `--isolated`, add `"--", "--isolated"` to its `args`.
+The entry's `command` is the absolute path of the running `passless`; if passless cannot tell it, the
+entry says `passless` and the MCP client must find it on its `PATH` (`cargo install` puts it in
+`~/.cargo/bin`), or you put the absolute path there. The first call runs `npx --yes @playwright/mcp`,
+so it needs Node and network. The managed browser is headless by default; for a visible one set the
+profile's `browser_command` to the browser's absolute path with no arguments
+([Containment](containment.md#supported-browsers)).
 
 ## chrome-devtools-mcp
 

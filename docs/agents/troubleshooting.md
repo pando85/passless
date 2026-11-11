@@ -3,7 +3,8 @@
 > **EXPERIMENTAL.** Agent mode is implemented but not yet validated for production use.
 
 Start with `passless doctor --agents`: it checks the browser binary, containment, extension, native
-host, notification bus and state directory without a daemon.
+host, notification bus and state directory from the config file (no daemon needed for those), and,
+when agents are enabled, that the daemon's agent subsystem answers (`agent_subsystem`).
 
 ## Agent support is disabled, or the profile is not found
 
@@ -17,6 +18,13 @@ passless`) or reload a profile's policy with `passless agent-admin policy reload
 
 `several agent profiles are configured`: pass `--profile <name>` to `passless agent browser` or
 `passless agent mcp ...`.
+
+## The daemon runs but the agent subsystem does not
+
+| Symptom | Cause and fix |
+|---|---|
+| Daemon log: `Agent subsystem failed to start: IPC error: failed to create runtime dir: ... File exists`, `agent-admin` says `no agent socket`, `doctor --agents` fails `agent_subsystem` | Older versions left `$XDG_RUNTIME_DIR/agent` behind after a SIGTERM or a crash, and the next start could not create it. Current versions remove their own directory at a clean shutdown and reclaim a leftover at start: a real directory owned by the daemon's user with mode 0700 whose sockets nobody answers is removed and recreated. Upgrade and restart. Where the start still fails with `cannot reclaim the stale runtime dir`, the log says why: it is a symlink or a file, another user owns it or its mode is not 0700 (so Passless will not remove it; check it and delete it yourself), or a live daemon answers on it (stop that one). With an older build, `systemctl --user stop passless; rm -rf "$XDG_RUNTIME_DIR/agent"; systemctl --user start passless`. |
+| `doctor --agents` fails `agent_subsystem` with `nothing answers on the admin socket` | The daemon is not running, or it started without agents (the `Agent subsystem failed to start` line in `journalctl --user -u passless` says why), or `agents.enabled` was set after the daemon started: restart it. |
 
 ## Configuration errors
 
@@ -44,6 +52,23 @@ Run `passless agent-admin profile check <profile>`.
 - Containment refused the launch: the browser's user can open a hidraw device and `bwrap` does not work.
   Install bubblewrap, and check that unprivileged user namespaces are enabled
   (`passless doctor --agents` shows the case).
+- The MCP client says `Unexpected status 503 when connecting to http://127.0.0.1:<port>/json/version/`:
+  the browser could not be started. The response body names the class
+  (`{"error":"managed browser unavailable","class":"runtime_root_invalid",...}`; other classes are
+  `launch_failed`, `daemon_unreachable`, `refused` and `unavailable`) and the MCP server's stderr
+  (the client's MCP log) has the full text; the daemon's log has the launch error:
+  `journalctl --user -u passless`.
+  - `class` `runtime_root_invalid` (`failed to launch browser: invalid runtime root: ...`): the
+    browser runtime root, by default `$XDG_RUNTIME_DIR/passless/browser`, cannot be used. Current
+    versions create it (mode 0700, yours) when it is missing; an older build fails with `No such file
+    or directory`: `mkdir -p -m 700 "$XDG_RUNTIME_DIR/passless/browser"`. An existing root that is
+    a symlink, is not mode 0700 or has the wrong owner is refused, not repaired: fix or remove it.
+    For a configured `browser_runtime_root` Passless creates only the last component and only when
+    the parent exists and is not writable by others; create parents yourself. With a `browser_user`
+    that is not the daemon's user, create the root owned by that user with mode 0700 (the default
+    root is only created for the daemon's own user).
+  - `class` `daemon_unreachable`: the daemon is not running, or runs without agents (see above).
+  - `class` `launch_failed`: see `passless doctor --agents` and the daemon log.
 - The extension is not intercepting: the launch fails and no endpoint is printed. Check
   `passless doctor --agents` for the extension and native host, and the daemon log.
 - `agent browser ... must run inside a principal session`: start your agent with

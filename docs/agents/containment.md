@@ -52,6 +52,7 @@ passless doctor --agents
 
 ```text
 status: healthy
+  [ok] agent_subsystem: the daemon's agent subsystem answers on its admin socket
   [ok] coding: browser_binary: Chrome for Testing ... at ~/.cache/ms-playwright/.../chrome
   [ok] coding: containment: required and in place: bwrap /usr/bin/bwrap; ...
   [ok] extension: the interception extension renders and verifies (id ..., needs Chrome 116)
@@ -61,9 +62,13 @@ status: healthy
   [ok] interaction_mode: the human authenticator's prompts are not auto-approved
 ```
 
-It needs no daemon. It checks the browser binary and what containment applies per profile, the
+The host checks need no daemon: the browser binary and what containment applies per profile, the
 extension and the native host manifest, the notification bus, the state directory and the
-automatic-interaction guard below. It exits 1 when a check fails.
+automatic-interaction guard below. `containment` reads `required and in place` while the daemon's
+UHID device exists (the browser's user could open its hidraw node) and `in place as defence in depth`
+when it does not. With `agents.enabled = true` it also pings the daemon's agent socket
+(`agent_subsystem`), so a daemon that is not running, or runs without agents, makes it fail. It exits
+1 when a check fails.
 
 ## Automatic interaction mode
 
