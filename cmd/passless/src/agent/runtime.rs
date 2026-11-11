@@ -2721,6 +2721,25 @@ impl AgentRuntime {
                     RecommendedAction::FixRequest,
                 ))
             }
+            Err(super::browser::CdpError::Denied(reason)) => {
+                // The extension filter (review M3): the agent tried to reach the Passless
+                // extension or a browser-internal page. Audited as a denial.
+                let outcome = super::audit_events::BrowserControlOutcome::Denied;
+                let _ = self.audit_gate.record(
+                    super::audit_events::BrowserControlRequestBuilder::new(
+                        profile_id.clone(),
+                        lease_id,
+                        &cdp_method,
+                        outcome,
+                    )
+                    .build(),
+                );
+                Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    format!("CDP request denied: {reason}"),
+                    RecommendedAction::FixRequest,
+                ))
+            }
             Err(e) => {
                 let outcome = super::audit_events::BrowserControlOutcome::Error;
                 let _ = self.audit_gate.record(

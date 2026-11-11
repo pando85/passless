@@ -5,6 +5,7 @@ pub mod browser;
 pub mod browser_select;
 pub mod capacity;
 pub mod cdp_bootstrap;
+pub mod cdp_filter;
 pub mod client;
 pub mod containment;
 pub mod deployment;

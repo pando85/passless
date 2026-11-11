@@ -24,6 +24,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json;
 
+use super::cdp_filter::{ExtensionCdpFilter, Inbound, RequestVerdict};
 use super::containment::{ContainmentPlan, ContainmentPolicy, refuse_if_hidraw_accessible};
 use super::launcher::{
     DEFAULT_RLIMIT_CORE, HardenedChildSetup, bind_parent_death, cloexec_except,
@@ -602,6 +603,8 @@ pub enum CdpError {
     Timeout,
     ResponseTooLarge,
     TooManyMessages,
+    /// The pipe-mode extension filter refused the request (`cdp_filter.rs`, review M3).
+    Denied(String),
 }
 
 impl fmt::Display for CdpError {
@@ -616,6 +619,7 @@ impl fmt::Display for CdpError {
             Self::Timeout => write!(f, "CDP round-trip timed out"),
             Self::ResponseTooLarge => write!(f, "CDP response exceeds size limit"),
             Self::TooManyMessages => write!(f, "CDP response exceeds message count limit"),
+            Self::Denied(reason) => write!(f, "CDP request denied: {}", reason),
         }
     }
 }
@@ -660,6 +664,8 @@ pub struct BrowserLease {
     pub cdp: Option<DaemonCdpEndpoints>,
     pub cdp_buffer: VecDeque<String>,
     pub cdp_read_buf: Vec<u8>,
+    /// Keeps the agent's pipe-mode CDP traffic away from the Passless extension (review M3).
+    cdp_filter: ExtensionCdpFilter,
     pub child_reaped: bool,
     pub cdp_endpoint: Option<String>,
     pub start_url: Option<String>,
@@ -794,7 +800,7 @@ impl StartUrlOpener for CdpStartUrlOpener {
                 })
                 .to_string();
                 let result = manager
-                    .cdp_round_trip(lease_id, &request, START_URL_OPEN_TIMEOUT)
+                    .daemon_cdp_round_trip(lease_id, &request, START_URL_OPEN_TIMEOUT)
                     .map_err(|e| e.to_string())?;
                 let id = serde_json::Number::from(START_URL_CDP_ID);
                 let reply = result
@@ -1243,6 +1249,7 @@ impl BrowserProcessManager {
             cdp: daemon_endpoints,
             cdp_buffer: VecDeque::new(),
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
+            cdp_filter: ExtensionCdpFilter::new(AGENT_EXTENSION_ID),
             child_reaped: false,
             cdp_endpoint: cdp_endpoint_url,
             start_url: if agent_endpoint.is_some() {
@@ -1886,11 +1893,34 @@ impl BrowserProcessManager {
             .count()
     }
 
+    /// One `browser-control` round trip for the agent: the request passes the extension filter
+    /// (`cdp_filter.rs`) and so does everything the agent receives.
     pub fn cdp_round_trip(
         &mut self,
         lease_id: &BrowserLeaseId,
         request_json: &str,
         timeout: Duration,
+    ) -> Result<CdpRoundTripResult, CdpError> {
+        self.round_trip(lease_id, request_json, timeout, true)
+    }
+
+    /// A round trip of the daemon's own (the start URL). The request is not checked; the messages
+    /// read still pass the filter, so its view of the extension's sessions stays complete.
+    pub fn daemon_cdp_round_trip(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        request_json: &str,
+        timeout: Duration,
+    ) -> Result<CdpRoundTripResult, CdpError> {
+        self.round_trip(lease_id, request_json, timeout, false)
+    }
+
+    fn round_trip(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        request_json: &str,
+        timeout: Duration,
+        from_agent: bool,
     ) -> Result<CdpRoundTripResult, CdpError> {
         validate_cdp_request(request_json)?;
 
@@ -1904,125 +1934,67 @@ impl BrowserProcessManager {
         if entry.state.is_terminal() {
             return Err(CdpError::BrowserExited);
         }
-
-        let cdp = entry.cdp.as_mut().ok_or(CdpError::NoCdpEndpoints)?;
-
-        let mut frame = request_json.as_bytes().to_vec();
-        frame.push(0);
-
-        cdp.to_browser
-            .write_all(&frame)
-            .map_err(|e| CdpError::WriteFailed(e.to_string()))?;
-        cdp.to_browser
-            .flush()
-            .map_err(|e| CdpError::WriteFailed(e.to_string()))?;
-
-        let request_id = extract_cdp_id(request_json);
+        if entry.cdp.is_none() {
+            return Err(CdpError::NoCdpEndpoints);
+        }
 
         let deadline = Instant::now() + timeout;
+
+        if from_agent {
+            let request: serde_json::Value = serde_json::from_str(request_json)
+                .map_err(|e| CdpError::InvalidRequest(format!("invalid JSON: {}", e)))?;
+            match entry.cdp_filter.check_request(&request) {
+                RequestVerdict::Forward => {}
+                RequestVerdict::Deny(reason) => return Err(CdpError::Denied(reason)),
+                RequestVerdict::LookupTarget(target) => {
+                    if lookup_extension_target(entry, &target, deadline)? {
+                        return Err(CdpError::Denied(
+                            "the target is the Passless extension".to_string(),
+                        ));
+                    }
+                }
+            }
+            entry.cdp_filter.note_forwarded(&request);
+        }
+
+        write_cdp_frame(entry, request_json)?;
+
+        let request_id = extract_cdp_id(request_json);
         let mut collected_messages: Vec<String> = Vec::new();
         let mut total_bytes: usize = 0;
-        let mut found_response = false;
 
         loop {
-            while let Some(buffered) = entry.cdp_buffer.pop_front() {
-                let msg_len = buffered.len();
-                if collected_messages.len() >= CDP_MAX_RESPONSE_MESSAGES {
-                    return Err(CdpError::TooManyMessages);
-                }
-                if total_bytes + msg_len > CDP_MAX_RESPONSE_TOTAL_BYTES {
-                    return Err(CdpError::ResponseTooLarge);
-                }
-
-                if let Some(ref rid) = request_id
-                    && cdp_message_has_id(&buffered, rid)
-                {
-                    found_response = true;
-                }
-
-                collected_messages.push(buffered);
-                total_bytes += msg_len;
-
-                if found_response {
-                    return Ok(CdpRoundTripResult {
-                        messages: collected_messages,
-                    });
-                }
-            }
-
-            let now = Instant::now();
-            if now >= deadline {
-                if found_response {
-                    return Ok(CdpRoundTripResult {
-                        messages: collected_messages,
-                    });
-                }
-                return Err(CdpError::Timeout);
-            }
-
-            let fd = cdp.from_browser.as_raw_fd();
-            set_nonblocking(fd, true);
-
-            let mut buf = vec![0u8; CDP_READ_BUF_SIZE];
-            let n = match cdp.from_browser.read(&mut buf) {
-                Ok(0) => {
-                    set_nonblocking(fd, false);
-                    return Err(CdpError::BrowserExited);
-                }
-                Ok(n) => n,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    set_nonblocking(fd, false);
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        if found_response {
-                            return Ok(CdpRoundTripResult {
-                                messages: collected_messages,
-                            });
-                        }
-                        return Err(CdpError::Timeout);
+            let raw = match entry.cdp_buffer.pop_front() {
+                Some(buffered) => buffered,
+                None => match read_cdp_message(entry, deadline)? {
+                    Some(message) => message,
+                    None => return Err(CdpError::Timeout),
+                },
+            };
+            let message = match entry.cdp_filter.inbound(&raw) {
+                Inbound::Deliver(message) => message,
+                Inbound::Drop { commands } => {
+                    for command in commands {
+                        write_cdp_frame(entry, &command)?;
                     }
-                    let sleep_time = remaining.min(Duration::from_millis(10));
-                    std::thread::sleep(sleep_time);
                     continue;
                 }
-                Err(e) => {
-                    set_nonblocking(fd, false);
-                    return Err(CdpError::ReadFailed(e.to_string()));
-                }
             };
-
-            set_nonblocking(fd, false);
-
-            entry.cdp_read_buf.extend_from_slice(&buf[..n]);
-
-            while let Some(nul_pos) = entry.cdp_read_buf.iter().position(|&b| b == 0) {
-                let msg_bytes = entry.cdp_read_buf.drain(..=nul_pos).collect::<Vec<_>>();
-                let msg_str =
-                    String::from_utf8_lossy(&msg_bytes[..msg_bytes.len() - 1]).to_string();
-
-                if !msg_str.is_empty() {
-                    if collected_messages.len() >= CDP_MAX_RESPONSE_MESSAGES {
-                        return Err(CdpError::TooManyMessages);
-                    }
-                    if total_bytes + msg_str.len() > CDP_MAX_RESPONSE_TOTAL_BYTES {
-                        return Err(CdpError::ResponseTooLarge);
-                    }
-
-                    if let Some(ref rid) = request_id
-                        && cdp_message_has_id(&msg_str, rid)
-                    {
-                        found_response = true;
-                    }
-
-                    collected_messages.push(msg_str);
-                    total_bytes += collected_messages.last().unwrap().len();
-
-                    if found_response {
-                        return Ok(CdpRoundTripResult {
-                            messages: collected_messages,
-                        });
-                    }
-                }
+            if collected_messages.len() >= CDP_MAX_RESPONSE_MESSAGES {
+                return Err(CdpError::TooManyMessages);
+            }
+            if total_bytes + message.len() > CDP_MAX_RESPONSE_TOTAL_BYTES {
+                return Err(CdpError::ResponseTooLarge);
+            }
+            let found_response = request_id
+                .as_ref()
+                .is_some_and(|rid| cdp_message_has_id(&message, rid));
+            total_bytes += message.len();
+            collected_messages.push(message);
+            if found_response {
+                return Ok(CdpRoundTripResult {
+                    messages: collected_messages,
+                });
             }
         }
     }
@@ -3564,6 +3536,95 @@ fn write_manifest_atomic_at(dir: &Path, manifest: &BrowserManifest) -> Result<()
 fn decode_wait_status(status: libc::c_int) -> Option<ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
     Some(ExitStatus::from_raw(status))
+}
+
+/// Write one NUL-terminated frame to the browser's CDP pipe.
+fn write_cdp_frame(entry: &mut BrowserLease, json: &str) -> Result<(), CdpError> {
+    let cdp = entry.cdp.as_mut().ok_or(CdpError::NoCdpEndpoints)?;
+    let mut frame = json.as_bytes().to_vec();
+    frame.push(0);
+    cdp.to_browser
+        .write_all(&frame)
+        .map_err(|e| CdpError::WriteFailed(e.to_string()))?;
+    cdp.to_browser
+        .flush()
+        .map_err(|e| CdpError::WriteFailed(e.to_string()))
+}
+
+/// The next complete message from the browser's CDP pipe, or `None` once `deadline` passes.
+fn read_cdp_message(
+    entry: &mut BrowserLease,
+    deadline: Instant,
+) -> Result<Option<String>, CdpError> {
+    loop {
+        if let Some(nul_pos) = entry.cdp_read_buf.iter().position(|&b| b == 0) {
+            let mut message = entry.cdp_read_buf.drain(..=nul_pos).collect::<Vec<_>>();
+            message.pop();
+            if message.is_empty() {
+                continue;
+            }
+            return Ok(Some(String::from_utf8_lossy(&message).into_owned()));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+
+        let cdp = entry.cdp.as_mut().ok_or(CdpError::NoCdpEndpoints)?;
+        let fd = cdp.from_browser.as_raw_fd();
+        set_nonblocking(fd, true);
+        let mut buf = vec![0u8; CDP_READ_BUF_SIZE];
+        let read = cdp.from_browser.read(&mut buf);
+        set_nonblocking(fd, false);
+        match read {
+            Ok(0) => return Err(CdpError::BrowserExited),
+            Ok(n) => entry
+                .cdp_read_buf
+                .extend_from_slice(buf.get(..n).unwrap_or_default()),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(e) => return Err(CdpError::ReadFailed(e.to_string())),
+        }
+    }
+}
+
+/// Ask the browser what `target` is before an agent command that names it is forwarded. Messages
+/// read meanwhile are kept for the agent (they pass the filter when delivered). Fails closed: a
+/// lookup without an answer by `deadline` refuses the command.
+fn lookup_extension_target(
+    entry: &mut BrowserLease,
+    target: &str,
+    deadline: Instant,
+) -> Result<bool, CdpError> {
+    let (lookup_id, command) = entry.cdp_filter.lookup_command(target);
+    write_cdp_frame(entry, &command)?;
+    loop {
+        let Some(raw) = read_cdp_message(entry, deadline)? else {
+            return Err(CdpError::Denied(
+                "the target could not be checked in time".to_string(),
+            ));
+        };
+        let id = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|message| {
+                let id = message.get("id")?.as_u64()?;
+                Some((id, message))
+            });
+        match id {
+            Some((id, response)) if id == lookup_id => {
+                return Ok(entry.cdp_filter.lookup_result(target, &response));
+            }
+            // A stale answer to an earlier daemon command of the filter.
+            Some((id, _)) if ExtensionCdpFilter::is_internal_id(id) => {}
+            _ => {
+                if entry.cdp_buffer.len() >= CDP_MAX_RESPONSE_MESSAGES {
+                    return Err(CdpError::TooManyMessages);
+                }
+                entry.cdp_buffer.push_back(raw);
+            }
+        }
+    }
 }
 
 fn validate_cdp_request(json: &str) -> Result<(), CdpError> {
@@ -6517,6 +6578,168 @@ mod tests {
         assert_eq!(cdp_result.messages.len(), 2);
         assert!(cdp_result.messages[0].contains("loadEventFired"));
         assert!(cdp_result.messages[1].contains(r#""id":1"#));
+    }
+
+    /// Read `count` NUL-terminated frames the daemon wrote to the fake browser.
+    fn read_frames(reader: &mut fs::File, count: usize) -> Vec<serde_json::Value> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while bytes.iter().filter(|&&b| b == 0).count() < count {
+            let n = reader.read(&mut chunk).unwrap();
+            assert!(n > 0, "the daemon closed the pipe");
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        bytes
+            .split(|&b| b == 0)
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice(frame).unwrap())
+            .collect()
+    }
+
+    fn write_frame(writer: &mut fs::File, message: &serde_json::Value) {
+        let mut frame = message.to_string().into_bytes();
+        frame.push(0);
+        writer.write_all(&frame).unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn assert_nothing_written(reader: &fs::File) {
+        set_nonblocking(reader.as_raw_fd(), true);
+        let mut probe = [0u8; 64];
+        let read = (&*reader).read(&mut probe);
+        set_nonblocking(reader.as_raw_fd(), false);
+        assert!(
+            matches!(&read, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "the daemon wrote to the browser: {read:?}"
+        );
+    }
+
+    fn worker_target_info(target_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "targetId": target_id,
+            "type": "service_worker",
+            "title": "",
+            "url": format!("chrome-extension://{AGENT_EXTENSION_ID}/worker.js"),
+            "attached": false,
+            "canAccessOpener": false,
+        })
+    }
+
+    #[test]
+    fn test_cdp_round_trip_denies_attaching_to_the_extension_worker() {
+        // Review M3: the agent names the worker's target; the daemon looks it up itself and
+        // refuses the attach without forwarding it.
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let (daemon_write, daemon_read, mut fake_browser_read, mut fake_browser_write) =
+            create_fake_cdp_pair();
+        let lease_id = inject_lease_with_fake_cdp(&mut mgr, daemon_write, daemon_read);
+
+        let browser = std::thread::spawn(move || {
+            let lookup = read_frames(&mut fake_browser_read, 1).remove(0);
+            assert_eq!(lookup["method"], "Target.getTargetInfo");
+            assert_eq!(lookup["params"]["targetId"], "WORKER");
+            // An unrelated event arrives before the answer; it is kept for the agent.
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"method": "Page.loadEventFired", "params": {}}),
+            );
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"id": lookup["id"], "result": {"targetInfo": worker_target_info("WORKER")}}),
+            );
+            (fake_browser_read, fake_browser_write)
+        });
+        let attach = make_cdp_request_with_params(
+            1,
+            "Target.attachToTarget",
+            r#"{"targetId":"WORKER","flatten":true}"#,
+        );
+        let result = mgr.cdp_round_trip(&lease_id, &attach, Duration::from_secs(5));
+        let (fake_browser_read, mut fake_browser_write) = browser.join().unwrap();
+        assert!(matches!(&result, Err(CdpError::Denied(_))), "{result:?}");
+        assert_nothing_written(&fake_browser_read);
+
+        // Known now: closing it is refused without another lookup, and nothing is written.
+        let close =
+            make_cdp_request_with_params(2, "Target.closeTarget", r#"{"targetId":"WORKER"}"#);
+        assert!(matches!(
+            mgr.cdp_round_trip(&lease_id, &close, Duration::from_secs(1)),
+            Err(CdpError::Denied(_))
+        ));
+        assert_nothing_written(&fake_browser_read);
+
+        // The event read during the lookup reaches the agent with its next response.
+        let browser = std::thread::spawn(move || {
+            let mut reader = fake_browser_read;
+            let request = read_frames(&mut reader, 1).remove(0);
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"id": request["id"], "result": {}}),
+            );
+        });
+        let reload = make_cdp_request(3, "Page.reload");
+        let messages = mgr
+            .cdp_round_trip(&lease_id, &reload, Duration::from_secs(5))
+            .unwrap()
+            .messages;
+        browser.join().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].contains("loadEventFired"));
+        assert!(messages[1].contains(r#""id":3"#));
+    }
+
+    #[test]
+    fn test_cdp_round_trip_hides_and_detaches_an_auto_attached_extension_worker() {
+        // Review M3: Playwright-style `Target.setAutoAttach {flatten: true}` attaches to every
+        // target. The worker's attach event never reaches the agent, the daemon detaches that
+        // session (resuming the paused worker first), and the session is refused afterwards.
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let (daemon_write, daemon_read, mut fake_browser_read, mut fake_browser_write) =
+            create_fake_cdp_pair();
+        let lease_id = inject_lease_with_fake_cdp(&mut mgr, daemon_write, daemon_read);
+
+        let browser = std::thread::spawn(move || {
+            let request = read_frames(&mut fake_browser_read, 1).remove(0);
+            assert_eq!(request["method"], "Target.setAutoAttach");
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"method": "Target.attachedToTarget", "params": {
+                    "sessionId": "WORKER-SESSION",
+                    "targetInfo": worker_target_info("WORKER"),
+                    "waitingForDebugger": true,
+                }}),
+            );
+            write_frame(
+                &mut fake_browser_write,
+                &serde_json::json!({"id": request["id"], "result": {}}),
+            );
+            read_frames(&mut fake_browser_read, 2)
+        });
+        let auto_attach = make_cdp_request_with_params(
+            1,
+            "Target.setAutoAttach",
+            r#"{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}"#,
+        );
+        let messages = mgr
+            .cdp_round_trip(&lease_id, &auto_attach, Duration::from_secs(5))
+            .unwrap()
+            .messages;
+        let daemon_commands = browser.join().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains(r#""id":1"#));
+        assert_eq!(
+            daemon_commands[0]["method"],
+            "Runtime.runIfWaitingForDebugger"
+        );
+        assert_eq!(daemon_commands[0]["sessionId"], "WORKER-SESSION");
+        assert_eq!(daemon_commands[1]["method"], "Target.detachFromTarget");
+        assert_eq!(daemon_commands[1]["params"]["sessionId"], "WORKER-SESSION");
+
+        let evaluate = r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"1"},"sessionId":"WORKER-SESSION"}"#;
+        assert!(matches!(
+            mgr.cdp_round_trip(&lease_id, evaluate, Duration::from_secs(1)),
+            Err(CdpError::Denied(_))
+        ));
     }
 
     #[test]

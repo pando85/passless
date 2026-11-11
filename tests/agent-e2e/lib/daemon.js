@@ -40,7 +40,7 @@ function tomlValue(v) {
  * @param {object} [o.agents]  extra raw `[agents]` keys (`escalation_cooldown`, `escalation_timeout`, `state_dir`, ...)
  * @param {boolean} [o.noBrowserCommand]  write no `browser_command` (the daemon chooses the browser)
  * @param {string} [o.browserScope]  `browser_scope` of every profile (default "profile", see below)
- * Per profile: `max_granted_rules`.
+ * Per profile: `max_granted_rules`, `cdpExpose` (`'pipe'` for pipe mode; port mode otherwise).
  */
 function renderConfig(env, o) {
   const user = os.userInfo().username;
@@ -65,7 +65,11 @@ function renderConfig(env, o) {
     // fixed in P10 (PR_SET_PDEATHSIG follows the thread that forked the browser, which was the short-lived IPC
     // handler thread). The daemon now forks browsers on a long-lived launcher thread; E2E-46/session-scope runs
     // `browserScope: 'session'` as the B1 regression.
-    b.push(`browser_scope = ${q(o.browserScope || 'profile')}`, 'browser_cdp_expose = "port"', 'browser_cdp_port = 0');
+    b.push(`browser_scope = ${q(o.browserScope || 'profile')}`);
+    // `cdpExpose: 'pipe'` (E2E-52): CDP only through the daemon's `browser-control`; the default is port mode, which
+    // the Playwright-driven scenarios connect to.
+    if (p.cdpExpose === 'pipe') b.push('browser_cdp_expose = "pipe"');
+    else b.push('browser_cdp_expose = "port"', 'browser_cdp_port = 0');
     if (mode === 'isolated') {
       const base = path.join(env.dirs.work, 'iso', name);
       fs.mkdirSync(path.join(base, 'credentials'), { recursive: true, mode: 0o700 });

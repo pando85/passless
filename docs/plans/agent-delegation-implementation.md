@@ -714,6 +714,7 @@ local-full only.
 | E2E-49 | Notification server restarts while a prompt is pending | Pending entry expires cleanly; next request prompts on the new server |
 | E2E-50 C | Repeated abort at the last second | Rate limit then cooldown (V-M2) |
 | E2E-51 | `create()` from an unfocused tab (an older tab in front of the new one) | The page gets `NotAllowedError`; the audit shows the registration; the documented cleanup (the operator deletes the orphan credential) removes it |
+| E2E-52 C | Pipe mode: `browser-control` tries to reach the extension worker (target list, auto-attach, extension and `chrome:` URLs, `Extensions`, `exposeDevToolsProtocol`, stopping workers) | The worker is never listed or handed out, every attempt is refused and audited as denied, and a `get()` driven through `browser-control` is still intercepted (review M3). XFAIL until a principal can launch a pipe-mode browser (`EnsureBrowser` is port-only) |
 
 ## Traceability matrix
 

@@ -47,7 +47,10 @@ injection or another WebAuthn proxy.
 CDP and `browser-control` are full browser-session authority. Output can contain cookies, DOM, tokens
 and network data: do not mix it with credential or admin output or forward it to untrusted consumers.
 Passless does not limit what happens inside an authenticated site, and local expiry does not log the
-agent out of it ([Containment](containment.md#cdp-port-mode)).
+agent out of it ([Containment](containment.md#cdp-port-mode)). The one exception is the Passless
+extension: in pipe mode `browser-control` refuses commands that would attach to, message, close or
+inspect it, and URLs that name an extension or a `chrome:`/`devtools:` page. Port mode cannot be
+filtered; use pipe mode when the agent is not trusted with the extension.
 
 ## Sessions and budgets
 

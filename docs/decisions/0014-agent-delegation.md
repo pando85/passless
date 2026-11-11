@@ -77,7 +77,7 @@ exist.
 | Human user | Trusted. Approves escalations through the notification server. |
 | Daemon | Trusted computing base: storage, key providers, policy, audit, notification prompt. |
 | Agent principal | Untrusted beyond its policy. Requests operations; never sets policy or approves escalations. |
-| Managed browser and extension | Inside the session's TCB for origin reporting; never holds keys or the daemon bearer in the page. |
+| Managed browser and extension | Inside the session's TCB for origin reporting; never holds keys or the daemon bearer in the page. The agent holds CDP authority over the browser: pipe mode keeps it away from the extension (§4.3); port mode does not, so there the extension's origin report is only as trustworthy as the CDP client (§11, §15). |
 | Web page | Untrusted. Supplies options, challenges and display text. |
 
 Trust boundaries:
@@ -184,6 +184,40 @@ bearer gates lazy startup only; it does not protect Chromium's listener.
 
 In both modes the WebAuthn ceremony is mediated by the daemon; CDP exposure decides only who holds
 authenticated browser-session authority.
+
+**Extension filter (pipe mode).** CDP can attach to any target, the extension's service worker
+included: a session on it could read the daemon bearer, send requests with a forged
+`remoteDesktopClientOverride.origin` or `sameOriginWithAncestors`, or call
+`webAuthenticationProxy.detach()`. In pipe mode `browser-control` filters the agent's commands
+against the fixed extension ID (`cdp_filter.rs`, review M3):
+
+- it refuses the `Extensions` domain, `Target.exposeDevToolsProtocol` (it would give page script an
+  unfiltered CDP channel), and `ServiceWorker.inspectWorker`, `stopWorker` and `stopAllWorkers`,
+  which name workers by version and cannot be attributed without tracking every registration;
+- it refuses a command whose `targetId` is an extension target (the daemon asks the browser with
+  its own `Target.getTargetInfo` before it forwards one naming a target it does not know; no answer
+  in time refuses the command), whose `sessionId` is a session on one, or whose parameters name an
+  extension (`chrome-extension:`, the extension ID) or a browser-internal page (`chrome:`,
+  `devtools:`, from which the extension could be inspected or disabled), after URL-style
+  normalization (tabs and newlines dropped, percent escapes decoded once, lowercase);
+- it hides extension targets: `Target.getTargets` results lose them, and their target events are
+  dropped. An auto-attach (`Target.setAutoAttach`, as Playwright and Puppeteer send it with
+  `flatten: true`) that reaches the worker is not shown; the daemon resumes the worker if it waits
+  for a debugger and detaches that session, and the client never learns of it;
+- it reserves request IDs from 2000000000 for the daemon and swallows the answers to its own
+  commands.
+
+A refusal is a `Forbidden` error, audited as a `denied` browser-control record. The filter's view
+is updated only while a `browser-control` call reads the pipe, so a worker that restarts under an
+auto-attach with `waitForDebuggerOnStart` stays paused until the next call (availability of the
+agent's own ceremonies only). The filter does not restrict `file:` URLs, so the agent can read what
+the browser user can read, the extension's `worker.js` and its bearer included; the bearer alone
+does not pass the sign socket's peer-UID check when the browser runs as another user (§4.4), and in
+a shared-UID deployment the agent can read that file directly anyway. As implemented, no principal
+path launches a pipe-mode browser yet (`EnsureBrowser` serves port mode only, and an admin launch
+binds no principal session), so the filter is tested against a scripted browser pipe and E2E-52
+stays XFAIL until one does. Port mode has no such filter:
+Chromium's listener is reached directly and the bootstrap never relays frames (§7, §15).
 
 ### 4.4 Extension and transport
 
@@ -389,7 +423,13 @@ on the filesystem and the UID:
   `DevToolsActivePort` once it has read the endpoint, but a same-UID agent can still find the
   loopback listener (socket tables and its own processes' descriptors) and read the WebSocket URL
   from DevTools' `/json/version`. Port mode already trusts the local environment (§4.3); the
-  private `/dev` bounds what a request that bypasses the extension can reach.
+  private `/dev` bounds what a request that bypasses the extension can reach. A port-mode CDP client
+  can also attach to the extension's service worker and evaluate code there: read the bearer, send
+  requests with a forged origin, or detach the proxy. That bypasses no policy (the daemon still
+  checks the origin against the RP ID, the rules, the budget and replay, and a detached proxy leaves
+  only the contained native path), but the extension's origin report is then only as trustworthy
+  as the CDP client. Pipe mode filters CDP access to the extension (§4.3) and is the hardened
+  option.
 - The daemon's writes into a lease never follow a path the browser user controls (the runtime
   root belongs to that user): the lease directory and the extension directory stay the daemon's,
   every write goes through directory handles opened without following symlinks, files are created
@@ -645,7 +685,8 @@ Testing 156, each headed and with `--headless=new`
 - answer every `onIsUvpaaRequest` with `false`, because an unanswered request hangs the page;
 - treat `onRequestCanceled` as an abort, propagating it to the daemon, which cancels any pending
   escalation wait for that ceremony; honor the RP timeout and browser shutdown;
-- keep the daemon bearer in the service worker; it is never visible to page JavaScript;
+- keep the daemon bearer in the service worker; it is never visible to page JavaScript (a CDP
+  client is another matter: see "Who can forge it" below);
 - return correct DOMException names (the page receives the name given to `complete*Request`);
 - track in-flight requests by the browser-supplied request ID (the event carries no tab or frame
   identifier), record the pending request IDs in `chrome.storage.session`, and fail them with
@@ -663,6 +704,15 @@ worker-extracted copy. The top origin is not available on this path,
 so the audit records `top_origin = null` together with `cross_origin` (§12). A request with
 `sameOriginWithAncestors = false` is denied: cross-origin frames fail closed. The daemon treats
 `remoteDesktopClientOverride` as browser metadata, not as an RP-supplied extension.
+
+**Who can forge it.** A page cannot; a CDP client that reaches the extension's worker can (it can
+evaluate code there and call the sign transport with any request details). In pipe mode the daemon
+filters CDP so that the agent cannot reach the worker or any other extension or browser-internal
+page (§4.3). In port mode it cannot, so there the origin report is only as trustworthy as the CDP
+client, and it is the daemon's own checks that hold: the origin is validated against the RP ID,
+the rules, the budget and the replay key apply, and a proxy the client detaches leaves only the
+contained native path (§7). A forged origin therefore gives no more than the agent could obtain by
+navigating the browser to that origin, which CDP already allows.
 
 **`clientDataJSON`.** Chrome does not validate the `clientDataJSON` the extension returns (verified:
 a wrong origin, a wrong challenge and an absent value were all handed to the page). The daemon alone
@@ -814,7 +864,9 @@ principal's tighter defaults would stop Chromium from starting.
 5. Storage, key provider, verification provider and operation lock are selected as one backend
    unit.
 6. The extension, page and agent never receive private keys, PINs, backend handles or arbitrary
-   signing APIs.
+   signing APIs. The sign transport is not one: every request on it is validated (origin against
+   RP ID, rules, budget, replay) whoever presents the bearer. In pipe mode the agent cannot reach
+   the extension worker (§4.3); in port mode it can (§11, §15).
 7. No agent ceremony involves human interaction or native WebAuthn fallback.
 8. UP and UV are set only from validated agent-session evidence under an `allow` decision.
 9. Every operation resolves through exactly one rule. Exact rules beat granted rules, which beat
@@ -885,6 +937,7 @@ reservation (§12).
 | Counter races corrupt human credentials | Shared handle and operation lock | Backend-specific crash consistency |
 | Agent ceremony panics while holding the human locks | Panic-free agent code under the shared locks; the human path recovers poisoned operation, storage and PIN locks (§14, invariant 23) | Release builds abort: a panic in a dependency restarts the daemon (systemd `Restart=on-failure`) |
 | Extension reports a false origin | Origin taken only from the browser-supplied `remoteDesktopClientOverride`, which a page cannot forge; the daemon builds `clientDataJSON`; cross-origin frames fail closed | Browser and extension are in the TCB; the top origin is not available |
+| Agent drives the extension worker over CDP (reads the bearer, forges the origin, detaches the proxy) | Pipe mode: `browser-control` refuses attaching to, messaging, closing or inspecting extension targets, hides them from target lists and auto-attach, and refuses extension and browser-internal URLs (§4.3); in both modes the daemon validates the origin against the RP ID, rules, budget and replay, and containment covers a detached proxy | Port mode: unfiltered, so the origin report is as trustworthy as the CDP client (§7, §11); pipe mode: a worker paused by an auto-attach waits for the next `browser-control` call, and `file:` navigations can read the extension's files (the bearer alone does not pass the sign socket's peer-UID check of a distinct-UID browser) |
 | Registration completes but the page gets `NotAllowedError` (unfocused tab) | The audit records the registration; the operator deletes the orphan credential; adapters bring the page to the front | An orphan credential can remain until deleted |
 | Stale registration authority | Registration bearers revoked with the lease; escalation bound to the waiting ceremony's session | — |
 | Unwanted autonomous registration | Separate rule, exact RP, acknowledgement, exclude checks, audit | A broad registration rule grants broad power |
@@ -942,7 +995,8 @@ sessions; external audit checkpoints; RP-integrated session revocation; remote p
 
 - Daemon agent runtime: `cmd/passless/src/agent/` (`runtime.rs`, `sign.rs`, `register.rs`,
   `policy_engine.rs`, `grant.rs`, `prompt.rs`, `audit.rs`, `audit_events.rs`, `backend.rs`,
-  `browser.rs`, `launcher.rs`, `cdp_bootstrap.rs`).
+  `browser.rs`, `launcher.rs`, `cdp_bootstrap.rs`, `cdp_filter.rs` for the pipe-mode extension
+  filter).
 - Granted-rules store: `cmd/passless/src/agent/granted_rules.rs`; principal identity and the
   admin authority token: `agent/identity.rs`.
 - Configuration and policy digest: `passless-core/src/agent/config.rs`, `policy.rs`.
