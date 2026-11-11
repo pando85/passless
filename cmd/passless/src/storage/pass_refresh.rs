@@ -1,6 +1,8 @@
 use crate::storage::index::load_credential_paths;
 use crate::storage::pass::sync::PassGitSync;
-use crate::storage::pass::{GpgBackend, PassStorageAdapter as InnerPassStorageAdapter};
+use crate::storage::pass::{
+    GpgBackend, PassStorageAdapter as InnerPassStorageAdapter, TEMP_FILE_EXCLUDE_PATTERN,
+};
 use crate::storage::{CredentialFilter, CredentialStorage, RelyingPartyMetadata};
 use git2::{Oid, Repository};
 use log::{debug, warn};
@@ -83,6 +85,10 @@ impl PassStorageAdapter {
             sync,
         };
 
+        // Never let a Git-sync `git add .` stage a temporary file a crash left behind.
+        adapter
+            .sync
+            .ensure_local_exclude_pattern(TEMP_FILE_EXCLUDE_PATTERN);
         adapter.sync.prepare_startup();
         let generation = repository_generation(&adapter.store_path, &adapter.path);
         if generation != adapter.indexed_generation {

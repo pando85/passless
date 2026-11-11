@@ -166,6 +166,9 @@ impl PassStorageAdapter {
             decryption_affinity: HashMap::new(),
         };
 
+        // A crash between GnuPG and the rename leaves a temporary file behind.
+        remove_stale_temp_files(&adapter.get_fido2_path());
+
         // Load indexes by scanning directory structure (no decryption!)
         adapter.indexes = load_credential_paths(&adapter.get_fido2_path(), "gpg")
             .map_err(|e| Error::Storage(format!("Failed to load credential paths: {}", e)))?;
@@ -594,7 +597,7 @@ fn encrypt_with_gnupg_binary(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::Storage(format!("Invalid path {}", output_path.display())))?;
-    let tmp_path = parent.join(format!(".tmp.{}.{}.new", std::process::id(), file_name));
+    let tmp_path = parent.join(temp_file_name(std::process::id(), file_name));
 
     let result = run_gnupg_encrypt(binary, recipients, plaintext, &tmp_path)
         .and_then(|()| publish_encrypted_file(&tmp_path, output_path, parent));
@@ -602,6 +605,75 @@ fn encrypt_with_gnupg_binary(
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
+}
+
+/// Gitignore pattern of the temporary files [`encrypt_with_gnupg_binary`] writes
+/// (`.tmp.<pid>.<credential>.gpg.new`). It goes into the repository's `info/exclude`, so the
+/// `git add .` of a Git-sync commit can never stage one that a crash left behind.
+pub(crate) const TEMP_FILE_EXCLUDE_PATTERN: &str = ".tmp.*.gpg.new";
+
+/// Temporary files younger than this are kept by the stale-file cleanup: another process may be
+/// in the middle of a write.
+const STALE_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn temp_file_name(pid: u32, file_name: &str) -> String {
+    format!(".tmp.{pid}.{file_name}.new")
+}
+
+/// Whether `name` is exactly a temporary file of [`encrypt_with_gnupg_binary`]:
+/// `.tmp.<digits>.<name>.gpg.new`.
+fn is_temp_file_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".tmp.") else {
+        return false;
+    };
+    let Some((pid, credential)) = rest.split_once('.') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && credential.len() > ".gpg.new".len()
+        && credential.ends_with(".gpg.new")
+}
+
+/// Remove temporary files a crash left in the credential subtree: regular files named exactly as
+/// [`temp_file_name`] makes them, directly inside an RP directory of `fido2_path`, at least
+/// [`STALE_TEMP_MIN_AGE`] old. Nothing else is touched. Returns how many were removed.
+fn remove_stale_temp_files(fido2_path: &Path) -> usize {
+    let mut removed = 0;
+    let Ok(rp_dirs) = std::fs::read_dir(fido2_path) else {
+        return 0;
+    };
+    for rp_dir in rp_dirs.flatten() {
+        if !rp_dir.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(rp_dir.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !is_temp_file_name(name) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= STALE_TEMP_MIN_AGE);
+            if old_enough && std::fs::remove_file(entry.path()).is_ok() {
+                warn!(
+                    "Removed a stale temporary credential file: {}",
+                    entry.path().display()
+                );
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// Flush the encrypted temporary file, rename it over `target` and flush the directory entry.
@@ -1409,6 +1481,85 @@ printf plaintext
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".tmp."))
             .collect()
+    }
+
+    fn age_file(path: &Path, age: std::time::Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn only_the_exact_temp_file_names_are_recognized() {
+        assert_eq!(temp_file_name(42, "ab12.gpg"), ".tmp.42.ab12.gpg.new");
+        assert!(is_temp_file_name(&temp_file_name(42, "ab12.gpg")));
+        assert!(is_temp_file_name(".tmp.1.x.gpg.new"));
+        for other in [
+            "ab12.gpg",
+            ".tmp.42.ab12.gpg",
+            ".tmp.abc.ab12.gpg.new",
+            ".tmp..ab12.gpg.new",
+            ".tmp.42..gpg.new",
+            "tmp.42.ab12.gpg.new",
+            ".reencrypt.42.ab12.gpg",
+            ".tmp.42.ab12.gpg.new.bak",
+        ] {
+            assert!(!is_temp_file_name(other), "{other}");
+        }
+    }
+
+    /// Initialisation removes stale temporary files of the exact naming, inside RP directories
+    /// only, and leaves everything else alone (fresh ones, other names, credentials, files outside
+    /// the credential subtree, symlinks).
+    #[cfg(unix)]
+    #[test]
+    fn stale_temp_files_are_removed_at_initialisation_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        let fido2 = store.join("fido2");
+        let rp = fido2.join("example.com");
+        fs::create_dir_all(&rp).unwrap();
+        fs::create_dir_all(store.join("other")).unwrap();
+
+        let stale = rp.join(".tmp.4242.aa.gpg.new");
+        let fresh = rp.join(".tmp.4243.bb.gpg.new");
+        let credential = rp.join("cc.gpg");
+        let lookalike = rp.join(".tmp.abc.dd.gpg.new");
+        let reencrypt_name = rp.join(".tmp.4242.ee.gpg");
+        let outside = store.join("other/.tmp.4242.ff.gpg.new");
+        let at_root = fido2.join(".tmp.4242.gg.gpg.new");
+        for path in [
+            &stale,
+            &fresh,
+            &credential,
+            &lookalike,
+            &reencrypt_name,
+            &outside,
+            &at_root,
+        ] {
+            fs::write(path, b"x").unwrap();
+        }
+        let old = std::time::Duration::from_secs(3600);
+        for path in [&stale, &lookalike, &reencrypt_name, &outside, &at_root] {
+            age_file(path, old);
+        }
+        let link = rp.join(".tmp.4244.hh.gpg.new");
+        std::os::unix::fs::symlink(&credential, &link).unwrap();
+
+        assert_eq!(remove_stale_temp_files(&fido2), 1);
+
+        assert!(!stale.exists());
+        for kept in [
+            &fresh,
+            &credential,
+            &lookalike,
+            &reencrypt_name,
+            &outside,
+            &at_root,
+        ] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        assert!(link.symlink_metadata().is_ok(), "a symlink is left alone");
     }
 
     /// Review L3: GnuPG's `--output <target>` truncates in place. The ciphertext goes to a

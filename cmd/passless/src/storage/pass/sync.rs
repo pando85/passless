@@ -219,6 +219,22 @@ impl PassGitSync {
         };
 
         let pattern = format!("/{}", relative.to_string_lossy().replace('\\', "/"));
+        Self::add_exclude_pattern(&repo, &pattern);
+    }
+
+    /// Add `pattern` (a gitignore pattern) to the repository-local exclude file, so `git add .`
+    /// (what prs-lib's commit runs) never stages a matching file. Like the local-only paths, this
+    /// is not committed and applies per clone.
+    pub fn ensure_local_exclude_pattern(&self, pattern: &str) {
+        let store_path = self.lock_state().store_path.clone();
+        let Ok(repo) = Repository::discover(&store_path) else {
+            debug!("No Git repository found while configuring a local exclude pattern");
+            return;
+        };
+        Self::add_exclude_pattern(&repo, pattern);
+    }
+
+    fn add_exclude_pattern(repo: &Repository, pattern: &str) {
         let exclude_path = repo.path().join("info").join("exclude");
         let mut contents = fs::read_to_string(&exclude_path).unwrap_or_default();
         if contents.lines().any(|line| line.trim() == pattern) {
@@ -227,7 +243,7 @@ impl PassGitSync {
         if !contents.is_empty() && !contents.ends_with('\n') {
             contents.push('\n');
         }
-        contents.push_str(&pattern);
+        contents.push_str(pattern);
         contents.push('\n');
         if let Some(parent) = exclude_path.parent()
             && let Err(error) = fs::create_dir_all(parent)
@@ -236,7 +252,7 @@ impl PassGitSync {
             return;
         }
         if let Err(error) = fs::write(&exclude_path, contents) {
-            warn!("Failed to exclude local-only pass state from Git: {error}");
+            warn!("Failed to add {pattern} to the Git exclude file: {error}");
         }
     }
 
@@ -454,6 +470,41 @@ mod tests {
         assert_eq!(sync.lock_state().depth, 1);
         sync.end_operation();
         assert_eq!(sync.lock_state().depth, 0);
+    }
+
+    /// A temporary credential file a crash left behind must not be staged by `git add .` (what
+    /// the Git-sync commit runs); the credentials next to it still are.
+    #[test]
+    fn the_temp_file_pattern_keeps_leftovers_out_of_a_git_add() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let rp_dir = temp.path().join("fido2/example.com");
+        fs::create_dir_all(&rp_dir).unwrap();
+        fs::write(rp_dir.join("aa.gpg"), b"credential").unwrap();
+        fs::write(rp_dir.join(".tmp.4242.aa.gpg.new"), b"half").unwrap();
+
+        let sync = PassGitSync::new(temp.path().to_path_buf(), true, false);
+        sync.ensure_local_exclude_pattern(crate::storage::pass::TEMP_FILE_EXCLUDE_PATTERN);
+        // Idempotent: the pattern is written once.
+        sync.ensure_local_exclude_pattern(crate::storage::pass::TEMP_FILE_EXCLUDE_PATTERN);
+        let exclude = fs::read_to_string(repo.path().join("info/exclude")).unwrap();
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|line| *line == crate::storage::pass::TEMP_FILE_EXCLUDE_PATTERN)
+                .count(),
+            1
+        );
+
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["."], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        let staged: Vec<String> = index
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+            .collect();
+        assert_eq!(staged, vec!["fido2/example.com/aa.gpg"]);
     }
 
     #[test]
