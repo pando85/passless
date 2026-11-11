@@ -401,8 +401,9 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
    mode, principal, action, RP ID, origin, and whether the grant would be persistent. It shows no
    page- or agent-supplied text. The only actions are **Allow always** and **Deny**.
 5. The WebAuthn call stays open until a decision or the ceremony's effective timeout. The waiting
-   ceremony is a parked continuation in the escalation service; it holds no thread, no operation
-   lock and no storage lock (§8.2). The timeout
+   ceremony is parked in the escalation service; it holds no lock (no operation, storage, policy
+   or session lock) and no request-cap slot, while its request thread sleeps on the escalation
+   condvar (§8.2; amended in P7). The timeout
    matches Chromium: the page's `timeout` clamped to 3 minutes–20 hours, or 20 hours when unset
    (`AdjustTimeout()` in `content/browser/webauth/authenticator_common_impl.cc`;
    `kMinRequestTimeout`/`kMaxRequestTimeout` in `device/fido/public/fido_constants.cc`). The
@@ -442,9 +443,10 @@ is evaluated against this evidence; agent UV satisfies level 3 only because the 
   drop is process-wide and irreversible, which rules out doing it in the daemon.
 - Each profile shows at most one escalation prompt at a time. Other keys queue in a bounded
   queue; overflow is denied.
-- Waiting ceremonies are parked continuations that hold no thread. At most 4 escalation waiters
-  exist per session and 16 per profile; a ceremony beyond either cap is denied and audited, and
-  other profiles are unaffected.
+- Waiting ceremonies are parked: they hold no lock and no request-cap slot (the transport permit
+  is suspended for the wait), only their sleeping request thread (amended in P7). At most 4
+  escalation waiters exist per session, 16 per profile and 64 in all; a ceremony beyond a cap is
+  denied and audited, and other profiles are unaffected.
 - The budget claim happens only after origin and policy validation, and for a `request` rule only
   after approval (§9).
 - A same-UID agent can drive the user's notification server (`dunstctl`, `makoctl`, or a replaced
@@ -869,13 +871,13 @@ References are `file:line` at commit `130eaa5`.
 | Item | Current | Target |
 |---|---|---|
 | Native fallback for `confirm`/human rules | Daemon returns `human_interaction_required` (`sign.rs:1383-1414`); worker flags `fallback` (`worker.js:140`); page replays natively (`main.js:282`) | Planned (P2): removed (§7) |
-| Human/confirm evidence in schema | **Done (P4).** `RuleAction` (`deny`, `allow`, `request`) replaces `AgentAuthorization` and the human/agent UP and UV sources; rules carry no evidence fields; `allow` sets UP=1 and UV=1 from session evidence; `request` denies with `escalation_unavailable` until P7 | — |
+| Human/confirm evidence in schema | **Done (P4).** `RuleAction` (`deny`, `allow`, `request`) replaces `AgentAuthorization` and the human/agent UP and UV sources; rules carry no evidence fields; `allow` sets UP=1 and UV=1 from session evidence; `request` escalates (P7, §8) | — |
 | Legacy fields and `policy` alias | **Done (P4).** The legacy evidence tables and presets map (`autonomous`/`allow+agent+agent` to `allow`, `supervised`/`confirm+*` to `request`, `deny+none+none` to `deny`) with one warning per mapped field, logged once per load and shown by `passless agent-admin profile check`; any other combination (including `allow` with human or `none` evidence) and the removed profile keys `rp_ids`, `registration_allowed`, `require_uv`, `human_verification_prompt` fail startup with a migration message. Legacy parsing is removed in the release after next (R8) | — |
 | Cross-origin frames | **Done (P2, P6).** `sameOriginWithAncestors = false` from the browser-supplied override is denied and audited with `top_origin = null` (§11) | — |
 | `localhost` RP | **Done in the daemon (P4).** `validate_rp_id`, `parse_origin` and the launch URL check accept `localhost` and `http://localhost[:port]` for exact rules only; resolution never matches `localhost` through the wildcard; `*.localhost` and other `http` hosts are rejected. **Done (P6)** in the extension: the origin comes from the browser-supplied override, which the daemon re-parses | — |
 | `credential:<ref>` vs `allowCredentials` | **Done (P4).** `narrow_candidates` pins first (`credential:<ref>`), `allowCredentials` then chooses within the pinned set, and the wildcard always selects `single` (§10.1) | — |
 | Epochs and live resolution | **Done (P5).** A revocation epoch (bumped by a reload that changes the digest; P7 bumps it on grant revocation) and a grant epoch (P7 bumps it when a grant is added; never revokes). Sessions record the revocation epoch at creation and are checked against it on every request and again immediately before key use, together with a live re-resolve (invariant 13). Reload re-reads and validates the configuration file; an invalid file or a restart-only change keeps the old generation and returns an error; an unchanged digest revokes nothing. `max_operations` is read from the live policy | — |
-| Budget claim order | **Done (P5).** Origin and RP validation, session grant and principal binding, resolve, unsupported options, then replay key, then budget; rejected requests never claim budget. `request` keeps a seam for P7 between resolve and the replay key (`sign.rs`, `register.rs`) | — |
+| Budget claim order | **Done (P5).** Origin and RP validation, session grant and principal binding, resolve, unsupported options, then replay key, then budget; rejected requests never claim budget. `request` (P7) runs the escalation pre-checks, takes the replay key without budget, and claims the budget only after approval (`AgentSession::claim_key`, `ClaimGuard::claim_budget`) | — |
 | Replay | **Done (P5).** `SHA-256(action ‖ rp_id ‖ origin ‖ top_origin ‖ challenge)` with length-prefixed fields and a presence tag for `top_origin` (`session.rs`); per bearer session; a duplicate joins the in-flight request until its own deadline (an aborted duplicate detaches alone) or gets the original outcome for 120 s; a reused challenge under another key is rejected; failures consume the key | — |
 | Registration bearers | **Done (P3).** Bound to the browser lease and revoked by `revoke_by_lease`; a late use is refused with `401 invalid_bearer` and audited as `policy.deny(reason=bearer_revoked)` (at most 16 records per bearer) | — |
 | Operator-minted enrollment grants (#411) | **Done (P3).** `RegistrationGrantRegistry`, the `RequestRegistration` admin request, its CLI and handler are removed; registration authority is the exact-RP `register = "allow"` rule (`register = "request"` denies with audit until P7); a wildcard rule never permits registration | — |
@@ -883,7 +885,7 @@ References are `file:line` at commit `130eaa5`.
 | Principal digest at signing | **Done (P5).** The session records the principal digest; sign and registration deny `principal_mismatch` when it differs from the session grant's | — |
 | Policy digest | **Done (P4, P7).** Version 5 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits, the browser fields, `max_granted_rules` and the escalation timeout and cooldown; a profile whose rules are all `deny` loads (B4). Granted rules have a separate `grants_digest` (§8.4) | — |
 | Audit content | No session, operation, origin, credential or result in `PolicyAllowMeta` (`audit_events.rs:659-666`); "generation" is an ID length (`runtime.rs:4079`) | Planned (P8): fields of §12, including `top_origin = null` with `cross_origin` |
-| Escalation audit events | Not implemented | Planned (P8): timeout or abort recorded as `escalation_expired` with a reason; `escalation_revoked` only for operator revocation (§12) |
+| Escalation audit events | **Done (P7).** `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted` or `server_lost`) and `revoked` (`reason = policy_reload`), plus `granted_rule.add` and `granted_rule.revoke`; a failed `requested` write fails the ceremony | Planned (P8): the §12 fields and the schema bump |
 | Interception mechanism | **Done (P6).** Worker-only extension on `chrome.webAuthenticationProxy`; no content script; `main.js` and `broker.js` removed; manifest `key` fixes the extension ID; launch waits for the worker's attached `hello` and opens the start URL only then (B2) | — |
 | Origin source and `clientDataJSON` | **Done (P6).** Origin and `sameOriginWithAncestors` from `remoteDesktopClientOverride`, re-parsed by the daemon; the daemon builds `clientDataJSON` and the response JSON; the worker forwards it verbatim (§11) | — |
 | Conditional mediation and UVPAA | **Done (P6).** Unavailable while attached; `onIsUvpaaRequest` answered `false`; passkey autofill unsupported (§11) | — |
@@ -893,11 +895,11 @@ References are `file:line` at commit `130eaa5`.
 | Unsupported options | **Done (P5).** Unsupported extensions, enterprise attestation and no supported algorithm return `NotSupportedError` before budget or storage; `excludeCredentials` matches return `InvalidStateError`; origin failures `SecurityError`; daemon errors carry the DOMException name and `busy` (R11 caps) maps to `NotAllowedError` | — |
 | Transport | **Done (P6).** `connectNative` port, framed relay, one multiplexed connection per worker with keepalive both ways; per-browser-UID sockets and a `SO_PEERCRED` check at `hello` (§4.4) | — |
 | Unfocused-tab registration | **Documented (P6)** as a limitation (orphan credential, audit records it; `agent-admin credential delete` removes it) | Planned (P10): adapters bring the page to the front (§11) |
-| Escalation, granted-rules store, grants CLI | **Store and CLI done (P7 WP1).** `agent/granted_rules.rs` (fail-closed load, atomic write, epochs), installed as the policy runtime's grant source; `agent-admin grants list/revoke/clear` | Planned (P7): escalation (§8.1) |
-| Registration escalation | Not implemented | Planned (P7): not joinable; one-use token bound to the creating ceremony; the credential reference joins the pinned set (§8.3) |
-| Abort handling and in-flight tracking | **Done (P6)** for the worker: pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11) | Planned (P7): withdrawn or aborted escalations rate-limited, 3 per key per 10 minutes, then cooldown (§8.1) |
-| Escalation waiters | Not implemented | Planned (P7): parked continuations holding no thread; caps of 4 per session and 16 per profile (§8.2) |
-| Notification bus for a root daemon | Prompt uses the daemon's own session bus | Planned (P7): `agents.notify_user`; dedicated per-prompt privilege-dropping child; no bus means deny and audit (§8.2) |
+| Escalation, granted-rules store, grants CLI | **Done (P7).** `agent/granted_rules.rs` (fail-closed load, atomic write, epochs), installed as the policy runtime's grant source; `agent-admin grants list/revoke/clear`. `agent/escalation.rs` coordinates escalations (join, per-profile prompt and FIFO of 8, cooldown, V-M2 rate limit, waiter caps); `sign.rs`/`register.rs` pre-check, take the replay key, park with no lock held, then re-resolve to a granted `allow` and claim the budget; a reload that changes the policy cancels pending escalations (§8.1) | — |
+| Registration escalation | **Done (P7).** Not joinable (`escalation_busy`); the one-use `RegistrationApproval` is bound to the creating ceremony and required by its pre-key-use re-check; after the credential write `authenticate = allow` is persisted with `kind = registration` and the credential reference, which joins the configured pinned set; a failed grant write keeps the credential and is audited (§8.3) | — |
+| Abort handling and in-flight tracking | **Done (P6)** for the worker: pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11). **Done (P7):** withdrawn or aborted escalations are rate-limited, 3 per key per 10 minutes, then cooldown; an abort within 2 s of the deadline counts as a timeout (§8.1) | — |
+| Escalation waiters | **Done (P7).** Parked waiters hold no lock and no request-cap slot (the transport permit is suspended); caps of 4 per session, 16 per profile and 64 in all; the wait ends at the earliest of the Chromium-clamped page timeout (3 min–20 h), `agents.escalation_timeout` and the session TTL (§8.1, §8.2) | — |
+| Notification bus for a root daemon | **Done (P7).** `agents.notify_user`; a dedicated per-prompt child (`__agent-escalation-prompt`) drops privileges, connects to the user's bus, and is killed to withdraw; no bus means deny and audit (`escalation_unavailable`) (§8.2) | — |
 | Granted-rules location | **Done (P7).** `agents.state_dir` with unit-specific defaults; `agents.notify_user` validated (§8.2, §8.4) | — |
 | CLI naming | **Done (P7).** Granted rules under `passless agent-admin grants`; session grants under `agent-admin sessions` and principal sessions under `agent-admin principals`, with the old `delegation` and `session` names as hidden aliases for one release (§8.4) | — |
 | Same-UID self-approval | Not documented | Planned (P11): documented residual risk; `notify_user` differs from every principal and browser user (§8.2, §13, §15) |
@@ -911,7 +913,7 @@ References are `file:line` at commit `130eaa5`.
 | Audit before key use | **Done.** Fsynced, hash-chained append (`audit.rs:163-164`, `audit.rs:1258`); allow record gates signing (`sign.rs:1516`) | — |
 | `credProtect` | **Done.** Levels 2 and 3 enforced (`sign.rs:1468`, `sign.rs:1531`) | — |
 | Agents off by default | **Done.** `AgentConfig.enabled` defaults to false (`config.rs:989`) | — |
-| D-Bus sender validation | **Done.** zbus match on server unique name, others rejected (`prompt.rs:565-613`) | — |
+| D-Bus sender validation | **Done.** zbus match on server unique name, others rejected; since P7 in the prompt child (`escalation_prompt.rs`) | — |
 | Session (grant) audit events | **Done.** Request and approve recorded (`grant.rs:571`, `grant.rs:639`) | — |
 | Shared-UID spawn hygiene | **Done.** FD closure and `PR_SET_PDEATHSIG` (`browser.rs:2248-2257`) | — |
 | Distinct-UID systemd baseline | **Done.** Baseline directives (`contrib/systemd/passless-agent.service:64-71`) | Evaluated directives including `PrivateDevices`, namespaces, seccomp (§13) |

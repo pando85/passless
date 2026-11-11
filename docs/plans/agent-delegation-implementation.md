@@ -632,6 +632,10 @@ list. The schema version is bumped. E2E-32.
   lands: the browser's `DevToolsActivePort` in the profile stays readable by a same-UID agent.
   Hide it from the agent, or document the residual risk.
 - Fix B1 and B7 (see Defects found by the P1 baseline) with a regression test.
+- `HardenedChildSetup::apply` (`launcher.rs`) sets `PR_SET_PDEATHSIG` before `setuid`, and a
+  credential change clears the parent-death signal, so a root-launched browser loses it. Set it
+  after the credential drop and re-check the parent, as `apply_prompt_child` already does. Related
+  to B1; found in P7.
 - Profile-scoped shared browser: a second principal's bearer must not depend on the first
   principal's grant; on first-principal exit, rebind or close (P5 review L5).
 

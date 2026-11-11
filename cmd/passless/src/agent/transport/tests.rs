@@ -1847,3 +1847,29 @@ fn authenticator_selection_members_are_type_checked() {
         Some("hybrid-thing")
     );
 }
+
+#[test]
+fn the_transport_deadline_follows_chromiums_clamp() {
+    let received = Instant::now();
+    let three_min = Duration::from_secs(180);
+    let twenty_h = Duration::from_secs(20 * 3600);
+    assert_eq!(
+        super::transport_ceremony_deadline(None, received),
+        received + twenty_h,
+        "no page timeout: 20 h"
+    );
+    assert_eq!(
+        super::transport_ceremony_deadline(Some(1_000), received),
+        received + three_min,
+        "a short page timeout is raised to 3 min"
+    );
+    assert_eq!(
+        super::transport_ceremony_deadline(Some(600_000), received),
+        received + Duration::from_secs(600)
+    );
+    assert_eq!(
+        super::transport_ceremony_deadline(Some(u64::MAX), received),
+        received + twenty_h,
+        "a long page timeout is capped at 20 h"
+    );
+}
