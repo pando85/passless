@@ -1,5 +1,5 @@
 'use strict';
-// Generated test CA + leaf certificate for https://rp-a.test, https://rp-b.test, https://evil.test.
+// Generated test CA + leaf certificate for https://rp-a.test ... rp-j.test and https://evil.test.
 // Trust is established per browser launch with --ignore-certificate-errors-spki-list (no system or
 // NSS trust store is touched) and --host-resolver-rules (no /etc/hosts edits).
 // Material is per run: run.sh sets AGENT_E2E_TLS_DIR (inside its temp dir, removed at the end); without it a
@@ -13,7 +13,8 @@ const { execFileSync } = require('node:child_process');
 
 const { CACHE_DIR } = require('./paths');
 
-const TEST_HOSTS = ['rp-a.test', 'rp-b.test', 'evil.test'];
+// rp-c ... rp-j serve the escalation scenarios that need several distinct RP IDs (queue and waiter caps).
+const TEST_HOSTS = ['rp-a.test', 'rp-b.test', 'evil.test', ...'cdefghij'.split('').map(c => `rp-${c}.test`)];
 
 function spkiHash(pemFile) {
   const pub = execFileSync('openssl', ['x509', '-in', pemFile, '-pubkey', '-noout']);

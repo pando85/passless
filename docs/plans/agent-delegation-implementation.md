@@ -666,7 +666,7 @@ local-full only.
 | E2E-06 C | `http://localhost` RP | Works (today fails: https-only manifest) |
 | E2E-07 | Multi-account RP with `single` / `newest` / `credential:<ref>` | Deterministic selection; `single` errors on ambiguity |
 | E2E-08 | Popup and same-origin iframe | Works |
-| E2E-09 C | `confirm` legacy rule before P7 | Denied; native `get` is never invoked (CDP `WebAuthn` virtual authenticator attached as a canary must stay unused) |
+| E2E-09 C | `request` rule (legacy `confirm` maps to it) without a notification server | Denied; native `get` is never invoked (CDP `WebAuthn` virtual authenticator attached as a canary must stay unused) |
 | E2E-10 C | Cross-origin iframe to `rp-b` inside `rp-a` | Denied |
 | E2E-11 C | Registration after browser exit using the old bearer | Refused |
 | E2E-12 C | Wildcard `request` plus exact `allow` | Exact wins; wildcard path audited `rule="*"` |
@@ -683,7 +683,7 @@ local-full only.
 | E2E-23 C | `request` approved | Ceremony continues; grant persisted; next ceremony needs no prompt |
 | E2E-24 C | `request` denied | `NotAllowedError`; cooldown blocks a re-prompt for 10 min (clock-injected) |
 | E2E-25 C | Two tabs request the same RP concurrently | One notification; both complete after one approval |
-| E2E-26 | Different RPs concurrently | One prompt at a time; the others queue; overflow denied |
+| E2E-26 | Different RPs concurrently | One prompt at a time; the others queue; overflow denied (E2E proves the sequential, in-order prompting with four RPs; the queue bound needs several bearer sessions of one profile and is covered by the coordinator unit tests) |
 | E2E-27 C | `register = "request"` approved | One registration; `authenticate = allow` persisted with `kind=registration`; second registration prompts again |
 | E2E-28 C | Notification shows only daemon fields | Notify body and actions inspected via the double; page-controlled strings absent |
 | E2E-29 C | Spoofed `ActionInvoked` from a non-server bus name | Ignored |

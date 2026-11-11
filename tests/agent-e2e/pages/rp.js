@@ -52,9 +52,9 @@
   window.e2e = {
     describe, b64uToBuf, bufToB64u,
     // `viaToJSON`: send the browser's own PublicKeyCredential.toJSON() output to the RP (raw page only).
-    async register({ username, userVerification, residentKey, timeout, signal, viaToJSON } = {}) {
+    async register({ username, displayName, userVerification, residentKey, timeout, signal, viaToJSON } = {}) {
       try {
-        const options = await post('/api/register/options', { username, userVerification, residentKey, timeout });
+        const options = await post('/api/register/options', { username, displayName, userVerification, residentKey, timeout });
         let response; let credential = null;
         if (flavor() === 'sw') {
           response = await SimpleWebAuthnBrowser.startRegistration({ optionsJSON: options });

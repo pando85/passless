@@ -144,10 +144,10 @@ class RpServer {
     };
   }
 
-  async registerOptions({ username, userVerification = 'preferred', residentKey = 'required', attestation = 'none', timeout }) {
+  async registerOptions({ username, displayName, userVerification = 'preferred', residentKey = 'required', attestation = 'none', timeout }) {
     const user = this.ensureUser(username);
     const options = await swServer.generateRegistrationOptions({
-      rpName: `E2E ${this.name}`, rpID: this.rpID, userName: user.name, userID: user.id,
+      rpName: `E2E ${this.name}`, rpID: this.rpID, userName: user.name, userDisplayName: displayName, userID: user.id,
       attestationType: attestation, timeout,
       authenticatorSelection: { residentKey, userVerification },
       excludeCredentials: user.credentials.map(c => ({ id: c.id, transports: c.transports })),

@@ -41,8 +41,8 @@ Chrome for Testing are downloaded once into `target/agent-e2e-cache/` (never int
 
 - `lib/env.js` hermetic env and guards; `lib/daemon.js` config + daemon + product browser launch;
   `lib/browser.js` discovery and matrix; `lib/rp-server.js` + `pages/` test RP; `lib/tls.js` test CA and
-  `rp-a.test` / `rp-b.test` / `evil.test` via `--host-resolver-rules`; `lib/notify-double.js` (Rust tool in
-  `tools/notify-double`); `lib/mcp-client.js` minimal MCP client; `lib/scenario.js` matrix, CI tags and xfail.
+  `rp-a.test` ... `rp-j.test` / `evil.test` via `--host-resolver-rules`; `lib/notify-double.js` (Rust tool in
+  `tools/notify-double`); `lib/escalation.js` (helpers of the P7 escalation scenarios); `lib/mcp-client.js` minimal MCP client; `lib/scenario.js` matrix, CI tags and xfail.
 - `scenarios/e2e-NN-*.test.js` follow the catalogue in `docs/plans/agent-delegation-implementation.md`.
 - `lib/helpers.js`: `extensionEndpoint` (bearer, socket and build version from the extension worker), `FramedClient`
   (the daemon's wire protocol v2: `hello`, `request`, `abort`), proxy-shaped request bodies, and the daemon log patterns
@@ -51,6 +51,29 @@ Chrome for Testing are downloaded once into `target/agent-e2e-cache/` (never int
   after the worker attached the WebAuthn proxy) and returns the start-URL tab, brought to the front; the browser's
   own `about:blank` tab is `b.blankPages`. `{startUrl: false}` navigates the blank tab instead (RPs the rules do not
   admit as a start URL). `lib/browser.js` `stopExtensionWorker` closes the worker target (`Target.closeTarget`).
+
+## Escalation scenarios (P7)
+
+A `request` rule escalates: the daemon's prompt child shows a notification on the private bus, and the scripted
+notification double answers it. Stack options: `notify: {script: [...]}` (step N answers the N-th new notification, calls
+beyond the list are `ignore`; `approve[:ms]`, `deny[:ms]`, `close[:ms]`, `ignore`), `notify: false` (no notification server
+on the private bus: escalation is denied `escalation_unavailable`), `agents: {escalation_cooldown: 2, escalation_timeout: N,
+state_dir: '/abs'}` (raw `[agents]` keys; a 1 s cooldown is accepted by debug builds only), per profile `max_granted_rules`.
+`stack.notify.stop()` waits for the double to exit (it owns `org.freedesktop.Notifications`); `stack.restartNotify({script})`
+starts a new one with its own log (`notify-2.jsonl`). Approvals must be scripted at `approve:1500` or later: the daemon
+accepts "Allow always" only 1000 ms after the notification was shown, and an earlier one is a deny.
+
+Helpers (`lib/helpers.js`): `escalationEvents`, `grantedRuleEvents`, `denyReasons`, `grantsStore` (parsed grant store file).
+Quirks: the escalation pre-check runs before the replay key, so a refusal (cooldown, caps, unavailable) consumes neither;
+a deny, expiry or abort after the wait started consumes the key, so every retry uses a fresh challenge (the page helpers
+fetch new RP options per call). `PASSLESS_INTERACTION_MODE=automatic` has no effect on escalation (E2E-44). After a grant
+revocation the managed browser keeps running with a revoked bearer, so a scenario restarts the browser (E2E-31).
+
+CI subset: E2E-23, 24, 25, 27, 28, 29, 31, 48, 50 (about 5 to 15 s each). Full matrix only: E2E-20/escalation (6 min
+approval), 21 (3 min timeout), 26, 30, 43, 44, 49. E2E-26 proves sequential prompting in arrival order with four RPs; the queue
+bound (1 active + 8 queued) needs several bearer sessions of one profile, which the harness cannot create (admin launch
+returns the profile's live lease; `browser_scope = "session"` browsers are killed after launch, B1), so the bound is covered by
+the coordinator unit tests. E2E-44/startup-refusal stays `xfailUntil: 'P10'` (R19).
 
 Debug-build daemon hooks (set through `daemonEnv`): `PASSLESS_E2E_HOLD_REQUEST_MS` holds each request before its
 ceremony (an abort or disconnect then lands before key use), `PASSLESS_E2E_HOLD_RESULT_MS` holds each successful
