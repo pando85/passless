@@ -131,10 +131,7 @@ impl<
         })?;
 
         {
-            let mut storage = service.storage.lock().map_err(|e| {
-                error!("Failed to lock storage while beginning operation: {}", e);
-                soft_fido2_transport::Error::Other("Failed to begin storage operation".to_string())
-            })?;
+            let mut storage = storage::lock_shared_storage(&service.storage);
             storage.begin_operation().map_err(|e| {
                 error!("Failed to begin storage operation: {:?}", e);
                 soft_fido2_transport::Error::Other("Failed to begin storage operation".to_string())
@@ -145,10 +142,7 @@ impl<
         let command_result = service.handle(data, &mut response);
 
         {
-            let mut storage = service.storage.lock().map_err(|e| {
-                error!("Failed to lock storage while ending operation: {}", e);
-                soft_fido2_transport::Error::Other("Failed to end storage operation".to_string())
-            })?;
+            let mut storage = storage::lock_shared_storage(&service.storage);
             if let Err(e) = storage.end_operation() {
                 warn!("Failed to end storage operation: {:?}", e);
             }
@@ -291,9 +285,7 @@ fn run_with_service_inner<
         config,
         shutdown.clone(),
         Box::new(move || {
-            if let Ok(mut storage) = service_ref.lock() {
-                storage.cleanup_expired_cache();
-            }
+            storage::lock_shared_storage(&service_ref).cleanup_expired_cache();
         }),
     );
 

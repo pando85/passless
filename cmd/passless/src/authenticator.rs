@@ -4,8 +4,8 @@ use crate::credential_backup::{
     decrypt_credential, encrypt_credential, restore_auth_data,
 };
 use crate::notification::{show_user_presence_notification, show_verification_notification};
-use crate::pin_storage::PinStorage;
-use crate::storage::{CredentialFilter, CredentialStorage};
+use crate::pin_storage::{PinStorage, lock_pin_storage};
+use crate::storage::{CredentialFilter, CredentialStorage, lock_shared_storage};
 use crate::util::bytes_to_hex;
 
 use passless_core::config::{PinConfig, PinEnforcement, SecurityConfig};
@@ -129,10 +129,7 @@ impl<P: PinStorage> PinStorageWrapper<P> {
 
 impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrapper<P> {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
-        let storage = self
-            .storage
-            .lock()
-            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        let storage = lock_pin_storage(&self.storage);
         let mut state = storage.load_pin_state()?;
         self.clamp_uv_retries(&mut state);
         let mut last = self
@@ -144,10 +141,7 @@ impl<P: PinStorage + 'static> soft_fido2::PinStorageCallbacks for PinStorageWrap
     }
 
     fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
-        let storage = self
-            .storage
-            .lock()
-            .map_err(|_| soft_fido2::StatusCode::Other)?;
+        let storage = lock_pin_storage(&self.storage);
         let mut clamped_state = state.clone();
         self.clamp_uv_retries(&mut clamped_state);
         storage.save_pin_state(&clamped_state)?;
@@ -209,13 +203,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             self.security_config.user_verification_authentication
         };
 
-        let storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock during user verification request");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let storage = lock_shared_storage(&self.storage);
 
         if storage.disable_user_verification() && !is_registration && !should_verify {
             debug!("User verification handled by backend (e.g., GPG): {}", info);
@@ -263,7 +251,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         let uv_retries;
 
         if let Some(pin_storage) = &self.pin_storage {
-            let storage = pin_storage.lock().map_err(|_| soft_fido2::Error::Other)?;
+            let storage = lock_pin_storage(pin_storage);
             match storage.load_pin_state() {
                 Ok(state) => {
                     pin_set = state.is_pin_set();
@@ -343,13 +331,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
         info!("Storing credential for RP: {}", credential.rp_id);
         debug!("Credential ID: {}", bytes_to_hex(credential.id));
 
-        let mut storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while writing credential");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let mut storage = lock_shared_storage(&self.storage);
 
         storage.write(*credential)?;
         info!(
@@ -362,13 +344,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     fn read_credential(&self, cred_id: &[u8]) -> Result<Option<Credential>> {
         debug!("Reading credential: id={}", bytes_to_hex(cred_id));
 
-        let mut storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while reading credential");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let mut storage = lock_shared_storage(&self.storage);
 
         match storage.read(cred_id) {
             Ok(cred) => {
@@ -389,13 +365,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     fn delete_credential(&self, cred_id: &[u8]) -> Result<()> {
         info!("Removing credential ID: {}", bytes_to_hex(cred_id));
 
-        let mut storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while deleting credential");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let mut storage = lock_shared_storage(&self.storage);
 
         storage.delete(cred_id)?;
         debug!("Credential removed");
@@ -413,16 +383,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
 
         info!("Listing credentials for RP: {}", rp_id);
 
-        let mut storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    "Failed to acquire storage lock while listing credentials: {}",
-                    e
-                );
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let mut storage = lock_shared_storage(&self.storage);
 
         let filter = CredentialFilter::ByRp(rp_id.to_string());
 
@@ -458,13 +419,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     fn enumerate_rps(&self) -> Result<Vec<(String, Option<String>, usize)>> {
         debug!("Enumerating relying parties");
 
-        let mut storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while enumerating RPs");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let mut storage = lock_shared_storage(&self.storage);
 
         let result: Vec<_> = storage
             .list_relying_parties()?
@@ -479,13 +434,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     fn credential_count(&self) -> Result<usize> {
         debug!("Counting total credentials");
 
-        let storage = match self.storage.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                error!("Failed to acquire storage lock while counting credentials");
-                return Err(soft_fido2::Error::Other);
-            }
-        };
+        let storage = lock_shared_storage(&self.storage);
 
         let count = storage.count_credentials();
         debug!("Total credentials found: {}", count);
@@ -504,9 +453,7 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
 {
     fn load_pin_state(&self) -> std::result::Result<PinState, soft_fido2::StatusCode> {
         if let Some(pin_storage) = &self.pin_storage {
-            let storage = pin_storage
-                .lock()
-                .map_err(|_| soft_fido2::StatusCode::Other)?;
+            let storage = lock_pin_storage(pin_storage);
             storage.load_pin_state()
         } else {
             Ok(PinState::new())
@@ -515,9 +462,7 @@ impl<S: CredentialStorage, P: PinStorage> soft_fido2::PinStorageCallbacks
 
     fn save_pin_state(&self, state: &PinState) -> std::result::Result<(), soft_fido2::StatusCode> {
         if let Some(pin_storage) = &self.pin_storage {
-            let storage = pin_storage
-                .lock()
-                .map_err(|_| soft_fido2::StatusCode::Other)?;
+            let storage = lock_pin_storage(pin_storage);
             storage.save_pin_state(state)
         } else {
             Ok(())
@@ -819,8 +764,7 @@ impl<
         let pin_configured = self
             .pin_storage
             .as_ref()
-            .and_then(|ps| ps.lock().ok())
-            .and_then(|ps| ps.is_pin_configured().ok())
+            .and_then(|ps| lock_pin_storage(ps).is_pin_configured().ok())
             .unwrap_or(false);
 
         let state = if pin_configured {
@@ -847,9 +791,7 @@ impl<
     /// reports "not configured". Backend failures must fail closed.
     fn pin_configured_for_uv_reset(&self) -> core::result::Result<bool, StatusCode> {
         match &self.pin_storage {
-            Some(storage) => Ok(storage
-                .lock()
-                .map_err(|_| StatusCode::Other)?
+            Some(storage) => Ok(lock_pin_storage(storage)
                 .load_pin_state()?
                 .pin_hash
                 .is_some()),
@@ -959,13 +901,7 @@ impl<
                 }
 
                 let mut credential = {
-                    let mut storage = match self.storage.lock() {
-                        Ok(storage) => storage,
-                        Err(_) => {
-                            response.push(StatusCode::Other as u8);
-                            return;
-                        }
-                    };
+                    let mut storage = lock_shared_storage(&self.storage);
                     match storage.read(&credential_id) {
                         Ok(credential) => credential,
                         Err(soft_fido2::Error::DoesNotExist) => {
@@ -1055,7 +991,7 @@ impl<
                 }
 
                 let result = (|| -> Result<()> {
-                    let mut storage = self.storage.lock().map_err(|_| soft_fido2::Error::Other)?;
+                    let mut storage = lock_shared_storage(&self.storage);
                     let mut credential = storage.read(&credential_id)?;
                     credential.backup_state = CredentialBackupState::BackedUp;
                     storage.write(Self::credential_ref(&credential))
@@ -1129,7 +1065,7 @@ impl<
         let credential_id = credential.id.clone();
 
         let result = (|| -> core::result::Result<(), StatusCode> {
-            let mut storage = self.storage.lock().map_err(|_| StatusCode::Other)?;
+            let mut storage = lock_shared_storage(&self.storage);
             let existing = match storage.read(&credential_id) {
                 Ok(existing) => Some(existing),
                 Err(soft_fido2::Error::DoesNotExist) => None,
@@ -1270,10 +1206,8 @@ impl<
 
     /// Get storage information
     pub fn storage_info(&self) -> String {
-        match self.storage.lock() {
-            Ok(storage) => format!("Credentials in storage: {}", storage.count_credentials()),
-            Err(_) => "Failed to acquire storage lock".to_string(),
-        }
+        let storage = lock_shared_storage(&self.storage);
+        format!("Credentials in storage: {}", storage.count_credentials())
     }
 
     /// Register a custom CTAP command handler

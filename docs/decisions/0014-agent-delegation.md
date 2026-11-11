@@ -847,6 +847,23 @@ principal's tighter defaults would stop Chromium from starting.
 Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 replace its items 7–14;
 24 and 25 are new.
 
+**Invariant 23 and panics.** Same-user ceremonies hold the human operation lock and the shared
+credential storage for their key-use section (LOCKING.md rule 4). Release builds keep
+`panic = "abort"`, so a panic anywhere in the daemon ends the process, human path included. The
+invariant therefore rests on two measures. The agent code that runs under the shared locks is
+panic-free: it returns errors instead of calling `expect` or `unwrap` (credential IDs come from
+`getrandom(2)` through a fallible call, CBOR encoding and the audit gate's state locks fail as
+errors, the TPM nonce length is checked). And the human path recovers a poisoned operation,
+storage or PIN storage lock instead of failing every later command, which is what makes an
+unwinding agent panic harmless in debug and test builds and in any future unwind build
+(`an_agent_panic_under_the_shared_locks_leaves_the_human_path_working`). Switching release
+builds to `panic = "unwind"` with `catch_unwind` around ceremonies was considered and not
+adopted: a panic is a bug that should stay loud, the human path cannot use `catch_unwind`
+itself, and recovered locks are sound without it. The residual is a panic inside a dependency
+(`soft_fido2`, `serde_json`, `ciborium`), which still ends the daemon until systemd restarts it;
+it is an availability failure, never a weakened check, and startup recovery closes any open audit
+reservation (§12).
+
 ## 15. Threats and residual risk
 
 | Threat | Mitigation | Residual |
@@ -864,6 +881,7 @@ Invariants 1–6 and 15–23 were ADR 0007 §10 items 1–6 and 15–23; 7–14 
 | RP-requested UV is fabricated | UV only from validated agent evidence | RP cannot distinguish agent from human UV |
 | Wildcard or ambiguity picks the wrong account | Pinning before `allowCredentials`; forced `single` under `*` | `first-matching` is deliberately less specific |
 | Counter races corrupt human credentials | Shared handle and operation lock | Backend-specific crash consistency |
+| Agent ceremony panics while holding the human locks | Panic-free agent code under the shared locks; the human path recovers poisoned operation, storage and PIN locks (§14, invariant 23) | Release builds abort: a panic in a dependency restarts the daemon (systemd `Restart=on-failure`) |
 | Extension reports a false origin | Origin taken only from the browser-supplied `remoteDesktopClientOverride`, which a page cannot forge; the daemon builds `clientDataJSON`; cross-origin frames fail closed | Browser and extension are in the TCB; the top origin is not available |
 | Registration completes but the page gets `NotAllowedError` (unfocused tab) | The audit records the registration; the operator deletes the orphan credential; adapters bring the page to the front | An orphan credential can remain until deleted |
 | Stale registration authority | Registration bearers revoked with the lease; escalation bound to the waiting ceremony's session | — |

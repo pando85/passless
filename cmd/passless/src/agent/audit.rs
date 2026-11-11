@@ -3,8 +3,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use nix::dir::Dir;
@@ -1275,6 +1275,17 @@ impl AuditGate {
         Ok(())
     }
 
+    /// Lock one of the gate's state mutexes on the record path. A poisoned one means a record
+    /// panicked half way, so the chain state may no longer match the segment on disk: the circuit
+    /// is broken and the record refused, never a panic. Records are written under the human
+    /// operation and storage locks (ADR 0014 invariant 23).
+    fn lock_state<'a, T>(&self, mutex: &'a Mutex<T>) -> Result<MutexGuard<'a, T>, AuditError> {
+        mutex.lock().map_err(|_| {
+            self.circuit_broken.store(true, Ordering::SeqCst);
+            AuditError::CircuitBroken("audit state lock poisoned".into())
+        })
+    }
+
     pub fn record(&self, event: AuditEvent) -> Result<AuditReceipt, AuditError> {
         if self.circuit_broken.load(Ordering::SeqCst) {
             return Err(AuditError::CircuitBroken(
@@ -1298,9 +1309,9 @@ impl AuditGate {
             .append_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut seq_guard = self.sequence.lock().unwrap();
-        let mut hash_guard = self.last_hash.lock().unwrap();
-        let mut writer_guard = self.writer.lock().unwrap();
+        let mut seq_guard = self.lock_state(&self.sequence)?;
+        let mut hash_guard = self.lock_state(&self.last_hash)?;
+        let mut writer_guard = self.lock_state(&self.writer)?;
 
         let next_seq = seq_guard.checked_add(1).ok_or(AuditError::Overflow)?;
         let prev_hash = *hash_guard;
@@ -1317,7 +1328,7 @@ impl AuditGate {
             &current_hash,
         );
 
-        let current_seg_name = self.current_segment_name.lock().unwrap().clone();
+        let current_seg_name = self.lock_state(&self.current_segment_name)?.clone();
         let should_rotate = if let Ok(stat) = nix::sys::stat::fstatat(
             &self.dir_fd,
             current_seg_name.as_str(),
@@ -1334,9 +1345,9 @@ impl AuditGate {
             drop(hash_guard);
             drop(seq_guard);
             self.rotate_segment()?;
-            seq_guard = self.sequence.lock().unwrap();
-            hash_guard = self.last_hash.lock().unwrap();
-            writer_guard = self.writer.lock().unwrap();
+            seq_guard = self.lock_state(&self.sequence)?;
+            hash_guard = self.lock_state(&self.last_hash)?;
+            writer_guard = self.lock_state(&self.writer)?;
         }
 
         let save_offset = writer_guard.current_offset().map_err(|e| {
@@ -1410,7 +1421,7 @@ impl AuditGate {
             )));
         }
 
-        let seg_idx = *self.segment_index.lock().unwrap();
+        let seg_idx = *self.lock_state(&self.segment_index)?;
         let new_anchor = AnchorState {
             segment_index: seg_idx,
             sequence: next_seq,
@@ -1427,7 +1438,7 @@ impl AuditGate {
 
         *seq_guard = next_seq;
         *hash_guard = current_hash;
-        *self.anchor.lock().unwrap() = new_anchor;
+        *self.lock_state(&self.anchor)? = new_anchor;
 
         Ok(AuditReceipt {
             #[cfg(test)]
@@ -1439,10 +1450,10 @@ impl AuditGate {
 
     /// Called only from `record`, under `append_lock`.
     fn rotate_segment(&self) -> Result<(), AuditError> {
-        let seg_idx = self.segment_index.lock().unwrap();
-        let mut writer_guard = self.writer.lock().unwrap();
-        let hash_guard = self.last_hash.lock().unwrap();
-        let seq_guard = self.sequence.lock().unwrap();
+        let seg_idx = self.lock_state(&self.segment_index)?;
+        let mut writer_guard = self.lock_state(&self.writer)?;
+        let hash_guard = self.lock_state(&self.last_hash)?;
+        let seq_guard = self.lock_state(&self.sequence)?;
 
         writer_guard.sync_data().map_err(|e| {
             self.circuit_broken.store(true, Ordering::SeqCst);
@@ -1504,11 +1515,11 @@ impl AuditGate {
 
         let seg_ino = check_file_at(&self.dir_fd, seg_name.as_str())?.0;
 
-        *self.current_segment.lock().unwrap() = self.dir.join(&seg_name);
-        *self.current_segment_name.lock().unwrap() = seg_name;
-        *self.writer.lock().unwrap() = Box::new(FileWriter::new(file_for_write));
-        *self.segment_index.lock().unwrap() = next_idx;
-        *self.segment_file_ino.lock().unwrap() = seg_ino;
+        *self.lock_state(&self.current_segment)? = self.dir.join(&seg_name);
+        *self.lock_state(&self.current_segment_name)? = seg_name;
+        *self.lock_state(&self.writer)? = Box::new(FileWriter::new(file_for_write));
+        *self.lock_state(&self.segment_index)? = next_idx;
+        *self.lock_state(&self.segment_file_ino)? = seg_ino;
 
         Ok(())
     }

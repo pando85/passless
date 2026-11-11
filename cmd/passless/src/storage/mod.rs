@@ -22,6 +22,38 @@ pub use tpm::TpmStorageAdapter;
 
 use soft_fido2::Result;
 
+use std::sync::{Mutex, MutexGuard};
+
+use log::warn;
+
+/// Lock the credential storage of the human authenticator, recovering a poisoned lock.
+///
+/// Same-user agent ceremonies share this mutex (ADR 0014 invariant 3), so a panic in one of them
+/// must not disable the human path for the rest of the daemon's life (invariant 23). Release
+/// builds abort on panic, so this matters for debug and test builds and for any future unwind
+/// build; agent code under this lock is kept panic-free as well.
+///
+/// Recovering is sound because the guarded adapter is never left half-updated in a way that
+/// matters:
+/// - Agent ceremonies touch the adapter only through `CredentialStorage` methods. A panic in agent
+///   code (selection, audit reservation, re-check) leaves it between two complete calls, a state
+///   the human path itself produces; an iteration cursor left mid-way is reset by the next
+///   `read_first`.
+/// - Inside an adapter method (code the human path runs too), a credential file is written
+///   atomically (temporary file and rename, or GnuPG writing the target) before the in-memory
+///   index is updated and the cached entry dropped: memory is a cache of the files, never the
+///   other way round. A panic before the rename changes nothing; after it, at worst the index
+///   lacks the new credential until the next start, or a cached copy of the previous contents
+///   lives until `CREDENTIAL_CACHE_TTL` expires. A pass Git-sync bracket left open defers the Git
+///   commit. None of these corrupts a credential or a key, or grants anything.
+pub fn lock_shared_storage<S: ?Sized>(storage: &Mutex<S>) -> MutexGuard<'_, S> {
+    storage.lock().unwrap_or_else(|poisoned| {
+        warn!("credential storage lock was poisoned by a panicked thread; recovering");
+        storage.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Filter criteria for reading credentials
 #[derive(Debug, Clone)]
 pub enum CredentialFilter {

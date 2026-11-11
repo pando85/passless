@@ -188,8 +188,7 @@ pub fn parse_origin(origin: &str) -> Option<ParsedOrigin> {
     if host_part.contains('?') || host_part.contains('#') || host_part.contains('@') {
         return None;
     }
-    let (host, port) = if host_part.contains(':') {
-        let (host, port_str) = host_part.rsplit_once(':').unwrap();
+    let (host, port) = if let Some((host, port_str)) = host_part.rsplit_once(':') {
         if host.is_empty() {
             return None;
         }
@@ -6317,6 +6316,69 @@ pub(crate) mod tests {
             assert_eq!(served.len(), 1);
             assert_eq!(served[0]["result"], "replay_served");
             assert_eq!(served[0]["decision"], "allow");
+        }
+
+        #[test]
+        fn an_agent_panic_under_the_shared_locks_leaves_the_human_path_working() {
+            // ADR 0014 invariant 23 (review M1). A same-user ceremony panics while it holds the
+            // human operation lock and the shared credential storage (test builds unwind); both
+            // locks are poisoned. The human CTAP path then still runs a command and reads storage.
+            use crate::authenticator::{AuthenticatorService, PasslessCallbacks};
+            use passless_core::config::PinConfig;
+            use soft_fido2::AuthenticatorCallbacks;
+            use soft_fido2_transport::{Cmd, CommandHandler};
+
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let ceremony = std::thread::spawn(move || {
+                let _hook = super::super::super::session::test_hooks::set_before_key_use(|| {
+                    assert_eq!(
+                        lock_order::held_levels(),
+                        vec![LockLevel::Operation, LockLevel::Storage],
+                        "the hook runs under the shared locks"
+                    );
+                    panic!("an agent ceremony panicked under the human locks");
+                });
+                handler.sign(&ctx, &req)
+            });
+            assert!(ceremony.join().is_err(), "the ceremony panicked");
+            assert!(f.operation_lock.is_poisoned());
+            assert!(f.storage.is_poisoned());
+            // The panic closed the reservation (P8 drop guard): the audit is consistent.
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["failure_class"], "abandoned");
+
+            // A human CTAP command (authenticatorGetInfo) through the same locks.
+            let service =
+                AuthenticatorService::<Box<dyn CredentialStorage>, ()>::with_shared_storage(
+                    f.storage.clone(),
+                    None,
+                    SecurityConfig::default(),
+                    PinConfig::default(),
+                )
+                .expect("the human service builds over the shared storage");
+            let mut human =
+                crate::ServiceHandler::with_operation_lock(service, f.operation_lock.clone());
+            let info = human
+                .handle_command(Cmd::Cbor, &[0x04])
+                .expect("the human path answers after an agent panic");
+            assert_eq!(info.first(), Some(&0x00), "CTAP2_OK");
+            assert!(!f.operation_lock.is_poisoned(), "the poison was cleared");
+            assert!(!f.storage.is_poisoned(), "the poison was cleared");
+
+            // And a human storage read finds the shared credential.
+            let callbacks = PasslessCallbacks::<Box<dyn CredentialStorage>, ()>::new(
+                f.storage.clone(),
+                None,
+                SecurityConfig::default(),
+                PinConfig::default(),
+            );
+            let listed = callbacks
+                .list_credentials("example.com", None)
+                .expect("the human path reads storage after an agent panic");
+            assert_eq!(listed.len(), 1);
         }
     }
 

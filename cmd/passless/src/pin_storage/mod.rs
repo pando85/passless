@@ -12,8 +12,11 @@ pub use pass::PassPinStorage;
 #[cfg(feature = "tpm")]
 pub use tpm::TpmPinStorage;
 
-use serde::{Deserialize, Serialize};
 use soft_fido2::{PinState, StatusCode};
+
+use std::sync::{Mutex, MutexGuard};
+
+use serde::{Deserialize, Serialize};
 
 /// Serializable PIN config for storage (synced across machines)
 ///
@@ -258,6 +261,22 @@ impl SerializablePinState {
             credential_wrapping_generation: config.credential_wrapping_generation,
         }
     }
+}
+
+/// Lock the human authenticator's PIN storage, recovering a poisoned lock.
+///
+/// The agent runtime holds this mutex in its backend handle, so a poisoned lock must not disable
+/// the human PIN path (ADR 0014 invariant 23). Recovering is sound: every `PinStorage` method takes
+/// `&self`, so the mutex only serializes calls and never guards a value a panicking thread could
+/// have left half-written. The PIN state lives in the backend's files, and a backend's interior
+/// state (pass: its `RwLock` caches) has its own synchronization. Agent ceremonies never take this
+/// lock today; it is recovered all the same so that the guarantee does not depend on that.
+pub fn lock_pin_storage<P: ?Sized>(storage: &Mutex<P>) -> MutexGuard<'_, P> {
+    storage.lock().unwrap_or_else(|poisoned| {
+        log::warn!("PIN storage lock was poisoned by a panicked thread; recovering");
+        storage.clear_poison();
+        poisoned.into_inner()
+    })
 }
 
 /// Trait for PIN storage backends

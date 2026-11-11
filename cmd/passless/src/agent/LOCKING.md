@@ -32,7 +32,11 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    escalation, a human or the browser manager, and never while holding a policy, session or
    registry guard. The browser lease is activated after the operation lock is released
    (`BrowserLeaseActivation`), and only until it has succeeded once. The human path recovers a
-   poisoned operation lock (`main.rs::lock_operation`), because it guards no data.
+   poisoned operation lock (`main.rs::lock_operation`), because it guards no data, and a
+   poisoned credential storage or PIN storage lock (`storage::lock_shared_storage`,
+   `pin_storage::lock_pin_storage`; the soundness argument is on those functions). Release builds
+   abort on panic, so the code that runs under these locks on the agent side is kept panic-free
+   (no `expect`, `unwrap` or fallible indexing; ADR 0014 section 14, invariant 23).
 5. **The audit gate is a terminal leaf.** `AuditGate::record` may be called with any of the locks
    above held. It never acquires a lock outside the audit gate. Inside it, `append_lock` serializes
    whole records, including segment rotation. A ceremony's records go through one

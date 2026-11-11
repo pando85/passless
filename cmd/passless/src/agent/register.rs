@@ -743,7 +743,16 @@ impl RegisterHandler {
             )
         })?;
 
-        let credential_id = generate_credential_id();
+        // Fallible, never panicking: storage and the human operation lock are held here, and a
+        // panic would abort the daemon, human path included (ADR 0014 invariant 23).
+        let credential_id = generate_credential_id().map_err(|_| {
+            target.audit.fail(PolicyDenyReason::KeyGenerationFailed);
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "credential ID generation failed",
+                RecommendedAction::Retry,
+            )
+        })?;
 
         // `GeneratedCredentialKey::cose_public_key` is the provider's raw public key (SEC1 point or
         // Ed25519 bytes), not a COSE_Key; encode it before it goes into the attested credential data.
@@ -774,7 +783,14 @@ impl RegisterHandler {
             req.top_origin.as_deref(),
         );
 
-        let attestation_object = build_attestation_object(&authenticator_data);
+        let attestation_object = build_attestation_object(&authenticator_data).map_err(|_| {
+            target.audit.fail(PolicyDenyReason::KeyGenerationFailed);
+            ProtocolError::new(
+                ErrorCode::Internal,
+                "attestation object encoding failed",
+                RecommendedAction::Retry,
+            )
+        })?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -873,11 +889,12 @@ fn normalize_rp_id(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-fn generate_credential_id() -> Vec<u8> {
+/// 32 random bytes from the OS (`getrandom(2)`, no file descriptor). A failure is an error, not a
+/// panic: the caller holds storage and, in same-user mode, the human operation lock.
+fn generate_credential_id() -> Result<Vec<u8>, rand::Error> {
     let mut id = vec![0u8; 32];
-    let mut rng = std::fs::File::open("/dev/urandom").expect("open urandom");
-    std::io::Read::read_exact(&mut rng, &mut id).expect("read urandom");
-    id
+    rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut id)?;
+    Ok(id)
 }
 
 /// Encode a provider public key as a COSE_Key (RFC 9052 section 7) in CTAP2 canonical form.
@@ -997,7 +1014,7 @@ fn json_escape_string(s: &str) -> String {
     out
 }
 
-fn build_attestation_object(auth_data: &[u8]) -> Vec<u8> {
+fn build_attestation_object(auth_data: &[u8]) -> Result<Vec<u8>, &'static str> {
     let attestation_map = ciborium::Value::Map(vec![
         (
             ciborium::Value::Text("fmt".to_string()),
@@ -1014,8 +1031,8 @@ fn build_attestation_object(auth_data: &[u8]) -> Vec<u8> {
     ]);
 
     let mut buf = Vec::new();
-    ciborium::into_writer(&attestation_map, &mut buf).expect("CBOR encoding of attestation object");
-    buf
+    ciborium::into_writer(&attestation_map, &mut buf).map_err(|_| "CBOR encoding failed")?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -1385,7 +1402,7 @@ mod tests {
     #[test]
     fn test_build_attestation_object_is_valid_cbor() {
         let auth_data = vec![0x01, 0x02, 0x03];
-        let att_obj = build_attestation_object(&auth_data);
+        let att_obj = build_attestation_object(&auth_data).expect("encodes");
 
         let value: ciborium::Value = ciborium::from_reader(att_obj.as_slice()).expect("valid CBOR");
 
@@ -1408,14 +1425,14 @@ mod tests {
 
     #[test]
     fn test_generate_credential_id_length() {
-        let id = generate_credential_id();
+        let id = generate_credential_id().expect("the OS RNG works");
         assert_eq!(id.len(), 32);
     }
 
     #[test]
     fn test_generate_credential_id_unique() {
-        let id1 = generate_credential_id();
-        let id2 = generate_credential_id();
+        let id1 = generate_credential_id().expect("the OS RNG works");
+        let id2 = generate_credential_id().expect("the OS RNG works");
         assert_ne!(id1, id2);
     }
 
