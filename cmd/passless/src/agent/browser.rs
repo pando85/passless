@@ -1053,6 +1053,11 @@ impl BrowserProcessManager {
         // Every daemon write below goes through pinned directory handles (`safe_fs`): the runtime
         // root may belong to the browser user, so no path the daemon writes through may contain a
         // component that user could swap for a symlink (review H1).
+        ensure_runtime_root(&config.runtime_root, config.target_uid, config.target_gid).map_err(
+            |e| {
+                LaunchError::RuntimeRootInvalid(format!("{}: {}", config.runtime_root.display(), e))
+            },
+        )?;
         let root = open_runtime_root(&config.runtime_root, config.target_uid).map_err(|e| {
             LaunchError::RuntimeRootInvalid(format!("{}: {}", config.runtime_root.display(), e))
         })?;
@@ -2229,6 +2234,132 @@ fn clamp_login_timeout(timeout: Duration) -> Duration {
     } else {
         timeout
     }
+}
+
+/// The runtime root a profile without `browser_runtime_root` uses, and the system directory it
+/// lives below (`$XDG_RUNTIME_DIR`, else `/tmp`).
+pub fn default_runtime_root() -> (PathBuf, PathBuf) {
+    let base = dirs::runtime_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let root = base.join("passless").join("browser");
+    (base, root)
+}
+
+/// Creates the browser runtime root when it is missing, so that a fresh machine can launch a
+/// browser without a manual `mkdir`. A root that exists is left alone (its owner, mode and type
+/// are judged by [`open_runtime_root`], which refuses a wrong one or a symlink); this never
+/// chmods or chowns an existing entry.
+///
+/// - The default root (`$XDG_RUNTIME_DIR/passless/browser`) is created, with its missing parents,
+///   through [`Dir::open_or_create_path`]: mode 0700, owned by the daemon, no symlink followed.
+///   That is only done when the browser runs as the daemon's own user, the one case in which the
+///   daemon's directory is the browser user's: for another browser user the root has to be
+///   owned by that user and its parents traversable by it, which the daemon cannot assume under
+///   its own runtime directory, so the error says to create it or to set `browser_runtime_root`.
+/// - A configured `browser_runtime_root` is created only as its final component: its parent must
+///   exist, be reached without a symlink, belong to the daemon, root or the browser user, and not
+///   be writable by anyone else (or be sticky). The new directory is 0700 and, for another
+///   browser user, handed to that user (which needs root); a failed hand-over removes it again.
+///   Parents are never created for a configured root, so a typo does not litter the disk.
+pub fn ensure_runtime_root(path: &Path, target_uid: u32, target_gid: u32) -> io::Result<()> {
+    let (default_base, default_root) = default_runtime_root();
+    ensure_runtime_root_with(path, target_uid, target_gid, &default_base, &default_root)
+}
+
+/// [`ensure_runtime_root`] with the default root given (tests do not touch the environment).
+fn ensure_runtime_root_with(
+    path: &Path,
+    target_uid: u32,
+    target_gid: u32,
+    default_base: &Path,
+    default_root: &Path,
+) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // SAFETY: no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if path == default_root {
+        if target_uid != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the default runtime root does not exist, and the browser runs as uid \
+                     {target_uid}, not as the daemon (uid {euid}): create it owned by that user \
+                     with mode 0700, or set browser_runtime_root"
+                ),
+            ));
+        }
+        let base = fs::canonicalize(default_base)?;
+        let relative = path.strip_prefix(default_base).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime root is not below its base",
+            )
+        })?;
+        return Dir::open_or_create_path(&base.join(relative), RUNTIME_DIR_MODE, &base).map(|_| ());
+    }
+    create_final_component(path, euid, target_uid, target_gid)
+}
+
+/// The configured-root half of [`ensure_runtime_root`]: create only the last component of `path`.
+fn create_final_component(
+    path: &Path,
+    euid: u32,
+    target_uid: u32,
+    target_gid: u32,
+) -> io::Result<()> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime root has no parent directory or name",
+        ));
+    };
+    let resolved_parent = fs::canonicalize(parent).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "its parent directory {} is not usable ({e}); create the parent, the daemon only \
+                 creates the last component of browser_runtime_root",
+                parent.display()
+            ),
+        )
+    })?;
+    let parent_dir = Dir::open_path(&resolved_parent)?;
+    let st = parent_dir.stat()?;
+    let mode = st.st_mode & 0o7777;
+    let trusted_owner = [euid, 0, target_uid].contains(&st.st_uid);
+    let others_can_write = mode & 0o022 != 0 && mode & libc::S_ISVTX == 0;
+    if !trusted_owner || others_can_write {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "its parent directory {} (uid {}, mode {:o}) is not safe to create it in: it must \
+                 belong to the daemon, root or the browser user and not be writable by others",
+                resolved_parent.display(),
+                st.st_uid,
+                mode & 0o777
+            ),
+        ));
+    }
+    let dir = match parent_dir.create_dir(name, RUNTIME_DIR_MODE) {
+        Ok(dir) => dir,
+        // Created by someone else in the meantime: judged by `open_runtime_root`.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if target_uid != euid
+        && let Err(e) = dir.chown(target_uid, target_gid)
+    {
+        let _ = parent_dir.remove_tree(name);
+        return Err(io::Error::new(
+            e.kind(),
+            format!("cannot hand the new runtime root to uid {target_uid}: {e}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Opens the browser runtime root as a pinned directory (review H1). Its last component must not
@@ -4312,6 +4443,185 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = setup_runtime_root(dir.path());
         assert!(validate_runtime_root(&root, 99999).is_err());
+    }
+
+    fn ids() -> (u32, u32) {
+        // SAFETY: no preconditions.
+        unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A fresh machine: `$XDG_RUNTIME_DIR` exists, `passless/browser` does not. The first launch
+    /// used to fail with "No such file or directory".
+    #[test]
+    fn test_default_runtime_root_is_created_0700_and_then_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("xdg-runtime");
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = base.join("passless").join("browser");
+        let (uid, gid) = ids();
+        assert!(!root.exists());
+
+        ensure_runtime_root_with(&root, uid, gid, &base, &root).unwrap();
+        assert_eq!(mode_of(&root), 0o700);
+        assert_eq!(mode_of(&base.join("passless")), 0o700);
+        assert_eq!(fs::metadata(&root).unwrap().uid(), uid);
+        validate_runtime_root(&root, uid).unwrap();
+
+        // Idempotent, and a lease can be created in it afterwards.
+        ensure_runtime_root_with(&root, uid, gid, &base, &root).unwrap();
+        assert_eq!(mode_of(&root), 0o700);
+    }
+
+    #[test]
+    fn test_default_runtime_root_is_not_created_for_another_browser_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("passless").join("browser");
+        let (uid, gid) = ids();
+        let err = ensure_runtime_root_with(&root, uid.wrapping_add(1), gid, tmp.path(), &root)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("browser_runtime_root"), "{err}");
+        assert!(!tmp.path().join("passless").exists(), "nothing was created");
+    }
+
+    /// A pre-existing root is never repaired: the wrong mode, a symlink and a foreign owner stay
+    /// refused by the launch validation.
+    #[test]
+    fn test_existing_runtime_roots_are_left_alone_and_still_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (uid, gid) = ids();
+
+        let wide = tmp.path().join("wide");
+        fs::create_dir(&wide).unwrap();
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_runtime_root_with(&wide, uid, gid, tmp.path(), &wide).unwrap();
+        assert_eq!(mode_of(&wide), 0o755, "not chmodded");
+        assert!(validate_runtime_root(&wide, uid).is_err());
+
+        let real = setup_runtime_root(tmp.path());
+        let link = tmp.path().join("link");
+        unix_fs::symlink(&real, &link).unwrap();
+        ensure_runtime_root_with(&link, uid, gid, tmp.path(), &link).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(validate_runtime_root(&link, uid).is_err());
+
+        // Owned by someone else (as if the browser user were another one): left, then refused.
+        let owned = setup_runtime_root(tmp.path());
+        ensure_runtime_root_with(&owned, uid, gid, tmp.path(), &owned).unwrap();
+        assert!(validate_runtime_root(&owned, uid.wrapping_add(1)).is_err());
+    }
+
+    /// A symlink planted where a missing parent of the default root would go is not followed.
+    #[test]
+    fn test_default_runtime_root_refuses_a_symlinked_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let base = tmp.path().join("xdg-runtime");
+        fs::create_dir(&base).unwrap();
+        unix_fs::symlink(&elsewhere, base.join("passless")).unwrap();
+        let root = base.join("passless").join("browser");
+        let (uid, gid) = ids();
+        assert!(ensure_runtime_root_with(&root, uid, gid, &base, &root).is_err());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_configured_runtime_root_creates_only_its_final_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (uid, gid) = ids();
+        let other_default = tmp.path().join("default");
+        let parent = tmp.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = parent.join("browser-root");
+
+        ensure_runtime_root_with(&root, uid, gid, tmp.path(), &other_default).unwrap();
+        assert_eq!(mode_of(&root), 0o700);
+        assert_eq!(fs::metadata(&root).unwrap().uid(), uid);
+        validate_runtime_root(&root, uid).unwrap();
+
+        // A missing parent is not created.
+        let deep = tmp.path().join("absent").join("browser-root");
+        let err =
+            ensure_runtime_root_with(&deep, uid, gid, tmp.path(), &other_default).unwrap_err();
+        assert!(err.to_string().contains("create the parent"), "{err}");
+        assert!(!tmp.path().join("absent").exists());
+
+        // A parent others can write to is refused; a sticky one (like /tmp) is not.
+        let shared = tmp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let in_shared = shared.join("browser-root");
+        let err =
+            ensure_runtime_root_with(&in_shared, uid, gid, tmp.path(), &other_default).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(!in_shared.exists());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        ensure_runtime_root_with(&in_shared, uid, gid, tmp.path(), &other_default).unwrap();
+        assert_eq!(mode_of(&in_shared), 0o700);
+
+        // A symlinked parent resolves like a system symlink (`/var/run`), a symlink at the root
+        // itself is left for the validation to refuse.
+        let alias = tmp.path().join("alias");
+        unix_fs::symlink(&parent, &alias).unwrap();
+        ensure_runtime_root_with(&alias.join("second"), uid, gid, tmp.path(), &other_default)
+            .unwrap();
+        assert_eq!(mode_of(&parent.join("second")), 0o700);
+    }
+
+    /// Handing a new root to another user needs root; without it the half-made directory is
+    /// removed again and the launch reports why.
+    #[test]
+    fn test_configured_runtime_root_for_another_user_is_not_left_behind_without_root() {
+        // SAFETY: no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (uid, gid) = ids();
+        let root = tmp.path().join("browser-root");
+        let err = ensure_runtime_root_with(
+            &root,
+            uid.wrapping_add(1),
+            gid.wrapping_add(1),
+            tmp.path(),
+            &tmp.path().join("default"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("hand the new runtime root"),
+            "{err}"
+        );
+        assert!(!root.exists());
+    }
+
+    /// The launch itself: a missing root is created, so the launch no longer fails with "invalid
+    /// runtime root".
+    #[test]
+    fn test_launch_creates_a_missing_runtime_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config(tmp.path());
+        let root = tmp.path().join("fresh-root");
+        config.runtime_root = root.clone();
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let result = mgr.launch(&config, test_profile_id());
+        assert!(
+            !matches!(result, Err(LaunchError::RuntimeRootInvalid(_))),
+            "{result:?}"
+        );
+        assert_eq!(mode_of(&root), 0o700);
+        mgr.terminate_all();
     }
 
     #[test]

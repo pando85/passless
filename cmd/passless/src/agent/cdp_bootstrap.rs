@@ -219,16 +219,18 @@ where
                     )
                 }
                 Err(e) => {
-                    // Keep detailed daemon/profile information out of the HTTP response. It may
-                    // contain paths or policy details; the wrapper's stderr is the right channel.
-                    log::warn!("failed to ensure managed browser for CDP bootstrap: {e}");
-                    write_json(
-                        &mut stream,
-                        503,
-                        "Service Unavailable",
-                        r#"{"error":"managed browser unavailable"}"#,
-                        &[],
-                    )
+                    // The response carries the failure's class and a fixed hint, never the
+                    // daemon's message: that may hold paths or policy details. The wrapper's
+                    // stderr (and the daemon's log) get the full text.
+                    let (class, hint) = classify_ensure_error(&e);
+                    log::warn!("failed to ensure managed browser for CDP bootstrap ({class}): {e}");
+                    let body = serde_json::json!({
+                        "error": "managed browser unavailable",
+                        "class": class,
+                        "hint": hint,
+                    })
+                    .to_string();
+                    write_json(&mut stream, 503, "Service Unavailable", &body, &[])
                 }
             }
         }
@@ -239,6 +241,36 @@ where
             r#"{"error":"not found"}"#,
             &[],
         ),
+    }
+}
+
+/// The class of a failed `EnsureBrowser` and a fixed, secret-free hint saying where to look, from
+/// the error text the agent client produced. The class is one of a closed set of words.
+fn classify_ensure_error(error: &str) -> (&'static str, &'static str) {
+    const LOG: &str = "see the passless daemon's log (journalctl --user -u passless)";
+    let has = |needle: &str| error.contains(needle);
+    if has("no agent socket") || has("daemon is not running") {
+        (
+            "daemon_unreachable",
+            "the passless daemon is not running, or runs without agents: start it with \
+             `[agents] enabled = true` and check `passless doctor --agents`",
+        )
+    } else if has("invalid runtime root") {
+        (
+            "runtime_root_invalid",
+            "the browser runtime root could not be used: see the passless daemon's log \
+             (journalctl --user -u passless) for the directory and the reason",
+        )
+    } else if has("failed to launch browser") {
+        (
+            "launch_failed",
+            "the daemon could not start the browser: see the passless daemon's log \
+             (journalctl --user -u passless) and run `passless doctor --agents`",
+        )
+    } else if has("denied") || has("not allowed") || has("refused") {
+        ("refused", LOG)
+    } else {
+        ("unavailable", LOG)
     }
 }
 
@@ -483,6 +515,51 @@ mod tests {
             "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 503"));
+    }
+
+    /// The 503 for a failed launch says why (the class and a fixed hint), and never echoes the
+    /// daemon's message with its paths.
+    #[test]
+    fn a_failed_launch_503_names_the_class_and_leaks_nothing() {
+        let server = CdpBootstrap::start("secret".into(), || {
+            Err(
+                "protocol error: failed to launch browser: invalid runtime root: \
+                 /run/user/1000/passless/browser: No such file or directory"
+                    .into(),
+            )
+        })
+        .unwrap();
+        let response = request(
+            server.addr(),
+            "GET /json/version/ HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["error"], "managed browser unavailable");
+        assert_eq!(json["class"], "runtime_root_invalid");
+        assert!(json["hint"].as_str().unwrap().contains("daemon's log"));
+        assert!(!body.contains("/run/user"), "{body}");
+        assert!(!body.contains("secret"), "{body}");
+    }
+
+    #[test]
+    fn ensure_errors_are_classified() {
+        let class = |e: &str| classify_ensure_error(e).0;
+        assert_eq!(
+            class("the passless daemon is not running: no agent socket at /x"),
+            "daemon_unreachable"
+        );
+        assert_eq!(
+            class("protocol error: failed to launch browser: invalid runtime root: /x: nope"),
+            "runtime_root_invalid"
+        );
+        assert_eq!(
+            class("protocol error: failed to launch browser: failed to spawn browser: x"),
+            "launch_failed"
+        );
+        assert_eq!(class("policy denied"), "refused");
+        assert_eq!(class("something else"), "unavailable");
     }
 
     #[test]

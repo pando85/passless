@@ -27,6 +27,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path};
 
+/// The deepest directory tree [`Dir::remove_tree`] descends into.
+const MAX_REMOVE_DEPTH: usize = 16;
+
 /// An open directory, reached without following symlinks.
 #[derive(Debug)]
 pub struct Dir {
@@ -272,6 +275,99 @@ impl Dir {
             }
         }
         Ok(())
+    }
+
+    /// Remove the entry `name` below this directory, recursively when it is a directory, without
+    /// following a symlink anywhere (a symlink is unlinked itself) and without leaving the
+    /// filesystem of this directory. A missing entry is not an error.
+    pub fn remove_tree(&self, name: &str) -> io::Result<()> {
+        let c_name = cstr(name)?;
+        let dev = self.stat()?.st_dev;
+        self.remove_entry(&c_name, dev, 0)
+    }
+
+    fn remove_entry(&self, name: &CStr, dev: libc::dev_t, depth: usize) -> io::Result<()> {
+        // SAFETY: `stat` is plain data; `name` is NUL-terminated; the result is checked.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let err = io::Error::last_os_error();
+            return if err.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(err)
+            };
+        }
+        let flags = if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            if depth >= MAX_REMOVE_DEPTH {
+                return Err(io::Error::other("directory tree is too deep to remove"));
+            }
+            if st.st_dev != dev {
+                return Err(io::Error::other(
+                    "refusing to remove across a filesystem boundary",
+                ));
+            }
+            let child = Self {
+                fd: open_dir_at(self.fd.as_raw_fd(), name)?,
+            };
+            for entry in child.entry_names()? {
+                child.remove_entry(&entry, dev, depth + 1)?;
+            }
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        // SAFETY: `name` is NUL-terminated; the result is checked.
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// The names of the entries of this directory (not `.` and `..`).
+    fn entry_names(&self) -> io::Result<Vec<CString>> {
+        // SAFETY: a plain syscall; the result is checked.
+        let dup = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` is a fresh descriptor; `fdopendir` takes it over on success.
+        let dirp = unsafe { libc::fdopendir(dup) };
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: `dup` is still ours when `fdopendir` failed.
+            unsafe { libc::close(dup) };
+            return Err(err);
+        }
+        // The duplicate shares the file offset of the original.
+        // SAFETY: `dirp` is a valid stream.
+        unsafe { libc::rewinddir(dirp) };
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: `dirp` is a valid stream; the entry is read before the next call.
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `d_name` is a NUL-terminated name.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(name.to_owned());
+            }
+        }
+        // SAFETY: `dirp` is valid and closed once (this also closes `dup`).
+        unsafe { libc::closedir(dirp) };
+        Ok(names)
     }
 
     /// Rename `from` to `to` inside this directory.
@@ -596,6 +692,38 @@ mod tests {
         let fifo = std::ffi::CString::new(tmp.path().join("fifo").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert!(dir.read_whole_file("fifo", &[uid], 64).is_err());
+    }
+
+    #[test]
+    fn remove_tree_removes_a_tree_and_never_follows_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = victim(tmp.path());
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep"), b"keep").unwrap();
+        let tree = tmp.path().join("tree");
+        fs::create_dir_all(tree.join("a").join("b")).unwrap();
+        fs::write(tree.join("a").join("b").join("f"), b"x").unwrap();
+        fs::write(tree.join("top"), b"x").unwrap();
+        // A symlink to a directory and to a file: removed as links, targets untouched.
+        symlink(&elsewhere, tree.join("a").join("dirlink")).unwrap();
+        symlink(&victim, tree.join("filelink")).unwrap();
+        fs::create_dir(tree.join("sibling")).unwrap();
+        fs::write(tree.join("sibling").join("f"), b"x").unwrap();
+
+        let dir = Dir::open_path(tmp.path()).unwrap();
+        dir.remove_tree("tree").unwrap();
+        assert!(!tree.exists());
+        assert_eq!(fs::read(elsewhere.join("keep")).unwrap(), b"keep");
+        untouched(&victim);
+
+        // Missing is fine; a symlink or file at the name is unlinked itself; bad names refused.
+        dir.remove_tree("tree").unwrap();
+        symlink(&elsewhere, tmp.path().join("link")).unwrap();
+        dir.remove_tree("link").unwrap();
+        assert!(fs::symlink_metadata(tmp.path().join("link")).is_err());
+        assert!(elsewhere.join("keep").exists());
+        assert!(dir.remove_tree("../x").is_err());
     }
 
     #[test]

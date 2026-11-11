@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,12 +205,7 @@ impl AgentRuntime {
         let runtime_root = profile_config
             .browser_runtime_root
             .clone()
-            .unwrap_or_else(|| {
-                dirs::runtime_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join("passless")
-                    .join("browser")
-            });
+            .unwrap_or_else(|| crate::agent::browser::default_runtime_root().1);
         let rp_ids = profile_config.rule_rp_ids();
         let config = BrowserConfig {
             executable: launch.executable,

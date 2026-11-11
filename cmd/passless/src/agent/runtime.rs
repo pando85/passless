@@ -1039,6 +1039,18 @@ impl AgentRuntime {
                 )
                 .map_err(RuntimeError::Config)?;
                 if let Some(ref runtime_root) = profile.browser_runtime_root {
+                    // A missing final component is created (see `ensure_runtime_root`), so a
+                    // fresh machine starts; a root that exists is judged as before.
+                    super::browser::ensure_runtime_root(runtime_root, bu.uid, bu.gid).map_err(
+                        |e| {
+                            RuntimeError::Config(format!(
+                                "profile '{}': browser_runtime_root '{}': {}",
+                                name,
+                                runtime_root.display(),
+                                e
+                            ))
+                        },
+                    )?;
                     validate_browser_runtime_root_at_startup(runtime_root, bu.uid, name)?;
                 }
                 Some(bu)
@@ -3938,12 +3950,7 @@ impl AgentRuntime {
         let runtime_root = profile_config
             .browser_runtime_root
             .clone()
-            .unwrap_or_else(|| {
-                dirs::runtime_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("passless")
-                    .join("browser")
-            });
+            .unwrap_or_else(|| super::browser::default_runtime_root().1);
 
         let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
         let browser_gid = profile.browser_gid.unwrap_or(profile.daemon_gid);
