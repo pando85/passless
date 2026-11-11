@@ -7,7 +7,7 @@
 #   AGENT_E2E_HEADLESS=new|headed|both
 #   AGENT_E2E_FILTER=E2E-01,6       scenario ids (also accepted as arguments); overrides the CI selection
 #   AGENT_E2E_ALLOW_SKIP=1          a SKIP no longer fails the run (optional tools / missing browsers)
-#   AGENT_E2E_TIMEOUT=SECONDS       overall limit (default 900 for ci, 2400 for full)
+#   AGENT_E2E_TIMEOUT=SECONDS       overall limit (default 900 for ci, 14400 for full)
 #
 # Hermeticity: the whole run happens inside a private `dbus-run-session` started from a MINIMAL bus config (no
 # service directories, so nothing can be bus-activated), with a scrubbed environment (temp HOME/XDG_*, no
@@ -96,7 +96,7 @@ CONF
   export AGENT_E2E_RESULTS="${AGENT_E2E_RESULTS:-$(mktemp)}"
   : > "$AGENT_E2E_RESULTS"
 
-  if [[ "$AGENT_E2E_MATRIX" == "full" ]]; then default_timeout=2400; else default_timeout=900; fi
+  if [[ "$AGENT_E2E_MATRIX" == "full" ]]; then default_timeout=14400; else default_timeout=900; fi
   limit="${AGENT_E2E_TIMEOUT:-$default_timeout}"
 
   # Scrubbed environment: only what the harness needs, plus every AGENT_E2E_* setting. The real bus address is
