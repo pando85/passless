@@ -18,8 +18,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install system dependencies
         run: |
-          sudo apt update
-          sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm && break || sleep 10
+          done
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v7
         with:
