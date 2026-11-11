@@ -1089,6 +1089,18 @@ fn requests_over_the_connection_cap_get_an_explicit_busy_and_none_is_dropped() {
     served.sort();
     assert_eq!(served, vec![1, 2], "no request was dropped");
     assert_eq!(f.key_provider.sign_calls(), 2);
+    // ADR 0014 section 12: a transport-level busy refusal happens before any ceremony exists and
+    // writes no operation record. The two served ceremonies are the only ones recorded; the four
+    // refused requests add no reservation, no refusal and no terminal record.
+    let kinds = |kind: &str| f.events().iter().filter(|e| e["kind"] == kind).count();
+    assert_eq!(kinds("policy.allow"), 2, "{:?}", f.events());
+    assert_eq!(kinds("operation.terminal"), 2, "{:?}", f.events());
+    assert_eq!(kinds("policy.deny"), 0, "{:?}", f.events());
+    assert!(
+        f.events().iter().all(|e| e["result"] != "busy"),
+        "no record carries result = busy: {:?}",
+        f.events()
+    );
 }
 
 #[test]
@@ -1139,6 +1151,17 @@ fn connections_over_the_connection_cap_are_answered_busy() {
     assert_eq!(error["code"], "busy");
     assert!(over.closed());
     drop(idle);
+    // The refused connection never reached a ceremony: no operation record of any kind.
+    let operation_records: Vec<_> =
+        f.events()
+            .into_iter()
+            .filter(|e| {
+                e["kind"].as_str().is_some_and(|kind| {
+                    kind.starts_with("policy.") || kind.starts_with("operation.")
+                }) || e["result"] == "busy"
+            })
+            .collect();
+    assert!(operation_records.is_empty(), "{operation_records:?}");
 }
 
 // --- the daemon's own parse, clientDataJSON and responseJson ---------------------------------
