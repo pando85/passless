@@ -82,10 +82,20 @@
       return;
     }
 
+    // Every ancestor frame origin (Chromium only). The worker treats a frame as cross-origin when any
+    // ancestor differs from its own origin, or when the list is unavailable (fail closed).
+    var ancestors = null;
+    try {
+      if (location.ancestorOrigins) ancestors = Array.prototype.slice.call(location.ancestorOrigins);
+    } catch (e) {
+      ancestors = null;
+    }
+
     chrome.runtime.sendMessage({
       source: "passless-agent-broker",
       request_id: message.id,
       type: messageType,
+      ancestor_origins: ancestors,
       request: message.request
     }, function(response) {
       var failed = Boolean(chrome.runtime.lastError) || !response;
@@ -95,7 +105,6 @@
         id: message.id,
         ok: !failed && response.ok === true,
         response: failed ? null : response.response,
-        fallback: !failed && response.fallback === true,
         error: failed ? "broker_unavailable" : response.error,
         type: messageType
       }, location.origin);

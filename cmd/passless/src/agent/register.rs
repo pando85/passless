@@ -42,6 +42,13 @@ pub struct RegisterHandler {
 }
 
 impl RegisterHandler {
+    fn record_policy_deny(&self, ctx: &RegisterContext, rp_id: &str, reason: PolicyDenyReason) {
+        let deny_event =
+            PolicyDenyBuilder::new(ctx.profile_id.clone(), AuditAction::Register, rp_id, reason)
+                .build();
+        let _ = self.audit_gate.record(deny_event);
+    }
+
     pub fn register(
         &self,
         ctx: &RegisterContext,
@@ -55,17 +62,18 @@ impl RegisterHandler {
             req.cross_origin,
             &normalized_rp,
         ) {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Register,
-                &normalized_rp,
-                PolicyDenyReason::OriginInvalid,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
+            let (reason, message) = if req.cross_origin {
+                (
+                    PolicyDenyReason::CrossOriginDenied,
+                    "cross-origin frames are not permitted",
+                )
+            } else {
+                (PolicyDenyReason::OriginInvalid, "origin not valid for RP")
+            };
+            self.record_policy_deny(ctx, &normalized_rp, reason);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                "origin not valid for RP",
+                message,
                 RecommendedAction::FixRequest,
             ));
         }
@@ -141,11 +149,17 @@ impl RegisterHandler {
                     RecommendedAction::FixRequest,
                 ));
             }
+            // `confirm`/`request` act as `deny` until the escalation service lands (P7); see sign.rs.
             passless_core::agent::AgentAuthorization::Confirm => {
+                self.record_policy_deny(
+                    ctx,
+                    &normalized_rp,
+                    PolicyDenyReason::EscalationUnavailable,
+                );
                 return Err(ProtocolError::new(
-                    ErrorCode::InteractionRequired,
-                    "human confirmation is required by policy",
-                    RecommendedAction::Retry,
+                    ErrorCode::Forbidden,
+                    "escalation is unavailable: policy requires human confirmation",
+                    RecommendedAction::FixRequest,
                 ));
             }
             passless_core::agent::AgentAuthorization::Allow => {}
@@ -160,10 +174,13 @@ impl RegisterHandler {
         if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
             || human_uv_required
         {
+            // No human evidence in an agent ceremony before P7. `human_verification_prompt` is parsed
+            // but can only make this check stricter; P4 replaces the schema.
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::EscalationUnavailable);
             return Err(ProtocolError::new(
-                ErrorCode::InteractionRequired,
-                "human WebAuthn verification is required by policy",
-                RecommendedAction::Retry,
+                ErrorCode::Forbidden,
+                "escalation is unavailable: policy requires human verification",
+                RecommendedAction::FixRequest,
             ));
         }
 
@@ -1112,6 +1129,35 @@ mod tests {
         let result = handler.register(&ctx, &req);
         assert!(result.is_err());
         let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+    }
+
+    #[test]
+    fn test_register_confirm_policy_acts_as_deny_until_p7() {
+        let mut config = make_registration_profile_config();
+        config.rules[0].register = AgentCeremonyPolicy {
+            authorization: AgentAuthorization::Confirm,
+            user_presence: UserPresenceSource::Human,
+            user_verification: UserVerificationSource::None,
+        };
+        let f = make_fixture_with_config(config);
+
+        let err = f
+            .make_handler()
+            .register(&f.make_ctx(), &f.make_req())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_ne!(err.code, ErrorCode::InteractionRequired);
+    }
+
+    #[test]
+    fn test_register_cross_origin_is_denied() {
+        let f = RegisterTestFixture::new();
+        let mut req = f.make_req();
+        req.top_origin = Some("https://top.example".to_string());
+        req.cross_origin = true;
+
+        let err = f.make_handler().register(&f.make_ctx(), &req).unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
     }
 

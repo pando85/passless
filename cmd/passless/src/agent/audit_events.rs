@@ -691,6 +691,11 @@ pub enum PolicyDenyReason {
     AuditFailure,
     CounterPersistenceFailure,
     GrantRevoked,
+    /// A ceremony needed a human decision (`confirm`/`request`, human UP or UV) but the escalation service
+    /// does not exist yet (P7); the ceremony is denied and never reaches a prompt or the native path.
+    EscalationUnavailable,
+    /// The request came from a frame whose origin differs from its ancestors; cross-origin fails closed.
+    CrossOriginDenied,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

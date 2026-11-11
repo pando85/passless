@@ -291,6 +291,47 @@ pub struct BrowserConfig {
     pub bind_parent_death: bool,
 }
 
+/// Removes a lease's runtime directory (which holds `worker.js` with the bearer token) when a launch
+/// fails. Disarmed once the lease is registered; from then on `cleanup` owns the directory.
+struct LaunchDirGuard {
+    runtime_dir: PathBuf,
+    armed: bool,
+}
+
+impl LaunchDirGuard {
+    fn new(runtime_dir: PathBuf) -> Self {
+        Self {
+            runtime_dir,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LaunchDirGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Never follow a symlink; `remove_dir_all` does not follow symlinks inside the tree either.
+        match fs::symlink_metadata(&self.runtime_dir) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                if let Err(e) = fs::remove_dir_all(&self.runtime_dir) {
+                    log::warn!(
+                        "failed to remove runtime dir {} after a failed launch: {}",
+                        self.runtime_dir.display(),
+                        e
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub trait ChildSpawner: Send + Sync {
     fn spawn_browser(
         &self,
@@ -739,6 +780,9 @@ impl BrowserProcessManager {
             .join(format!("lease-{}", lease_id.as_str()));
         let profile_dir = runtime_dir.join("profile");
 
+        // Every error path below removes the runtime dir (it holds the extension worker's bearer token).
+        let mut dir_guard = LaunchDirGuard::new(runtime_dir.clone());
+
         create_lease_dir(
             &runtime_dir,
             RUNTIME_DIR_MODE,
@@ -765,6 +809,9 @@ impl BrowserProcessManager {
                 config.target_uid,
                 config.target_gid,
             )?;
+            // Verified before anything is spawned: a missing or unreadable extension is a launch
+            // error, never a browser without interception.
+            verify_extension_dir(&ext_dir)?;
             if let Ok(current_exe) = std::env::current_exe() {
                 let sign_proxy = current_exe
                     .parent()
@@ -900,6 +947,7 @@ impl BrowserProcessManager {
         }
 
         self.leases.insert(lease_id.clone(), lease);
+        dir_guard.disarm();
 
         Ok(lease_id)
     }
@@ -1910,7 +1958,25 @@ fn generate_agent_extension(
         target_gid,
     )?;
 
+    if simulate_missing_extension() {
+        let _ = fs::remove_dir_all(&ext_dir);
+    }
+
     Ok(ext_dir)
+}
+
+/// Debug and test builds only: lets E2E-47 and the unit tests simulate an extension directory that is
+/// missing after generation. Release builds have no such hook.
+fn simulate_missing_extension() -> bool {
+    #[cfg(test)]
+    if tests::OMIT_EXTENSION.with(|c| c.get()) {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PASSLESS_E2E_OMIT_AGENT_EXTENSION").is_some() {
+        return true;
+    }
+    false
 }
 
 pub const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
@@ -2004,9 +2070,151 @@ fn remove_native_messaging_manifest_from_all() {
     }
 }
 
+/// Scripts the generated extension always consists of; each must exist and be non-empty.
+const EXTENSION_SCRIPTS: [&str; 3] = ["worker.js", "main.js", "broker.js"];
+
+/// Checks that the agent extension can be loaded and still intercepts WebAuthn: the directory exists,
+/// the three scripts exist and are non-empty, and `manifest.json` is readable valid JSON that
+/// declares what the generator emits (`nativeMessaging`, the service worker, `main.js` as a MAIN-world
+/// `document_start` script in all frames, and `broker.js`). A failure is a launch error with an
+/// actionable message; the caller must not start any browser (plan D6 layer 2).
+pub(crate) fn verify_extension_dir(ext_dir: &Path) -> Result<(), LaunchError> {
+    let fail = |why: String| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "{why}; refusing to launch the managed browser without the passless agent extension \
+             (it is required so that WebAuthn requests never reach the human authenticator). \
+             Check that the browser runtime root is writable and has free space, then retry; \
+             if it persists, reinstall passless"
+        ))
+    };
+    let meta = fs::metadata(ext_dir).map_err(|e| {
+        fail(format!(
+            "extension directory {} is unavailable: {e}",
+            ext_dir.display()
+        ))
+    })?;
+    if !meta.is_dir() {
+        return Err(fail(format!(
+            "extension path {} is not a directory",
+            ext_dir.display()
+        )));
+    }
+    let manifest_path = ext_dir.join("manifest.json");
+    let manifest = fs::read_to_string(&manifest_path).map_err(|e| {
+        fail(format!(
+            "extension manifest {} is not readable: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: serde_json::Value = match serde_json::from_str(&manifest) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => {
+            return Err(fail(format!(
+                "extension manifest {} is not a valid JSON object",
+                manifest_path.display()
+            )));
+        }
+    };
+
+    let mut scripts: Vec<&str> = EXTENSION_SCRIPTS.to_vec();
+    if let Some(worker) = manifest
+        .pointer("/background/service_worker")
+        .and_then(|v| v.as_str())
+    {
+        scripts.push(worker);
+    }
+    for script in scripts {
+        let path = ext_dir.join(script);
+        match fs::metadata(&path) {
+            Ok(m) if m.is_file() && m.len() > 0 => {}
+            Ok(_) => {
+                return Err(fail(format!(
+                    "extension script {} is empty or not a regular file",
+                    path.display()
+                )));
+            }
+            Err(e) => {
+                return Err(fail(format!(
+                    "extension script {} is missing or unreadable: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    let has_permission = |name: &str| {
+        manifest
+            .get("permissions")
+            .and_then(|v| v.as_array())
+            .is_some_and(|p| p.iter().any(|v| v.as_str() == Some(name)))
+    };
+    if !has_permission("nativeMessaging") {
+        return Err(fail(
+            "extension manifest lacks the nativeMessaging permission".to_string(),
+        ));
+    }
+    if manifest
+        .pointer("/background/service_worker")
+        .and_then(|v| v.as_str())
+        != Some("worker.js")
+    {
+        return Err(fail(
+            "extension manifest does not declare worker.js as its service worker".to_string(),
+        ));
+    }
+
+    let content_scripts = manifest
+        .get("content_scripts")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let entry_for = |script: &str| {
+        content_scripts.iter().find(|entry| {
+            entry
+                .get("js")
+                .and_then(|v| v.as_array())
+                .is_some_and(|js| js.iter().any(|v| v.as_str() == Some(script)))
+        })
+    };
+    let main = entry_for("main.js")
+        .ok_or_else(|| fail("extension manifest does not inject main.js".to_string()))?;
+    let main_ok = main.get("world").and_then(|v| v.as_str()) == Some("MAIN")
+        && main.get("all_frames").and_then(|v| v.as_bool()) == Some(true)
+        && main.get("run_at").and_then(|v| v.as_str()) == Some("document_start");
+    if !main_ok {
+        return Err(fail(
+            "extension manifest must inject main.js in the MAIN world, in all frames, at document_start"
+                .to_string(),
+        ));
+    }
+    if entry_for("broker.js").is_none() {
+        return Err(fail(
+            "extension manifest does not inject broker.js".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_browser_command(
     config: &BrowserConfig,
     profile_dir: &Path,
+) -> Result<Command, LaunchError> {
+    build_browser_command_inner(config, profile_dir, true)
+}
+
+/// Test-only: builds the command without requiring the extension, for fake spawners and flag tests.
+#[cfg(test)]
+fn build_browser_command_unverified(
+    config: &BrowserConfig,
+    profile_dir: &Path,
+) -> Result<Command, LaunchError> {
+    build_browser_command_inner(config, profile_dir, false)
+}
+
+fn build_browser_command_inner(
+    config: &BrowserConfig,
+    profile_dir: &Path,
+    require_extension: bool,
 ) -> Result<Command, LaunchError> {
     for arg in &config.extra_args {
         if arg.starts_with("--remote-debugging-pipe")
@@ -2033,15 +2241,17 @@ pub(crate) fn build_browser_command(
     cmd.arg("--no-first-run");
     cmd.arg("--no-default-browser-check");
     cmd.arg("--disable-sync");
+    // The managed browser is never launched without the interception extension, and never with
+    // `--disable-extensions`: without it WebAuthn requests would reach the human authenticator
+    // (ADR 0014 §7, invariant 25).
     let ext_dir = profile_dir
         .parent()
         .unwrap_or(profile_dir)
         .join(AGENT_EXTENSION_DIR);
-    if ext_dir.is_dir() {
-        cmd.arg(format!("--load-extension={}", ext_dir.display()));
-    } else {
-        cmd.arg("--disable-extensions");
+    if require_extension {
+        verify_extension_dir(&ext_dir)?;
     }
+    cmd.arg(format!("--load-extension={}", ext_dir.display()));
     cmd.arg("--disable-save-password-bubble");
     cmd.arg("--disable-client-side-phishing-detection");
     cmd.arg("--password-store=basic");
@@ -2150,7 +2360,7 @@ fn spawn_browser_unhardened(
     profile_dir: &Path,
     cdp: &CdpPipes,
 ) -> Result<Child, LaunchError> {
-    let mut cmd = build_browser_command(config, profile_dir)?;
+    let mut cmd = build_browser_command_unverified(config, profile_dir)?;
 
     let fd_read = cdp.browser_from_daemon_read;
     let fd_write = cdp.browser_to_daemon_write;
@@ -2923,6 +3133,11 @@ mod tests {
     use std::os::unix::fs as unix_fs;
 
     use super::super::launcher::ProbeResult;
+
+    thread_local! {
+        /// Makes `generate_agent_extension` drop the extension directory (see `simulate_missing_extension`).
+        pub(super) static OMIT_EXTENSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -5961,7 +6176,7 @@ mod tests {
             bind_parent_death: true,
         };
 
-        let cmd = build_browser_command(&config, dir.path()).unwrap();
+        let cmd = build_browser_command_unverified(&config, dir.path()).unwrap();
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -6001,7 +6216,7 @@ mod tests {
             bind_parent_death: true,
         };
 
-        let cmd = build_browser_command(&config, dir.path()).unwrap();
+        let cmd = build_browser_command_unverified(&config, dir.path()).unwrap();
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -6219,7 +6434,7 @@ mod tests {
             cdp_port: 9222,
             bind_parent_death: true,
         };
-        assert!(build_browser_command(&config, dir.path()).is_ok());
+        assert!(build_browser_command_unverified(&config, dir.path()).is_ok());
     }
 
     #[test]
@@ -6737,7 +6952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_command_disables_extensions_without_metadata() {
+    fn test_browser_command_fails_closed_without_extension() {
         let dir = tempfile::tempdir().unwrap();
         let clock = test_clock();
         let mut mgr = BrowserProcessManager::new(clock);
@@ -6749,16 +6964,8 @@ mod tests {
 
         let lease = &mgr.leases[&lease_id];
         let profile_dir = &lease.manifest.profile_dir;
-        let cmd = build_browser_command(&config, profile_dir).unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert!(
-            args.iter().any(|a| a == "--disable-extensions"),
-            "should disable extensions when no metadata provided"
-        );
-        assert!(!args.iter().any(|a| a.starts_with("--load-extension=")));
+        let err = build_browser_command(&config, profile_dir).unwrap_err();
+        assert!(matches!(err, LaunchError::ExtensionSetupFailed(_)));
     }
 
     #[test]
@@ -6914,8 +7121,7 @@ mod tests {
         let profile_dir = runtime_dir.join("profile");
         let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
         fs::create_dir_all(&profile_dir).unwrap();
-        fs::create_dir_all(&ext_dir).unwrap();
-        fs::write(ext_dir.join("manifest.json"), "{}").unwrap();
+        write_valid_extension(&ext_dir);
 
         let config = BrowserConfig {
             executable: PathBuf::from("/usr/bin/chromium"),
@@ -6943,36 +7149,310 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--disable-extensions"));
     }
 
+    fn extension_test_config(dir: &Path) -> BrowserConfig {
+        let mut config = test_config(dir);
+        config.executable = PathBuf::from("/usr/bin/chromium");
+        config
+    }
+
     #[test]
-    fn test_build_browser_command_disables_extensions_when_no_dir() {
+    fn test_build_browser_command_fails_closed_when_no_dir() {
         let dir = tempfile::tempdir().unwrap();
         let profile_dir = dir.path().join("no-ext").join("profile");
         fs::create_dir_all(&profile_dir).unwrap();
+        let config = extension_test_config(dir.path());
 
-        let config = BrowserConfig {
-            executable: PathBuf::from("/usr/bin/chromium"),
-            start_url: None,
-            extra_args: Vec::new(),
-            runtime_root: dir.path().to_path_buf(),
-            ttl: Duration::from_secs(300),
-            login_timeout: DEFAULT_LOGIN_TIMEOUT,
-            rp_ids: vec!["example.com".to_string()],
-            target_uid: 1000,
-            target_gid: 1000,
-            daemon_uid: 0,
-            daemon_gid: 0,
-            cdp_expose: CdpExposeMode::Pipe,
-            cdp_port: 9222,
-            bind_parent_death: true,
+        let err = build_browser_command(&config, &profile_dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, LaunchError::ExtensionSetupFailed(_)), "{msg}");
+        assert!(msg.contains("agent extension"), "{msg}");
+        assert!(msg.contains("refusing to launch"), "{msg}");
+    }
+
+    /// Writes an extension directory that has what the generator emits: the real manifest template
+    /// and non-empty scripts.
+    fn write_valid_extension(ext_dir: &Path) {
+        fs::create_dir_all(ext_dir).unwrap();
+        fs::write(
+            ext_dir.join("manifest.json"),
+            include_str!("../../assets/agent-extension/manifest.json"),
+        )
+        .unwrap();
+        for script in EXTENSION_SCRIPTS {
+            fs::write(ext_dir.join(script), "// script\n").unwrap();
+        }
+    }
+
+    fn manifest_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/agent-extension/manifest.json"))
+                .unwrap();
+        edit(&mut manifest);
+        manifest.to_string()
+    }
+
+    #[test]
+    fn test_verify_extension_dir_accepts_the_generated_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_extension(&dir.path().join("ext"));
+        verify_extension_dir(&dir.path().join("ext")).unwrap();
+
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "tok".to_string(),
+        };
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let generated = generate_agent_extension(dir.path(), &metadata, uid, gid).unwrap();
+        verify_extension_dir(&generated).unwrap();
+    }
+
+    #[test]
+    fn test_verify_extension_dir_rejects_unusable_directories() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Missing directory.
+        assert!(verify_extension_dir(&dir.path().join("missing")).is_err());
+
+        // A file instead of a directory.
+        let file = dir.path().join("file");
+        fs::write(&file, "{}").unwrap();
+        assert!(verify_extension_dir(&file).is_err());
+
+        // Directory without a manifest.
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert!(verify_extension_dir(&empty).is_err());
+
+        // Unreadable manifest (a directory where the file should be).
+        let unreadable = dir.path().join("unreadable");
+        fs::create_dir_all(unreadable.join("manifest.json")).unwrap();
+        assert!(verify_extension_dir(&unreadable).is_err());
+
+        // Manifest that is not a JSON object.
+        let garbage = dir.path().join("garbage");
+        fs::create_dir(&garbage).unwrap();
+        fs::write(garbage.join("manifest.json"), "not json").unwrap();
+        assert!(verify_extension_dir(&garbage).is_err());
+    }
+
+    #[test]
+    fn test_verify_extension_dir_requires_non_empty_scripts() {
+        for script in EXTENSION_SCRIPTS {
+            let dir = tempfile::tempdir().unwrap();
+            let ext = dir.path().join("ext");
+            write_valid_extension(&ext);
+
+            fs::remove_file(ext.join(script)).unwrap();
+            let err = verify_extension_dir(&ext).unwrap_err().to_string();
+            assert!(err.contains(script), "missing {script}: {err}");
+
+            fs::write(ext.join(script), "").unwrap();
+            let err = verify_extension_dir(&ext).unwrap_err().to_string();
+            assert!(err.contains(script), "empty {script}: {err}");
+
+            fs::write(ext.join(script), "// ok").unwrap();
+            verify_extension_dir(&ext).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_verify_extension_dir_requires_interception_in_the_manifest() {
+        type ManifestEdit = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, ManifestEdit)> = vec![
+            (
+                "nativeMessaging permission",
+                Box::new(|m| m["permissions"] = serde_json::json!([])),
+            ),
+            (
+                "service worker",
+                Box::new(|m| m["background"]["service_worker"] = serde_json::json!("other.js")),
+            ),
+            (
+                "no content scripts",
+                Box::new(|m| m["content_scripts"] = serde_json::json!([])),
+            ),
+            (
+                "main.js world",
+                Box::new(|m| {
+                    for entry in m["content_scripts"].as_array_mut().unwrap() {
+                        if entry["js"][0] == "main.js" {
+                            entry["world"] = serde_json::json!("ISOLATED");
+                        }
+                    }
+                }),
+            ),
+            (
+                "main.js all_frames",
+                Box::new(|m| {
+                    for entry in m["content_scripts"].as_array_mut().unwrap() {
+                        if entry["js"][0] == "main.js" {
+                            entry["all_frames"] = serde_json::json!(false);
+                        }
+                    }
+                }),
+            ),
+            (
+                "main.js run_at",
+                Box::new(|m| {
+                    for entry in m["content_scripts"].as_array_mut().unwrap() {
+                        if entry["js"][0] == "main.js" {
+                            entry["run_at"] = serde_json::json!("document_idle");
+                        }
+                    }
+                }),
+            ),
+            (
+                "main.js missing",
+                Box::new(|m| {
+                    m["content_scripts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|e| e["js"][0] != "main.js");
+                }),
+            ),
+            (
+                "broker.js missing",
+                Box::new(|m| {
+                    m["content_scripts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|e| e["js"][0] != "broker.js");
+                }),
+            ),
+        ];
+        for (name, edit) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let ext = dir.path().join("ext");
+            write_valid_extension(&ext);
+            fs::write(ext.join("manifest.json"), manifest_with(edit)).unwrap();
+            let err = verify_extension_dir(&ext);
+            assert!(
+                matches!(err, Err(LaunchError::ExtensionSetupFailed(_))),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_template_manifest_covers_blank_frames_and_localhost() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/agent-extension/manifest.json"))
+                .unwrap();
+        for entry in manifest["content_scripts"].as_array().unwrap() {
+            assert_eq!(entry["match_about_blank"], true, "{entry}");
+            assert_eq!(entry["match_origin_as_fallback"], true, "{entry}");
+            let matches = entry["matches"].to_string();
+            assert!(matches.contains("http://localhost/*"), "{matches}");
+            assert!(matches.contains("http://127.0.0.1/*"), "{matches}");
+        }
+        let min: u32 = manifest["minimum_chrome_version"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(min >= 119, "match_origin_as_fallback needs Chromium 119");
+    }
+
+    struct CountingSpawner(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ChildSpawner for CountingSpawner {
+        fn spawn_browser(
+            &self,
+            _config: &BrowserConfig,
+            _profile_dir: &Path,
+            _cdp: &CdpPipes,
+        ) -> Result<Child, LaunchError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Command::new("/bin/true")
+                .spawn()
+                .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+        }
+    }
+
+    #[test]
+    fn test_launch_with_missing_extension_is_an_error_and_spawns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mgr = BrowserProcessManager::with_spawner(
+            test_clock(),
+            Arc::new(CountingSpawner(spawned.clone())),
+        );
+        let config = test_config(dir.path());
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "tok".to_string(),
         };
 
-        let cmd = build_browser_command(&config, &profile_dir).unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
+        OMIT_EXTENSION.with(|c| c.set(true));
+        let result = mgr.launch_pending_with_agent_endpoint(
+            &config,
+            test_endpoint_id(),
+            test_profile_id(),
+            Some(&metadata),
+        );
+        OMIT_EXTENSION.with(|c| c.set(false));
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, LaunchError::ExtensionSetupFailed(_)), "{err}");
+        assert!(err.to_string().contains("agent extension"), "{err}");
+        assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(mgr.leases.is_empty(), "no lease for a launch that failed");
+        assert_no_lease_dirs(&config.runtime_root);
+    }
+
+    fn assert_no_lease_dirs(runtime_root: &Path) {
+        let left: Vec<_> = fs::read_dir(runtime_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(args.iter().any(|a| a == "--disable-extensions"));
-        assert!(!args.iter().any(|a| a.starts_with("--load-extension=")));
+        assert!(
+            left.is_empty(),
+            "a failed launch must remove the lease runtime dir (it holds the worker token): {left:?}"
+        );
+    }
+
+    #[test]
+    fn test_failed_launch_after_extension_generation_removes_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let mut config = test_config(dir.path());
+        // Fails after the extension (and its bearer token) was written.
+        config.start_url = Some("https://not-in-scope.invalid/".to_string());
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "secret-token".to_string(),
+        };
+
+        let err = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap_err();
+        assert!(matches!(err, LaunchError::InvalidStartUrl(_)), "{err}");
+        assert_no_lease_dirs(&config.runtime_root);
+    }
+
+    #[test]
+    fn test_successful_launch_keeps_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let config = test_config(dir.path());
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "tok".to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+        assert!(mgr.leases[&lease_id].manifest.runtime_dir.is_dir());
     }
 
     #[test]

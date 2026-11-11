@@ -527,6 +527,11 @@ in the progress log. The harness itself is reviewed for hermeticity: it must not
 
 E2E-09 and E2E-10.
 
+Recorded decision (P2): a subframe that was not delegated WebAuthn (no `allow="publickey-credentials-*"`) is
+rejected by the extension with `NotAllowedError` before any daemon call, so it leaves no audit record. This is
+acceptable because Chromium itself refuses WebAuthn in undelegated frames. Delegated cross-origin frames reach the
+daemon, which denies and audits them (`cross_origin_denied`, E2E-10).
+
 **P3.**
 
 - Delete `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, the UHID
@@ -791,7 +796,7 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 | P0a | ✅ | — | proxy gate passed; incognito via Preferences seeding; no HID-disable switch → bwrap mandatory; TLS via spki list OK; CfT 157 loads extensions |
 | P0b | ✅ | — | ADR 0014 amended (R1–R4, R7, R9, R10, R12–R19, V-M3, V-H2, P0a outcomes; invariant 25; §19 rows); plan R, D1, D4, D6, P0a, E2E updated |
 | P1 | ✅ | — | Baseline: 24 PASS, 8 XFAIL (E2E-02, 06 until P6) on Chromium and PW Chromium headed/headless; CfT 12 PASS/4 XFAIL; defects B1–B7 recorded |
-| P2 | ⏳ | — | |
+| P2 | ✅ | — | Native fallback removed; cross-origin and `confirm` deny with audit; launch refuses invalid extension; interim MAIN-world hardening (prototype, single read, about:blank/srcdoc/blob frames). E2E-09, 10, 47 pass; E2E-02, 06 XFAIL until P6 |
 | P3 | ⏳ | — | |
 | P4 | ⏳ | — | |
 | P5 | ⏳ | — | |

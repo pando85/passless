@@ -12,8 +12,9 @@
   var credentials = navigator.credentials;
   if (!credentials || typeof credentials.get !== "function") return;
 
-  var originalGet = credentials.get.bind(credentials);
-  var originalCreate = credentials.create ? credentials.create.bind(credentials) : null;
+  // The native functions are captured once, in this closure. Only non-WebAuthn calls ever reach them.
+  var originalGet = credentials.get;
+  var originalCreate = typeof credentials.create === "function" ? credentials.create : null;
   var pending = new Map();
 
   function b64urlEncode(bytes) {
@@ -57,17 +58,17 @@
     return b64urlEncode(bytes);
   }
 
-  function timeoutFor(publicKey) {
-    if (!Number.isFinite(publicKey.timeout) || publicKey.timeout <= 0) return DEFAULT_TIMEOUT_MS;
-    return Math.min(Math.floor(publicKey.timeout), MAX_TIMEOUT_MS);
+  function timeoutFor(timeout) {
+    if (!Number.isFinite(timeout) || timeout <= 0) return DEFAULT_TIMEOUT_MS;
+    return Math.min(Math.floor(timeout), MAX_TIMEOUT_MS);
   }
 
   function policyAllowsWebAuthn(feature) {
     if (window.top === window.self) return true;
     var policy = document.permissionsPolicy || document.featurePolicy;
     // Cross-origin autonomous authentication is security-sensitive. If the
-    // browser cannot prove that WebAuthn was delegated to this frame, leave
-    // the request to the native browser instead of assuming permission.
+    // browser cannot prove that WebAuthn was delegated to this frame, the
+    // request is refused (never handed to the native browser, ADR 0014 §7).
     if (!policy || typeof policy.allowsFeature !== "function") return false;
     return policy.allowsFeature(feature);
   }
@@ -278,12 +279,11 @@
     var operation = finishOperation(message.id);
     if (!operation) return;
 
+    // Fail closed: whatever went wrong (daemon error, denial, transport failure, timeout), the page gets
+    // NotAllowedError. The original navigator.credentials.get/create is never called for a WebAuthn
+    // request (ADR 0014 §7, invariant 25).
     if (!message.ok) {
-      if (message.fallback && operation.native) {
-        Promise.resolve(operation.native(operation.options)).then(operation.resolve, operation.reject);
-      } else {
-        operation.reject(notAllowed());
-      }
+      operation.reject(notAllowed());
       return;
     }
 
@@ -296,68 +296,118 @@
     }
   });
 
-  function runOperation(type, options, request, nativeOperation) {
+  function runOperation(type, publicKey, signal, request) {
     return new Promise(function(resolve, reject) {
-      if (options.signal && options.signal.aborted) {
+      if (signal && signal.aborted) {
         reject(abortError());
         return;
       }
 
       var id = requestId();
-      var timeout = timeoutFor(options.publicKey);
+      var timeout = timeoutFor(publicKey.timeout);
       var operation = {
         resolve: resolve,
         reject: reject,
-        native: nativeOperation,
-        options: options,
-        signal: options.signal || null,
+        signal: signal || null,
         abortListener: null,
         timer: null
       };
       operation.timer = setTimeout(function() {
         if (finishOperation(id)) reject(notAllowed());
       }, timeout);
-      if (operation.signal) {
-        operation.abortListener = function() {
-          if (finishOperation(id)) reject(abortError());
-        };
-        operation.signal.addEventListener("abort", operation.abortListener, { once: true });
-      }
       pending.set(id, operation);
-      window.postMessage({
-        source: "passless-agent-main",
-        channel: channel,
-        id: id,
-        request: request,
-        type: type
-      }, location.origin);
+      try {
+        if (operation.signal) {
+          operation.abortListener = function() {
+            if (finishOperation(id)) reject(abortError());
+          };
+          operation.signal.addEventListener("abort", operation.abortListener, { once: true });
+        }
+        window.postMessage({
+          source: "passless-agent-main",
+          channel: channel,
+          id: id,
+          request: request,
+          type: type
+        }, location.origin);
+      } catch (error) {
+        // For example an opaque origin ("null"), where postMessage throws. Clear the pending entry and timer
+        // now and fail closed.
+        finishOperation(id);
+        reject(notAllowed());
+      }
     });
   }
 
-  credentials.get = function(options) {
-    // Conditional mediation is passive passkey autofill. Do not turn merely
-    // visiting a page into an autonomous same-user login; keep it native.
-    if (options && options.mediation === "conditional") return originalGet(options);
-    if (!options || !options.publicKey || !policyAllowsWebAuthn("publickey-credentials-get")) return originalGet(options);
+  // A copy of `options` that has no `publicKey` key, for the non-WebAuthn passthrough. The page's own object is
+  // never handed to the native function, so a getter or Proxy cannot show a different `publicKey` to it.
+  function withoutPublicKey(options) {
+    var copy = {};
+    var names = ["mediation", "signal", "password", "federated", "otp", "identity", "unmediated"];
+    var keys = Object.keys(options);
+    for (var i = 0; i < keys.length; i++) {
+      if (names.indexOf(keys[i]) === -1) names.push(keys[i]);
+    }
+    for (var j = 0; j < names.length; j++) {
+      var name = names[j];
+      if (name === "publicKey") continue;
+      if (name in options) copy[name] = options[name];
+    }
+    return copy;
+  }
+
+  function intercept(type, self, options) {
+    var native = type === "get" ? originalGet : originalCreate;
+    var feature = type === "get" ? "publickey-credentials-get" : "publickey-credentials-create";
+    // Not an options dictionary: the native function rejects it itself, without any authenticator.
+    if (options === null || (typeof options !== "object" && typeof options !== "function")) {
+      return native.call(self, options);
+    }
+    // Read `publicKey` exactly once. The path is chosen with `in`, not truthiness, and everything below uses `pk`.
+    var hasPublicKey = "publicKey" in options;
+    var pk = hasPublicKey ? options.publicKey : undefined;
+    if (!hasPublicKey || pk === undefined) {
+      // Only non-WebAuthn calls (passwords, federated credentials) go to the original; they never reach an
+      // authenticator.
+      return native.call(self, withoutPublicKey(options));
+    }
+    // Conditional mediation is passive passkey autofill. It is not supported for agents and must not reach
+    // the native path either, so it is rejected (ADR 0014 §11).
+    var mediation = options.mediation;
+    var signal = options.signal;
+    if (mediation === "conditional") return Promise.reject(notAllowed());
+    // A subframe that was not delegated WebAuthn is refused here, without a daemon call or an audit record.
+    // Chromium itself refuses undelegated frames, so nothing is lost.
+    if (!policyAllowsWebAuthn(feature)) return Promise.reject(notAllowed());
     var request;
     try {
-      request = serialize(options.publicKey);
+      request = type === "get" ? serialize(pk) : serializeCreate(pk);
     } catch (error) {
       return Promise.reject(error instanceof DOMException ? error : notAllowed());
     }
-    return runOperation("get", options, request, originalGet);
-  };
+    return runOperation(type, pk, signal, request);
+  }
 
-  if (originalCreate) {
-    credentials.create = function(options) {
-      if (!options || !options.publicKey || !policyAllowsWebAuthn("publickey-credentials-create")) return originalCreate(options);
-      var request;
-      try {
-        request = serializeCreate(options.publicKey);
-      } catch (error) {
-        return Promise.reject(error instanceof DOMException ? error : notAllowed());
-      }
-      return runOperation("create", options, request, originalCreate);
-    };
+  // Override on the instance and on the prototype, non-writable and non-configurable, so that neither
+  // `CredentialsContainer.prototype.get.call(...)`, `delete navigator.credentials.get` nor a reassignment
+  // reaches the native function.
+  function lock(target, name, fn) {
+    try {
+      Object.defineProperty(target, name, { value: fn, writable: false, configurable: false, enumerable: true });
+    } catch (error) {
+      // Already locked (the script ran before): keep the existing override.
+    }
+  }
+
+  var proto = Object.getPrototypeOf(credentials);
+  var targets = [credentials];
+  if (proto && proto !== Object.prototype) targets.push(proto);
+
+  function overrideGet(options) { return intercept("get", this, options); }
+  function overrideCreate(options) { return intercept("create", this, options); }
+
+  for (var t = 0; t < targets.length; t++) {
+    lock(targets[t], "get", overrideGet);
+    if (originalCreate) lock(targets[t], "create", overrideCreate);
   }
 })("__PASSLESS_CHANNEL__");

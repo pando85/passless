@@ -33,17 +33,29 @@
     return parsed.origin;
   }
 
-  function validateOrigins(sender) {
+  function validateOrigins(sender, ancestorOrigins) {
     var origin = parseHttpsOrigin(sender.url);
     if (!origin) return null;
 
     var topOrigin = origin;
+    var topKnown = false;
     if (sender.tab && typeof sender.tab.url === "string") {
       topOrigin = parseHttpsOrigin(sender.tab.url);
       if (!topOrigin) return null;
+      topKnown = true;
     }
 
-    var crossOrigin = sender.frameId !== 0 && origin !== topOrigin;
+    // Fail closed (ADR 0014 §11): a frame is cross-origin unless it is the top-level frame, or the top origin
+    // and every ancestor origin are known and equal to its own. The daemon denies every cross-origin request.
+    var crossOrigin = false;
+    if (sender.frameId !== 0) {
+      crossOrigin = !topKnown || origin !== topOrigin || !Array.isArray(ancestorOrigins);
+      if (!crossOrigin) {
+        for (var i = 0; i < ancestorOrigins.length; i++) {
+          if (ancestorOrigins[i] !== origin) crossOrigin = true;
+        }
+      }
+    }
     return {
       origin: origin,
       top_origin: topOrigin,
@@ -136,8 +148,7 @@
         completeRequest(requestId, {
           ok: false,
           type: type,
-          error: response.error,
-          fallback: response.error === "human_interaction_required"
+          error: response.error
         });
         return;
       }
@@ -194,7 +205,7 @@
       return false;
     }
 
-    var origins = validateOrigins(sender);
+    var origins = validateOrigins(sender, message.ancestor_origins);
     if (!origins) {
       sendResponse({ ok: false, error: "invalid_origin" });
       return false;

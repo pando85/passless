@@ -68,6 +68,7 @@ function makeCredentialId(len) {
 function runMainTest(channel, setupFn) {
   const sandbox = {
     _originalCalled: false,
+    _originalCreateCalled: false,
     _originalOptions: null,
     _postMessageCalls: [],
     _setTimeoutCalls: [],
@@ -82,13 +83,21 @@ function runMainTest(channel, setupFn) {
     },
   };
 
-  const credentials = {
+  // Like the browser: the methods live on CredentialsContainer.prototype, not on the instance.
+  const credentialsProto = {
     get: function(options) {
       sandbox._originalCalled = true;
       sandbox._originalOptions = options;
       return Promise.resolve({ id: "original-credential" });
     },
+    create: function(options) {
+      sandbox._originalCreateCalled = true;
+      sandbox._originalOptions = options;
+      return Promise.resolve({ id: "original-created-credential" });
+    },
   };
+  const credentials = Object.create(credentialsProto);
+  sandbox._credentialsProto = credentialsProto;
 
   const navigatorObj = { credentials: credentials };
 
@@ -1875,6 +1884,358 @@ test("uv: broker rejects numeric user_verification", async function() {
     );
   });
   assert.strictEqual(sandbox._chromeSendMessage, undefined);
+});
+
+// ---- P2: no native fallback, fail closed (ADR 0014 §7, invariant 25) ----
+
+function publicKeyGetOptions() {
+  return {
+    publicKey: {
+      challenge: makeChallenge(32),
+      rpId: "example.com",
+      userVerification: "preferred",
+    },
+  };
+}
+
+function publicKeyCreateOptions() {
+  return {
+    publicKey: {
+      challenge: makeChallenge(32),
+      rp: { id: "example.com", name: "Example" },
+      user: { id: new Uint8Array([1, 2, 3, 4]), name: "alice", displayName: "Alice" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      userVerification: "preferred",
+    },
+  };
+}
+
+const DAEMON_FAILURES = [
+  { ok: false, error: "transport_error" },
+  { ok: false, error: "broker_unavailable" },
+  { ok: false, error: "invalid_daemon_response" },
+  { ok: false, error: "forbidden" },
+  { ok: false, error: "human_interaction_required", fallback: true },
+  { ok: false, response: null, fallback: true },
+];
+
+for (const kind of ["get", "create"]) {
+  DAEMON_FAILURES.forEach(function(failure, index) {
+    test("main: " + kind + " never calls the original after daemon failure #" + index, async function() {
+      const ch = "nofallback-" + kind + "-" + index;
+      let rejectedError = null;
+      let resolved = false;
+
+      const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
+        const p = kind === "get" ? creds.get(publicKeyGetOptions()) : creds.create(publicKeyCreateOptions());
+        p.then(function() { resolved = true; }, function(e) { rejectedError = e; });
+
+        simulateMessage(
+          listeners["message"],
+          Object.assign({
+            source: "passless-agent-broker",
+            channel: ch,
+            id: sandbox._postMessageCalls[0].data.id,
+            type: kind,
+          }, failure),
+          sandbox.window,
+          "https://example.com"
+        );
+      });
+
+      await flushPromises();
+      assert.strictEqual(resolved, false);
+      assert.ok(rejectedError, "must reject");
+      assert.strictEqual(rejectedError.name, "NotAllowedError");
+      assert.strictEqual(sandbox._originalCalled, false, "original get must not be called");
+      assert.strictEqual(sandbox._originalCreateCalled, false, "original create must not be called");
+    });
+  });
+
+  test("main: " + kind + " never calls the original after a timeout", async function() {
+    const ch = "nofallback-timeout-" + kind;
+    let rejectedError = null;
+    let timerFn = null;
+    const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
+      const p = kind === "get" ? creds.get(publicKeyGetOptions()) : creds.create(publicKeyCreateOptions());
+      p.catch(function(e) { rejectedError = e; });
+      timerFn = sandbox._setTimeoutCalls[0].fn;
+    });
+    timerFn();
+    await flushPromises();
+    assert.ok(rejectedError);
+    assert.strictEqual(rejectedError.name, "NotAllowedError");
+    assert.strictEqual(sandbox._originalCalled, false);
+    assert.strictEqual(sandbox._originalCreateCalled, false);
+  });
+
+  test("main: " + kind + " in a frame without proven delegation is rejected, not native", async function() {
+    const ch = "nofallback-frame-" + kind;
+    let rejectedError = null;
+    const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
+      sandbox.window.top = {};
+      sandbox.window.self = sandbox.window;
+      sandbox.document = {};
+      const p = kind === "get" ? creds.get(publicKeyGetOptions()) : creds.create(publicKeyCreateOptions());
+      p.catch(function(e) { rejectedError = e; });
+    });
+    await flushPromises();
+    assert.ok(rejectedError);
+    assert.strictEqual(rejectedError.name, "NotAllowedError");
+    assert.strictEqual(sandbox._originalCalled, false);
+    assert.strictEqual(sandbox._originalCreateCalled, false);
+    assert.strictEqual(sandbox._postMessageCalls.length, 0);
+  });
+}
+
+test("main: conditional mediation is rejected, not native", async function() {
+  const ch = "nofallback-conditional";
+  let rejectedError = null;
+  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
+    const options = publicKeyGetOptions();
+    options.mediation = "conditional";
+    creds.get(options).catch(function(e) { rejectedError = e; });
+  });
+  await flushPromises();
+  assert.ok(rejectedError);
+  assert.strictEqual(rejectedError.name, "NotAllowedError");
+  assert.strictEqual(sandbox._originalCalled, false);
+  assert.strictEqual(sandbox._postMessageCalls.length, 0);
+});
+
+test("main: non-WebAuthn create passes through (not an authenticator path)", async function() {
+  const sandbox = runMainTest("passthrough-create", function(sandbox, listeners, creds) {
+    creds.create({ password: { id: "x" } });
+  });
+  assert.strictEqual(sandbox._originalCreateCalled, true);
+});
+
+test("broker: never forwards a fallback flag and forwards ancestor origins", async function() {
+  const ch = "p2-broker-1";
+  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
+    sandbox.location.ancestorOrigins = ["https://top.example"];
+    sandbox._chromeSendResponse = { ok: false, error: "human_interaction_required", fallback: true };
+    simulateMessage(
+      listeners["message"],
+      {
+        source: "passless-agent-main",
+        channel: ch,
+        id: "req-1",
+        request: { rp_id: "example.com", challenge_b64u: "aaa", allow_credentials: [], user_verification: false },
+      },
+      sandbox.window,
+      "https://example.com"
+    );
+  });
+  assert.deepStrictEqual(Array.from(sandbox._chromeSendMessage.ancestor_origins), ["https://top.example"]);
+  const reply = sandbox._postMessageCalls[0].data;
+  assert.strictEqual(reply.ok, false);
+  assert.ok(!("fallback" in reply), "fallback must not be relayed");
+});
+
+test("worker: daemon human_interaction_required is a plain failure without fallback", async function() {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
+    sandbox._nativeMessageResponse = { error: "human_interaction_required" };
+  });
+  let response = null;
+  sandbox._listeners[0](
+    {
+      source: "passless-agent-broker",
+      request_id: "p2-fallback-1",
+      request: { rp_id: "example.com", challenge_b64u: "aaa", allow_credentials: [], user_verification: false },
+    },
+    { url: "https://example.com/page", tab: { url: "https://example.com/top" }, frameId: 0 },
+    function(r) { response = r; }
+  );
+  await flushPromises();
+  assert.ok(response);
+  assert.strictEqual(response.ok, false);
+  assert.ok(!("fallback" in response));
+});
+
+function workerCrossOrigin(sender, ancestorOrigins) {
+  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
+    sandbox._nativeMessageResponse = { body: "{}" };
+  });
+  sandbox._listeners[0](
+    {
+      source: "passless-agent-broker",
+      request_id: "p2-cross-" + Math.random(),
+      ancestor_origins: ancestorOrigins,
+      request: { rp_id: "example.com", challenge_b64u: "aaa", allow_credentials: [], user_verification: false },
+    },
+    sender,
+    function() {}
+  );
+  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
+  return JSON.parse(sandbox._nativeMessageCalls[0].message.body);
+}
+
+test("worker: same-origin subframe with matching ancestors is not cross-origin", async function() {
+  const body = workerCrossOrigin(
+    { url: "https://example.com/frame", tab: { url: "https://example.com/top" }, frameId: 3 },
+    ["https://example.com"]
+  );
+  assert.strictEqual(body.cross_origin, false);
+});
+
+test("worker: an intermediate cross-origin ancestor makes a same-origin leaf cross-origin", async function() {
+  const body = workerCrossOrigin(
+    { url: "https://example.com/frame", tab: { url: "https://example.com/top" }, frameId: 3 },
+    ["https://other.example", "https://example.com"]
+  );
+  assert.strictEqual(body.cross_origin, true);
+});
+
+test("worker: unknown ancestors or top origin in a subframe fail closed", async function() {
+  assert.strictEqual(
+    workerCrossOrigin({ url: "https://example.com/f", tab: { url: "https://example.com/t" }, frameId: 3 }, null).cross_origin,
+    true
+  );
+  assert.strictEqual(
+    workerCrossOrigin({ url: "https://example.com/f", frameId: 3 }, ["https://example.com"]).cross_origin,
+    true
+  );
+  assert.strictEqual(
+    workerCrossOrigin({ url: "https://example.com/f" }, ["https://example.com"]).cross_origin,
+    true
+  );
+});
+
+test("worker: top-level frame is never cross-origin", async function() {
+  const body = workerCrossOrigin(
+    { url: "https://example.com/page", tab: { url: "https://example.com/page" }, frameId: 0 },
+    []
+  );
+  assert.strictEqual(body.cross_origin, false);
+});
+
+// ---- Interim MAIN-world hardening (H1, H2, L1) ----
+
+test("main: CredentialsContainer.prototype.get/create are overridden too", async function() {
+  let getError = null;
+  let createError = null;
+  const sandbox = runMainTest("proto-1", function(sandbox, listeners, creds) {
+    const proto = sandbox._credentialsProto;
+    proto.get.call(creds, publicKeyGetOptions()).catch(function(e) { getError = e; });
+    proto.create.call(creds, publicKeyCreateOptions()).catch(function(e) { createError = e; });
+  });
+  assert.strictEqual(sandbox._originalCalled, false, "prototype get must not reach native");
+  assert.strictEqual(sandbox._originalCreateCalled, false, "prototype create must not reach native");
+  assert.strictEqual(sandbox._postMessageCalls.length, 2, "both went to the broker");
+});
+
+test("main: overrides cannot be deleted or reassigned", async function() {
+  const sandbox = runMainTest("lock-1", function(sandbox, listeners, creds) {
+    const proto = sandbox._credentialsProto;
+    for (const target of [creds, proto]) {
+      for (const name of ["get", "create"]) {
+        const installed = target[name];
+        assert.strictEqual(Reflect.deleteProperty(target, name), false, "delete " + name);
+        assert.throws(function() { target[name] = function() { return "page"; }; }, TypeError);
+        assert.throws(function() {
+          Object.defineProperty(target, name, { value: function() {} });
+        }, TypeError);
+        assert.strictEqual(target[name], installed);
+      }
+    }
+    // After the failed delete, the call still goes through the override.
+    assert.throws(function() { delete creds.get; }, TypeError); // strict mode
+    creds.get(publicKeyGetOptions()).catch(function() {});
+  });
+  assert.strictEqual(sandbox._originalCalled, false);
+  assert.strictEqual(sandbox._postMessageCalls.length, 1);
+});
+
+test("main: publicKey getter that returns undefined first never reaches native with a publicKey", async function() {
+  let reads = 0;
+  const sandbox = runMainTest("getter-1", function(sandbox, listeners, creds) {
+    const real = publicKeyGetOptions().publicKey;
+    const options = {};
+    Object.defineProperty(options, "publicKey", {
+      enumerable: true,
+      get: function() { reads++; return reads === 1 ? undefined : real; },
+    });
+    creds.get(options).catch(function() {});
+  });
+  assert.strictEqual(reads, 1, "publicKey must be read exactly once");
+  assert.strictEqual(sandbox._originalCalled, true, "the page said there is no publicKey: non-WebAuthn passthrough");
+  assert.ok(!("publicKey" in sandbox._originalOptions), "native must get a copy without publicKey");
+});
+
+test("main: Proxy that hides publicKey from `in` never hands it to native", async function() {
+  const real = publicKeyGetOptions().publicKey;
+  const sandbox = runMainTest("getter-2", function(sandbox, listeners, creds) {
+    const options = new Proxy({ mediation: "optional" }, {
+      has: function(t, k) { return k === "publicKey" ? false : k in t; },
+      get: function(t, k) { return k === "publicKey" ? real : t[k]; },
+    });
+    creds.get(options).catch(function() {});
+  });
+  assert.strictEqual(sandbox._originalCalled, true);
+  assert.ok(!("publicKey" in sandbox._originalOptions));
+  assert.strictEqual(sandbox._originalOptions.mediation, "optional");
+});
+
+test("main: publicKey and signal are read once and the page object never reaches native", async function() {
+  let pkReads = 0;
+  let signalReads = 0;
+  const sandbox = runMainTest("getter-3", function(sandbox, listeners, creds) {
+    const options = {};
+    Object.defineProperty(options, "publicKey", {
+      enumerable: true,
+      get: function() { pkReads++; return publicKeyGetOptions().publicKey; },
+    });
+    Object.defineProperty(options, "signal", {
+      enumerable: true,
+      get: function() { signalReads++; return undefined; },
+    });
+    creds.get(options).catch(function() {});
+  });
+  assert.strictEqual(pkReads, 1);
+  assert.strictEqual(signalReads, 1);
+  assert.strictEqual(sandbox._originalCalled, false);
+  assert.strictEqual(sandbox._postMessageCalls.length, 1);
+});
+
+test("main: publicKey present as null or garbage is refused, never native", async function() {
+  const errors = [];
+  const sandbox = runMainTest("garbage-1", function(sandbox, listeners, creds) {
+    creds.get({ publicKey: null }).catch(function(e) { errors.push(e); });
+    creds.get({ publicKey: 5 }).catch(function(e) { errors.push(e); });
+  });
+  await flushPromises();
+  assert.strictEqual(sandbox._originalCalled, false);
+  assert.strictEqual(errors.length, 2);
+});
+
+test("main: postMessage failure (opaque origin) rejects NotAllowedError and clears the timer", async function() {
+  let rejected = null;
+  const sandbox = runMainTest("opaque-1", function(sandbox, listeners, creds) {
+    sandbox.window.postMessage = function() { throw new Error("SyntaxError: target origin 'null'"); };
+    creds.get(publicKeyGetOptions()).catch(function(e) { rejected = e; });
+  });
+  await flushPromises();
+  assert.ok(rejected, "must reject");
+  assert.strictEqual(rejected.name, "NotAllowedError");
+  assert.strictEqual(sandbox._setTimeoutCalls.length, 1);
+  assert.deepStrictEqual(sandbox._clearTimeoutCalls, [sandbox._setTimeoutCalls[0].id], "timer cleared immediately");
+  assert.strictEqual(sandbox._originalCalled, false);
+});
+
+test("manifest: injects into about:blank, srcdoc, blob and localhost frames", async function() {
+  const manifest = JSON.parse(readTemplate("manifest.json"));
+  assert.ok(parseInt(manifest.minimum_chrome_version, 10) >= 119);
+  for (const entry of manifest.content_scripts) {
+    assert.strictEqual(entry.all_frames, true);
+    assert.strictEqual(entry.match_about_blank, true);
+    assert.strictEqual(entry.match_origin_as_fallback, true);
+    assert.strictEqual(entry.run_at, "document_start");
+    assert.ok(entry.matches.indexOf("https://*/*") !== -1);
+    assert.ok(entry.matches.indexOf("http://localhost/*") !== -1);
+    assert.ok(entry.matches.indexOf("http://127.0.0.1/*") !== -1);
+  }
+  assert.ok(manifest.host_permissions.indexOf("http://localhost/*") !== -1);
 });
 
 // ======================== REPORT ========================

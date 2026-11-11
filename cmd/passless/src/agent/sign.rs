@@ -205,8 +205,9 @@ pub fn verify_origin_context(
     if !verify_origin_structural(origin, rp_id) {
         return false;
     }
+    // Cross-origin frames fail closed (ADR 0014 §11, `sameOriginWithAncestors = false`): never allowed.
     if cross_origin {
-        return top_origin.and_then(parse_origin).is_some();
+        return false;
     }
     match top_origin {
         Some(top) => parse_origin(top).is_some_and(|parsed| {
@@ -1258,17 +1259,18 @@ impl SignHandler {
             req.cross_origin,
             &normalized_rp,
         ) {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::OriginInvalid,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
+            let (reason, message) = if req.cross_origin {
+                (
+                    PolicyDenyReason::CrossOriginDenied,
+                    "cross-origin frames are not permitted",
+                )
+            } else {
+                (PolicyDenyReason::OriginInvalid, "origin not valid for RP")
+            };
+            self.record_policy_deny(ctx, &normalized_rp, reason);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
-                "origin not valid for RP",
+                message,
                 RecommendedAction::FixRequest,
             ));
         }
@@ -1380,17 +1382,28 @@ impl SignHandler {
                     RecommendedAction::FixRequest,
                 ));
             }
+            // `confirm` (legacy `supervised`) and the ADR `request` action act as `deny` until the
+            // escalation service lands (P7): an agent ceremony never shows a prompt and never falls back
+            // to the human or native path (ADR 0014 §7, invariant 25).
             passless_core::agent::AgentAuthorization::Confirm => {
-                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
+                self.record_policy_deny(
+                    ctx,
+                    &normalized_rp,
+                    PolicyDenyReason::EscalationUnavailable,
+                );
                 return Err(ProtocolError::new(
-                    ErrorCode::InteractionRequired,
-                    "human confirmation is required by policy",
-                    RecommendedAction::Retry,
+                    ErrorCode::Forbidden,
+                    "escalation is unavailable: policy requires human confirmation",
+                    RecommendedAction::FixRequest,
                 ));
             }
             passless_core::agent::AgentAuthorization::Allow => {}
         }
 
+        // Human evidence cannot be produced in an agent ceremony before P7: a rule that needs a human
+        // for UP, or for UV, is denied (fail closed, never a prompt or the native path).
+        // `human_verification_prompt` is still parsed so that existing configs load; it can only make
+        // this check stricter, never open a human path. P4 replaces the schema.
         let human_uv_required = ceremony_policy.user_verification
             == passless_core::agent::UserVerificationSource::Human
             && (req.user_verification
@@ -1400,19 +1413,11 @@ impl SignHandler {
         if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
             || human_uv_required
         {
-            self.record_policy_deny(
-                ctx,
-                &normalized_rp,
-                if human_uv_required {
-                    PolicyDenyReason::UvRequired
-                } else {
-                    PolicyDenyReason::ActionNotAllowed
-                },
-            );
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::EscalationUnavailable);
             return Err(ProtocolError::new(
-                ErrorCode::InteractionRequired,
-                "human WebAuthn verification is required by policy",
-                RecommendedAction::Retry,
+                ErrorCode::Forbidden,
+                "escalation is unavailable: policy requires human verification",
+                RecommendedAction::FixRequest,
             ));
         }
 
@@ -1803,17 +1808,23 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_origin_requires_top_origin() {
+    fn test_cross_origin_always_fails_closed() {
         assert!(!verify_origin_context(
             "https://login.example.com",
             None,
             true,
             "example.com"
         ));
-        assert!(verify_origin_context(
+        assert!(!verify_origin_context(
             "https://login.example.com",
             Some("https://portal.example.net"),
             true,
+            "example.com"
+        ));
+        assert!(verify_origin_context(
+            "https://login.example.com",
+            Some("https://login.example.com"),
+            false,
             "example.com"
         ));
     }
@@ -4080,7 +4091,88 @@ mod tests {
             assert!(!policy_events.is_empty());
             let last = policy_events.last().unwrap();
             assert_eq!(last["kind"], "policy.deny");
-            assert_eq!(last["reason"], "action_not_allowed");
+            assert_eq!(last["reason"], "escalation_unavailable");
+        }
+
+        // `confirm` (legacy `supervised`) and ADR `request` act as `deny` until P7: HTTP 403, an audited
+        // deny, no allow record, and no human or native path (the handler has no prompt dependency).
+        #[test]
+        fn confirm_policy_is_denied_with_403_and_audited_without_human_path() {
+            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_ne!(err.code, ErrorCode::InteractionRequired);
+            let (status, code) = error_status_code(err.code);
+            assert_eq!(status, "403 Forbidden");
+            assert_eq!(code, "forbidden");
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert_eq!(
+                policy_events.len(),
+                1,
+                "exactly one policy record: {policy_events:?}"
+            );
+            assert_eq!(policy_events[0]["kind"], "policy.deny");
+            assert_eq!(policy_events[0]["action"], "authenticate");
+            assert_eq!(policy_events[0]["reason"], "escalation_unavailable");
+        }
+
+        #[test]
+        fn allow_rule_needing_human_evidence_is_denied_not_prompted() {
+            let rule = AgentRpRule {
+                credential_selection: None,
+                rp_id: "example.com".to_string(),
+                register: AgentCeremonyPolicy::deny(),
+                authenticate: AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Allow,
+                    user_presence: UserPresenceSource::Human,
+                    user_verification: UserVerificationSource::Agent,
+                },
+            };
+            let f = AuditTestFixture::new(vec![rule], vec!["example.com"]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert_eq!(policy_events.last().unwrap()["kind"], "policy.deny");
+            assert_eq!(
+                policy_events.last().unwrap()["reason"],
+                "escalation_unavailable"
+            );
+        }
+
+        #[test]
+        fn cross_origin_request_is_denied_and_audited() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "https://example.com".to_string();
+            req.top_origin = Some("https://top.example".to_string());
+            req.cross_origin = true;
+            let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(error_status_code(err.code).0, "403 Forbidden");
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert_eq!(policy_events.len(), 1, "{policy_events:?}");
+            assert_eq!(policy_events[0]["kind"], "policy.deny");
+            assert_eq!(policy_events[0]["reason"], "cross_origin_denied");
+        }
+
+        #[test]
+        fn cross_origin_is_denied_even_without_a_top_origin() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.cross_origin = true;
+            let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
         }
 
         #[test]

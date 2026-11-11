@@ -3,11 +3,11 @@ const { scenario } = require('../lib/scenario');
 const { authenticate, assertVerifiedAssertion, assertInterceptionActive, assertAgentAllowed } = require('../lib/helpers');
 
 // Catalogue: `http://localhost` RP works. Today it cannot: validate_rp_id rejects "localhost" (needs two
-// labels, so the whole agent subsystem fails to start), and the extension manifest matches https://*/*
-// only (R12, R15).
+// labels, so the whole agent subsystem fails to start). The manifest matches http://localhost since P2 (so the page
+// is never native), but the worker and the daemon origin parser still accept https only (R12, R15).
 scenario({
   id: 'E2E-06', title: 'http://localhost RP works', ci: true,
-  xfailUntil: 'P6', xfailMatch: /Configuration error: RP ID must have at least two labels: 'localhost'/, xfailReason: 'config rejects rp_id "localhost" (R15, P4) and the manifest matches https only (R12, P6)',
+  xfailUntil: 'P6', xfailMatch: /Configuration error: RP ID must have at least two labels: 'localhost'/, xfailReason: 'config rejects rp_id "localhost" (R15, P4); the manifest now injects on http://localhost (P2), but the worker and daemon still require https origins until the P6 rewrite',
 }, async ctx => {
   const stack = await ctx.stack({
     rps: { local: { host: 'localhost' } },
