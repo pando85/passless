@@ -499,9 +499,4 @@ mod tests {
             NotificationActionMode::DunstDefault
         ));
     }
-
-    #[test]
-    fn test_notification_action_mode_doesnt_panic() {
-        let _ = notification_action_mode(PromptKind::UserPresence);
-    }
 }

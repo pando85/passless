@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use passless_core::agent::{
-    AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration, BrowserScope,
-    validate_rp_id,
+    AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, AgentStorageConfig, BoundedDuration,
+    BrowserScope, RuleAction, validate_rp_id,
 };
 
 fn isolated_profile() -> AgentProfileConfig {
@@ -15,11 +15,8 @@ fn isolated_profile() -> AgentProfileConfig {
         max_concurrent_sessions: 1,
         browser_scope: BrowserScope::Session,
         credential_selection: passless_core::agent::config::CredentialSelection::Single,
-        human_verification_prompt: passless_core::agent::config::HumanVerificationPrompt::Always,
         mode: AgentMode::Isolated,
         principal_user: "testuser".into(),
-        rp_ids: vec!["example.com".into()],
-        require_uv: true,
         credential_refs: None,
         max_grant_ttl: None,
         max_session_ttl: None,
@@ -27,8 +24,13 @@ fn isolated_profile() -> AgentProfileConfig {
             path: PathBuf::from("/tmp/agent-test/cred"),
             pin_path: PathBuf::from("/tmp/agent-test/pin"),
         }),
-        registration_allowed: false,
-        rules: vec![],
+        rules: vec![AgentRpRule {
+            rp_id: "example.com".into(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
+            credential_selection: None,
+        }],
+        legacy: Default::default(),
         device: None,
         start_url: None,
         browser_command: None,
@@ -115,7 +117,7 @@ fn isolated_mode_rejects_browser_runtime_root() {
 #[test]
 fn invalid_rp_id_in_profile_rejected() {
     let mut profile = isolated_profile();
-    profile.rp_ids = vec!["https://example.com".into()];
+    profile.rules[0].rp_id = "https://example.com".into();
     let pid = passless_core::agent::ProfileId::new("test").unwrap();
     let err = profile.validate(&pid).unwrap_err();
     assert!(err.to_string().contains("scheme"));
@@ -240,7 +242,9 @@ fn rp_id_validation_integration() {
     assert!(validate_rp_id("example.com").is_ok());
     assert!(validate_rp_id("sub.example.com").is_ok());
     assert!(validate_rp_id("https://example.com").is_err());
-    assert!(validate_rp_id("localhost").is_err());
+    // `localhost` is the one exception to the public-suffix rule; its subdomains stay invalid.
+    assert_eq!(validate_rp_id("localhost").unwrap(), "localhost");
+    assert!(validate_rp_id("foo.localhost").is_err());
     assert!(validate_rp_id("com").is_err());
     assert!(validate_rp_id("*.example.com").is_err());
     assert!(validate_rp_id("192.168.1.1").is_err());
@@ -290,4 +294,22 @@ fn empty_start_url_rejected() {
     let pid = passless_core::agent::ProfileId::new("test").unwrap();
     let err = profile.validate(&pid).unwrap_err();
     assert!(err.to_string().contains("start_url must not be empty"));
+}
+
+// B4 regression: a profile whose rules are all `deny` is valid.
+#[test]
+fn all_deny_rule_set_validates() {
+    let mut profile = isolated_profile();
+    profile.rules[0].authenticate = RuleAction::Deny;
+    profile.rules[0].register = RuleAction::Deny;
+    let pid = passless_core::agent::ProfileId::new("test").unwrap();
+    profile.validate(&pid).unwrap();
+}
+
+#[test]
+fn profile_without_rules_validates_and_denies_everything() {
+    let mut profile = isolated_profile();
+    profile.rules.clear();
+    let pid = passless_core::agent::ProfileId::new("test").unwrap();
+    profile.validate(&pid).unwrap();
 }

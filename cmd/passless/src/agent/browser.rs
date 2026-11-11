@@ -15,8 +15,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use passless_core::agent::config::{ANY_RP_ID, CdpExposeMode, validate_rp_id};
-use passless_core::agent::{BrowserLeaseId, EndpointId, ProfileId};
+use passless_core::agent::config::{CdpExposeMode, LOCALHOST_RP_ID};
+use passless_core::agent::{
+    AgentRpRule, BrowserLeaseId, EndpointId, ProfileId, RuleAction, rule_for_host,
+};
 
 use rand::Rng;
 use rsa::PrivateKey;
@@ -282,6 +284,8 @@ pub struct BrowserConfig {
     pub ttl: Duration,
     pub login_timeout: Duration,
     pub rp_ids: Vec<String>,
+    /// The profile's rules, used to validate the launch URL (`validate_start_url`).
+    pub start_url_rules: Vec<AgentRpRule>,
     pub target_uid: u32,
     pub target_gid: u32,
     pub daemon_uid: u32,
@@ -840,7 +844,7 @@ impl BrowserProcessManager {
         })?;
 
         if let Some(ref url) = config.start_url {
-            validate_start_url(url, &config.rp_ids)
+            validate_start_url(url, &config.start_url_rules)
                 .map_err(|_| LaunchError::InvalidStartUrl(url.clone()))?;
         }
 
@@ -1746,78 +1750,38 @@ fn fingerprint_path(path: &Path) -> io::Result<ProfileFingerprint> {
     })
 }
 
-fn validate_start_url(url: &str, rp_ids: &[String]) -> Result<(), ()> {
-    let rest = url.strip_prefix("https://").ok_or(())?;
-    if rest.is_empty() {
+/// Validate a launch URL against the profile's rules (ADR 0014 sections 6.1 and 6.3, plan R15).
+///
+/// The URL is parsed with `url::Url`; credentials in the URL (`http://localhost:1@evil.com/`) are
+/// rejected and the host is compared exactly. `https` is required, except `http://localhost`.
+/// The most specific rule for the host decides (`rule_for_host`), and the navigation is allowed
+/// only if that rule is not `deny` for both actions: a denied RP is never a launch target, while a
+/// subdomain deny does not break an allowed parent domain.
+fn validate_start_url(url: &str, rules: &[AgentRpRule]) -> Result<(), ()> {
+    let parsed = url::Url::parse(url).map_err(|_| ())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(());
     }
-
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-
-    if host.is_empty() {
+    let plain_http = match parsed.scheme() {
+        "https" => false,
+        "http" => true,
+        _ => return Err(()),
+    };
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.to_ascii_lowercase(),
+        _ => return Err(()),
+    };
+    if plain_http && host != LOCALHOST_RP_ID {
         return Err(());
     }
-
-    if !is_valid_dns_name(host) && !is_ip_address(host) {
-        return Err(());
-    }
-
-    let host_normalized = host.to_ascii_lowercase();
-
-    if rp_ids.iter().any(|rp_id| rp_id.trim() == ANY_RP_ID) {
-        return validate_rp_id(&host_normalized).map(|_| ()).map_err(|_| ());
-    }
-
-    let matching: Vec<&str> = rp_ids
-        .iter()
-        .filter(|rp_id| {
-            let rp = rp_id.trim().to_ascii_lowercase();
-            host_normalized == rp || host_normalized.ends_with(&format!(".{}", rp))
-        })
-        .map(|s| s.as_str())
-        .collect();
-
-    if matching.len() != 1 {
-        return Err(());
-    }
-
-    Ok(())
-}
-
-fn is_valid_dns_name(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let labels: Vec<&str> = s.split('.').collect();
-    if labels.is_empty() {
-        return false;
-    }
-    for label in &labels {
-        if label.is_empty() || label.len() > 63 {
-            return false;
+    match rule_for_host(rules, &host) {
+        Some(rule)
+            if rule.authenticate != RuleAction::Deny || rule.register != RuleAction::Deny =>
+        {
+            Ok(())
         }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return false;
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return false;
-        }
+        _ => Err(()),
     }
-    true
-}
-
-fn is_ip_address(s: &str) -> bool {
-    use std::net::IpAddr;
-    s.parse::<IpAddr>().is_ok()
 }
 
 fn create_cdp_pipes() -> io::Result<CdpPipes> {
@@ -3156,6 +3120,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: uid,
             target_gid: gid,
             daemon_uid: 0,
@@ -3389,16 +3354,110 @@ mod tests {
 
     #[test]
     fn test_validate_start_url_valid() {
-        let rp_ids = vec!["example.com".to_string()];
+        let rp_ids = start_url_test_rules(&[("example.com", RuleAction::Allow)]);
         assert!(validate_start_url("https://example.com", &rp_ids).is_ok());
         assert!(validate_start_url("https://example.com/path", &rp_ids).is_ok());
         assert!(validate_start_url("https://sub.example.com:443/path", &rp_ids).is_ok());
         assert!(validate_start_url("https://example.com?query=1", &rp_ids).is_ok());
     }
 
+    fn start_url_test_rules(rules: &[(&str, RuleAction)]) -> Vec<AgentRpRule> {
+        rules
+            .iter()
+            .map(|(rp_id, action)| AgentRpRule {
+                rp_id: (*rp_id).to_string(),
+                register: RuleAction::Deny,
+                authenticate: *action,
+                credential_selection: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_validate_start_url_localhost_exact_rule_only() {
+        let exact = start_url_test_rules(&[("localhost", RuleAction::Allow)]);
+        assert!(validate_start_url("http://localhost", &exact).is_ok());
+        assert!(validate_start_url("http://localhost:8080/path", &exact).is_ok());
+        assert!(validate_start_url("https://localhost", &exact).is_ok());
+        // Never through the wildcard, never another http host, never a subdomain of localhost.
+        let wildcard = start_url_test_rules(&[("*", RuleAction::Allow)]);
+        assert!(validate_start_url("http://localhost", &wildcard).is_err());
+        assert!(validate_start_url("https://localhost", &wildcard).is_err());
+        let example = start_url_test_rules(&[("example.com", RuleAction::Allow)]);
+        assert!(validate_start_url("http://example.com", &example).is_err());
+        assert!(validate_start_url("http://foo.localhost", &exact).is_err());
+        assert!(validate_start_url("https://foo.localhost", &exact).is_err());
+        // A trailing dot is a different host.
+        assert!(validate_start_url("http://localhost./", &exact).is_err());
+    }
+
+    #[test]
+    fn test_validate_start_url_rejects_userinfo_and_confused_hosts() {
+        let exact = start_url_test_rules(&[("localhost", RuleAction::Allow)]);
+        // `localhost:1` is userinfo here and the real host is evil.com.
+        assert!(validate_start_url("http://localhost:1@evil.com/", &exact).is_err());
+        assert!(validate_start_url("http://user@localhost/", &exact).is_err());
+        assert!(
+            validate_start_url(
+                "https://user:pw@example.com/",
+                &start_url_test_rules(&[("example.com", RuleAction::Allow)])
+            )
+            .is_err()
+        );
+        let wildcard = start_url_test_rules(&[("*", RuleAction::Allow)]);
+        assert!(validate_start_url("https://example.com:443@evil.com/", &wildcard).is_err());
+        assert!(validate_start_url("https://example.com@evil.com/", &wildcard).is_err());
+        assert!(
+            validate_start_url("https://evil.com\\@example.com/", &wildcard).is_ok(),
+            "backslash is a path separator for https: the host is evil.com, matched by the wildcard"
+        );
+    }
+
+    #[test]
+    fn test_validate_start_url_ports_and_ip_hosts() {
+        let exact = start_url_test_rules(&[("localhost", RuleAction::Allow)]);
+        assert!(validate_start_url("http://localhost:3000", &exact).is_ok());
+        assert!(validate_start_url("http://localhost:99999", &exact).is_err());
+        assert!(validate_start_url("http://localhost:abc", &exact).is_err());
+        let wildcard = start_url_test_rules(&[("*", RuleAction::Allow)]);
+        // IP literals are never valid RP hosts.
+        assert!(validate_start_url("https://127.0.0.1/", &wildcard).is_err());
+        assert!(validate_start_url("https://[::1]/", &wildcard).is_err());
+        assert!(validate_start_url("https://[::1]:8443/", &exact).is_err());
+        assert!(validate_start_url("http://[::1]/", &exact).is_err());
+        assert!(validate_start_url("http://127.0.0.1/", &exact).is_err());
+    }
+
+    #[test]
+    fn test_validate_start_url_most_specific_rule_decides() {
+        // A subdomain deny must not break the allowed parent domain, and a denied host is never a
+        // launch target.
+        let rules = start_url_test_rules(&[
+            ("example.com", RuleAction::Allow),
+            ("login.example.com", RuleAction::Deny),
+        ]);
+        assert!(validate_start_url("https://example.com/", &rules).is_ok());
+        assert!(validate_start_url("https://app.example.com/", &rules).is_ok());
+        assert!(validate_start_url("https://login.example.com/", &rules).is_err());
+        assert!(validate_start_url("https://sso.login.example.com/", &rules).is_err());
+        // The reverse: an allowed subdomain under a denied parent.
+        let rules = start_url_test_rules(&[
+            ("example.com", RuleAction::Deny),
+            ("login.example.com", RuleAction::Request),
+        ]);
+        assert!(validate_start_url("https://login.example.com/", &rules).is_ok());
+        assert!(validate_start_url("https://example.com/", &rules).is_err());
+        // An exact deny beats the wildcard.
+        let rules =
+            start_url_test_rules(&[("*", RuleAction::Allow), ("bad.com", RuleAction::Deny)]);
+        assert!(validate_start_url("https://good.com/", &rules).is_ok());
+        assert!(validate_start_url("https://bad.com/", &rules).is_err());
+        assert!(validate_start_url("https://x.bad.com/", &rules).is_err());
+    }
+
     #[test]
     fn test_validate_start_url_invalid_scheme() {
-        let rp_ids = vec!["example.com".to_string()];
+        let rp_ids = start_url_test_rules(&[("example.com", RuleAction::Allow)]);
         assert!(validate_start_url("http://example.com", &rp_ids).is_err());
         assert!(validate_start_url("ftp://example.com", &rp_ids).is_err());
         assert!(validate_start_url("", &rp_ids).is_err());
@@ -3407,21 +3466,24 @@ mod tests {
 
     #[test]
     fn test_validate_start_url_host_must_match_rp_id() {
-        let rp_ids = vec!["example.com".to_string()];
+        let rp_ids = start_url_test_rules(&[("example.com", RuleAction::Allow)]);
         assert!(validate_start_url("https://other.com/path", &rp_ids).is_err());
         assert!(validate_start_url("https://notexample.com/path", &rp_ids).is_err());
     }
 
     #[test]
     fn test_validate_start_url_matches_exactly_one_rp_id() {
-        let rp_ids = vec!["example.com".to_string(), "example.org".to_string()];
+        let rp_ids = start_url_test_rules(&[
+            ("example.com", RuleAction::Allow),
+            ("example.org", RuleAction::Allow),
+        ]);
         assert!(validate_start_url("https://other.com/path", &rp_ids).is_err());
         assert!(validate_start_url("https://example.com/path", &rp_ids).is_ok());
     }
 
     #[test]
     fn test_validate_start_url_no_rp_match() {
-        let rp_ids: Vec<String> = vec![];
+        let rp_ids: Vec<AgentRpRule> = vec![];
         assert!(validate_start_url("https://example.com", &rp_ids).is_err());
     }
 
@@ -4519,6 +4581,7 @@ mod tests {
         let mut mgr = BrowserProcessManager::new(clock);
         let mut config = test_config(dir.path());
         config.rp_ids = vec!["other.com".to_string()];
+        config.start_url_rules = start_url_test_rules(&[("other.com", RuleAction::Allow)]);
         config.start_url = Some("https://example.com/dashboard".to_string());
 
         let result = mgr.launch(&config, test_endpoint_id(), test_profile_id());
@@ -4860,6 +4923,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1001,
             target_gid: 1001,
             daemon_uid: 0,
@@ -4890,6 +4954,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1001,
             target_gid: 1001,
             daemon_uid: 0,
@@ -6157,6 +6222,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -6197,6 +6263,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -6232,6 +6299,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -6256,6 +6324,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -6280,6 +6349,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -6302,6 +6372,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -6416,6 +6487,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,
@@ -7121,6 +7193,7 @@ mod tests {
             ttl: Duration::from_secs(300),
             login_timeout: DEFAULT_LOGIN_TIMEOUT,
             rp_ids: vec!["example.com".to_string()],
+            start_url_rules: start_url_test_rules(&[("example.com", RuleAction::Allow)]),
             target_uid: 1000,
             target_gid: 1000,
             daemon_uid: 0,

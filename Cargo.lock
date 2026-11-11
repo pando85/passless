@@ -1635,6 +1635,7 @@ dependencies = [
  "tokio",
  "toml",
  "tss-esapi",
+ "url",
  "zbus",
  "zeroize",
 ]

@@ -100,8 +100,14 @@ impl From<ProtocolError> for ClientError {
 }
 
 pub fn resolve_runtime_base() -> Result<PathBuf, ClientError> {
-    if let Ok(val) = std::env::var(ENV_RUNTIME_DIR) {
-        let p = PathBuf::from(&val);
+    resolve_runtime_base_with(std::env::var(ENV_RUNTIME_DIR).ok().as_deref())
+}
+
+/// Resolves the runtime base directory given the value of `ENV_RUNTIME_DIR`,
+/// so tests can exercise it without mutating the process environment.
+fn resolve_runtime_base_with(override_dir: Option<&str>) -> Result<PathBuf, ClientError> {
+    if let Some(val) = override_dir {
+        let p = PathBuf::from(val);
         if !p.is_absolute() {
             return Err(ClientError::UnsafePath {
                 detail: format!("{} must be an absolute path", ENV_RUNTIME_DIR),
@@ -563,8 +569,6 @@ mod tests {
 
     use crate::agent::ipc::{AdminHandler, IpcServer, PrincipalHandler, ProfileAccess, RuntimeDir};
 
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct EchoAdminHandler;
 
     impl AdminHandler for EchoAdminHandler {
@@ -930,59 +934,45 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_default() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
-        let base = resolve_runtime_base().unwrap();
+        let base = resolve_runtime_base_with(None).unwrap();
         assert!(base.is_absolute(), "base must be absolute: {:?}", base);
     }
 
     #[test]
     fn test_resolve_runtime_base_rejects_relative() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, "relative/path") };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some("relative/path"));
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
     fn test_resolve_runtime_base_accepts_valid_dir() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, dir.path().to_str().unwrap()) };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some(dir.path().to_str().unwrap()));
         assert!(result.is_ok());
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
     fn test_resolve_runtime_base_rejects_symlink() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, link.to_str().unwrap()) };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some(link.to_str().unwrap()));
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
     fn test_resolve_runtime_base_rejects_wrong_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, dir.path().to_str().unwrap()) };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some(dir.path().to_str().unwrap()));
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]

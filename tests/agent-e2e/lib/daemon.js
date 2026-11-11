@@ -1,10 +1,8 @@
 'use strict';
 // Starts the passless daemon (agent runtime enabled) against the hermetic env, writes the per-scenario
-// agent config in today's schema, launches the managed browser through the product's own
-// `passless agent-admin browser launch`, and collects logs and the audit log.
-//
-// Scenarios describe policy with ADR 0014 vocabulary (`allow` / `deny` / `request`); RULE_ACTION maps
-// that onto today's config strings. P4 replaces this table with the new schema.
+// agent config in the ADR 0014 schema (rules with `deny` / `allow` / `request` per action), launches the
+// managed browser through the product's own `passless agent-admin browser launch`, and collects logs
+// and the audit log.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -16,9 +14,7 @@ const { ensureBuilt } = require('./build');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ADR action -> today's alias. `request` has no equivalent before P7; `supervised` (human prompt via
-// the trusted notification) is the closest, and is what `confirm` maps to.
-const RULE_ACTION = { allow: 'autonomous', deny: 'deny', request: 'supervised' };
+const RULE_ACTIONS = ['deny', 'allow', 'request'];
 
 class DaemonStartError extends Error {}
 
@@ -34,7 +30,10 @@ function tomlValue(v) {
  * @param {object} env
  * @param {object} o
  * @param {Object<string,object>} o.profiles  name -> {mode, rules:[{rp, authenticate, register, credential_selection}],
- *        credential_selection, max_operations, legacyDevice, extra:{...raw profile keys}}
+ *        credential_selection, max_operations, legacyDevice, extra:{...raw profile keys},
+ *        legacyRules:[{rp, authenticate, register}] (raw TOML expressions, written verbatim: legacy vocabulary
+ *        such as '"autonomous"' or '{ authorization = "confirm", ... }')}
+ * `*` rules (same-user only) get the profile listed in `acknowledge_global_same_user` automatically.
  * @param {string[]} [o.browserArgs]  extra browser flags (variant + TLS), put after the executable
  * @param {string} o.browserExe
  */
@@ -43,6 +42,7 @@ function renderConfig(env, o) {
   const lines = [];
   lines.push('[local]', `path = ${q(env.dirs.store)}`, '');
   const sameUserRegisterAck = [];
+  const globalAck = [];
   const profileBlocks = [];
   for (const [name, p] of Object.entries(o.profiles)) {
     const mode = p.mode || 'same-user';
@@ -72,17 +72,23 @@ function renderConfig(env, o) {
         `uniq = ${q(`legacy-${name}-uniq`)}`, 'vendor_id = 4660', 'product_id = 22136');
     }
     for (const r of p.rules || []) {
-      const reg = RULE_ACTION[r.register || 'deny'];
-      const auth = RULE_ACTION[r.authenticate || 'deny'];
-      if (!reg || !auth) throw new Error(`bad rule action in ${JSON.stringify(r)}`);
+      const reg = r.register || 'deny';
+      const auth = r.authenticate || 'deny';
+      if (!RULE_ACTIONS.includes(reg) || !RULE_ACTIONS.includes(auth)) throw new Error(`bad rule action in ${JSON.stringify(r)}`);
       b.push('', `[[agents.profiles.${name}.rules]]`, `rp_id = ${q(r.rp)}`, `authenticate = ${q(auth)}`, `register = ${q(reg)}`);
       if (r.credential_selection) b.push(`credential_selection = ${q(r.credential_selection)}`);
       if (mode === 'same-user' && reg !== 'deny' && !sameUserRegisterAck.includes(name)) sameUserRegisterAck.push(name);
+      if (mode === 'same-user' && r.rp === '*' && !globalAck.includes(name)) globalAck.push(name);
+    }
+    for (const r of p.legacyRules || []) {
+      if (mode === 'same-user' && r.register !== '"deny"' && !sameUserRegisterAck.includes(name)) sameUserRegisterAck.push(name);
+      b.push('', `[[agents.profiles.${name}.rules]]`, `rp_id = ${q(r.rp)}`, `authenticate = ${r.authenticate}`, `register = ${r.register}`);
     }
     for (const [k, v] of Object.entries(p.extra || {})) b.splice(2, 0, `${k} = ${tomlValue(v)}`);
     profileBlocks.push(b.join('\n'));
   }
   lines.push('[agents]', 'enabled = true', `audit_path = ${q(env.dirs.audit)}`);
+  if (globalAck.length) lines.push(`acknowledge_global_same_user = ${tomlValue(globalAck)}`);
   if (sameUserRegisterAck.length) lines.push(`acknowledge_same_user_registration = ${tomlValue(sameUserRegisterAck)}`);
   lines.push('', profileBlocks.join('\n\n'), '');
   return lines.join('\n');
@@ -246,4 +252,4 @@ async function startDaemon(env, o) {
   return daemon;
 }
 
-module.exports = { startDaemon, renderConfig, DaemonStartError, RULE_ACTION };
+module.exports = { startDaemon, renderConfig, DaemonStartError };

@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
-use passless_core::agent::config::{ANY_RP_ID, CredentialSelection};
+use passless_core::agent::config::{ANY_RP_ID, CredentialSelection, LOCALHOST_RP_ID};
 use passless_core::agent::protocol::{
-    ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, RegisterCredentialRequest,
-    SignAssertionRequest, SignAssertionResponse,
+    ErrorCode, IntentAction, PrincipalResponse, ProtocolError, RecommendedAction,
+    RegisterCredentialRequest, SignAssertionRequest, SignAssertionResponse,
 };
-use passless_core::agent::{AgentProfileConfig, CredentialRef, ProfileId};
+use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
@@ -146,13 +146,28 @@ pub fn build_authenticator_data(
     auth_data
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginScheme {
+    Https,
+    /// Accepted only for exactly `localhost` (ADR 0014 section 6.1, plan R15).
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedOrigin {
+    pub scheme: OriginScheme,
     pub host: String,
     pub port: Option<u16>,
 }
 
+/// Parse a web origin. `https://host[:port]` is accepted for any host; `http://` is accepted only
+/// for exactly `localhost[:port]`, never for `*.localhost` or any other host.
 pub fn parse_origin(origin: &str) -> Option<ParsedOrigin> {
-    let rest = origin.strip_prefix("https://")?;
+    let (scheme, rest) = if let Some(rest) = origin.strip_prefix("https://") {
+        (OriginScheme::Https, rest)
+    } else {
+        (OriginScheme::Http, origin.strip_prefix("http://")?)
+    };
     if rest.is_empty() {
         return None;
     }
@@ -166,22 +181,24 @@ pub fn parse_origin(origin: &str) -> Option<ParsedOrigin> {
     if host_part.contains('?') || host_part.contains('#') || host_part.contains('@') {
         return None;
     }
-    if host_part.contains(':') {
+    let (host, port) = if host_part.contains(':') {
         let (host, port_str) = host_part.rsplit_once(':').unwrap();
         if host.is_empty() {
             return None;
         }
-        let port: u16 = port_str.parse().ok()?;
-        Some(ParsedOrigin {
-            host: host.to_ascii_lowercase(),
-            port: Some(port),
-        })
+        // ASCII digits only (`u16::from_str` also accepts a leading `+`), and port 0 is not a port.
+        if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok().filter(|port| *port != 0)?;
+        (host.to_ascii_lowercase(), Some(port))
     } else {
-        Some(ParsedOrigin {
-            host: host_part.to_ascii_lowercase(),
-            port: None,
-        })
+        (host_part.to_ascii_lowercase(), None)
+    };
+    if scheme == OriginScheme::Http && host != LOCALHOST_RP_ID {
+        return None;
     }
+    Some(ParsedOrigin { scheme, host, port })
 }
 
 pub fn verify_origin_structural(origin: &str, rp_id: &str) -> bool {
@@ -192,6 +209,10 @@ pub fn verify_origin_structural(origin: &str, rp_id: &str) -> bool {
     let normalized_rp = rp_id.trim().trim_end_matches('.').to_ascii_lowercase();
     if normalized_rp.is_empty() {
         return false;
+    }
+    // `localhost` is an exact-match RP: `foo.localhost` is never a valid origin for it.
+    if normalized_rp == LOCALHOST_RP_ID {
+        return parsed.host == LOCALHOST_RP_ID;
     }
     parsed.host == normalized_rp || parsed.host.ends_with(&format!(".{normalized_rp}"))
 }
@@ -211,8 +232,11 @@ pub fn verify_origin_context(
     }
     match top_origin {
         Some(top) => parse_origin(top).is_some_and(|parsed| {
-            parse_origin(origin)
-                .is_some_and(|frame| parsed.host == frame.host && parsed.port == frame.port)
+            parse_origin(origin).is_some_and(|frame| {
+                parsed.scheme == frame.scheme
+                    && parsed.host == frame.host
+                    && parsed.port == frame.port
+            })
         }),
         None => true,
     }
@@ -571,7 +595,7 @@ impl SignContextRegistry {
         handler: Arc<RegisterHandler>,
     ) -> Result<(), String> {
         let context = context.with_fresh_revocation();
-        let max_requests = usize::from(context.profile_config.max_operations);
+        let max_requests = usize::from(context.max_operations);
         let request_budget = self.request_budget(&token, max_requests)?;
         let mut map = self
             .registration_entries
@@ -660,7 +684,7 @@ impl SignContextRegistry {
         context: SignContext,
         handler: Arc<SignHandler>,
     ) -> Result<(), String> {
-        let max_requests = usize::from(context.profile_config.max_operations);
+        let max_requests = usize::from(context.max_operations);
         let request_budget = self.request_budget(&token, max_requests)?;
         let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
         if map.contains_key(&token) {
@@ -1335,7 +1359,12 @@ fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
 pub struct SignContext {
     pub profile_id: ProfileId,
     pub active_grant_id: passless_core::agent::GrantId,
-    pub profile_config: AgentProfileConfig,
+    /// Operation budget, copied from the profile at session creation.
+    ///
+    /// TODO(P5): the budget (and the session TTL) are still frozen at creation. Authorization is
+    /// not: rules, selection and acknowledgements resolve against the live policy on every
+    /// request (`PolicyRuntime::resolve`). P5 replaces this copy with the revocation epoch.
+    pub max_operations: u16,
 }
 
 #[derive(Clone)]
@@ -1450,7 +1479,7 @@ impl SignHandler {
 
         if !grant_snapshot.rp_ids.iter().any(|id| {
             let scope_rp = normalize_rp_id(id);
-            scope_rp == normalized_rp || scope_rp == ANY_RP_ID
+            scope_rp == normalized_rp || (scope_rp == ANY_RP_ID && normalized_rp != LOCALHOST_RP_ID)
         }) {
             let deny_event = PolicyDenyBuilder::new(
                 ctx.profile_id.clone(),
@@ -1467,39 +1496,31 @@ impl SignHandler {
             ));
         }
 
-        let ceremony_policy = ctx
-            .profile_config
-            .rule_for_rp(&normalized_rp)
-            .map(|rule| rule.authenticate)
-            .ok_or_else(|| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
-                    PolicyDenyReason::ActionNotAllowed,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "RP policy does not allow signing",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        match ceremony_policy.authorization {
-            passless_core::agent::AgentAuthorization::Deny => {
+        // Resolve against the live policy and granted rules on every request, never against a copy
+        // of the profile configuration frozen into the session at creation (plan R16).
+        // TODO(P5): also compare the revocation epoch here and again immediately before key use.
+        let matched = self.policy_runtime.resolve(
+            &ctx.profile_id,
+            &IntentAction::Authenticate,
+            &normalized_rp,
+        );
+        match matched.action {
+            RuleAction::Deny => {
                 self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
-                    "RP policy denies signing",
+                    if matched.rule == RuleIdentity::None {
+                        "RP policy does not allow signing"
+                    } else {
+                        "RP policy denies signing"
+                    },
                     RecommendedAction::FixRequest,
                 ));
             }
-            // `confirm` (legacy `supervised`) and the ADR `request` action act as `deny` until the
-            // escalation service lands (P7): an agent ceremony never shows a prompt and never falls back
-            // to the human or native path (ADR 0014 §7, invariant 25).
-            passless_core::agent::AgentAuthorization::Confirm => {
+            // `request` acts as `deny` until the escalation service lands (P7): an agent ceremony
+            // never shows a prompt and never falls back to the human or native path (ADR 0014
+            // section 7, invariant 25).
+            RuleAction::Request => {
                 self.record_policy_deny(
                     ctx,
                     &normalized_rp,
@@ -1507,45 +1528,17 @@ impl SignHandler {
                 );
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
-                    "escalation is unavailable: policy requires human confirmation",
+                    "escalation is unavailable: policy requires approval",
                     RecommendedAction::FixRequest,
                 ));
             }
-            passless_core::agent::AgentAuthorization::Allow => {}
+            RuleAction::Allow => {}
         }
 
-        // Human evidence cannot be produced in an agent ceremony before P7: a rule that needs a human
-        // for UP, or for UV, is denied (fail closed, never a prompt or the native path).
-        // `human_verification_prompt` is still parsed so that existing configs load; it can only make
-        // this check stricter, never open a human path. P4 replaces the schema.
-        let human_uv_required = ceremony_policy.user_verification
-            == passless_core::agent::UserVerificationSource::Human
-            && (req.user_verification
-                || self.security_config.always_uv
-                || ctx.profile_config.human_verification_prompt
-                    == passless_core::agent::HumanVerificationPrompt::Always);
-        if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
-            || human_uv_required
-        {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::EscalationUnavailable);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "escalation is unavailable: policy requires human verification",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let up = ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Agent;
-        let uv = ceremony_policy.user_verification
-            == passless_core::agent::UserVerificationSource::Agent;
-        if (req.user_verification || self.security_config.always_uv) && !uv {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "user verification is required but the configured evidence source is none",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // `allow` is the only agent evidence: UP and UV come from the validated agent session,
+        // never from a rule field or the RP's `userVerification` request (ADR 0014 section 7).
+        let up = true;
+        let uv = true;
 
         let mut storage = self.credential_storage.lock().map_err(|_| {
             ProtocolError::new(
@@ -1577,24 +1570,16 @@ impl SignHandler {
         for credential_ref in &credential_scope {
             if let Ok(credential_id) =
                 Self::resolve_credential_id(&mut storage, credential_ref, &normalized_rp)
+                && let Ok(credential) = storage.read(&credential_id)
             {
-                let encoded_id = b64u_encode(&credential_id);
-                if !req.allow_credentials.is_empty() && !req.allow_credentials.contains(&encoded_id)
-                {
-                    continue;
-                }
-                if let Ok(credential) = storage.read(&credential_id) {
-                    if credential.extensions.cred_protect == Some(2)
-                        && !uv
-                        && req.allow_credentials.is_empty()
-                    {
-                        continue;
-                    }
-                    candidates.push((credential_id, credential_ref.clone(), credential.created));
-                }
+                candidates.push((credential_id, credential_ref.clone(), credential.created));
             }
         }
 
+        // ADR 0014 section 10.1: pinning (`credential_refs`, then `credential:<ref>`) narrows the
+        // candidate set first, and a non-empty `allowCredentials` chooses within that pinned set.
+        let candidates =
+            Self::narrow_candidates(candidates, &req.allow_credentials, &matched.selection);
         if candidates.is_empty() && !req.allow_credentials.is_empty() {
             self.record_policy_deny(
                 ctx,
@@ -1608,29 +1593,17 @@ impl SignHandler {
             ));
         }
 
-        let credential_selection = ctx
-            .profile_config
-            .credential_selection_for_rp(&normalized_rp);
         let cred_id =
-            Self::select_credential(candidates, &req.allow_credentials, &credential_selection)
-                .inspect_err(|_| {
-                    self.record_policy_deny(
-                        ctx,
-                        &normalized_rp,
-                        PolicyDenyReason::CredentialNotMatch,
-                    );
-                })?;
+            Self::select_credential(candidates, &matched.selection).inspect_err(|_| {
+                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::CredentialNotMatch);
+            })?;
 
         let allow_event = PolicyAllowBuilder::new(
             ctx.profile_id.clone(),
             AuditAction::Authenticate,
             &normalized_rp,
         )
-        .evidence_sources(
-            &ceremony_policy.authorization.to_string(),
-            &ceremony_policy.user_presence.to_string(),
-            &ceremony_policy.user_verification.to_string(),
-        )
+        .evidence_sources("allow", "agent", "agent")
         .build();
         self.audit_gate.record(allow_event).map_err(|_| {
             ProtocolError::new(
@@ -1736,9 +1709,25 @@ impl SignHandler {
         ))
     }
 
-    fn select_credential(
+    /// Narrow the candidate set (ADR 0014 section 10.1): a `credential:<ref>` selection pins
+    /// first, then a non-empty `allowCredentials` keeps only the listed credentials. The pin is
+    /// applied before `allowCredentials`, so an `allowCredentials` entry never overrides it.
+    fn narrow_candidates(
         mut candidates: Vec<(Vec<u8>, CredentialRef, i64)>,
         allow_credentials: &[String],
+        selection: &CredentialSelection,
+    ) -> Vec<(Vec<u8>, CredentialRef, i64)> {
+        if let CredentialSelection::Credential(pinned) = selection {
+            candidates.retain(|(_, candidate_ref, _)| candidate_ref == pinned);
+        }
+        if !allow_credentials.is_empty() {
+            candidates.retain(|(id, _, _)| allow_credentials.contains(&b64u_encode(id)));
+        }
+        candidates
+    }
+
+    fn select_credential(
+        mut candidates: Vec<(Vec<u8>, CredentialRef, i64)>,
         selection: &CredentialSelection,
     ) -> Result<Vec<u8>, ProtocolError> {
         if candidates.is_empty() {
@@ -1749,35 +1738,19 @@ impl SignHandler {
             ));
         }
 
-        if !allow_credentials.is_empty() {
-            for allowed in allow_credentials {
-                if let Some(index) = candidates
-                    .iter()
-                    .position(|(id, _, _)| b64u_encode(id) == *allowed)
-                {
-                    return Ok(candidates.swap_remove(index).0);
-                }
-            }
+        // Exactly one permitted credential remains: use it.
+        if candidates.len() == 1 {
+            return Ok(candidates.remove(0).0);
         }
 
         match selection {
-            CredentialSelection::Credential(reference) => candidates
-                .into_iter()
-                .find(|(_, candidate_ref, _)| candidate_ref == reference)
-                .map(|(id, _, _)| id)
-                .ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::NotFound,
-                        "configured credential does not match this WebAuthn request",
-                        RecommendedAction::FixRequest,
-                    )
-                }),
-            CredentialSelection::Single if candidates.len() != 1 => Err(ProtocolError::new(
-                ErrorCode::Conflict,
-                "multiple discoverable credentials match; configure credential_selection",
-                RecommendedAction::FixRequest,
-            )),
-            CredentialSelection::Single => Ok(candidates.remove(0).0),
+            CredentialSelection::Credential(_) | CredentialSelection::Single => {
+                Err(ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "multiple discoverable credentials match; configure credential_selection",
+                    RecommendedAction::FixRequest,
+                ))
+            }
             CredentialSelection::FirstMatching => {
                 candidates.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(candidates.remove(0).0)
@@ -1899,8 +1872,13 @@ mod tests {
 
     #[test]
     fn test_origin_verification_rejects_http() {
+        // Plain `http://` is rejected for every host except exactly `localhost`.
         assert!(!verify_origin_structural(
             "http://example.com",
+            "example.com"
+        ));
+        assert!(!verify_origin_structural(
+            "http://login.example.com",
             "example.com"
         ));
     }
@@ -1998,8 +1976,145 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_origin_rejects_bad_ports_and_confusable_origins() {
+        for origin in [
+            "http://localhost:0",
+            "https://example.com:0",
+            "http://localhost:+80",
+            "https://example.com:+443",
+            "http://localhost:",
+            "http://localhost:-1",
+            "http://localhost:65536",
+            "http://localhost:80a",
+            "ws://localhost",
+            "wss://localhost",
+            "http://a@localhost",
+            "http://localhost@evil.com",
+            "http://localhost.",
+            "http://localhost.evil.com",
+            "http://foo.localhost",
+            "http://LOCALHOST.",
+        ] {
+            assert!(parse_origin(origin).is_none(), "{origin} must be rejected");
+        }
+        assert_eq!(
+            parse_origin("http://localhost:65535").unwrap().port,
+            Some(65535)
+        );
+        assert_eq!(
+            parse_origin("http://LOCALHOST:8080").unwrap().host,
+            "localhost"
+        );
+        // A trailing-dot localhost never satisfies the exact `localhost` RP.
+        assert!(!verify_origin_structural("https://localhost.", "localhost"));
+        assert!(!verify_origin_structural("http://localhost:0", "localhost"));
+    }
+
+    #[test]
     fn test_parse_origin_invalid_scheme() {
         assert!(parse_origin("http://example.com").is_none());
+        assert!(parse_origin("ftp://example.com").is_none());
+        assert!(parse_origin("example.com").is_none());
+    }
+
+    #[test]
+    fn test_parse_origin_accepts_http_localhost_only() {
+        let plain = parse_origin("http://localhost").unwrap();
+        assert_eq!(plain.scheme, OriginScheme::Http);
+        assert_eq!(plain.host, "localhost");
+        assert_eq!(plain.port, None);
+
+        let with_port = parse_origin("http://localhost:8080").unwrap();
+        assert_eq!(with_port.scheme, OriginScheme::Http);
+        assert_eq!(with_port.port, Some(8080));
+
+        let https = parse_origin("https://localhost").unwrap();
+        assert_eq!(https.scheme, OriginScheme::Https);
+        assert_eq!(parse_origin("http://LOCALHOST").unwrap().host, "localhost");
+
+        // `http://` is never accepted for another host, including subdomains of localhost.
+        for rejected in [
+            "http://example.com",
+            "http://foo.localhost",
+            "http://localhost.evil.com",
+            "http://127.0.0.1",
+            "http://[::1]",
+            "http://localhost@evil.com",
+            "http://localhost/path",
+            "http://localhost?x=1",
+        ] {
+            assert!(parse_origin(rejected).is_none(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn test_origin_verification_localhost_is_exact() {
+        for accepted in [
+            "http://localhost",
+            "http://localhost:8080",
+            "https://localhost",
+            "https://localhost:8443",
+        ] {
+            assert!(
+                verify_origin_structural(accepted, "localhost"),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "http://example.com",
+            "http://foo.localhost",
+            "http://localhost.evil.com",
+            "https://foo.localhost",
+            "https://localhost.evil.com",
+            "http://127.0.0.1",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                !verify_origin_structural(rejected, "localhost"),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_http_localhost_origin_is_not_valid_for_other_rps() {
+        assert!(!verify_origin_structural("http://localhost", "example.com"));
+        assert!(!verify_origin_structural(
+            "http://localhost:8080",
+            "example.com"
+        ));
+        assert!(!verify_origin_structural(
+            "https://example.com",
+            "localhost"
+        ));
+    }
+
+    #[test]
+    fn test_verify_origin_context_rejects_scheme_mismatch_with_top_origin() {
+        assert!(!verify_origin_context(
+            "http://localhost",
+            Some("https://localhost"),
+            false,
+            "localhost"
+        ));
+        assert!(!verify_origin_context(
+            "https://localhost",
+            Some("http://localhost"),
+            false,
+            "localhost"
+        ));
+        assert!(verify_origin_context(
+            "http://localhost:8080",
+            Some("http://localhost:8080"),
+            false,
+            "localhost"
+        ));
+        assert!(!verify_origin_context(
+            "http://localhost:8080",
+            Some("http://localhost:9090"),
+            false,
+            "localhost"
+        ));
     }
 
     #[test]
@@ -2980,8 +3095,8 @@ mod tests {
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::{CredentialFilter, CredentialStorage};
         use passless_core::agent::{
-            AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, BrowserScope, UserPresenceSource, UserVerificationSource,
+            AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, BrowserScope,
+            CredentialSelection, GrantSource,
         };
         use passless_core::config::SecurityConfig;
         use soft_fido2::{
@@ -3054,7 +3169,7 @@ mod tests {
                     sign_count: AtomicUsize::new(0),
                 }
             }
-            fn sign_calls(&self) -> usize {
+            pub fn sign_calls(&self) -> usize {
                 self.sign_count.load(Ordering::Acquire)
             }
         }
@@ -3085,15 +3200,18 @@ mod tests {
         pub struct WriteCountingStorage {
             creds: Mutex<Vec<soft_fido2::Credential>>,
             write_count: AtomicU64,
+            /// Remaining matches of the iteration started by the last `read_first`.
+            queue: std::collections::VecDeque<soft_fido2::Credential>,
         }
         impl WriteCountingStorage {
             pub fn new() -> Self {
                 Self {
                     creds: Mutex::new(Vec::new()),
                     write_count: AtomicU64::new(0),
+                    queue: std::collections::VecDeque::new(),
                 }
             }
-            fn writes(&self) -> u64 {
+            pub fn writes(&self) -> u64 {
                 self.write_count.load(Ordering::Acquire)
             }
             pub fn add_cred(&self, cred: soft_fido2::Credential) {
@@ -3105,26 +3223,24 @@ mod tests {
                 &mut self,
                 filter: CredentialFilter,
             ) -> soft_fido2::Result<soft_fido2::Credential> {
-                let creds = self.creds.lock().unwrap();
-                match filter {
-                    CredentialFilter::ByRp(rp_id) => creds
-                        .iter()
-                        .find(|c| c.rp.id == rp_id)
-                        .cloned()
-                        .ok_or(soft_fido2::Error::Other),
-                    CredentialFilter::None => {
-                        creds.first().cloned().ok_or(soft_fido2::Error::Other)
+                let matches: Vec<soft_fido2::Credential> = {
+                    let creds = self.creds.lock().unwrap();
+                    match filter {
+                        CredentialFilter::ByRp(rp_id) => {
+                            creds.iter().filter(|c| c.rp.id == rp_id).cloned().collect()
+                        }
+                        CredentialFilter::None => creds.clone(),
+                        CredentialFilter::ById(id) => {
+                            creds.iter().filter(|c| c.id == id).cloned().collect()
+                        }
+                        CredentialFilter::ByHash(_) => Vec::new(),
                     }
-                    CredentialFilter::ById(id) => creds
-                        .iter()
-                        .find(|c| c.id == id)
-                        .cloned()
-                        .ok_or(soft_fido2::Error::Other),
-                    CredentialFilter::ByHash(_) => Err(soft_fido2::Error::Other),
-                }
+                };
+                self.queue = matches.into();
+                self.queue.pop_front().ok_or(soft_fido2::Error::Other)
             }
             fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
-                Err(soft_fido2::Error::Other)
+                self.queue.pop_front().ok_or(soft_fido2::Error::Other)
             }
             fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
                 self.creds
@@ -3155,6 +3271,82 @@ mod tests {
             }
         }
 
+        /// A granted-rules store whose answer a test flips at runtime (plan R16: ceremonies resolve
+        /// live, never against state copied at session creation).
+        #[derive(Default)]
+        pub struct ToggleGrants(pub std::sync::atomic::AtomicBool);
+        impl ToggleGrants {
+            pub fn set(&self, granted: bool) {
+                self.0.store(granted, Ordering::Release);
+            }
+        }
+        impl GrantSource for ToggleGrants {
+            fn is_granted(&self, _profile_id: &ProfileId, _rp_id: &str) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+
+        pub fn rule(rp_id: &str, authenticate: RuleAction, register: RuleAction) -> AgentRpRule {
+            AgentRpRule {
+                rp_id: rp_id.to_string(),
+                register,
+                authenticate,
+                credential_selection: None,
+            }
+        }
+
+        pub fn allow_rule(rp_id: &str) -> AgentRpRule {
+            rule(rp_id, RuleAction::Allow, RuleAction::Deny)
+        }
+
+        pub fn request_rule(rp_id: &str) -> AgentRpRule {
+            rule(rp_id, RuleAction::Request, RuleAction::Deny)
+        }
+
+        pub fn deny_rule(rp_id: &str) -> AgentRpRule {
+            rule(rp_id, RuleAction::Deny, RuleAction::Deny)
+        }
+
+        pub fn test_profile_config(
+            rules: Vec<AgentRpRule>,
+            credential_refs: Option<Vec<passless_core::agent::CredentialRef>>,
+            selection: CredentialSelection,
+        ) -> AgentProfileConfig {
+            AgentProfileConfig {
+                max_operations: 64,
+                max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
+                credential_selection: selection,
+                mode: AgentMode::SameUser,
+                principal_user: String::new(),
+                credential_refs,
+                max_grant_ttl: None,
+                max_session_ttl: None,
+                storage: None,
+                rules,
+                legacy: Default::default(),
+                device: None,
+                start_url: None,
+                browser_command: None,
+                browser_user: None,
+                browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
+            }
+        }
+
+        pub fn test_agent_config(profile_config: AgentProfileConfig) -> AgentConfig {
+            let mut profiles = BTreeMap::new();
+            profiles.insert("test-profile".to_string(), profile_config);
+            AgentConfig {
+                enabled: true,
+                profiles,
+                audit_path: Some(std::path::PathBuf::from("/tmp/test-audit")),
+                acknowledge_global_same_user: vec!["test-profile".to_string()],
+                acknowledge_same_user_registration: vec!["test-profile".to_string()],
+            }
+        }
+
         pub struct TestFixture {
             profile_id: ProfileId,
             grant_id: passless_core::agent::GrantId,
@@ -3165,7 +3357,6 @@ mod tests {
             audit_gate: Arc<AuditGate>,
             operation_lock: Arc<Mutex<()>>,
             security_config: SecurityConfig,
-            profile_config: AgentProfileConfig,
         }
 
         impl TestFixture {
@@ -3209,50 +3400,12 @@ mod tests {
                 })
                     as Box<dyn CredentialStorage>));
 
-                let profile_config = AgentProfileConfig {
-                    max_operations: 64,
-                    max_concurrent_sessions: 1,
-                    browser_scope: BrowserScope::Session,
-                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
-                    human_verification_prompt:
-                        passless_core::agent::config::HumanVerificationPrompt::Always,
-                    mode: AgentMode::Isolated,
-                    principal_user: String::new(),
-                    rp_ids: vec!["example.com".to_string()],
-                    require_uv: false,
-                    credential_refs: Some(vec![cred_ref.clone()]),
-                    max_grant_ttl: None,
-                    max_session_ttl: None,
-                    storage: None,
-                    registration_allowed: false,
-                    rules: vec![AgentRpRule {
-                        credential_selection: None,
-                        rp_id: "example.com".to_string(),
-                        register: AgentCeremonyPolicy::deny(),
-                        authenticate: AgentCeremonyPolicy {
-                            authorization: AgentAuthorization::Allow,
-                            user_presence: UserPresenceSource::Agent,
-                            user_verification: UserVerificationSource::Agent,
-                        },
-                    }],
-                    device: None,
-                    start_url: None,
-                    browser_command: None,
-                    browser_user: None,
-                    browser_runtime_root: None,
-                    browser_cdp_expose: None,
-                    browser_cdp_port: None,
-                };
-
-                let mut profiles = BTreeMap::new();
-                profiles.insert("test-profile".to_string(), profile_config.clone());
-                let agent_config = AgentConfig {
-                    enabled: true,
-                    profiles,
-                    audit_path: Some(audit_path),
-                    acknowledge_global_same_user: vec![],
-                    acknowledge_same_user_registration: vec![],
-                };
+                let profile_config = test_profile_config(
+                    vec![allow_rule("example.com")],
+                    Some(vec![cred_ref.clone()]),
+                    CredentialSelection::Single,
+                );
+                let agent_config = test_agent_config(profile_config);
 
                 let clock = Arc::new(MockClock::new());
                 let mono_clock = Arc::new(MockMonoClock::new());
@@ -3305,7 +3458,6 @@ mod tests {
                     audit_gate,
                     operation_lock,
                     security_config,
-                    profile_config,
                 }
             }
 
@@ -3324,7 +3476,7 @@ mod tests {
                 SignContext {
                     profile_id: self.profile_id.clone(),
                     active_grant_id: self.grant_id.clone(),
-                    profile_config: self.profile_config.clone(),
+                    max_operations: 64,
                 }
             }
 
@@ -3352,7 +3504,7 @@ mod tests {
             assert_eq!(storage.writes(), storage_writes_before);
         }
 
-        fn get_write_counting_storage(
+        pub fn get_write_counting_storage(
             storage: &Arc<Mutex<Box<dyn CredentialStorage>>>,
         ) -> &WriteCountingStorage {
             let boxed = storage.lock().unwrap();
@@ -3409,12 +3561,10 @@ mod tests {
                 extensions: soft_fido2::Extensions::default(),
             });
 
-            let mut profile_config = f.profile_config.clone();
-            profile_config.credential_refs = None;
             let ctx = SignContext {
                 profile_id: f.profile_id.clone(),
                 active_grant_id: dynamic_grant_id,
-                profile_config,
+                max_operations: 64,
             };
             let mut req = f.make_req();
             req.allow_credentials = vec![b64u_encode(&new_credential_id)];
@@ -3484,7 +3634,7 @@ mod tests {
             let ctx = SignContext {
                 profile_id: f.profile_id.clone(),
                 active_grant_id: fake_grant_id,
-                profile_config: f.profile_config.clone(),
+                max_operations: 64,
             };
             let req = f.make_req();
             let writes_before = get_write_counting_storage(&f.storage).writes();
@@ -3505,7 +3655,7 @@ mod tests {
             let ctx = SignContext {
                 profile_id: wrong_profile,
                 active_grant_id: f.grant_id.clone(),
-                profile_config: f.profile_config.clone(),
+                max_operations: 64,
             };
             let req = f.make_req();
             let writes_before = get_write_counting_storage(&f.storage).writes();
@@ -3672,10 +3822,7 @@ mod tests {
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::CredentialStorage;
 
-        use passless_core::agent::{
-            AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, BrowserScope, UserPresenceSource, UserVerificationSource,
-        };
+        use passless_core::agent::{AgentProfileConfig, AgentRpRule, CredentialSelection};
         use passless_core::config::SecurityConfig;
 
         use soft_fido2::{
@@ -3683,7 +3830,6 @@ mod tests {
             SoftwareCredentialKeyProvider, User,
         };
 
-        use std::collections::BTreeMap;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
@@ -3748,22 +3894,86 @@ mod tests {
                 .collect()
         }
 
+        /// One credential held by the fixture's storage.
+        #[derive(Clone)]
+        struct StoredCred {
+            id: Vec<u8>,
+            rp_id: &'static str,
+            created: i64,
+        }
+
+        fn stored(id: u8, rp_id: &'static str, created: i64) -> StoredCred {
+            StoredCred {
+                id: vec![id; 32],
+                rp_id,
+                created,
+            }
+        }
+
+        fn cred_ref_of(id: &[u8]) -> passless_core::agent::CredentialRef {
+            passless_core::agent::CredentialRef::with_default_domain(id)
+        }
+
+        /// How a fixture is built. The default is one credential for `example.com`, an explicit
+        /// grant naming that credential, and profile selection `single`.
+        #[derive(Clone)]
+        struct FixtureSpec {
+            rules: Vec<AgentRpRule>,
+            grant_rp_ids: Vec<&'static str>,
+            selection: CredentialSelection,
+            credentials: Vec<StoredCred>,
+            /// A dynamic grant (empty credential list: discover per request) instead of an
+            /// explicit grant naming every stored credential.
+            dynamic_grant: bool,
+        }
+
+        impl FixtureSpec {
+            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&'static str>) -> Self {
+                Self {
+                    rules,
+                    grant_rp_ids,
+                    selection: CredentialSelection::Single,
+                    credentials: vec![stored(1, "example.com", 0)],
+                    dynamic_grant: false,
+                }
+            }
+        }
+
         struct AuditTestFixture {
+            spec: FixtureSpec,
             profile_id: ProfileId,
             grant_id: passless_core::agent::GrantId,
             clock: Arc<MockClock>,
             policy_runtime: Arc<PolicyRuntime>,
+            granted_rules: Arc<ToggleGrants>,
             storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
             key_provider: Arc<RecordingKeyProvider>,
             audit_gate: Arc<AuditGate>,
             operation_lock: Arc<Mutex<()>>,
             security_config: SecurityConfig,
-            profile_config: AgentProfileConfig,
             audit_dir: std::path::PathBuf,
         }
 
         impl AuditTestFixture {
-            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&str>) -> Self {
+            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&'static str>) -> Self {
+                Self::from_spec(FixtureSpec::new(rules, grant_rp_ids))
+            }
+
+            fn profile_config(spec: &FixtureSpec) -> AgentProfileConfig {
+                let credential_refs = if spec.dynamic_grant {
+                    None
+                } else {
+                    Some(
+                        spec.credentials
+                            .iter()
+                            .map(|c| cred_ref_of(&c.id))
+                            .collect(),
+                    )
+                };
+                test_profile_config(spec.rules.clone(), credential_refs, spec.selection.clone())
+            }
+
+            fn from_spec(spec: FixtureSpec) -> Self {
                 let tmp = tempfile::tempdir().unwrap();
                 let audit_path = tmp.path().to_path_buf();
                 drop(tmp);
@@ -3776,99 +3986,40 @@ mod tests {
                 let audit_gate = Arc::new(AuditGate::open(&audit_path).unwrap());
 
                 let profile_id = ProfileId::new("test-profile").unwrap();
-                let cred_id = vec![1u8; 32];
-                let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred_id);
-
                 let provider = SoftwareCredentialKeyProvider;
-                let generated = provider.generate(-7).unwrap();
-                let key = generated.key;
 
-                let cred = soft_fido2::Credential {
-                    id: cred_id.clone(),
-                    rp: RelyingParty::new("example.com".into()),
-                    user: User::new(vec![1, 2, 3]),
-                    sign_count: 0,
-                    alg: -7,
-                    key: key.clone(),
-                    created: 0,
-                    discoverable: true,
-                    backup_state: CredentialBackupState::NotEligible,
-                    extensions: soft_fido2::Extensions::default(),
-                };
+                let storage_impl = WriteCountingStorage::new();
+                for stored in &spec.credentials {
+                    storage_impl.add_cred(soft_fido2::Credential {
+                        id: stored.id.clone(),
+                        rp: RelyingParty::new(stored.rp_id.into()),
+                        user: User::new(vec![1, 2, 3, stored.id[0]]),
+                        sign_count: 0,
+                        alg: -7,
+                        key: provider.generate(-7).unwrap().key,
+                        created: stored.created,
+                        discoverable: true,
+                        backup_state: CredentialBackupState::NotEligible,
+                        extensions: soft_fido2::Extensions::default(),
+                    });
+                }
+                let storage = Arc::new(Mutex::new(
+                    Box::new(storage_impl) as Box<dyn CredentialStorage>
+                ));
 
-                let storage = Arc::new(Mutex::new(Box::new({
-                    let s = WriteCountingStorage::new();
-                    s.add_cred(cred);
-                    s
-                })
-                    as Box<dyn CredentialStorage>));
-
-                let rp_id_strings: Vec<String> =
-                    grant_rp_ids.iter().map(|s| s.to_string()).collect();
-
-                let profile_config = AgentProfileConfig {
-                    max_operations: 64,
-                    max_concurrent_sessions: 1,
-                    browser_scope: BrowserScope::Session,
-                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
-                    human_verification_prompt:
-                        passless_core::agent::config::HumanVerificationPrompt::Always,
-                    mode: AgentMode::Isolated,
-                    principal_user: String::new(),
-                    rp_ids: rp_id_strings.clone(),
-                    require_uv: false,
-                    credential_refs: Some(vec![cred_ref.clone()]),
-                    max_grant_ttl: None,
-                    max_session_ttl: None,
-                    storage: None,
-                    registration_allowed: false,
-                    rules,
-                    device: None,
-                    start_url: None,
-                    browser_command: None,
-                    browser_user: None,
-                    browser_runtime_root: None,
-                    browser_cdp_expose: None,
-                    browser_cdp_port: None,
-                };
-
-                let mut profiles = BTreeMap::new();
-                profiles.insert("test-profile".to_string(), profile_config.clone());
-                let agent_config = AgentConfig {
-                    enabled: true,
-                    profiles,
-                    audit_path: Some(audit_path.clone()),
-                    acknowledge_global_same_user: vec![],
-                    acknowledge_same_user_registration: vec![],
-                };
+                let agent_config = test_agent_config(Self::profile_config(&spec));
 
                 let clock = Arc::new(MockClock::new());
                 let mono_clock = Arc::new(MockMonoClock::new());
+                let granted_rules = Arc::new(ToggleGrants::default());
 
                 let policy_runtime = Arc::new(
                     PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
-                        .unwrap(),
+                        .unwrap()
+                        .with_grant_source(granted_rules.clone()),
                 );
 
-                let session_id = passless_core::agent::PrincipalSessionId::new();
-                let endpoint_id = passless_core::agent::EndpointId::new();
-
-                let grant_req_id = policy_runtime
-                    .admin_request_grant(GrantRequestParams {
-                        profile_id: profile_id.clone(),
-                        session_id: session_id.clone(),
-                        endpoint_id: endpoint_id.clone(),
-                        principal_digest: [0u8; 32],
-                        rp_ids: grant_rp_ids.iter().map(|s| s.to_string()).collect(),
-                        credentials: vec![cred_ref.clone()],
-                        requested_ttl_secs: 300,
-                    })
-                    .unwrap();
-
-                let authority = intent::admin_authority();
-                let grant_id = policy_runtime
-                    .admin_approve_grant(&grant_req_id, &authority)
-                    .unwrap();
+                let grant_id = Self::approve_grant(&policy_runtime, &profile_id, &spec);
 
                 let key_provider = Arc::new(RecordingKeyProvider::new());
                 let operation_lock = Arc::new(Mutex::new(()));
@@ -3877,6 +4028,7 @@ mod tests {
                     disable_core_dumps: false,
                     constant_signature_counter: true,
                     enable_credential_backup: false,
+                    // The RP-facing UV knobs must not matter under `allow`.
                     always_uv: false,
                     user_verification_registration: false,
                     user_verification_authentication: false,
@@ -3884,32 +4036,66 @@ mod tests {
                 };
 
                 Self {
+                    spec,
                     profile_id,
                     grant_id,
                     clock,
                     policy_runtime,
+                    granted_rules,
                     storage,
                     key_provider,
                     audit_gate,
                     operation_lock,
                     security_config,
-                    profile_config,
                     audit_dir: audit_path,
                 }
             }
 
-            fn default_allow() -> Self {
-                let rule = AgentRpRule {
-                    credential_selection: None,
-                    rp_id: "example.com".to_string(),
-                    register: AgentCeremonyPolicy::deny(),
-                    authenticate: AgentCeremonyPolicy {
-                        authorization: AgentAuthorization::Allow,
-                        user_presence: UserPresenceSource::Agent,
-                        user_verification: UserVerificationSource::Agent,
+            fn approve_grant(
+                policy_runtime: &PolicyRuntime,
+                profile_id: &ProfileId,
+                spec: &FixtureSpec,
+            ) -> passless_core::agent::GrantId {
+                let params = GrantRequestParams {
+                    profile_id: profile_id.clone(),
+                    session_id: passless_core::agent::PrincipalSessionId::new(),
+                    endpoint_id: passless_core::agent::EndpointId::new(),
+                    principal_digest: [0u8; 32],
+                    rp_ids: spec.grant_rp_ids.iter().map(|s| s.to_string()).collect(),
+                    credentials: if spec.dynamic_grant {
+                        vec![]
+                    } else {
+                        spec.credentials
+                            .iter()
+                            .map(|c| cred_ref_of(&c.id))
+                            .collect()
                     },
+                    requested_ttl_secs: 300,
                 };
-                Self::new(vec![rule], vec!["example.com"])
+                let request_id = if spec.dynamic_grant {
+                    policy_runtime.admin_request_dynamic_grant(params).unwrap()
+                } else {
+                    policy_runtime.admin_request_grant(params).unwrap()
+                };
+                policy_runtime
+                    .admin_approve_grant(&request_id, &intent::admin_authority())
+                    .unwrap()
+            }
+
+            /// Replace the live policy with `rules`. A reload revokes every grant (ADR 0014
+            /// section 6.4: the revocation epoch), so a fresh grant is approved on the new
+            /// generation; the handler is untouched and the context carries nothing but the new
+            /// grant id, so only the live policy can explain the next result.
+            fn reload_rules(&mut self, rules: Vec<AgentRpRule>) {
+                self.spec.rules = rules;
+                let config = test_agent_config(Self::profile_config(&self.spec));
+                self.policy_runtime.reload(&config).unwrap();
+                self.grant_id =
+                    Self::approve_grant(&self.policy_runtime, &self.profile_id, &self.spec);
+            }
+
+            fn default_allow() -> Self {
+                Self::new(vec![allow_rule("example.com")], vec!["example.com"])
             }
 
             fn make_handler(&self) -> SignHandler {
@@ -3927,7 +4113,7 @@ mod tests {
                 SignContext {
                     profile_id: self.profile_id.clone(),
                     active_grant_id: self.grant_id.clone(),
-                    profile_config: self.profile_config.clone(),
+                    max_operations: 64,
                 }
             }
 
@@ -3942,44 +4128,36 @@ mod tests {
                     cross_origin: false,
                 }
             }
-        }
 
-        fn allow_rule(rp_id: &str) -> AgentRpRule {
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
+            /// A request for `localhost` (an `http://` origin, as a local dev server would send).
+            fn make_localhost_req(&self) -> SignAssertionRequest {
+                SignAssertionRequest {
+                    origin: "http://localhost:8080".to_string(),
+                    rp_id: "localhost".to_string(),
+                    ..self.make_req()
+                }
+            }
+
+            /// The `(kind, reason)` of every policy record, oldest first.
+            fn policy_records(&self) -> Vec<(String, Option<String>)> {
+                find_policy_events(&read_audit_events(&self.audit_dir))
+                    .iter()
+                    .map(|e| {
+                        (
+                            e["kind"].as_str().unwrap().to_string(),
+                            e["reason"].as_str().map(str::to_string),
+                        )
+                    })
+                    .collect()
             }
         }
 
-        fn confirm_rule(rp_id: &str) -> AgentRpRule {
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Confirm,
-                    user_presence: UserPresenceSource::Human,
-                    user_verification: UserVerificationSource::None,
-                },
-            }
-        }
-
-        fn deny_rule(rp_id: &str) -> AgentRpRule {
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.to_string(),
-                register: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Confirm,
-                    user_presence: UserPresenceSource::Human,
-                    user_verification: UserVerificationSource::None,
-                },
-                authenticate: AgentCeremonyPolicy::deny(),
+        fn signed_credential(result: Result<PrincipalResponse, ProtocolError>) -> Vec<u8> {
+            match result.expect("sign should succeed") {
+                PrincipalResponse::SignAssertionResult(resp) => {
+                    super::b64u_decode(&resp.credential_id_b64u).unwrap()
+                }
+                _ => panic!("expected SignAssertionResult"),
             }
         }
 
@@ -4125,17 +4303,7 @@ mod tests {
 
         #[test]
         fn counter_increments_in_monotonic_mode_response() {
-            let rule = AgentRpRule {
-                credential_selection: None,
-                rp_id: "example.com".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
-            };
-            let mut f = AuditTestFixture::new(vec![rule], vec!["example.com"]);
+            let mut f = AuditTestFixture::new(vec![allow_rule("example.com")], vec!["example.com"]);
             f.security_config.constant_signature_counter = false;
 
             let handler = f.make_handler();
@@ -4170,37 +4338,66 @@ mod tests {
         }
 
         #[test]
-        fn confirm_policy_blocks_autonomous_sign() {
-            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
-            let handler = f.make_handler();
-            let ctx = f.make_ctx();
-            let req = f.make_req();
-            let result = handler.sign(&ctx, &req);
-            assert!(result.is_err());
+        fn request_rule_denies_with_escalation_unavailable_and_signs_nothing() {
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_ne!(err.code, ErrorCode::InteractionRequired);
+            assert!(err.message.contains("escalation is unavailable"));
+            assert_eq!(f.key_provider.sign_calls(), 0, "no signature");
+            assert_eq!(
+                get_write_counting_storage(&f.storage).writes(),
+                writes_before
+            );
+            assert_eq!(
+                f.policy_records(),
+                vec![(
+                    "policy.deny".to_string(),
+                    Some("escalation_unavailable".into())
+                )]
+            );
         }
 
         #[test]
-        fn confirm_policy_deny_audit_event() {
-            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
-            let handler = f.make_handler();
-            let ctx = f.make_ctx();
-            let req = f.make_req();
-            let result = handler.sign(&ctx, &req);
-            assert!(result.is_err());
-
-            let events = read_audit_events(&f.audit_dir);
-            let policy_events = find_policy_events(&events);
-            assert!(!policy_events.is_empty());
-            let last = policy_events.last().unwrap();
-            assert_eq!(last["kind"], "policy.deny");
-            assert_eq!(last["reason"], "escalation_unavailable");
+        fn deny_rule_denies_with_action_not_allowed_and_signs_nothing() {
+            let f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0, "no signature");
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
         }
 
-        // `confirm` (legacy `supervised`) and ADR `request` act as `deny` until P7: HTTP 403, an audited
-        // deny, no allow record, and no human or native path (the handler has no prompt dependency).
         #[test]
-        fn confirm_policy_is_denied_with_403_and_audited_without_human_path() {
-            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
+        fn unmatched_rp_denies_with_action_not_allowed() {
+            // The grant covers the RP, but no rule does: default deny.
+            let f = AuditTestFixture::new(vec![allow_rule("other.com")], vec!["example.com"]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        // `request` acts as `deny` until P7: HTTP 403, an audited deny, no allow record, and no
+        // human or native path (the handler has no prompt dependency).
+        #[test]
+        fn request_rule_is_denied_with_403_and_audited_without_human_path() {
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
             let handler = f.make_handler();
             let ctx = f.make_ctx();
             let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
@@ -4223,30 +4420,520 @@ mod tests {
         }
 
         #[test]
-        fn allow_rule_needing_human_evidence_is_denied_not_prompted() {
-            let rule = AgentRpRule {
-                credential_selection: None,
-                rp_id: "example.com".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Human,
-                    user_verification: UserVerificationSource::Agent,
-                },
+        fn allow_signs_with_agent_evidence_and_up_uv_flags_even_without_rp_uv_request() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            // The RP does not ask for UV, and `always_uv` is off: UP and UV are still set because
+            // `allow` is agent-session evidence (ADR 0014 section 7).
+            req.user_verification = false;
+            assert!(!f.security_config.always_uv);
+
+            let result = f.make_handler().sign(&f.make_ctx(), &req);
+            let resp = match result.unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => resp,
+                _ => panic!("expected SignAssertionResult"),
             };
-            let f = AuditTestFixture::new(vec![rule], vec!["example.com"]);
+            let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+            assert_eq!(auth_data[32] & 0x05, 0x05, "UP and UV flags");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            let events = read_audit_events(&f.audit_dir);
+            let allow = find_policy_events(&events)
+                .into_iter()
+                .find(|e| e["kind"] == "policy.allow")
+                .expect("allow event");
+            assert_eq!(
+                (
+                    allow["authorization"].as_str(),
+                    allow["user_presence"].as_str(),
+                    allow["user_verification"].as_str(),
+                ),
+                (Some("allow"), Some("agent"), Some("agent")),
+                "{allow}"
+            );
+        }
+
+        #[test]
+        fn allow_sets_up_and_uv_when_the_rp_requests_uv_too() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.user_verification = true;
+            let resp = match f.make_handler().sign(&f.make_ctx(), &req).unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => resp,
+                _ => panic!("expected SignAssertionResult"),
+            };
+            let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+            assert_eq!(auth_data[32] & 0x05, 0x05);
+        }
+
+        // --- live resolution (plan R16) ---
+
+        #[test]
+        fn granted_rule_upgrades_request_live_through_the_same_context() {
+            // The granted-rules store changes while the handler and context stay as they were:
+            // `request` is denied, then allowed once the store grants it, then denied again when
+            // the grant is withdrawn.
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert!(err.message.contains("escalation is unavailable"));
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            f.granted_rules.set(true);
+            handler
+                .sign(&ctx, &f.make_req())
+                .expect("a granted request rule is an allow");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            f.granted_rules.set(false);
+            assert!(handler.sign(&ctx, &f.make_req()).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 1, "no further signature");
+        }
+
+        #[test]
+        fn orphaned_grant_is_inert_when_the_rule_is_deny() {
+            let f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            f.granted_rules.set(true);
             let err = f
                 .make_handler()
                 .sign(&f.make_ctx(), &f.make_req())
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
-
-            let events = read_audit_events(&f.audit_dir);
-            let policy_events = find_policy_events(&events);
-            assert_eq!(policy_events.last().unwrap()["kind"], "policy.deny");
+            assert_eq!(f.key_provider.sign_calls(), 0);
             assert_eq!(
-                policy_events.last().unwrap()["reason"],
-                "escalation_unavailable"
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        #[test]
+        fn reload_to_deny_is_enforced_by_the_unchanged_handler() {
+            let mut f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            handler
+                .sign(&f.make_ctx(), &f.make_req())
+                .expect("allowed before the reload");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            f.reload_rules(vec![deny_rule("example.com")]);
+            let err = handler.sign(&f.make_ctx(), &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                1,
+                "no signature after the reload"
+            );
+            assert_eq!(
+                f.policy_records().last().unwrap(),
+                &("policy.deny".to_string(), Some("action_not_allowed".into()))
+            );
+
+            // Removing the rule entirely is the same default deny.
+            f.reload_rules(vec![]);
+            assert!(handler.sign(&f.make_ctx(), &f.make_req()).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn reload_from_deny_to_allow_is_enforced_by_the_unchanged_handler() {
+            let mut f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            assert!(handler.sign(&f.make_ctx(), &f.make_req()).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            f.reload_rules(vec![allow_rule("example.com")]);
+            handler
+                .sign(&f.make_ctx(), &f.make_req())
+                .expect("allowed after the reload");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            f.reload_rules(vec![request_rule("example.com")]);
+            let err = handler.sign(&f.make_ctx(), &f.make_req()).unwrap_err();
+            assert!(err.message.contains("escalation is unavailable"));
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn grant_from_before_a_reload_is_not_usable_after_it() {
+            // The reload bumps the revocation epoch: the old context's grant is gone, whatever the
+            // new rules say.
+            let mut f = AuditTestFixture::default_allow();
+            let stale_ctx = f.make_ctx();
+            f.reload_rules(vec![allow_rule("example.com")]);
+            let err = f
+                .make_handler()
+                .sign(&stale_ctx, &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records().last().unwrap().1.as_deref(),
+                Some("grant_not_found")
+            );
+        }
+
+        // --- selection (ADR 0014 section 10.1) ---
+
+        fn two_credentials_spec(
+            rules: Vec<AgentRpRule>,
+            selection: CredentialSelection,
+        ) -> FixtureSpec {
+            FixtureSpec {
+                selection,
+                // A is older than B.
+                credentials: vec![
+                    stored(0xA1, "example.com", 10),
+                    stored(0xB2, "example.com", 20),
+                ],
+                dynamic_grant: true,
+                ..FixtureSpec::new(rules, vec!["example.com"])
+            }
+        }
+
+        fn id_a() -> Vec<u8> {
+            vec![0xA1; 32]
+        }
+
+        fn id_b() -> Vec<u8> {
+            vec![0xB2; 32]
+        }
+
+        #[test]
+        fn pinned_credential_wins_over_allow_credentials() {
+            let mut rule = allow_rule("example.com");
+            rule.credential_selection = Some(CredentialSelection::Credential(cred_ref_of(&id_a())));
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![rule],
+                CredentialSelection::Single,
+            ));
+
+            // allowCredentials names only B, but the rule pins A: denied, and B never signs.
+            let mut only_b = f.make_req();
+            only_b.allow_credentials = vec![b64u_encode(&id_b())];
+            let err = f.make_handler().sign(&f.make_ctx(), &only_b).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0, "B must never sign");
+            assert_eq!(
+                f.policy_records(),
+                vec![(
+                    "policy.deny".to_string(),
+                    Some("allow_credentials_mismatch".into())
+                )]
+            );
+
+            // allowCredentials [A, B]: the pinned set is [A], so A signs.
+            let mut both = f.make_req();
+            both.allow_credentials = vec![b64u_encode(&id_b()), b64u_encode(&id_a())];
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &both));
+            assert_eq!(signed, id_a());
+
+            // No allowCredentials at all: still A.
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_a());
+        }
+
+        #[test]
+        fn allow_credentials_chooses_within_the_set_and_beats_single() {
+            // Two candidates, selection `single`: an allowCredentials entry that leaves exactly one
+            // permitted credential is used (step 3), and none at all is a conflict (step 4).
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Single,
+            ));
+            let mut only_b = f.make_req();
+            only_b.allow_credentials = vec![b64u_encode(&id_b())];
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &only_b));
+            assert_eq!(signed, id_b());
+
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict);
+            assert_eq!(f.key_provider.sign_calls(), 1, "the conflict signs nothing");
+        }
+
+        #[test]
+        fn first_allow_credentials_entry_no_longer_wins_with_several_candidates() {
+            // Both credentials are listed and the selection is `single`: the old "first
+            // allowCredentials entry wins" behaviour is gone, so this is a conflict.
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Single,
+            ));
+            let mut both = f.make_req();
+            both.allow_credentials = vec![b64u_encode(&id_b()), b64u_encode(&id_a())];
+            let err = f.make_handler().sign(&f.make_ctx(), &both).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records().last().unwrap().1.as_deref(),
+                Some("credential_not_match")
+            );
+        }
+
+        #[test]
+        fn exact_rule_applies_profile_selection_newest_and_first_matching() {
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Newest,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_b(), "newest picks the credential created last");
+
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::FirstMatching,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_a(), "first-matching is stable by credential id");
+        }
+
+        #[test]
+        fn rule_selection_overrides_profile_selection() {
+            let mut rule = allow_rule("example.com");
+            rule.credential_selection = Some(CredentialSelection::FirstMatching);
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![rule],
+                CredentialSelection::Newest,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_a());
+        }
+
+        #[test]
+        fn wildcard_forces_single_even_when_the_profile_default_is_newest() {
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule(ANY_RP_ID)],
+                CredentialSelection::Newest,
+            ));
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::Conflict,
+                "a wildcard never picks an account"
+            );
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // Control: the same profile with an exact rule does pick the newest credential.
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Newest,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_b());
+        }
+
+        #[test]
+        fn wildcard_with_a_single_credential_signs_it() {
+            let f = AuditTestFixture::from_spec(FixtureSpec {
+                dynamic_grant: true,
+                ..FixtureSpec::new(vec![allow_rule(ANY_RP_ID)], vec!["*"])
+            });
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, vec![1u8; 32]);
+            let events = read_audit_events(&f.audit_dir);
+            let allow = find_policy_events(&events)
+                .into_iter()
+                .find(|e| e["kind"] == "policy.allow")
+                .unwrap();
+            assert_eq!(allow["rp_id"], "example.com");
+        }
+
+        // --- pure selection functions ---
+
+        fn cand(id: u8, created: i64) -> (Vec<u8>, passless_core::agent::CredentialRef, i64) {
+            let id = vec![id; 32];
+            let reference = cred_ref_of(&id);
+            (id, reference, created)
+        }
+
+        #[test]
+        fn narrow_candidates_pins_before_allow_credentials() {
+            let candidates = vec![cand(1, 0), cand(2, 0), cand(3, 0)];
+            let pin = CredentialSelection::Credential(cred_ref_of(&[1u8; 32]));
+
+            let ids = |v: Vec<(Vec<u8>, _, i64)>| v.into_iter().map(|c| c.0[0]).collect::<Vec<_>>();
+
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[],
+                    &pin
+                )),
+                vec![1]
+            );
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[b64u_encode(&[2u8; 32])],
+                    &pin
+                )),
+                Vec::<u8>::new(),
+                "allowCredentials cannot widen a pin"
+            );
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[b64u_encode(&[2u8; 32]), b64u_encode(&[1u8; 32])],
+                    &pin
+                )),
+                vec![1]
+            );
+            // Without a pin, allowCredentials narrows.
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[b64u_encode(&[3u8; 32])],
+                    &CredentialSelection::Single
+                )),
+                vec![3]
+            );
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates,
+                    &[],
+                    &CredentialSelection::Newest
+                )),
+                vec![1, 2, 3]
+            );
+        }
+
+        #[test]
+        fn select_credential_follows_the_selection_rules() {
+            let one = vec![cand(9, 5)];
+            // Exactly one candidate is used whatever the selection says.
+            for selection in [
+                CredentialSelection::Single,
+                CredentialSelection::FirstMatching,
+                CredentialSelection::Newest,
+            ] {
+                assert_eq!(
+                    SignHandler::select_credential(one.clone(), &selection).unwrap(),
+                    vec![9; 32]
+                );
+            }
+
+            let several = vec![cand(3, 1), cand(1, 7), cand(2, 7)];
+            assert_eq!(
+                SignHandler::select_credential(several.clone(), &CredentialSelection::Single)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Conflict
+            );
+            assert_eq!(
+                SignHandler::select_credential(
+                    several.clone(),
+                    &CredentialSelection::FirstMatching
+                )
+                .unwrap(),
+                vec![1; 32]
+            );
+            // Newest, ties broken by credential id.
+            assert_eq!(
+                SignHandler::select_credential(several, &CredentialSelection::Newest).unwrap(),
+                vec![1; 32]
+            );
+            assert_eq!(
+                SignHandler::select_credential(vec![], &CredentialSelection::Newest)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::NotFound
+            );
+        }
+
+        // --- localhost (ADR 0014 section 6.1) ---
+
+        fn localhost_spec(rules: Vec<AgentRpRule>, grant: Vec<&'static str>) -> FixtureSpec {
+            FixtureSpec {
+                credentials: vec![stored(7, "localhost", 0)],
+                dynamic_grant: true,
+                ..FixtureSpec::new(rules, grant)
+            }
+        }
+
+        #[test]
+        fn localhost_signs_through_an_exact_allow_rule() {
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule("localhost")],
+                vec!["localhost"],
+            ));
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &f.make_localhost_req()),
+            );
+            assert_eq!(signed, vec![7; 32]);
+            let events = read_audit_events(&f.audit_dir);
+            let last = find_policy_events(&events).last().cloned().unwrap().clone();
+            assert_eq!(last["kind"], "policy.allow");
+            assert_eq!(last["rp_id"], "localhost");
+        }
+
+        #[test]
+        fn localhost_also_accepts_an_https_origin() {
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule("localhost")],
+                vec!["localhost"],
+            ));
+            let mut req = f.make_localhost_req();
+            req.origin = "https://localhost:8443".to_string();
+            signed_credential(f.make_handler().sign(&f.make_ctx(), &req));
+        }
+
+        #[test]
+        fn localhost_is_denied_through_a_wildcard_only_rule() {
+            // Resolution: the grant names `localhost`, but only the wildcard rule exists, and the
+            // wildcard never matches `localhost`.
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule(ANY_RP_ID)],
+                vec!["localhost"],
+            ));
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_localhost_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        #[test]
+        fn localhost_is_excluded_from_a_wildcard_grant_scope() {
+            // The grant scope `*` does not cover `localhost` either (checked before resolution).
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule(ANY_RP_ID), allow_rule("localhost")],
+                vec!["*"],
+            ));
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_localhost_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("rp_id_not_match".into()))]
+            );
+        }
+
+        #[test]
+        fn localhost_http_origin_is_rejected_for_another_rp() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "http://localhost:8080".to_string();
+            let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("origin_invalid".into()))]
             );
         }
 
@@ -4774,8 +5461,6 @@ mod tests {
         use super::*;
         use crate::agent::audit::test_support::read_audit_events;
         use passless_core::agent::protocol::RegisterCredentialRequest;
-        use passless_core::agent::{AgentAuthorization, AgentCeremonyPolicy};
-        use passless_core::agent::{UserPresenceSource, UserVerificationSource};
         use soft_fido2::SoftwareCredentialKeyProvider;
 
         struct Rig {
@@ -4796,27 +5481,38 @@ mod tests {
                     .unwrap();
                 let store_tmp = tempfile::tempdir().unwrap();
 
-                let mut profile_config = sign_handler_tests::TestFixture::new(true)
-                    .make_ctx()
-                    .profile_config;
-                profile_config.rules[0].register = AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                };
+                let profile_config = sign_handler_tests::test_profile_config(
+                    vec![sign_handler_tests::rule(
+                        "example.com",
+                        RuleAction::Deny,
+                        RuleAction::Allow,
+                    )],
+                    None,
+                    CredentialSelection::Single,
+                );
+                let clock = Arc::new(sign_handler_tests::MockClock::new());
+                let policy_runtime = Arc::new(
+                    PolicyRuntime::new(
+                        &sign_handler_tests::test_agent_config(profile_config),
+                        clock,
+                        Arc::new(sign_handler_tests::MockMonoClock::new()),
+                        None,
+                    )
+                    .unwrap(),
+                );
                 let storage: Arc<Mutex<Box<dyn CredentialStorage>>> =
                     Arc::new(Mutex::new(Box::new(
                         crate::storage::LocalStorageAdapter::new(store_tmp.path().into()).unwrap(),
                     )));
                 let handler = Arc::new(RegisterHandler {
+                    policy_runtime,
                     credential_storage: storage.clone(),
                     audit_gate: Arc::new(AuditGate::open(&audit_dir).unwrap()),
                     key_provider: Arc::new(SoftwareCredentialKeyProvider),
                     security_config: SecurityConfig::default(),
                     operation_lock: Arc::new(Mutex::new(())),
                 });
-                let ctx =
-                    RegisterContext::new(ProfileId::new("test-profile").unwrap(), profile_config);
+                let ctx = RegisterContext::new(ProfileId::new("test-profile").unwrap(), 64);
                 Self {
                     registry: Arc::new(SignContextRegistry::new()),
                     handler,

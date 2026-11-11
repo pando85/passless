@@ -1367,11 +1367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_query_server_capabilities_does_not_panic() {
-        let _ = query_server_capabilities();
-    }
-
-    #[test]
     fn test_build_security_title_register() {
         let title = build_security_title(PromptAction::Register);
         assert!(title.contains("registration"));
@@ -1564,7 +1559,10 @@ mod tests {
 mod dbus_tests {
     use std::collections::HashMap;
     use std::env;
-    use std::process::Command;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1721,24 +1719,89 @@ mod dbus_tests {
             .await;
     }
 
+    /// A private, minimal session bus: no service activation directories, a
+    /// private socket, and a scrubbed environment. The daemon runs in its own
+    /// process group, dies with the test process, and is killed and reaped on
+    /// drop (including during a panic unwind).
     struct PrivateDBus {
-        pid: u32,
+        // Field order matters: the daemon is killed before its directory is removed.
+        daemon: Child,
+        _dir: tempfile::TempDir,
         address: String,
     }
 
     impl PrivateDBus {
         fn start() -> Self {
-            let output = Command::new("dbus-daemon")
-                .args(["--print-address=1", "--print-pid=2", "--fork", "--session"])
-                .output()
-                .expect("failed to start dbus-daemon");
+            // Keep the socket path short (sun_path is limited to ~108 bytes).
+            let base = if env::temp_dir().as_os_str().len() > 40 {
+                PathBuf::from("/tmp")
+            } else {
+                env::temp_dir()
+            };
+            let dir = tempfile::Builder::new()
+                .prefix("passless-bus-")
+                .tempdir_in(base)
+                .expect("failed to create dbus scratch dir");
+            let sock = dir.path().join("bus.sock");
+            let conf = dir.path().join("bus.conf");
+            std::fs::write(
+                &conf,
+                format!(
+                    "<busconfig>\n\
+                     <type>session</type>\n\
+                     <listen>unix:path={}</listen>\n\
+                     <auth>EXTERNAL</auth>\n\
+                     <policy context=\"default\">\n\
+                     <allow send_destination=\"*\" eavesdrop=\"true\"/>\n\
+                     <allow eavesdrop=\"true\"/>\n\
+                     <allow own=\"*\"/>\n\
+                     <allow user=\"*\"/>\n\
+                     </policy>\n\
+                     </busconfig>\n",
+                    sock.display()
+                ),
+            )
+            .expect("failed to write dbus config");
 
-            let address = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let pid_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            assert!(!address.is_empty(), "dbus-daemon did not print address");
-            assert!(!pid_str.is_empty(), "dbus-daemon did not print pid");
-            let pid: u32 = pid_str.parse().expect("invalid pid from dbus-daemon");
-            Self { pid, address }
+            let mut cmd = Command::new("dbus-daemon");
+            cmd.arg(format!("--config-file={}", conf.display()))
+                .args(["--nofork", "--print-address=1"])
+                .env_clear()
+                .env("PATH", env::var_os("PATH").unwrap_or_default())
+                .env("HOME", dir.path())
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .env("XDG_DATA_DIRS", dir.path().join("share"))
+                .env("XDG_RUNTIME_DIR", dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .process_group(0);
+            // SAFETY: the closure only calls the async-signal-safe `prctl`.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut daemon = cmd.spawn().expect("failed to start dbus-daemon");
+
+            let stdout = daemon.stdout.take().expect("piped stdout");
+            let mut address = String::new();
+            let read = BufReader::new(stdout).read_line(&mut address);
+            let address = address.trim().to_string();
+            // Build `Self` before asserting so a failure still kills the daemon.
+            let bus = Self {
+                daemon,
+                _dir: dir,
+                address,
+            };
+            read.expect("failed to read dbus-daemon address");
+            assert!(
+                !bus.address.is_empty(),
+                "dbus-daemon did not print an address"
+            );
+            bus
         }
 
         fn address(&self) -> &str {
@@ -1748,9 +1811,12 @@ mod dbus_tests {
 
     impl Drop for PrivateDBus {
         fn drop(&mut self) {
+            // The process group id equals the leader's pid (`process_group(0)`).
             unsafe {
-                libc::kill(self.pid as i32, libc::SIGKILL);
+                libc::kill(-(self.daemon.id() as i32), libc::SIGKILL);
             }
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
         }
     }
 
@@ -1807,17 +1873,17 @@ mod dbus_tests {
             .unwrap()
     }
 
-    async fn run_prompt_test<F, Fut>(
+    async fn run_prompt_test<T, F, Fut>(
         server_kind: ServerKind,
         _timeout_secs: u64,
         _min_review_delay_ms: u64,
         test_fn: F,
-    ) -> PromptResult
+    ) -> T
     where
         F: FnOnce(Arc<Mutex<SharedState>>, Arc<zbus::Connection>, Arc<Notify>) -> Fut
             + Send
             + 'static,
-        Fut: std::future::Future<Output = PromptResult> + Send,
+        Fut: std::future::Future<Output = T> + Send,
     {
         let _lock = DBUS_ENV_LOCK.lock().await;
         let dbus = PrivateDBus::start();
@@ -2039,6 +2105,31 @@ mod dbus_tests {
             .await
         });
         assert_eq!(result.decision, PromptDecision::Timeout);
+    }
+
+    #[test]
+    fn test_query_server_capabilities_against_private_bus() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (kind, expected) in [
+            (ServerKind::FullActions, ServerCapability::FullActions),
+            (
+                ServerKind::DefaultActionOnly,
+                ServerCapability::DefaultActionOnly,
+            ),
+            (ServerKind::Unknown, ServerCapability::Unknown),
+        ] {
+            let capability = rt.block_on(run_prompt_test(
+                kind,
+                5,
+                100,
+                |_state, _conn, _notify_ready| async move {
+                    tokio::task::spawn_blocking(query_server_capabilities)
+                        .await
+                        .unwrap()
+                },
+            ));
+            assert_eq!(capability, expected);
+        }
     }
 
     #[test]

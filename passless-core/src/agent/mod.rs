@@ -2,12 +2,12 @@ pub mod config;
 pub mod ids;
 pub mod policy;
 pub mod protocol;
+pub mod resolve;
 
 pub use config::{
-    AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-    AgentRpRule, AgentStorageConfig, BoundedDuration, BrowserScope, CredentialSelection,
-    DeviceIdentity, HumanVerificationPrompt, UserPresenceSource, UserVerificationSource,
-    validate_rp_id,
+    AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, AgentStorageConfig, BoundedDuration,
+    BrowserScope, CredentialSelection, DeviceIdentity, LOCALHOST_RP_ID, LegacyConfigUse,
+    MAX_GRANT_RP_IDS, PolicyAction, RuleAction, validate_rp_id,
 };
 pub use ids::{
     BrowserLeaseId, CredentialRef, EndpointId, GrantId, IdError, IntentId, PendingRequestId,
@@ -27,4 +27,7 @@ pub use protocol::{
     ProfileStatusResponse, ProfileSummary, ProtocolError, ProtocolVersion, RecommendedAction,
     RegisterCredentialRequest, RegisterCredentialResponse, RequestFrame, ResponseFrame, Role,
     SeqpacketCodec, SessionInfo, SessionList, Validate, ValidationErrors,
+};
+pub use resolve::{
+    GrantSource, MatchedRule, NoGrantedRules, RuleIdentity, resolve_rules, rule_for_host,
 };

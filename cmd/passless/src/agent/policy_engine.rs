@@ -6,9 +6,10 @@ use std::time::Duration;
 use passless_core::agent::config::{ANY_RP_ID, validate_rp_id};
 use passless_core::agent::protocol::IntentAction;
 use passless_core::agent::{
-    AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-    AgentRpRule, CredentialRef, EndpointId, GrantId, IntentId, PendingRequestId, Policy,
-    PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId,
+    AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
+    EndpointId, GrantId, GrantSource, IntentId, MatchedRule, NoGrantedRules, PendingRequestId,
+    Policy, PolicyAction, PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId,
+    ProfileId, RuleAction, resolve_rules,
 };
 
 use super::audit::AuditGate;
@@ -177,9 +178,9 @@ pub struct PolicySnapshot {
     pub max_grant_ttl_secs: u64,
     pub max_session_ttl_secs: u64,
     pub max_concurrent_grants: u64,
-    pub require_uv: bool,
-    pub registration_allowed: bool,
     pub allowed_actions: BTreeSet<String>,
+    /// Profile default credential selection (a rule may override it; the wildcard is `single`).
+    pub credential_selection: CredentialSelection,
     pub rules: Vec<AgentRpRule>,
 }
 
@@ -221,31 +222,36 @@ impl PolicySnapshot {
         self.allowed_actions.contains(action_str)
     }
 
-    pub fn ceremony_policy(
+    /// Resolve `(action, rp_id)` over this snapshot's rules (ADR 0014 section 6.2).
+    pub fn resolve(
         &self,
-        rp_id: &str,
         action: &IntentAction,
-    ) -> Option<&AgentCeremonyPolicy> {
-        let normalized = validate_rp_id(rp_id).ok()?;
-        let rule = self
-            .rules
-            .iter()
-            .find(|rule| rule.rp_id.trim().eq_ignore_ascii_case(&normalized))
-            .or_else(|| {
-                self.rules
-                    .iter()
-                    .find(|rule| rule.rp_id.trim() == ANY_RP_ID)
-            })?;
-        Some(match action {
-            IntentAction::Register => &rule.register,
-            IntentAction::Authenticate => &rule.authenticate,
-        })
+        rp_id: &str,
+        grants: &dyn GrantSource,
+    ) -> MatchedRule {
+        resolve_rules(
+            &self.rules,
+            &self.credential_selection,
+            policy_action(action),
+            rp_id,
+            |rp_id| grants.is_granted(&self.profile_id, rp_id),
+        )
+    }
+}
+
+fn policy_action(action: &IntentAction) -> PolicyAction {
+    match action {
+        IntentAction::Register => PolicyAction::Register,
+        IntentAction::Authenticate => PolicyAction::Authenticate,
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PolicyGenerationSnapshot {
     pub generation_id: PolicyGenerationId,
+    /// Monotonic policy generation: 1 at start, bumped by every reload (ADR 0014 section 6.4).
+    /// It accompanies the digest; the digest identifies content, the generation orders loads.
+    pub generation: u64,
     pub snapshots: Vec<PolicySnapshot>,
     pub digest: PolicyDigest,
     pub created_at_mono: u64,
@@ -589,6 +595,12 @@ pub struct PolicyRuntime {
     pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
     audit_gate: Option<Arc<AuditGate>>,
+    /// The granted-rules store consulted to upgrade a `request` (ADR 0014 section 6.2). It holds
+    /// nothing until the escalation service lands (P7).
+    granted_rules: Arc<dyn GrantSource>,
+    /// Serializes reloads, so the numeric generation is read, bumped and published atomically:
+    /// concurrent reloads get distinct, strictly increasing generations.
+    reload_lock: Mutex<()>,
 }
 
 impl PolicyRuntime {
@@ -598,7 +610,7 @@ impl PolicyRuntime {
         monotonic_clock: Arc<dyn MonotonicClock>,
         audit_gate: Option<Arc<AuditGate>>,
     ) -> Result<Self, PolicyRuntimeError> {
-        let generation = Self::compile_generation(config, clock.monotonic_secs())?;
+        let generation = Self::compile_generation(config, clock.monotonic_secs(), 1)?;
         let gen_arc = Arc::new(generation);
 
         let intent_store = IntentStore::with_defaults(Box::new(ArcMonotonicClockAdapter(
@@ -627,12 +639,21 @@ impl PolicyRuntime {
             pending_requests: Mutex::new(HashMap::new()),
             clock,
             audit_gate,
+            granted_rules: Arc::new(NoGrantedRules),
+            reload_lock: Mutex::new(()),
         })
+    }
+
+    /// Install the granted-rules store consulted by [`Self::resolve`].
+    pub fn with_grant_source(mut self, granted_rules: Arc<dyn GrantSource>) -> Self {
+        self.granted_rules = granted_rules;
+        self
     }
 
     pub fn compile_generation(
         config: &AgentConfig,
         now_mono: u64,
+        generation: u64,
     ) -> Result<PolicyGenerationSnapshot, PolicyRuntimeError> {
         let mut snapshots = Vec::new();
 
@@ -641,7 +662,12 @@ impl PolicyRuntime {
                 PolicyRuntimeError::Compilation(format!("invalid profile id '{}': {}", name, e))
             })?;
 
-            let snapshot = Self::compile_snapshot(&profile_id, profile_config)?;
+            let snapshot = Self::compile_snapshot(
+                &profile_id,
+                profile_config,
+                config.acknowledge_global_same_user.contains(name),
+                config.acknowledge_same_user_registration.contains(name),
+            )?;
             snapshots.push(snapshot);
         }
 
@@ -663,6 +689,7 @@ impl PolicyRuntime {
 
         Ok(PolicyGenerationSnapshot {
             generation_id,
+            generation,
             snapshots,
             digest,
             created_at_mono: now_mono,
@@ -672,8 +699,10 @@ impl PolicyRuntime {
     fn compile_snapshot(
         profile_id: &ProfileId,
         config: &AgentProfileConfig,
+        acknowledged_global_same_user: bool,
+        acknowledged_same_user_registration: bool,
     ) -> Result<PolicySnapshot, PolicyRuntimeError> {
-        let mut rules = config.effective_rules();
+        let mut rules = config.rules.clone();
         rules.sort_by_key(|rule| rule.rp_id.trim().to_ascii_lowercase());
         let mut normalized_rp_ids: Vec<String> = rules
             .iter()
@@ -687,14 +716,11 @@ impl PolicyRuntime {
         let mut allowed_actions = BTreeSet::new();
         if rules
             .iter()
-            .any(|rule| rule.authenticate.authorization != AgentAuthorization::Deny)
+            .any(|rule| rule.authenticate != RuleAction::Deny)
         {
             allowed_actions.insert("authenticate".to_string());
         }
-        if rules
-            .iter()
-            .any(|rule| rule.register.authorization != AgentAuthorization::Deny)
-        {
+        if rules.iter().any(|rule| rule.register != RuleAction::Deny) {
             allowed_actions.insert("register".to_string());
         }
 
@@ -719,14 +745,23 @@ impl PolicyRuntime {
             normalized_rp_ids: normalized_rp_ids.clone(),
             credential_refs: credential_refs.clone(),
             allowed_actions: allowed_actions.iter().cloned().collect(),
-            registration_allowed: config.registration_allowed || config.allows_registration(),
-            require_uv: config.require_uv,
             max_concurrent_grants,
             max_grant_ttl: max_grant_ttl_secs,
             max_session_ttl: max_session_ttl_secs,
+            max_operations: u64::from(config.max_operations),
+            max_concurrent_sessions: u64::from(config.max_concurrent_sessions),
+            browser_scope: config.browser_scope.to_string(),
             principal_user: config.principal_user.clone(),
             start_url: config.start_url.clone(),
             browser_argv: config.browser_command.clone().unwrap_or_default(),
+            browser_cdp_expose: config
+                .browser_cdp_expose
+                .map(|mode| mode.to_string())
+                .unwrap_or_default(),
+            browser_cdp_port: u64::from(config.browser_cdp_port.unwrap_or(0)),
+            credential_selection: config.credential_selection.clone(),
+            acknowledged_global_same_user,
+            acknowledged_same_user_registration,
             storage_backend,
             storage_path,
             browser_user: config.browser_user.clone().unwrap_or_default(),
@@ -753,9 +788,8 @@ impl PolicyRuntime {
             max_grant_ttl_secs,
             max_session_ttl_secs,
             max_concurrent_grants,
-            require_uv: config.require_uv,
-            registration_allowed: config.registration_allowed || config.allows_registration(),
             allowed_actions,
+            credential_selection: config.credential_selection.clone(),
             rules,
         })
     }
@@ -764,22 +798,33 @@ impl PolicyRuntime {
         self.current.read().unwrap().clone()
     }
 
-    pub fn ceremony_policy(
+    /// Resolve `(action, rp_id)` for `profile_id` against the LIVE compiled policy (the current
+    /// generation, replaced on reload) and the granted-rules store (ADR 0014 sections 6.2, 6.4).
+    ///
+    /// Ceremonies resolve through this on every request instead of a profile configuration copied
+    /// into the session at creation (plan R16). An unknown profile resolves to default deny.
+    pub fn resolve(
         &self,
         profile_id: &ProfileId,
-        generation_id: &PolicyGenerationId,
-        generation_digest: &PolicyDigest,
-        rp_id: &str,
         action: &IntentAction,
-    ) -> Option<AgentCeremonyPolicy> {
-        let generation = self.current.read().unwrap();
-        if generation.generation_id != *generation_id || generation.digest != *generation_digest {
-            return None;
+        rp_id: &str,
+    ) -> MatchedRule {
+        let generation = self.current.read().unwrap().clone();
+        match generation.find_snapshot(profile_id) {
+            Some(snapshot) => snapshot.resolve(action, rp_id, self.granted_rules.as_ref()),
+            None => resolve_rules(
+                &[],
+                &CredentialSelection::default(),
+                policy_action(action),
+                rp_id,
+                |_| false,
+            ),
         }
-        generation
-            .find_snapshot(profile_id)
-            .and_then(|snapshot| snapshot.ceremony_policy(rp_id, action))
-            .cloned()
+    }
+
+    /// The numeric policy generation (1 at start, bumped by every reload).
+    pub fn generation_number(&self) -> u64 {
+        self.current.read().unwrap().generation
     }
 
     pub fn digest(&self) -> PolicyDigest {
@@ -893,8 +938,10 @@ impl PolicyRuntime {
     }
 
     pub fn reload(&self, config: &AgentConfig) -> Result<PolicyDigest, PolicyRuntimeError> {
+        let _reload = self.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
         let now_mono = self.clock.monotonic_secs();
-        let new_generation = Self::compile_generation(config, now_mono)?;
+        let next_generation = self.current.read().unwrap().generation.saturating_add(1);
+        let new_generation = Self::compile_generation(config, now_mono, next_generation)?;
         let new_digest = new_generation.digest.clone();
 
         let mut new_registries = HashMap::new();
@@ -1009,16 +1056,10 @@ impl PolicyRuntime {
             );
         }
 
-        let ceremony_policy = match snapshot.ceremony_policy(&request.rp_id, &request.action) {
-            Some(policy) => policy,
-            None => {
-                return (
-                    Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
-                    None,
-                );
-            }
-        };
-        if ceremony_policy.authorization == AgentAuthorization::Deny {
+        // `request` denies here: escalation lands with P7, and this intent hand-off is removed there.
+        let matched =
+            snapshot.resolve(&request.action, &request.rp_id, self.granted_rules.as_ref());
+        if matched.action != RuleAction::Allow {
             return (
                 Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
                 None,
@@ -1083,14 +1124,6 @@ impl PolicyRuntime {
                 );
             }
         };
-
-        if snapshot.require_uv && !request.uv_enforced {
-            let _ = intents.rollback_claim(&intent_id);
-            return (
-                Decision::deny(ReasonCode::UvRequired, OperatorAction::VerifyUser),
-                None,
-            );
-        }
 
         let ceremony_id = CeremonyId::new();
 
@@ -1746,9 +1779,8 @@ impl MonotonicClock for ArcMonotonicClockAdapter {
 mod tests {
     use super::*;
     use passless_core::agent::{
-        AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-        AgentRpRule, AgentStorageConfig, BrowserScope, CredentialRef, ProfileId,
-        UserPresenceSource, UserVerificationSource,
+        AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, AgentStorageConfig, BrowserScope,
+        CredentialRef, ProfileId, RuleAction, RuleIdentity,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1818,13 +1850,9 @@ mod tests {
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
-                credential_selection: passless_core::agent::config::CredentialSelection::Single,
-                human_verification_prompt:
-                    passless_core::agent::config::HumanVerificationPrompt::Always,
+                credential_selection: CredentialSelection::Single,
                 mode: AgentMode::Isolated,
                 principal_user: "test-user".to_string(),
-                rp_ids: rp_ids.into_iter().map(|s| s.to_string()).collect(),
-                require_uv: false,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -1832,8 +1860,20 @@ mod tests {
                     path: PathBuf::from(format!("/tmp/test-{}/creds", profile_name)),
                     pin_path: PathBuf::from(format!("/tmp/test-{}/pin", profile_name)),
                 }),
-                registration_allowed,
-                rules: vec![],
+                rules: rp_ids
+                    .into_iter()
+                    .map(|rp_id| AgentRpRule {
+                        rp_id: rp_id.to_string(),
+                        register: if registration_allowed {
+                            RuleAction::Allow
+                        } else {
+                            RuleAction::Deny
+                        },
+                        authenticate: RuleAction::Allow,
+                        credential_selection: None,
+                    })
+                    .collect(),
+                legacy: Default::default(),
                 device: None,
                 start_url: None,
                 browser_command: None,
@@ -1881,27 +1921,67 @@ mod tests {
         }
     }
 
+    fn rule(rp_id: &str, authenticate: RuleAction, register: RuleAction) -> AgentRpRule {
+        AgentRpRule {
+            rp_id: rp_id.to_string(),
+            register,
+            authenticate,
+            credential_selection: None,
+        }
+    }
+
+    /// A granted-rules store with a fixed set of `(profile, rp_id)` entries.
+    struct TestGrants(Vec<(String, String)>);
+
+    impl TestGrants {
+        fn of(entries: &[(&str, &str)]) -> Arc<Self> {
+            Arc::new(Self(
+                entries
+                    .iter()
+                    .map(|(p, r)| (p.to_string(), r.to_string()))
+                    .collect(),
+            ))
+        }
+    }
+
+    impl GrantSource for TestGrants {
+        fn is_granted(&self, profile_id: &ProfileId, rp_id: &str) -> bool {
+            self.0
+                .iter()
+                .any(|(p, r)| p == profile_id.as_str() && r == rp_id)
+        }
+    }
+
+    fn same_user_config(name: &str, rules: Vec<AgentRpRule>) -> AgentConfig {
+        let mut config = make_isolated_config(name, vec![], false);
+        config.acknowledge_global_same_user = vec![name.to_string()];
+        let profile = config.profiles.get_mut(name).unwrap();
+        profile.mode = AgentMode::SameUser;
+        profile.storage = None;
+        profile.rules = rules;
+        config
+    }
+
     #[test]
     fn test_compile_isolated_snapshot() {
         let config = make_isolated_config("test", vec!["example.com"], true);
-        let _clock = test_clock();
-        let generation = PolicyRuntime::compile_generation(&config, 0).unwrap();
+        let generation = PolicyRuntime::compile_generation(&config, 0, 1).unwrap();
 
         assert_eq!(generation.snapshots.len(), 1);
         let s = &generation.snapshots[0];
         assert_eq!(s.profile_id.as_str(), "test");
         assert_eq!(s.mode, AgentMode::Isolated);
         assert_eq!(s.normalized_rp_ids, vec!["example.com"]);
-        assert!(s.registration_allowed);
         assert!(s.allowed_actions.contains("register"));
         assert!(s.allowed_actions.contains("authenticate"));
+        assert_eq!(s.credential_selection, CredentialSelection::Single);
     }
 
     #[test]
     fn test_snapshot_deterministic_digest() {
         let config = make_isolated_config("det", vec!["example.com"], false);
-        let gen1 = PolicyRuntime::compile_generation(&config, 0).unwrap();
-        let gen2 = PolicyRuntime::compile_generation(&config, 0).unwrap();
+        let gen1 = PolicyRuntime::compile_generation(&config, 0, 1).unwrap();
+        let gen2 = PolicyRuntime::compile_generation(&config, 0, 1).unwrap();
 
         assert_eq!(gen1.snapshots[0].digest, gen2.snapshots[0].digest);
     }
@@ -1910,86 +1990,415 @@ mod tests {
     fn test_compile_explicit_allow_and_deny_rules() {
         let mut config = make_isolated_config("rules", vec![], false);
         let profile = config.profiles.get_mut("rules").unwrap();
-        profile.rules = vec![AgentRpRule {
-            credential_selection: None,
-            rp_id: "example.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy {
-                authorization: AgentAuthorization::Allow,
-                user_presence: UserPresenceSource::Agent,
-                user_verification: UserVerificationSource::Agent,
-            },
-        }];
+        profile.rules = vec![rule("example.com", RuleAction::Allow, RuleAction::Deny)];
 
-        let generation = PolicyRuntime::compile_generation(&config, 0).unwrap();
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("rules").unwrap();
+        let auth = runtime.resolve(&pid, &IntentAction::Authenticate, "example.com");
+        assert_eq!(auth.action, RuleAction::Allow);
+        assert_eq!(auth.rule, RuleIdentity::Exact("example.com".to_string()));
+        let reg = runtime.resolve(&pid, &IntentAction::Register, "example.com");
+        assert_eq!(reg.action, RuleAction::Deny);
+
+        let generation = runtime.current_generation();
         let snapshot = &generation.snapshots[0];
-        assert_eq!(
-            snapshot
-                .ceremony_policy("example.com", &IntentAction::Authenticate)
-                .unwrap()
-                .authorization,
-            AgentAuthorization::Allow
-        );
-        assert_eq!(
-            snapshot
-                .ceremony_policy("example.com", &IntentAction::Register)
-                .unwrap()
-                .authorization,
-            AgentAuthorization::Deny
-        );
         assert!(snapshot.action_allowed(&IntentAction::Authenticate));
         assert!(!snapshot.action_allowed(&IntentAction::Register));
     }
 
     #[test]
-    fn test_compile_same_user_wildcard_policy_with_exact_override() {
-        let mut config = make_isolated_config("wildcard", vec![], false);
-        let profile = config.profiles.get_mut("wildcard").unwrap();
-        profile.mode = AgentMode::SameUser;
-        profile.storage = None;
-        profile.rules = vec![
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: ANY_RP_ID.to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy::autonomous(),
-            },
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: "bank.example.com".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy::supervised(),
-            },
+    fn test_compile_all_deny_profile_succeeds() {
+        // Regression (defect B4): a profile whose rules are all `deny` is valid and authorizes
+        // nothing.
+        let mut config = make_isolated_config("alldeny", vec![], false);
+        config.profiles.get_mut("alldeny").unwrap().rules = vec![
+            rule("example.com", RuleAction::Deny, RuleAction::Deny),
+            rule("github.com", RuleAction::Deny, RuleAction::Deny),
         ];
 
-        let generation = PolicyRuntime::compile_generation(&config, 0).unwrap();
+        let generation = PolicyRuntime::compile_generation(&config, 0, 1).unwrap();
         let snapshot = &generation.snapshots[0];
+        assert!(snapshot.allowed_actions.is_empty());
+        assert!(snapshot.policy.allowed_actions.is_empty());
 
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("alldeny").unwrap();
+        for action in [IntentAction::Authenticate, IntentAction::Register] {
+            assert_eq!(
+                runtime.resolve(&pid, &action, "example.com").action,
+                RuleAction::Deny
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_profile_without_rules_succeeds() {
+        let config = make_isolated_config("norules", vec![], false);
+        let generation = PolicyRuntime::compile_generation(&config, 0, 1).unwrap();
+        assert!(generation.snapshots[0].allowed_actions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_same_user_wildcard_policy_with_exact_override() {
+        let config = same_user_config(
+            "wildcard",
+            vec![
+                rule(ANY_RP_ID, RuleAction::Allow, RuleAction::Deny),
+                rule("bank.example.com", RuleAction::Request, RuleAction::Deny),
+            ],
+        );
+
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("wildcard").unwrap();
+        let generation = runtime.current_generation();
+        let snapshot = &generation.snapshots[0];
         assert!(snapshot.is_rp_exact_match("github.com"));
-        assert_eq!(
-            snapshot
-                .ceremony_policy("github.com", &IntentAction::Authenticate)
-                .unwrap(),
-            &AgentCeremonyPolicy::autonomous()
-        );
-        assert_eq!(
-            snapshot
-                .ceremony_policy("bank.example.com", &IntentAction::Authenticate)
-                .unwrap(),
-            &AgentCeremonyPolicy::supervised()
-        );
-        assert_eq!(
-            snapshot
-                .ceremony_policy("github.com", &IntentAction::Register)
-                .unwrap(),
-            &AgentCeremonyPolicy::deny()
-        );
         assert!(!snapshot.is_rp_exact_match("com"));
-        assert!(
-            snapshot
-                .ceremony_policy("com", &IntentAction::Authenticate)
-                .is_none()
+
+        let github = runtime.resolve(&pid, &IntentAction::Authenticate, "github.com");
+        assert_eq!(github.action, RuleAction::Allow);
+        assert!(github.is_wildcard());
+        assert_eq!(github.audit_rule(), Some("*"));
+
+        let bank = runtime.resolve(&pid, &IntentAction::Authenticate, "bank.example.com");
+        assert_eq!(bank.configured, RuleAction::Request);
+        assert_eq!(bank.action, RuleAction::Request);
+        assert_eq!(bank.audit_rule(), Some("bank.example.com"));
+
+        assert_eq!(
+            runtime
+                .resolve(&pid, &IntentAction::Register, "github.com")
+                .action,
+            RuleAction::Deny
         );
+        assert_eq!(
+            runtime
+                .resolve(&pid, &IntentAction::Authenticate, "com")
+                .action,
+            RuleAction::Deny
+        );
+    }
+
+    #[test]
+    fn test_resolve_precedence_exact_over_wildcard() {
+        let config = same_user_config(
+            "prec",
+            vec![
+                rule(ANY_RP_ID, RuleAction::Allow, RuleAction::Deny),
+                rule("blocked.example.com", RuleAction::Deny, RuleAction::Deny),
+            ],
+        );
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("prec").unwrap();
+
+        let blocked = runtime.resolve(&pid, &IntentAction::Authenticate, "blocked.example.com");
+        assert_eq!(blocked.action, RuleAction::Deny);
+        assert_eq!(
+            blocked.rule,
+            RuleIdentity::Exact("blocked.example.com".to_string())
+        );
+        let other = runtime.resolve(&pid, &IntentAction::Authenticate, "other.example.com");
+        assert_eq!(other.action, RuleAction::Allow);
+        assert_eq!(other.rule, RuleIdentity::Wildcard);
+    }
+
+    #[test]
+    fn test_resolve_granted_placeholder_between_exact_and_wildcard() {
+        // exact `allow` > granted `request` > wildcard `allow`/`request`.
+        let config = same_user_config(
+            "granted",
+            vec![
+                rule(ANY_RP_ID, RuleAction::Request, RuleAction::Deny),
+                rule("github.com", RuleAction::Request, RuleAction::Deny),
+                rule("direct.example.com", RuleAction::Allow, RuleAction::Deny),
+            ],
+        );
+        let clock = test_clock();
+        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+            .unwrap()
+            .with_grant_source(TestGrants::of(&[
+                ("granted", "github.com"),
+                ("granted", "direct.example.com"),
+                ("granted", "wild.example.com"),
+            ]));
+        let pid = ProfileId::new("granted").unwrap();
+        let auth = IntentAction::Authenticate;
+
+        // An exact `request` rule with a matching grant becomes `allow`.
+        let github = runtime.resolve(&pid, &auth, "github.com");
+        assert_eq!(github.configured, RuleAction::Request);
+        assert_eq!(github.action, RuleAction::Allow);
+        assert!(github.granted);
+
+        // Exact `allow` is allow without consulting the store.
+        let direct = runtime.resolve(&pid, &auth, "direct.example.com");
+        assert_eq!(direct.action, RuleAction::Allow);
+        assert!(!direct.granted);
+
+        // The wildcard `request` is also upgraded by an exact granted entry for the RP...
+        let wild = runtime.resolve(&pid, &auth, "wild.example.com");
+        assert_eq!(wild.rule, RuleIdentity::Wildcard);
+        assert_eq!(wild.action, RuleAction::Allow);
+        assert!(wild.granted);
+
+        // ...and stays `request` without one.
+        let other = runtime.resolve(&pid, &auth, "other.example.com");
+        assert_eq!(other.rule, RuleIdentity::Wildcard);
+        assert_eq!(other.action, RuleAction::Request);
+        assert!(!other.granted);
+    }
+
+    #[test]
+    fn test_resolve_orphaned_grant_is_inert() {
+        // The granted-rules store says granted, but the config rule is `deny` or absent: never
+        // `allow` (ADR 0014 section 6.2).
+        let config = make_isolated_config("orphan", vec![], false);
+        let mut config = config;
+        config.profiles.get_mut("orphan").unwrap().rules = vec![
+            rule("denied.example.com", RuleAction::Deny, RuleAction::Deny),
+            rule("alsodenied.example.com", RuleAction::Deny, RuleAction::Deny),
+        ];
+        let clock = test_clock();
+        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+            .unwrap()
+            .with_grant_source(TestGrants::of(&[
+                ("orphan", "denied.example.com"),
+                ("orphan", "removed.example.com"),
+            ]));
+        let pid = ProfileId::new("orphan").unwrap();
+
+        let denied = runtime.resolve(&pid, &IntentAction::Authenticate, "denied.example.com");
+        assert_eq!(denied.action, RuleAction::Deny);
+        assert!(!denied.granted);
+
+        let removed = runtime.resolve(&pid, &IntentAction::Authenticate, "removed.example.com");
+        assert_eq!(removed.action, RuleAction::Deny);
+        assert_eq!(removed.rule, RuleIdentity::None);
+        assert!(!removed.granted);
+    }
+
+    #[test]
+    fn test_resolve_grant_never_upgrades_register_request() {
+        let mut config = make_isolated_config("regreq", vec![], false);
+        config.profiles.get_mut("regreq").unwrap().rules =
+            vec![rule("example.com", RuleAction::Allow, RuleAction::Request)];
+        let clock = test_clock();
+        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+            .unwrap()
+            .with_grant_source(TestGrants::of(&[("regreq", "example.com")]));
+        let pid = ProfileId::new("regreq").unwrap();
+        let reg = runtime.resolve(&pid, &IntentAction::Register, "example.com");
+        assert_eq!(reg.action, RuleAction::Request);
+        assert!(!reg.granted);
+    }
+
+    #[test]
+    fn test_resolve_grants_are_per_profile() {
+        let mut config = make_isolated_config("p_one", vec![], false);
+        config.profiles.get_mut("p_one").unwrap().rules =
+            vec![rule("example.com", RuleAction::Request, RuleAction::Deny)];
+        let clock = test_clock();
+        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+            .unwrap()
+            .with_grant_source(TestGrants::of(&[("someone_else", "example.com")]));
+        let pid = ProfileId::new("p_one").unwrap();
+        assert_eq!(
+            runtime
+                .resolve(&pid, &IntentAction::Authenticate, "example.com")
+                .action,
+            RuleAction::Request
+        );
+    }
+
+    #[test]
+    fn test_resolve_wildcard_never_matches_localhost_or_register() {
+        let config = same_user_config(
+            "wildlocal",
+            vec![rule(ANY_RP_ID, RuleAction::Allow, RuleAction::Allow)],
+        );
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("wildlocal").unwrap();
+        assert_eq!(
+            runtime
+                .resolve(&pid, &IntentAction::Authenticate, "localhost")
+                .action,
+            RuleAction::Deny
+        );
+        assert_eq!(
+            runtime
+                .resolve(&pid, &IntentAction::Register, "example.com")
+                .action,
+            RuleAction::Deny
+        );
+    }
+
+    #[test]
+    fn test_resolve_wildcard_selection_is_forced_single() {
+        let mut config = same_user_config(
+            "wildsel",
+            vec![
+                rule(ANY_RP_ID, RuleAction::Allow, RuleAction::Deny),
+                rule("exact.example.com", RuleAction::Allow, RuleAction::Deny),
+            ],
+        );
+        config
+            .profiles
+            .get_mut("wildsel")
+            .unwrap()
+            .credential_selection = CredentialSelection::Newest;
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("wildsel").unwrap();
+
+        let wild = runtime.resolve(&pid, &IntentAction::Authenticate, "any.example.com");
+        assert_eq!(wild.selection, CredentialSelection::Single);
+        let exact = runtime.resolve(&pid, &IntentAction::Authenticate, "exact.example.com");
+        assert_eq!(exact.selection, CredentialSelection::Newest);
+    }
+
+    #[test]
+    fn test_resolve_unknown_profile_denies() {
+        let config = make_isolated_config("known", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        let unknown = ProfileId::new("unknown").unwrap();
+        for action in [IntentAction::Authenticate, IntentAction::Register] {
+            let matched = runtime.resolve(&unknown, &action, "example.com");
+            assert_eq!(matched.action, RuleAction::Deny);
+            assert_eq!(matched.rule, RuleIdentity::None);
+            assert!(matched.audit_rule().is_none());
+        }
+    }
+
+    #[test]
+    fn test_resolve_is_live_after_reload() {
+        let allow = make_isolated_config("live", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&allow);
+        let pid = ProfileId::new("live").unwrap();
+        let auth = IntentAction::Authenticate;
+        assert_eq!(
+            runtime.resolve(&pid, &auth, "example.com").action,
+            RuleAction::Allow
+        );
+
+        let mut deny = allow.clone();
+        deny.profiles.get_mut("live").unwrap().rules[0].authenticate = RuleAction::Deny;
+        runtime.reload(&deny).unwrap();
+        assert_eq!(
+            runtime.resolve(&pid, &auth, "example.com").action,
+            RuleAction::Deny
+        );
+
+        runtime.reload(&allow).unwrap();
+        assert_eq!(
+            runtime.resolve(&pid, &auth, "example.com").action,
+            RuleAction::Allow
+        );
+    }
+
+    #[test]
+    fn test_generation_number_starts_at_one_and_increments_on_reload() {
+        let config = make_isolated_config("gen", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        assert_eq!(runtime.generation_number(), 1);
+        assert_eq!(runtime.current_generation().generation, 1);
+
+        let digest_before = runtime.digest();
+        let generation_id_before = runtime.current_generation().generation_id.clone();
+
+        // A no-op reload leaves the content digest unchanged, but the numeric generation and the
+        // generation id still advance.
+        let digest_after = runtime.reload(&config).unwrap();
+        assert_eq!(digest_after, digest_before);
+        assert_eq!(runtime.digest(), digest_before);
+        assert_eq!(runtime.generation_number(), 2);
+        assert_ne!(
+            runtime.current_generation().generation_id,
+            generation_id_before
+        );
+
+        let mut changed = config.clone();
+        changed.profiles.get_mut("gen").unwrap().rules[0].authenticate = RuleAction::Request;
+        let digest_changed = runtime.reload(&changed).unwrap();
+        assert_ne!(digest_changed, digest_before);
+        assert_eq!(runtime.generation_number(), 3);
+    }
+
+    #[test]
+    fn test_failed_reload_keeps_generation_number() {
+        let config = make_isolated_config("genfail", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        let mut broken = config.clone();
+        broken.profiles.insert(
+            String::new(),
+            broken.profiles.get("genfail").unwrap().clone(),
+        );
+        assert!(runtime.reload(&broken).is_err());
+        assert_eq!(runtime.generation_number(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_reloads_get_unique_monotonic_generations() {
+        let config = make_isolated_config("genrace", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        let runtime = Arc::new(runtime);
+        const THREADS: u64 = 8;
+        const RELOADS_PER_THREAD: u64 = 10;
+        let observed = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..RELOADS_PER_THREAD {
+                        runtime.reload(&config).unwrap();
+                        observed.lock().unwrap().push(runtime.generation_number());
+                    }
+                });
+            }
+        });
+        // Every reload bumped the generation exactly once: none was lost to a racing reload.
+        assert_eq!(
+            runtime.generation_number(),
+            1 + THREADS * RELOADS_PER_THREAD
+        );
+        let observed = observed.into_inner().unwrap();
+        assert!(observed.iter().all(|g| *g >= 2));
+    }
+
+    #[test]
+    fn test_digest_changes_with_rule_action() {
+        let allow = make_isolated_config("dig", vec!["example.com"], false);
+        let mut request = allow.clone();
+        request.profiles.get_mut("dig").unwrap().rules[0].authenticate = RuleAction::Request;
+        let d1 = PolicyRuntime::compile_generation(&allow, 0, 1)
+            .unwrap()
+            .digest;
+        let d2 = PolicyRuntime::compile_generation(&request, 0, 1)
+            .unwrap()
+            .digest;
+        assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn test_authorize_denies_non_allow_rule_actions() {
+        let mut config = make_isolated_config("nonallow", vec![], false);
+        config.profiles.get_mut("nonallow").unwrap().rules = vec![
+            rule("request.example.com", RuleAction::Request, RuleAction::Deny),
+            rule("deny.example.com", RuleAction::Deny, RuleAction::Deny),
+        ];
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("nonallow").unwrap();
+        for rp in ["request.example.com", "deny.example.com"] {
+            let request = make_auth_request(
+                &runtime,
+                pid.clone(),
+                IntentAction::Authenticate,
+                rp,
+                None,
+                false,
+            );
+            let (decision, handle) = runtime.authorize(&request);
+            assert_eq!(decision.outcome, Outcome::Deny, "{rp}");
+            assert_eq!(decision.reason, ReasonCode::ActionNotAllowed, "{rp}");
+            assert!(handle.is_none());
+        }
     }
 
     #[test]

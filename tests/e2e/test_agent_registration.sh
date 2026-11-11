@@ -130,13 +130,13 @@ pin_path = "${TEST_DIR}/agent-pin"
 
 [[agents.profiles.webauthn-test.rules]]
 rp_id = "webauthn.io"
-register = { authorization = "allow", user_presence = "none", user_verification = "none" }
-authenticate = { authorization = "allow", user_presence = "none", user_verification = "none" }
+register = "allow"
+authenticate = "allow"
 
 [[agents.profiles.webauthn-test.rules]]
 rp_id = "example.com"
-register = { authorization = "allow", user_presence = "none", user_verification = "none" }
-authenticate = { authorization = "allow", user_presence = "none", user_verification = "none" }
+register = "allow"
+authenticate = "allow"
 
 [local]
 path = "${STORAGE_DIR}"

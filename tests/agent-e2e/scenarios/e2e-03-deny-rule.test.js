@@ -6,12 +6,8 @@ const { authenticate, policyEvents, storeFingerprint, assertInterceptionActive, 
 scenario({ id: 'E2E-03', title: 'deny rule: NotAllowedError, no prompt, no key use', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
-    // Baseline finding: a profile whose rules are ALL deny does not start ("invalid policy: allowed_actions
-    // must not be empty"), so another RP is allowed to keep the profile valid. rp-a is explicitly denied.
-    profiles: { agent: { mode: 'same-user', rules: [
-      { rp: 'rp-a.test', authenticate: 'deny', register: 'deny' },
-      { rp: 'other.test', authenticate: 'allow', register: 'deny' },
-    ] } },
+    // B4 (fixed in P4): a profile whose rules are ALL deny must start. rp-a is explicitly denied and nothing else is allowed.
+    profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'deny', register: 'deny' }] } },
   });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice'); // a credential exists, so a leak to the human path would succeed

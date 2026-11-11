@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -85,7 +86,8 @@ pub fn install(target: AgentSkillTarget, scope: AgentSkillScope, force: bool) ->
     let home = dirs::home_dir().ok_or_else(|| {
         Error::Other("Could not determine the home directory for skill installation".to_string())
     })?;
-    let agents = selected_agents(target, &home, &project)?;
+    let path = env::var_os("PATH");
+    let agents = selected_agents(target, &home, &project, path.as_deref())?;
 
     for agent in agents {
         let path = agent.skill_path(scope, &home, &project);
@@ -875,6 +877,7 @@ fn selected_agents(
     target: AgentSkillTarget,
     home: &Path,
     project: &Path,
+    path: Option<&OsStr>,
 ) -> Result<Vec<AgentKind>> {
     let explicit = match target {
         AgentSkillTarget::Auto => None,
@@ -888,7 +891,7 @@ fn selected_agents(
 
     let agents: Vec<_> = AgentKind::ALL
         .into_iter()
-        .filter(|agent| agent_is_detected(*agent, home, project))
+        .filter(|agent| agent_is_detected(*agent, home, project, path))
         .collect();
     if agents.is_empty() {
         return Err(Error::Other(
@@ -899,19 +902,23 @@ fn selected_agents(
     Ok(agents)
 }
 
-fn agent_is_detected(agent: AgentKind, home: &Path, project: &Path) -> bool {
+fn agent_is_detected(agent: AgentKind, home: &Path, project: &Path, path: Option<&OsStr>) -> bool {
     agent.user_config_path(home).is_dir()
         || match agent {
             AgentKind::Opencode => project.join(".opencode").is_dir(),
             AgentKind::Claude => project.join(".claude").is_dir(),
             AgentKind::Pi => project.join(".pi").is_dir(),
         }
-        || command_exists(agent.command())
+        || command_exists(agent.command(), path)
 }
 
-fn command_exists(command: &str) -> bool {
-    env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|directory| {
+/// Whether `command` is an executable file in one of the `path` directories.
+///
+/// `path` is the value of `PATH`, passed in so callers (and tests) never need
+/// to read or rewrite the process environment.
+fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
+    path.is_some_and(|path| {
+        env::split_paths(path).any(|directory| {
             let candidate = directory.join(command);
             fs::metadata(candidate).is_ok_and(|metadata| {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
@@ -1146,24 +1153,31 @@ mod tests {
         assert_eq!(paths.len(), 6);
     }
 
+    /// A `PATH` value that contains no agent executables.
+    fn empty_path() -> &'static OsStr {
+        OsStr::new("/nonexistent-passless-test-path")
+    }
+
     #[test]
     fn explicit_selection_does_not_require_detection() {
         let dir = tempdir().unwrap();
-        let selected = selected_agents(AgentSkillTarget::Claude, dir.path(), dir.path()).unwrap();
+        let selected =
+            selected_agents(AgentSkillTarget::Claude, dir.path(), dir.path(), None).unwrap();
         assert_eq!(selected, vec![AgentKind::Claude]);
     }
 
     #[test]
     fn explicit_opencode_does_not_require_detection() {
         let dir = tempdir().unwrap();
-        let selected = selected_agents(AgentSkillTarget::Opencode, dir.path(), dir.path()).unwrap();
+        let selected =
+            selected_agents(AgentSkillTarget::Opencode, dir.path(), dir.path(), None).unwrap();
         assert_eq!(selected, vec![AgentKind::Opencode]);
     }
 
     #[test]
     fn explicit_pi_does_not_require_detection() {
         let dir = tempdir().unwrap();
-        let selected = selected_agents(AgentSkillTarget::Pi, dir.path(), dir.path()).unwrap();
+        let selected = selected_agents(AgentSkillTarget::Pi, dir.path(), dir.path(), None).unwrap();
         assert_eq!(selected, vec![AgentKind::Pi]);
     }
 
@@ -1174,8 +1188,13 @@ mod tests {
         fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
         fs::create_dir_all(home.path().join(".claude")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Opencode));
         assert!(selected.contains(&AgentKind::Claude));
     }
@@ -1186,8 +1205,13 @@ mod tests {
         let project = tempdir().unwrap();
         fs::create_dir_all(project.path().join(".opencode")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Opencode));
     }
 
@@ -1197,8 +1221,13 @@ mod tests {
         let project = tempdir().unwrap();
         fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Pi));
     }
 
@@ -1208,8 +1237,13 @@ mod tests {
         let project = tempdir().unwrap();
         fs::create_dir_all(project.path().join(".pi")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Pi));
     }
 
@@ -1223,13 +1257,13 @@ mod tests {
         fs::write(&fake_opencode, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&fake_opencode, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", bin_dir.path()) };
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(bin_dir.path().as_os_str()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Opencode));
     }
 
@@ -1238,12 +1272,13 @@ mod tests {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", tempdir().unwrap().path()) };
-        let result = selected_agents(AgentSkillTarget::Auto, home.path(), project.path());
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        let empty_bin_dir = tempdir().unwrap();
+        let result = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_bin_dir.path().as_os_str()),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -1453,12 +1488,10 @@ mod tests {
         fs::write(&fake, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", bin_dir.path()) };
-        assert!(command_exists("test-cmd-exists"));
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        assert!(command_exists(
+            "test-cmd-exists",
+            Some(bin_dir.path().as_os_str())
+        ));
     }
 
     #[test]
@@ -1468,12 +1501,11 @@ mod tests {
         fs::write(&fake, "not executable").unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", bin_dir.path()) };
-        assert!(!command_exists("test-cmd-noexec"));
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        assert!(!command_exists(
+            "test-cmd-noexec",
+            Some(bin_dir.path().as_os_str())
+        ));
+        assert!(!command_exists("test-cmd-noexec", None));
     }
 
     #[test]

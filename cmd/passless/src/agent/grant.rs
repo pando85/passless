@@ -21,7 +21,7 @@ const GRANT_STATE_EXPIRED: u8 = 2;
 const CLAIM_NONCE_BYTES: usize = 32;
 const MAX_RP_ID_LEN: usize = 253;
 const MAX_CREDENTIALS_PER_GRANT: usize = 64;
-const MAX_RP_IDS_PER_GRANT: usize = 32;
+const MAX_RP_IDS_PER_GRANT: usize = passless_core::agent::MAX_GRANT_RP_IDS;
 const MIN_TTL_SECS: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1062,7 +1062,6 @@ mod tests {
             &test_profile_id(),
             vec!["make_credential".to_string(), "get_assertion".to_string()],
             5,
-            true,
             300,
         )
         .unwrap();
@@ -1644,7 +1643,6 @@ mod tests {
             &test_profile_id(),
             vec!["different_action".to_string()],
             5,
-            true,
             300,
         )
         .unwrap();

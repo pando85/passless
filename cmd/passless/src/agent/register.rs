@@ -5,16 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::debug;
 use sha2::{Digest, Sha256};
 
-use passless_core::agent::config::ANY_RP_ID;
 use passless_core::agent::protocol::{
-    ErrorCode, ProtocolError, RecommendedAction, RegisterCredentialRequest,
+    ErrorCode, IntentAction, ProtocolError, RecommendedAction, RegisterCredentialRequest,
     RegisterCredentialResponse,
 };
-use passless_core::agent::{AgentProfileConfig, ProfileId};
+use passless_core::agent::{ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::policy_engine::PolicyRuntime;
 use super::sign::{b64u_decode, b64u_encode, verify_origin_context};
 
 use crate::storage::CredentialStorage;
@@ -28,17 +28,19 @@ const PASSLESS_AAGUID: [u8; 16] = [
 #[derive(Clone)]
 pub struct RegisterContext {
     pub profile_id: ProfileId,
-    pub profile_config: AgentProfileConfig,
+    /// Operation budget, copied from the profile at session creation (TODO(P5): frozen until the
+    /// revocation epoch lands; authorization itself resolves live through `PolicyRuntime`).
+    pub max_operations: u16,
     /// Set by the registry when the bearer is revoked (browser exit, lease revocation). An in-flight
     /// request re-checks it before key use and before the credential is written (ADR 0014 section 9).
     revoked: Arc<AtomicBool>,
 }
 
 impl RegisterContext {
-    pub fn new(profile_id: ProfileId, profile_config: AgentProfileConfig) -> Self {
+    pub fn new(profile_id: ProfileId, max_operations: u16) -> Self {
         Self {
             profile_id,
-            profile_config,
+            max_operations,
             revoked: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -60,6 +62,7 @@ impl RegisterContext {
 }
 
 pub struct RegisterHandler {
+    pub policy_runtime: Arc<PolicyRuntime>,
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub audit_gate: Arc<AuditGate>,
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
@@ -139,40 +142,28 @@ impl RegisterHandler {
         }
 
         // Registration authority is policy only (ADR 0014 section 10.3): an exact RP rule with
-        // `register = "allow"`. There is no operator-minted enrollment grant. A wildcard rule never
-        // permits registration (section 6.3).
-        let rule = ctx
-            .profile_config
-            .rule_for_rp(&normalized_rp)
-            .ok_or_else(|| {
-                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "RP policy does not allow registration",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-        if rule.rp_id.trim() == ANY_RP_ID {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "a wildcard rule never permits registration",
-                RecommendedAction::FixRequest,
-            ));
-        }
-        let ceremony_policy = rule.register;
-
-        match ceremony_policy.authorization {
-            passless_core::agent::AgentAuthorization::Deny => {
+        // `register = "allow"`, resolved against the live policy on every request (plan R16). There
+        // is no operator-minted enrollment grant. A wildcard rule never permits registration
+        // (section 6.3): `resolve` never matches the wildcard for `register`.
+        // TODO(P5): also compare the revocation epoch here and again immediately before key use.
+        let matched =
+            self.policy_runtime
+                .resolve(&ctx.profile_id, &IntentAction::Register, &normalized_rp);
+        match matched.action {
+            RuleAction::Deny => {
                 self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
-                    "RP policy denies registration",
+                    if matched.rule == RuleIdentity::None {
+                        "RP policy does not allow registration"
+                    } else {
+                        "RP policy denies registration"
+                    },
                     RecommendedAction::FixRequest,
                 ));
             }
-            // `confirm`/`request` act as `deny` until the escalation service lands (P7); see sign.rs.
-            passless_core::agent::AgentAuthorization::Confirm => {
+            // `request` acts as `deny` until the escalation service lands (P7); see sign.rs.
+            RuleAction::Request => {
                 self.record_policy_deny(
                     ctx,
                     &normalized_rp,
@@ -180,42 +171,11 @@ impl RegisterHandler {
                 );
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
-                    "escalation is unavailable: policy requires human confirmation",
+                    "escalation is unavailable: policy requires approval",
                     RecommendedAction::FixRequest,
                 ));
             }
-            passless_core::agent::AgentAuthorization::Allow => {}
-        }
-
-        let human_uv_required = ceremony_policy.user_verification
-            == passless_core::agent::UserVerificationSource::Human
-            && (req.user_verification
-                || self.security_config.always_uv
-                || ctx.profile_config.human_verification_prompt
-                    == passless_core::agent::HumanVerificationPrompt::Always);
-        if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
-            || human_uv_required
-        {
-            // No human evidence in an agent ceremony before P7. `human_verification_prompt` is parsed
-            // but can only make this check stricter; P4 replaces the schema.
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::EscalationUnavailable);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "escalation is unavailable: policy requires human verification",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let up = ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Agent;
-        let uv = ceremony_policy.user_verification
-            == passless_core::agent::UserVerificationSource::Agent;
-        if (req.user_verification || self.security_config.always_uv) && !uv {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "user verification is required but the configured evidence source is none",
-                RecommendedAction::FixRequest,
-            ));
+            RuleAction::Allow => {}
         }
 
         let user_id = b64u_decode(&req.user_id_b64u).map_err(|_| {
@@ -277,11 +237,7 @@ impl RegisterHandler {
             AuditAction::Register,
             &normalized_rp,
         )
-        .evidence_sources(
-            &ceremony_policy.authorization.to_string(),
-            &ceremony_policy.user_presence.to_string(),
-            &ceremony_policy.user_verification.to_string(),
-        )
+        .evidence_sources("allow", "agent", "agent")
         .build();
         self.audit_gate.record(allow_event).map_err(|_| {
             ProtocolError::new(
@@ -320,8 +276,10 @@ impl RegisterHandler {
             &normalized_rp,
             &credential_id,
             &cose_key,
-            up,
-            uv,
+            // `allow` is the only agent evidence: UP and UV come from the validated agent session
+            // (ADR 0014 section 7).
+            true,
+            true,
         );
 
         let client_data_json = build_client_data_json_for_registration(
@@ -560,13 +518,16 @@ mod tests {
     use super::*;
 
     use crate::agent::audit::{AuditGate, test_support::read_audit_events};
+    use crate::agent::browser::SystemClock;
+    use crate::agent::intent::SystemClock as MonotonicSystemClock;
     use crate::storage::CredentialStorage;
+    use passless_core::agent::config::ANY_RP_ID as WILDCARD_RP_ID;
     use passless_core::agent::{
-        AgentAuthorization, AgentCeremonyPolicy, AgentMode, AgentProfileConfig, AgentRpRule,
-        BrowserScope, UserPresenceSource, UserVerificationSource,
+        AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, BrowserScope, CredentialSelection,
     };
     use passless_core::config::SecurityConfig;
     use soft_fido2::{CredentialBackupState, RelyingParty, SoftwareCredentialKeyProvider, User};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -658,33 +619,29 @@ mod tests {
         }
     }
 
-    fn make_registration_profile_config() -> AgentProfileConfig {
+    fn register_rule(rp_id: &str, register: RuleAction) -> AgentRpRule {
+        AgentRpRule {
+            rp_id: rp_id.to_string(),
+            register,
+            authenticate: RuleAction::Deny,
+            credential_selection: None,
+        }
+    }
+
+    fn profile_with_rules(rules: Vec<AgentRpRule>) -> AgentProfileConfig {
         AgentProfileConfig {
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
-            credential_selection: passless_core::agent::config::CredentialSelection::Single,
-            human_verification_prompt:
-                passless_core::agent::config::HumanVerificationPrompt::Always,
+            credential_selection: CredentialSelection::Single,
             mode: AgentMode::Isolated,
             principal_user: String::new(),
-            rp_ids: vec!["example.com".to_string()],
-            require_uv: false,
             credential_refs: Some(vec![]),
             max_grant_ttl: None,
             max_session_ttl: None,
             storage: None,
-            registration_allowed: true,
-            rules: vec![AgentRpRule {
-                credential_selection: None,
-                rp_id: "example.com".to_string(),
-                register: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
-                authenticate: AgentCeremonyPolicy::deny(),
-            }],
+            rules,
+            legacy: Default::default(),
             device: None,
             start_url: None,
             browser_command: None,
@@ -695,6 +652,10 @@ mod tests {
         }
     }
 
+    fn make_registration_profile_config() -> AgentProfileConfig {
+        profile_with_rules(vec![register_rule("example.com", RuleAction::Allow)])
+    }
+
     struct RegisterTestFixture {
         profile_id: ProfileId,
         storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
@@ -703,7 +664,7 @@ mod tests {
         audit_dir: std::path::PathBuf,
         operation_lock: Arc<Mutex<()>>,
         security_config: SecurityConfig,
-        profile_config: AgentProfileConfig,
+        policy_runtime: Arc<PolicyRuntime>,
         _tmp: tempfile::TempDir,
     }
 
@@ -714,6 +675,7 @@ mod tests {
 
         fn make_handler(&self) -> RegisterHandler {
             RegisterHandler {
+                policy_runtime: self.policy_runtime.clone(),
                 credential_storage: self.storage.clone(),
                 audit_gate: self.audit_gate.clone(),
                 key_provider: self.key_provider.clone(),
@@ -723,7 +685,14 @@ mod tests {
         }
 
         fn make_ctx(&self) -> RegisterContext {
-            RegisterContext::new(self.profile_id.clone(), self.profile_config.clone())
+            RegisterContext::new(self.profile_id.clone(), 64)
+        }
+
+        /// Replace the live policy (the session context is NOT rebuilt).
+        fn reload_profile(&self, profile_config: AgentProfileConfig) {
+            self.policy_runtime
+                .reload(&agent_config_for(&self.profile_id, profile_config))
+                .unwrap();
         }
 
         fn make_req(&self) -> RegisterCredentialRequest {
@@ -756,39 +725,23 @@ mod tests {
     }
 
     fn make_deny_profile_config() -> AgentProfileConfig {
-        AgentProfileConfig {
-            max_operations: 64,
-            max_concurrent_sessions: 1,
-            browser_scope: BrowserScope::Session,
-            credential_selection: passless_core::agent::config::CredentialSelection::Single,
-            human_verification_prompt:
-                passless_core::agent::config::HumanVerificationPrompt::Always,
-            mode: AgentMode::Isolated,
-            principal_user: String::new(),
-            rp_ids: vec!["example.com".to_string()],
-            require_uv: false,
-            credential_refs: Some(vec![]),
-            max_grant_ttl: None,
-            max_session_ttl: None,
-            storage: None,
-            registration_allowed: true,
-            rules: vec![AgentRpRule {
-                credential_selection: None,
-                rp_id: "example.com".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
-            }],
-            device: None,
-            start_url: None,
-            browser_command: None,
-            browser_user: None,
-            browser_runtime_root: None,
-            browser_cdp_expose: None,
-            browser_cdp_port: None,
+        profile_with_rules(vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
+            credential_selection: None,
+        }])
+    }
+
+    fn agent_config_for(profile_id: &ProfileId, profile_config: AgentProfileConfig) -> AgentConfig {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(profile_id.as_str().to_string(), profile_config);
+        AgentConfig {
+            enabled: true,
+            profiles,
+            audit_path: Some(std::path::PathBuf::from("/tmp/test-audit")),
+            acknowledge_global_same_user: vec![profile_id.as_str().to_string()],
+            acknowledge_same_user_registration: vec![],
         }
     }
 
@@ -802,9 +755,19 @@ mod tests {
         )
         .unwrap();
         let audit_gate = Arc::new(AuditGate::open(&audit_dir).unwrap());
+        let profile_id = ProfileId::new("test-register-profile").unwrap();
+        let policy_runtime = Arc::new(
+            PolicyRuntime::new(
+                &agent_config_for(&profile_id, profile_config),
+                Arc::new(SystemClock),
+                Arc::new(MonotonicSystemClock::new()),
+                None,
+            )
+            .unwrap(),
+        );
 
         RegisterTestFixture {
-            profile_id: ProfileId::new("test-register-profile").unwrap(),
+            profile_id,
             storage: Arc::new(Mutex::new(
                 Box::new(WriteCountingStorage::new()) as Box<dyn CredentialStorage>
             )),
@@ -813,7 +776,7 @@ mod tests {
             audit_dir,
             operation_lock: Arc::new(Mutex::new(())),
             security_config: make_test_security_config(),
-            profile_config,
+            policy_runtime,
             _tmp: tmp,
         }
     }
@@ -1021,14 +984,11 @@ mod tests {
     }
 
     #[test]
-    fn test_register_confirm_policy_acts_as_deny_until_p7() {
-        let mut config = make_registration_profile_config();
-        config.rules[0].register = AgentCeremonyPolicy {
-            authorization: AgentAuthorization::Confirm,
-            user_presence: UserPresenceSource::Human,
-            user_verification: UserVerificationSource::None,
-        };
-        let f = make_fixture_with_config(config);
+    fn test_register_request_rule_denies_with_escalation_unavailable_until_p7() {
+        let f = make_fixture_with_config(profile_with_rules(vec![register_rule(
+            "example.com",
+            RuleAction::Request,
+        )]));
 
         let err = f
             .make_handler()
@@ -1036,12 +996,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
         assert_ne!(err.code, ErrorCode::InteractionRequired);
+        assert!(err.message.contains("escalation is unavailable"));
         assert_eq!(
             deny_reasons(&f),
             vec![(
                 "example.com".to_string(),
                 "escalation_unavailable".to_string()
             )]
+        );
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+        assert!(
+            f.policy_events()
+                .iter()
+                .all(|e| e["kind"] != "policy.allow"),
+            "no allow event for a request rule"
         );
     }
 
@@ -1140,6 +1108,26 @@ mod tests {
         } else {
             panic!("attestation object should be a CBOR map");
         }
+    }
+
+    #[test]
+    fn test_register_allow_sets_up_and_uv_and_audits_agent_evidence() {
+        let f = RegisterTestFixture::new();
+        let mut req = f.make_req();
+        // The RP's `userVerification` request does not matter: allow means UP and UV from the
+        // agent session (ADR 0014 section 7).
+        req.user_verification = false;
+        let resp = f.make_handler().register(&f.make_ctx(), &req).unwrap();
+
+        let auth_data = b64u_decode(&resp.authenticator_data_b64u).unwrap();
+        assert_eq!(auth_data[32] & 0x05, 0x05, "UP and UV flags");
+        assert_eq!(auth_data[32] & 0x40, 0x40, "AT flag");
+
+        let events = f.policy_events();
+        let allow = events.last().unwrap();
+        assert_eq!(allow["kind"], "policy.allow");
+        assert_eq!(allow["action"], "register");
+        assert_eq!(allow["rp_id"], "example.com");
     }
 
     #[test]
@@ -1397,39 +1385,29 @@ mod tests {
         );
     }
 
-    fn wildcard_register_config(register: AgentCeremonyPolicy) -> AgentProfileConfig {
-        let mut config = make_registration_profile_config();
-        config.rules = vec![AgentRpRule {
-            credential_selection: None,
-            rp_id: ANY_RP_ID.to_string(),
-            register,
-            authenticate: AgentCeremonyPolicy::deny(),
-        }];
+    fn wildcard_register_config(register: RuleAction) -> AgentProfileConfig {
+        let mut config = profile_with_rules(vec![register_rule(WILDCARD_RP_ID, register)]);
+        config.mode = AgentMode::SameUser;
         config
     }
 
     #[test]
     fn test_register_under_wildcard_is_always_denied() {
         // `register = "deny"` is the only configuration the wildcard allows (section 6.3) ...
-        // ... but the handler also refuses a wildcard rule that says `allow`, so a policy bug
-        // elsewhere can never turn the wildcard into registration authority.
-        for register in [
-            AgentCeremonyPolicy::deny(),
-            AgentCeremonyPolicy {
-                authorization: AgentAuthorization::Allow,
-                user_presence: UserPresenceSource::Agent,
-                user_verification: UserVerificationSource::Agent,
-            },
-        ] {
+        // ... but resolution also never lets a wildcard rule that says `allow` or `request`
+        // grant registration, so a validation bug elsewhere can never turn the wildcard into
+        // registration authority.
+        for register in [RuleAction::Deny, RuleAction::Allow, RuleAction::Request] {
             let f = make_fixture_with_config(wildcard_register_config(register));
             let err = f
                 .make_handler()
                 .register(&f.make_ctx(), &f.make_req())
                 .unwrap_err();
-            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(err.code, ErrorCode::Forbidden, "{register}");
             assert_eq!(
                 deny_reasons(&f),
-                vec![("example.com".to_string(), "action_not_allowed".to_string())]
+                vec![("example.com".to_string(), "action_not_allowed".to_string())],
+                "{register}"
             );
             let boxed = f.storage.lock().unwrap();
             assert_eq!(boxed.count_credentials(), 0, "no credential may be written");
@@ -1438,24 +1416,69 @@ mod tests {
 
     #[test]
     fn test_exact_rule_wins_over_wildcard_for_registration() {
-        let mut config = wildcard_register_config(AgentCeremonyPolicy::deny());
-        config.rules.insert(
-            0,
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: "example.com".to_string(),
-                register: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
-                authenticate: AgentCeremonyPolicy::deny(),
-            },
-        );
+        let mut config = wildcard_register_config(RuleAction::Deny);
+        config
+            .rules
+            .insert(0, register_rule("example.com", RuleAction::Allow));
         let f = make_fixture_with_config(config);
         f.make_handler()
             .register(&f.make_ctx(), &f.make_req())
             .expect("exact allow rule is used");
+    }
+
+    #[test]
+    fn test_register_resolution_is_live_reload_to_deny() {
+        let f = RegisterTestFixture::new();
+        let handler = f.make_handler();
+        let ctx = f.make_ctx();
+
+        handler
+            .register(&ctx, &f.make_req())
+            .expect("allowed before reload");
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+
+        // Reload without rebuilding the handler or the session context.
+        f.reload_profile(make_deny_profile_config());
+        let err = handler.register(&ctx, &f.make_req()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("example.com".to_string(), "action_not_allowed".to_string())]
+        );
+        assert_eq!(
+            f.storage.lock().unwrap().count_credentials(),
+            1,
+            "nothing written after the reload"
+        );
+    }
+
+    #[test]
+    fn test_register_resolution_is_live_reload_to_request_and_back() {
+        let f = make_fixture_with_config(make_deny_profile_config());
+        let handler = f.make_handler();
+        let ctx = f.make_ctx();
+        assert!(handler.register(&ctx, &f.make_req()).is_err());
+
+        // The reverse direction: a deny profile becomes allow without touching the context.
+        f.reload_profile(make_registration_profile_config());
+        handler
+            .register(&ctx, &f.make_req())
+            .expect("allowed after reload");
+
+        f.reload_profile(profile_with_rules(vec![register_rule(
+            "example.com",
+            RuleAction::Request,
+        )]));
+        let err = handler.register(&ctx, &f.make_req()).unwrap_err();
+        assert!(err.message.contains("escalation is unavailable"));
+        let reasons = deny_reasons(&f);
+        assert_eq!(
+            reasons.last().unwrap(),
+            &(
+                "example.com".to_string(),
+                "escalation_unavailable".to_string()
+            )
+        );
     }
 
     #[test]
@@ -1611,20 +1634,17 @@ mod tests {
     }
 
     #[test]
-    fn test_uv_required_without_agent_uv_source_is_audited() {
-        let mut config = make_registration_profile_config();
-        config.rules[0].register.user_verification = UserVerificationSource::None;
-        let f = make_fixture_with_config(config);
-        let mut req = f.make_req();
-        req.user_verification = true;
-
-        let err = f.make_handler().register(&f.make_ctx(), &req).unwrap_err();
-
-        assert_eq!(err.code, ErrorCode::Forbidden);
-        assert_eq!(
-            deny_reasons(&f),
-            vec![("example.com".to_string(), "uv_required".to_string())]
-        );
+    fn test_register_user_verification_request_is_irrelevant_under_allow() {
+        // The RP's `userVerification` request and `always_uv` no longer matter: `allow` carries UV
+        // from the agent session.
+        let f = RegisterTestFixture::new();
+        for rp_wants_uv in [false, true] {
+            let mut req = f.make_req();
+            req.user_verification = rp_wants_uv;
+            let resp = f.make_handler().register(&f.make_ctx(), &req).unwrap();
+            let auth_data = b64u_decode(&resp.authenticator_data_b64u).unwrap();
+            assert_eq!(auth_data[32] & 0x05, 0x05);
+        }
     }
 
     #[test]

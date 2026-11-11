@@ -25,7 +25,8 @@ const { ARTIFACTS_DIR } = require('./paths');
 function selected(meta) {
   const filter = (process.env.AGENT_E2E_FILTER || '').split(',').map(s => s.trim()).filter(Boolean);
   if (filter.length) {
-    const num = meta.id.replace(/^E2E-/, '');
+    // `E2E-12/audit-rule` is a part of E2E-12 and is selected with it.
+    const num = meta.id.replace(/^E2E-/, '').split('/')[0];
     return filter.some(f => f === meta.id || f === num || f.replace(/^E2E-/, '').replace(/^0+/, '') === num.replace(/^0+/, ''));
   }
   const m = process.env.AGENT_E2E_MATRIX || 'ci';

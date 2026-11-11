@@ -295,11 +295,7 @@ impl AgentRuntime {
                     .join("passless")
                     .join("browser")
             });
-        let rp_ids = if !profile_config.rp_ids.is_empty() {
-            profile_config.rp_ids.clone()
-        } else {
-            profile_config.allowed_rp_ids()
-        };
+        let rp_ids = profile_config.rule_rp_ids();
         let config = BrowserConfig {
             executable: PathBuf::from(&browser_command[0]),
             start_url: start_url
@@ -310,6 +306,7 @@ impl AgentRuntime {
             ttl: BROWSER_TTL,
             login_timeout: LOGIN_TIMEOUT,
             rp_ids,
+            start_url_rules: profile_config.rules.clone(),
             target_uid: profile.browser_uid.unwrap_or(profile.daemon_uid),
             target_gid: profile.browser_gid.unwrap_or(profile.daemon_gid),
             daemon_uid: profile.daemon_uid,
@@ -332,9 +329,10 @@ impl AgentRuntime {
         // with it.
         let registration_ctx = crate::agent::register::RegisterContext::new(
             profile_id.clone(),
-            profile_config.clone(),
+            profile_config.max_operations,
         );
         let registration_handler = Arc::new(crate::agent::register::RegisterHandler {
+            policy_runtime: self.policy_runtime.clone(),
             credential_storage: profile.backend.credential_storage.clone(),
             audit_gate: self.audit_gate.clone(),
             key_provider: profile.backend.key_provider.clone(),
@@ -449,7 +447,7 @@ impl AgentRuntime {
         }
 
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if dynamic_credential_scope || !credential_refs.is_empty() {
+        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
             let params = crate::agent::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id: session_id.clone(),
@@ -495,7 +493,7 @@ impl AgentRuntime {
             let sign_ctx = crate::agent::sign::SignContext {
                 profile_id: profile_id.clone(),
                 active_grant_id: grant_id.clone(),
-                profile_config: profile_config.clone(),
+                max_operations: profile_config.max_operations,
             };
             let active_ttl = profile_config
                 .max_session_ttl

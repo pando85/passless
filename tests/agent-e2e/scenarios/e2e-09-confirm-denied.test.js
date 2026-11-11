@@ -2,13 +2,13 @@
 const { scenario, assert } = require('../lib/scenario');
 const { authenticate, policyEvents, storeFingerprint, assertInterceptionActive, assertNoNotification } = require('../lib/helpers');
 
-// Catalogue: `confirm` legacy rule before P7: denied; the native `get` is never invoked. The legacy mapping in
-// lib/daemon.js turns `request` into `supervised`, which resolves to `confirm`.
+// Catalogue: a `request` rule before P7 (a legacy `confirm`/`supervised` rule maps to it, see E2E-13): denied with audit
+// `escalation_unavailable`; the native `get` is never invoked.
 //
 // Evidence that nothing reached the human authenticator (a credential for alice exists in its store, so a leak would
 // succeed): the RP never sees an assertion, the human store (including its signature counters) is unchanged, and
 // the daemon log has no new CTAP request after the ceremony. No notification is shown (notify-double).
-scenario({ id: 'E2E-09', title: 'confirm rule acts as deny: no prompt, no human authenticator', ci: true }, async ctx => {
+scenario({ id: 'E2E-09', title: 'request rule acts as deny until P7: no prompt, no human authenticator', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'request', register: 'deny' }] } },
@@ -25,7 +25,7 @@ scenario({ id: 'E2E-09', title: 'confirm rule acts as deny: no prompt, no human 
   const logBefore = stack.daemon.log().length;
   const res = await authenticate(b.page, { username: 'alice' });
 
-  assert.equal(res.ok, false, `a confirm rule must not authenticate: ${JSON.stringify(res)}`);
+  assert.equal(res.ok, false, `a request rule must not authenticate: ${JSON.stringify(res)}`);
   assert.equal(res.name, 'NotAllowedError');
   assert.equal(rp.authentications.length, assertionsBefore, 'the RP must never receive an assertion');
   assert.equal(storeFingerprint(stack.daemon), storeBefore, 'human store (incl. counters) unchanged: the human authenticator signed nothing');

@@ -564,7 +564,12 @@ Migrate the fixtures in `config.rs` tests (1449-1758), `policy.rs` tests (1019-1
 - a duplicate is coalesced, never signed twice;
 - a failure consumes the key;
 - a principal digest mismatch is denied;
-- reload revokes bearers.
+- reload revokes bearers;
+- reload re-reads the config from disk (and validates it) before compiling a new generation
+  (P4 left `handle_reload_policy` recompiling the in-memory config, so a config file change does not
+  reach the runtime yet);
+- re-resolve the rule and compare the revocation epoch immediately before key use (invariant 13;
+  P4 resolves once per request, before the audit reservation and key use).
 
 Replace the `sign.rs` replay tests (2091-2258). E2E-14 and E2E-15.
 
@@ -804,7 +809,7 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 | P1 | ✅ | — | Baseline: 24 PASS, 8 XFAIL (E2E-02, 06 until P6) on Chromium and PW Chromium headed/headless; CfT 12 PASS/4 XFAIL; defects B1–B7 recorded |
 | P2 | ✅ | — | Native fallback removed; cross-origin and `confirm` deny with audit; launch refuses invalid extension; interim MAIN-world hardening (prototype, single read, about:blank/srcdoc/blob frames). E2E-09, 10, 47 pass; E2E-02, 06 XFAIL until P6 |
 | P3 | ✅ | — | UHID route and minted grants removed; registration bearers lease-bound; B3 (COSE_Key) and B6 fixed. E2E-11 pass; E2E-02 XFAIL until P6 (extension `/register` response shape only) |
-| P4 | ⏳ | — | |
+| P4 | ✅ | — | `RuleAction`/`PolicyAction`, legacy mapping with warnings (doctor shows them; unmappable legacy values are reported by `validate`, so a disabled `[agents]` section never breaks the human config load), validation (wildcard, `register = request`, `localhost` exact only, at most 32 RP rules without a `*` rule), `resolve_rules`/`MatchedRule`/`GrantSource` hook, ceremonies resolve per request through `PolicyRuntime::resolve` against the compiled in-memory generation (not a copy in the session context), numeric generation (serialized reloads), digest v4, pinning before `allowCredentials`, B4 fixed, launch-URL check by most specific rule. E2E-12, 13 added; E2E-03 uses an all-deny profile. Not yet real: config changes do not reach the runtime (reload re-recompiles the in-memory config; P5 re-reads the file) and there is no re-resolve before key use (P5/invariant 13). Also frozen: `max_operations` in the sign/register contexts (P5); audit `rule` identity (E2E-12/audit-rule XFAIL until P8) |
 | P5 | ⏳ | — | |
 | P6 | ⏳ | — | |
 | P7 | ⏳ | — | |

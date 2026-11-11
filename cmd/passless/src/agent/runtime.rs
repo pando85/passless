@@ -143,6 +143,24 @@ fn cleanup_all_shared_for_profile(
     shared.remove(profile_id).map(|lease| lease.lease_id)
 }
 
+/// The wire form of a rule action. `allow` always uses agent evidence (ADR 0014 section 7), and
+/// `deny` and `request` set no UP or UV at all.
+///
+/// The `user_presence` / `user_verification` wire fields remain for client compatibility until P8/P9
+/// reshape the authority report.
+fn authority_ceremony(action: passless_core::agent::RuleAction) -> AuthorityCeremony {
+    let evidence = if action == passless_core::agent::RuleAction::Allow {
+        "agent"
+    } else {
+        "none"
+    };
+    AuthorityCeremony {
+        authorization: action.to_string(),
+        user_presence: evidence.to_string(),
+        user_verification: evidence.to_string(),
+    }
+}
+
 pub struct ProfileRuntime {
     pub profile_name: String,
     pub profile_id: ProfileId,
@@ -1493,17 +1511,15 @@ impl AgentRuntime {
         managed: &ManagedPrincipalSession,
     ) -> EffectiveAuthority {
         let acts_as_human = profile.mode == AgentMode::SameUser;
-        let rules = profile.profile_config.effective_rules();
-        let wildcard = rules
+        let rules = &profile.profile_config.rules;
+        let wildcard = rules.iter().any(|rule| rule.is_wildcard());
+        let autonomous_authentication = rules
             .iter()
-            .any(|rule| rule.rp_id.trim() == passless_core::agent::config::ANY_RP_ID);
-        let autonomous_authentication = rules.iter().any(|rule| {
-            rule.authenticate.authorization == passless_core::agent::AgentAuthorization::Allow
-        });
+            .any(|rule| rule.authenticate == passless_core::agent::RuleAction::Allow);
         let human_backend_registration = acts_as_human
-            && rules.iter().any(|rule| {
-                rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
-            });
+            && rules
+                .iter()
+                .any(|rule| rule.register != passless_core::agent::RuleAction::Deny);
         let direct_cdp = profile.profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
         let ambiguous_selection = matches!(
             profile.profile_config.credential_selection,
@@ -1563,22 +1579,14 @@ impl AgentRuntime {
                 credential_namespace: if acts_as_human { "human" } else { "isolated" }.into(),
                 rp_identity: if acts_as_human { "human" } else { "agent" }.into(),
             },
-            policy_generation: generation.generation_id.as_str().to_string(),
+            policy_generation: generation.generation.to_string(),
             rp_rules: rules
-                .into_iter()
+                .iter()
                 .map(|rule| AuthorityRpRule {
-                    wildcard: rule.rp_id.trim() == passless_core::agent::config::ANY_RP_ID,
-                    rp_id: rule.rp_id,
-                    authenticate: AuthorityCeremony {
-                        authorization: rule.authenticate.authorization.to_string(),
-                        user_presence: rule.authenticate.user_presence.to_string(),
-                        user_verification: rule.authenticate.user_verification.to_string(),
-                    },
-                    register: AuthorityCeremony {
-                        authorization: rule.register.authorization.to_string(),
-                        user_presence: rule.register.user_presence.to_string(),
-                        user_verification: rule.register.user_verification.to_string(),
-                    },
+                    wildcard: rule.is_wildcard(),
+                    rp_id: rule.rp_id.clone(),
+                    authenticate: authority_ceremony(rule.authenticate),
+                    register: authority_ceremony(rule.register),
                 })
                 .collect(),
             credentials: AuthorityCredentialScope {
@@ -2542,7 +2550,7 @@ impl AgentRuntime {
         let generation = self.policy_runtime.current_generation();
         let policy_gen = generation
             .find_snapshot(profile_id)
-            .map(|_| generation.generation_id.as_str().len() as u64)
+            .map(|_| generation.generation)
             .unwrap_or(0);
         let active_grants = self
             .policy_runtime
@@ -2596,7 +2604,7 @@ impl AgentRuntime {
         let generation = self.policy_runtime.current_generation();
         let policy_gen = generation
             .find_snapshot(profile_id)
-            .map(|_| generation.generation_id.as_str().len() as u64)
+            .map(|_| generation.generation)
             .unwrap_or(0);
 
         let (pin_storage_available, pin_set) = {
@@ -2618,20 +2626,33 @@ impl AgentRuntime {
             }
         };
 
-        let require_uv = profile.profile_config.requires_human_uv();
+        // Agent ceremonies carry no human UV evidence (ADR 0014 section 7), so no PIN is required.
+        let require_uv = false;
 
-        super::doctor::build_profile_diagnostic_report(super::doctor::ProfileDiagnosticParams {
-            profile_id,
-            enabled,
-            mode: profile.mode,
-            endpoint_has_id,
-            browser_lease_state: browser_lease_state.as_deref(),
-            policy_generation: policy_gen,
-            audit_gate: &self.audit_gate,
-            pin_storage_available,
-            pin_set,
-            require_uv,
-        })
+        let mut report = super::doctor::build_profile_diagnostic_report(
+            super::doctor::ProfileDiagnosticParams {
+                profile_id,
+                enabled,
+                mode: profile.mode,
+                endpoint_has_id,
+                browser_lease_state: browser_lease_state.as_deref(),
+                policy_generation: policy_gen,
+                audit_gate: &self.audit_gate,
+                pin_storage_available,
+                pin_set,
+                require_uv,
+            },
+        );
+        // Deprecated config vocabulary is accepted with a warning for one minor release (plan R8):
+        // a warning never makes the profile unhealthy, so the check passes and carries the text.
+        for warning in profile.profile_config.deprecation_warnings(profile_id) {
+            report.checks.push(passless_core::agent::DoctorCheck {
+                name: "config_deprecation".into(),
+                passed: true,
+                message: format!("warning: {warning}"),
+            });
+        }
+        report
     }
 
     fn handle_enableprofile(&self, profile_id: &ProfileId) -> Result<AdminResponse, ProtocolError> {
@@ -2741,7 +2762,7 @@ impl AgentRuntime {
         })?;
 
         let digest_hex = hex::encode(generation.digest.as_bytes());
-        let gen_num = generation.generation_id.as_str().len() as u64;
+        let gen_num = generation.generation;
         let _ = snapshot;
 
         Ok(AdminResponse::PolicyInfo(
@@ -2774,7 +2795,7 @@ impl AgentRuntime {
         let generation = self.policy_runtime.current_generation();
         let gen_event = super::audit_events::AdminPolicyRecompileBuilder::new(
             profile_id.clone(),
-            generation.generation_id.as_str().len() as u64,
+            generation.generation,
         )
         .build();
         let _ = self.audit_gate.record(gen_event);
@@ -2810,11 +2831,16 @@ impl AgentRuntime {
             })?;
 
             let filter = if let Some(rp) = rp_id {
-                if !profile
-                    .profile_config
-                    .rp_ids
-                    .iter()
-                    .any(|configured_rp| configured_rp.trim().eq_ignore_ascii_case(rp.trim()))
+                // Only RPs the profile has a rule for (exact, or through the wildcard).
+                if self
+                    .policy_runtime
+                    .resolve(
+                        &profile.profile_id,
+                        &passless_core::agent::protocol::IntentAction::Authenticate,
+                        rp,
+                    )
+                    .rule
+                    == passless_core::agent::RuleIdentity::None
                 {
                     continue;
                 }
@@ -3589,11 +3615,7 @@ impl AgentRuntime {
         let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
         let browser_gid = profile.browser_gid.unwrap_or(profile.daemon_gid);
 
-        let rp_ids = if !profile_config.rp_ids.is_empty() {
-            profile_config.rp_ids.clone()
-        } else {
-            profile_config.allowed_rp_ids()
-        };
+        let rp_ids = profile_config.rule_rp_ids();
 
         let config = BrowserConfig {
             executable,
@@ -3605,6 +3627,7 @@ impl AgentRuntime {
             ttl: std::time::Duration::from_secs(3600),
             login_timeout: std::time::Duration::from_secs(300),
             rp_ids,
+            start_url_rules: profile_config.rules.clone(),
             target_uid: browser_uid,
             target_gid: browser_gid,
             daemon_uid: profile.daemon_uid,
@@ -3651,10 +3674,13 @@ impl AgentRuntime {
 
         // Registration authority is policy only (`register = "allow"` on an exact RP rule); the
         // bearer is bound to the browser lease below and revoked with it.
-        let register_ctx =
-            super::register::RegisterContext::new(profile_id.clone(), profile_config.clone());
+        let register_ctx = super::register::RegisterContext::new(
+            profile_id.clone(),
+            profile_config.max_operations,
+        );
 
         let register_handler = Arc::new(super::register::RegisterHandler {
+            policy_runtime: self.policy_runtime.clone(),
             credential_storage: profile.backend.credential_storage.clone(),
             audit_gate: self.audit_gate.clone(),
             key_provider: profile.backend.key_provider.clone(),
@@ -3752,7 +3778,7 @@ impl AgentRuntime {
         }
 
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if dynamic_credential_scope || !credential_refs.is_empty() {
+        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
             let session_id = passless_core::agent::PrincipalSessionId::new();
             let grant_params = super::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
@@ -3787,7 +3813,7 @@ impl AgentRuntime {
                             let sign_ctx = super::sign::SignContext {
                                 profile_id: profile_id.clone(),
                                 active_grant_id: grant_id,
-                                profile_config: profile_config.clone(),
+                                max_operations: profile_config.max_operations,
                             };
                             let sign_handler = Arc::new(super::sign::SignHandler {
                                 credential_storage: profile.backend.credential_storage.clone(),

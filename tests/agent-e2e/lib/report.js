@@ -39,7 +39,7 @@ if (rows.length === 0) problems.push('no scenario ran');
 if ((counts.SKIP || 0) > 0 && process.env.AGENT_E2E_ALLOW_SKIP !== '1') problems.push(`${counts.SKIP} scenario(s) skipped (set AGENT_E2E_ALLOW_SKIP=1 to allow)`);
 for (const f of (process.env.AGENT_E2E_FILTER || '').split(',').map(x => x.trim()).filter(Boolean)) {
   const num = f.replace(/^E2E-/, '').replace(/^0+/, '');
-  if (!rows.some(r => r.id.replace(/^E2E-/, '').replace(/^0+/, '') === num)) problems.push(`filter ${f} matched no scenario`);
+  if (!rows.some(r => r.id.replace(/^E2E-/, '').split('/')[0].replace(/^0+/, '') === num)) problems.push(`filter ${f} matched no scenario`);
 }
 for (const p of problems) console.log(`PROBLEM: ${p}`);
 process.exit((counts.FAIL || 0) + (counts.XPASS || 0) + problems.length > 0 ? 1 : 0);
