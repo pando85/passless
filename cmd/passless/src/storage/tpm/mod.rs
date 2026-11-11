@@ -451,10 +451,7 @@ impl TpmStorageAdapter {
             soft_fido2::Error::Other
         })?;
 
-        let mut context = self.context.lock().map_err(|e| {
-            log::error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = portable::context::lock_context(&self.context);
 
         let parent_key = self.sealing_parent_handle(&mut context)?;
         let sealing_pub = self.create_sealing_public()?;
@@ -546,10 +543,7 @@ impl TpmStorageAdapter {
     pub fn unseal_data(&self, sealed_data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         debug!("Unsealing data with TPM (hybrid decryption)");
 
-        let mut context = self.context.lock().map_err(|e| {
-            log::error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = portable::context::lock_context(&self.context);
 
         let sealed_blob: SealedBlob = serde_json::from_slice(sealed_data).map_err(|e| {
             log::error!("Failed to deserialize sealed blob: {}", e);

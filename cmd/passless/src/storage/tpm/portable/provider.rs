@@ -103,10 +103,7 @@ impl TpmCredentialKeyProvider {
             return Ok(());
         }
 
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context for capability check: {}", e);
-            CredentialKeyError::TransientFailure("Failed to lock TPM context".to_string())
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let (alg_data, _) = context
             .get_capability(CapabilityType::Algorithms, 0, 256)
@@ -189,10 +186,7 @@ impl TpmCredentialKeyProvider {
         let metadata = self.parent.load_metadata()?;
         self.parent.verify_parent(&metadata)?;
 
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let parent_tpm_handle =
             tss_esapi::handles::PersistentTpmHandle::new(metadata.persistent_handle)
@@ -308,10 +302,7 @@ impl TpmCredentialKeyProvider {
         let metadata = self.parent.load_metadata()?;
         self.parent.verify_parent(&metadata)?;
 
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let parent_tpm_handle =
             tss_esapi::handles::PersistentTpmHandle::new(metadata.persistent_handle)
@@ -388,10 +379,7 @@ impl TpmCredentialKeyProvider {
 
         validate_signing_template(&public)?;
 
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context: {}", e);
-            CredentialKeyError::TransientFailure("Failed to lock TPM context".to_string())
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let metadata = self.parent.load_metadata().map_err(|e| {
             error!("Failed to load parent metadata: {}", e);
