@@ -164,34 +164,19 @@ fn render_browser(
 }
 
 /// `passless agent browser`.
-pub fn dispatch_browser(
-    profile: Option<&str>,
-    output: OutputFormat,
-    flags: &BrowserFlags,
-) -> Result<()> {
+pub fn dispatch_browser(profile: Option<&str>, flags: &BrowserFlags) -> Result<()> {
     let profile = profile
         .ok_or_else(|| Error::Other("--profile is required for `agent browser`".to_string()))?;
     if !in_principal_session(profile)? {
-        let mut args = vec![
-            "agent".to_string(),
-            "browser".to_string(),
-            "--profile".to_string(),
-            profile.to_string(),
-        ];
-        for (on, flag) in [
-            (flags.json, "--json"),
-            (flags.env, "--env"),
-            (flags.wait, "--wait"),
-            (flags.headed, "--headed"),
-        ] {
-            if on {
-                args.push(flag.to_string());
-            }
-        }
-        if let Some(url) = &flags.url {
-            args.extend(["--url".to_string(), url.clone()]);
-        }
-        return relaunch(output, profile, args);
+        // Not relaunched in a session of its own like the MCP adapters: the browser belongs to the
+        // principal session and is closed when it ends, so a browser started here would die as
+        // soon as this command printed its endpoint.
+        return Err(Error::Other(format!(
+            "`agent browser` must run inside a principal session of profile '{profile}' (the \
+             browser belongs to that session and is closed when it ends): start your agent with \
+             `passless agent run --profile {profile} -- <command>` and call this from it, or use \
+             `passless agent mcp playwright|chrome-devtools`, which keep a session of their own"
+        )));
     }
     let mut status = ensure(profile, flags.url.as_deref(), flags.headed)?;
     if flags.wait {

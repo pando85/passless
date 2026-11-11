@@ -213,6 +213,16 @@ revocation is closing it) is closed there and a fresh browser launched.
   were locked. These policy locks are now flat (`intents` and `pending` were removed with the
   principal intent protocol in P7).
 
+## Shared browser ownership (P10b, L5)
+
+`SharedBrowserLease::owner_session` is the principal session that launched a `browser_scope =
+"profile"` browser: the worker's bearer, the session grant and the bearer session behind it are
+the owner's. `cleanup_browser_for_session` decides in `detach_session_from_shared`, under the
+bookkeeping lock (35) alone, that the owner's exit (or the last session's) closes the browser, then
+removes the other sessions' `active_browser` entries for that lease (35 again, not nested), and only
+then takes `browser_manager` (30) to terminate it, exactly as the last-session case did. No lock is
+held across another, and the order of the table above is unchanged.
+
 ## Known bounded waits (not deadlocks)
 
 - `browser_manager` is held across a browser launch and across `terminate` (up to about 8 s). A
@@ -224,6 +234,10 @@ revocation is closing it) is closed there and a fresh browser launched.
   held across the bootstrap's wait for a reconnecting worker (at most the 10 s degraded grace
   period). The first sign of a lease waits for it to
   activate the lease, holding no backend lock, so the human CTAP path is not delayed.
+- The browser launch also runs `<browser> --version` (at most 10 s, `browser_select::run_version`,
+  D4/R14) before the spawn, under `browser_manager` on the principal path (`resolve_browser_launch`:
+  it reads `agent_config` (45), which ranks above the manager, so the order is unchanged). The admin
+  launch runs it before taking the manager.
 - A revocation waits for a key use that already passed its re-check (rule 6): one signature or
   one credential write.
 - The human CTAP path holds the operation lock across a whole CTAP command, including its

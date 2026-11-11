@@ -1407,8 +1407,9 @@ pub enum AgentCommand {
     /// while it runs (the profile's `browser_scope` decides whether sessions share it). The
     /// endpoint is withheld until the interception extension is attached and allowed in
     /// incognito, so a printed endpoint is always an intercepted browser. Requires
-    /// `browser_cdp_expose = "port"` on the profile. Not run from a principal session, the
-    /// command starts one for the profile (like `agent run`).
+    /// `browser_cdp_expose = "port"` on the profile. It must run inside a principal session of
+    /// the profile (the browser is closed when that session ends), e.g. an agent started with
+    /// `passless agent run --profile P -- <command>`.
     Browser {
         /// Print JSON ({endpoint, ...}) instead of the bare endpoint URL
         #[arg(long, conflicts_with = "env")]

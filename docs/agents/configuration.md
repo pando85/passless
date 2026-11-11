@@ -38,6 +38,14 @@ audit_path = "/var/lib/passless-agent/audit"
   the native path would be signed silently. Agents then refuse to start (and a reload is
   rejected) while any same-user profile has an `allow` or `request` rule, unless this is `true`.
 
+- `browser_path` (absolute path, optional): the browser binary of profiles that set no
+  `browser_command`. Unset, the daemon picks the first supported browser it finds: Playwright's
+  Chromium (`~/.cache/ms-playwright`), Chrome for Testing (`~/.cache/puppeteer`), the
+  distribution's `chromium`. Such a browser starts with `--headless=new` (`passless agent browser
+  --headed` omits it). Branded Google Chrome and `chrome-headless-shell` are refused: neither can
+  load the interception extension. With a distinct-UID principal the binary must be owned by root
+  on a path nobody else can write. `passless doctor --agents` shows what would be used.
+
 ## Profile structure
 
 Each profile is a named entry under `[agents.profiles.<id>]`.
@@ -71,7 +79,7 @@ register = "deny"
 | `credential_selection` | `single`, `first-matching`, `newest`, or `credential:<ref>` |
 | `human_verification_prompt` | `always` (default) or `when-required` |
 | `start_url` | Optional HTTPS start URL |
-| `browser_command` | Managed Chromium/Chrome executable and arguments |
+| `browser_command` | Managed Chromium or Chrome for Testing executable and arguments (optional: see `agents.browser_path`) |
 | `browser_user` | Optional Unix account used by the managed browser where supported |
 | `browser_runtime_root` | Runtime root for the managed browser where required |
 | `browser_cdp_expose` | `pipe` (default) or `port` |

@@ -12,6 +12,7 @@ const { startNotifyDouble } = require('./notify-double');
 const { RpServer } = require('./rp-server');
 const { ensureTestTls, rpBrowserArgs } = require('./tls');
 const { variantArgs, connect, waitForExtensionWorker, launchPlain } = require('./browser');
+const { startAdapter } = require('./adapters');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -36,11 +37,12 @@ async function waitForPage(context, url, timeoutMs = 15000) {
  *                                             notification server: escalation is denied `escalation_unavailable`)
  * @param {object} [o.agents]                  raw `[agents]` keys, e.g. {escalation_cooldown: 2}
  * @param {string} [o.browserScope]            `browser_scope` of every profile (default "profile")
+ * @param {boolean} [o.noBrowserCommand]       profiles get no `browser_command`: the daemon picks the browser (`agents.browser_path`)
  * @param {object} [o.daemonEnv]
  */
 async function createStack(label, variant, o) {
   const env = createEnv(label);
-  const stack = { env, variant, rp: {}, browsers: [], failed: false };
+  const stack = { env, variant, rp: {}, browsers: [], adapters: [], failed: false };
   try {
     const tls = Object.values(o.rps || {}).some(r => r.host && r.host !== 'localhost') ? ensureTestTls() : null;
     for (const [key, spec] of Object.entries(o.rps || {})) {
@@ -55,9 +57,11 @@ async function createStack(label, variant, o) {
       limits: o.limits,
       agents: o.agents,
       browserScope: o.browserScope,
+      noBrowserCommand: o.noBrowserCommand,
       browserExe: variant.browser.exe,
       browserArgs: [...variantArgs(variant), ...rpBrowserArgs(rpList)],
-      env: o.daemonEnv,
+      // The principal sessions the daemon starts inherit its environment: the npx shim logs here.
+      env: { AGENT_E2E_NPX_LOG: path.join(env.dirs.logs, 'npx.jsonl'), ...(o.daemonEnv || {}) },
     });
     stack.daemon = await stack.startDaemon(o.profiles);
   } catch (e) {
@@ -90,6 +94,16 @@ async function createStack(label, variant, o) {
     if (previous) await previous.stop();
     stack.notify = await startNotifyDouble(env, opts);
     return previous;
+  };
+
+  /**
+   * Start an MCP adapter (`passless agent mcp playwright|chrome-devtools`) for `profile` as an agent would, with the
+   * harness's npx stand-in; returns {client, npxCalls()} (see lib/adapters.js). Closed with the stack.
+   */
+  stack.adapter = (kind, opts) => {
+    const a = startAdapter(stack, kind, opts);
+    stack.adapters.push(a);
+    return a;
   };
 
   /** Launch the managed browser for `profile` via the product path and attach Playwright. */
@@ -167,6 +181,8 @@ async function createStack(label, variant, o) {
 
 async function closeStack(stack, failed) {
   stack.failed = stack.failed || failed;
+  for (const a of stack.adapters || []) { try { a.close(); } catch { /* gone */ } }
+  stack.adapters = [];
   for (const b of stack.browsers || []) { try { await b.browser.close(); } catch { /* gone */ } }
   stack.browsers = [];
   if (stack.daemon) { try { await stack.daemon.stop(); } catch { /* gone */ } }

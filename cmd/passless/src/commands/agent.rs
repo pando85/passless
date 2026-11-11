@@ -118,7 +118,6 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
             url,
         } => super::agent_browser::dispatch_browser(
             profile,
-            output,
             &super::agent_browser::BrowserFlags {
                 json: *json,
                 env: *env,

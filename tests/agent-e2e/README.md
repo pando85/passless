@@ -87,6 +87,20 @@ result after key use, `PASSLESS_E2E_OMIT_AGENT_EXTENSION` drops the generated ex
 `PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` writes a manifest the browser refuses to load (E2E-47/unloadable) and
 `PASSLESS_E2E_DISABLE_BWRAP` makes the launcher treat bwrap as unavailable (E2E-46/refused).
 
+## Agent-browser easy path (P10b)
+
+E2E-34/35 (Playwright MCP, `--isolated`), 36 (chrome-devtools-mcp), 37 (`connectOverCDP(PASSLESS_CDP_URL)`) and 41 (refused
+browsers) run the real `passless agent mcp ...` / `agent browser` against the scenario's daemon (`lib/adapters.js`). `npx` is
+`bin/npx`, a stand-in that runs the copies `package.json` pins (`@playwright/mcp`, `chrome-devtools-mcp`), so no scenario needs
+the network. `agent browser` only works inside a principal session, so E2E-37 starts an agent as the product does
+(`passless agent run -- /bin/bash <script>`). E2E-41 writes no `browser_command` (`noBrowserCommand`) and sets `agents.browser_path`
+to stand-ins for branded Chrome and `chrome-headless-shell` (and to the real ones when installed).
+
+E2E-38 (browser-use) and E2E-39 (agent-browser) are local and optional: without the tool they are recorded `SKIP-OPT`, which never
+fails a run (`AGENT_E2E_AGENT_BROWSER`, `AGENT_E2E_BROWSER_USE_PYTHON` name the tools). E2E-42 needs `dunst` and a display (headed
+variants under Xvfb). E2E-40 is the matrix itself: `AGENT_E2E_MATRIX=full tests/agent-e2e/run.sh E2E-01 E2E-23 E2E-34` runs the
+core flows on every browser, headed and headless.
+
 ## Expected failures
 
 ```js

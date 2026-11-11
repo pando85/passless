@@ -38,6 +38,13 @@ function record(entry) {
   if (file) fs.appendFileSync(file, JSON.stringify(entry) + '\n');
 }
 
+/**
+ * Thrown by a scenario for a tool that is optional and absent (browser-use, agent-browser, dunst: catalogue "local,
+ * optional"). Recorded as SKIP-OPT, which never fails the run (unlike SKIP, a missing browser).
+ */
+class OptionalSkip extends Error {}
+const skipOptional = reason => { throw new OptionalSkip(reason); };
+
 const firstLine = e => String((e && e.message) || e).split('\n').find(l => l.trim()) || '';
 
 function scenario(meta, body) {
@@ -82,6 +89,11 @@ function scenario(meta, body) {
         const leaks = s.env.cleanup();
         if (leaks.length && !error) error = new Error(`leaked processes after cleanup: ${leaks.join(', ')}`);
       }
+      if (error instanceof OptionalSkip) {
+        record({ ...base, status: 'SKIP-OPT', reason: error.message });
+        t.skip(`optional tool absent: ${error.message}`);
+        return;
+      }
       if (xfail) {
         if (error && !meta.xfailMatch.test(String((error && error.message) || error))) {
           record({ ...base, status: 'FAIL', error: `unexpected failure (expected ${meta.xfailMatch}): ${firstLine(error)}` });
@@ -115,4 +127,4 @@ function smoke(id, title, fn, { timeoutMs = 120000 } = {}) {
   });
 }
 
-module.exports = { scenario, smoke, assert, record };
+module.exports = { scenario, smoke, assert, record, skipOptional };

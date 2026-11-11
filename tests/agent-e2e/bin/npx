@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+'use strict';
+// `npx` stand-in for the hermetic harness: `npx [--yes|-y] <package[@version]> [args...]` runs the copy that
+// package.json pins in node_modules, so `passless agent mcp ...` (which runs real npx in production) needs no network.
+// The argv it received is appended to $AGENT_E2E_NPX_LOG (bearer values redacted) so scenarios can assert the exact
+// command the adapter built. Unknown packages fail with 127 rather than reaching the registry.
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+
+const modules = path.join(__dirname, '..', 'node_modules');
+const argv = process.argv.slice(2);
+if (process.env.AGENT_E2E_NPX_LOG) {
+  const redacted = argv.map(a => a.replace(/(Bearer )\S+/, '$1<redacted>'));
+  fs.appendFileSync(process.env.AGENT_E2E_NPX_LOG, JSON.stringify(redacted) + '\n');
+}
+
+let i = 0;
+while (i < argv.length && /^-/.test(argv[i])) i++; // npx's own flags (--yes, -y, --no-install ...)
+const spec = argv[i];
+if (!spec) { console.error('npx shim: no package given'); process.exit(2); }
+const name = spec.replace(/(?<=.)@[^@/]*$/, ''); // drop a trailing @version, keep a leading scope @
+const rest = argv.slice(i + 1);
+
+function binOf(pkg) {
+  const dir = path.join(modules, pkg);
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+  const bin = typeof meta.bin === 'string' ? meta.bin : meta.bin[Object.keys(meta.bin).find(k => k === pkg || pkg.endsWith(`/${k}`)) || Object.keys(meta.bin)[0]];
+  return path.join(dir, bin);
+}
+
+let entry;
+try {
+  if (name === '@playwright/mcp' || name === 'chrome-devtools-mcp') entry = binOf(name);
+} catch (e) { console.error(`npx shim: ${name} is not installed in tests/agent-e2e/node_modules (${e.message})`); process.exit(127); }
+if (!entry) { console.error(`npx shim: ${name} is not a package the harness pins`); process.exit(127); }
+
+const child = spawn(process.execPath, [entry, ...rest], { stdio: 'inherit' });
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => child.kill(sig));
+child.on('exit', (code, signal) => process.exit(code ?? (signal ? 128 : 1)));

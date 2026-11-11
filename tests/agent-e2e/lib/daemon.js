@@ -38,6 +38,7 @@ function tomlValue(v) {
  * @param {string} o.browserExe
  * @param {object} [o.limits]  `[agents.limits]` keys
  * @param {object} [o.agents]  extra raw `[agents]` keys (`escalation_cooldown`, `escalation_timeout`, `state_dir`, ...)
+ * @param {boolean} [o.noBrowserCommand]  write no `browser_command` (the daemon chooses the browser)
  * @param {string} [o.browserScope]  `browser_scope` of every profile (default "profile", see below)
  * Per profile: `max_granted_rules`.
  */
@@ -56,7 +57,8 @@ function renderConfig(env, o) {
     b.push(`max_operations = ${p.max_operations || 16}`, `max_session_ttl = ${p.max_session_ttl || 300}`);
     if (p.max_granted_rules !== undefined) b.push(`max_granted_rules = ${p.max_granted_rules}`);
     if (p.credential_selection) b.push(`credential_selection = ${q(p.credential_selection)}`);
-    b.push(`browser_command = ${tomlValue([o.browserExe, ...(o.browserArgs || [])])}`);
+    // `noBrowserCommand`: the profile sets none, so the daemon picks the binary (`agents.browser_path`, else detection; E2E-41).
+    if (!o.noBrowserCommand) b.push(`browser_command = ${tomlValue([o.browserExe, ...(o.browserArgs || [])])}`);
     // Isolated profiles take browser_runtime_root too (defect B7, fixed in P10b).
     b.push(`browser_runtime_root = ${q(path.join(env.dirs.run, 'browser'))}`);
     // browser_scope = "profile" by default: it was the only scope that survived its launch before defect B1 was
@@ -227,6 +229,8 @@ async function startDaemon(env, o) {
 
   const daemon = {
     logFile, configPath, pid: child.pid,
+    /** The passless binary and the environment the daemon runs with (CLI clients use the same runtime dir and config). */
+    bin: bins.passless, cliEnv: childEnv,
     /** This daemon's own human hidraw node (or why it could not be identified). */
     hidraw: human.node || null, hidrawError: human.error || null,
     log: readLog,

@@ -14,6 +14,7 @@
     "@puppeteer/browsers": "3.2.7",
     "@simplewebauthn/browser": "14.0.0",
     "@simplewebauthn/server": "14.1.0",
+    "chrome-devtools-mcp": "1.12.0",
     "playwright-core": "1.64.0"
   }
 }

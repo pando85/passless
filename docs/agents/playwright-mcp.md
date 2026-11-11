@@ -1,5 +1,7 @@
 # Playwright MCP
 
+> `passless agent mcp playwright --profile <name> [-- <@playwright/mcp args>]` is the current form (it runs `npx @playwright/mcp` itself; `--package` pins the version, `--npx` names npx), and `passless agent mcp --print-config <claude-code|opencode|cursor|vscode>` prints the client entry. `passless agent mcp chrome-devtools` and `passless agent browser` are the same easy path for chrome-devtools-mcp and for any CDP client. The `agent playwright-mcp` command below is a hidden alias kept for one release; the full rewrite of this guide is P11.
+
 Passless can run Playwright MCP against a managed Chromium browser without proxying Chrome DevTools Protocol (CDP) traffic.
 
 This integration is intentionally restricted to the trusted CDP port model. It does **not** weaken the default isolated `pipe` mode and it does not turn the Passless daemon into a WebSocket proxy.
