@@ -5165,12 +5165,21 @@ register = "deny"
         tracker.push_handle(h2);
         tracker.push_handle(h3);
 
-        std::thread::sleep(Duration::from_millis(50));
-
-        tracker.reap_finished();
-
-        let remaining = tracker.handles.lock().unwrap().len();
-        assert_eq!(remaining, 1);
+        // The two threads that return at once finish eventually; the gated one cannot.
+        let started = Instant::now();
+        loop {
+            tracker.reap_finished();
+            let remaining = tracker.handles.lock().unwrap().len();
+            if remaining <= 1 {
+                assert_eq!(remaining, 1, "the gated worker must not be reaped");
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "finished workers were not reaped: {remaining} left"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         {
             let (lock, cvar) = &*gate;

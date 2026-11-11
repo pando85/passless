@@ -1746,25 +1746,36 @@ mod dbus_tests {
             .unwrap_or(false)
     }
 
+    /// Timing is asserted from recorded instants, never from sleeps: a timer deadline is computed
+    /// after the instant recorded before the request, so "not before the deadline" holds however
+    /// long the scheduler stalls this thread. Waits poll up to `EVENT_WAIT`.
     #[test]
     fn driver_fails_a_silent_child_and_kills_a_withdrawn_one() {
+        const SILENT_TIMEOUT: Duration = Duration::from_millis(300);
+        const GRACE: Duration = Duration::from_millis(300);
         let spawner = Arc::new(SilentSpawner {
             pids: StdMutex::default(),
         });
         let prompter = NotificationPrompter::with_timing(
             spawner.clone(),
             Timing {
-                shown_timeout: Duration::from_millis(300),
-                withdraw_grace: Duration::from_millis(300),
+                shown_timeout: SILENT_TIMEOUT,
+                withdraw_grace: GRACE,
                 min_review_delay: MIN_REVIEW_DELAY,
             },
         );
+        let requested = Instant::now();
         let sink = show(&prompter, 1);
         assert_eq!(
             sink.wait_for(1),
             [PromptEvent::Failed(
                 "the prompt was not shown in time".to_string()
             )]
+        );
+        assert!(
+            requested.elapsed() >= SILENT_TIMEOUT,
+            "failed a silent child after only {:?}",
+            requested.elapsed()
         );
         let first = spawner.pids.lock().unwrap()[0];
         let start = Instant::now();
@@ -1778,7 +1789,7 @@ mod dbus_tests {
             spawner.clone(),
             Timing {
                 shown_timeout: Duration::from_secs(60),
-                withdraw_grace: Duration::from_millis(300),
+                withdraw_grace: GRACE,
                 min_review_delay: MIN_REVIEW_DELAY,
             },
         );
@@ -1789,15 +1800,18 @@ mod dbus_tests {
             thread::sleep(Duration::from_millis(20));
         }
         let second = spawner.pids.lock().unwrap()[1];
-        thread::sleep(Duration::from_millis(100));
+        let withdrawn = Instant::now();
         prompter.withdraw(&ticket(2));
-        thread::sleep(Duration::from_millis(100));
-        assert!(running(second), "killed before the grace period");
         let start = Instant::now();
         while running(second) {
             assert!(start.elapsed() < EVENT_WAIT, "child {second} not killed");
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(5));
         }
+        assert!(
+            withdrawn.elapsed() >= GRACE,
+            "killed after only {:?}, before the grace period",
+            withdrawn.elapsed()
+        );
         assert!(sink.events.lock().unwrap().is_empty());
     }
 }

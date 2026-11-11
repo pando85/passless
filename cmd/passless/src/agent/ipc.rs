@@ -1793,7 +1793,16 @@ mod tests {
             }));
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Every handler thread holds a slot (acquired before it reads its request) and then blocks
+        // on the gate; wait for that instead of guessing how long the threads take to start.
+        let started = std::time::Instant::now();
+        while server.conn_counter.current.load(Ordering::Acquire) < MAX_CONCURRENT_CONNECTIONS {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the handlers never took their connection slots"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         let extra_pair = create_seqpacket_pair();
         let frame = RequestFrame::Admin(AdminRequestFrame::new(1, AdminRequest::Ping));
