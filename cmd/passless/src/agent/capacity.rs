@@ -14,6 +14,7 @@ use log::warn;
 
 use passless_core::agent::{AgentRequestLimits, ProfileId};
 
+use super::escalation::ParkHook;
 use super::lock_order::{self, LockLevel};
 use super::session::AgentSession;
 
@@ -179,6 +180,7 @@ impl RequestLimiter {
             profile,
             connection: connection.clone(),
             session: session.clone(),
+            suspended: false,
         })
     }
 
@@ -224,19 +226,64 @@ impl RequestLimiter {
 }
 
 /// One admitted request. Dropping it releases its slot in every cap.
+///
+/// While its ceremony is parked on an escalation the permit is suspended: its slots are given
+/// back, so parked ceremonies never exhaust the request caps (the escalation service bounds them
+/// with its own waiter caps; plan P7 gap 2). Resuming takes the slots back unconditionally, even
+/// over a cap, because the ceremony is already admitted.
 pub struct RequestPermit {
     limiter: Arc<RequestLimiter>,
     profile: Arc<AtomicUsize>,
     connection: Arc<ConnectionSlots>,
     session: Arc<AgentSession>,
+    suspended: bool,
 }
 
-impl Drop for RequestPermit {
-    fn drop(&mut self) {
+impl RequestPermit {
+    fn release(&self) {
         decrement(self.session.active_requests());
         decrement(&self.connection.active);
         decrement(&self.profile);
         decrement(&self.limiter.global);
+    }
+
+    /// Give the slots back while the ceremony is parked.
+    pub fn suspend(&mut self) {
+        if !self.suspended {
+            self.suspended = true;
+            self.release();
+        }
+    }
+
+    /// Take the slots back after the wait, regardless of the caps.
+    pub fn resume(&mut self) {
+        if self.suspended {
+            self.suspended = false;
+            self.limiter.global.fetch_add(1, Ordering::AcqRel);
+            self.profile.fetch_add(1, Ordering::AcqRel);
+            self.connection.active.fetch_add(1, Ordering::AcqRel);
+            self.session
+                .active_requests()
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl ParkHook for RequestPermit {
+    fn suspend(&mut self) {
+        RequestPermit::suspend(self);
+    }
+
+    fn resume(&mut self) {
+        RequestPermit::resume(self);
+    }
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        if !self.suspended {
+            self.release();
+        }
     }
 }
 
@@ -374,6 +421,40 @@ mod tests {
         drop(permit);
         drop(held);
         assert_eq!(limiter.active_for_profile(&a), 0);
+        assert_eq!(limiter.active(), 0);
+    }
+
+    #[test]
+    fn a_suspended_permit_frees_every_slot_and_resumes_over_the_cap() {
+        let limiter = RequestLimiter::new(limits(1, 1, 1));
+        let connection = ConnectionSlots::new();
+        let session = session();
+        let mut parked = limiter.try_acquire(&connection, &session).unwrap();
+        assert_eq!(
+            limiter.try_acquire(&connection, &session).err(),
+            Some(BusyScope::Global)
+        );
+
+        parked.suspend();
+        assert_eq!(limiter.active(), 0);
+        assert_eq!(connection.active(), 0);
+        assert_eq!(session.active_requests().load(Ordering::Acquire), 0);
+        let other = limiter.try_acquire(&connection, &session).unwrap();
+
+        // Resuming never fails: the parked ceremony was already admitted.
+        parked.resume();
+        assert_eq!(limiter.active(), 2);
+        drop(other);
+        drop(parked);
+        assert_eq!(limiter.active(), 0);
+        assert_eq!(limiter.active_for_profile(session.profile_id()), 0);
+        assert_eq!(connection.active(), 0);
+        assert_eq!(session.active_requests().load(Ordering::Acquire), 0);
+
+        // A permit dropped while suspended releases nothing twice.
+        let mut suspended = limiter.try_acquire(&connection, &session).unwrap();
+        suspended.suspend();
+        drop(suspended);
         assert_eq!(limiter.active(), 0);
     }
 

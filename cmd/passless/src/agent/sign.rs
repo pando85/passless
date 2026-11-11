@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use log::warn;
+use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
 use passless_core::agent::config::{ANY_RP_ID, CredentialSelection, LOCALHOST_RP_ID};
@@ -17,12 +17,17 @@ use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::escalation::{
+    EscalationOutcome, EscalationRefusal, EscalationRequest, EscalationService, NoPark, ParkHook,
+    WaiterSession,
+};
+use super::granted_rules::PermittingRule;
 use super::lock_order::{self, LockLevel, Tracked};
 use super::policy_engine::PolicyRuntime;
 use super::register::{RegisterContext, RegisterHandler};
 use super::session::{
     AgentSession, CeremonyAction, CeremonyOutcome, CeremonyResult, ChallengeDigest, Claim,
-    ClaimRejection, JoinResult, ReplayKey, SessionInvalid, ceremony_deadline,
+    ClaimGuard, ClaimRejection, JoinResult, ReplayKey, SessionInvalid, ceremony_deadline,
 };
 
 use crate::storage::CredentialStorage;
@@ -790,6 +795,8 @@ pub struct SignHandler {
     pub security_config: SecurityConfig,
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
     pub operation_lock: Arc<Mutex<()>>,
+    /// The escalation coordinator a `request` resolution waits on (ADR 0014 section 8).
+    pub escalation: Arc<EscalationService>,
 }
 
 /// Client extensions an authentication request may name. `appid` is honored by never matching a
@@ -944,6 +951,195 @@ impl<'a> AuditTarget<'a> {
             origin: None,
             top_origin: None,
             cross_origin: None,
+        }
+    }
+}
+
+/// The audit reason and error of a refused escalation (nothing was prompted).
+pub(crate) fn escalation_refusal_error(
+    refusal: EscalationRefusal,
+) -> (PolicyDenyReason, ProtocolError) {
+    let reason = refusal.deny_reason();
+    let error = match refusal {
+        EscalationRefusal::AuditFailure => ProtocolError::new(
+            ErrorCode::Internal,
+            "the escalation request could not be audited",
+            RecommendedAction::Retry,
+        ),
+        EscalationRefusal::Unavailable => ProtocolError::new(
+            ErrorCode::Forbidden,
+            "escalation is unavailable: policy requires approval and no prompt can be shown",
+            RecommendedAction::FixRequest,
+        ),
+        _ => ProtocolError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "escalation refused: {}",
+                serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            ),
+            RecommendedAction::Abort,
+        ),
+    };
+    (reason, error)
+}
+
+/// One ceremony's escalation (ADR 0014 section 8.1): what it is for and where it waits.
+pub(crate) struct Escalation<'a> {
+    pub service: &'a Arc<EscalationService>,
+    pub policy_runtime: &'a PolicyRuntime,
+    pub session: &'a Arc<AgentSession>,
+    pub profile_id: &'a ProfileId,
+    pub action: CeremonyAction,
+    /// The normalized RP ID.
+    pub rp_id: &'a str,
+    pub origin: &'a str,
+    /// The configured rule that resolved to `request`.
+    pub rule: &'a RuleIdentity,
+}
+
+/// An escalation request that passed the pre-checks (cooldown, grant cap and store, bus, queue,
+/// waiter caps, a pending registration), before the replay key is taken.
+pub(crate) struct PreparedEscalation {
+    request: EscalationRequest,
+    /// `agents.escalation_timeout`, when set.
+    timeout: Option<Duration>,
+}
+
+impl Escalation<'_> {
+    /// Build the request from the live policy and run the coordinator's pre-checks. A refusal
+    /// is returned before the replay key is consumed and before anything is prompted (plan P7
+    /// section 2).
+    pub fn prepare(&self) -> Result<PreparedEscalation, (PolicyDenyReason, ProtocolError)> {
+        let profile = self
+            .policy_runtime
+            .escalation_profile(self.profile_id)
+            .ok_or_else(|| {
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "the profile no longer exists",
+                        RecommendedAction::Abort,
+                    ),
+                )
+            })?;
+        let rule = match self.rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => {
+                return Err((
+                    PolicyDenyReason::ActionNotAllowed,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "no rule permits an escalation",
+                        RecommendedAction::FixRequest,
+                    ),
+                ));
+            }
+        };
+        let request = EscalationRequest {
+            profile: self.profile_id.clone(),
+            rp_id: self.rp_id.to_string(),
+            action: self.action,
+            origin: self.origin.to_string(),
+            rule,
+            session: WaiterSession::of(self.session),
+            mode: profile.mode,
+            principal_user: profile.principal_user.clone(),
+            max_granted_rules: profile.max_granted_rules,
+        };
+        self.service
+            .precheck(&request)
+            .map_err(escalation_refusal_error)?;
+        Ok(PreparedEscalation {
+            request,
+            timeout: profile.escalation_timeout,
+        })
+    }
+
+    /// Create or join the escalation and park until it ends (a fresh replay key only; a
+    /// duplicate joins the in-flight slot instead, so it never adds a second waiter). Returns
+    /// the approval ([`EscalationOutcome::Approved`] or
+    /// [`EscalationOutcome::RegistrationApproved`]), or the audit reason and error that end the
+    /// ceremony. No lock is held while parked (LOCKING.md rule 3); `park` suspends the
+    /// ceremony's capacity permit for the wait.
+    ///
+    /// The wait ends at the earliest of `deadline` (the transport's Chromium-clamped ceremony
+    /// deadline), `agents.escalation_timeout` and the session's expiry. An abort within
+    /// [`super::escalation::DEADLINE_ABORT_GRACE`] of that point counts as a timeout (plan P7
+    /// gap 8).
+    pub fn wait(
+        &self,
+        prepared: PreparedEscalation,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+    ) -> Result<EscalationOutcome, (PolicyDenyReason, ProtocolError)> {
+        let PreparedEscalation { request, timeout } = prepared;
+        let waiter = self
+            .service
+            .join_or_create(request)
+            .map_err(escalation_refusal_error)?;
+
+        let now = Instant::now();
+        let mut wait_deadline = deadline.min(self.session.expires_at());
+        if let Some(timeout) = timeout {
+            wait_deadline = wait_deadline.min(now + timeout);
+        }
+        let still_valid = || {
+            self.session
+                .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+                .is_ok()
+        };
+        let escalation_id = waiter.escalation_id().clone();
+        let outcome = waiter.wait(wait_deadline, cancelled, &still_valid, park);
+        debug!("escalation {}: wait ended: {:?}", escalation_id, outcome);
+        match outcome {
+            EscalationOutcome::Approved { .. } | EscalationOutcome::RegistrationApproved(_) => {
+                Ok(outcome)
+            }
+            EscalationOutcome::Denied { reason, .. } => Err((
+                reason.unwrap_or(PolicyDenyReason::EscalationDenied),
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "the escalation was denied",
+                    RecommendedAction::Abort,
+                ),
+            )),
+            EscalationOutcome::ServerLost { .. } => Err((
+                PolicyDenyReason::EscalationExpired,
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "the notification server went away before a decision",
+                    RecommendedAction::Retry,
+                ),
+            )),
+            EscalationOutcome::TimedOut => Err((
+                PolicyDenyReason::EscalationExpired,
+                ProtocolError::new(
+                    ErrorCode::Timeout,
+                    "no escalation decision before the ceremony deadline",
+                    RecommendedAction::Abort,
+                ),
+            )),
+            EscalationOutcome::Revoked { .. } => Err((
+                PolicyDenyReason::PolicyRevoked,
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "a policy reload cancelled the escalation",
+                    RecommendedAction::Abort,
+                ),
+            )),
+            EscalationOutcome::Aborted => Err(aborted_error()),
+            EscalationOutcome::SessionInvalid => Err(session_invalid_error(
+                self.session
+                    .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+                    .err()
+                    .unwrap_or(SessionInvalid::Revoked),
+            )),
         }
     }
 }
@@ -1117,7 +1313,10 @@ impl SignHandler {
     /// 3. session grant: active, bound to the session's principal digest, RP in scope;
     /// 4. resolve the rule against the live policy and granted rules (`deny`, `request`, `allow`);
     /// 5. options the authenticator cannot honor (`NotSupportedError`) and a malformed challenge;
-    /// 6. replay key, then budget ([`AgentSession::claim`]);
+    /// 6. replay key, then budget ([`AgentSession::claim`]); for `request`, the escalation
+    ///    pre-checks (cooldown, grant cap, bus, queue, waiter caps), then the replay key only
+    ///    ([`AgentSession::claim_key`]), then the escalation wait with no lock held, and after
+    ///    approval a re-resolve to a granted `allow` and the budget ([`Self::sign_escalated`]);
     /// 7. backend operation lock and credential selection ([`Self::sign_fresh`]);
     /// 8. durable audit reservation;
     /// 9. immediately before key use: revocation epoch, live re-resolve, session and grant validity;
@@ -1128,6 +1327,19 @@ impl SignHandler {
         req: &SignAssertionRequest,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        self.sign_parked(ctx, req, deadline, cancelled, &mut NoPark)
+    }
+
+    /// [`Self::sign_with`] for a transport-carried ceremony: `park` suspends the request's
+    /// capacity permit while the ceremony waits on an escalation.
+    pub fn sign_parked(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
     ) -> Result<PrincipalResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
         let target = AuditTarget::of_request(
@@ -1200,27 +1412,9 @@ impl SignHandler {
                     ),
                 ));
             }
-            // P7 SEAM (escalation). `request` acts as `deny` until the escalation service lands: an
-            // agent ceremony never shows a prompt and never falls back to the human or native path
-            // (ADR 0014 section 7, invariant 25). P7 replaces this arm with: cooldown, grant cap,
-            // notification bus and queue checks; then the replay key (a duplicate joins the pending
-            // escalation instead of prompting again); then the wait for the decision, holding no
-            // lock (LOCKING.md); and only after approval continues at step 5 below, so the budget
-            // is claimed after approval (plan R4 as revised by V-H2).
-            RuleAction::Request => {
-                return Err(self.deny(
-                    ctx,
-                    target,
-                    (
-                        PolicyDenyReason::EscalationUnavailable,
-                        ProtocolError::new(
-                            ErrorCode::Forbidden,
-                            "escalation is unavailable: policy requires approval",
-                            RecommendedAction::FixRequest,
-                        ),
-                    ),
-                ));
-            }
+            // `request` (ADR 0014 section 8.1): steps 5 and 6 run unchanged; the replay key is
+            // taken without budget, then the ceremony escalates (`Self::sign_escalated`).
+            RuleAction::Request => {}
             RuleAction::Allow => {}
         }
 
@@ -1246,7 +1440,10 @@ impl SignHandler {
             return Err(self.deny(ctx, target, aborted_error()));
         }
 
-        // 6. Replay key, then budget (R1, R4). The budget limit is the live `max_operations`.
+        // 6. Replay key, then budget (R1, R4). The budget limit is the live `max_operations`. A
+        //    `request` resolution runs the escalation pre-checks first (a refusal consumes
+        //    nothing), then takes the replay key only: its budget is claimed after approval
+        //    (V-H2), and a duplicate joins the in-flight slot instead of prompting again.
         let key = ReplayKey::derive(
             CeremonyAction::Authenticate,
             &normalized_rp,
@@ -1254,20 +1451,59 @@ impl SignHandler {
             req.top_origin.as_deref(),
             &challenge,
         );
-        let max_operations = self
-            .policy_runtime
-            .max_operations(&ctx.profile_id)
-            .unwrap_or(0);
-        match ctx.session.claim(
-            key,
-            ChallengeDigest::of(&challenge),
-            u32::from(max_operations),
-            Instant::now(),
-        ) {
-            Claim::Fresh(guard) => {
+        let escalation = Escalation {
+            service: &self.escalation,
+            policy_runtime: &self.policy_runtime,
+            session: &ctx.session,
+            profile_id: &ctx.profile_id,
+            action: CeremonyAction::Authenticate,
+            rp_id: target.rp_id,
+            origin: &req.origin,
+            rule: &matched.rule,
+        };
+        let prepared = if matched.action == RuleAction::Request {
+            Some(
+                escalation
+                    .prepare()
+                    .map_err(|refused| self.deny(ctx, target, refused))?,
+            )
+        } else {
+            None
+        };
+        let claim = if prepared.is_some() {
+            ctx.session
+                .claim_key(key, ChallengeDigest::of(&challenge), Instant::now())
+        } else {
+            let max_operations = self
+                .policy_runtime
+                .max_operations(&ctx.profile_id)
+                .unwrap_or(0);
+            ctx.session.claim(
+                key,
+                ChallengeDigest::of(&challenge),
+                u32::from(max_operations),
+                Instant::now(),
+            )
+        };
+        match claim {
+            Claim::Fresh(mut guard) => {
                 let mut key_used = false;
-                let outcome =
-                    self.sign_fresh(ctx, req, target, &grant, &matched, cancelled, &mut key_used);
+                let outcome = if let Some(prepared) = prepared {
+                    self.sign_escalated(
+                        ctx,
+                        req,
+                        target,
+                        &grant,
+                        (&escalation, prepared),
+                        &mut guard,
+                        deadline,
+                        cancelled,
+                        park,
+                        &mut key_used,
+                    )
+                } else {
+                    self.sign_fresh(ctx, req, target, &grant, &matched, cancelled, &mut key_used)
+                };
                 // The operation lock is released: activate the browser lease now (review H1).
                 // The assertion is released only if activation succeeds.
                 let outcome = outcome
@@ -1278,7 +1514,8 @@ impl SignHandler {
                 if key_used {
                     guard.complete(&ceremony);
                 } else {
-                    // Ended before key use: the key stays consumed, the budget is given back.
+                    // Ended before key use: the key stays consumed, a claimed budget is given
+                    // back (none was claimed for an escalation that did not end in approval).
                     guard.complete_without_key_use(&ceremony);
                 }
                 outcome
@@ -1300,6 +1537,64 @@ impl SignHandler {
                 Err(self.deny(ctx, target, claim_rejection_error(rejection)))
             }
         }
+    }
+
+    /// The escalated path of a fresh replay key (ADR 0014 section 8.1): create or join the
+    /// escalation and wait for it holding no lock; on approval re-resolve (the result must be a
+    /// granted `allow`), claim the budget, and continue as [`Self::sign_fresh`], whose pre-key-use
+    /// re-check is unchanged. A deny, expiry or abort ends the ceremony with no budget claimed.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_escalated(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        target: &AuditTarget,
+        grant: &super::policy_engine::GrantSignSnapshot,
+        (escalation, prepared): (&Escalation<'_>, PreparedEscalation),
+        guard: &mut ClaimGuard,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+        key_used: &mut bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        match escalation.wait(prepared, deadline, cancelled, park) {
+            Ok(EscalationOutcome::Approved { .. }) => {}
+            Ok(_) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "an authentication escalation ended with a registration approval",
+                    RecommendedAction::Abort,
+                ));
+            }
+            Err(denied) => return Err(self.deny(ctx, target, denied)),
+        }
+
+        // The approval persisted a grant: the live resolution must now be a granted `allow`.
+        let approved =
+            self.policy_runtime
+                .resolve(&ctx.profile_id, &IntentAction::Authenticate, target.rp_id);
+        if approved.action != RuleAction::Allow || !approved.granted {
+            return Err(self.deny(
+                ctx,
+                target,
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "policy no longer permits this operation after approval",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        let max_operations = self
+            .policy_runtime
+            .max_operations(&ctx.profile_id)
+            .unwrap_or(0);
+        guard
+            .claim_budget(u32::from(max_operations))
+            .map_err(|rejection| self.deny(ctx, target, claim_rejection_error(rejection)))?;
+        self.sign_fresh(ctx, req, target, grant, &approved, cancelled, key_used)
     }
 
     /// Before a duplicate gets the stored outcome, its session must still be valid (review L3):
@@ -1381,7 +1676,19 @@ impl SignHandler {
             }
             discovered
         } else {
-            grant.credential_refs.clone()
+            // Configured pins (a frozen session snapshot) plus the credentials registration
+            // grants pinned for this RP (live; ADR 0014 section 8.3). With no configured pins,
+            // discovery above already finds a registered credential.
+            let mut pinned = grant.credential_refs.clone();
+            for granted in self
+                .policy_runtime
+                .granted_credential_refs(&ctx.profile_id, normalized_rp)
+            {
+                if !pinned.contains(&granted) {
+                    pinned.push(granted);
+                }
+            }
+            pinned
         };
 
         let mut candidates = Vec::new();
@@ -2728,6 +3035,9 @@ pub(crate) mod tests {
                     security_config: self.security_config.clone(),
                     key_provider: self.key_provider.clone(),
                     operation_lock: self.operation_lock.clone(),
+                    escalation: crate::agent::escalation::test_support::idle_service(
+                        self.audit_gate.clone(),
+                    ),
                 }
             }
 
@@ -3088,12 +3398,17 @@ pub(crate) mod tests {
         use super::*;
 
         use crate::agent::audit::AuditGate;
+        use crate::agent::escalation::test_support::{self, ScriptedPrompter};
+        use crate::agent::escalation::{EscalationService, PromptEvent};
         use crate::agent::grant::GrantRequestParams;
+        use crate::agent::granted_rules::GrantedRulesStore;
         use crate::agent::identity;
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::CredentialStorage;
 
-        use passless_core::agent::{AgentProfileConfig, AgentRpRule, CredentialSelection};
+        use passless_core::agent::{
+            AgentProfileConfig, AgentRpRule, CredentialSelection, GrantSource,
+        };
         use passless_core::config::SecurityConfig;
 
         use soft_fido2::{
@@ -3196,6 +3511,10 @@ pub(crate) mod tests {
             /// A dynamic grant (empty credential list: discover per request) instead of an
             /// explicit grant naming every stored credential.
             dynamic_grant: bool,
+            /// Escalate through a real coordinator, granted-rules store and scripted prompter
+            /// (the store is then the policy's grant source); otherwise no prompt can be shown
+            /// and `ToggleGrants` is the grant source.
+            escalation: bool,
         }
 
         impl FixtureSpec {
@@ -3206,6 +3525,7 @@ pub(crate) mod tests {
                     selection: CredentialSelection::Single,
                     credentials: vec![stored(1, "example.com", 0)],
                     dynamic_grant: false,
+                    escalation: false,
                 }
             }
         }
@@ -3223,6 +3543,10 @@ pub(crate) mod tests {
             operation_lock: Arc<Mutex<()>>,
             security_config: SecurityConfig,
             audit_dir: std::path::PathBuf,
+            escalation: Arc<EscalationService>,
+            prompter: Arc<ScriptedPrompter>,
+            store: Arc<GrantedRulesStore>,
+            _state_dir: tempfile::TempDir,
         }
 
         impl AuditTestFixture {
@@ -3282,12 +3606,34 @@ pub(crate) mod tests {
 
                 let clock = Arc::new(MockClock::new());
                 let granted_rules = Arc::new(ToggleGrants::default());
+                let state_dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(GrantedRulesStore::open(
+                    state_dir.path(),
+                    [profile_id.clone()],
+                ));
+                let grant_source: Arc<dyn GrantSource> = if spec.escalation {
+                    store.clone()
+                } else {
+                    granted_rules.clone()
+                };
 
                 let policy_runtime = Arc::new(
                     PolicyRuntime::new(&agent_config, clock.clone(), None)
                         .unwrap()
-                        .with_grant_source(granted_rules.clone()),
+                        .with_grant_source(grant_source),
                 );
+                let prompter = Arc::new(ScriptedPrompter::default());
+                let escalation = if spec.escalation {
+                    test_support::service(
+                        audit_gate.clone(),
+                        store.clone(),
+                        policy_runtime.clone(),
+                        prompter.clone(),
+                        Duration::from_secs(600),
+                    )
+                } else {
+                    test_support::idle_service(audit_gate.clone())
+                };
 
                 let grant_id = Self::approve_grant(&policy_runtime, &profile_id, &spec);
 
@@ -3318,6 +3664,10 @@ pub(crate) mod tests {
                     operation_lock,
                     security_config,
                     audit_dir: audit_path,
+                    escalation,
+                    prompter,
+                    store,
+                    _state_dir: state_dir,
                 }
             }
 
@@ -3376,6 +3726,7 @@ pub(crate) mod tests {
                     security_config: self.security_config.clone(),
                     key_provider: self.key_provider.clone(),
                     operation_lock: self.operation_lock.clone(),
+                    escalation: self.escalation.clone(),
                 }
             }
 
@@ -3614,7 +3965,7 @@ pub(crate) mod tests {
         }
 
         #[test]
-        fn request_rule_denies_with_escalation_unavailable_and_signs_nothing() {
+        fn request_rule_without_a_prompt_denies_with_escalation_unavailable_and_signs_nothing() {
             let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
             let writes_before = get_write_counting_storage(&f.storage).writes();
             let err = f
@@ -3669,8 +4020,8 @@ pub(crate) mod tests {
             );
         }
 
-        // `request` acts as `deny` until P7: `forbidden`, an audited deny, no allow record, and no
-        // human or native path (the handler has no prompt dependency).
+        // Without a notification bus `request` is denied: `forbidden`, an audited deny, no allow
+        // record, no prompt and no human or native path.
         #[test]
         fn request_rule_is_denied_as_forbidden_and_audited_without_human_path() {
             let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
@@ -4326,6 +4677,9 @@ pub(crate) mod tests {
                     key_provider: self.key_provider.clone(),
                     security_config: self.security_config.clone(),
                     operation_lock: self.operation_lock.clone(),
+                    escalation: crate::agent::escalation::test_support::idle_service(
+                        self.audit_gate.clone(),
+                    ),
                 }
             }
 
@@ -4998,6 +5352,377 @@ pub(crate) mod tests {
             assert_eq!(f.reasons().last().unwrap(), "challenge_reused");
             assert_eq!(f.key_provider.sign_calls(), 1);
         }
+
+        // --- P7: escalation (ADR 0014 section 8) ---
+
+        fn escalation_fixture() -> AuditTestFixture {
+            let mut spec = FixtureSpec::new(vec![request_rule("example.com")], vec!["example.com"]);
+            spec.escalation = true;
+            AuditTestFixture::from_spec(spec)
+        }
+
+        type SignResult = Result<PrincipalResponse, ProtocolError>;
+
+        /// Sign on a thread (the ceremony parks until the test decides the prompt).
+        fn sign_on_thread(
+            f: &AuditTestFixture,
+            ctx: &SignContext,
+            req: SignAssertionRequest,
+        ) -> std::thread::JoinHandle<SignResult> {
+            let handler = f.make_handler();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || handler.sign(&ctx, &req))
+        }
+
+        fn kinds(f: &AuditTestFixture) -> Vec<String> {
+            read_audit_events(&f.audit_dir)
+                .iter()
+                .filter_map(|e| e["kind"].as_str().map(str::to_string))
+                .filter(|k| k.starts_with("escalation.") || k.starts_with("granted_rule."))
+                .collect()
+        }
+
+        fn granted(f: &AuditTestFixture) -> usize {
+            f.store
+                .profile(&f.profile_id)
+                .map_or(0, |grants| grants.rules().len())
+        }
+
+        #[test]
+        fn approved_escalation_persists_the_grant_and_signs_once() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            // The prompt carries only daemon-derived fields.
+            let fields = f.prompter.last_fields();
+            assert_eq!(fields.rp_id, "example.com");
+            assert_eq!(fields.origin, "https://example.com");
+            assert_eq!(fields.profile, "test-profile");
+            f.prompter.decide(PromptEvent::Approved);
+            ceremony.join().unwrap().expect("approved ceremony signs");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+            assert_eq!(ctx.session.operations_used(), 1, "one budget claim");
+            assert_eq!(granted(&f), 1);
+            assert_eq!(
+                kinds(&f),
+                vec![
+                    "escalation.requested",
+                    "escalation.approved",
+                    "granted_rule.add"
+                ]
+            );
+            assert_eq!(f.policy_records(), vec![("policy.allow".to_string(), None)]);
+
+            // The grant now upgrades `request` to `allow`: no further prompt.
+            f.make_handler()
+                .sign(&ctx, &f.req_with_challenge(b"second"))
+                .expect("granted allow");
+            assert_eq!(f.prompter.shown(), 1);
+            assert_eq!(f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn no_budget_is_claimed_unless_the_escalation_is_approved() {
+            // Denied.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            f.prompter.decide(PromptEvent::Denied(
+                crate::agent::audit_events::EscalationDenyCause::User,
+            ));
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.reasons(), vec!["escalation_denied"]);
+
+            // Timed out: the ceremony deadline passes while parked.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let handler = f.make_handler();
+            let err = handler
+                .sign_with(
+                    &ctx,
+                    &f.make_req(),
+                    Instant::now() + Duration::from_millis(300),
+                    &|| false,
+                )
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Timeout);
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.reasons(), vec!["escalation_expired"]);
+            assert!(kinds(&f).contains(&"escalation.expired".to_string()));
+
+            // Aborted by the browser well before the deadline.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ceremony = {
+                let handler = f.make_handler();
+                let ctx = ctx.clone();
+                let req = f.make_req();
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    handler.sign_with(
+                        &ctx,
+                        &req,
+                        Instant::now() + Duration::from_secs(60),
+                        &|| cancel.load(Ordering::Acquire),
+                    )
+                })
+            };
+            f.prompter.wait_shown(1);
+            cancel.store(true, Ordering::Release);
+            assert_eq!(
+                ceremony.join().unwrap().unwrap_err().code,
+                ErrorCode::Aborted
+            );
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.prompter.withdrawn(), 1, "the prompt is withdrawn");
+            // The replay key stays consumed with the abort's outcome.
+            assert_eq!(
+                f.make_handler().sign(&ctx, &f.make_req()).unwrap_err().code,
+                ErrorCode::Aborted
+            );
+            assert_eq!(f.prompter.shown(), 1);
+        }
+
+        #[test]
+        fn a_replay_duplicate_joins_the_pending_escalation() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let joined = Arc::new(std::sync::Barrier::new(2));
+            let original = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let duplicate = {
+                let handler = f.make_handler();
+                let ctx = ctx.clone();
+                let req = f.make_req();
+                let joined = joined.clone();
+                std::thread::spawn(move || {
+                    let _hook = super::super::super::session::test_hooks::set_on_join(move || {
+                        joined.wait();
+                    });
+                    handler.sign(&ctx, &req)
+                })
+            };
+            joined.wait();
+            f.prompter.decide(PromptEvent::Approved);
+            let first = original.join().unwrap().expect("original signs");
+            let second = duplicate
+                .join()
+                .unwrap()
+                .expect("duplicate gets the outcome");
+            assert_eq!(signature_of(&Ok(first)), signature_of(&Ok(second)));
+            assert_eq!(f.prompter.shown(), 1, "one prompt");
+            assert_eq!(f.key_provider.sign_calls(), 1, "signed once");
+            assert_eq!(ctx.session.operations_used(), 1);
+            assert_eq!(
+                kinds(&f)
+                    .iter()
+                    .filter(|k| *k == "escalation.requested")
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn a_reload_cancels_the_waiter() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            // What `handle_reload_policy` does for a changed reload.
+            f.escalation.cancel_profile(&f.profile_id);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.prompter.withdrawn(), 1);
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+            assert_eq!(granted(&f), 0);
+
+            // A changed reload also invalidates the waiting session on its own.
+            let mut f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            f.reload_rules(vec![
+                request_rule("example.com"),
+                allow_rule("other.example"),
+            ]);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn an_added_grant_bumps_only_the_grant_epoch() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let revocation = f.policy_runtime.revocation_epoch();
+            let grant_epoch = f.policy_runtime.grant_epoch();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.approve(1);
+            ceremony.join().unwrap().unwrap();
+            assert_eq!(f.policy_runtime.grant_epoch(), grant_epoch + 1);
+            assert_eq!(f.policy_runtime.revocation_epoch(), revocation);
+            // Active sessions stay valid.
+            assert!(
+                ctx.session
+                    .validity(f.policy_runtime.revocation_epoch(), Instant::now())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_grant_is_inert_once_its_rule_is_removed() {
+            let mut f = escalation_fixture();
+            let ceremony = sign_on_thread(&f, &f.make_ctx(), f.make_req());
+            f.prompter.approve(1);
+            ceremony.join().unwrap().unwrap();
+            assert_eq!(granted(&f), 1);
+
+            // The rule is gone: the grant stays stored but permits nothing (ADR 0014 section
+            // 6.2), and nothing is prompted.
+            f.reload_rules(vec![]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.req_with_challenge(b"after removal"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons().last().unwrap(), "action_not_allowed");
+            f.reload_rules(vec![deny_rule("example.com")]);
+            assert!(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &f.req_with_challenge(b"after deny"))
+                    .is_err()
+            );
+            assert_eq!(granted(&f), 1);
+            assert_eq!(f.prompter.shown(), 1);
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            // Restoring the `request` rule revives it without a prompt.
+            f.reload_rules(vec![request_rule("example.com")]);
+            f.make_handler()
+                .sign(&f.make_ctx(), &f.req_with_challenge(b"restored"))
+                .expect("the stored grant applies again");
+            assert_eq!(f.prompter.shown(), 1);
+        }
+
+        #[test]
+        fn automatic_interaction_mode_does_not_affect_escalation() {
+            // `PASSLESS_INTERACTION_MODE=automatic` auto-approves the human path's prompts only;
+            // an escalation still prompts and a deny is still a deny (ADR 0014 section 7, E2E-44).
+            // SAFETY: only this test sets the variable; nothing else in the test binary reads it
+            // concurrently (the human notification path is never exercised by unit tests).
+            unsafe { std::env::set_var("PASSLESS_INTERACTION_MODE", "automatic") };
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            f.prompter.decide(PromptEvent::Denied(
+                crate::agent::audit_events::EscalationDenyCause::User,
+            ));
+            let result = ceremony.join().unwrap();
+            unsafe { std::env::remove_var("PASSLESS_INTERACTION_MODE") };
+            assert_eq!(result.unwrap_err().code, ErrorCode::Forbidden);
+            assert_eq!(f.prompter.shown(), 1, "prompted, never auto-approved");
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(granted(&f), 0);
+        }
+
+        #[test]
+        fn registration_grant_credentials_join_the_configured_pins() {
+            // The profile pins the stored credential 1; credential B exists but is not pinned.
+            // A registration grant for B adds it to the pinned set (ADR 0014 section 8.3).
+            let f = escalation_fixture();
+            let id_b = vec![0xB2u8; 32];
+            get_write_counting_storage(&f.storage).add_cred(soft_fido2::Credential {
+                id: id_b.clone(),
+                rp: RelyingParty::new("example.com".into()),
+                user: User::new(vec![9]),
+                sign_count: 0,
+                alg: -7,
+                key: SoftwareCredentialKeyProvider.generate(-7).unwrap().key,
+                created: 5,
+                discoverable: true,
+                backup_state: CredentialBackupState::NotEligible,
+                extensions: soft_fido2::Extensions::default(),
+            });
+            let mut req = f.make_req();
+            req.allow_credentials = vec![b64u_encode(&id_b)];
+
+            // An escalation grant for the RP alone does not widen the pins.
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.com",
+                        crate::agent::granted_rules::GrantKind::Escalation,
+                        "esc-1",
+                        "https://example.com",
+                        crate::agent::granted_rules::PermittingRule::Exact,
+                        None,
+                    ),
+                    64,
+                )
+                .unwrap();
+            assert_eq!(
+                f.make_handler().sign(&f.make_ctx(), &req).unwrap_err().code,
+                ErrorCode::Forbidden
+            );
+            assert_eq!(f.reasons(), vec!["allow_credentials_mismatch"]);
+
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.com",
+                        crate::agent::granted_rules::GrantKind::Registration,
+                        "esc-2",
+                        "https://example.com",
+                        crate::agent::granted_rules::PermittingRule::Exact,
+                        Some(cred_ref_of(&id_b)),
+                    ),
+                    64,
+                )
+                .unwrap();
+            let mut req = f.req_with_challenge(b"pinned");
+            req.allow_credentials = vec![b64u_encode(&id_b)];
+            assert_eq!(
+                signed_credential(f.make_handler().sign(&f.make_ctx(), &req)),
+                id_b,
+                "the registration grant's credential is in the pinned set"
+            );
+            assert_eq!(f.prompter.shown(), 0);
+        }
+
+        #[test]
+        fn the_human_operation_lock_is_free_while_a_waiter_is_parked() {
+            // LOCKING.md rule 3: a parked escalation waiter holds no lock, so the human CTAP path
+            // (which takes the shared operation lock) runs while it waits. The debug lock-order
+            // checks run on both threads.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            {
+                let _human = lock_order::lock(&f.operation_lock, LockLevel::Operation);
+                let _storage = lock_order::lock(&f.storage, LockLevel::Storage);
+                assert!(!ceremony.is_finished());
+            }
+            assert!(lock_order::held_levels().is_empty());
+            f.prompter.decide(PromptEvent::Approved);
+            ceremony.join().unwrap().expect("signs after approval");
+        }
     }
 
     mod registration_lease_tests {
@@ -5047,13 +5772,17 @@ pub(crate) mod tests {
                     Arc::new(Mutex::new(Box::new(
                         crate::storage::LocalStorageAdapter::new(store_tmp.path().into()).unwrap(),
                     )));
+                let audit_gate = Arc::new(AuditGate::open(&audit_dir).unwrap());
                 let handler = Arc::new(RegisterHandler {
                     policy_runtime,
                     credential_storage: storage.clone(),
-                    audit_gate: Arc::new(AuditGate::open(&audit_dir).unwrap()),
+                    audit_gate: audit_gate.clone(),
                     key_provider: Arc::new(SoftwareCredentialKeyProvider),
                     security_config: SecurityConfig::default(),
                     operation_lock: Arc::new(Mutex::new(())),
+                    escalation: crate::agent::escalation::test_support::idle_service(
+                        audit_gate.clone(),
+                    ),
                 });
                 let profile_id = ProfileId::new("test-profile").unwrap();
                 let ctx = RegisterContext::new(profile_id.clone(), test_session(&profile_id));

@@ -1,27 +1,31 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use log::debug;
+use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
 use passless_core::agent::protocol::{
     ErrorCode, IntentAction, ProtocolError, RecommendedAction, RegisterCredentialRequest,
     RegisterCredentialResponse,
 };
-use passless_core::agent::{ProfileId, RuleAction, RuleIdentity};
+use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::escalation::{
+    EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, WaiterSession,
+};
 use super::lock_order::{self, LockLevel};
 use super::policy_engine::PolicyRuntime;
 use super::session::{
     AgentSession, CeremonyAction, CeremonyOutcome, CeremonyResult, ChallengeDigest, Claim,
-    JoinResult, ReplayKey, ceremony_deadline,
+    ClaimGuard, JoinResult, ReplayKey, ceremony_deadline,
 };
 use super::sign::{
-    AuditTarget, aborted_error, b64u_decode, b64u_encode, claim_rejection_error, decode_challenge,
-    extensions_supported, join_failure, session_invalid_error, verify_origin_context,
+    AuditTarget, Escalation, PreparedEscalation, aborted_error, b64u_decode, b64u_encode,
+    claim_rejection_error, decode_challenge, extensions_supported, join_failure,
+    session_invalid_error, verify_origin_context,
 };
 
 use crate::storage::CredentialStorage;
@@ -67,6 +71,23 @@ pub struct RegisterHandler {
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
     pub security_config: SecurityConfig,
     pub operation_lock: Arc<Mutex<()>>,
+    /// The escalation coordinator a `register = "request"` resolution waits on (ADR 0014
+    /// section 8.3).
+    pub escalation: Arc<EscalationService>,
+}
+
+/// A registration approval is bound to the creating ceremony: its profile, RP and session.
+fn approval_matches(approval: &RegistrationApproval, ctx: &RegisterContext, rp_id: &str) -> bool {
+    approval.profile() == &ctx.profile_id
+        && approval.rp_id() == rp_id
+        && approval.session() == WaiterSession::of(&ctx.session)
+}
+
+/// What the escalated path carries into [`RegisterHandler::register_fresh`].
+struct Fresh<'a> {
+    algorithm: i32,
+    user_id: Vec<u8>,
+    guard: &'a mut ClaimGuard,
 }
 
 /// The attestation inside a replayed or joined outcome.
@@ -202,7 +223,9 @@ impl RegisterHandler {
     /// 3. resolve `register` against the live policy (exact rule only; never the wildcard);
     /// 4. options the authenticator cannot honor (`NotSupportedError`): extensions, enterprise
     ///    attestation, no supported algorithm; and malformed fields;
-    /// 5. replay key, then budget;
+    /// 5. replay key, then budget; for `request`, the replay key only, then this ceremony's own
+    ///    escalation (not joinable), and after approval the budget and the one-use approval that
+    ///    the pre-key-use re-check requires ([`Self::register_escalated`]);
     /// 6. backend operation lock, `excludeCredentials` (`InvalidStateError`);
     /// 7. durable audit reservation;
     /// 8. immediately before key use: revocation epoch, live re-resolve, session validity;
@@ -213,6 +236,19 @@ impl RegisterHandler {
         req: &RegisterCredentialRequest,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
+    ) -> Result<RegisterCredentialResponse, ProtocolError> {
+        self.register_parked(ctx, req, deadline, cancelled, &mut NoPark)
+    }
+
+    /// [`Self::register_with`] for a transport-carried ceremony: `park` suspends the request's
+    /// capacity permit while the ceremony waits on an escalation.
+    pub fn register_parked(
+        &self,
+        ctx: &RegisterContext,
+        req: &RegisterCredentialRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
     ) -> Result<RegisterCredentialResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
         let target = AuditTarget::of_request(
@@ -282,23 +318,10 @@ impl RegisterHandler {
                     ),
                 ));
             }
-            // P7 SEAM (registration escalation, ADR 0014 section 8.3): see `SignHandler::sign_with`.
-            // A registration escalation is not joinable (V-M3): the one-use token is bound to the
-            // ceremony that created it. Budget is claimed only after approval.
-            RuleAction::Request => {
-                return Err(self.deny(
-                    ctx,
-                    target,
-                    (
-                        PolicyDenyReason::EscalationUnavailable,
-                        ProtocolError::new(
-                            ErrorCode::Forbidden,
-                            "escalation is unavailable: policy requires approval",
-                            RecommendedAction::FixRequest,
-                        ),
-                    ),
-                ));
-            }
+            // `register = "request"` (ADR 0014 section 8.3): steps 4 and 5 run unchanged; the
+            // replay key is taken without budget, then the ceremony escalates
+            // (`Self::register_escalated`). A registration escalation is not joinable (V-M3).
+            RuleAction::Request => {}
             RuleAction::Allow => {}
         }
 
@@ -365,7 +388,8 @@ impl RegisterHandler {
         }
 
         // 5. Replay key, then budget (R1, R4): an identical registration never creates a second
-        //    credential. The budget limit is the live `max_operations`.
+        //    credential. The budget limit is the live `max_operations`. A `request` resolution
+        //    takes the replay key only; its budget is claimed after approval (V-H2).
         let key = ReplayKey::derive(
             CeremonyAction::Register,
             &normalized_rp,
@@ -373,35 +397,79 @@ impl RegisterHandler {
             req.top_origin.as_deref(),
             &challenge,
         );
-        let max_operations = self
-            .policy_runtime
-            .max_operations(&ctx.profile_id)
-            .unwrap_or(0);
-        match ctx.session.claim(
-            key,
-            ChallengeDigest::of(&challenge),
-            u32::from(max_operations),
-            Instant::now(),
-        ) {
-            Claim::Fresh(guard) => {
+        let escalation = Escalation {
+            service: &self.escalation,
+            policy_runtime: &self.policy_runtime,
+            session: &ctx.session,
+            profile_id: &ctx.profile_id,
+            action: CeremonyAction::Register,
+            rp_id: target.rp_id,
+            origin: &req.origin,
+            rule: &matched.rule,
+        };
+        let prepared = if matched.action == RuleAction::Request {
+            Some(
+                escalation
+                    .prepare()
+                    .map_err(|refused| self.deny(ctx, target, refused))?,
+            )
+        } else {
+            None
+        };
+        let claim = if prepared.is_some() {
+            ctx.session
+                .claim_key(key, ChallengeDigest::of(&challenge), Instant::now())
+        } else {
+            let max_operations = self
+                .policy_runtime
+                .max_operations(&ctx.profile_id)
+                .unwrap_or(0);
+            ctx.session.claim(
+                key,
+                ChallengeDigest::of(&challenge),
+                u32::from(max_operations),
+                Instant::now(),
+            )
+        };
+        match claim {
+            Claim::Fresh(mut guard) => {
                 let mut key_used = false;
-                let outcome = self.register_fresh(
-                    ctx,
-                    req,
-                    target,
-                    algorithm,
-                    user_id,
-                    cancelled,
-                    &mut key_used,
-                );
+                let outcome = if let Some(prepared) = prepared {
+                    self.register_escalated(
+                        ctx,
+                        req,
+                        target,
+                        (&escalation, prepared),
+                        Fresh {
+                            algorithm,
+                            user_id,
+                            guard: &mut guard,
+                        },
+                        deadline,
+                        cancelled,
+                        park,
+                        &mut key_used,
+                    )
+                } else {
+                    self.register_fresh(
+                        ctx,
+                        req,
+                        target,
+                        algorithm,
+                        user_id,
+                        None,
+                        cancelled,
+                        &mut key_used,
+                    )
+                };
                 let ceremony = outcome
                     .clone()
                     .map(|response| CeremonyResult::Attestation(Box::new(response)));
                 if key_used {
                     guard.complete(&ceremony);
                 } else {
-                    // Ended before key generation: the key stays consumed, the budget is given
-                    // back (review M2).
+                    // Ended before key generation: the key stays consumed, a claimed budget is
+                    // given back (review M2).
                     guard.complete_without_key_use(&ceremony);
                 }
                 outcome
@@ -423,6 +491,88 @@ impl RegisterHandler {
                 Err(self.deny(ctx, target, claim_rejection_error(rejection)))
             }
         }
+    }
+
+    /// The escalated path of a fresh replay key (ADR 0014 section 8.3): raise this ceremony's own
+    /// escalation (never joined) and wait holding no lock. On approval claim the budget and
+    /// register with the one-use approval, which the pre-key-use re-check requires. After the
+    /// credential is written, persist `authenticate = allow` with `kind = registration` and the
+    /// new credential reference; if that fails the credential is still returned, the failure is
+    /// audited and no grant persists (plan P7 gap 10). A deny, expiry or abort claims no budget.
+    #[allow(clippy::too_many_arguments)]
+    fn register_escalated(
+        &self,
+        ctx: &RegisterContext,
+        req: &RegisterCredentialRequest,
+        target: &AuditTarget,
+        (escalation, prepared): (&Escalation<'_>, PreparedEscalation),
+        fresh: Fresh<'_>,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+        key_used: &mut bool,
+    ) -> Result<RegisterCredentialResponse, ProtocolError> {
+        let approval = match escalation.wait(prepared, deadline, cancelled, park) {
+            Ok(EscalationOutcome::RegistrationApproved(approval)) => approval,
+            Ok(_) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "a registration escalation ended without a registration approval",
+                    RecommendedAction::Abort,
+                ));
+            }
+            Err(denied) => return Err(self.deny(ctx, target, denied)),
+        };
+        if !approval_matches(&approval, ctx, target.rp_id) {
+            return Err(self.deny(
+                ctx,
+                target,
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "the registration approval is bound to another ceremony",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        let max_operations = self
+            .policy_runtime
+            .max_operations(&ctx.profile_id)
+            .unwrap_or(0);
+        fresh
+            .guard
+            .claim_budget(u32::from(max_operations))
+            .map_err(|rejection| self.deny(ctx, target, claim_rejection_error(rejection)))?;
+        let response = self.register_fresh(
+            ctx,
+            req,
+            target,
+            fresh.algorithm,
+            fresh.user_id,
+            Some(&approval),
+            cancelled,
+            key_used,
+        )?;
+
+        // The operation and storage locks are released: persist the registration grant.
+        let max_granted_rules = self
+            .policy_runtime
+            .escalation_profile(&ctx.profile_id)
+            .map_or(0, |profile| profile.max_granted_rules);
+        let credential_id = b64u_decode(&response.credential_id_b64u).unwrap_or_default();
+        if let Err(e) = self.escalation.record_registration_grant(
+            &approval,
+            CredentialRef::with_default_domain(&credential_id),
+            max_granted_rules,
+        ) {
+            warn!(
+                "agent register: credential for rp={} kept without a registration grant: {}",
+                target.rp_id, e
+            );
+        }
+        Ok(response)
     }
 
     /// Before a duplicate gets the stored outcome its session must still be valid (review L3);
@@ -448,6 +598,7 @@ impl RegisterHandler {
         &self,
         ctx: &RegisterContext,
         target: &AuditTarget,
+        approval: Option<&RegistrationApproval>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), ProtocolError> {
         let rp_id = target.rp_id;
@@ -458,7 +609,11 @@ impl RegisterHandler {
         let matched = self
             .policy_runtime
             .resolve(&ctx.profile_id, &IntentAction::Register, rp_id);
-        if matched.action != RuleAction::Allow {
+        // A configured `request` permits key use only with this ceremony's own approval (ADR 0014
+        // section 8.3).
+        let approved = matched.configured == RuleAction::Request
+            && approval.is_some_and(|approval| approval_matches(approval, ctx, rp_id));
+        if matched.action != RuleAction::Allow && !approved {
             return Err(self.deny(
                 ctx,
                 target,
@@ -484,6 +639,7 @@ impl RegisterHandler {
         target: &AuditTarget,
         algorithm: i32,
         user_id: Vec<u8>,
+        approval: Option<&RegistrationApproval>,
         cancelled: &dyn Fn() -> bool,
         key_used: &mut bool,
     ) -> Result<RegisterCredentialResponse, ProtocolError> {
@@ -531,7 +687,7 @@ impl RegisterHandler {
         super::session::test_hooks::before_key_use();
         let _session_gate = ctx.session.key_use_guard();
         let _epoch_gate = self.policy_runtime.key_use_guard();
-        self.recheck_before_key_use(ctx, target, cancelled)?;
+        self.recheck_before_key_use(ctx, target, approval, cancelled)?;
 
         // 9. Key generation.
         *key_used = true;
@@ -818,6 +974,9 @@ mod tests {
 
     use crate::agent::audit::{AuditGate, test_support::read_audit_events};
     use crate::agent::browser::SystemClock;
+    use crate::agent::escalation::test_support::{self, ScriptedPrompter};
+    use crate::agent::escalation::{EscalationService, PromptEvent};
+    use crate::agent::granted_rules::{GrantKind, GrantedRulesStore};
     use crate::storage::CredentialStorage;
     use passless_core::agent::config::ANY_RP_ID as WILDCARD_RP_ID;
     use passless_core::agent::{
@@ -964,6 +1123,9 @@ mod tests {
         operation_lock: Arc<Mutex<()>>,
         security_config: SecurityConfig,
         policy_runtime: Arc<PolicyRuntime>,
+        store: Arc<GrantedRulesStore>,
+        prompter: Arc<ScriptedPrompter>,
+        escalation: Arc<EscalationService>,
         _tmp: tempfile::TempDir,
     }
 
@@ -980,6 +1142,7 @@ mod tests {
                 key_provider: self.key_provider.clone(),
                 security_config: self.security_config.clone(),
                 operation_lock: self.operation_lock.clone(),
+                escalation: self.escalation.clone(),
             }
         }
 
@@ -1073,13 +1236,26 @@ mod tests {
         .unwrap();
         let audit_gate = Arc::new(AuditGate::open(&audit_dir).unwrap());
         let profile_id = ProfileId::new("test-register-profile").unwrap();
+        let store = Arc::new(GrantedRulesStore::open(
+            &tmp.path().join("state"),
+            [profile_id.clone()],
+        ));
         let policy_runtime = Arc::new(
             PolicyRuntime::new(
                 &agent_config_for(&profile_id, profile_config),
                 Arc::new(SystemClock),
                 None,
             )
-            .unwrap(),
+            .unwrap()
+            .with_grant_source(store.clone()),
+        );
+        let prompter = Arc::new(ScriptedPrompter::default());
+        let escalation = test_support::service(
+            audit_gate.clone(),
+            store.clone(),
+            policy_runtime.clone(),
+            prompter.clone(),
+            std::time::Duration::from_secs(600),
         );
 
         RegisterTestFixture {
@@ -1093,6 +1269,9 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             security_config: make_test_security_config(),
             policy_runtime,
+            store,
+            prompter,
+            escalation,
             _tmp: tmp,
         }
     }
@@ -1301,11 +1480,13 @@ mod tests {
     }
 
     #[test]
-    fn test_register_request_rule_denies_with_escalation_unavailable_until_p7() {
+    fn test_register_request_rule_without_a_prompt_denies_with_escalation_unavailable() {
         let f = make_fixture_with_config(profile_with_rules(vec![register_rule(
             "example.com",
             RuleAction::Request,
         )]));
+        // No session bus: nothing is prompted, the ceremony is denied and audited.
+        f.prompter.set_unavailable(true);
 
         let err = f
             .make_handler()
@@ -1314,6 +1495,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::Forbidden);
         assert_ne!(err.code, ErrorCode::InteractionRequired);
         assert!(err.message.contains("escalation is unavailable"));
+        assert_eq!(f.prompter.shown(), 0);
         assert_eq!(
             deny_reasons(&f),
             vec![(
@@ -1793,6 +1975,7 @@ mod tests {
             "example.com",
             RuleAction::Request,
         )]));
+        f.prompter.set_unavailable(true);
         let err = handler.register(&f.make_ctx(), &f.make_req()).unwrap_err();
         assert!(err.message.contains("escalation is unavailable"));
         let reasons = deny_reasons(&f);
@@ -2151,5 +2334,174 @@ mod tests {
             "InvalidState ends before key use"
         );
         assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+    }
+
+    // --- P7: registration escalation (ADR 0014 section 8.3) ---
+
+    fn register_request_config() -> AgentProfileConfig {
+        profile_with_rules(vec![AgentRpRule {
+            rp_id: "example.com".to_string(),
+            register: RuleAction::Request,
+            authenticate: RuleAction::Request,
+            credential_selection: None,
+        }])
+    }
+
+    type RegisterResult = Result<RegisterCredentialResponse, ProtocolError>;
+
+    fn register_on_thread(
+        f: &RegisterTestFixture,
+        ctx: &RegisterContext,
+        req: RegisterCredentialRequest,
+    ) -> std::thread::JoinHandle<RegisterResult> {
+        let handler = f.make_handler();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || handler.register(&ctx, &req))
+    }
+
+    fn req_with_challenge(f: &RegisterTestFixture, challenge: &[u8]) -> RegisterCredentialRequest {
+        RegisterCredentialRequest {
+            challenge_b64u: b64u_encode(challenge),
+            ..f.make_req()
+        }
+    }
+
+    fn escalation_kinds(f: &RegisterTestFixture) -> Vec<String> {
+        read_audit_events(&f.audit_dir)
+            .iter()
+            .filter_map(|e| e["kind"].as_str().map(str::to_string))
+            .filter(|k| k.starts_with("escalation.") || k.starts_with("granted_rule."))
+            .collect()
+    }
+
+    fn deny() -> PromptEvent {
+        PromptEvent::Denied(crate::agent::audit_events::EscalationDenyCause::User)
+    }
+
+    #[test]
+    fn test_registration_escalation_registers_once_and_persists_a_registration_grant() {
+        let f = make_fixture_with_config(register_request_config());
+        let ctx = f.make_ctx();
+        let ceremony = register_on_thread(&f, &ctx, f.make_req());
+        f.prompter.approve(1);
+        let response = ceremony.join().unwrap().expect("approved registration");
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+        assert_eq!(ctx.session.operations_used(), 1);
+
+        let credential_id = b64u_decode(&response.credential_id_b64u).unwrap();
+        let grants = f.store.profile(&f.profile_id).unwrap();
+        let rules = grants.rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].kind, GrantKind::Registration);
+        assert_eq!(rules[0].rp_id, "example.com");
+        assert_eq!(
+            rules[0].credential_ref,
+            Some(CredentialRef::with_default_domain(&credential_id))
+        );
+        assert_eq!(
+            escalation_kinds(&f),
+            vec![
+                "escalation.requested",
+                "escalation.approved",
+                "granted_rule.add"
+            ]
+        );
+        // `authenticate` for the RP is now a granted allow; registration still escalates.
+        let auth =
+            f.policy_runtime
+                .resolve(&f.profile_id, &IntentAction::Authenticate, "example.com");
+        assert!(auth.granted && auth.action == RuleAction::Allow);
+
+        let second = register_on_thread(&f, &ctx, req_with_challenge(&f, b"second"));
+        f.prompter.wait_shown(2);
+        f.prompter.decide(deny());
+        assert_eq!(
+            second.join().unwrap().unwrap_err().code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+        assert_eq!(
+            ctx.session.operations_used(),
+            1,
+            "a denied escalation claims nothing"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_registration_escalation_is_busy_not_joined() {
+        let f = make_fixture_with_config(register_request_config());
+        let ctx = f.make_ctx();
+        let first = register_on_thread(&f, &ctx, f.make_req());
+        f.prompter.wait_shown(1);
+
+        let err = f
+            .make_handler()
+            .register(&ctx, &req_with_challenge(&f, b"concurrent"))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(deny_reasons(&f).last().unwrap().1, "escalation_busy");
+        assert_eq!(f.prompter.shown(), 1);
+
+        f.prompter.decide(deny());
+        assert_eq!(
+            first.join().unwrap().unwrap_err().code,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(deny_reasons(&f).last().unwrap().1, "escalation_denied");
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+        assert_eq!(ctx.session.operations_used(), 0);
+        assert!(f.store.profile(&f.profile_id).unwrap().rules().is_empty());
+    }
+
+    #[test]
+    fn test_registration_request_needs_its_own_approval_before_key_use() {
+        // Without an approval the pre-key-use re-check refuses a configured `request`.
+        let f = make_fixture_with_config(register_request_config());
+        let ctx = f.make_ctx();
+        let req = f.make_req();
+        let target = AuditTarget::of_request("example.com", &req.origin, None, false);
+        let err = f
+            .make_handler()
+            .recheck_before_key_use(&ctx, &target, None, &|| false)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(deny_reasons(&f).last().unwrap().1, "policy_revoked");
+    }
+
+    #[test]
+    fn test_failed_registration_grant_write_keeps_the_credential() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = make_fixture_with_config(register_request_config());
+        let dir = f.store.dir().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ctx = f.make_ctx();
+        let ceremony = register_on_thread(&f, &ctx, f.make_req());
+        f.prompter.wait_shown(1);
+        // The store becomes unwritable between the prompt and the credential write.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        f.prompter.decide(PromptEvent::Approved);
+        let result = ceremony.join().unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        result.expect("the credential is returned (plan P7 gap 10)");
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 1);
+        assert!(
+            f.store
+                .profile(&f.profile_id)
+                .is_none_or(|grants| grants.rules().is_empty()),
+            "no grant persisted"
+        );
+        let denied = read_audit_events(&f.audit_dir)
+            .into_iter()
+            .find(|e| e["kind"] == "escalation.denied")
+            .expect("the failed grant write is audited");
+        assert_eq!(denied["cause"], "grant_write_failed");
+        // The next authentication escalates again.
+        let auth =
+            f.policy_runtime
+                .resolve(&f.profile_id, &IntentAction::Authenticate, "example.com");
+        assert_eq!(auth.action, RuleAction::Request);
     }
 }

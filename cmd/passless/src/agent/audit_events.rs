@@ -824,6 +824,13 @@ pub enum PolicyDenyReason {
     /// The profile's granted-rules store is disabled (unreadable, wrongly owned or corrupt), so no
     /// grant can be persisted.
     GrantsUnavailable,
+    /// The human denied the escalation the ceremony waited on (Deny, a dismissal or an approval
+    /// before the minimum review delay); the escalation itself is recorded as
+    /// `escalation.denied`.
+    EscalationDenied,
+    /// The escalation the ceremony waited on expired: the ceremony deadline passed, or the
+    /// notification server went away (`escalation.expired`).
+    EscalationExpired,
     /// The request came from a frame whose origin differs from its ancestors; cross-origin fails closed.
     CrossOriginDenied,
     /// The request used a bearer whose browser lease was revoked or whose browser exited.
@@ -3151,6 +3158,8 @@ mod tests {
             (PolicyDenyReason::EscalationBusy, "escalation_busy"),
             (PolicyDenyReason::GrantCapReached, "grant_cap_reached"),
             (PolicyDenyReason::GrantsUnavailable, "grants_unavailable"),
+            (PolicyDenyReason::EscalationDenied, "escalation_denied"),
+            (PolicyDenyReason::EscalationExpired, "escalation_expired"),
             (
                 PolicyDenyReason::EscalationUnavailable,
                 "escalation_unavailable",

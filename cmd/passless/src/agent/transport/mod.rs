@@ -47,9 +47,11 @@ use serde_json::{Map, Value, json};
 use passless_core::agent::protocol::{ErrorCode, PrincipalResponse};
 
 use super::audit_events::{TransportPeerRefusedBuilder, TransportVersionSkewBuilder};
-use super::capacity::{BusyScope, ConnectionSlots, RequestLimiter, decrement, try_increment};
+use super::capacity::{
+    BusyScope, ConnectionSlots, RequestLimiter, RequestPermit, decrement, try_increment,
+};
 use super::lock_order::{self, LockLevel};
-use super::session::ceremony_deadline;
+use super::session::{MAX_CEREMONY_TIMEOUT, MIN_TRANSPORT_CEREMONY_TIMEOUT};
 use super::sign::{BearerEntry, SignContextRegistry, constant_time_eq, dom_exception_name};
 
 use self::frame::{FrameError, PROTOCOL_VERSION, WRITE_TIMEOUT, read_frame, write_frame};
@@ -83,15 +85,18 @@ pub fn build_version() -> String {
     frame::build_version_from(crate::build::PKG_VERSION, crate::build::SHORT_COMMIT)
 }
 
-/// The deadline of a ceremony carried by this transport: [`ceremony_deadline`] of the page
-/// timeout from the daemon's own parse of the request details, counted from when the request
-/// frame arrived. It bounds how long a duplicate waits for the original (ADR 0014 section 9).
-///
-/// P7 SEAM (escalation): an escalation wait extends this deadline to Chromium's own clamp of the
-/// page timeout, clamp(timeout, 3 min, 20 h), so a pending approval is not cut short before
-/// Chromium itself gives up on the request (E2E-20, E2E-21).
+/// The deadline of a ceremony carried by this transport, counted from when the request frame
+/// arrived: Chromium's own clamp of the page timeout, `clamp(timeout, 3 min, 20 h)`, or 20 h when
+/// the page set none (`AdjustTimeout()`; ADR 0014 section 8.1). Chromium gives up on the request
+/// at that point, so a pending escalation is never cut short before the page itself would be
+/// (E2E-20, E2E-21). It also bounds how long a duplicate waits for the original (section 9). An
+/// escalation wait is further bounded by `agents.escalation_timeout` and the session TTL.
 pub(crate) fn transport_ceremony_deadline(timeout_ms: Option<u64>, received: Instant) -> Instant {
-    ceremony_deadline(timeout_ms, received)
+    let timeout = timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(MAX_CEREMONY_TIMEOUT)
+        .clamp(MIN_TRANSPORT_CEREMONY_TIMEOUT, MAX_CEREMONY_TIMEOUT);
+    received + timeout
 }
 
 /// Timings of the transport. Tests shorten them.
@@ -759,7 +764,8 @@ impl Shared {
             .name("agent-sign-req".to_string())
             .spawn(move || {
                 shared.hold_request(&state);
-                let outcome = run_ceremony(&entry, &parsed, deadline, &state);
+                let mut permit = permit;
+                let outcome = run_ceremony(&entry, &parsed, deadline, &state, &mut permit);
                 let held_aborted = outcome.is_ok() && shared.hold_result(&state);
                 worker_connection.untrack(id);
                 let result = match outcome {
@@ -991,18 +997,21 @@ impl Connection {
 }
 
 /// Run the ceremony and build its `responseJson`.
+/// `permit` is suspended while the ceremony is parked on an escalation and resumed afterwards
+/// (plan P7 gap 2), so parked ceremonies do not hold the request caps.
 fn run_ceremony(
     entry: &BearerEntry,
     parsed: &ParsedCeremony,
     deadline: Instant,
     state: &RequestState,
+    permit: &mut RequestPermit,
 ) -> Result<String, ErrorCode> {
     let cancelled = || state.cancelled.load(Ordering::Acquire);
     match (entry, parsed) {
         (BearerEntry::Sign(entry), ParsedCeremony::Get(request)) => {
             match entry
                 .handler
-                .sign_with(&entry.context, request, deadline, &cancelled)
+                .sign_parked(&entry.context, request, deadline, &cancelled, permit)
                 .map_err(|e| e.code)?
             {
                 PrincipalResponse::SignAssertionResult(response) => {
@@ -1020,7 +1029,7 @@ fn run_ceremony(
         ) => {
             let response = entry
                 .handler
-                .register_with(&entry.context, request, deadline, &cancelled)
+                .register_parked(&entry.context, request, deadline, &cancelled, permit)
                 .map_err(|e| e.code)?;
             webauthn::attestation_response_json(&response, *cred_props).map_err(|reason| {
                 warn!(

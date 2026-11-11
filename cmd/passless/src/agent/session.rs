@@ -36,6 +36,9 @@ pub const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_CEREMONY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Shortest ceremony timeout honored.
 pub const MIN_CEREMONY_TIMEOUT: Duration = Duration::from_secs(1);
+/// Shortest ceremony timeout of a transport-carried ceremony: Chromium's own lower clamp (3 min,
+/// `kMinRequestTimeout`), so an escalation is not cut short before the page gives up.
+pub const MIN_TRANSPORT_CEREMONY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Longest ceremony timeout honored: Chromium's own upper clamp (20 h).
 pub const MAX_CEREMONY_TIMEOUT: Duration = Duration::from_secs(20 * 3600);
 /// Served duplicates of one replay key that are audited; later ones are still served, not audited,
@@ -395,12 +398,41 @@ impl AgentSession {
         lock_order::lock(&self.state, LockLevel::Session).operations_used
     }
 
+    /// When the session TTL passes.
+    pub fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+
     /// Check the replay key, then claim one operation of the live budget `max_operations` (R4).
+    /// A budget refusal leaves the replay key unused.
     pub fn claim(
         self: &Arc<Self>,
         key: ReplayKey,
         challenge: ChallengeDigest,
         max_operations: u32,
+        now: Instant,
+    ) -> Claim {
+        self.claim_slot(key, challenge, Some(max_operations), now)
+    }
+
+    /// Check the replay key only (an escalated ceremony, ADR 0014 section 8.2): a fresh key takes
+    /// the replay slot without budget. The budget is claimed after approval with
+    /// [`ClaimGuard::claim_budget`]; a denied, expired or aborted escalation completes the slot
+    /// with no budget claimed.
+    pub fn claim_key(
+        self: &Arc<Self>,
+        key: ReplayKey,
+        challenge: ChallengeDigest,
+        now: Instant,
+    ) -> Claim {
+        self.claim_slot(key, challenge, None, now)
+    }
+
+    fn claim_slot(
+        self: &Arc<Self>,
+        key: ReplayKey,
+        challenge: ChallengeDigest,
+        max_operations: Option<u32>,
         now: Instant,
     ) -> Claim {
         let mut state = lock_order::lock(&self.state, LockLevel::Session);
@@ -429,11 +461,13 @@ impl AgentSession {
         if state.challenges.get(&challenge).is_some_and(|k| *k != key) {
             return Claim::Rejected(ClaimRejection::ChallengeReused);
         }
-        if state.operations_used >= max_operations {
-            return Claim::Rejected(ClaimRejection::BudgetExhausted);
+        if let Some(max_operations) = max_operations {
+            if state.operations_used >= max_operations {
+                return Claim::Rejected(ClaimRejection::BudgetExhausted);
+            }
+            state.operations_used += 1;
         }
 
-        state.operations_used += 1;
         let in_flight = Arc::new(InFlight::new());
         state
             .replay
@@ -444,8 +478,19 @@ impl AgentSession {
             session: self.clone(),
             key,
             in_flight,
+            budget_claimed: max_operations.is_some(),
             done: false,
         })
+    }
+
+    /// Claim one operation of the live budget for a slot taken by [`Self::claim_key`].
+    fn claim_operation(&self, max_operations: u32) -> Result<(), ClaimRejection> {
+        let mut state = lock_order::lock(&self.state, LockLevel::Session);
+        if state.operations_used >= max_operations {
+            return Err(ClaimRejection::BudgetExhausted);
+        }
+        state.operations_used += 1;
+        Ok(())
     }
 
     fn record_completion(&self, key: ReplayKey, outcome: CeremonyOutcome, refund: bool) {
@@ -469,19 +514,41 @@ pub struct ClaimGuard {
     session: Arc<AgentSession>,
     key: ReplayKey,
     in_flight: Arc<InFlight>,
+    /// Whether this slot holds one operation of budget (always after [`AgentSession::claim`];
+    /// after [`AgentSession::claim_key`] only once [`Self::claim_budget`] succeeded).
+    budget_claimed: bool,
     done: bool,
 }
 
 impl ClaimGuard {
+    /// Claim one operation of the live budget `max_operations` for a slot taken without budget
+    /// (an approved escalation). Claiming twice is a no-op. A refusal leaves the slot unclaimed;
+    /// the caller completes it with the refusal.
+    pub fn claim_budget(&mut self, max_operations: u32) -> Result<(), ClaimRejection> {
+        if self.budget_claimed {
+            return Ok(());
+        }
+        self.session.claim_operation(max_operations)?;
+        self.budget_claimed = true;
+        Ok(())
+    }
+
+    /// Whether this slot holds one operation of budget.
+    pub fn budget_claimed(&self) -> bool {
+        self.budget_claimed
+    }
+
     /// Complete after key use: the operation stays counted against the budget.
     pub fn complete(mut self, outcome: &CeremonyOutcome) {
         self.finish(outcome.clone(), false);
     }
 
     /// Complete a ceremony that ended before key use (review M2): the replay key stays consumed
-    /// (a duplicate gets this outcome) but the operation is given back to the budget.
+    /// (a duplicate gets this outcome) but the operation, if one was claimed, is given back to the
+    /// budget.
     pub fn complete_without_key_use(mut self, outcome: &CeremonyOutcome) {
-        self.finish(outcome.clone(), true);
+        let refund = self.budget_claimed;
+        self.finish(outcome.clone(), refund);
     }
 
     fn finish(&mut self, outcome: CeremonyOutcome, refund: bool) {
@@ -674,6 +741,49 @@ mod tests {
             Claim::Completed(Err(e), _) => assert_eq!(e.code, ErrorCode::Internal),
             _ => panic!("the failure must be returned to the duplicate"),
         }
+    }
+
+    #[test]
+    fn a_key_only_claim_takes_budget_only_when_claimed_and_refunds_only_that() {
+        let session = AgentSession::new(binding(1));
+        let now = Instant::now();
+
+        // Denied escalation: the slot completes, nothing was claimed, nothing is refunded.
+        let (k1, c1) = key(CeremonyAction::Authenticate, "a.example", b"one");
+        let Claim::Fresh(guard) = session.claim_key(k1, c1, now) else {
+            panic!("fresh");
+        };
+        assert!(!guard.budget_claimed());
+        assert_eq!(session.operations_used(), 0);
+        guard.complete_without_key_use(&Err(internal_failure("denied")));
+        assert_eq!(session.operations_used(), 0);
+        // The replay key is consumed: a duplicate gets the outcome, no new slot.
+        assert!(matches!(
+            session.claim_key(k1, c1, now),
+            Claim::Completed(..)
+        ));
+
+        // Approved: the budget is claimed once (a second claim is a no-op), then refunded only
+        // if the ceremony ends before key use.
+        let (k2, c2) = key(CeremonyAction::Authenticate, "a.example", b"two");
+        let Claim::Fresh(mut guard) = session.claim_key(k2, c2, now) else {
+            panic!("fresh");
+        };
+        guard.claim_budget(1).unwrap();
+        guard.claim_budget(1).unwrap();
+        assert_eq!(session.operations_used(), 1);
+        guard.complete_without_key_use(&Err(internal_failure("before key use")));
+        assert_eq!(session.operations_used(), 0);
+
+        // The live budget is enforced at claim time, after approval.
+        let (k3, c3) = key(CeremonyAction::Authenticate, "a.example", b"three");
+        let Claim::Fresh(mut guard) = session.claim_key(k3, c3, now) else {
+            panic!("fresh");
+        };
+        assert_eq!(guard.claim_budget(0), Err(ClaimRejection::BudgetExhausted));
+        assert!(!guard.budget_claimed());
+        guard.complete_without_key_use(&Err(internal_failure("budget")));
+        assert_eq!(session.operations_used(), 0);
     }
 
     #[test]

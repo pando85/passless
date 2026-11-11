@@ -82,9 +82,22 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 **Sign** (`SignHandler::sign_with`, the check order of ADR 0014 section 9):
 
 - Steps 1 to 6 (session, origin, grant, resolve, options, replay key and budget) take only leaf
-  locks, one at a time: policy (70), session (60) and audit (90).
+  locks, one at a time: policy (70), granted-rules view (71), session (60) and audit (90).
 - A duplicate then joins the in-flight slot (65), holding nothing else.
-- A fresh key takes the operation lock (20), then storage (40). Under both it takes policy (70)
+- **Parked wait** (`request`, ADR 0014 section 8.1). The escalation pre-checks read the
+  granted-rules view (71) and take the escalation mutex (80), one at a time, before the replay
+  key. The replay key is taken without budget (`claim_key`: session, 60). A fresh key then calls
+  `join_or_create` (view 71, escalation 80, audit 90 for `escalation.requested`, one at a time)
+  and parks in `Waiter::wait` on the escalation condvar holding **no other lock** (rule 3): no
+  operation lock, storage, policy, session, gate or transport lock is held across the wait. The
+  ceremony's capacity permit is suspended for the wait and resumed afterwards; it is a set of
+  atomic counters, not a lock. Every 250 ms the waiter releases the escalation mutex and checks
+  its cancellation, deadline and session validity (an atomic and the epoch). After approval it
+  re-resolves (policy 70, view 71), claims the budget (session 60) and continues as a fresh key
+  below. `the_human_operation_lock_is_free_while_a_waiter_is_parked` (`sign.rs`) takes the human
+  operation lock and storage under the debug lock-order checks while a waiter is parked.
+- A fresh key takes the operation lock (20), then storage (40). Under both it reads the
+  granted-rules view (71) for the credentials registration grants pinned, and takes policy (70)
   and audit (90) for the reservation. For the pre-key-use re-check it takes the session gate
   (66) and the epoch gate (69), then policy (70) to re-resolve.
 - The counter is written, storage is released, and the key provider signs. Then the gates and
@@ -95,7 +108,10 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
   (60), one after the other.
 
 **Register** follows the same path without the lease activation; its gates are held until the
-credential is written.
+credential is written. A registration escalation parks like an authentication one (it is never
+joined). After an approved registration has written its credential and released the operation
+lock, storage and the gates, `record_registration_grant` persists the grant with nothing else
+held: writer (64), then view (71), then audit (90).
 
 **Sign transport** (`transport/mod.rs`). The connection's reader thread authenticates `hello`
 through the registry maps (50) and the session and policy reads of the bearer, one at a time;
@@ -132,7 +148,7 @@ writer is released before `bump_grant_epoch` (an atomic) or `bump_revocation_epo
 gate, 69). After a revoke or clear the admin handler revokes stale sessions and closes browsers
 exactly as a reload does (steps 4 and 5 below).
 
-**Escalation** (`EscalationService`, wired into the ceremonies in P7 WP3). `join_or_create`
+**Escalation** (`EscalationService`; the ceremony side is the parked wait above). `join_or_create`
 reads the granted-rules view (71) through the grant writer and takes the escalation mutex (80)
 twice, never together: once to check the cooldown, once to admit the request. The
 `escalation.requested` record (90) is written with nothing held. A waiter parks on the escalation
@@ -141,7 +157,9 @@ holds no lock: the approval takes the escalation mutex to move the entry to `Dec
 it, records `escalation.approved` (90), persists the grant (`GrantedRulesStore::add`: writer 64,
 then view 71; the grant epoch is an atomic), and takes the escalation mutex again to publish the
 outcome. Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
-is released.
+is released. A reload that changed the policy calls `cancel_profile` after the configuration
+lock (45) and `reload_lock` (68) are released: it takes the escalation mutex (80) and then
+withdraws the prompts (82).
 
 **Reload** (`handle_reload_policy`) takes these locks in this order:
 

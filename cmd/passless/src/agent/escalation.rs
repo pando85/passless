@@ -393,8 +393,37 @@ impl GrantWriter for StoreGrantWriter {
     }
 }
 
-/// Suspends and resumes the ceremony's capacity permit around the wait (wired to `capacity.rs`
-/// in WP3). `resume` is called exactly once after every `suspend`, also on unwinding.
+/// The [`Prompter`] of a daemon that cannot show escalation prompts at all (a root daemon without
+/// `agents.notify_user`): every `request` resolution is refused with `escalation_unavailable`
+/// before anything is prompted.
+pub struct UnavailablePrompter {
+    reason: String,
+}
+
+impl UnavailablePrompter {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl Prompter for UnavailablePrompter {
+    fn available(&self, _profile: &ProfileId) -> Result<(), String> {
+        Err(self.reason.clone())
+    }
+
+    fn show(&self, ticket: PromptTicket, _fields: PromptFields, sink: Weak<dyn PromptSink>) {
+        if let Some(sink) = sink.upgrade() {
+            sink.prompt_event(&ticket, PromptEvent::Failed(self.reason.clone()));
+        }
+    }
+
+    fn withdraw(&self, _ticket: &PromptTicket) {}
+}
+
+/// Suspends and resumes the ceremony's capacity permit around the wait (`capacity.rs`
+/// `RequestPermit`). `resume` is called exactly once after every `suspend`, also on unwinding.
 pub trait ParkHook {
     fn suspend(&mut self) {}
     fn resume(&mut self) {}
@@ -1265,8 +1294,8 @@ impl EscalationService {
 
     /// Persist the grant of an approved registration after its credential was written (ADR 0014
     /// section 8.3), bump the grant epoch and audit `granted_rule.add`. A failure persists
-    /// nothing; the credential stays and its next authentication escalates again (plan P7 gap
-    /// 10).
+    /// nothing and is audited as `escalation.denied` with `cause = grant_write_failed`; the
+    /// credential stays and its next authentication escalates again (plan P7 gap 10).
     pub fn record_registration_grant(
         &self,
         approval: &RegistrationApproval,
@@ -1281,8 +1310,28 @@ impl EscalationService {
             approval.rule,
             Some(credential_ref.clone()),
         );
-        self.grants
-            .add(&approval.profile, rule, max_granted_rules)?;
+        if let Err(e) = self.grants.add(&approval.profile, rule, max_granted_rules) {
+            warn!(
+                "escalation {}: the registration grant could not be persisted: {}",
+                approval.escalation_id, e
+            );
+            let context = EscalationAuditContext {
+                escalation_id: approval.escalation_id.as_str().to_string(),
+                profile_id: approval.profile.clone(),
+                action: AuditAction::Register,
+                rp_id: approval.rp_id.clone(),
+            };
+            if let Err(audit_error) = self
+                .audit
+                .record(context.denied(EscalationDenyCause::GrantWriteFailed))
+            {
+                warn!(
+                    "escalation {}: the failed grant write could not be audited: {}",
+                    approval.escalation_id, audit_error
+                );
+            }
+            return Err(e);
+        }
         let added = GrantedRuleAddBuilder::new(
             approval.profile.clone(),
             &approval.rp_id,
@@ -1469,6 +1518,144 @@ impl Drop for Waiter {
             self.service
                 .depart(self.serial, self.id, Departure::Aborted);
         }
+    }
+}
+
+/// A scripted prompter and service constructors for the ceremony tests (`sign.rs`, `register.rs`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    use std::sync::atomic::AtomicBool;
+
+    use super::super::identity::SystemClock;
+
+    /// One shown prompt and where its decision goes.
+    type Shown = (PromptTicket, PromptFields, Weak<dyn PromptSink>);
+
+    /// Records shown and withdrawn prompts; a test decides the last shown prompt by hand.
+    #[derive(Default)]
+    pub struct ScriptedPrompter {
+        shown: Mutex<Vec<Shown>>,
+        withdrawn: Mutex<Vec<PromptTicket>>,
+        changed: Condvar,
+        unavailable: AtomicBool,
+    }
+
+    impl ScriptedPrompter {
+        pub fn set_unavailable(&self, unavailable: bool) {
+            self.unavailable.store(unavailable, Ordering::SeqCst);
+        }
+
+        pub fn shown(&self) -> usize {
+            self.shown.lock().unwrap().len()
+        }
+
+        pub fn withdrawn(&self) -> usize {
+            self.withdrawn.lock().unwrap().len()
+        }
+
+        pub fn last_fields(&self) -> PromptFields {
+            self.shown.lock().unwrap().last().unwrap().1.clone()
+        }
+
+        /// Wait until `count` prompts were shown.
+        pub fn wait_shown(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut shown = self.shown.lock().unwrap();
+            while shown.len() < count {
+                let now = Instant::now();
+                assert!(now < deadline, "only {} prompt(s) shown", shown.len());
+                shown = self.changed.wait_timeout(shown, deadline - now).unwrap().0;
+            }
+        }
+
+        /// Report `event` for the last shown prompt.
+        pub fn decide(&self, event: PromptEvent) {
+            let (ticket, sink) = {
+                let shown = self.shown.lock().unwrap();
+                let (ticket, _, sink) = shown.last().expect("no prompt shown");
+                (ticket.clone(), sink.clone())
+            };
+            sink.upgrade()
+                .expect("escalation service dropped")
+                .prompt_event(&ticket, event);
+        }
+
+        /// Wait for prompt `count`, then approve it.
+        pub fn approve(&self, count: usize) {
+            self.wait_shown(count);
+            self.decide(PromptEvent::Approved);
+        }
+    }
+
+    impl Prompter for ScriptedPrompter {
+        fn available(&self, _profile: &ProfileId) -> Result<(), String> {
+            if self.unavailable.load(Ordering::SeqCst) {
+                Err("no session bus".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn show(&self, ticket: PromptTicket, fields: PromptFields, sink: Weak<dyn PromptSink>) {
+            assert!(lock_order::held_levels().is_empty());
+            self.shown.lock().unwrap().push((ticket, fields, sink));
+            self.changed.notify_all();
+        }
+
+        fn withdraw(&self, ticket: &PromptTicket) {
+            assert!(lock_order::held_levels().is_empty());
+            self.withdrawn.lock().unwrap().push(ticket.clone());
+        }
+    }
+
+    /// Accepts no grant (the ceremony tests that never approve).
+    struct NoGrants;
+
+    impl GrantWriter for NoGrants {
+        fn capacity(&self, _profile: &ProfileId) -> GrantCapacity {
+            GrantCapacity::Available { used: 0 }
+        }
+
+        fn add(
+            &self,
+            profile: &ProfileId,
+            _rule: GrantedRule,
+            _max_rules: usize,
+        ) -> Result<(), GrantStoreError> {
+            Err(GrantStoreError::Unavailable(profile.to_string()))
+        }
+    }
+
+    /// A coordinator that can show no prompt: every escalation is refused with
+    /// `escalation_unavailable` (a daemon without a session bus).
+    pub fn idle_service(audit: Arc<AuditGate>) -> Arc<EscalationService> {
+        EscalationService::new(EscalationDeps {
+            audit,
+            grants: Arc::new(NoGrants),
+            prompter: Arc::new(UnavailablePrompter::new("no session bus in this test")),
+            clock: Arc::new(SystemClock::new()),
+            cooldown: Duration::from_secs(600),
+        })
+    }
+
+    /// The production coordinator over the real audit gate and granted-rules store, with a
+    /// scripted prompter.
+    pub fn service(
+        audit: Arc<AuditGate>,
+        store: Arc<GrantedRulesStore>,
+        policy: Arc<PolicyRuntime>,
+        prompter: Arc<ScriptedPrompter>,
+        cooldown: Duration,
+    ) -> Arc<EscalationService> {
+        EscalationService::new(EscalationDeps {
+            audit,
+            grants: Arc::new(StoreGrantWriter { store, policy }),
+            prompter,
+            clock: Arc::new(SystemClock::new()),
+            cooldown,
+        })
     }
 }
 

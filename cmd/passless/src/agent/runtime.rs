@@ -30,6 +30,9 @@ use super::audit_events::{
 };
 use super::backend::CredentialBackendHandle;
 use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
+use super::escalation::{
+    EscalationDeps, EscalationService, Prompter, StoreGrantWriter, UnavailablePrompter,
+};
 use super::granted_rules::GrantedRulesStore;
 use super::ipc::{AdminHandler, IpcServer, PrincipalHandler, ProfileAccess, RuntimeDir};
 use super::launcher::{
@@ -37,6 +40,7 @@ use super::launcher::{
     verify_process_ancestry,
 };
 use super::policy_engine::PolicyRuntime;
+use super::prompt::{NotificationPrompter, ProcessSpawner};
 use super::sign::SignContextRegistry;
 use super::storage_factory::{create_storage_bundle_with_options, key_provider_for_config};
 use super::transport::{ReadinessRegistry, SignTransportServer, TransportOptions};
@@ -113,6 +117,38 @@ fn open_granted_rules(agent_config: &AgentConfig) -> GrantedRulesStore {
             "no agents.state_dir and no home directory to derive it from",
         ),
     }
+}
+
+/// The escalation coordinator (ADR 0014 section 8): prompts go to `agents.notify_user` through
+/// the privilege-dropping prompt child. A daemon that cannot reach any session bus
+/// (`escalation_unavailable_reason`) refuses every escalation with `escalation_unavailable`
+/// without prompting.
+fn build_escalation_service(
+    agent_config: &AgentConfig,
+    daemon_uid: u32,
+    audit_gate: Arc<AuditGate>,
+    granted_rules: Arc<GrantedRulesStore>,
+    policy_runtime: Arc<PolicyRuntime>,
+) -> Arc<EscalationService> {
+    let prompter: Arc<dyn Prompter> = match agent_config.escalation_unavailable_reason(daemon_uid) {
+        Some(reason) => {
+            warn!("agent escalation unavailable: {}", reason);
+            Arc::new(UnavailablePrompter::new(reason))
+        }
+        None => Arc::new(NotificationPrompter::new(Arc::new(ProcessSpawner::new(
+            agent_config.notify_user.clone(),
+        )))),
+    };
+    EscalationService::new(EscalationDeps {
+        audit: audit_gate,
+        grants: Arc::new(StoreGrantWriter {
+            store: granted_rules,
+            policy: policy_runtime,
+        }),
+        prompter,
+        clock: Arc::new(super::identity::SystemClock::new()),
+        cooldown: agent_config.escalation_cooldown(),
+    })
 }
 
 fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> ProtocolError {
@@ -607,6 +643,8 @@ pub struct AgentRuntime {
     /// The persistent granted-rules store (ADR 0014 section 8.4), also installed as the policy
     /// runtime's grant source.
     granted_rules: Arc<GrantedRulesStore>,
+    /// The escalation coordinator every `request` resolution waits on (ADR 0014 section 8).
+    escalation: Arc<EscalationService>,
 }
 
 impl AgentRuntime {
@@ -674,6 +712,14 @@ impl AgentRuntime {
                     RuntimeError::Policy(format!("failed to create policy runtime: {}", e))
                 })?
                 .with_grant_source(granted_rules.clone()),
+        );
+
+        let escalation = build_escalation_service(
+            agent_config,
+            daemon_uid,
+            audit_gate.clone(),
+            granted_rules.clone(),
+            policy_runtime.clone(),
         );
 
         let browser_manager =
@@ -1179,6 +1225,7 @@ impl AgentRuntime {
             sign_uid_sockets,
             sign_readiness,
             granted_rules,
+            escalation,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -2951,6 +2998,7 @@ impl AgentRuntime {
                 &self.policy_runtime,
             )
             .map_err(rejected)?;
+            self.escalation.set_cooldown(config.escalation_cooldown());
             *current = config;
             outcome
         };
@@ -2963,6 +3011,12 @@ impl AgentRuntime {
         let _ = self.audit_gate.record(gen_event);
 
         if outcome.changed {
+            // Pending escalations were raised under the old policy: cancel them
+            // (`escalation.revoked`, `reason = policy_reload`). The epoch bump already makes
+            // their waiters' sessions invalid; this also withdraws the prompts at once.
+            for profile in self.profiles.keys() {
+                self.escalation.cancel_profile(profile);
+            }
             let revoked = self
                 .sign_registry
                 .revoke_stale_sessions(outcome.revocation_epoch);
@@ -3962,6 +4016,7 @@ impl AgentRuntime {
             key_provider: profile.backend.key_provider.clone(),
             security_config: profile.security_config.clone(),
             operation_lock: profile.backend.operation_lock.clone(),
+            escalation: self.escalation.clone(),
         });
 
         // Register the bearer token with the sign registry for registration
@@ -4127,6 +4182,7 @@ impl AgentRuntime {
                                 security_config: profile.security_config.clone(),
                                 key_provider: profile.backend.key_provider.clone(),
                                 operation_lock: profile.backend.operation_lock.clone(),
+                                escalation: self.escalation.clone(),
                             });
                             if let Err(e) = self.sign_registry.register_pending(
                                 bearer_token.clone(),

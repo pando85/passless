@@ -181,6 +181,9 @@ impl Fixture {
             security_config: Self::security_config(),
             key_provider: self.key_provider.clone(),
             operation_lock: self.operation_lock.clone(),
+            escalation: crate::agent::escalation::test_support::idle_service(
+                self.audit_gate.clone(),
+            ),
         });
         let register_handler = Arc::new(RegisterHandler {
             policy_runtime: self.policy_runtime.clone(),
@@ -189,6 +192,9 @@ impl Fixture {
             key_provider: self.key_provider.clone(),
             security_config: Self::security_config(),
             operation_lock: self.operation_lock.clone(),
+            escalation: crate::agent::escalation::test_support::idle_service(
+                self.audit_gate.clone(),
+            ),
         });
         self.registry
             .register_pending(

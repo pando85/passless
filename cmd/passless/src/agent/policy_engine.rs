@@ -102,6 +102,16 @@ fn policy_action(action: &IntentAction) -> PolicyAction {
     }
 }
 
+/// What an escalation needs from the live policy of its profile.
+#[derive(Debug, Clone)]
+pub struct EscalationProfile {
+    pub mode: AgentMode,
+    pub principal_user: String,
+    pub max_granted_rules: usize,
+    /// `agents.escalation_timeout`, when set.
+    pub escalation_timeout: Option<Duration>,
+}
+
 /// The global escalation keys that are part of every profile's policy digest.
 #[derive(Debug, Clone, Copy)]
 struct EscalationSettings {
@@ -543,6 +553,30 @@ impl PolicyRuntime {
         self.current_generation()
             .find_snapshot(profile_id)
             .map(|snapshot| snapshot.max_operations)
+    }
+
+    /// The live escalation settings of a profile (ADR 0014 section 8), if the profile exists.
+    pub fn escalation_profile(&self, profile_id: &ProfileId) -> Option<EscalationProfile> {
+        self.current_generation()
+            .find_snapshot(profile_id)
+            .map(|snapshot| EscalationProfile {
+                mode: snapshot.mode,
+                principal_user: snapshot.policy.principal_user.clone(),
+                max_granted_rules: usize::from(snapshot.max_granted_rules),
+                escalation_timeout: (snapshot.policy.escalation_timeout > 0)
+                    .then(|| Duration::from_secs(snapshot.policy.escalation_timeout)),
+            })
+    }
+
+    /// The credential references that registration grants pinned for exactly `rp_id` (ADR 0014
+    /// section 8.3), read live from the granted-rules store.
+    pub fn granted_credential_refs(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+    ) -> Vec<CredentialRef> {
+        self.granted_rules
+            .granted_credential_refs(profile_id, rp_id)
     }
 
     /// Resolve `(action, rp_id)` for `profile_id` against the LIVE compiled policy (the current
