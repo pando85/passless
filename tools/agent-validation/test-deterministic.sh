@@ -30,6 +30,9 @@ shellcheck -S warning \
     tools/agent-validation/lib/*.sh \
     tools/agent-validation/stages/*.sh \
     tools/agent-validation/browser/*.sh \
+    tools/agent-validation/policy/*.sh \
+    tools/agent-validation/scripts/*.sh \
+    tools/agent-validation/controlled-rp/gen_cert.sh \
     tools/agent-validation/tests/*.sh \
     tools/agent-validation/test-orchestrator.sh
 

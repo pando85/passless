@@ -1,6 +1,6 @@
 # Controlled RP — WebAuthn Test Harness
 
-Standards-based WebAuthn Relying Party for testing stock Chromium/Firefox against the Passless virtual authenticator via UHID. Uses `@simplewebauthn/server` v13.3.0 for full cryptographic verification: attestation/authenticator data parsing, RP ID hash, UP/UV flags, signature verification, challenge/origin binding, and monotonic signature counter.
+Standards-based WebAuthn Relying Party for testing stock Chromium/Firefox against the Passless authenticator. Uses `@simplewebauthn/server` v13.3.0 for full cryptographic verification: attestation/authenticator data parsing, RP ID hash, UP/UV flags, signature verification, challenge/origin binding, and monotonic signature counter.
 
 No browser extensions or proxies required.
 
@@ -13,7 +13,7 @@ No browser extensions or proxies required.
 ## Quick Start
 
 ```bash
-cd tools/agent-uhid-feasibility/controlled-rp
+cd tools/agent-validation/controlled-rp
 
 # Install dependencies (first time only)
 npm install

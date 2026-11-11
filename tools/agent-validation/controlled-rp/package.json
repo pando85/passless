@@ -1,7 +1,7 @@
 {
   "name": "controlled-rp",
   "version": "1.0.0",
-  "description": "Standards-based WebAuthn RP test harness for Passless UHID feasibility",
+  "description": "Standards-based WebAuthn RP test harness for Passless agent validation",
   "type": "module",
   "private": true,
   "scripts": {

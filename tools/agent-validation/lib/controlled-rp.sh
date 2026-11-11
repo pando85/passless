@@ -24,7 +24,7 @@ av_find_controlled_rp() {
         validation_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     fi
 
-    local rp_dir="${validation_dir}/../agent-uhid-feasibility/controlled-rp"
+    local rp_dir="${validation_dir}/controlled-rp"
 
     if [[ ! -d "$rp_dir" ]]; then
         av_log_error "Controlled RP directory not found: $rp_dir"

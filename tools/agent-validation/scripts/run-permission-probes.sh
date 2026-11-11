@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/run-permission-probes.sh — Permission probes for /dev/uhid and hidraw nodes.
-# Runs without root. Records machine-readable JSON evidence.
+# Runs without root and needs no helper binary. Records machine-readable JSON evidence.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,19 +10,15 @@ mkdir -p "${EVIDENCE_DIR}"
 
 TIMESTAMP=$(date -Iseconds)
 
-BIN="${CARGO_TARGET_DIR:-${TOOL_DIR}/target}/debug/uhid-feasibility"
-if [[ ! -x "${BIN}" ]]; then
-    BIN=$(find /dev/shm -name "uhid-feasibility" -type f -executable 2>/dev/null | head -1)
-fi
-
-if [[ ! -x "${BIN:-}" ]]; then
-    echo "ERROR: uhid-feasibility binary not found" >&2
-    exit 1
-fi
-
 echo "=== Permission Probes ==="
 echo "timestamp: ${TIMESTAMP}"
 echo ""
+
+# Open the node read-write the way a client would; report whether that works.
+can_open_rw() {
+    local path="$1"
+    ( exec 3<>"${path}" ) 2>/dev/null
+}
 
 probe_to_json() {
     local path="$1"
@@ -37,10 +33,7 @@ probe_to_json() {
         group_gid=$(stat -c '%g' "${path}" 2>/dev/null || echo "-1")
         [[ -r "${path}" ]] && readable="true"
         [[ -w "${path}" ]] && writable="true"
-
-        local test_out
-        test_out=$("${BIN}" perm "${path}" 2>&1) || true
-        if echo "${test_out}" | grep -q "open R/W:.*true"; then
+        if can_open_rw "${path}"; then
             open_rw="true"
         fi
     else
@@ -53,24 +46,19 @@ probe_to_json() {
 PROBES=()
 
 echo "--- /dev/uhid ---"
-"${BIN}" perm 2>&1 || true
 PROBES+=("$(probe_to_json /dev/uhid uhid)")
+echo "${PROBES[-1]}"
 echo ""
 
 echo "--- hidraw nodes ---"
 for f in /dev/hidraw*; do
     [[ -e "$f" ]] || continue
-    NAME=$(basename "$f")
-    "${BIN}" perm "$f" 2>&1 || true
-    PROBES+=("$(probe_to_json "$f" "$NAME")")
-    echo ""
+    PROBES+=("$(probe_to_json "$f" "$(basename "$f")")")
+    echo "${PROBES[-1]}"
 done
 
-echo "--- /dev/uhid (tool env) ---"
-"${BIN}" env 2>&1 || true
-
 PROBES_JSON=$(IFS=,; echo "${PROBES[*]}")
-JSON="{\"phase\":\"0-permission-probes\",\"timestamp\":\"${TIMESTAMP}\",\"probes\":[${PROBES_JSON}]}"
+JSON="{\"phase\":\"permission-probes\",\"timestamp\":\"${TIMESTAMP}\",\"probes\":[${PROBES_JSON}]}"
 
 OUTFILE="${EVIDENCE_DIR}/permission-probes-$(date +%Y%m%dT%H%M%S).json"
 echo "${JSON}" | python3 -m json.tool > "${OUTFILE}" 2>/dev/null || echo "${JSON}" > "${OUTFILE}"

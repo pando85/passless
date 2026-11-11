@@ -10,6 +10,13 @@ The agent validation orchestrator provides a fail-closed framework to run compre
 - **Tier 2**: Automated browser session tests (Chromium, notifications, ceremonies)
 - **Tier 3**: Privileged release lab tests (device permissions, principal isolation)
 
+## Layout
+
+- `run.sh`, `validate`, `lib/`, `stages/`, `tests/`: the orchestrator, its stages and their tests.
+- `controlled-rp/`: the standards-based WebAuthn relying party used by the browser stages.
+- `policy/`: the lab udev rule and its privileged setup, cleanup and dry-run validation scripts.
+- `scripts/`: the permission probes of the device-probes stage.
+
 ## Requirements
 
 - x86_64 Linux environment (for release mode)
@@ -99,5 +106,5 @@ All wired stages either run their asserted behavior or report `SKIP`. A required
 
 This orchestrator integrates with:
 - Existing fmt/clippy/test pipelines
-- Phase 0 tooling
+- The lab device policy (`policy/`) and permission probes (`scripts/`)
 - The broader agent validation plan

@@ -3,9 +3,7 @@ members = [
     "cmd/passless",
     "passless-config-doc",
     "passless-core",
-    "passless-uhid",
     "tools/agent-principal-probe",
-    "tools/agent-uhid-feasibility",
     "tools/notify-double",
 ]
 resolver = "2"
@@ -21,7 +19,6 @@ repository = "https://github.com/pando85/passless"
 # Workspace crates
 passless-core = { path = "./passless-core", version = "0.21.0" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.21.0" }
-passless-uhid = { path = "./passless-uhid", version = "0.21.0" }
 
 soft-fido2 = "0.17.0"
 soft-fido2-ctap = "0.17.0"
