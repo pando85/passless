@@ -24,15 +24,25 @@
 //! nothing else, and call their `cancelled`/`still_valid` checks with the mutex released.
 //!
 //! Approval protocol: under the mutex the decision must match the active ticket of an entry that
-//! is still `Prompting`; it becomes `Deciding`. With the mutex released the approval is audited
-//! (`escalation.approved`) and, for `authenticate`, the grant is persisted (which bumps the grant
-//! epoch). Then the entry becomes `Approved` under the mutex and the waiters are woken. A failed
-//! audit or store write turns the approval into a deny. A registration approval persists nothing
-//! here: the creating ceremony persists the grant after the credential is written
-//! ([`EscalationService::record_registration_grant`]).
+//! is still `Prompting`; it becomes `Deciding`. With the mutex released, and under an unwind guard
+//! that finishes the entry as denied if anything panics:
+//!
+//! 1. `escalation.approved` is audited;
+//! 2. for `authenticate`, `granted_rule.add` is audited, before the store write;
+//! 3. the entry is re-checked under the mutex: a reload or a grant clear that cancelled it while it
+//!    was `Deciding` stands, and nothing is written;
+//! 4. the grant is persisted (which bumps the grant epoch);
+//! 5. the entry becomes `Approved` under the mutex and the waiters are woken. If a cancellation
+//!    got in between 3 and 5, the grant just written is revoked again (compensation) and the
+//!    revocation is audited as `granted_rule.revoke`.
+//!
+//! A failed audit or store write turns the approval into a deny. A registration approval persists
+//! nothing here: the creating ceremony persists the grant after the credential is written
+//! ([`EscalationService::record_registration_grant`], which also audits before it writes).
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -45,7 +55,7 @@ use passless_core::agent::{AgentMode, CredentialRef, ProfileId};
 use super::audit::AuditGate;
 use super::audit_events::{
     AuditAction, AuditEvent, EscalationAuditContext, EscalationDenyCause, EscalationExpireReason,
-    EscalationRevokeReason, GrantedRuleAddBuilder, PolicyDenyReason,
+    EscalationRevokeReason, GrantedRuleAddBuilder, GrantedRuleRevokeBuilder, PolicyDenyReason,
 };
 use super::escalation_prompt::{PromptFields, PromptVerb};
 use super::granted_rules::{
@@ -68,6 +78,8 @@ pub const MAX_WAITERS_GLOBAL: usize = 64;
 pub const WITHDRAWAL_WINDOW: Duration = Duration::from_secs(600);
 /// Withdrawals within [`WITHDRAWAL_WINDOW`] that start the cooldown.
 pub const WITHDRAWALS_BEFORE_COOLDOWN: usize = 3;
+/// Keys each of the cooldown and withdrawal maps tracks; beyond it the oldest entry is evicted.
+pub const MAX_TRACKED_KEYS: usize = 4096;
 /// Longest a waiter parks before it re-checks its cancellation, deadline and session.
 pub const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// An abort this close to the deadline counts as a timeout (Chromium's cancel and the daemon's
@@ -365,6 +377,14 @@ pub trait GrantWriter: Send + Sync {
         rule: GrantedRule,
         max_rules: usize,
     ) -> Result<(), GrantStoreError>;
+    /// Remove what the escalation `request_id` persisted and bump the revocation epoch (the
+    /// compensation of an approval a reload or a clear overtook). Returns the rules removed;
+    /// `Ok(0)` or `NotFound` when it persisted nothing.
+    fn revoke_request(
+        &self,
+        profile: &ProfileId,
+        request_id: &str,
+    ) -> Result<usize, GrantStoreError>;
 }
 
 /// The production [`GrantWriter`]: the granted-rules store, bumping the policy's grant epoch.
@@ -390,6 +410,18 @@ impl GrantWriter for StoreGrantWriter {
         self.store
             .add(&self.policy, profile, rule, max_rules)
             .map(|_| ())
+    }
+
+    fn revoke_request(
+        &self,
+        profile: &ProfileId,
+        request_id: &str,
+    ) -> Result<usize, GrantStoreError> {
+        match self.store.revoke_request(&self.policy, profile, request_id) {
+            Ok(outcome) => Ok(outcome.revoked),
+            Err(GrantStoreError::NotFound) => Ok(0),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -548,15 +580,44 @@ impl Inner {
     }
 
     fn start_cooldown(&mut self, key: &EscalationKey, now: MonotonicTime, cooldown: Duration) {
-        self.cooldown.insert(key.clone(), later(now, cooldown));
         self.withdrawals.remove(key);
+        // Prune on every insert, so the map holds live cooldowns only, then cap it.
+        self.cooldown.retain(|_, until| now < *until);
+        if !self.cooldown.contains_key(key) && self.cooldown.len() >= MAX_TRACKED_KEYS {
+            // Nothing is expired after the prune: the oldest cooldown overall goes.
+            let oldest = self
+                .cooldown
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.cooldown.remove(&oldest);
+            }
+        }
+        self.cooldown.insert(key.clone(), later(now, cooldown));
     }
 
     /// Count a withdrawal of `key` (V-M2); the third within the window starts the cooldown.
     fn record_withdrawal(&mut self, key: &EscalationKey, now: MonotonicTime, cooldown: Duration) {
         let window = u64::try_from(WITHDRAWAL_WINDOW.as_millis()).unwrap_or(u64::MAX);
+        // Prune on every insert, so the map holds keys with a withdrawal inside the window only,
+        // then cap it.
+        self.withdrawals.retain(|_, recent| {
+            recent.retain(|at| now.saturating_duration_since(*at) < window);
+            !recent.is_empty()
+        });
+        if !self.withdrawals.contains_key(key) && self.withdrawals.len() >= MAX_TRACKED_KEYS {
+            // Nothing is expired after the prune: the key whose latest withdrawal is oldest goes.
+            let oldest = self
+                .withdrawals
+                .iter()
+                .min_by_key(|(_, recent)| recent.back().copied())
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.withdrawals.remove(&oldest);
+            }
+        }
         let recent = self.withdrawals.entry(key.clone()).or_default();
-        recent.retain(|at| now.saturating_duration_since(*at) < window);
         recent.push_back(now);
         if recent.len() >= WITHDRAWALS_BEFORE_COOLDOWN {
             info!(
@@ -1125,116 +1186,216 @@ impl EscalationService {
             )
         };
 
+        // From here until the entry is finished, a panic must not leave it `Deciding`.
+        let mut guard = DecidingGuard {
+            service: self,
+            serial,
+            context: context.clone(),
+            cause: EscalationDenyCause::AuditFailure,
+            reason: PolicyDenyReason::AuditFailure,
+            armed: true,
+        };
+        let settled = self.settle_approval(&mut guard, &request, &escalation_id, latency_ms);
+        guard.armed = false;
+        let committed = self.finish_deciding(serial, settled.outcome, settled.audit);
+        if !committed && settled.grant_written {
+            self.compensate_grant(&request, &escalation_id);
+        }
+    }
+
+    /// Steps 1 to 4 of the approval protocol: the audit records and the grant write. The returned
+    /// outcome is published by [`Self::finish_deciding`].
+    fn settle_approval(
+        &self,
+        guard: &mut DecidingGuard<'_>,
+        request: &EscalationRequest,
+        escalation_id: &EscalationId,
+        latency_ms: u64,
+    ) -> Settled {
+        let context = guard.context.clone();
+        let denied = |cause: EscalationDenyCause, reason: PolicyDenyReason| Settled {
+            outcome: EntryOutcome::Denied {
+                cause,
+                reason: Some(reason),
+            },
+            audit: Some(context.denied(cause)),
+            grant_written: false,
+        };
+
         if let Err(e) = self.audit.record(context.approved(latency_ms)) {
             warn!(
                 "escalation {}: escalation.approved could not be audited, denying: {}",
                 escalation_id, e
             );
-            self.finish_deciding(
-                serial,
-                EntryOutcome::Denied {
-                    cause: EscalationDenyCause::AuditFailure,
-                    reason: Some(PolicyDenyReason::AuditFailure),
-                },
-                Some(context.denied(EscalationDenyCause::AuditFailure)),
+            return denied(
+                EscalationDenyCause::AuditFailure,
+                PolicyDenyReason::AuditFailure,
             );
-            return;
         }
 
-        let outcome = match request.action {
-            CeremonyAction::Authenticate => {
-                let rule = GrantedRule::new(
-                    &request.rp_id,
-                    GrantKind::Escalation,
-                    escalation_id.as_str(),
-                    &request.origin,
-                    request.rule,
-                    None,
-                );
-                match self
-                    .grants
-                    .add(&request.profile, rule, request.max_granted_rules)
-                {
-                    Ok(()) => {
-                        let added = GrantedRuleAddBuilder::new(
-                            request.profile.clone(),
-                            &request.rp_id,
-                            GrantKind::Escalation,
-                            escalation_id.as_str(),
-                            request.rule,
-                        )
-                        .build();
-                        if let Err(e) = self.audit.record(added) {
-                            warn!(
-                                "escalation {}: granted_rule.add could not be audited: {}",
-                                escalation_id, e
-                            );
-                        }
-                        info!(
-                            "escalation {}: approved; {}/{} granted",
-                            escalation_id, request.profile, request.rp_id
-                        );
-                        EntryOutcome::Approved
-                    }
-                    Err(e) => {
-                        warn!(
-                            "escalation {}: the grant could not be persisted, denying: {}",
-                            escalation_id, e
-                        );
-                        let reason = match e {
-                            GrantStoreError::CapReached(_) => PolicyDenyReason::GrantCapReached,
-                            _ => PolicyDenyReason::GrantsUnavailable,
-                        };
-                        self.finish_deciding(
-                            serial,
-                            EntryOutcome::Denied {
-                                cause: EscalationDenyCause::GrantWriteFailed,
-                                reason: Some(reason),
-                            },
-                            Some(context.denied(EscalationDenyCause::GrantWriteFailed)),
-                        );
-                        return;
-                    }
-                }
-            }
-            CeremonyAction::Register => {
-                info!(
-                    "escalation {}: registration approved for {}/{}",
-                    escalation_id, request.profile, request.rp_id
-                );
-                EntryOutcome::Registration(Some(RegistrationApproval {
+        if request.action == CeremonyAction::Register {
+            info!(
+                "escalation {}: registration approved for {}/{}",
+                escalation_id, request.profile, request.rp_id
+            );
+            return Settled {
+                outcome: EntryOutcome::Registration(Some(RegistrationApproval {
                     escalation_id: escalation_id.clone(),
                     profile: request.profile.clone(),
                     rp_id: request.rp_id.clone(),
                     origin: request.origin.clone(),
                     rule: request.rule,
                     session: request.session,
-                }))
+                })),
+                audit: None,
+                grant_written: false,
+            };
+        }
+
+        // The audit record comes before the store write: a grant is never persisted without its
+        // record. If this write fails the approval is denied; if the store write then fails, the
+        // `escalation.denied` record follows this one.
+        let added = GrantedRuleAddBuilder::new(
+            request.profile.clone(),
+            &request.rp_id,
+            GrantKind::Escalation,
+            escalation_id.as_str(),
+            request.rule,
+        )
+        .build();
+        if let Err(e) = self.audit.record(added) {
+            warn!(
+                "escalation {}: granted_rule.add could not be audited, denying: {}",
+                escalation_id, e
+            );
+            return denied(
+                EscalationDenyCause::AuditFailure,
+                PolicyDenyReason::AuditFailure,
+            );
+        }
+
+        // A reload or a grant clear may have cancelled the entry while it was `Deciding`: the
+        // revocation stands, so nothing is written. (A cancellation after this check is caught by
+        // the compensation in `approve`.)
+        if !self.is_deciding(guard.serial) {
+            info!(
+                "escalation {}: cancelled while deciding; no grant is written",
+                escalation_id
+            );
+            return Settled {
+                outcome: EntryOutcome::Revoked,
+                audit: None,
+                grant_written: false,
+            };
+        }
+
+        guard.cause = EscalationDenyCause::GrantWriteFailed;
+        guard.reason = PolicyDenyReason::GrantsUnavailable;
+        let rule = GrantedRule::new(
+            &request.rp_id,
+            GrantKind::Escalation,
+            escalation_id.as_str(),
+            &request.origin,
+            request.rule,
+            None,
+        );
+        match self
+            .grants
+            .add(&request.profile, rule, request.max_granted_rules)
+        {
+            Ok(()) => {
+                info!(
+                    "escalation {}: approved; {}/{} granted",
+                    escalation_id, request.profile, request.rp_id
+                );
+                Settled {
+                    outcome: EntryOutcome::Approved,
+                    audit: None,
+                    grant_written: true,
+                }
             }
-        };
-        self.finish_deciding(serial, outcome, None);
+            Err(e) => {
+                warn!(
+                    "escalation {}: the grant could not be persisted, denying: {}",
+                    escalation_id, e
+                );
+                let reason = match e {
+                    GrantStoreError::CapReached(_) => PolicyDenyReason::GrantCapReached,
+                    _ => PolicyDenyReason::GrantsUnavailable,
+                };
+                denied(EscalationDenyCause::GrantWriteFailed, reason)
+            }
+        }
     }
 
-    /// Step 4 of the approval protocol (or its deny).
-    fn finish_deciding(&self, serial: u64, outcome: EntryOutcome, audit: Option<AuditEvent>) {
+    /// Whether `serial` is still `Deciding` (not cancelled by a reload or a clear).
+    fn is_deciding(&self, serial: u64) -> bool {
+        self.lock()
+            .entries
+            .get(&serial)
+            .is_some_and(|entry| entry.state == EscalationState::Deciding)
+    }
+
+    /// Revoke the grant of `escalation_id` that was written while a reload or a grant clear
+    /// cancelled its entry, and audit the revocation. The entry itself stays `Revoked`.
+    fn compensate_grant(&self, request: &EscalationRequest, escalation_id: &EscalationId) {
+        match self
+            .grants
+            .revoke_request(&request.profile, escalation_id.as_str())
+        {
+            Ok(revoked) => {
+                info!(
+                    "escalation {}: cancelled while its grant was written; {} grant(s) revoked",
+                    escalation_id, revoked
+                );
+                let event = GrantedRuleRevokeBuilder::new(
+                    request.profile.clone(),
+                    Some(request.rp_id.clone()),
+                    revoked,
+                )
+                .build();
+                if let Err(e) = self.audit.record(event) {
+                    warn!(
+                        "escalation {}: granted_rule.revoke could not be audited: {}",
+                        escalation_id, e
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "escalation {}: cancelled while its grant was written, and the grant could not \
+                 be revoked again; revoke it with the granted-rules CLI: {}",
+                escalation_id, e
+            ),
+        }
+    }
+
+    /// Step 5 of the approval protocol (or its deny). Returns whether the entry was still
+    /// `Deciding` and took `outcome`; `false` when a reload or a clear cancelled it meanwhile (the
+    /// cancellation stands).
+    fn finish_deciding(
+        &self,
+        serial: u64,
+        outcome: EntryOutcome,
+        audit: Option<AuditEvent>,
+    ) -> bool {
         let now = self.clock.now();
         let mut effects = Vec::new();
         if let Some(event) = audit {
             effects.push(Effect::Audit(event));
         }
-        {
+        let committed = {
             let mut inner = self.lock();
             let Some(entry) = inner.entries.get_mut(&serial) else {
                 drop(inner);
                 self.run(effects);
-                return;
+                return false;
             };
             if entry.state != EscalationState::Deciding {
                 // Revoked by a reload while the approval was written; the revocation stands.
                 inner.collect(serial);
                 drop(inner);
                 self.run(effects);
-                return;
+                return false;
             }
             entry.state = match outcome {
                 EntryOutcome::Approved | EntryOutcome::Registration(_) => EscalationState::Approved,
@@ -1246,8 +1407,10 @@ impl EscalationService {
             inner.pump(&profile, now, &mut effects);
             inner.collect(serial);
             self.changed.notify_all();
-        }
+            true
+        };
         self.run(effects);
+        committed
     }
 
     /// Cancel every pending escalation of `profile` after a reload changed the policy. Each is
@@ -1293,45 +1456,30 @@ impl EscalationService {
     }
 
     /// Persist the grant of an approved registration after its credential was written (ADR 0014
-    /// section 8.3), bump the grant epoch and audit `granted_rule.add`. A failure persists
-    /// nothing and is audited as `escalation.denied` with `cause = grant_write_failed`; the
-    /// credential stays and its next authentication escalates again (plan P7 gap 10).
+    /// section 8.3), bump the grant epoch and audit `granted_rule.add`. The audit record is
+    /// written first: if it fails nothing is persisted. A failure of either step is audited as
+    /// `escalation.denied` with `cause = audit_failure` or `grant_write_failed`; the credential
+    /// stays and its next authentication escalates again (plan P7 gap 10).
     pub fn record_registration_grant(
         &self,
         approval: &RegistrationApproval,
         credential_ref: CredentialRef,
         max_granted_rules: usize,
     ) -> Result<(), GrantStoreError> {
-        let rule = GrantedRule::new(
-            &approval.rp_id,
-            GrantKind::Registration,
-            approval.escalation_id.as_str(),
-            &approval.origin,
-            approval.rule,
-            Some(credential_ref.clone()),
-        );
-        if let Err(e) = self.grants.add(&approval.profile, rule, max_granted_rules) {
-            warn!(
-                "escalation {}: the registration grant could not be persisted: {}",
-                approval.escalation_id, e
-            );
-            let context = EscalationAuditContext {
-                escalation_id: approval.escalation_id.as_str().to_string(),
-                profile_id: approval.profile.clone(),
-                action: AuditAction::Register,
-                rp_id: approval.rp_id.clone(),
-            };
-            if let Err(audit_error) = self
-                .audit
-                .record(context.denied(EscalationDenyCause::GrantWriteFailed))
-            {
+        let context = EscalationAuditContext {
+            escalation_id: approval.escalation_id.as_str().to_string(),
+            profile_id: approval.profile.clone(),
+            action: AuditAction::Register,
+            rp_id: approval.rp_id.clone(),
+        };
+        let audit_denial = |cause: EscalationDenyCause| {
+            if let Err(audit_error) = self.audit.record(context.denied(cause)) {
                 warn!(
                     "escalation {}: the failed grant write could not be audited: {}",
                     approval.escalation_id, audit_error
                 );
             }
-            return Err(e);
-        }
+        };
         let added = GrantedRuleAddBuilder::new(
             approval.profile.clone(),
             &approval.rp_id,
@@ -1339,13 +1487,33 @@ impl EscalationService {
             approval.escalation_id.as_str(),
             approval.rule,
         )
-        .credential_ref(Some(credential_ref))
+        .credential_ref(Some(credential_ref.clone()))
         .build();
         if let Err(e) = self.audit.record(added) {
             warn!(
-                "escalation {}: granted_rule.add could not be audited: {}",
+                "escalation {}: granted_rule.add could not be audited, no grant persisted: {}",
                 approval.escalation_id, e
             );
+            audit_denial(EscalationDenyCause::AuditFailure);
+            return Err(GrantStoreError::Io(format!(
+                "granted_rule.add could not be audited: {e}"
+            )));
+        }
+        let rule = GrantedRule::new(
+            &approval.rp_id,
+            GrantKind::Registration,
+            approval.escalation_id.as_str(),
+            &approval.origin,
+            approval.rule,
+            Some(credential_ref),
+        );
+        if let Err(e) = self.grants.add(&approval.profile, rule, max_granted_rules) {
+            warn!(
+                "escalation {}: the registration grant could not be persisted: {}",
+                approval.escalation_id, e
+            );
+            audit_denial(EscalationDenyCause::GrantWriteFailed);
+            return Err(e);
         }
         Ok(())
     }
@@ -1369,6 +1537,54 @@ impl EscalationService {
     pub fn in_cooldown(&self, key: &EscalationKey) -> bool {
         let now = self.clock.now();
         self.lock().in_cooldown(key, now)
+    }
+}
+
+/// What the approval decided, to be published by `finish_deciding`.
+struct Settled {
+    outcome: EntryOutcome,
+    audit: Option<AuditEvent>,
+    /// The grant was persisted (it is revoked again if the entry was cancelled meanwhile).
+    grant_written: bool,
+}
+
+/// Finishes a `Deciding` entry as `Denied`, and wakes its waiters, if the approval unwinds: a panic
+/// in an audit or store call must not leave the profile's prompt slot jammed. The state change
+/// comes first; the denial's audit record is then attempted without letting a second panic (the
+/// one that is unwinding may come from the audit itself) escape the destructor.
+struct DecidingGuard<'a> {
+    service: &'a EscalationService,
+    serial: u64,
+    context: EscalationAuditContext,
+    cause: EscalationDenyCause,
+    reason: PolicyDenyReason,
+    armed: bool,
+}
+
+impl Drop for DecidingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        warn!(
+            "escalation {}: the approval panicked; denying",
+            self.context.escalation_id
+        );
+        let outcome = EntryOutcome::Denied {
+            cause: self.cause,
+            reason: Some(self.reason),
+        };
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.service.finish_deciding(self.serial, outcome, None);
+        }));
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Err(e) = self.service.audit.record(self.context.denied(self.cause)) {
+                warn!(
+                    "escalation {}: the denial could not be audited: {}",
+                    self.context.escalation_id, e
+                );
+            }
+        }));
     }
 }
 
@@ -1626,6 +1842,14 @@ pub(crate) mod test_support {
         ) -> Result<(), GrantStoreError> {
             Err(GrantStoreError::Unavailable(profile.to_string()))
         }
+
+        fn revoke_request(
+            &self,
+            _profile: &ProfileId,
+            _request_id: &str,
+        ) -> Result<usize, GrantStoreError> {
+            Ok(0)
+        }
     }
 
     /// A coordinator that can show no prompt: every escalation is refused with
@@ -1682,14 +1906,27 @@ mod tests {
         }
     }
 
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
     #[derive(Default)]
     struct FakeAudit {
         kinds: Mutex<Vec<String>>,
         events: Mutex<Vec<serde_json::Value>>,
         failing: Mutex<HashSet<&'static str>>,
+        panicking: Mutex<HashSet<&'static str>>,
+        /// Runs (with no lock held) after the record of that kind is written.
+        hooks: Mutex<HashMap<&'static str, Hook>>,
     }
 
     impl FakeAudit {
+        fn panic_on(&self, kind: &'static str) {
+            self.panicking.lock().unwrap().insert(kind);
+        }
+
+        fn hook(&self, kind: &'static str, hook: impl Fn() + Send + Sync + 'static) {
+            self.hooks.lock().unwrap().insert(kind, Arc::new(hook));
+        }
+
         fn fail(&self, kind: &'static str) {
             self.failing.lock().unwrap().insert(kind);
         }
@@ -1722,6 +1959,9 @@ mod tests {
                 lock_order::held_levels()
             );
             let kind = event.kind_name();
+            if self.panicking.lock().unwrap().contains(kind) {
+                panic!("injected audit panic");
+            }
             if self.failing.lock().unwrap().contains(kind) {
                 return Err("injected audit failure".to_string());
             }
@@ -1730,6 +1970,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::to_value(&event).unwrap());
+            let hook = self.hooks.lock().unwrap().get(kind).cloned();
+            if let Some(hook) = hook {
+                hook();
+            }
             Ok(())
         }
     }
@@ -1739,6 +1983,10 @@ mod tests {
         rules: Mutex<Vec<GrantedRule>>,
         unavailable: AtomicBool,
         fail_writes: AtomicBool,
+        panic_writes: AtomicBool,
+        adds: AtomicU64,
+        /// Runs (with no lock held) after the rule is stored.
+        after_add: Mutex<Option<Hook>>,
     }
 
     impl GrantWriter for FakeGrants {
@@ -1758,15 +2006,37 @@ mod tests {
             max_rules: usize,
         ) -> Result<(), GrantStoreError> {
             assert!(lock_order::held_levels().is_empty());
+            self.adds.fetch_add(1, Ordering::SeqCst);
+            if self.panic_writes.load(Ordering::SeqCst) {
+                panic!("injected store panic");
+            }
             if self.fail_writes.load(Ordering::SeqCst) {
                 return Err(GrantStoreError::Io("injected".to_string()));
             }
-            let mut rules = self.rules.lock().unwrap();
-            if rules.len() >= max_rules {
-                return Err(GrantStoreError::CapReached(max_rules));
+            {
+                let mut rules = self.rules.lock().unwrap();
+                if rules.len() >= max_rules {
+                    return Err(GrantStoreError::CapReached(max_rules));
+                }
+                rules.push(rule);
             }
-            rules.push(rule);
+            let hook = self.after_add.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
             Ok(())
+        }
+
+        fn revoke_request(
+            &self,
+            _profile: &ProfileId,
+            request_id: &str,
+        ) -> Result<usize, GrantStoreError> {
+            assert!(lock_order::held_levels().is_empty());
+            let mut rules = self.rules.lock().unwrap();
+            let before = rules.len();
+            rules.retain(|rule| rule.request_id != request_id);
+            Ok(before - rules.len())
         }
     }
 
@@ -2427,13 +2697,246 @@ mod tests {
             h.audit.last("escalation.denied")["cause"],
             "grant_write_failed"
         );
-        assert_eq!(h.audit.count("granted_rule.add"), 0);
+        // The record precedes the failed write, and the deny follows it.
+        let kinds = h.audit.kinds();
+        let position = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+        assert!(position("granted_rule.add") < position("escalation.denied"));
         // The prompt slot is free again.
         let _next = h
             .service
             .join_or_create(request("p", "b.example", 1))
             .unwrap();
         assert_eq!(h.prompter.shown().len(), 2);
+    }
+
+    /// Approve the last shown prompt of `h`, run the approval on this thread and return the
+    /// parked waiter's outcome.
+    fn approve_and_join(h: &Harness, rp_id: &str) -> EscalationOutcome {
+        let parked = park(h.service.join_or_create(request("p", rp_id, 1)).unwrap());
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        parked.join().unwrap()
+    }
+
+    fn assert_denied(outcome: EscalationOutcome, expected_cause: EscalationDenyCause) {
+        match outcome {
+            EscalationOutcome::Denied { cause, .. } => assert_eq!(cause, expected_cause),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn cancel_on(h: &Harness) -> impl Fn() + Send + Sync + 'static {
+        let service = Arc::clone(&h.service);
+        move || service.cancel_profile(&profile("p"))
+    }
+
+    #[test]
+    fn the_grant_is_audited_before_the_store_write_and_an_audit_failure_denies() {
+        let h = harness();
+        h.audit.fail("granted_rule.add");
+        let outcome = approve_and_join(&h, "a.example");
+        match outcome {
+            EscalationOutcome::Denied { cause, reason, .. } => {
+                assert_eq!(cause, EscalationDenyCause::AuditFailure);
+                assert_eq!(reason, Some(PolicyDenyReason::AuditFailure));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Nothing was written: the record failed first.
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 0);
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+        assert_eq!(h.audit.last("escalation.denied")["cause"], "audit_failure");
+        // The prompt slot is free again.
+        let _next = h
+            .service
+            .join_or_create(request("p", "b.example", 1))
+            .unwrap();
+        assert_eq!(h.prompter.shown().len(), 2);
+
+        // A successful approval records the grant, then writes it.
+        let h = harness();
+        let seen = Arc::new(AtomicU64::new(u64::MAX));
+        let (audit_grants, observed) = (Arc::clone(&h.grants), Arc::clone(&seen));
+        h.audit.hook("granted_rule.add", move || {
+            observed.store(audit_grants.adds.load(Ordering::SeqCst), Ordering::SeqCst);
+        });
+        assert!(matches!(
+            approve_and_join(&h, "a.example"),
+            EscalationOutcome::Approved { .. }
+        ));
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "store written before audit");
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn registration_grant_is_audited_before_the_store_write() {
+        fn approval(h: &Harness) -> RegistrationApproval {
+            match approve_and_join_register(h) {
+                EscalationOutcome::RegistrationApproved(approval) => approval,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        fn approve_and_join_register(h: &Harness) -> EscalationOutcome {
+            let parked = park(
+                h.service
+                    .join_or_create(register("p", "r.example", 1))
+                    .unwrap(),
+            );
+            h.service
+                .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+            parked.join().unwrap()
+        }
+        let cred = || CredentialRef::with_default_domain(b"cred");
+
+        // The record fails: nothing is persisted.
+        let h = harness();
+        let approval_token = approval(&h);
+        h.audit.fail("granted_rule.add");
+        assert!(
+            h.service
+                .record_registration_grant(&approval_token, cred(), 64)
+                .is_err()
+        );
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 0);
+        assert_eq!(h.audit.last("escalation.denied")["cause"], "audit_failure");
+
+        // The write fails: the record precedes the deny.
+        let h = harness();
+        let approval_token = approval(&h);
+        h.grants.fail_writes.store(true, Ordering::SeqCst);
+        assert!(
+            h.service
+                .record_registration_grant(&approval_token, cred(), 64)
+                .is_err()
+        );
+        let kinds = h.audit.kinds();
+        let position = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+        assert!(position("granted_rule.add") < position("escalation.denied"));
+        assert_eq!(
+            h.audit.last("escalation.denied")["cause"],
+            "grant_write_failed"
+        );
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reload_between_the_grant_audit_and_the_store_write_stands() {
+        let h = harness();
+        h.audit.hook("granted_rule.add", cancel_on(&h));
+        let outcome = approve_and_join(&h, "a.example");
+        assert!(matches!(outcome, EscalationOutcome::Revoked { .. }));
+        // The re-check under the mutex saw the revocation: no write, nothing to compensate.
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 0);
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+        assert_eq!(h.audit.count("escalation.revoked"), 1);
+        assert_eq!(h.audit.count("granted_rule.revoke"), 0);
+        assert_eq!(
+            h.service.state_of(&request("p", "a.example", 1).key()),
+            None
+        );
+        // The profile prompts again.
+        let _again = h
+            .service
+            .join_or_create(request("p", "a.example", 1))
+            .unwrap();
+        assert_eq!(h.prompter.shown().len(), 2);
+    }
+
+    #[test]
+    fn a_reload_after_the_store_write_revokes_the_grant_again() {
+        let h = harness();
+        *h.grants.after_add.lock().unwrap() = Some(Arc::new(cancel_on(&h)));
+        let outcome = approve_and_join(&h, "a.example");
+        assert!(matches!(outcome, EscalationOutcome::Revoked { .. }));
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 1);
+        // The compensation removed the grant and audited it.
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+        let revoked = h.audit.last("granted_rule.revoke");
+        assert_eq!(revoked["rp_id"], "a.example");
+        assert_eq!(revoked["revoked"], 1);
+        assert_eq!(h.audit.count("escalation.revoked"), 1);
+        assert_eq!(
+            h.service.state_of(&request("p", "a.example", 1).key()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_registration_approval_cancelled_while_deciding_stands_cancelled() {
+        let h = harness();
+        h.audit.hook("escalation.approved", cancel_on(&h));
+        let parked = park(
+            h.service
+                .join_or_create(register("p", "r.example", 1))
+                .unwrap(),
+        );
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        assert!(matches!(
+            parked.join().unwrap(),
+            EscalationOutcome::Revoked { .. }
+        ));
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 0);
+    }
+
+    /// Run an approval that panics; it must leave the entry denied and the slot free.
+    fn assert_panicking_approval_denies(h: &Harness, cause: EscalationDenyCause) {
+        let parked = park(
+            h.service
+                .join_or_create(request("p", "a.example", 1))
+                .unwrap(),
+        );
+        let ticket = h.prompter.last_shown();
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            h.service.prompt_event(&ticket, PromptEvent::Approved);
+        }));
+        assert!(panicked.is_err(), "the injected panic must propagate");
+        assert_denied(parked.join().unwrap(), cause);
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+        assert_eq!(
+            h.service.state_of(&request("p", "a.example", 1).key()),
+            None
+        );
+        // The profile's prompt slot is not jammed.
+        let _next = h
+            .service
+            .join_or_create(request("p", "b.example", 1))
+            .unwrap();
+        assert_eq!(h.prompter.shown().len(), 2);
+    }
+
+    #[test]
+    fn a_panicking_audit_does_not_jam_the_profile() {
+        let h = harness();
+        h.audit.panic_on("escalation.approved");
+        assert_panicking_approval_denies(&h, EscalationDenyCause::AuditFailure);
+        assert_eq!(h.audit.last("escalation.denied")["cause"], "audit_failure");
+
+        let h = harness();
+        h.audit.panic_on("granted_rule.add");
+        assert_panicking_approval_denies(&h, EscalationDenyCause::AuditFailure);
+        assert_eq!(h.grants.adds.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_panicking_store_does_not_jam_the_profile() {
+        let h = harness();
+        h.grants.panic_writes.store(true, Ordering::SeqCst);
+        assert_panicking_approval_denies(&h, EscalationDenyCause::GrantWriteFailed);
+        assert_eq!(
+            h.audit.last("escalation.denied")["cause"],
+            "grant_write_failed"
+        );
+    }
+
+    #[test]
+    fn a_second_panic_in_the_guard_is_contained() {
+        // The audit panics on the approval and again on the denial: the entry is still finished.
+        let h = harness();
+        h.audit.panic_on("escalation.approved");
+        h.audit.panic_on("escalation.denied");
+        assert_panicking_approval_denies(&h, EscalationDenyCause::AuditFailure);
+        assert_eq!(h.audit.count("escalation.denied"), 0);
     }
 
     #[test]
@@ -2584,5 +3087,107 @@ mod tests {
         assert!(event["escalation_id"].as_str().unwrap().starts_with("esc-"));
         let parsed: AuditEvent = serde_json::from_value(event).unwrap();
         assert_eq!(parsed.kind_name(), "escalation.requested");
+    }
+    fn key(index: usize) -> EscalationKey {
+        EscalationKey {
+            profile: profile("p"),
+            rp_id: format!("{index}.example"),
+            action: CeremonyAction::Authenticate,
+        }
+    }
+
+    fn at(ms: u64) -> MonotonicTime {
+        MonotonicTime::from_millis(ms)
+    }
+
+    #[test]
+    fn cooldown_map_prunes_expired_entries_on_every_insert_and_is_capped() {
+        let mut inner = Inner::default();
+        let cooldown = Duration::from_secs(10);
+        inner.start_cooldown(&key(0), at(1_000), cooldown);
+        inner.start_cooldown(&key(1), at(2_000), cooldown);
+        assert_eq!(inner.cooldown.len(), 2);
+        // The first two expired and are never looked up again; the next insert drops them.
+        inner.start_cooldown(&key(2), at(60_000), cooldown);
+        assert_eq!(inner.cooldown.len(), 1);
+        assert!(inner.cooldown.contains_key(&key(2)));
+
+        // Past the cap the oldest cooldown goes; a refresh of a present key evicts nothing.
+        let long = Duration::from_secs(3_600);
+        let mut inner = Inner::default();
+        for index in 0..MAX_TRACKED_KEYS {
+            inner.start_cooldown(&key(index), at(1_000 + index as u64), long);
+        }
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        inner.start_cooldown(&key(MAX_TRACKED_KEYS - 1), at(9_000), long);
+        assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        assert!(inner.cooldown.contains_key(&key(0)));
+        for index in MAX_TRACKED_KEYS..MAX_TRACKED_KEYS + 10 {
+            inner.start_cooldown(&key(index), at(10_000 + index as u64), long);
+            assert_eq!(inner.cooldown.len(), MAX_TRACKED_KEYS);
+        }
+        assert!(!inner.cooldown.contains_key(&key(0)));
+        assert!(!inner.cooldown.contains_key(&key(9)));
+        assert!(inner.cooldown.contains_key(&key(10)));
+        assert!(inner.cooldown.contains_key(&key(MAX_TRACKED_KEYS + 9)));
+        // An expired entry is dropped before a live one is evicted.
+        inner.start_cooldown(&key(99_999), at(10_000_000 + 3_600_000), long);
+        assert_eq!(inner.cooldown.len(), 1);
+    }
+
+    #[test]
+    fn withdrawal_map_prunes_expired_entries_on_every_insert_and_is_capped() {
+        let cooldown = Duration::from_secs(600);
+        let window = WITHDRAWAL_WINDOW.as_millis() as u64;
+        let mut inner = Inner::default();
+        inner.record_withdrawal(&key(0), at(1_000), cooldown);
+        inner.record_withdrawal(&key(1), at(2_000), cooldown);
+        assert_eq!(inner.withdrawals.len(), 2);
+        // Both left the window without being touched again; another key's insert drops them.
+        inner.record_withdrawal(&key(2), at(2_000 + window), cooldown);
+        assert_eq!(inner.withdrawals.len(), 1);
+        assert!(inner.withdrawals.contains_key(&key(2)));
+
+        let mut inner = Inner::default();
+        for index in 0..MAX_TRACKED_KEYS + 10 {
+            inner.record_withdrawal(&key(index), at(1_000 + index as u64), cooldown);
+            assert!(inner.withdrawals.len() <= MAX_TRACKED_KEYS);
+        }
+        assert_eq!(inner.withdrawals.len(), MAX_TRACKED_KEYS);
+        assert!(!inner.withdrawals.contains_key(&key(0)));
+        assert!(inner.withdrawals.contains_key(&key(10)));
+        assert!(inner.withdrawals.contains_key(&key(MAX_TRACKED_KEYS + 9)));
+        // The V-M2 count of a tracked key still reaches its cooldown.
+        let tracked = key(MAX_TRACKED_KEYS + 9);
+        inner.record_withdrawal(&tracked, at(100_000), cooldown);
+        inner.record_withdrawal(&tracked, at(100_001), cooldown);
+        assert!(inner.in_cooldown(&tracked, at(100_002)));
+    }
+
+    #[test]
+    fn session_expiry_is_reported_by_still_valid_without_a_cooldown() {
+        let h = harness();
+        let waiter = h
+            .service
+            .join_or_create(request("p", "a.example", 1))
+            .unwrap();
+        let started = Instant::now();
+        // A deadline far away: the session going invalid after a moment ends the wait.
+        let outcome = waiter.wait(
+            far(),
+            &|| false,
+            &|| started.elapsed() < Duration::from_millis(300),
+            &mut NoPark,
+        );
+        assert!(matches!(outcome, EscalationOutcome::SessionInvalid));
+        assert_eq!(h.audit.last("escalation.expired")["reason"], "aborted");
+        assert_eq!(h.audit.count("escalation.denied"), 0);
+        assert!(!h.service.in_cooldown(&request("p", "a.example", 1).key()));
+        // The key can be escalated at once again.
+        let _again = h
+            .service
+            .join_or_create(request("p", "a.example", 1))
+            .unwrap();
+        assert_eq!(h.prompter.shown().len(), 2);
     }
 }

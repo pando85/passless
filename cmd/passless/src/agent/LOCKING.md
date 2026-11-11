@@ -154,9 +154,16 @@ twice, never together: once to check the cooldown, once to admit the request. Th
 `escalation.requested` record (90) is written with nothing held. A waiter parks on the escalation
 condvar holding nothing else. A prompt report runs on the profile's prompt driver thread, which
 holds no lock: the approval takes the escalation mutex to move the entry to `Deciding`, releases
-it, records `escalation.approved` (90), persists the grant (`GrantedRulesStore::add`: writer 64,
-then view 71; the grant epoch is an atomic), and takes the escalation mutex again to publish the
-outcome. Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
+it, records `escalation.approved` and `granted_rule.add` (90, the latter before the store write),
+takes the escalation mutex once more only to check that the entry is still `Deciding` (a reload or
+a grant clear may have cancelled it; the mutex is released before the write), persists the grant
+(`GrantedRulesStore::add`: writer 64, then view 71; the grant epoch is an atomic), and takes the
+escalation mutex again to publish the outcome. If the entry was cancelled in between, the grant
+is revoked again after the mutex is released (`GrantedRulesStore::revoke_request`: writer 64, then
+view 71; the revocation epoch is bumped after the writer is released) and `granted_rule.revoke` is
+recorded (90). A panic anywhere in the approval finishes the entry as denied from a drop guard
+(escalation mutex, then the audit gate, one at a time). The cooldown and withdrawal maps are
+pruned on every insert and capped at 4096 entries each, under the same mutex. Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
 is released. A reload that changed the policy calls `cancel_profile` after the configuration
 lock (45) and `reload_lock` (68) are released: it takes the escalation mutex (80) and then
 withdraws the prompts (82).

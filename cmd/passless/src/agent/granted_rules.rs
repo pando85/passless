@@ -409,6 +409,37 @@ impl GrantedRulesStore {
         })
     }
 
+    /// Remove the granted rules the escalation `request_id` persisted, then bump the revocation
+    /// epoch. This is the compensation of an approval that a reload or a clear overtook while the
+    /// grant was being written (ADR 0014 section 8): it never touches another escalation's grant.
+    /// [`GrantStoreError::NotFound`] when this escalation persisted nothing.
+    pub fn revoke_request(
+        &self,
+        policy: &PolicyRuntime,
+        profile: &ProfileId,
+        request_id: &str,
+    ) -> Result<RevokeOutcome, GrantStoreError> {
+        let revoked = {
+            let _writer = self.lock_writer(profile)?;
+            let rules = self.enabled_rules(profile)?;
+            let before = rules.len();
+            let kept: Vec<_> = rules
+                .into_iter()
+                .filter(|rule| rule.request_id != request_id)
+                .collect();
+            let revoked = before - kept.len();
+            if revoked == 0 {
+                return Err(GrantStoreError::NotFound);
+            }
+            self.persist_and_swap(profile, kept)?;
+            revoked
+        };
+        Ok(RevokeOutcome {
+            revoked,
+            revocation_epoch: policy.bump_revocation_epoch(),
+        })
+    }
+
     /// Remove every granted rule of `profile`, then bump the revocation epoch when anything was
     /// removed. The caller revokes the stale sessions.
     pub fn clear(
@@ -1218,6 +1249,33 @@ rule = "exact"
         let outcome = store.clear(&policy, &profile()).unwrap();
         assert_eq!(outcome.revoked, 0);
         assert_eq!(policy.revocation_epoch(), revocation_epoch + 2);
+    }
+
+    #[test]
+    fn revoke_request_removes_only_that_escalations_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let store = open(tmp.path());
+        store
+            .add(&policy, &profile(), escalation("example.com"), 64)
+            .unwrap();
+        let mut other = escalation("other.example");
+        other.request_id = "esc-2".to_string();
+        store.add(&policy, &profile(), other, 64).unwrap();
+        let revocation_epoch = policy.revocation_epoch();
+
+        assert_eq!(
+            store.revoke_request(&policy, &profile(), "esc-unknown"),
+            Err(GrantStoreError::NotFound)
+        );
+        assert_eq!(policy.revocation_epoch(), revocation_epoch);
+
+        let outcome = store.revoke_request(&policy, &profile(), "esc-1").unwrap();
+        assert_eq!(outcome.revoked, 1);
+        assert_eq!(policy.revocation_epoch(), revocation_epoch + 1);
+        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(store.is_granted(&profile(), "other.example"));
+        assert!(!open(tmp.path()).is_granted(&profile(), "example.com"));
     }
 
     #[test]
