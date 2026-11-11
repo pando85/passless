@@ -518,19 +518,19 @@ test_agent_ceremonies_uses_intents() {
     fi
 }
 
-test_agent_ceremonies_uses_delegation() {
-    log_test "agent-ceremonies uses delegation grants for same-user flow"
+test_agent_ceremonies_has_no_delegation() {
+    log_test "principal driver no longer uses the removed delegation protocol"
 
     if grep -q "delegation request" "${VALIDATION_DIR}/browser/principal-driver.sh"; then
-        log_pass "agent-ceremonies uses delegation request"
+        log_fail "principal-driver still uses delegation request"
     else
-        log_fail "agent-ceremonies does not use delegation request"
+        log_pass "principal-driver does not use delegation request"
     fi
 
     if grep -q "delegation wait" "${VALIDATION_DIR}/browser/principal-driver.sh"; then
-        log_pass "agent-ceremonies uses delegation wait"
+        log_fail "principal-driver still uses delegation wait"
     else
-        log_fail "agent-ceremonies does not use delegation wait"
+        log_pass "principal-driver does not use delegation wait"
     fi
 }
 
@@ -559,7 +559,7 @@ main() {
     test_browser_lease_requires_semantics
     test_agent_ceremonies_requires_explicit_config
     test_agent_ceremonies_uses_intents
-    test_agent_ceremonies_uses_delegation
+    test_agent_ceremonies_has_no_delegation
 
     echo "" >&2
     echo -e "${BLUE}Tests: $TEST_COUNT total, $PASS_COUNT passed, $FAIL_COUNT failed${NC}" >&2

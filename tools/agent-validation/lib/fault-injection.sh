@@ -18,7 +18,7 @@ AV_FAULT_RUST_CATEGORIES=(
     "audit-circuit-breaker;passless-rs;agent::audit::tests;test_circuit_breaker_permanent"
     "audit-rotation;passless-rs;agent::audit::tests;test_audit_gate_rotation,test_cross_segment_reopen,test_empty_rotated_segment_restart"
     "grant-races;passless-rs;agent::grant::tests;test_concurrent_claim_only_one_succeeds,agent::policy_engine::tests::test_concurrent_reloads_get_unique_monotonic_generations"
-    "policy-reload;passless-rs;agent::policy_engine::tests;test_unchanged_reload_keeps_session_grants_and_changed_reload_drops_them,test_reload_cancels_pending_requests"
+    "policy-reload;passless-rs;agent::policy_engine::tests;test_unchanged_reload_keeps_session_grants_and_changed_reload_drops_them"
     "browser-cleanup-quarantine;passless-rs;agent::browser::tests;test_quarantine_path_format,test_quarantine_path_unique,test_pid_mismatch_cleanup_quarantines"
     "protocol-ipc;passless-rs;agent::ipc::tests;test_malformed_message_rejected"
     "monotonic-clocks;passless-rs;agent::browser::tests;test_system_clock_monotonic,test_mock_clock_advance,test_mock_clock_set_offset,test_mock_clock_concurrent_advance"
