@@ -15,6 +15,10 @@ if (process.env.AGENT_E2E_NPX_LOG) {
   const redacted = argv.map(a => a.replace(/(Bearer )\S+/, '$1<redacted>'));
   fs.appendFileSync(process.env.AGENT_E2E_NPX_LOG, JSON.stringify(redacted) + '\n');
   // The first PATH entry the adapter gave this process (it forwards npx's own directory, so an nvm node is found).
+  // The adapter hands the bootstrap's bearer over in the environment, never in argv (which every local user can read
+  // through /proc): record the header with the bearer redacted, or null when the variable is absent.
+  const headers = process.env.PLAYWRIGHT_MCP_CDP_HEADERS;
+  fs.appendFileSync(`${process.env.AGENT_E2E_NPX_LOG}.headers`, JSON.stringify(headers === undefined ? null : headers.replace(/(Bearer )\S+/, '$1<redacted>')) + '\n');
   fs.appendFileSync(`${process.env.AGENT_E2E_NPX_LOG}.path`, `${(process.env.PATH || '').split(':')[0]}\n`);
 }
 

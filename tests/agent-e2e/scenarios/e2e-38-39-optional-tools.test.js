@@ -3,11 +3,11 @@
 // (SKIP-OPT, never a failure) when its tool is absent; when it is present it must log in with a passkey through the
 // managed browser's endpoint, from `passless agent browser`.
 //
-// - agent-browser: the `agent-browser` binary from AGENT_E2E_AGENT_BROWSER, then PATH, then tests/agent-e2e/node_modules/.bin.
+// - agent-browser: the `agent-browser` binary from AGENT_E2E_AGENT_BROWSER, then PATH, then tests/agent-e2e/node_modules/.bin and target/agent-e2e-cache/agent-browser/node_modules/.bin.
 //   Verified against agent-browser 0.42.0 (`agent-browser --cdp <url> open|eval|close`).
 // - browser-use: a Python that imports `browser_use` (AGENT_E2E_BROWSER_USE_PYTHON, else `python3`). Its API changes between
-//   releases; the driver below uses `Browser(cdp_url=...)` with `start()`, `new_page()` / `get_current_page()` and
-//   `evaluate()` (browser-use 0.7+). Not run on the machine this was written on (browser-use is not installed there).
+//   releases; the driver below targets browser-use 1.x (verified with 1.0.2; 1.0 removed `new_page()` and `evaluate()`).
+//   Install it into the harness cache with `python3 -m venv target/agent-e2e-cache/browser-use-venv` and its `pip install browser-use`.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -17,7 +17,13 @@ const { execFile, spawnSync } = require('node:child_process');
 const { scenario, assert, skipOptional } = require('../lib/scenario');
 const { assertVerifiedAssertion, assertAgentAllowed } = require('../lib/helpers');
 const { startAgentBrowser, authenticateFn } = require('../lib/adapters');
-const { HARNESS_ROOT } = require('../lib/paths');
+const { HARNESS_ROOT, REPO_ROOT } = require('../lib/paths');
+
+// Optional tools may live in the harness's own cache (never in the user's home): a venv with browser-use and an npm prefix
+// with agent-browser under target/agent-e2e-cache.
+const CACHE = path.join(REPO_ROOT, 'target', 'agent-e2e-cache');
+const CACHED_PYTHON = path.join(CACHE, 'browser-use-venv', 'bin', 'python');
+const CACHED_BIN_DIR = path.join(CACHE, 'agent-browser', 'node_modules', '.bin');
 
 const profiles = { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } };
 
@@ -34,7 +40,7 @@ function findOnPath(name, extraDirs = []) {
 }
 
 scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (local, optional)', ci: false }, async ctx => {
-  const python = process.env.AGENT_E2E_BROWSER_USE_PYTHON || findOnPath('python3');
+  const python = process.env.AGENT_E2E_BROWSER_USE_PYTHON || (fs.existsSync(CACHED_PYTHON) ? CACHED_PYTHON : findOnPath('python3'));
   if (!python) skipOptional('no python3');
   // Detection with the user's own site-packages (plain `python3 -c`, not `-I`, which ignores the user site) in a clean
   // environment; the run keeps the scenario's temp HOME and only points PYTHONUSERBASE at the real user base.
@@ -49,15 +55,20 @@ scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (
   const { url, agent } = await startAgentBrowser(stack, 'agent');
   try {
     const script = path.join(stack.env.dirs.work, 'browser_use_login.py');
+    // browser-use 1.0: `Browser(cdp_url=...).start()` attaches a browser-harness daemon to the endpoint and returns the
+    // environment (BU_NAME) the REPL worker gets; the agent then drives pages with the browser-harness helpers
+    // (new_tab / js / wait_for_load), exactly as browser-use's own REPL cells do.
     fs.writeFileSync(script, [
-      'import asyncio, json, sys',
+      'import asyncio, json, os, sys',
       'from browser_use import Browser',
       'async def main(cdp_url, page_url, fn):',
       '    browser = Browser(cdp_url=cdp_url)',
-      '    await browser.start()',
+      '    os.environ.update(await browser.start())',
       '    try:',
-      '        page = await browser.new_page(page_url)',
-      '        result = await page.evaluate(fn)',
+      '        from browser_harness import helpers as h',
+      '        h.new_tab(page_url)',
+      '        h.wait_for_load()',
+      '        result = h.js("(" + fn + ")()")',
       '        print("RESULT:" + (result if isinstance(result, str) else json.dumps(result)))',
       '    finally:',
       '        await browser.stop()',
@@ -73,7 +84,7 @@ scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (
 });
 
 scenario({ id: 'E2E-39', title: 'agent-browser --cdp with the endpoint from `agent browser` (local, optional)', ci: false }, async ctx => {
-  const bin = process.env.AGENT_E2E_AGENT_BROWSER || findOnPath('agent-browser', [path.join(HARNESS_ROOT, 'node_modules', '.bin')]);
+  const bin = process.env.AGENT_E2E_AGENT_BROWSER || findOnPath('agent-browser', [path.join(HARNESS_ROOT, 'node_modules', '.bin'), CACHED_BIN_DIR]);
   if (!bin) skipOptional('agent-browser is not installed (npm i -g agent-browser, or set AGENT_E2E_AGENT_BROWSER)');
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
   const rp = stack.rp.a;

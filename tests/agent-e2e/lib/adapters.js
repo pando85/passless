@@ -44,6 +44,8 @@ function startAdapter(stack, kind, { profile, flags = [], extra = [], defaultNpx
     client, kind, args, shimDir,
     /** Argv of every npx invocation of this run (bearer values redacted), oldest first. */
     npxCalls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []),
+    /** The `PLAYWRIGHT_MCP_CDP_HEADERS` value of every npx invocation (bearer redacted; null when the variable was absent). */
+    npxCdpHeaders: () => (fs.existsSync(`${log}.headers`) ? fs.readFileSync(`${log}.headers`, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []),
     /** The first PATH entry of every npx invocation (what the adapter forwarded). */
     npxPathHeads: () => (fs.existsSync(`${log}.path`) ? fs.readFileSync(`${log}.path`, 'utf8').split('\n').filter(Boolean) : []),
     close: () => client.close(),

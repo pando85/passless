@@ -8,7 +8,7 @@ const { extensionWorkerTargets } = require('../lib/browser');
 const profiles = { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } };
 
 // Catalogue E2E-34: Playwright MCP through `passless agent mcp playwright`: navigate, log in with a passkey. The adapter runs
-// `npx --yes @playwright/mcp --cdp-endpoint <bootstrap> --cdp-header 'Authorization: Bearer ...'`; the bootstrap starts the
+// `npx --yes @playwright/mcp --cdp-endpoint <bootstrap>` with `PLAYWRIGHT_MCP_CDP_HEADERS='Authorization: Bearer ...'` in its environment; the bootstrap starts the
 // managed browser lazily, on the first discovery request, which @playwright/mcp makes at its first browser tool call.
 scenario({ id: 'E2E-34', title: 'Playwright MCP via `agent mcp playwright`: navigate and log in with a passkey', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
@@ -34,14 +34,17 @@ scenario({ id: 'E2E-34', title: 'Playwright MCP via `agent mcp playwright`: navi
   await assertAgentAllowed(stack, { rpId: 'rp-a.test', n: 2 });
   assertNoNotification(stack);
 
-  // The adapter's command line: package, endpoint and bearer header (redacted by the shim).
+  // The adapter's command line: package, endpoint and bearer header (the bearer arrives in `PLAYWRIGHT_MCP_CDP_HEADERS`, redacted by the shim).
   const calls = mcp.npxCalls();
   assert.equal(calls.length, 1, JSON.stringify(calls));
   const [argv] = calls;
   assert.deepEqual(argv.slice(0, 2), ['--yes', '@playwright/mcp']);
   const at = flag => argv[argv.indexOf(flag) + 1];
   assert.match(at('--cdp-endpoint'), /^http:\/\/127\.0\.0\.1:\d+$/, 'the loopback discovery endpoint');
-  assert.equal(at('--cdp-header'), 'Authorization: Bearer <redacted>');
+  // The bearer is not in argv (readable by every local user through /proc): it goes in the environment.
+  assert.ok(!argv.includes('--cdp-header'), `the bearer must not be an argument: ${JSON.stringify(argv)}`);
+  assert.ok(!argv.some(a => /Bearer/i.test(a)), `no bearer in argv: ${JSON.stringify(argv)}`);
+  assert.deepEqual(mcp.npxCdpHeaders(), ['Authorization: Bearer <redacted>'], 'the bearer reached @playwright/mcp as PLAYWRIGHT_MCP_CDP_HEADERS');
 });
 
 // Catalogue E2E-35: Playwright MCP with `--isolated`: the MCP server creates a browser context of its own
