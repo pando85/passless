@@ -62,10 +62,10 @@ create_mock_passless_bin() {
     cat > "$bin_path" << 'MOCK_EOF'
 #!/bin/bash
 case "$*" in
-    *"agent-admin --output json session list --profile"*)
+    *"agent-admin --output json principals list --profile"*)
         echo '{"sessions":[{"session_id":"sess-001"}]}'
         ;;
-    *"agent-admin --output json delegation list --profile"*)
+    *"agent-admin --output json sessions list --profile"*)
         echo '{"grants":[{"grant_id":"grant-001"}]}'
         ;;
     *"agent-admin --output json profile check test-profile"*)
@@ -74,10 +74,10 @@ case "$*" in
     *"agent-admin --output json profile disable"*)
         echo '{"profile_id":"test-profile","enabled":false}'
         ;;
-    *"agent-admin --output json session revoke"*)
+    *"agent-admin --output json principals revoke"*)
         echo '{"revoked":true}'
         ;;
-    *"agent-admin --output json delegation revoke"*)
+    *"agent-admin --output json sessions revoke"*)
         echo '{"revoked":true}'
         ;;
     *"agent-admin --output json shutdown --confirm"*)
@@ -530,18 +530,18 @@ test_mock_passless_bin_uses_correct_argv() {
     mock_bin=$(create_mock_passless_bin)
 
     local output
-    output=$("$mock_bin" agent-admin --output json session list --profile test 2>/dev/null)
+    output=$("$mock_bin" agent-admin --output json principals list --profile test 2>/dev/null)
     if echo "$output" | jq -e '.sessions' &>/dev/null; then
-        log_pass "mock uses correct argv: agent-admin --output json session list --profile"
+        log_pass "mock uses correct argv: agent-admin --output json principals list --profile"
     else
         log_fail "mock argv incorrect"
     fi
 
-    output=$("$mock_bin" agent-admin --output json session revoke sess-001 --confirm 2>/dev/null)
+    output=$("$mock_bin" agent-admin --output json principals revoke sess-001 --confirm 2>/dev/null)
     if echo "$output" | jq -e '.revoked == true' &>/dev/null; then
-        log_pass "mock uses correct argv: session revoke SESSION_ID --confirm"
+        log_pass "mock uses correct argv: principals revoke SESSION_ID --confirm"
     else
-        log_fail "mock session revoke argv incorrect"
+        log_fail "mock principals revoke argv incorrect"
     fi
 
     output=$("$mock_bin" agent-admin --output json profile disable test-profile 2>/dev/null)

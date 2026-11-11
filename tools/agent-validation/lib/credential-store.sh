@@ -426,13 +426,13 @@ av_record_agent_state() {
 
     local session_json="[]"
     local session_output
-    if session_output=$("${cmd_prefix[@]}" "$passless_bin" agent-admin --output json session list --profile "$profile_id" 2>/dev/null); then
+    if session_output=$("${cmd_prefix[@]}" "$passless_bin" agent-admin --output json principals list --profile "$profile_id" 2>/dev/null); then
         session_json=$(printf '%s' "$session_output" | jq -c '.sessions // []' 2>/dev/null || echo "[]")
     fi
 
     local delegation_json="[]"
     local delegation_output
-    if delegation_output=$("${cmd_prefix[@]}" "$passless_bin" agent-admin --output json delegation list --profile "$profile_id" 2>/dev/null); then
+    if delegation_output=$("${cmd_prefix[@]}" "$passless_bin" agent-admin --output json sessions list --profile "$profile_id" 2>/dev/null); then
         delegation_json=$(printf '%s' "$delegation_output" | jq -c '.grants // []' 2>/dev/null || echo "[]")
     fi
 
@@ -538,10 +538,10 @@ av_revoke_agent_sessions() {
         if [[ -n "$session_ids" ]]; then
             while IFS= read -r sid; do
                 [[ -z "$sid" ]] && continue
-                if "${cmd_prefix[@]}" "$passless_bin" agent-admin --output json session revoke "$sid" --confirm >/dev/null 2>&1; then
+                if "${cmd_prefix[@]}" "$passless_bin" agent-admin --output json principals revoke "$sid" --confirm >/dev/null 2>&1; then
                     ((revoked_count++)) || true
                 else
-                    av_log_warn "session revoke failed for: $sid"
+                    av_log_warn "principals revoke failed for: $sid"
                     revoke_failed=true
                 fi
             done <<< "$session_ids"
@@ -553,10 +553,10 @@ av_revoke_agent_sessions() {
         if [[ -n "$grant_ids" ]]; then
             while IFS= read -r gid; do
                 [[ -z "$gid" ]] && continue
-                if "${cmd_prefix[@]}" "$passless_bin" agent-admin --output json delegation revoke "$gid" --confirm >/dev/null 2>&1; then
+                if "${cmd_prefix[@]}" "$passless_bin" agent-admin --output json sessions revoke "$gid" --confirm >/dev/null 2>&1; then
                     ((revoked_count++)) || true
                 else
-                    av_log_warn "delegation revoke failed for: $gid"
+                    av_log_warn "sessions revoke failed for: $gid"
                     revoke_failed=true
                 fi
             done <<< "$grant_ids"
