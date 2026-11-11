@@ -702,9 +702,13 @@ impl RegisterHandler {
         let _op_lock = lock_order::lock(&self.operation_lock, LockLevel::Operation);
         let mut storage = lock_order::lock(&self.credential_storage, LockLevel::Storage);
 
+        // The exclude list is matched within this RP only (WebAuthn section 5.4.4 scopes it to the
+        // RP): a credential ID that exists for another RP must not be revealed (review L8).
         for excluded_b64u in &req.exclude_credentials {
             if let Ok(excluded_id) = b64u_decode(excluded_b64u)
-                && storage.read(&excluded_id).is_ok()
+                && storage
+                    .read(&excluded_id)
+                    .is_ok_and(|existing| existing.rp.id.eq_ignore_ascii_case(normalized_rp))
             {
                 return Err(self.deny(
                     target,
@@ -1535,6 +1539,59 @@ mod tests {
         let err = result.unwrap_err();
         // WebAuthn `InvalidStateError` (ADR 0014 section 10.3).
         assert_eq!(err.code, ErrorCode::InvalidState);
+    }
+
+    /// Review L8: the exclude list is matched within the request's RP. A credential ID that
+    /// exists for another RP must not be revealed (the outcome is the same as for an unknown ID)
+    /// and must not block the registration.
+    #[test]
+    fn test_register_exclude_list_does_not_reveal_a_credential_of_another_rp() {
+        let f = RegisterTestFixture::new();
+        let other = soft_fido2::Credential {
+            id: vec![0xCD; 32],
+            rp: RelyingParty::new("other.example".into()),
+            user: User::new(vec![1, 2, 3]),
+            sign_count: 0,
+            alg: -7,
+            key: f.key_provider.generate(-7).unwrap().key,
+            created: 0,
+            discoverable: true,
+            backup_state: CredentialBackupState::NotEligible,
+            extensions: soft_fido2::Extensions::default(),
+        };
+        {
+            let mut storage = f.storage.lock().unwrap();
+            let cred_ref = soft_fido2::CredentialRef {
+                id: &other.id,
+                rp_id: &other.rp.id,
+                rp_name: other.rp.name.as_deref(),
+                user_id: &other.user.id,
+                user_name: other.user.name.as_deref(),
+                user_display_name: other.user.display_name.as_deref(),
+                sign_count: &other.sign_count,
+                alg: &other.alg,
+                key: &other.key,
+                created: &other.created,
+                discoverable: &other.discoverable,
+                cred_protect: other.extensions.cred_protect.as_ref(),
+                cred_random: None,
+                backup_state: &other.backup_state,
+            };
+            storage.write(cred_ref).unwrap();
+        }
+
+        let handler = f.make_handler();
+        let ctx = f.make_ctx();
+        let mut req = f.make_req();
+        assert_eq!(req.rp_id, "example.com");
+        req.exclude_credentials = vec![b64u_encode(&other.id)];
+
+        let result = handler.register(&ctx, &req);
+        assert!(
+            result.is_ok(),
+            "a credential of another RP in excludeCredentials must be ignored: {:?}",
+            result.err()
+        );
     }
 
     #[test]

@@ -224,10 +224,21 @@ pub struct BrowserManifest {
     pub ttl_monotonic_secs: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEndpointMetadata {
     pub socket_path: String,
     pub bearer_token: String,
+}
+
+/// The bearer authorizes ceremonies for its session, so it never reaches a log or a panic message
+/// through `{:?}` (ADR 0014 section 12: records never contain bearers).
+impl std::fmt::Debug for AgentEndpointMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentEndpointMetadata")
+            .field("socket_path", &self.socket_path)
+            .field("bearer_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7237,6 +7248,18 @@ mod tests {
                 serde_json::to_string(&super::super::transport::build_version()).unwrap()
             )
         );
+    }
+
+    #[test]
+    fn test_agent_endpoint_metadata_debug_redacts_the_bearer() {
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "s3cr3t-bearer-value".to_string(),
+        };
+        let shown = format!("{metadata:?} {metadata:#?}");
+        assert!(!shown.contains("s3cr3t-bearer-value"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+        assert!(shown.contains("/tmp/test/sock"));
     }
 
     #[test]
