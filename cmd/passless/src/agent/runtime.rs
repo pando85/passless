@@ -2620,16 +2620,12 @@ impl AgentRuntime {
                 super::lock_order::LockLevel::BrowserManager,
             );
             if let Some(false) = browser_mgr.lease_has_cdp_pipes(&lease_id) {
-                let endpoint_msg = browser_mgr
-                    .lease_cdp_endpoint(&lease_id)
-                    .flatten()
-                    .unwrap_or_else(|| "<endpoint not yet discovered>".to_string());
+                // The endpoint is not named here: it is handed out only by the bootstrap, which
+                // withholds it while the lease's interception is degraded (review L1).
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
-                    format!(
-                        "browser-control is unavailable in port mode; connect directly via CDP: {}",
-                        endpoint_msg
-                    ),
+                    "browser-control is unavailable in port mode; get the CDP endpoint from the \
+                     browser bootstrap",
                     RecommendedAction::FixRequest,
                 ));
             }

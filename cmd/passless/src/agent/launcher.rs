@@ -686,9 +686,9 @@ impl HardenedChildSetup {
 
     /// Pre-exec setup of a hardened child (a principal or a managed browser):
     ///
-    /// 1. for another user, every inherited descriptor except `preserved_fds` is marked
-    ///    close-on-exec (not closed: Rust's exec-error pipe must survive until exec, so that a
-    ///    failing step below, or the exec itself, reaches `Command::spawn`);
+    /// 1. every inherited descriptor except `preserved_fds` is marked close-on-exec, for the same
+    ///    user too (not closed: Rust's exec-error pipe must survive until exec, so that a failing
+    ///    step below, or the exec itself, reaches `Command::spawn`);
     /// 2. `setsid`;
     /// 3. for another user, `setgroups(0)`, `setgid`, `setuid`, irreversibly;
     /// 4. `PR_SET_PDEATHSIG(SIGTERM)` when `bind_parent_death`, **after** the credential change,
@@ -707,9 +707,7 @@ impl HardenedChildSetup {
         preserved_fds: &[RawFd],
         parent: libc::pid_t,
     ) -> Result<(), io::Error> {
-        if !self.same_user() {
-            unsafe { cloexec_except(preserved_fds)? };
-        }
+        unsafe { cloexec_except(preserved_fds)? };
 
         if unsafe { libc::setsid() } < 0 {
             return Err(io::Error::last_os_error());
@@ -2928,6 +2926,26 @@ mod tests {
         }
         let status = command.status().expect("the real parent passes the check");
         assert!(status.success());
+    }
+
+    /// Review L2: a same-user child does not inherit the daemon's descriptors either.
+    #[test]
+    fn a_same_user_hardened_child_inherits_no_daemon_descriptor() {
+        let leaked = fs::File::open("/dev/null").unwrap();
+        let fd = leaked.as_raw_fd();
+        assert!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } >= 0);
+        let setup = same_user_setup(false);
+        let parent = std::process::id() as libc::pid_t;
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &format!("! test -e /proc/self/fd/{fd}")])
+            .stdin(Stdio::null());
+        // SAFETY: `apply` is async-signal-safe and runs pre-exec.
+        unsafe {
+            command.pre_exec(move || setup.apply(&[0, 1, 2], parent));
+        }
+        assert!(command.status().unwrap().success(), "fd {fd} was inherited");
+        drop(leaked);
     }
 
     #[test]

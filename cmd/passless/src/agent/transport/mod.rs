@@ -271,24 +271,31 @@ impl SignTransportServer {
                 blocking.display()
             ));
         }
-        let uid_dir = sign_dir.join(uid.to_string());
-        match std::fs::create_dir(&uid_dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let meta = std::fs::symlink_metadata(&uid_dir)
-                    .map_err(|e| format!("inspect {}: {e}", uid_dir.display()))?;
-                if !meta.is_dir() {
-                    return Err(format!("{} is not a directory", uid_dir.display()));
-                }
-            }
-            Err(e) => return Err(format!("create {}: {e}", uid_dir.display())),
+        // A directory left by an earlier run belongs to the browser user, who could have planted
+        // a symlink in it: remove it (never following anything) and create a fresh one that stays
+        // the daemon's until the socket in it is bound, chmodded and chowned; the directory is
+        // handed to the browser user last (review H1).
+        let name = uid.to_string();
+        let uid_dir = sign_dir.join(&name);
+        match std::fs::symlink_metadata(&uid_dir) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&uid_dir)
+                .map_err(|e| format!("remove stale {}: {e}", uid_dir.display()))?,
+            Ok(_) => std::fs::remove_file(&uid_dir)
+                .map_err(|e| format!("remove stale {}: {e}", uid_dir.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("inspect {}: {e}", uid_dir.display())),
         }
-        chown(&uid_dir, uid, gid)?;
-        std::fs::set_permissions(&uid_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("set {} permissions: {e}", uid_dir.display()))?;
+        let sign = crate::agent::safe_fs::Dir::open_path(&sign_dir)
+            .map_err(|e| format!("open {}: {e}", sign_dir.display()))?;
+        let pinned = sign
+            .create_dir(&name, 0o700)
+            .map_err(|e| format!("create {}: {e}", uid_dir.display()))?;
         let socket_path = uid_dir.join("sock");
         let listener = bind_socket(&socket_path)?;
         chown(&socket_path, uid, gid)?;
+        pinned
+            .chown(uid, gid)
+            .map_err(|e| format!("chown {} to {uid}:{gid}: {e}", uid_dir.display()))?;
         self.listeners.push((listener, socket_path.clone()));
         Ok(socket_path)
     }

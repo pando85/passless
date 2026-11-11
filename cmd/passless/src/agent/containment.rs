@@ -9,16 +9,20 @@
 //! - whenever `bwrap` works for the browser's user (it is installed and unprivileged user
 //!   namespaces are available), the managed browser runs in a private `/dev` that has no
 //!   `hidraw*` and no `uhid`: `bwrap --dev-bind / / --dev /dev --die-with-parent <browser> ...`;
-//! - otherwise the launch-time check `faccessat(AT_EACCESS, R_OK | W_OK)` over every
+//! - otherwise the launch-time check `faccessat2(AT_EACCESS, R_OK | W_OK)` over every
 //!   `/dev/hidraw*` runs in the child that will exec the browser, after the credential drop, so it
-//!   is evaluated as the browser's UID and groups; if any node is accessible the child refuses to
-//!   exec and the launch fails with an actionable error.
+//!   is evaluated as the browser's UID and groups, ACLs included. The child lists `/dev` itself
+//!   (`getdents64` into a stack buffer). If any node is accessible, or the check cannot be made
+//!   (`/dev` unreadable, `faccessat2` missing, an unexpected error), the child refuses to exec and
+//!   the launch fails with an actionable error (fail closed).
 //!
 //! [`assess`] reports which case applies (required and in place, in place as defence in depth,
 //! not required, refused) for `passless doctor`.
 //!
-//! Side effects of the private `/dev` (spike Q8, `tests/agent-e2e/spikes/RESULTS-env.md`):
-//! supplementary groups are dropped inside the namespace and the UID is unchanged; the host
+//! Side effects of the private `/dev` (spike Q8, `tests/agent-e2e/spikes/RESULTS-env.md`): the UID
+//! is unchanged, and supplementary groups are not dropped: an unprivileged user namespace maps only
+//! the user's own UID and GID, so the others show as the overflow GID 65534 but stay effective for
+//! permission checks (which is why the private `/dev`, not the groups, keeps hidraw out); the host
 //! `/dev/shm` is replaced by a private one (bound through when a path the browser needs lives
 //! there); `/dev/dri` is hidden, so the browser renders without the GPU; the X and Wayland sockets
 //! stay reachable through `--dev-bind / /`. A hidraw node that appears after launch never appears
@@ -45,6 +49,9 @@ pub const BWRAP_PRIVATE_DEV_ARGS: [&str; 6] =
 /// The errno with which the pre-exec hidraw check fails when the browser's UID can open a hidraw
 /// node. No other pre-exec step or `execve` returns it, so the spawn error identifies the refusal.
 pub(crate) const HIDRAW_ACCESSIBLE_ERRNO: i32 = libc::ENOTUNIQ;
+/// The errno with which the pre-exec hidraw check fails when it cannot tell (fail closed): `/dev`
+/// cannot be listed, `faccessat2` is unavailable (Linux before 5.8), or it fails unexpectedly.
+pub(crate) const HIDRAW_UNVERIFIABLE_ERRNO: i32 = libc::EREMCHG;
 
 /// How long the `bwrap` usability probe may take.
 const BWRAP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -136,8 +143,10 @@ impl ContainmentPolicy {
     }
 }
 
-/// `bwrap` from the well-known locations, then the daemon's `PATH`. A root daemon accepts only a
-/// root-owned binary that neither group nor others can write.
+/// `bwrap` from the well-known locations, then the daemon's `PATH`. The candidate is
+/// canonicalized, and the binary and every directory on its canonical path must be owned by root
+/// or the daemon's user (root only, for a root daemon) and writable by neither group nor others, so
+/// nobody else can replace what the daemon will run as the browser's containment.
 pub fn find_bwrap(daemon_uid: u32) -> Result<PathBuf, String> {
     if cfg!(debug_assertions) && std::env::var_os(DISABLE_BWRAP_ENV).is_some() {
         return Err(format!(
@@ -155,64 +164,170 @@ pub fn find_bwrap(daemon_uid: u32) -> Result<PathBuf, String> {
     );
     let mut rejected = Vec::new();
     for candidate in candidates {
-        let Ok(meta) = fs::metadata(&candidate) else {
+        let Ok(canonical) = fs::canonicalize(&candidate) else {
+            continue;
+        };
+        let Ok(meta) = fs::metadata(&canonical) else {
             continue;
         };
         if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
             continue;
         }
-        if daemon_uid == 0 && (meta.uid() != 0 || meta.mode() & 0o022 != 0) {
-            rejected.push(candidate.display().to_string());
-            continue;
+        match trusted_path(&canonical, daemon_uid) {
+            Ok(()) => return Ok(canonical),
+            Err(why) => rejected.push(why),
         }
-        return Ok(candidate);
     }
     if rejected.is_empty() {
         Err("bwrap (bubblewrap) is not installed".to_string())
     } else {
-        Err(format!(
-            "bwrap at {} is not root-owned or is writable by others",
-            rejected.join(", ")
-        ))
+        Err(format!("no trusted bwrap: {}", rejected.join("; ")))
     }
 }
 
-/// The hidraw device nodes under `dev_dir`, as C strings built before any fork.
-fn hidraw_nodes(dev_dir: &Path) -> Vec<CString> {
-    let Ok(entries) = fs::read_dir(dev_dir) else {
-        return Vec::new();
-    };
-    let mut nodes: Vec<CString> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().as_bytes().starts_with(b"hidraw"))
-        .filter_map(|entry| CString::new(entry.path().as_os_str().as_bytes()).ok())
-        .collect();
-    nodes.sort();
-    nodes
-}
-
-/// Fail with [`HIDRAW_ACCESSIBLE_ERRNO`] if this process, with its effective IDs and groups,
-/// could open any of `nodes` for reading and writing. Async-signal-safe; allocates nothing.
-///
-/// # Safety
-///
-/// `nodes` must stay valid; safe to call in a forked child before `exec`.
-pub(crate) unsafe fn refuse_if_hidraw_accessible(nodes: &[CString]) -> Result<(), io::Error> {
-    for node in nodes {
-        // SAFETY: `node` is a valid NUL-terminated path.
-        let ret = unsafe {
-            libc::faccessat(
-                libc::AT_FDCWD,
-                node.as_ptr(),
-                libc::R_OK | libc::W_OK,
-                libc::AT_EACCESS,
-            )
-        };
-        if ret == 0 {
-            return Err(io::Error::from_raw_os_error(HIDRAW_ACCESSIBLE_ERRNO));
+/// Every component of the canonical `path`, the file included, is owned by root or `daemon_uid`
+/// (root only when `daemon_uid` is 0) and writable by neither group nor others.
+fn trusted_path(path: &Path, daemon_uid: u32) -> Result<(), String> {
+    for component in path.ancestors() {
+        let meta = fs::symlink_metadata(component)
+            .map_err(|e| format!("inspect {}: {e}", component.display()))?;
+        let owner_ok = meta.uid() == 0 || meta.uid() == daemon_uid;
+        if !owner_ok || meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is owned by uid {} with mode {:o}, so another user could replace {}",
+                component.display(),
+                meta.uid(),
+                meta.mode() & 0o7777,
+                path.display()
+            ));
         }
     }
     Ok(())
+}
+
+/// The hidraw device nodes under `dev_dir`, for messages only (the check itself lists the
+/// directory in the child, see [`refuse_if_hidraw_accessible`]).
+fn hidraw_node_names(dev_dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(dev_dir) else {
+        return format!("{} is not readable", dev_dir.display());
+    };
+    let mut nodes: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().as_bytes().starts_with(b"hidraw"))
+        .map(|entry| entry.path().display().to_string())
+        .collect();
+    nodes.sort();
+    nodes.join(", ")
+}
+
+/// What one `faccessat2` failure means for the browser: the node cannot be opened for reading
+/// and writing (`EACCES`: mode bits or ACL; `ENOENT`: gone, or a dangling symlink; `EROFS`:
+/// read-only file system; `EPERM`: write access to an immutable inode, or an LSM denial, either of
+/// which also fails the browser's `open(O_RDWR)`), or the check is inconclusive (anything else, in
+/// particular `ENOSYS`: no `faccessat2` before Linux 5.8, whose `faccessat` fallback in libc would
+/// ignore ACLs).
+fn access_error_means_inaccessible(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::EACCES | libc::ENOENT | libc::EROFS | libc::EPERM
+    )
+}
+
+/// A `getdents64` buffer on the stack, aligned for `linux_dirent64`.
+#[repr(C, align(8))]
+struct DirentBuffer([u8; 4096]);
+
+/// Fail with [`HIDRAW_ACCESSIBLE_ERRNO`] if this process, with its effective IDs and groups, could
+/// open any `hidraw*` entry of `dev_dir` for reading and writing (`faccessat2(AT_EACCESS)`, so
+/// ACLs count), and with [`HIDRAW_UNVERIFIABLE_ERRNO`] if that cannot be decided. It lists the
+/// directory itself with `getdents64` into a stack buffer: async-signal-safe, allocates nothing, so
+/// it runs in the forked child after the credential drop and sees the nodes present at exec time.
+///
+/// # Safety
+///
+/// Safe to call in a forked child before `exec`; `dev_dir` must stay valid.
+pub(crate) unsafe fn refuse_if_hidraw_accessible(
+    dev_dir: &std::ffi::CStr,
+) -> Result<(), io::Error> {
+    let unverifiable = || Err(io::Error::from_raw_os_error(HIDRAW_UNVERIFIABLE_ERRNO));
+    // SAFETY: plain syscalls on a descriptor this function owns; the buffer outlives every use.
+    unsafe {
+        let dirfd = libc::open(
+            dev_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if dirfd < 0 {
+            return unverifiable();
+        }
+        let mut buf = DirentBuffer([0; 4096]);
+        let result = loop {
+            let n = libc::syscall(libc::SYS_getdents64, dirfd, buf.0.as_mut_ptr(), buf.0.len());
+            if n < 0 {
+                break unverifiable();
+            }
+            if n == 0 {
+                break Ok(());
+            }
+            let mut offset = 0usize;
+            let mut verdict = None;
+            while offset < n as usize {
+                // linux_dirent64: d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name[].
+                let entry = buf.0.as_ptr().add(offset);
+                let reclen = u16::from_ne_bytes([*entry.add(16), *entry.add(17)]) as usize;
+                if reclen == 0 {
+                    verdict = Some(unverifiable());
+                    break;
+                }
+                if reclen < 19 || offset + reclen > n as usize {
+                    verdict = Some(unverifiable());
+                    break;
+                }
+                let name = entry.add(19);
+                // A name of at least "hidraw" plus its NUL fits in the record, so the six bytes
+                // compared are inside it; a shorter name differs at its NUL.
+                let is_hidraw = reclen >= 19 + 7 && (0..6).all(|k| *name.add(k) == b"hidraw"[k]);
+                if is_hidraw {
+                    let ret = libc::syscall(
+                        libc::SYS_faccessat2,
+                        dirfd,
+                        name as *const libc::c_char,
+                        libc::R_OK | libc::W_OK,
+                        libc::AT_EACCESS,
+                    );
+                    if ret == 0 {
+                        verdict = Some(Err(io::Error::from_raw_os_error(HIDRAW_ACCESSIBLE_ERRNO)));
+                        break;
+                    }
+                    let errno = *libc::__errno_location();
+                    if !access_error_means_inaccessible(errno) {
+                        verdict = Some(unverifiable());
+                        break;
+                    }
+                }
+                offset += reclen;
+            }
+            if let Some(verdict) = verdict {
+                break verdict;
+            }
+        };
+        libc::close(dirfd);
+        result
+    }
+}
+
+/// Whether this process can open a hidraw node of `dev_dir`: `Some(true)` or `Some(false)`, or
+/// `None` when the check is inconclusive.
+fn hidraw_accessible_here(dev_dir: &std::ffi::CStr) -> Option<bool> {
+    // SAFETY: plain syscalls in this process.
+    match unsafe { refuse_if_hidraw_accessible(dev_dir) } {
+        Ok(()) => Some(false),
+        Err(e) if e.raw_os_error() == Some(HIDRAW_ACCESSIBLE_ERRNO) => Some(true),
+        Err(_) => None,
+    }
+}
+
+fn dev_dir_cstring(dev_dir: &Path) -> CString {
+    CString::new(dev_dir.as_os_str().as_bytes()).unwrap_or_else(|_| c"/dev".to_owned())
 }
 
 /// Wait up to `timeout` for `child`; kill it if it is still running then.
@@ -286,8 +401,11 @@ pub struct ContainmentPlan {
     bwrap: Option<PathBuf>,
     /// Bind the host `/dev/shm` into the private `/dev` (a path the browser needs lives there).
     bind_dev_shm: bool,
-    /// Without `bwrap`: the hidraw nodes the child checks before it execs the browser.
-    hidraw_nodes: Vec<CString>,
+    /// Without `bwrap`: the directory whose `hidraw*` nodes the child checks before it execs the
+    /// browser (`/dev`).
+    check_dev_dir: Option<CString>,
+    /// The device directory, for messages.
+    dev_dir: PathBuf,
     /// Without `bwrap`: why it is unavailable.
     unavailable: Option<String>,
     /// The browser's UID, for messages.
@@ -311,7 +429,8 @@ impl ContainmentPlan {
             return Self {
                 bwrap: None,
                 bind_dev_shm: false,
-                hidraw_nodes: Vec::new(),
+                check_dev_dir: None,
+                dev_dir: policy.dev_dir(),
                 unavailable: None,
                 browser_uid: setup.target_uid,
                 off: true,
@@ -325,7 +444,8 @@ impl ContainmentPlan {
             Ok(bwrap) => Self {
                 bwrap: Some(bwrap),
                 bind_dev_shm: needs_dev_shm,
-                hidraw_nodes: Vec::new(),
+                check_dev_dir: None,
+                dev_dir: policy.dev_dir(),
                 unavailable: None,
                 browser_uid: setup.target_uid,
                 off: false,
@@ -333,7 +453,8 @@ impl ContainmentPlan {
             Err(why) => Self {
                 bwrap: None,
                 bind_dev_shm: false,
-                hidraw_nodes: hidraw_nodes(&policy.dev_dir()),
+                check_dev_dir: Some(dev_dir_cstring(&policy.dev_dir())),
+                dev_dir: policy.dev_dir(),
                 unavailable: Some(why),
                 browser_uid: setup.target_uid,
                 off: false,
@@ -346,10 +467,16 @@ impl ContainmentPlan {
         self.bwrap.is_some()
     }
 
-    /// The hidraw nodes the child must find inaccessible before it execs the browser (none when
-    /// the browser runs in a private `/dev`). Built before the fork; the child only reads them.
-    pub fn hidraw_nodes_to_check(&self) -> &[CString] {
-        &self.hidraw_nodes
+    /// The directory whose `hidraw*` nodes the child must find inaccessible before it execs the
+    /// browser (`None` when the browser runs in a private `/dev`). Built before the fork; the child
+    /// passes it to [`refuse_if_hidraw_accessible`].
+    pub fn hidraw_dir_to_check(&self) -> Option<CString> {
+        self.check_dev_dir.clone()
+    }
+
+    /// Why the browser does not run in a private `/dev`, if it does not.
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.unavailable.as_deref()
     }
 
     /// Wrap the browser command in `bwrap` when the plan has a private `/dev`; otherwise return it
@@ -386,22 +513,33 @@ impl ContainmentPlan {
     /// The actionable launch error for a spawn that failed with `error`, if the failure is the
     /// child's hidraw refusal.
     pub fn refusal(&self, error: &io::Error) -> Option<String> {
-        if error.raw_os_error() != Some(HIDRAW_ACCESSIBLE_ERRNO) || self.off {
+        if self.off {
             return None;
         }
-        let nodes = self
-            .hidraw_nodes
-            .iter()
-            .map(|node| node.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(refusal_message(
-            self.browser_uid,
-            &nodes,
-            self.unavailable
-                .as_deref()
-                .unwrap_or("bwrap is unavailable"),
-        ))
+        let unavailable = self
+            .unavailable
+            .as_deref()
+            .unwrap_or("bwrap is unavailable");
+        match error.raw_os_error() {
+            Some(HIDRAW_ACCESSIBLE_ERRNO) => Some(refusal_message(
+                self.browser_uid,
+                &format!(
+                    "can open a hidraw device ({})",
+                    hidraw_node_names(&self.dev_dir)
+                ),
+                unavailable,
+            )),
+            Some(HIDRAW_UNVERIFIABLE_ERRNO) => Some(refusal_message(
+                self.browser_uid,
+                &format!(
+                    "could not be shown unable to open every hidraw device: {} could not be \
+                     listed, or faccessat2 (Linux 5.8 or later) is unavailable or failed",
+                    self.dev_dir.display()
+                ),
+                unavailable,
+            )),
+            _ => None,
+        }
     }
 
     /// The case this launch is in, as far as the launcher knows without probing as another user:
@@ -414,10 +552,8 @@ impl ContainmentPlan {
         }
         Some(if self.private_dev() {
             if same_user {
-                // SAFETY: plain syscalls in this process.
-                let accessible = unsafe {
-                    refuse_if_hidraw_accessible(&hidraw_nodes(Path::new("/dev"))).is_err()
-                };
+                let accessible =
+                    hidraw_accessible_here(&dev_dir_cstring(&self.dev_dir)).unwrap_or(true);
                 ContainmentCase::of(true, accessible)
             } else {
                 ContainmentCase::RequiredInPlace
@@ -428,10 +564,10 @@ impl ContainmentPlan {
     }
 }
 
-fn refusal_message(browser_uid: u32, nodes: &str, unavailable: &str) -> String {
+fn refusal_message(browser_uid: u32, finding: &str, unavailable: &str) -> String {
     format!(
-        "refusing to launch the managed browser: its user (uid {browser_uid}) can open a hidraw \
-         device ({nodes}), so a WebAuthn request that the passless extension does not handle \
+        "refusing to launch the managed browser: its user (uid {browser_uid}) {finding}, so a \
+         WebAuthn request that the passless extension does not handle \
          could reach the human authenticator, and the browser must run in a private /dev, which \
          needs bubblewrap; {unavailable}. Install bubblewrap (bwrap) and allow unprivileged user \
          namespaces (user.max_user_namespaces > 0; kernel.unprivileged_userns_clone = 1 where \
@@ -465,8 +601,7 @@ pub fn assess(
     let bwrap = policy
         .bwrap(setup.daemon_uid)
         .and_then(|bwrap| probe_bwrap(&bwrap, probe_setup).map(|()| bwrap));
-    let nodes = hidraw_nodes(&policy.dev_dir());
-    let hidraw_accessible = hidraw_accessible_as(setup, &nodes);
+    let hidraw_accessible = hidraw_accessible_as(setup, &dev_dir_cstring(&policy.dev_dir()));
     ContainmentReport {
         case: ContainmentCase::of(bwrap.is_ok(), hidraw_accessible.unwrap_or(true)),
         bwrap,
@@ -474,22 +609,19 @@ pub fn assess(
     }
 }
 
-/// Whether the browser's user can open any of `nodes`, evaluated as that user.
-fn hidraw_accessible_as(setup: &HardenedChildSetup, nodes: &[CString]) -> Option<bool> {
-    if nodes.is_empty() {
-        return Some(false);
-    }
+/// Whether the browser's user can open a hidraw node of `dev_dir`, evaluated as that user;
+/// `None` when that cannot be decided.
+fn hidraw_accessible_as(setup: &HardenedChildSetup, dev_dir: &std::ffi::CStr) -> Option<bool> {
     let same_user = setup.target_uid == setup.daemon_uid && setup.target_gid == setup.daemon_gid;
     if same_user {
-        // SAFETY: plain syscalls in this process.
-        return Some(unsafe { refuse_if_hidraw_accessible(nodes).is_err() });
+        return hidraw_accessible_here(dev_dir);
     }
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return None;
     }
     let (uid, gid) = (setup.target_uid, setup.target_gid);
-    let nodes = nodes.to_vec();
+    let dev_dir = dev_dir.to_owned();
     let mut command = Command::new("true");
     command
         .stdin(Stdio::null())
@@ -504,14 +636,14 @@ fn hidraw_accessible_as(setup: &HardenedChildSetup, nodes: &[CString]) -> Option
             {
                 return Err(io::Error::last_os_error());
             }
-            refuse_if_hidraw_accessible(&nodes)
+            refuse_if_hidraw_accessible(&dev_dir)
         });
     }
     match command.spawn() {
-        Ok(mut child) => {
-            let _ = wait_with_timeout(&mut child, BWRAP_PROBE_TIMEOUT);
-            Some(false)
-        }
+        Ok(mut child) => match wait_with_timeout(&mut child, BWRAP_PROBE_TIMEOUT) {
+            Ok(status) if status.success() => Some(false),
+            _ => None,
+        },
         Err(e) if e.raw_os_error() == Some(HIDRAW_ACCESSIBLE_ERRNO) => Some(true),
         Err(_) => None,
     }
@@ -588,23 +720,155 @@ pub(crate) mod tests {
         assert_eq!(ContainmentCase::Refused.to_string(), "refused");
     }
 
+    fn check(dir: &Path) -> Result<(), i32> {
+        unsafe { refuse_if_hidraw_accessible(&dev_dir_cstring(dir)) }
+            .map_err(|e| e.raw_os_error().unwrap())
+    }
+
     #[test]
     fn the_hidraw_check_sees_only_nodes_this_user_can_read_and_write() {
         let open = dev_dir(0o600);
-        let nodes = hidraw_nodes(open.path());
-        assert_eq!(nodes.len(), 1, "only hidraw* nodes are listed");
-        let err = unsafe { refuse_if_hidraw_accessible(&nodes) }.unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(HIDRAW_ACCESSIBLE_ERRNO));
+        assert_eq!(check(open.path()), Err(HIDRAW_ACCESSIBLE_ERRNO));
 
         // Readable but not writable is not enough to talk CTAP (root bypasses the mode bits).
         if unsafe { libc::geteuid() } != 0 {
             let read_only = dev_dir(0o400);
-            assert!(
-                unsafe { refuse_if_hidraw_accessible(&hidraw_nodes(read_only.path())) }.is_ok()
-            );
+            assert_eq!(check(read_only.path()), Ok(()));
         }
         let none = tempfile::tempdir().unwrap();
-        assert!(hidraw_nodes(none.path()).is_empty());
+        assert_eq!(check(none.path()), Ok(()), "no hidraw node at all");
+        // Non-hidraw names and short names are skipped.
+        for name in ["h", "hid", "hidra", "uhid", "xhidraw0"] {
+            fs::write(none.path().join(name), b"").unwrap();
+        }
+        assert_eq!(check(none.path()), Ok(()));
+    }
+
+    /// Review M1: the check fails closed. An unreadable device directory is inconclusive, and a
+    /// symlink named like a hidraw node is followed (the browser could open it that way).
+    #[test]
+    fn the_hidraw_check_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check(&tmp.path().join("missing")),
+            Err(HIDRAW_UNVERIFIABLE_ERRNO),
+            "a device directory that cannot be listed refuses"
+        );
+        let target = tmp.path().join("node");
+        fs::write(&target, b"").unwrap();
+        let dev = tmp.path().join("dev");
+        fs::create_dir(&dev).unwrap();
+        std::os::unix::fs::symlink(&target, dev.join("hidraw9")).unwrap();
+        assert_eq!(
+            check(&dev),
+            Err(HIDRAW_ACCESSIBLE_ERRNO),
+            "a symlink is followed"
+        );
+        fs::remove_file(dev.join("hidraw9")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), dev.join("hidraw9")).unwrap();
+        assert_eq!(
+            check(&dev),
+            Ok(()),
+            "a dangling symlink cannot be opened (ENOENT)"
+        );
+
+        assert!(access_error_means_inaccessible(libc::EACCES));
+        assert!(access_error_means_inaccessible(libc::ENOENT));
+        assert!(access_error_means_inaccessible(libc::EROFS));
+        assert!(access_error_means_inaccessible(libc::EPERM));
+        for errno in [
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EIO,
+            libc::ELOOP,
+            libc::ENOMEM,
+        ] {
+            assert!(
+                !access_error_means_inaccessible(errno),
+                "errno {errno} refuses"
+            );
+        }
+    }
+
+    /// On the real `/dev`, the check agrees with libc's `faccessat(AT_EACCESS)` (which uses
+    /// `faccessat2` on this kernel, so ACLs such as logind's `uaccess` count).
+    #[test]
+    fn the_hidraw_check_agrees_with_libc_on_the_real_dev() {
+        let expected = fs::read_dir("/dev")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().as_bytes().starts_with(b"hidraw"))
+            .any(|e| {
+                let path = CString::new(e.path().as_os_str().as_bytes()).unwrap();
+                unsafe {
+                    libc::faccessat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        libc::R_OK | libc::W_OK,
+                        libc::AT_EACCESS,
+                    ) == 0
+                }
+            });
+        assert_eq!(hidraw_accessible_here(c"/dev"), Some(expected));
+    }
+
+    /// The child lists the directory itself in 4 KiB batches: an accessible node among many
+    /// entries is found whichever batch it is in.
+    #[test]
+    fn the_hidraw_check_reads_every_directory_batch() {
+        let dev = tempfile::tempdir().unwrap();
+        for i in 0..400 {
+            fs::write(
+                dev.path()
+                    .join(format!("tty-some-longer-device-name-{i:04}")),
+                b"",
+            )
+            .unwrap();
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            for i in 0..50 {
+                let path = dev.path().join(format!("hidraw{i}"));
+                fs::write(&path, b"").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            assert_eq!(check(dev.path()), Ok(()), "only read-only hidraw nodes");
+        }
+        let path = dev.path().join("hidraw77");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(check(dev.path()), Err(HIDRAW_ACCESSIBLE_ERRNO));
+    }
+
+    /// Review L4: bwrap is trusted only if neither its binary nor any directory on its canonical
+    /// path can be written by another user.
+    #[test]
+    fn bwrap_must_live_on_a_path_nobody_else_can_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let bwrap = bin.join("bwrap");
+        fs::write(&bwrap, b"").unwrap();
+        fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o755)).unwrap();
+        // The temporary directory's ancestors are not all root- or uid-owned and 0755, so check
+        // just the components this test controls through a root-owned system binary as control.
+        if let Ok(system) = fs::canonicalize("/usr/bin/true") {
+            assert!(trusted_path(&system, uid).is_ok(), "{system:?}");
+        }
+        fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o775)).unwrap();
+        let err = trusted_path(&bwrap, uid).unwrap_err();
+        assert!(err.contains("could replace"), "{err}");
+        fs::set_permissions(&bwrap, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            trusted_path(&bwrap, uid).is_err(),
+            "a writable directory on the path"
+        );
+        // A root daemon trusts only root-owned components.
+        if uid != 0 {
+            assert!(trusted_path(&bwrap, 0).is_err());
+        }
     }
 
     #[test]
@@ -617,16 +881,15 @@ pub(crate) mod tests {
         let setup = same_user_setup();
         let plan = ContainmentPlan::for_launch(&policy, &setup, false, false);
         assert!(!plan.private_dev());
-        assert_eq!(plan.hidraw_nodes_to_check().len(), 1);
+        let dir = plan.hidraw_dir_to_check().expect("the child checks");
 
-        let nodes = plan.hidraw_nodes_to_check().to_vec();
         let parent = std::process::id() as libc::pid_t;
         let mut command = plan.wrap(Command::new("/bin/true"));
         // SAFETY: async-signal-safe pre-exec steps, as in the browser spawn.
         unsafe {
             command.pre_exec(move || {
                 setup.apply(&[0, 1, 2], parent)?;
-                refuse_if_hidraw_accessible(&nodes)
+                refuse_if_hidraw_accessible(&dir)
             });
         }
         let err = command.spawn().expect_err("the child refuses to exec");
@@ -645,6 +908,23 @@ pub(crate) mod tests {
         let report = assess(&policy, &same_user_setup(), false);
         assert_eq!(report.case, ContainmentCase::Refused);
         assert_eq!(report.hidraw_accessible, Some(true));
+
+        // An inconclusive check refuses too, with its own message.
+        let message = plan
+            .refusal(&io::Error::from_raw_os_error(HIDRAW_UNVERIFIABLE_ERRNO))
+            .expect("recognized");
+        assert!(message.contains("faccessat2"), "{message}");
+        let missing = ContainmentPolicy::Injected {
+            bwrap: None,
+            dev_dir: dev.path().join("missing"),
+        };
+        let report = assess(&missing, &same_user_setup(), false);
+        assert_eq!(report.hidraw_accessible, None);
+        assert_eq!(
+            report.case,
+            ContainmentCase::Refused,
+            "inconclusive counts as accessible"
+        );
     }
 
     #[test]
@@ -662,7 +942,7 @@ pub(crate) mod tests {
             "the probe ran the fake bwrap successfully"
         );
         assert!(
-            plan.hidraw_nodes_to_check().is_empty(),
+            plan.hidraw_dir_to_check().is_none(),
             "no child check under bwrap"
         );
 

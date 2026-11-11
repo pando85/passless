@@ -7,7 +7,9 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,12 +28,18 @@ use serde_json;
 
 use super::containment::{ContainmentPlan, ContainmentPolicy, refuse_if_hidraw_accessible};
 use super::launcher::{
-    DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NPROC, HardenedChildSetup,
-    bind_parent_death, cloexec_except, spawn_on_launcher_thread,
+    DEFAULT_RLIMIT_CORE, HardenedChildSetup, bind_parent_death, cloexec_except,
+    spawn_on_launcher_thread,
 };
+use super::safe_fs::{Dir, chown_file};
 use super::transport::{BearerReadiness, ReadinessRegistry};
 
 const RUNTIME_DIR_MODE: u32 = 0o700;
+/// A lease directory: owned by the daemon, traversable by the browser's group only. The daemon
+/// writes into it; the browser user cannot add, replace or rename entries in it (review H1).
+const LEASE_DIR_MODE: u32 = 0o710;
+/// Most bytes read from Chromium's `DevToolsActivePort`.
+const DEVTOOLS_ACTIVE_PORT_LIMIT: u64 = 512;
 const EXTENSION_DIR_MODE: u32 = 0o755;
 const DEFAULT_SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -44,7 +52,17 @@ const QUARANTINE_PREFIX: &str = "quarantine";
 const AGENT_EXTENSION_DIR: &str = "agent-extension";
 const CDP_FD_READ: RawFd = 3;
 const CDP_FD_WRITE: RawFd = 4;
+#[cfg(test)]
 const RLIMIT_NOFILE_CUR: u64 = 256;
+/// Resource limits of a managed browser that runs as another user (a root daemon sets them after
+/// the credential drop; a same-user browser keeps the daemon's). The principal defaults of
+/// `launcher.rs` (256 MiB address space, 32 processes, 64 descriptors) break Chromium, which maps
+/// gigabytes of address space for V8 and its sandboxes, runs a process per renderer, utility and
+/// zygote, and keeps many descriptors open (review M2). `RLIMIT_NPROC` counts every process of
+/// the browser user. Core dumps stay off.
+const BROWSER_RLIMIT_NOFILE: u64 = 8192;
+const BROWSER_RLIMIT_NPROC: u64 = 4096;
+const BROWSER_RLIMIT_AS: u64 = libc::RLIM_INFINITY;
 
 pub const CDP_MAX_REQUEST_BYTES: usize = 8 * 1024;
 pub const CDP_MAX_RESPONSE_MESSAGES: usize = 64;
@@ -380,10 +398,10 @@ impl BrowserConfig {
             target_gid: self.target_gid,
             daemon_uid: self.daemon_uid,
             daemon_gid: self.daemon_gid,
-            rlimit_nofile: RLIMIT_NOFILE_CUR,
-            rlimit_nproc: DEFAULT_RLIMIT_NPROC,
+            rlimit_nofile: BROWSER_RLIMIT_NOFILE,
+            rlimit_nproc: BROWSER_RLIMIT_NPROC,
             rlimit_core: DEFAULT_RLIMIT_CORE,
-            rlimit_as: DEFAULT_RLIMIT_AS,
+            rlimit_as: BROWSER_RLIMIT_AS,
             bind_parent_death: self.bind_parent_death,
         }
     }
@@ -633,6 +651,9 @@ pub struct BrowserLease {
     pub login_deadline: Instant,
     pub ttl_deadline: Instant,
     pub child: Option<Child>,
+    /// The lease directory, pinned when it was created: the daemon's later writes into it (the
+    /// `cdp-endpoint` file) go through this handle, never through the path (review H1).
+    runtime_dir_handle: Option<Dir>,
     pub cdp: Option<DaemonCdpEndpoints>,
     pub cdp_buffer: VecDeque<String>,
     pub cdp_read_buf: Vec<u8>,
@@ -961,40 +982,42 @@ impl BrowserProcessManager {
         let monotonic_secs = self.clock.monotonic_secs();
         let login_clamped = clamp_login_timeout(config.login_timeout);
 
-        validate_runtime_root(&config.runtime_root, config.target_uid).map_err(|e| {
+        // Every daemon write below goes through pinned directory handles (`safe_fs`): the runtime
+        // root may belong to the browser user, so no path the daemon writes through may contain a
+        // component that user could swap for a symlink (review H1).
+        let root = open_runtime_root(&config.runtime_root, config.target_uid).map_err(|e| {
             LaunchError::RuntimeRootInvalid(format!("{}: {}", config.runtime_root.display(), e))
         })?;
 
-        let runtime_dir = config
-            .runtime_root
-            .join(format!("lease-{}", lease_id.as_str()));
+        let lease_name = format!("lease-{}", lease_id.as_str());
+        let runtime_dir = config.runtime_root.join(&lease_name);
         let profile_dir = runtime_dir.join("profile");
 
         // Every error path below removes the runtime dir (it holds the extension worker's bearer token).
         let mut dir_guard = LaunchDirGuard::new(runtime_dir.clone());
 
-        create_lease_dir(
-            &runtime_dir,
-            RUNTIME_DIR_MODE,
-            config.target_uid,
-            config.target_gid,
-        )
-        .map_err(|e| {
-            LaunchError::DirCreationFailed(runtime_dir.display().to_string(), e.to_string())
-        })?;
-        create_lease_dir(
-            &profile_dir,
-            RUNTIME_DIR_MODE,
-            config.target_uid,
-            config.target_gid,
-        )
-        .map_err(|e| {
-            LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
-        })?;
+        // The lease directory stays the daemon's (group: the browser's, traverse only), so the
+        // browser user can neither plant nor swap anything the daemon writes or rewrites in it.
+        let lease_dir = root
+            .create_dir(&lease_name, LEASE_DIR_MODE)
+            .and_then(|dir| {
+                // SAFETY: no preconditions.
+                dir.chown(unsafe { libc::geteuid() }, config.target_gid)?;
+                Ok(dir)
+            })
+            .map_err(|e| {
+                LaunchError::DirCreationFailed(runtime_dir.display().to_string(), e.to_string())
+            })?;
+        let profile = lease_dir
+            .create_dir("profile", RUNTIME_DIR_MODE)
+            .map_err(|e| {
+                LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
+            })?;
 
         let mut relay_path = None;
         if let Some(metadata) = agent_endpoint {
-            let ext_dir = generate_agent_extension(
+            let ext_dir = generate_agent_extension_in(
+                &lease_dir,
                 &runtime_dir,
                 metadata,
                 config.target_uid,
@@ -1023,17 +1046,31 @@ impl BrowserProcessManager {
                     sign_proxy.display()
                 )));
             }
-            install_native_messaging_manifest(&ext_dir, &sign_proxy, &profile_dir)?;
+            install_native_messaging_manifest_in(&profile, &sign_proxy)?;
             // The extension must also run in off-the-record and CDP-created contexts, or their
             // requests would go native (ADR 0014 section 4.2); the worker's hello reports whether
             // this took effect, and the launch fails closed if it did not.
-            seed_incognito_access(&profile_dir, config.target_uid, config.target_gid)?;
+            seed_incognito_access_in(&profile, config.target_uid, config.target_gid)?;
             relay_path = Some(sign_proxy);
         }
 
-        let profile_fp = fingerprint_path(&profile_dir).map_err(|e| {
-            LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
-        })?;
+        // The profile is the only directory the browser user owns: handed over after the daemon's
+        // writes into it and before the browser starts. The daemon never writes into it again; it
+        // only reads `DevToolsActivePort` from it (`O_NOFOLLOW`, owner-checked) and unlinks that.
+        profile
+            .chown(config.target_uid, config.target_gid)
+            .map_err(|e| {
+                LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
+            })?;
+        let profile_fp = profile
+            .stat()
+            .map(|st| ProfileFingerprint {
+                inode: st.st_ino,
+                dev: st.st_dev,
+            })
+            .map_err(|e| {
+                LaunchError::DirCreationFailed(profile_dir.display().to_string(), e.to_string())
+            })?;
 
         if let Some(ref url) = config.start_url {
             validate_start_url(url, &config.start_url_rules)
@@ -1079,7 +1116,12 @@ impl BrowserProcessManager {
             let discovered = if config.cdp_port > 0 {
                 wait_for_cdp_port(&mut child, config.cdp_port, Duration::from_secs(30))
             } else {
-                discover_cdp_endpoint_with_child(&mut child, &profile_dir, Duration::from_secs(30))
+                discover_cdp_endpoint_with_child(
+                    &mut child,
+                    &profile,
+                    config.target_uid,
+                    Duration::from_secs(30),
+                )
             };
             let discovered = match discovered {
                 Ok(discovered) => discovered,
@@ -1090,11 +1132,12 @@ impl BrowserProcessManager {
             };
             // The daemon hands out the endpoint, and withholds it while the lease is degraded;
             // Chromium's own discovery file would let a same-UID agent find the port anyway.
-            hide_devtools_active_port(&profile_dir);
+            hide_devtools_active_port(&profile, &profile_dir);
             // An intercepted lease's `cdp-endpoint` file is written only once its worker attached
             // (`await_interception`) and removed while it is degraded; see `sync_cdp_endpoint_file`.
             if agent_endpoint.is_none()
                 && let Err(err) = write_cdp_endpoint(
+                    &lease_dir,
                     &runtime_dir,
                     &discovered,
                     config.target_uid,
@@ -1117,17 +1160,29 @@ impl BrowserProcessManager {
         let pid = child.id();
         let pgid = pid;
         if let Some(case) = containment.case_for_log(hardening.target_uid == hardening.daemon_uid) {
-            log::info!(
-                "browser lease {} (pid {}): native-path containment {}{}",
-                lease_id,
-                pid,
-                case,
-                if containment.private_dev() {
-                    " (private /dev through bwrap)"
-                } else {
-                    " (no private /dev; the browser user cannot open any hidraw device)"
-                }
-            );
+            if containment.private_dev() {
+                log::info!(
+                    "browser lease {} (pid {}): native-path containment {} (private /dev through \
+                     bwrap)",
+                    lease_id,
+                    pid,
+                    case
+                );
+            } else {
+                // Not silent: a bwrap probe that failed (for example on a resource limit) left
+                // the browser without a private /dev; the child's hidraw check passed.
+                log::warn!(
+                    "browser lease {} (pid {}): native-path containment {}: running without a \
+                     private /dev because {}; the browser user cannot open any hidraw device \
+                     now, but one that appears later would be reachable",
+                    lease_id,
+                    pid,
+                    case,
+                    containment
+                        .unavailable_reason()
+                        .unwrap_or("bwrap is unavailable")
+                );
+            }
         }
         let proc_identity = read_process_identity(pid).ok_or_else(|| {
             LaunchError::SpawnFailed(format!(
@@ -1162,7 +1217,7 @@ impl BrowserProcessManager {
             endpoint_scope: endpoint_id.as_str().to_string(),
         };
 
-        write_manifest_atomic(&runtime_dir, &manifest)?;
+        write_manifest_atomic(&lease_dir, &runtime_dir, &manifest)?;
 
         let (daemon_endpoints, consumed_pipes) = if let Some(cdp) = cdp_pipes {
             let endpoints = DaemonCdpEndpoints {
@@ -1183,6 +1238,7 @@ impl BrowserProcessManager {
             login_deadline,
             ttl_deadline: login_deadline,
             child: Some(child),
+            runtime_dir_handle: Some(lease_dir),
             cdp: daemon_endpoints,
             cdp_buffer: VecDeque::new(),
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
@@ -2065,24 +2121,33 @@ fn clamp_login_timeout(timeout: Duration) -> Duration {
     }
 }
 
-fn validate_runtime_root(path: &Path, expected_uid: u32) -> io::Result<()> {
+/// Opens the browser runtime root as a pinned directory (review H1). Its last component must not
+/// be a symlink; symlinks among its system ancestors (for example `/var/run`) are resolved first,
+/// and the resolved path is then opened component by component without following any symlink, so
+/// a component swapped afterwards is refused. The opened directory must be owned by the browser
+/// user with mode 0700: lease directories are created inside it through this handle.
+fn open_runtime_root(path: &Path, expected_uid: u32) -> io::Result<Dir> {
     let meta = fs::symlink_metadata(path)?;
-
     if meta.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime root is a symlink",
         ));
     }
-
-    if !meta.is_dir() {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "runtime root has no file name")
+    })?;
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let resolved = fs::canonicalize(parent)?.join(name);
+    let dir = Dir::open_path(&resolved)?;
+    let st = dir.stat()?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
             "runtime root is not a directory",
         ));
     }
-
-    let mode = meta.permissions().mode() & 0o777;
+    let mode = st.st_mode & 0o777;
     if mode != RUNTIME_DIR_MODE {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2092,113 +2157,36 @@ fn validate_runtime_root(path: &Path, expected_uid: u32) -> io::Result<()> {
             ),
         ));
     }
-
-    if meta.uid() != expected_uid {
+    if st.st_uid != expected_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
                 "runtime root not owned by target uid {} (owned by {})",
-                expected_uid,
-                meta.uid()
+                expected_uid, st.st_uid
             ),
         ));
     }
-
-    Ok(())
+    Ok(dir)
 }
 
+#[cfg(test)]
+fn validate_runtime_root(path: &Path, expected_uid: u32) -> io::Result<()> {
+    open_runtime_root(path, expected_uid).map(|_| ())
+}
+
+/// Test helper: creates the directory `path` (its parent opened without following symlinks) and
+/// chowns it, as the launcher does through its pinned handles.
+#[cfg(test)]
 fn create_lease_dir(path: &Path, mode: u32, target_uid: u32, target_gid: u32) -> io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("/"));
-    let dir_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no file name in lease dir path",
-        )
-    })?;
-    let c_name = CString::new(dir_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
-    let parent_c_path = path_to_cstring(parent)?;
-
-    let parent_fd = unsafe {
-        libc::open(
-            parent_c_path.as_ptr(),
-            libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_RDONLY,
-        )
-    };
-    if parent_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut dir_stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(parent_fd, &mut dir_stat) } != 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(parent_fd) };
-        return Err(err);
-    }
-    if (dir_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-        unsafe { libc::close(parent_fd) };
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "parent is not a directory",
-        ));
-    }
-
-    let mkdir_ret = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), mode) };
-    if mkdir_ret != 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::close(parent_fd) };
-        return Err(err);
-    }
-
-    let dir_fd = unsafe {
-        libc::openat(
-            parent_fd,
-            c_name.as_ptr(),
-            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY,
-        )
-    };
-    if dir_fd < 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::unlinkat(parent_fd, c_name.as_ptr(), libc::AT_REMOVEDIR);
-            libc::close(parent_fd);
-        }
-        return Err(err);
-    }
-
-    let mut new_stat: libc::stat = unsafe { std::mem::zeroed() };
-    let fstat_ok = unsafe { libc::fstat(dir_fd, &mut new_stat) } == 0;
-    let is_symlink = !fstat_ok || (new_stat.st_mode & libc::S_IFMT) == libc::S_IFLNK;
-    if is_symlink {
-        unsafe {
-            libc::close(dir_fd);
-            libc::unlinkat(parent_fd, c_name.as_ptr(), libc::AT_REMOVEDIR);
-            libc::close(parent_fd);
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "lease dir is a symlink after mkdir",
-        ));
-    }
-
-    let chown_ret = unsafe { libc::fchown(dir_fd, target_uid, target_gid) };
-    if chown_ret != 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(dir_fd);
-            libc::unlinkat(parent_fd, c_name.as_ptr(), libc::AT_REMOVEDIR);
-            libc::close(parent_fd);
-        }
-        return Err(err);
-    }
-
-    unsafe {
-        libc::close(dir_fd);
-        libc::close(parent_fd);
-    }
-    Ok(())
+    let parent = Dir::open_path(path.parent().unwrap_or(Path::new("/")))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    parent.create_dir(name, mode)?.chown(target_uid, target_gid)
 }
 
+#[cfg(test)]
 fn fingerprint_path(path: &Path) -> io::Result<ProfileFingerprint> {
     let meta = fs::metadata(path)?;
     Ok(ProfileFingerprint {
@@ -2282,71 +2270,51 @@ fn render_worker_script(template: &str, metadata: &AgentEndpointMetadata) -> Str
         )
 }
 
-fn write_extension_file(
-    dir: &Path,
-    name: &str,
-    content: &str,
-    mode: u32,
+/// Writes the lease's interception extension through the pinned lease directory: a daemon-owned
+/// `agent-extension` directory (0755) with `manifest.json` (0644, the daemon's, verbatim from the
+/// assets: its committed `key` fixes the extension ID) and `worker.js` with the lease's bearer, sign
+/// socket and build version. The worker file holds the bearer, so it is created exclusively and
+/// then handed to the browser user with mode 0600. Returns the directory's path.
+fn generate_agent_extension_in(
+    lease_dir: &Dir,
+    runtime_dir: &Path,
+    metadata: &AgentEndpointMetadata,
     target_uid: u32,
     target_gid: u32,
-) -> Result<(), LaunchError> {
-    let path = dir.join(name);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&path)
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("create {}: {}", name, e)))?;
-    (&file)
-        .write_all(content.as_bytes())
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("write {}: {}", name, e)))?;
-    let ret = unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) };
-    if ret != 0 {
-        return Err(LaunchError::ExtensionSetupFailed(format!(
-            "chown {}: {}",
-            name,
-            io::Error::last_os_error()
-        )));
+) -> Result<PathBuf, LaunchError> {
+    let fail = |what: &str, e: io::Error| LaunchError::ExtensionSetupFailed(format!("{what}: {e}"));
+    let ext = lease_dir
+        .create_dir(AGENT_EXTENSION_DIR, EXTENSION_DIR_MODE)
+        .map_err(|e| fail("extension dir", e))?;
+    ext.create_file("manifest.json", 0o644, extension_manifest().as_bytes())
+        .map_err(|e| fail("create manifest.json", e))?;
+    let worker = ext
+        .create_file(
+            "worker.js",
+            0o600,
+            render_worker_script(EXTENSION_WORKER_TEMPLATE, metadata).as_bytes(),
+        )
+        .map_err(|e| fail("create worker.js", e))?;
+    chown_file(&worker, target_uid, target_gid).map_err(|e| fail("chown worker.js", e))?;
+
+    let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
+    if simulate_missing_extension() {
+        let _ = fs::remove_dir_all(&ext_dir);
     }
-    Ok(())
+    Ok(ext_dir)
 }
 
-/// Writes the lease's interception extension: `manifest.json` verbatim from the assets (its
-/// committed `key` fixes the extension ID) and `worker.js` with the lease's bearer, sign socket
-/// and build version. The worker file holds the bearer, so it is readable by the browser user only.
+/// Test helper: [`generate_agent_extension_in`] for the lease directory at `runtime_dir`.
+#[cfg(test)]
 fn generate_agent_extension(
     runtime_dir: &Path,
     metadata: &AgentEndpointMetadata,
     target_uid: u32,
     target_gid: u32,
 ) -> Result<PathBuf, LaunchError> {
-    let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
-    create_lease_dir(&ext_dir, EXTENSION_DIR_MODE, target_uid, target_gid)
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("extension dir: {}", e)))?;
-
-    write_extension_file(
-        &ext_dir,
-        "manifest.json",
-        &extension_manifest(),
-        0o644,
-        target_uid,
-        target_gid,
-    )?;
-    write_extension_file(
-        &ext_dir,
-        "worker.js",
-        &render_worker_script(EXTENSION_WORKER_TEMPLATE, metadata),
-        0o600,
-        target_uid,
-        target_gid,
-    )?;
-
-    if simulate_missing_extension() {
-        let _ = fs::remove_dir_all(&ext_dir);
-    }
-
-    Ok(ext_dir)
+    let lease_dir = Dir::open_path(runtime_dir)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("open lease dir: {e}")))?;
+    generate_agent_extension_in(&lease_dir, runtime_dir, metadata, target_uid, target_gid)
 }
 
 /// The manifest to write: the committed one, verbatim. Debug builds only: with
@@ -2427,13 +2395,13 @@ pub(crate) fn installed_sign_proxy_path() -> Option<PathBuf> {
 
 /// Writes the native messaging host manifest into the lease's profile (`--user-data-dir`), never
 /// into the user's own browser configuration: it admits only the committed extension ID and runs
-/// `sign_proxy_path`.
-fn install_native_messaging_manifest(
-    ext_dir: &Path,
+/// `sign_proxy_path`. Written through the pinned profile directory before the profile is handed to
+/// the browser user: `NativeMessagingHosts` (0755) and the manifest (0644) stay the daemon's.
+fn install_native_messaging_manifest_in(
+    profile: &Dir,
     sign_proxy_path: &Path,
-    profile_dir: &Path,
-) -> Result<PathBuf, LaunchError> {
-    let ext_id = extension_id_of_dir(ext_dir)?;
+) -> Result<(), LaunchError> {
+    let ext_id = compute_extension_id(&extension_manifest())?;
     let manifest = serde_json::json!({
         "name": NATIVE_MESSAGING_HOST_NAME,
         "description": "Passless agent sign proxy",
@@ -2441,34 +2409,45 @@ fn install_native_messaging_manifest(
         "type": "stdio",
         "allowed_origins": [format!("chrome-extension://{}/", ext_id)]
     });
-    write_native_messaging_manifest(&profile_dir.join("NativeMessagingHosts"), &manifest)
-}
-
-fn write_native_messaging_manifest(
-    hosts_dir: &Path,
-    manifest: &serde_json::Value,
-) -> Result<PathBuf, LaunchError> {
-    fs::create_dir_all(hosts_dir).map_err(|e| {
-        LaunchError::ExtensionSetupFailed(format!(
-            "create native messaging dir {}: {}",
-            hosts_dir.display(),
-            e
-        ))
+    let contents = serde_json::to_vec_pretty(&manifest).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!("write native messaging manifest: {}", e))
     })?;
-    let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .open(&manifest_path)
+    let hosts = profile
+        .create_dir("NativeMessagingHosts", 0o755)
+        .map_err(|e| {
+            LaunchError::ExtensionSetupFailed(format!("create native messaging dir: {}", e))
+        })?;
+    hosts
+        .create_file(
+            &format!("{}.json", NATIVE_MESSAGING_HOST_NAME),
+            0o644,
+            &contents,
+        )
         .map_err(|e| {
             LaunchError::ExtensionSetupFailed(format!("create native messaging manifest: {}", e))
         })?;
-    serde_json::to_writer_pretty(&file, manifest).map_err(|e| {
-        LaunchError::ExtensionSetupFailed(format!("write native messaging manifest: {}", e))
-    })?;
-    Ok(manifest_path)
+    Ok(())
+}
+
+/// Test helper: [`install_native_messaging_manifest_in`] for `profile_dir` (created if missing,
+/// its parent opened without following symlinks). Returns the manifest's path.
+#[cfg(test)]
+fn install_native_messaging_manifest(
+    _ext_dir: &Path,
+    sign_proxy_path: &Path,
+    profile_dir: &Path,
+) -> Result<PathBuf, LaunchError> {
+    let fail = |e: io::Error| LaunchError::ExtensionSetupFailed(e.to_string());
+    let parent = Dir::open_path(profile_dir.parent().unwrap()).map_err(fail)?;
+    let name = profile_dir.file_name().unwrap().to_str().unwrap();
+    let profile = parent
+        .open_dir(name)
+        .or_else(|_| parent.create_dir(name, RUNTIME_DIR_MODE))
+        .map_err(fail)?;
+    install_native_messaging_manifest_in(&profile, sign_proxy_path)?;
+    Ok(profile_dir
+        .join("NativeMessagingHosts")
+        .join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME)))
 }
 
 /// The service worker file the extension consists of, besides `manifest.json`.
@@ -2715,7 +2694,7 @@ fn spawn_browser_hardened(
 
     let fd_read = cdp.browser_from_daemon_read;
     let fd_write = cdp.browser_to_daemon_write;
-    let hidraw_nodes = containment.hidraw_nodes_to_check().to_vec();
+    let hidraw_dir = containment.hidraw_dir_to_check();
     let parent = std::process::id() as libc::pid_t;
 
     unsafe {
@@ -2745,8 +2724,11 @@ fn spawn_browser_hardened(
             }
 
             setup.apply(&[0, 1, 2, CDP_FD_READ, CDP_FD_WRITE], parent)?;
-            // Evaluated as the browser's UID, after the drop (empty under bwrap).
-            refuse_if_hidraw_accessible(&hidraw_nodes)
+            // Evaluated as the browser's UID, after the drop (not needed under bwrap).
+            match &hidraw_dir {
+                Some(dir) => refuse_if_hidraw_accessible(dir),
+                None => Ok(()),
+            }
         });
     }
 
@@ -2864,7 +2846,7 @@ fn spawn_browser_port_mode(
     cmd.stderr(Stdio::inherit());
 
     let bind_parent_death_signal = config.bind_parent_death;
-    let hidraw_nodes = containment.hidraw_nodes_to_check().to_vec();
+    let hidraw_dir = containment.hidraw_dir_to_check();
     let parent = std::process::id() as libc::pid_t;
 
     unsafe {
@@ -2882,8 +2864,11 @@ fn spawn_browser_port_mode(
             } else {
                 setup.apply(&[0, 1, 2], parent)?;
             }
-            // Evaluated as the browser's UID (empty under bwrap).
-            refuse_if_hidraw_accessible(&hidraw_nodes)
+            // Evaluated as the browser's UID (not needed under bwrap).
+            match &hidraw_dir {
+                Some(dir) => refuse_if_hidraw_accessible(dir),
+                None => Ok(()),
+            }
         });
     }
 
@@ -2895,15 +2880,14 @@ fn spawn_browser_port_mode(
 /// and the file would let a same-UID agent find the loopback port without asking. This is
 /// discovery hygiene, not a boundary: a same-UID process can still find the browser's listening
 /// socket (`/proc/net/tcp` and its own processes' descriptors), and the file exists from the
-/// browser's start until this call (ADR 0014 section 7).
-fn hide_devtools_active_port(profile_dir: &Path) {
-    match fs::remove_file(profile_dir.join("DevToolsActivePort")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!(
+/// browser's start until this call (ADR 0014 section 7). The profile belongs to the browser user, so
+/// the entry is unlinked through the pinned profile handle and never followed.
+fn hide_devtools_active_port(profile: &Dir, profile_dir: &Path) {
+    if let Err(e) = profile.remove_file("DevToolsActivePort") {
+        log::warn!(
             "cannot remove {}: {e}",
             profile_dir.join("DevToolsActivePort").display()
-        ),
+        );
     }
 }
 
@@ -2915,47 +2899,34 @@ fn hide_devtools_active_port(profile_dir: &Path) {
 /// intercepted and their requests go native. The worker reports
 /// `chrome.extension.isAllowedIncognitoAccess()` in its hello, and the launch fails closed unless
 /// it is true, so a seed that did not take effect is a launch error.
-fn seed_incognito_access(
-    profile_dir: &Path,
+///
+/// Written through the pinned profile handle while the profile is still the daemon's; `Default`
+/// and `Preferences` are then handed to the browser user, which Chromium needs to rewrite them.
+fn seed_incognito_access_in(
+    profile: &Dir,
     target_uid: u32,
     target_gid: u32,
 ) -> Result<(), LaunchError> {
-    let extension_id = compute_extension_id(EXTENSION_MANIFEST_TEMPLATE)?;
-    let default_dir = profile_dir.join("Default");
-    create_lease_dir(&default_dir, RUNTIME_DIR_MODE, target_uid, target_gid).map_err(|e| {
+    let fail = |what: &str, e: io::Error| {
         LaunchError::ExtensionSetupFailed(format!(
-            "create {}: {e}; cannot seed incognito access for the passless agent extension",
-            default_dir.display()
+            "{what}: {e}; cannot seed incognito access for the passless agent extension"
         ))
-    })?;
+    };
+    let extension_id = compute_extension_id(EXTENSION_MANIFEST_TEMPLATE)?;
     let preferences = serde_json::json!({
         "extensions": {"settings": {extension_id: {"incognito": true}}}
     })
     .to_string();
-    // The profile is fresh: the file must not exist, and a symlink planted in its place (the
-    // directory belongs to the browser user) is refused rather than followed.
-    let path = default_dir.join("Preferences");
-    let fail = |what: &str, e: io::Error| {
-        LaunchError::ExtensionSetupFailed(format!(
-            "{what} {}: {e}; cannot seed incognito access for the passless agent extension",
-            path.display()
-        ))
-    };
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| fail("create", e))?;
-    (&file)
-        .write_all(preferences.as_bytes())
-        .map_err(|e| fail("write", e))?;
-    // SAFETY: fchown on a descriptor this function owns.
-    if unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) } != 0 {
-        return Err(fail("chown", io::Error::last_os_error()));
-    }
-    Ok(())
+    let default = profile
+        .create_dir("Default", RUNTIME_DIR_MODE)
+        .map_err(|e| fail("create Default", e))?;
+    let file = default
+        .create_file("Preferences", 0o600, preferences.as_bytes())
+        .map_err(|e| fail("create Default/Preferences", e))?;
+    chown_file(&file, target_uid, target_gid).map_err(|e| fail("chown Preferences", e))?;
+    default
+        .chown(target_uid, target_gid)
+        .map_err(|e| fail("chown Default", e))
 }
 
 fn ensure_browser_running(child: &mut Child) -> Result<(), LaunchError> {
@@ -3015,33 +2986,43 @@ pub(crate) fn discover_cdp_endpoint(
     }
 }
 
+/// Waits for Chromium's `DevToolsActivePort` in the profile, read through the pinned profile
+/// handle: a regular file owned by the browser user, opened without following a symlink and read
+/// up to a bound, so a file planted there cannot make the daemon read anything else (review H1).
+/// Its content is never echoed into an error.
 fn discover_cdp_endpoint_with_child(
     child: &mut Child,
-    profile_dir: &Path,
+    profile: &Dir,
+    owner: u32,
     timeout: Duration,
 ) -> Result<String, LaunchError> {
-    let port_file = profile_dir.join("DevToolsActivePort");
     let deadline = Instant::now() + timeout;
     loop {
         ensure_browser_running(child)?;
-        if let Ok(content) = fs::read_to_string(&port_file) {
+        if let Ok(content) =
+            profile.read_owned_file("DevToolsActivePort", owner, DEVTOOLS_ACTIVE_PORT_LIMIT)
+        {
+            let content = String::from_utf8_lossy(&content);
             let lines: Vec<&str> = content.lines().collect();
             if lines.len() >= 2 {
                 let port = lines[0].trim();
                 let ws_path = lines[1].trim();
                 let port_num: u16 = port.parse().map_err(|_| {
-                    LaunchError::InvalidCdpEndpoint(format!("invalid port '{}'", port))
+                    LaunchError::InvalidCdpEndpoint("DevToolsActivePort has no valid port".into())
                 })?;
                 if port_num == 0 {
                     return Err(LaunchError::InvalidCdpEndpoint("port must not be 0".into()));
                 }
-                if !ws_path.starts_with("/devtools/browser/") {
-                    return Err(LaunchError::InvalidCdpEndpoint(format!(
-                        "invalid devtools path '{}'",
-                        ws_path
-                    )));
+                if !ws_path.starts_with("/devtools/browser/")
+                    || !ws_path[1..]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'-')
+                {
+                    return Err(LaunchError::InvalidCdpEndpoint(
+                        "DevToolsActivePort has no valid devtools path".into(),
+                    ));
                 }
-                let url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+                let url = format!("ws://127.0.0.1:{}{}", port_num, ws_path);
                 validate_loopback_ws_url(&url)?;
                 return Ok(url);
             }
@@ -3174,48 +3155,45 @@ fn sync_cdp_endpoint_file(lease: &BrowserLease, attached: bool) -> Result<(), La
         return Ok(());
     };
     let runtime_dir = &lease.manifest.runtime_dir;
+    let Some(dir) = &lease.runtime_dir_handle else {
+        return Err(LaunchError::EndpointFileWriteFailed(
+            runtime_dir.join("cdp-endpoint").display().to_string(),
+            "the lease directory is not open".to_string(),
+        ));
+    };
     if attached {
         let (uid, gid) = interception.endpoint_file_owner;
-        write_cdp_endpoint(runtime_dir, endpoint, uid, gid)
+        write_cdp_endpoint(dir, runtime_dir, endpoint, uid, gid)
     } else {
-        match fs::remove_file(runtime_dir.join("cdp-endpoint")) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(LaunchError::EndpointFileWriteFailed(
+        dir.remove_file("cdp-endpoint").map_err(|e| {
+            LaunchError::EndpointFileWriteFailed(
                 runtime_dir.join("cdp-endpoint").display().to_string(),
                 e.to_string(),
-            )),
-        }
+            )
+        })
     }
 }
 
+/// (Re)writes the lease's `cdp-endpoint` file through the pinned lease directory: whatever entry
+/// has that name is removed, never followed, and a fresh file is created exclusively and handed to
+/// the browser user, who reads it.
 fn write_cdp_endpoint(
+    lease_dir: &Dir,
     runtime_dir: &Path,
     url: &str,
     target_uid: u32,
     target_gid: u32,
 ) -> Result<(), LaunchError> {
-    let path = runtime_dir.join("cdp-endpoint");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| {
-            LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
-        })?;
-    (&file).write_all(url.as_bytes()).map_err(|e| {
-        LaunchError::EndpointFileWriteFailed(path.display().to_string(), e.to_string())
-    })?;
-    let ret = unsafe { libc::fchown(file.as_raw_fd(), target_uid, target_gid) };
-    if ret != 0 {
-        return Err(LaunchError::EndpointFileWriteFailed(
-            path.display().to_string(),
-            io::Error::last_os_error().to_string(),
-        ));
-    }
-    Ok(())
+    let fail = |e: io::Error| {
+        LaunchError::EndpointFileWriteFailed(
+            runtime_dir.join("cdp-endpoint").display().to_string(),
+            e.to_string(),
+        )
+    };
+    let file = lease_dir
+        .replace_file("cdp-endpoint", 0o600, url.as_bytes())
+        .map_err(fail)?;
+    chown_file(&file, target_uid, target_gid).map_err(fail)
 }
 
 fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
@@ -3447,60 +3425,45 @@ fn path_to_cstring(path: &Path) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
 }
 
-fn write_manifest_atomic(dir: &Path, manifest: &BrowserManifest) -> Result<(), LaunchError> {
-    let manifest_path = dir.join(MANIFEST_FILENAME);
+/// Writes `browser-manifest.json` atomically through the pinned lease directory: an exclusive
+/// temporary file (`O_EXCL | O_NOFOLLOW`), fsync, `renameat` over the final name, fsync of the
+/// directory.
+fn write_manifest_atomic(
+    lease_dir: &Dir,
+    runtime_dir: &Path,
+    manifest: &BrowserManifest,
+) -> Result<(), LaunchError> {
+    let manifest_path = runtime_dir.join(MANIFEST_FILENAME);
     let tmp_name = format!(
         ".{}.tmp.{:016x}",
         MANIFEST_FILENAME,
         rand::thread_rng().r#gen::<u64>()
     );
-    let tmp_path = dir.join(&tmp_name);
-
+    let fail = |e: io::Error| {
+        LaunchError::ManifestWriteFailed(manifest_path.display().to_string(), e.to_string())
+    };
     let manifest_json = serde_json::to_string_pretty(manifest).map_err(|e| {
         LaunchError::ManifestWriteFailed(manifest_path.display().to_string(), e.to_string())
     })?;
-
-    let tmp_file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)
-        .map_err(|e| {
-            LaunchError::ManifestWriteFailed(tmp_path.display().to_string(), e.to_string())
-        })?;
-    (&tmp_file)
-        .write_all(manifest_json.as_bytes())
-        .map_err(|e| {
-            LaunchError::ManifestWriteFailed(tmp_path.display().to_string(), e.to_string())
-        })?;
-    #[cfg(target_os = "linux")]
-    {
-        let ret = unsafe { libc::fsync(tmp_file.as_raw_fd()) };
-        if ret != 0 {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(LaunchError::ManifestWriteFailed(
-                tmp_path.display().to_string(),
-                io::Error::last_os_error().to_string(),
-            ));
-        }
-    }
+    let tmp_file = lease_dir
+        .create_file(&tmp_name, 0o600, manifest_json.as_bytes())
+        .map_err(fail)?;
+    let synced = tmp_file.sync_all();
     drop(tmp_file);
-
-    fs::rename(&tmp_path, &manifest_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        LaunchError::ManifestWriteFailed(manifest_path.display().to_string(), e.to_string())
-    })?;
-
-    let dir_file = fs::File::open(dir)
-        .map_err(|e| LaunchError::ManifestWriteFailed(dir.display().to_string(), e.to_string()))?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let _ = unsafe { libc::fsync(dir_file.as_raw_fd()) };
+    if let Err(e) = synced.and_then(|()| lease_dir.rename(&tmp_name, MANIFEST_FILENAME)) {
+        let _ = lease_dir.remove_file(&tmp_name);
+        return Err(fail(e));
     }
-    drop(dir_file);
-
+    let _ = lease_dir.sync();
     Ok(())
+}
+
+/// Test helper: [`write_manifest_atomic`] for the directory at `dir`.
+#[cfg(test)]
+fn write_manifest_atomic_at(dir: &Path, manifest: &BrowserManifest) -> Result<(), LaunchError> {
+    let lease_dir = Dir::open_path(dir)
+        .map_err(|e| LaunchError::ManifestWriteFailed(dir.display().to_string(), e.to_string()))?;
+    write_manifest_atomic(&lease_dir, dir, manifest)
 }
 
 fn decode_wait_status(status: libc::c_int) -> Option<ExitStatus> {
@@ -5351,7 +5314,7 @@ mod tests {
             endpoint_scope: "ep".to_string(),
         };
 
-        write_manifest_atomic(&lease_dir, &manifest).unwrap();
+        write_manifest_atomic_at(&lease_dir, &manifest).unwrap();
 
         let manifest_path = lease_dir.join(MANIFEST_FILENAME);
         assert!(manifest_path.exists());
@@ -6733,12 +6696,53 @@ mod tests {
         fs::create_dir_all(&profile_dir).unwrap();
         let mut child = Command::new("/bin/false").spawn().unwrap();
 
+        let profile = Dir::open_path(&profile_dir).unwrap();
+        let uid = unsafe { libc::geteuid() };
         let result =
-            discover_cdp_endpoint_with_child(&mut child, &profile_dir, Duration::from_secs(5));
+            discover_cdp_endpoint_with_child(&mut child, &profile, uid, Duration::from_secs(5));
         assert!(matches!(
             result,
             Err(LaunchError::BrowserExitedBeforeCdp(_))
         ));
+    }
+
+    /// Review H1: `DevToolsActivePort` is read through the pinned profile handle; a symlink
+    /// planted in its place (for example to a secret file) is never followed, and the discovery
+    /// times out instead of reading, or echoing, the target.
+    #[test]
+    fn test_discover_cdp_endpoint_does_not_follow_a_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "9222\n/devtools/browser/stolen\n").unwrap();
+        let profile_dir = dir.path().join("profile");
+        fs::create_dir_all(&profile_dir).unwrap();
+        unix_fs::symlink(&secret, profile_dir.join("DevToolsActivePort")).unwrap();
+        let profile = Dir::open_path(&profile_dir).unwrap();
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let result =
+            discover_cdp_endpoint_with_child(&mut child, &profile, uid, Duration::from_millis(300));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            matches!(result, Err(LaunchError::CdpDiscoveryTimeout)),
+            "{result:?}"
+        );
+
+        // A real file is read; invalid content is reported without echoing it.
+        fs::remove_file(profile_dir.join("DevToolsActivePort")).unwrap();
+        fs::write(
+            profile_dir.join("DevToolsActivePort"),
+            "root:x:0:0\nsecret\n",
+        )
+        .unwrap();
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let err =
+            discover_cdp_endpoint_with_child(&mut child, &profile, uid, Duration::from_secs(2))
+                .unwrap_err();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!err.to_string().contains("root:x"), "{err}");
     }
 
     #[test]
@@ -8033,6 +8037,17 @@ mod tests {
         assert!(!is_managed_extension_or_profile_flag("--disable-sync"));
     }
 
+    /// Review M2: a browser that runs as another user gets limits Chromium can live with.
+    #[test]
+    fn test_browser_hardening_rlimits_fit_chromium() {
+        let dir = tempfile::tempdir().unwrap();
+        let hardening = test_config(dir.path()).hardening();
+        assert_eq!(hardening.rlimit_as, libc::RLIM_INFINITY);
+        assert!(hardening.rlimit_nproc >= 1024);
+        assert!(hardening.rlimit_nofile >= 4096);
+        assert_eq!(hardening.rlimit_core, 0);
+    }
+
     #[test]
     fn test_browser_config_hardening_preserves_bind_parent_death_true() {
         let dir = tempfile::tempdir().unwrap();
@@ -8776,9 +8791,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("DevToolsActivePort");
         fs::write(&file, "9222\n/devtools/browser/x\n").unwrap();
-        hide_devtools_active_port(dir.path());
+        let profile = Dir::open_path(dir.path()).unwrap();
+        hide_devtools_active_port(&profile, dir.path());
         assert!(!file.exists());
-        hide_devtools_active_port(dir.path());
+        hide_devtools_active_port(&profile, dir.path());
+        // A symlink in its place is removed itself; its target is untouched.
+        let target = dir.path().join("target");
+        fs::write(&target, "keep").unwrap();
+        unix_fs::symlink(&target, &file).unwrap();
+        hide_devtools_active_port(&profile, dir.path());
+        assert!(fs::symlink_metadata(&file).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
     }
 
     /// Plan D4 seeding: the fresh profile allows the extension in incognito before the first
@@ -8870,6 +8893,114 @@ mod tests {
             ),
             "{request}"
         );
+    }
+
+    /// Review H1: the lease directory stays the daemon's (0710, the browser's group), the extension
+    /// directory and manifest are the daemon's, only the profile subtree and the worker file are
+    /// handed to the browser user.
+    #[test]
+    fn test_lease_layout_keeps_daemon_written_directories_daemon_owned() {
+        let launch = intercepted_launch();
+        let lease = &launch.mgr.leases[&launch.lease_id];
+        let runtime_dir = &lease.manifest.runtime_dir;
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(runtime_dir), LEASE_DIR_MODE);
+        assert_eq!(
+            mode(&runtime_dir.join(AGENT_EXTENSION_DIR)),
+            EXTENSION_DIR_MODE
+        );
+        assert_eq!(
+            mode(&runtime_dir.join(AGENT_EXTENSION_DIR).join("manifest.json")),
+            0o644
+        );
+        assert_eq!(
+            mode(&runtime_dir.join(AGENT_EXTENSION_DIR).join("worker.js")),
+            0o600
+        );
+        assert_eq!(mode(&runtime_dir.join(MANIFEST_FILENAME)), 0o600);
+        assert_eq!(mode(&lease.manifest.profile_dir), RUNTIME_DIR_MODE);
+        let hosts = lease.manifest.profile_dir.join("NativeMessagingHosts");
+        assert_eq!(mode(&hosts), 0o755);
+        assert_eq!(
+            mode(&hosts.join(format!("{NATIVE_MESSAGING_HOST_NAME}.json"))),
+            0o644
+        );
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(fs::symlink_metadata(runtime_dir).unwrap().uid(), euid);
+    }
+
+    /// Review H1: a symlink planted where the daemon rewrites the `cdp-endpoint` file (it is
+    /// removed on degrade and rewritten on re-attach) is removed, never followed: its target is
+    /// untouched and the endpoint lands in a fresh regular file.
+    #[test]
+    fn test_cdp_endpoint_rewrite_does_not_follow_a_planted_symlink() {
+        let mut launch = intercepted_launch();
+        let endpoint = "ws://127.0.0.1:9333/devtools/browser/abc";
+        launch
+            .mgr
+            .leases
+            .get_mut(&launch.lease_id)
+            .unwrap()
+            .cdp_endpoint = Some(endpoint.to_string());
+        let runtime_dir = launch.mgr.leases[&launch.lease_id]
+            .manifest
+            .runtime_dir
+            .clone();
+        let victim = launch._dir.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        unix_fs::symlink(&victim, runtime_dir.join("cdp-endpoint")).unwrap();
+
+        launch.readiness.simulate_hello(BEARER, 1, true, true);
+        launch
+            .mgr
+            .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        let file = runtime_dir.join("cdp-endpoint");
+        assert!(fs::symlink_metadata(&file).unwrap().is_file());
+        assert_eq!(fs::read_to_string(&file).unwrap(), endpoint);
+
+        // The lease directory is pinned: renaming it away and planting a symlink to elsewhere in
+        // its place does not redirect the next rewrite.
+        let elsewhere = launch._dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let moved = runtime_dir.with_file_name("moved-lease");
+        fs::rename(&runtime_dir, &moved).unwrap();
+        unix_fs::symlink(&elsewhere, &runtime_dir).unwrap();
+        let grace = INTERCEPTION_DEGRADED_GRACE;
+        launch.readiness.simulate_disconnect(BEARER, 1);
+        launch
+            .readiness
+            .backdate_detached(BEARER, grace + Duration::from_secs(1));
+        launch.mgr.poll_interception(&launch.readiness, grace);
+        launch.readiness.simulate_hello(BEARER, 2, true, true);
+        launch.mgr.poll_interception(&launch.readiness, grace);
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing written there"
+        );
+        assert_eq!(
+            fs::read_to_string(moved.join("cdp-endpoint")).unwrap(),
+            endpoint
+        );
+        fs::remove_file(&runtime_dir).unwrap();
+        fs::rename(&moved, &runtime_dir).unwrap();
+    }
+
+    #[test]
+    fn test_runtime_root_with_a_symlinked_component_resolves_system_ancestors_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let uid = unsafe { libc::getuid() };
+        // A symlinked ancestor is resolved before the pinned open (like /var/run -> /run).
+        let alias = dir.path().join("alias");
+        unix_fs::symlink(dir.path(), &alias).unwrap();
+        assert!(validate_runtime_root(&alias.join("runtime-root"), uid).is_ok());
+        // The runtime root itself may not be a symlink.
+        let link = dir.path().join("root-link");
+        unix_fs::symlink(&root, &link).unwrap();
+        assert!(validate_runtime_root(&link, uid).is_err());
     }
 
     #[test]
