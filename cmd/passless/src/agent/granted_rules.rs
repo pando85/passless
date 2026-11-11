@@ -6,7 +6,10 @@
 //!
 //! One TOML file per profile, `<state_dir>/granted-rules/<profile>.toml`, owned by the daemon user
 //! with mode 0600 in a 0700 directory. Writes are atomic (temporary file, fsync, rename, fsync of
-//! the directory) and serialized per profile. Every load is fail-closed: a file that is not a
+//! the directory) and serialized per profile. The store directory is opened once as a pinned handle
+//! (`safe_fs::Dir`: `O_NOFOLLOW`, then owner and mode on the descriptor) and the temporary file, the
+//! rename, the fsync and the reload all go through it, so a symlink planted in its place is refused
+//! and a path swap cannot redirect a write (final security review L4). Every load is fail-closed: a file that is not a
 //! regular file owned by the daemon with mode 0600 or less, is too large, does not parse, has an
 //! unknown version, or holds an invalid or duplicate entry disables grants for that profile
 //! ([`ProfileGrants::Disabled`]). A disabled profile is never written, so a damaged file is left
@@ -14,9 +17,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
@@ -27,6 +30,7 @@ use sha2::{Digest, Sha256};
 
 use super::lock_order::{self, LockLevel};
 use super::policy_engine::PolicyRuntime;
+use super::safe_fs::Dir;
 
 /// The only store format version.
 pub const GRANTED_RULES_VERSION: u32 = 1;
@@ -508,9 +512,15 @@ impl GrantedRulesStore {
             grants: rules,
         };
         let content = toml::to_string(&file).map_err(|e| GrantStoreError::Io(e.to_string()))?;
-        write_atomically(&self.dir, profile, content.as_bytes(), self.owner_uid)
+        // One pinned directory handle for the write and the reload that checks it.
+        let handle = open_store_dir(&self.dir, true, self.owner_uid)
+            .map_err(GrantStoreError::Io)?
+            .ok_or_else(|| {
+                GrantStoreError::Io("the store directory could not be created".to_string())
+            })?;
+        write_in(&handle, profile, content.as_bytes())
             .map_err(|e| GrantStoreError::Io(e.to_string()))?;
-        let loaded = load_profile(&self.dir, profile, self.owner_uid);
+        let loaded = load_profile_from(&handle, &self.dir, profile, self.owner_uid);
         let result = match &loaded {
             ProfileGrants::Enabled(_) => Ok(()),
             ProfileGrants::Disabled(reason) => Err(GrantStoreError::Unavailable(reason.clone())),
@@ -552,21 +562,34 @@ fn store_path(dir: &Path, profile: &ProfileId) -> PathBuf {
     dir.join(format!("{}.toml", profile.as_str()))
 }
 
-fn tmp_path(dir: &Path, profile: &ProfileId) -> PathBuf {
-    dir.join(format!(".{}.toml.tmp", profile.as_str()))
+fn store_name(profile: &ProfileId) -> String {
+    format!("{}.toml", profile.as_str())
+}
+
+fn tmp_name(profile: &ProfileId) -> String {
+    format!(".{}.toml.tmp", profile.as_str())
 }
 
 /// Load one profile's store with every fail-closed check (module docs).
 fn load_profile(dir: &Path, profile: &ProfileId, owner_uid: u32) -> ProfileGrants {
-    let path = store_path(dir, profile);
-    if let Err(reason) = check_dir(dir, owner_uid) {
-        return ProfileGrants::Disabled(reason);
+    match open_store_dir(dir, false, owner_uid) {
+        Err(reason) => ProfileGrants::Disabled(reason),
+        Ok(None) => ProfileGrants::Enabled(Vec::new()),
+        Ok(Some(handle)) => load_profile_from(&handle, dir, profile, owner_uid),
     }
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&path)
-    {
+}
+
+/// [`load_profile`] through an already pinned store directory `handle` (`dir` is its path, for
+/// messages only): the file is opened relative to the descriptor with `O_NOFOLLOW`, so the path
+/// cannot be redirected between the directory check and the read.
+fn load_profile_from(
+    handle: &Dir,
+    dir: &Path,
+    profile: &ProfileId,
+    owner_uid: u32,
+) -> ProfileGrants {
+    let path = store_path(dir, profile);
+    let mut file = match handle.open_nofollow(&store_name(profile)) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return ProfileGrants::Enabled(Vec::new());
@@ -630,26 +653,81 @@ fn load_profile(dir: &Path, profile: &ProfileId, owner_uid: u32) -> ProfileGrant
     }
 }
 
-/// The store directory, when it exists, must be a real directory owned by the daemon.
-fn check_dir(dir: &Path, owner_uid: u32) -> Result<(), String> {
-    match fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot stat {}: {}", dir.display(), e)),
-        Ok(meta) if meta.file_type().is_symlink() => Err(format!("{} is a symlink", dir.display())),
-        Ok(meta) if !meta.is_dir() => Err(format!("{} is not a directory", dir.display())),
-        Ok(meta) if meta.uid() != owner_uid => Err(format!(
+/// Open the store directory `dir` (`<state_dir>/granted-rules`) as a pinned handle (review L4).
+///
+/// Everything after this call goes through the descriptor: the directory is opened with
+/// `openat(O_DIRECTORY | O_NOFOLLOW)` below its parent, so a symlink planted in its place is
+/// refused, and the owner and mode checks are `fstat` on the descriptor that is then used for the
+/// temporary file, the rename and the fsync, so a later swap of the path cannot redirect them.
+/// Missing is `Ok(None)` unless `create` (the directory is then made 0700). The state directory
+/// (the parent) is the operator's: it is resolved once and may itself be, or live under, a
+/// symlink; the store directory below it never may.
+fn open_store_dir(dir: &Path, create: bool, owner_uid: u32) -> Result<Option<Dir>, String> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(format!("{} is not a usable store directory", dir.display()));
+    };
+    if create {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+    }
+    let parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !create => return Ok(None),
+        Err(e) => return Err(format!("cannot resolve {}: {}", parent.display(), e)),
+    };
+    let parent_dir =
+        Dir::open_path(&parent).map_err(|e| format!("cannot open {}: {}", parent.display(), e))?;
+    let not_followed = |e: &io::Error| {
+        // `O_NOFOLLOW | O_DIRECTORY` on a symlink reports ELOOP or ENOTDIR, depending on the kernel
+        // path; a plain file in its place is ENOTDIR too.
+        matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
+    };
+    let handle = match parent_dir.open_dir(name) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if !create {
+                return Ok(None);
+            }
+            match parent_dir.create_dir(name, 0o700) {
+                Ok(handle) => handle,
+                // Created by a concurrent opener meanwhile: use it, after the checks below.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => parent_dir
+                    .open_dir(name)
+                    .map_err(|e| format!("cannot open {}: {}", dir.display(), e))?,
+                Err(e) => return Err(format!("cannot create {}: {}", dir.display(), e)),
+            }
+        }
+        Err(e) if not_followed(&e) => {
+            return Err(format!("{} is a symlink or not a directory", dir.display()));
+        }
+        Err(e) => return Err(format!("cannot open {}: {}", dir.display(), e)),
+    };
+    check_dir_handle(&handle, dir, owner_uid)?;
+    Ok(Some(handle))
+}
+
+/// The store directory must be owned by the daemon and not accessible to group or others.
+fn check_dir_handle(handle: &Dir, dir: &Path, owner_uid: u32) -> Result<(), String> {
+    let st = handle
+        .stat()
+        .map_err(|e| format!("cannot stat {}: {}", dir.display(), e))?;
+    if st.st_uid != owner_uid {
+        return Err(format!(
             "{} is owned by uid {}, not the daemon's uid {}",
             dir.display(),
-            meta.uid(),
+            st.st_uid,
             owner_uid
-        )),
-        Ok(meta) if meta.mode() & 0o077 != 0 => Err(format!(
+        ));
+    }
+    if st.st_mode & 0o077 != 0 {
+        return Err(format!(
             "{} has mode {:04o}; it must not be accessible to group or others (0700)",
             dir.display(),
-            meta.mode() & 0o7777
-        )),
-        Ok(_) => Ok(()),
+            st.st_mode & 0o7777
+        ));
     }
+    Ok(())
 }
 
 fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, String> {
@@ -691,50 +769,40 @@ fn parse_store(content: &[u8], profile: &ProfileId) -> Result<Vec<GrantedRule>, 
     Ok(file.grants)
 }
 
-/// Write `content` as the profile's store: a 0600 temporary file opened with `O_NOFOLLOW`,
-/// fsync, rename over the store, fsync of the directory. The directory is created 0700.
+/// Write `content` as the profile's store (review L4): open the store directory as a pinned handle
+/// (created 0700), then see [`write_in`]. The store itself opens the handle once for the write and
+/// the reload ([`GrantedRulesStore::persist_and_swap`]); this is the one-shot form the tests use.
+#[cfg(test)]
 fn write_atomically(
     dir: &Path,
     profile: &ProfileId,
     content: &[u8],
     owner_uid: u32,
 ) -> io::Result<()> {
-    ensure_dir(dir, owner_uid)?;
-    let tmp = tmp_path(dir, profile);
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&tmp)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, store_path(dir, profile))?;
-        File::open(dir)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    let handle = open_store_dir(dir, true, owner_uid)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("the store directory could not be created"))?;
+    write_in(&handle, profile, content)
 }
 
-fn ensure_dir(dir: &Path, owner_uid: u32) -> io::Result<()> {
-    if let Some(parent) = dir.parent() {
-        fs::create_dir_all(parent)?;
+/// Write `content` into the pinned store directory `handle`: an exclusive 0600 temporary file
+/// (`openat(O_CREAT | O_EXCL | O_NOFOLLOW)` after an `unlinkat` of any leftover, so a planted
+/// symlink or file is removed, never followed), fsync, `renameat` over the store, fsync of the
+/// directory.
+fn write_in(handle: &Dir, profile: &ProfileId, content: &[u8]) -> io::Result<()> {
+    let tmp = tmp_name(profile);
+    handle.remove_file(&tmp)?;
+    let result = (|| {
+        let file = handle.create_file(&tmp, 0o600, content)?;
+        file.sync_all()?;
+        drop(file);
+        handle.rename(&tmp, &store_name(profile))?;
+        handle.sync()
+    })();
+    if result.is_err() {
+        let _ = handle.remove_file(&tmp);
     }
-    match fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
-    check_dir(dir, owner_uid).map_err(io::Error::other)
+    result
 }
 
 fn digest_of(profile: &ProfileId, view: &ProfileGrants) -> String {
@@ -804,7 +872,7 @@ pub fn rfc3339_utc(time: SystemTime) -> String {
 mod tests {
     use super::*;
 
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::time::{Duration, Instant};
 
     use passless_core::agent::protocol::GrantAction;
@@ -1099,8 +1167,149 @@ rule = "exact"
         let tmp = tempfile::tempdir().unwrap();
         let path = seed(tmp.path(), VALID, 0o600);
         let dir = path.parent().unwrap();
-        assert!(check_dir(dir, unsafe { libc::geteuid() }).is_ok());
+        assert!(
+            open_store_dir(dir, false, unsafe { libc::geteuid() })
+                .unwrap()
+                .is_some()
+        );
         assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
+    }
+
+    /// Review L4: a store directory that is a symlink is refused, for reads and for writes, and
+    /// nothing is written through it.
+    #[test]
+    fn a_symlinked_store_directory_disables_grants_and_is_never_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::set_permissions(elsewhere.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // A well-formed store behind the link would otherwise load.
+        fs::write(elsewhere.path().join(format!("{PROFILE}.toml")), VALID).unwrap();
+        fs::set_permissions(
+            elsewhere.path().join(format!("{PROFILE}.toml")),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join(GRANTED_RULES_DIR)).unwrap();
+
+        assert_disabled(tmp.path(), "symlink");
+        let store = open(tmp.path());
+        assert!(!store.is_granted(&profile(), "example.com"));
+
+        // Writes refuse as well, and the link target is untouched.
+        let err = write_atomically(
+            &tmp.path().join(GRANTED_RULES_DIR),
+            &profile(),
+            b"x",
+            own_uid(),
+        )
+        .expect_err("a symlinked store directory is not written through");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let policy = policy();
+        assert!(
+            store
+                .add(&policy, &profile(), escalation("other.example"), 64)
+                .is_err()
+        );
+        let names: Vec<_> = fs::read_dir(elsewhere.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![format!("{PROFILE}.toml")],
+            "nothing was created"
+        );
+        assert_eq!(
+            fs::read_to_string(elsewhere.path().join(format!("{PROFILE}.toml"))).unwrap(),
+            VALID
+        );
+    }
+
+    /// Review L4: a symlink planted where the temporary file goes is replaced by the exclusive
+    /// create, never followed, and the link's target is left alone.
+    #[test]
+    fn a_symlink_planted_at_the_temporary_file_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = seed(tmp.path(), VALID, 0o600);
+        let dir = path.parent().unwrap().to_path_buf();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(".agent.toml.tmp")).unwrap();
+
+        let store = open(tmp.path());
+        store
+            .add(&policy(), &profile(), escalation("other.example"), 64)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(open(tmp.path()).is_granted(&profile(), "other.example"));
+        assert!(!dir.join(".agent.toml.tmp").exists());
+    }
+
+    /// Review L4: a symlink planted at the store file itself is replaced by the rename (it is not
+    /// followed), so the write never lands in the link's target.
+    #[test]
+    fn a_symlink_planted_at_the_store_file_is_replaced_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(GRANTED_RULES_DIR);
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        let store_file = dir.join(format!("{PROFILE}.toml"));
+        std::os::unix::fs::symlink(&victim, &store_file).unwrap();
+        // Loading refuses the link.
+        assert_disabled(tmp.path(), "symlink");
+        // A direct write replaces the link with a regular file and leaves the target alone.
+        write_atomically(&dir, &profile(), VALID.as_bytes(), own_uid()).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(
+            !fs::symlink_metadata(&store_file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
+    }
+
+    #[test]
+    fn a_store_directory_that_is_a_plain_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(GRANTED_RULES_DIR), "not a directory").unwrap();
+        assert_disabled(tmp.path(), "not a directory");
+    }
+
+    #[test]
+    fn a_missing_store_directory_is_an_empty_store_and_is_created_on_the_first_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state").join("agent");
+        let store = open(&state);
+        assert!(
+            store
+                .profile(&profile())
+                .unwrap()
+                .disabled_reason()
+                .is_none()
+        );
+        store
+            .add(&policy(), &profile(), escalation("example.com"), 64)
+            .unwrap();
+        let dir = state.join(GRANTED_RULES_DIR);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+        assert!(open(&state).is_granted(&profile(), "example.com"));
+    }
+
+    #[test]
+    fn a_symlinked_state_directory_is_the_operators_choice_and_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-state");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("state-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = open(&link);
+        store
+            .add(&policy(), &profile(), escalation("example.com"), 64)
+            .unwrap();
+        assert!(real.join(GRANTED_RULES_DIR).join("agent.toml").is_file());
+        assert!(open(&link).is_granted(&profile(), "example.com"));
     }
 
     #[test]

@@ -313,9 +313,9 @@ impl Dir {
         Ok(contents)
     }
 
-    /// Open `name` read-only without following a symlink or blocking, and check that it is a
-    /// regular file owned by one of `owners`.
-    fn open_regular_file(&self, name: &str, owners: &[u32]) -> io::Result<File> {
+    /// Open `name` read-only without following a symlink (`ELOOP`) or blocking. The caller checks
+    /// the file type, owner and mode with `fstat` on the descriptor.
+    pub fn open_nofollow(&self, name: &str) -> io::Result<File> {
         let c_name = cstr(name)?;
         // SAFETY: `c_name` is NUL-terminated; the result is checked.
         let fd = unsafe {
@@ -329,7 +329,13 @@ impl Dir {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: a fresh descriptor this function owns.
-        let file = unsafe { File::from_raw_fd(fd) };
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Open `name` read-only without following a symlink or blocking, and check that it is a
+    /// regular file owned by one of `owners`.
+    fn open_regular_file(&self, name: &str, owners: &[u32]) -> io::Result<File> {
+        let file = self.open_nofollow(name)?;
         let st = fstat(file.as_raw_fd())?;
         if st.st_mode & libc::S_IFMT != libc::S_IFREG || !owners.contains(&st.st_uid) {
             return Err(io::Error::new(
