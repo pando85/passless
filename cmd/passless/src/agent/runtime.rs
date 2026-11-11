@@ -534,6 +534,25 @@ impl ProfileRuntime {
     }
 }
 
+/// Credentials across the distinct storages in `storages` (a storage shared by several profiles is
+/// counted once). The lock is taken with recovery: a poisoned lock must not silently drop a
+/// backend from the count.
+fn distinct_credential_count<'a>(
+    storages: impl Iterator<Item = &'a Arc<Mutex<Box<dyn CredentialStorage>>>>,
+) -> u32 {
+    let mut seen: Vec<*const Mutex<Box<dyn CredentialStorage>>> = Vec::new();
+    let mut total = 0usize;
+    for storage in storages {
+        let ptr = Arc::as_ptr(storage);
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        total += crate::storage::lock_shared_storage(storage).count_credentials();
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
 /// The storage kind a profile's operations use: a same-user profile shares the human backend, so it
 /// reports the human backend's kind; an isolated profile reports its own storage's kind (and the
 /// human kind if its storage is missing, which profile start-up rejects anyway).
@@ -1581,20 +1600,11 @@ impl AgentRuntime {
     /// Credentials across the distinct backends the configured profiles use (a same-user profile
     /// shares the human backend, which is counted once).
     fn total_credential_count(&self) -> u32 {
-        let mut seen: Vec<*const Mutex<Box<dyn CredentialStorage>>> = Vec::new();
-        let mut total = 0usize;
-        for profile in self.profiles.values() {
-            let storage = &profile.backend.credential_storage;
-            let ptr = Arc::as_ptr(storage);
-            if seen.contains(&ptr) {
-                continue;
-            }
-            seen.push(ptr);
-            if let Ok(guard) = storage.lock() {
-                total += guard.count_credentials();
-            }
-        }
-        u32::try_from(total).unwrap_or(u32::MAX)
+        distinct_credential_count(
+            self.profiles
+                .values()
+                .map(|profile| &profile.backend.credential_storage),
+        )
     }
 
     fn active_session_count(&self, profile_id: &ProfileId) -> usize {
@@ -2866,13 +2876,11 @@ impl AgentRuntime {
 
             match pin_storage {
                 Some(ps) => {
-                    let storage = ps.lock();
-                    match storage {
-                        Ok(s) => match s.load_pin_state() {
-                            Ok(state) => (true, state.is_pin_set()),
-                            Err(_) => (true, false),
-                        },
-                        Err(_) => (false, false),
+                    // Recovering: a poisoned lock must not report the PIN storage unavailable.
+                    let storage = crate::pin_storage::lock_pin_storage(&ps);
+                    match storage.load_pin_state() {
+                        Ok(state) => (true, state.is_pin_set()),
+                        Err(_) => (true, false),
                     }
                 }
                 None => (false, false),
@@ -4570,6 +4578,53 @@ fn find_credential_by_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A storage that only reports a credential count.
+    struct CountOnlyStorage(usize);
+
+    impl CredentialStorage for CountOnlyStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(soft_fido2::Error::Other)
+        }
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(soft_fido2::Error::Other)
+        }
+        fn read(&mut self, _id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(soft_fido2::Error::Other)
+        }
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _id: &[u8]) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn count_credentials(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// Review L4: the status counts read a poisoned storage lock with recovery instead of
+    /// skipping the backend, and count a shared storage once.
+    #[test]
+    fn the_credential_count_recovers_a_poisoned_storage_lock() {
+        let shared: Arc<Mutex<Box<dyn CredentialStorage>>> =
+            Arc::new(Mutex::new(Box::new(CountOnlyStorage(3))));
+        let other: Arc<Mutex<Box<dyn CredentialStorage>>> =
+            Arc::new(Mutex::new(Box::new(CountOnlyStorage(4))));
+        let poisoner = other.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic under the storage lock");
+        })
+        .join();
+        assert!(other.is_poisoned());
+
+        let count = distinct_credential_count([&shared, &shared, &other].into_iter());
+        assert_eq!(count, 7);
+    }
 
     // --- audit: the backend kind of a profile ---
 
