@@ -18,7 +18,11 @@
 //!
 //! A suppressed refusal is therefore never lost: it is counted and the count is written. The one
 //! gap is a daemon that is killed while a count is pending (fewer than [`SUMMARY_EVERY`] refusals
-//! per key); a clean exit that drops the session writes it. Served duplicates keep their own cap
+//! per key); a clean exit that drops the session writes it. A revoked session stays in the
+//! registry's tombstone ring after its flush, so a late use of its bearer is still audited; the
+//! registry sweeps those ledgers ([`RefusalLedger::flush_due`]), which writes a pending count one
+//! window after the key's first refusal without waiting for another one. A live session's counts
+//! wait for its end as described above. Served duplicates keep their own cap
 //! ([`super::session::MAX_AUDITED_SERVES_PER_KEY`]) and do not pass through the ledger.
 //!
 //! Locking (`LOCKING.md`): the ledger's mutex is a leaf at [`LockLevel::RefusalLedger`], below the
@@ -245,6 +249,31 @@ impl RefusalLedger {
         }
     }
 
+    /// Take the pending counts of every key whose window has ended at `now`. A revoked session is
+    /// kept in the tombstone ring to audit late use of its bearer, and `revoke` has already
+    /// flushed it, so a refusal counted after that would wait for another refusal of the same key
+    /// or for the session's eviction. The registry sweeps its tombstones with this instead
+    /// (`SignContextRegistry::flush_due_revoked_refusals`), so a pending count is written within
+    /// one window and one sweep interval of its refusal, with no further refusal needed. A key
+    /// refused again later starts a new window as usual.
+    pub fn drain_due(&self, now: Instant) -> Vec<Summary> {
+        let mut inner = lock_order::lock(&self.inner, LockLevel::RefusalLedger);
+        let mut summaries = Vec::new();
+        for (key, entry) in inner.entries.iter_mut() {
+            if now.saturating_duration_since(entry.window_start) >= REFUSAL_WINDOW {
+                summaries.extend(entry.take_summary(key));
+            }
+        }
+        summaries
+    }
+
+    /// Write the counts [`Self::drain_due`] takes.
+    pub fn flush_due(&self, now: Instant) {
+        for summary in self.drain_due(now) {
+            summary.write();
+        }
+    }
+
     /// Refusals counted and not yet written, over every key (tests and diagnostics).
     #[cfg(test)]
     pub fn pending(&self) -> u64 {
@@ -380,6 +409,33 @@ mod tests {
         assert!(summary["origin"].is_null(), "a summary names no origin");
         assert_eq!(accounted(&written), 1000);
         assert_eq!(rig.ledger.pending(), 0);
+    }
+
+    /// Review L5: a count that waits after the session's flush is written when its window ends,
+    /// without another refusal of the key.
+    #[test]
+    fn a_sweep_writes_a_pending_count_once_its_window_has_ended() {
+        let rig = Rig::new();
+        let start = Instant::now();
+        for _ in 0..(u64::from(FULL_RECORDS_PER_WINDOW) + 5) {
+            rig.refuse("unlisted.example", PolicyDenyReason::BearerRevoked, start);
+        }
+        assert_eq!(rig.ledger.pending(), 5);
+
+        // Inside the window nothing is due.
+        rig.ledger
+            .flush_due(start + REFUSAL_WINDOW - Duration::from_secs(1));
+        assert_eq!(rig.ledger.pending(), 5);
+        assert_eq!(rig.denies().len(), FULL_RECORDS_PER_WINDOW as usize);
+
+        // At the window's end the summary is written, once.
+        rig.ledger.flush_due(start + REFUSAL_WINDOW);
+        rig.ledger.flush_due(start + REFUSAL_WINDOW * 2);
+        let written = rig.denies();
+        assert_eq!(written.len(), FULL_RECORDS_PER_WINDOW as usize + 1);
+        assert_eq!(written.last().unwrap()["suppressed"], 5);
+        assert_eq!(rig.ledger.pending(), 0);
+        assert_eq!(accounted(&written), u64::from(FULL_RECORDS_PER_WINDOW) + 5);
     }
 
     #[test]

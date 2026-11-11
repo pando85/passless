@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -283,6 +283,10 @@ pub struct SignContextRegistry {
     registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
     revoked_registrations: Mutex<RevokedRegistrations>,
     revoked_signs: Mutex<RevokedSigns>,
+    /// When the registry was created; the base of [`REFUSAL_SWEEP_INTERVAL`] throttling.
+    created: Instant,
+    /// Milliseconds after `created` of the last tombstone sweep.
+    last_refusal_sweep_ms: AtomicU64,
 }
 
 /// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
@@ -294,6 +298,9 @@ pub struct RegistrationLeaseEntry {
     pub handler: Arc<RegisterHandler>,
     pub lease_id: Option<String>,
 }
+
+/// How often the runtime loop sweeps the revoked bearers' refusal ledgers.
+const REFUSAL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Most revoked bearers of each kind remembered so a late use can be refused and audited.
 const MAX_REVOKED_REGISTRATIONS: usize = 256;
@@ -451,6 +458,8 @@ impl SignContextRegistry {
             registration_entries: Mutex::new(HashMap::new()),
             revoked_registrations: Mutex::new(RevokedRegistrations::default()),
             revoked_signs: Mutex::new(RevokedSigns::default()),
+            created: Instant::now(),
+            last_refusal_sweep_ms: AtomicU64::new(0),
         }
     }
 
@@ -574,6 +583,48 @@ impl SignContextRegistry {
     /// A sign bearer that was revoked; used only to refuse and audit a late authentication.
     pub fn lookup_revoked_sign(&self, token: &str) -> Option<RevokedSign> {
         self.lock_revoked_signs().find(token).cloned()
+    }
+
+    /// Write the pending refusal counts of revoked bearers whose window has ended (review L5).
+    ///
+    /// `AgentSession::revoke` flushes a session's ledger once, but the tombstone keeps the
+    /// session alive to audit a late use of its bearer, and those late refusals are counted after
+    /// the flush. Without this sweep their summary would wait for another refusal of the same key
+    /// or for the tombstone's eviction. The runtime loop calls it; it does its work at most once
+    /// per [`REFUSAL_SWEEP_INTERVAL`].
+    pub fn flush_due_revoked_refusals(&self) {
+        let now = Instant::now();
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.created).as_millis())
+            .unwrap_or(u64::MAX);
+        let interval_ms = u64::try_from(REFUSAL_SWEEP_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_refusal_sweep_ms.load(Ordering::Acquire);
+        if elapsed_ms < last.saturating_add(interval_ms) {
+            return;
+        }
+        self.last_refusal_sweep_ms
+            .store(elapsed_ms, Ordering::Release);
+        self.flush_due_revoked_refusals_at(now);
+    }
+
+    /// The sweep itself. The ledgers are collected under each tombstone map's lock and written
+    /// after it is released: the audit gate is never reached under a registry lock.
+    fn flush_due_revoked_refusals_at(&self, now: Instant) {
+        let mut ledgers: Vec<Arc<super::refusal_ledger::RefusalLedger>> = Vec::new();
+        ledgers.extend(
+            self.lock_revoked_signs()
+                .entries
+                .values()
+                .map(|revoked| revoked.context.session.refusals().clone()),
+        );
+        ledgers.extend(
+            self.lock_revoked_registrations()
+                .entries
+                .values()
+                .map(|revoked| revoked.context.session.refusals().clone()),
+        );
+        for ledger in ledgers {
+            ledger.flush_due(now);
+        }
     }
 
     /// Whether a live (bound, not revoked) sign or registration bearer exists for `lease_id`.
@@ -5972,6 +6023,50 @@ pub(crate) mod tests {
             let deny = find_policy_events(&events);
             assert_eq!(deny[0]["action"], "authenticate");
             assert_eq!(deny[0]["rp_id"], "example.com");
+        }
+
+        /// Review L5: late refusals counted after the revocation's flush are written by the
+        /// registry's sweep once their window ends, without another refusal.
+        #[test]
+        fn the_sweep_writes_the_pending_count_of_a_revoked_bearer_without_a_further_refusal() {
+            let f = AuditTestFixture::default_allow();
+            let registry = SignContextRegistry::new();
+            let ctx = f.make_ctx();
+            let token = generate_bearer_token().unwrap();
+            registry
+                .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                .unwrap();
+            registry
+                .bind_lease(&token, "lease-sign".to_string())
+                .unwrap();
+            let epoch = f.policy_runtime.bump_revocation_epoch();
+            registry.revoke_stale_sessions(epoch);
+            let revoked = registry.lookup_revoked_sign(&token).expect("remembered");
+
+            let full = crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW as usize;
+            for _ in 0..full + 4 {
+                revoked.refuse(Some("example.com"));
+            }
+            let suppressed = |f: &AuditTestFixture| -> Vec<serde_json::Value> {
+                read_audit_events(&f.audit_dir)
+                    .into_iter()
+                    .filter(|e| e["kind"] == "policy.deny" && !e["suppressed"].is_null())
+                    .collect()
+            };
+            assert!(suppressed(&f).is_empty(), "counted, not yet written");
+
+            // Inside the window the sweep writes nothing.
+            registry.flush_due_revoked_refusals_at(Instant::now());
+            assert!(suppressed(&f).is_empty());
+
+            // Once the window has ended the summary is written, and only once.
+            let after = Instant::now() + crate::agent::refusal_ledger::REFUSAL_WINDOW;
+            registry.flush_due_revoked_refusals_at(after);
+            registry.flush_due_revoked_refusals_at(after + Duration::from_secs(60));
+            let written = suppressed(&f);
+            assert_eq!(written.len(), 1, "{written:?}");
+            assert_eq!(written[0]["suppressed"], 4);
+            assert_eq!(written[0]["reason"], "bearer_revoked");
         }
 
         #[test]

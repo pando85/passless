@@ -1451,6 +1451,8 @@ impl AgentRuntime {
             self.worker_tracker.reap_finished();
             self.reap_expired_sessions();
             self.prune_completed_sessions();
+            // Write the late-use refusal counts of revoked bearers whose window has ended.
+            self.sign_registry.flush_due_revoked_refusals();
 
             {
                 let mut browser_mgr = super::lock_order::lock(
