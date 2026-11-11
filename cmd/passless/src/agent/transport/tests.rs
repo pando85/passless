@@ -27,12 +27,12 @@ use crate::agent::audit::AuditGate;
 use crate::agent::audit::test_support::read_audit_events;
 use crate::agent::capacity::RequestLimiter;
 use crate::agent::grant::GrantRequestParams;
-use crate::agent::intent;
+use crate::agent::identity;
 use crate::agent::policy_engine::PolicyRuntime;
 use crate::agent::register::{RegisterContext, RegisterHandler};
 use crate::agent::session::{AgentSession, SessionBinding};
 use crate::agent::sign::tests::sign_handler_tests::{
-    MockClock, MockMonoClock, RecordingKeyProvider, WriteCountingStorage, rule, test_agent_config,
+    MockClock, RecordingKeyProvider, WriteCountingStorage, rule, test_agent_config,
     test_profile_config,
 };
 use crate::agent::sign::{
@@ -109,7 +109,6 @@ impl Fixture {
             PolicyRuntime::new(
                 &test_agent_config(profile_config),
                 Arc::new(MockClock::new()),
-                Arc::new(MockMonoClock::new()),
                 None,
             )
             .unwrap(),
@@ -126,7 +125,7 @@ impl Fixture {
             })
             .unwrap();
         let grant_id = policy_runtime
-            .admin_approve_grant(&request_id, &intent::admin_authority())
+            .admin_approve_grant(&request_id, &identity::admin_authority())
             .unwrap();
 
         Self {

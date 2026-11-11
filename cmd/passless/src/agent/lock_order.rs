@@ -31,6 +31,9 @@ pub enum LockLevel {
     Capacity = 55,
     /// A bearer session's replay and budget table.
     Session = 60,
+    /// A profile's granted-rules write mutex (`GrantedRulesStore`): held across the store file
+    /// write, its reload and the view swap; released before any epoch bump.
+    GrantedRulesFile = 64,
     /// One in-flight ceremony's outcome slot (join waiters park on its condvar).
     InFlight = 65,
     /// A session's key-use gate: read from the pre-key-use re-check to the end of key use, write
@@ -43,6 +46,8 @@ pub enum LockLevel {
     EpochKeyUse = 69,
     /// Every other `PolicyRuntime` lock. A policy guard is never held across another acquisition.
     Policy = 70,
+    /// The granted-rules store's loaded views, read by resolution. A leaf.
+    GrantedRulesView = 71,
     /// The sign transport's readiness registry (`transport::ReadinessRegistry`). A leaf: callers may
     /// hold the profile lifecycle lock and the browser manager while they read or wait on it.
     TransportReadiness = 72,
@@ -60,6 +65,7 @@ impl LockLevel {
         matches!(
             self,
             Self::Policy
+                | Self::GrantedRulesView
                 | Self::TransportReadiness
                 | Self::TransportConnection
                 | Self::TransportWrite
@@ -252,6 +258,26 @@ mod tests {
         let a = Mutex::new(1);
         let b = Mutex::new(2);
         let _policy = lock(&a, LockLevel::Policy);
+        let _escalation = lock(&b, LockLevel::Escalation);
+    }
+    #[test]
+    fn granted_rules_writer_may_swap_the_view() {
+        let writer = Mutex::new(());
+        let view = RwLock::new(());
+        let _writer = lock(&writer, LockLevel::GrantedRulesFile);
+        let _view = write(&view, LockLevel::GrantedRulesView);
+        assert_eq!(
+            held_levels(),
+            vec![LockLevel::GrantedRulesFile, LockLevel::GrantedRulesView]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn granted_rules_view_is_a_leaf() {
+        let view = RwLock::new(());
+        let b = Mutex::new(());
+        let _view = read(&view, LockLevel::GrantedRulesView);
         let _escalation = lock(&b, LockLevel::Escalation);
     }
 }

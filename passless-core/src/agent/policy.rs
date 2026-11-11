@@ -33,8 +33,10 @@ impl std::error::Error for PolicyError {}
 
 /// Bumped whenever the digest input changes (version 4: rule actions replace evidence tables, and
 /// the digest covers profile and rule `credential_selection`, the acknowledgements and the
-/// operation/concurrency limits).
-pub const CURRENT_POLICY_VERSION: u8 = 4;
+/// operation/concurrency limits; version 5: `max_granted_rules` and the escalation timeout and
+/// cooldown). Granted rules themselves are not in this digest: they have their own
+/// `grants_digest`, so a reload compares configuration only.
+pub const CURRENT_POLICY_VERSION: u8 = 5;
 const MAX_TTL: u64 = 86400 * 365;
 const MAX_CONCURRENT_GRANTS_LIMIT: u64 = 1000;
 
@@ -67,6 +69,12 @@ pub struct PolicyParams {
     /// The profile is listed in `agents.acknowledge_same_user_registration`.
     pub acknowledged_same_user_registration: bool,
     pub rules: Vec<AgentRpRule>,
+    /// Cap on the profile's persistent granted rules.
+    pub max_granted_rules: u64,
+    /// `agents.escalation_timeout` in seconds (0 when unset).
+    pub escalation_timeout: u64,
+    /// `agents.escalation_cooldown` in seconds.
+    pub escalation_cooldown: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +104,9 @@ pub struct Policy {
     pub acknowledged_global_same_user: bool,
     pub acknowledged_same_user_registration: bool,
     pub rules: Vec<AgentRpRule>,
+    pub max_granted_rules: u64,
+    pub escalation_timeout: u64,
+    pub escalation_cooldown: u64,
 }
 
 impl Policy {
@@ -142,6 +153,9 @@ impl Policy {
             acknowledged_global_same_user: params.acknowledged_global_same_user,
             acknowledged_same_user_registration: params.acknowledged_same_user_registration,
             rules: sorted_rules,
+            max_granted_rules: params.max_granted_rules,
+            escalation_timeout: params.escalation_timeout,
+            escalation_cooldown: params.escalation_cooldown,
         };
         policy.validate()?;
         Ok(policy)
@@ -178,6 +192,9 @@ impl Policy {
             browser_user: String::new(),
             browser_runtime_root: String::new(),
             rules: vec![],
+            max_granted_rules: 0,
+            escalation_timeout: 0,
+            escalation_cooldown: 0,
         })
     }
 
@@ -494,6 +511,18 @@ pub mod cbor {
                 encode_text(&policy.browser_runtime_root),
             ),
             ("rules".to_string(), encode_rules(&policy.rules)),
+            (
+                "max_granted_rules".to_string(),
+                encode_uint(policy.max_granted_rules),
+            ),
+            (
+                "escalation_timeout".to_string(),
+                encode_uint(policy.escalation_timeout),
+            ),
+            (
+                "escalation_cooldown".to_string(),
+                encode_uint(policy.escalation_cooldown),
+            ),
         ];
         encode_map_sorted(&entries)
     }
@@ -570,6 +599,9 @@ pub mod cbor {
             "acknowledged_global_same_user",
             "acknowledged_same_user_registration",
             "rules",
+            "max_granted_rules",
+            "escalation_timeout",
+            "escalation_cooldown",
         ];
         keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         keys
@@ -601,10 +633,10 @@ mod tests {
         Policy::new(&ProfileId::new("a").unwrap(), vec!["act".to_string()], 1, 1).unwrap()
     }
 
-    /// The policy map has 25 entries: one byte of length follows the map header (`0xb8`).
+    /// The policy map has 28 entries: one byte of length follows the map header (`0xb8`).
     fn assert_map_header(cbor: &[u8]) {
         assert_eq!(cbor[0], 0xb8, "map header with one length byte");
-        assert_eq!(cbor[1], 25, "map of 25 entries");
+        assert_eq!(cbor[1], 28, "map of 28 entries");
     }
 
     #[test]
@@ -1101,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_policy_version_constant() {
-        assert_eq!(CURRENT_POLICY_VERSION, 4);
+        assert_eq!(CURRENT_POLICY_VERSION, 5);
     }
 
     #[test]
@@ -1112,7 +1144,7 @@ mod tests {
     #[test]
     fn test_sorted_keys_complete() {
         let keys = cbor::sorted_keys_for_policy();
-        assert_eq!(keys.len(), 25);
+        assert_eq!(keys.len(), 28);
         for key in [
             "version",
             "profile_id",
@@ -1139,6 +1171,9 @@ mod tests {
             "acknowledged_global_same_user",
             "acknowledged_same_user_registration",
             "rules",
+            "max_granted_rules",
+            "escalation_timeout",
+            "escalation_cooldown",
         ] {
             assert!(keys.contains(&key), "missing policy key {key}");
         }
@@ -1170,8 +1205,11 @@ mod tests {
                 "max_session_ttl",
                 "storage_backend",
                 "browser_cdp_port",
+                "max_granted_rules",
                 "normalized_rp_ids",
                 "browser_cdp_expose",
+                "escalation_timeout",
+                "escalation_cooldown",
                 "browser_runtime_root",
                 "credential_selection",
                 "max_concurrent_grants",
@@ -1250,6 +1288,9 @@ mod tests {
             acknowledged_global_same_user: false,
             acknowledged_same_user_registration: false,
             rules: vec![rule("example.com", RuleAction::Allow, RuleAction::Deny)],
+            max_granted_rules: 64,
+            escalation_timeout: 0,
+            escalation_cooldown: 600,
         }
     }
 
@@ -1314,6 +1355,9 @@ mod tests {
             ("acknowledged_same_user_registration", |p| {
                 p.acknowledged_same_user_registration = true
             }),
+            ("max_granted_rules", |p| p.max_granted_rules += 1),
+            ("escalation_timeout", |p| p.escalation_timeout = 300),
+            ("escalation_cooldown", |p| p.escalation_cooldown += 1),
             ("rules: add a rule", |p| {
                 p.rules
                     .push(rule("added.example", RuleAction::Allow, RuleAction::Deny))
@@ -1417,13 +1461,16 @@ mod tests {
         assert!(!policy.acknowledged_global_same_user);
         assert!(!policy.acknowledged_same_user_registration);
         assert!(policy.rules.is_empty());
-        assert_eq!(policy.version, 4);
+        assert_eq!(policy.max_granted_rules, 0);
+        assert_eq!(policy.escalation_timeout, 0);
+        assert_eq!(policy.escalation_cooldown, 0);
+        assert_eq!(policy.version, 5);
     }
 
     #[test]
     fn policy_rejects_previous_version() {
         let mut policy = test_policy();
-        policy.version = 3;
-        assert_eq!(policy.validate(), Err(PolicyError::InvalidVersion(3)));
+        policy.version = 4;
+        assert_eq!(policy.validate(), Err(PolicyError::InvalidVersion(4)));
     }
 }

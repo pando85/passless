@@ -23,6 +23,16 @@ audit_path = "/var/lib/passless-agent/audit"
   - `max_requests_per_connection` (default 8): per connection.
 
   Each is between 1 and 1024.
+- `notify_user` (user name, optional): the user whose session bus receives escalation prompts
+  (ADR 0014 section 8.2). A root daemon needs it for `request` rules and it must differ from every
+  `principal_user` and `browser_user`; a non-root daemon may only name its own user. Restart-only.
+- `state_dir` (absolute path, optional): persistent agent state, such as the granted-rules store
+  `<state_dir>/granted-rules/<profile>.toml`. Default `$XDG_STATE_HOME/passless/agent`, or
+  `/var/lib/passless-agent` for a root daemon. Restart-only.
+- `escalation_timeout` (seconds, optional): caps how long a ceremony waits for an escalation
+  decision; unset, the ceremony's own timeout applies. 1 to 72000.
+- `escalation_cooldown` (seconds, default 600): how long a denied or expired escalation key is
+  denied without a prompt. 60 to 86400 (debug builds accept 1).
 
 ## Profile structure
 
@@ -53,6 +63,7 @@ register = "deny"
 | `max_grant_ttl` | Legacy/compatibility grant bound where used by the isolated ceremony path |
 | `max_session_ttl` | Maximum browser/principal authority lifetime in seconds |
 | `max_operations` | Shared session operation budget; must be 1..4096 |
+| `max_granted_rules` | Most persistent granted rules (escalation approvals) of the profile; default 64, 1..256 |
 | `credential_selection` | `single`, `first-matching`, `newest`, or `credential:<ref>` |
 | `human_verification_prompt` | `always` (default) or `when-required` |
 | `start_url` | Optional HTTPS start URL |
@@ -274,7 +285,8 @@ The experimental `rp_ids`, `registration_allowed`, and `require_uv` fields remai
 `agent-admin policy reload` re-reads and validates the configuration file the daemon started from.
 
 - **Invalid file.** If the file cannot be read or fails validation, the reload is rejected with an error. The current policy stays in force.
-- **Restart-only changes.** A change to `enabled`, `audit_path`, `limits`, the set of profiles, or a profile's `mode`, `principal_user`, `browser_user`, `storage`, `browser_scope` or `max_concurrent_sessions` is rejected the same way, because it needs a restart.
+- **Restart-only changes.** A change to `enabled`, `audit_path`, `limits`, `notify_user`,
+  `state_dir`, the set of profiles, or a profile's `mode`, `principal_user`, `browser_user`, `storage`, `browser_scope` or `max_concurrent_sessions` is rejected the same way, because it needs a restart.
 - **Unchanged policy.** A reload whose effective policy is unchanged (same digest) changes nothing, and live sessions continue.
 - **Changed policy.** A reload that changes the effective policy revokes every agent session and closes the managed browsers. Operations already in flight fail before key use.
 

@@ -31,6 +31,9 @@ fn base_params() -> PolicyParams {
         acknowledged_global_same_user: false,
         acknowledged_same_user_registration: false,
         rules: vec![],
+        max_granted_rules: 64,
+        escalation_timeout: 0,
+        escalation_cooldown: 600,
     }
 }
 
@@ -38,7 +41,7 @@ fn base_params() -> PolicyParams {
 fn policy_from_params_round_trip() {
     let params = base_params();
     let policy = Policy::from_params(params.clone()).unwrap();
-    assert_eq!(policy.version, 4);
+    assert_eq!(policy.version, 5);
     assert_eq!(policy.profile_id, "testprofile");
     assert_eq!(policy.mode, "isolated");
     assert_eq!(policy.normalized_rp_ids, vec!["example.com"]);

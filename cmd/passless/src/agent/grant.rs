@@ -12,7 +12,7 @@ use passless_core::agent::{
 use super::audit::AuditGate;
 use super::audit_events::{GrantApproveBuilder, GrantRequestBuilder};
 use super::browser::Clock;
-use super::intent::AdminAuthority;
+use super::identity::AdminAuthority;
 
 const GRANT_STATE_ACTIVE: u8 = 0;
 const GRANT_STATE_REVOKED: u8 = 1;
@@ -1131,7 +1131,7 @@ mod tests {
         creds: Vec<CredentialRef>,
         ttl: u64,
     ) -> GrantId {
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let req_id = registry
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
@@ -1403,7 +1403,7 @@ mod tests {
             60,
         );
 
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let state = registry.revoke_grant(&gid, &authority).unwrap();
         assert_eq!(state, GrantState::Revoked);
         assert_eq!(
@@ -1417,7 +1417,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let gid = request_and_approve(
             &mut registry,
             &session,
@@ -1437,7 +1437,7 @@ mod tests {
     fn test_revocation_of_nonexistent() {
         let clock = test_clock();
         let registry = make_registry(&clock);
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let fake_id = GrantId::new();
         assert!(matches!(
             registry.revoke_grant(&fake_id, &authority),
@@ -1610,7 +1610,7 @@ mod tests {
         let session = test_session_id();
         let cred = test_cred(b"c1");
 
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let req_id = registry
             .request_grant(GrantRequestParams {
                 profile_id: ProfileId::new("profile-a").unwrap(),
@@ -1637,7 +1637,7 @@ mod tests {
             None,
         );
 
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let req_id2 = other_registry
             .request_grant(GrantRequestParams {
                 profile_id: ProfileId::new("profile-b").unwrap(),
@@ -1866,7 +1866,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         let req_id = registry
             .request_grant(GrantRequestParams {
@@ -1894,7 +1894,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         let req_id = registry
             .request_grant(GrantRequestParams {
@@ -1949,7 +1949,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let cred = test_cred(b"c1");
         let gid = request_and_approve(
             &mut registry,
@@ -2143,7 +2143,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         assert_eq!(registry.grant_count(), 0);
         assert_eq!(registry.active_count(), 0);
@@ -2357,7 +2357,7 @@ mod tests {
         );
 
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         let req_id = registry
             .request_dynamic_grant(GrantRequestParams {

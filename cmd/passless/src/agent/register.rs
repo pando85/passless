@@ -818,7 +818,6 @@ mod tests {
 
     use crate::agent::audit::{AuditGate, test_support::read_audit_events};
     use crate::agent::browser::SystemClock;
-    use crate::agent::intent::SystemClock as MonotonicSystemClock;
     use crate::storage::CredentialStorage;
     use passless_core::agent::config::ANY_RP_ID as WILDCARD_RP_ID;
     use passless_core::agent::{
@@ -929,6 +928,7 @@ mod tests {
 
     fn profile_with_rules(rules: Vec<AgentRpRule>) -> AgentProfileConfig {
         AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
@@ -1049,6 +1049,10 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert(profile_id.as_str().to_string(), profile_config);
         AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -1073,7 +1077,6 @@ mod tests {
             PolicyRuntime::new(
                 &agent_config_for(&profile_id, profile_config),
                 Arc::new(SystemClock),
-                Arc::new(MonotonicSystemClock::new()),
                 None,
             )
             .unwrap(),
@@ -2089,7 +2092,7 @@ mod tests {
             .unwrap();
         let grant_id = f
             .policy_runtime
-            .admin_approve_grant(&request, &crate::agent::intent::admin_authority())
+            .admin_approve_grant(&request, &crate::agent::identity::admin_authority())
             .unwrap();
         ctx.session.bind_grant(grant_id).unwrap();
         let err = f.make_handler().register(&ctx, &f.make_req()).unwrap_err();

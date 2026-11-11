@@ -2358,7 +2358,7 @@ pub(crate) mod tests {
         use crate::agent::audit::AuditGate;
         use crate::agent::browser;
         use crate::agent::grant::GrantRequestParams;
-        use crate::agent::intent;
+        use crate::agent::identity;
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::{CredentialFilter, CredentialStorage};
         use passless_core::agent::{
@@ -2401,27 +2401,6 @@ pub(crate) mod tests {
             }
             fn monotonic_secs(&self) -> u64 {
                 self.inner.lock().unwrap().offset.as_secs()
-            }
-        }
-
-        pub struct MockMonoClock {
-            inner: Mutex<MockClockInner>,
-        }
-        impl MockMonoClock {
-            pub fn new() -> Self {
-                Self {
-                    inner: Mutex::new(MockClockInner {
-                        base: Instant::now(),
-                        offset: Duration::ZERO,
-                    }),
-                }
-            }
-        }
-        impl intent::MonotonicClock for MockMonoClock {
-            fn now(&self) -> intent::MonotonicTime {
-                let inner = self.inner.lock().unwrap();
-                let elapsed = inner.offset;
-                intent::MonotonicTime::from_millis(elapsed.as_millis() as u64)
             }
         }
 
@@ -2590,6 +2569,7 @@ pub(crate) mod tests {
             selection: CredentialSelection,
         ) -> AgentProfileConfig {
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2616,6 +2596,10 @@ pub(crate) mod tests {
             let mut profiles = BTreeMap::new();
             profiles.insert("test-profile".to_string(), profile_config);
             AgentConfig {
+                notify_user: None,
+                state_dir: None,
+                escalation_timeout: None,
+                escalation_cooldown: 600,
                 limits: Default::default(),
                 enabled: true,
                 profiles,
@@ -2686,12 +2670,9 @@ pub(crate) mod tests {
                 let agent_config = test_agent_config(profile_config);
 
                 let clock = Arc::new(MockClock::new());
-                let mono_clock = Arc::new(MockMonoClock::new());
 
-                let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
-                        .unwrap(),
-                );
+                let policy_runtime =
+                    Arc::new(PolicyRuntime::new(&agent_config, clock.clone(), None).unwrap());
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
                 let endpoint_id = passless_core::agent::EndpointId::new();
@@ -2708,7 +2689,7 @@ pub(crate) mod tests {
                     })
                     .unwrap();
 
-                let authority = intent::admin_authority();
+                let authority = identity::admin_authority();
                 let grant_id = policy_runtime
                     .admin_approve_grant(&grant_req_id, &authority)
                     .unwrap();
@@ -2827,7 +2808,7 @@ pub(crate) mod tests {
                 .unwrap();
             let dynamic_grant_id = f
                 .policy_runtime
-                .admin_approve_grant(&grant_request, &intent::admin_authority())
+                .admin_approve_grant(&grant_request, &identity::admin_authority())
                 .unwrap();
 
             let new_credential_id = vec![2u8; 32];
@@ -3108,7 +3089,7 @@ pub(crate) mod tests {
 
         use crate::agent::audit::AuditGate;
         use crate::agent::grant::GrantRequestParams;
-        use crate::agent::intent;
+        use crate::agent::identity;
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::CredentialStorage;
 
@@ -3300,11 +3281,10 @@ pub(crate) mod tests {
                 let agent_config = test_agent_config(Self::profile_config(&spec));
 
                 let clock = Arc::new(MockClock::new());
-                let mono_clock = Arc::new(MockMonoClock::new());
                 let granted_rules = Arc::new(ToggleGrants::default());
 
                 let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
+                    PolicyRuntime::new(&agent_config, clock.clone(), None)
                         .unwrap()
                         .with_grant_source(granted_rules.clone()),
                 );
@@ -3368,7 +3348,7 @@ pub(crate) mod tests {
                     policy_runtime.admin_request_grant(params).unwrap()
                 };
                 policy_runtime
-                    .admin_approve_grant(&request_id, &intent::admin_authority())
+                    .admin_approve_grant(&request_id, &identity::admin_authority())
                     .unwrap()
             }
 
@@ -5059,7 +5039,6 @@ pub(crate) mod tests {
                     PolicyRuntime::new(
                         &sign_handler_tests::test_agent_config(profile_config),
                         clock,
-                        Arc::new(sign_handler_tests::MockMonoClock::new()),
                         None,
                     )
                     .unwrap(),

@@ -130,20 +130,20 @@ test_fault_category_includes_audit_enospc() {
     fi
 }
 
-test_fault_category_includes_intent_races() {
-    log_test "fault categories include intent/grant race tests"
+test_fault_category_includes_grant_races() {
+    log_test "fault categories include grant race tests"
     setup_env
     local found=false
     for spec in "${AV_FAULT_RUST_CATEGORIES[@]}"; do
-        if [[ "$spec" == *"intent"* ]] && [[ "$spec" == *"race"* ]]; then
+        if [[ "$spec" == *"grant"* ]] && [[ "$spec" == *"race"* ]]; then
             found=true
             break
         fi
     done
     if [[ "$found" == "true" ]]; then
-        log_pass "intent/grant race category present"
+        log_pass "grant race category present"
     else
-        log_fail "intent/grant race category missing"
+        log_fail "grant race category missing"
     fi
 }
 
@@ -329,7 +329,7 @@ main() {
     test_fault_categories_defined
     test_fault_category_names_unique
     test_fault_category_includes_audit_enospc
-    test_fault_category_includes_intent_races
+    test_fault_category_includes_grant_races
     test_fault_categories_exclude_agent_endpoints
     test_fault_category_includes_browser_cleanup
     test_fault_category_includes_malformed_ipc

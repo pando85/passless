@@ -16,8 +16,8 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    acquisitions are tracked by `lock_order.rs`.
 2. **Policy locks are leaves.** No policy guard is held across any other acquisition, including
    another policy lock. `PolicyRuntime` helpers that touch several of its maps take them one after
-   another and release each before the next (`invalidate_ceremony`, `abandon_pending`,
-   `principal_cancel_pending`, `cleanup_expired_pending`, `cancel_pending_for_session`, `reload`).
+   another and release each before the next (`abandon_pending`, `principal_cancel_pending`,
+   `cleanup_expired_pending`, `cancel_pending_for_session`, `principal_exit`, `reload`).
    The only policy lock held across others is `reload_lock`, which ranks below them.
 3. **No lock across a wait on a human, an escalation or a join.** A joined duplicate waits on its
    in-flight slot's condvar holding no other lock. P7's escalation wait must hold no lock either:
@@ -58,11 +58,13 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 50 T | `SignContextRegistry` maps: `entries`, `registration_entries`, `revoked_registrations` | `sign.rs` | They never nest. Each guard is released before the next map is locked and before a session is revoked. |
 | 55 T | `RequestLimiter::profiles` | `capacity.rs` | Per-profile request counters; a short section with nothing nested. |
 | 60 T | `AgentSession::state` (replay table and budget) | `session.rs` | Taken by `claim`, `record_completion` and `operations_used`. Never held across the in-flight slot. |
+| 64 T | `GrantedRulesStore::writers[profile]` | `granted_rules.rs` | One per profile. Held across the store file write, its reload and the view swap (71); released before the grant or revocation epoch is bumped. |
 | 65 T | `InFlight::outcome` and its condvar | `session.rs` | Joined duplicates park here, holding nothing else. The original publishes here first and only then records completion in the session table. |
 | 66 T | `AgentSession::key_use` gate (`RwLock`) | `session.rs` | Rule 6. Read by a ceremony from the re-check to the end of key use; write by `AgentSession::revoke` (called after registry guards are released or, in `revoke_all`, under them). |
 | 68 T | `PolicyRuntime::reload_lock` | `policy_engine.rs` | Serializes reloads. It is held across the epoch gate and the policy locks of rank 70. |
 | 69 T | `PolicyRuntime::key_use_gate` (`RwLock`) | `policy_engine.rs` | Rule 6. Read by a ceremony after its session gate; write by `bump_revocation_epoch` (under `reload_lock` on a reload). |
-| 70 T | `PolicyRuntime`: `current` (`RwLock`), `intents`, `grants`, `pending`, `pending_requests` | `policy_engine.rs` | Leaves (rule 2). `grants` may call the audit gate. |
+| 70 T | `PolicyRuntime`: `current` (`RwLock`), `grants`, `pending_requests` | `policy_engine.rs` | Leaves (rule 2). `grants` may call the audit gate. |
+| 71 T | `GrantedRulesStore::views` (`RwLock`) | `granted_rules.rs` | A leaf. Read by resolution (after the policy guard of rank 70 is released) and by the admin `grants` handlers; written by a store write under its writer (64). |
 | 72 T | `ReadinessRegistry::entries` and its condvar | `transport/readiness.rs` | A leaf. The hello path records into it and the launch path reads or waits on it (`status`, `wait_attached`), possibly holding `lifecycle_lock` (10) and `browser_manager` (30). Waiters park on its condvar holding nothing else. The hello path never takes the lifecycle lock or the browser manager. |
 | 74 T | Sign transport: `Shared::connections` and each `Connection::in_flight` | `transport/mod.rs` | Leaves; they never nest with each other. Short map sections only: a connection to supersede is cloned out before it is closed. |
 | 76 T | A transport connection's write mutex (`Connection::writer`) | `transport/mod.rs` | A leaf. Held across one frame write, bounded by the 5 s write timeout. `closed` is set under it, so no frame follows a close. |
@@ -121,6 +123,12 @@ lifecycle lock and then follows steps 4 and 5. The runtime loop reads the readin
 under `browser_manager` to find degraded leases (`poll_interception`), then records their audit
 events (90).
 
+**Granted rules** (`GrantedRulesStore::add`, `revoke`, `clear`). The profile's writer (64) is
+held across the file write; under it the view is read and then swapped (71), one at a time. The
+writer is released before `bump_grant_epoch` (an atomic) or `bump_revocation_epoch` (the epoch
+gate, 69). After a revoke or clear the admin handler revokes stale sessions and closes browsers
+exactly as a reload does (steps 4 and 5 below).
+
 **Reload** (`handle_reload_policy`) takes these locks in this order:
 
 1. `agent_config` write (45);
@@ -142,7 +150,8 @@ events (90).
   key provider, after the operation lock is released.
 - **Revocation between re-check and key use** (P5 review M1). The key-use gates (rule 6).
 - **Nested policy locks.** `pending` and `pending_requests` were held while `intents` and `grants`
-  were locked. These policy locks are now flat.
+  were locked. These policy locks are now flat (`intents` and `pending` were removed with the
+  principal intent protocol in P7).
 
 ## Known bounded waits (not deadlocks)
 

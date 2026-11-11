@@ -630,6 +630,7 @@ mod tests {
         use passless_core::agent::AgentMode;
 
         let profile = AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
@@ -670,6 +671,7 @@ mod tests {
         use passless_core::agent::AgentMode;
 
         let profile = AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,

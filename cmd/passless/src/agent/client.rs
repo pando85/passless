@@ -496,7 +496,6 @@ impl PrincipalClient {
 }
 
 pub enum WaitTarget {
-    Intent,
     Delegation,
 }
 
@@ -1079,7 +1078,7 @@ mod tests {
     fn test_wait_with_poll_immediate_success() {
         let req_id = passless_core::agent::PendingRequestId::new();
         let result = wait_with_poll(
-            WaitTarget::Intent,
+            WaitTarget::Delegation,
             &req_id,
             Some(Duration::from_secs(5)),
             Some(Duration::from_millis(10)),
@@ -1107,7 +1106,7 @@ mod tests {
         let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let counter_clone = counter.clone();
         let result = wait_with_poll(
-            WaitTarget::Intent,
+            WaitTarget::Delegation,
             &req_id,
             Some(Duration::from_secs(5)),
             Some(Duration::from_millis(10)),

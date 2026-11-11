@@ -241,6 +241,10 @@ pub enum AuditPayload {
     #[serde(rename = "prompt.error")]
     PromptError(PromptErrorMeta),
 
+    /// An operator revoked persistent granted rules (ADR 0014 section 8.4).
+    #[serde(rename = "granted_rule.revoke")]
+    GrantedRuleRevoke(GrantedRuleRevokeMeta),
+
     #[serde(rename = "admin.profile_enable")]
     AdminProfileEnable(AdminProfileEnableMeta),
     #[serde(rename = "admin.profile_disable")]
@@ -323,6 +327,7 @@ impl AuditPayload {
             Self::PromptDeny(_) => "prompt.deny",
             Self::PromptTimeout(_) => "prompt.timeout",
             Self::PromptError(_) => "prompt.error",
+            Self::GrantedRuleRevoke(_) => "granted_rule.revoke",
             Self::AdminProfileEnable(_) => "admin.profile_enable",
             Self::AdminProfileDisable(_) => "admin.profile_disable",
             Self::AdminProfileDisableRequest(_) => "admin.profile_disable_request",
@@ -920,6 +925,15 @@ pub struct PromptErrorMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantedRuleRevokeMeta {
+    profile_id: ProfileId,
+    /// The revoked RP; absent when every granted rule of the profile was cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rp_id: Option<String>,
+    revoked: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminProfileEnableMeta {
     profile_id: ProfileId,
 }
@@ -1465,126 +1479,6 @@ impl BrowserControlRequestBuilder {
                 outcome: self.outcome,
             },
         ))
-    }
-}
-
-pub struct IntentCreateBuilder {
-    intent_id: IntentId,
-    profile_id: ProfileId,
-    action: AuditAction,
-}
-
-impl IntentCreateBuilder {
-    pub fn new(intent_id: IntentId, profile_id: ProfileId, action: AuditAction) -> Self {
-        Self {
-            intent_id,
-            profile_id,
-            action,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentCreate(IntentCreateMeta {
-            intent_id: self.intent_id,
-            profile_id: self.profile_id,
-            action: self.action,
-        }))
-    }
-}
-
-pub struct IntentApproveBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentApproveBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentApprove(IntentApproveMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentDenyBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentDenyBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentDeny(IntentDenyMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentCancelBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentCancelBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentCancel(IntentCancelMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentClaimBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentClaimBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentClaim(IntentClaimMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentConsumeBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentConsumeBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentConsume(IntentConsumeMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentExpireBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentExpireBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentExpire(IntentExpireMeta {
-            intent_id: self.intent_id,
-        }))
     }
 }
 
@@ -2311,6 +2205,30 @@ impl PromptErrorBuilder {
     }
 }
 
+pub struct GrantedRuleRevokeBuilder {
+    profile_id: ProfileId,
+    rp_id: Option<String>,
+    revoked: u32,
+}
+
+impl GrantedRuleRevokeBuilder {
+    pub fn new(profile_id: ProfileId, rp_id: Option<String>, revoked: usize) -> Self {
+        Self {
+            profile_id,
+            rp_id,
+            revoked: u32::try_from(revoked).unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::GrantedRuleRevoke(GrantedRuleRevokeMeta {
+            profile_id: self.profile_id,
+            rp_id: self.rp_id,
+            revoked: self.revoked,
+        }))
+    }
+}
+
 pub struct AdminProfileEnableBuilder {
     profile_id: ProfileId,
 }
@@ -2561,6 +2479,17 @@ mod tests {
         CredentialRef::with_default_domain(b"test-credential-id")
     }
 
+    /// An `intent.*` record as written before the intent protocol was removed (P7). Nothing
+    /// emits these any more; the payload variants stay so that old logs still deserialize.
+    fn historic_intent_event(kind: &str, iid: &IntentId, pid: Option<&ProfileId>) -> AuditEvent {
+        let mut payload = serde_json::json!({ "kind": kind, "intent_id": iid });
+        if let Some(pid) = pid {
+            payload["profile_id"] = serde_json::to_value(pid).unwrap();
+            payload["action"] = serde_json::json!("register");
+        }
+        AuditEvent::new(serde_json::from_value(payload).unwrap())
+    }
+
     fn all_test_events() -> Vec<AuditEvent> {
         let pid = test_profile_id();
         let eid = test_endpoint_id();
@@ -2599,19 +2528,20 @@ mod tests {
                 InterceptionAuditState::Degraded,
             )
             .build(),
-            IntentCreateBuilder::new(iid.clone(), pid.clone(), AuditAction::Register).build(),
-            IntentApproveBuilder::new(iid.clone()).build(),
-            IntentDenyBuilder::new(iid.clone()).build(),
-            IntentCancelBuilder::new(iid.clone()).build(),
-            IntentClaimBuilder::new(iid.clone()).build(),
-            IntentConsumeBuilder::new(iid.clone()).build(),
-            IntentExpireBuilder::new(iid.clone()).build(),
+            historic_intent_event("intent.create", &iid, Some(&pid)),
+            historic_intent_event("intent.approve", &iid, None),
+            historic_intent_event("intent.deny", &iid, None),
+            historic_intent_event("intent.cancel", &iid, None),
+            historic_intent_event("intent.claim", &iid, None),
+            historic_intent_event("intent.consume", &iid, None),
+            historic_intent_event("intent.expire", &iid, None),
             GrantRequestBuilder::new(&req_id, pid.clone(), vec!["example.com".to_string()]).build(),
             GrantApproveBuilder::new(gid.clone(), pid.clone(), 300).build(),
             GrantRevokeBuilder::new(gid.clone()).build(),
             GrantExpireBuilder::new(gid.clone()).build(),
             GrantClaimBuilder::new(gid.clone(), &cer_id).build(),
             GrantConsumeBuilder::new(gid.clone(), &cer_id).build(),
+            GrantedRuleRevokeBuilder::new(pid.clone(), Some("example.com".to_string()), 1).build(),
             PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com").build(),
             PolicyDenyBuilder::new(
                 pid.clone(),
@@ -2849,12 +2779,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 54);
+        assert_eq!(events.len(), 55);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 54, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 55, "duplicate kind names detected");
     }
 
     #[test]
@@ -3025,6 +2955,7 @@ mod tests {
             "grant.expire",
             "grant.claim",
             "grant.consume",
+            "granted_rule.revoke",
             "policy.allow",
             "policy.deny",
             "policy.replay_served",

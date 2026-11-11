@@ -30,7 +30,7 @@ use super::audit_events::{
 };
 use super::backend::CredentialBackendHandle;
 use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
-use super::intent::SystemClock as IntentSystemClock;
+use super::granted_rules::GrantedRulesStore;
 use super::ipc::{AdminHandler, IpcServer, PrincipalHandler, ProfileAccess, RuntimeDir};
 use super::launcher::{
     PrincipalSession, SessionCapability, SpawnConfig, dup_fd_cloexec, spawn_principal,
@@ -94,7 +94,36 @@ struct RequestDelegationParams<'a> {
     max_session_ttl: u64,
     principal_reason: Option<String>,
     profile: &'a ProfileRuntime,
-    session_digest: &'a super::intent::ProcessIdentityDigest,
+    session_digest: &'a super::identity::ProcessIdentityDigest,
+}
+
+/// Open the granted-rules store under the effective `agents.state_dir`. Without a state directory
+/// every profile's grants are disabled (fail closed).
+fn open_granted_rules(agent_config: &AgentConfig) -> GrantedRulesStore {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let profiles = agent_config
+        .profiles
+        .keys()
+        .filter_map(|name| ProfileId::new(name.as_str()).ok());
+    match agent_config.effective_state_dir(euid) {
+        Some(state_dir) => GrantedRulesStore::open(&state_dir, profiles),
+        None => GrantedRulesStore::disabled(
+            profiles,
+            "no agents.state_dir and no home directory to derive it from",
+        ),
+    }
+}
+
+fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> ProtocolError {
+    use super::granted_rules::GrantStoreError;
+    let code = match &error {
+        GrantStoreError::UnknownProfile(_) | GrantStoreError::NotFound => ErrorCode::NotFound,
+        GrantStoreError::InvalidRpId(_) => ErrorCode::BadRequest,
+        GrantStoreError::Unavailable(_) | GrantStoreError::CapReached(_) => ErrorCode::Conflict,
+        GrantStoreError::Io(_) => ErrorCode::Internal,
+    };
+    ProtocolError::new(code, error.to_string(), RecommendedAction::FixRequest)
 }
 
 /// Re-read and validate the configuration file, check it can replace `current` without a restart,
@@ -523,7 +552,7 @@ pub struct ManagedPrincipalSession {
     pub session_id: PrincipalSessionId,
     pub profile_id: ProfileId,
     pub session: PrincipalSession,
-    pub process_digest: super::intent::ProcessIdentityDigest,
+    pub process_digest: super::identity::ProcessIdentityDigest,
     pub created_at: Instant,
     pub deadline: Instant,
     pub client_pid: i32,
@@ -575,6 +604,9 @@ pub struct AgentRuntime {
     sign_uid_sockets: HashMap<u32, Result<PathBuf, String>>,
     /// Interception readiness per bearer, reported by the extension worker's hello (plan D6.1).
     sign_readiness: Arc<ReadinessRegistry>,
+    /// The persistent granted-rules store (ADR 0014 section 8.4), also installed as the policy
+    /// runtime's grant source.
+    granted_rules: Arc<GrantedRulesStore>,
 }
 
 impl AgentRuntime {
@@ -623,8 +655,6 @@ impl AgentRuntime {
         let _startup_mono = Instant::now();
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let monotonic_clock: Arc<dyn super::intent::MonotonicClock> =
-            Arc::new(IntentSystemClock::new());
 
         let audit_path = agent_config.audit_path.as_ref().ok_or_else(|| {
             RuntimeError::Config("agents.audit_path is required when agent is enabled".into())
@@ -637,14 +667,13 @@ impl AgentRuntime {
         let start_event = DaemonStartBuilder::new(std::process::id(), BackendKind::Local).build();
         let _ = audit_gate.record(start_event);
 
+        let granted_rules = Arc::new(open_granted_rules(agent_config));
         let policy_runtime = Arc::new(
-            PolicyRuntime::new(
-                agent_config,
-                clock.clone(),
-                monotonic_clock.clone(),
-                Some(audit_gate.clone()),
-            )
-            .map_err(|e| RuntimeError::Policy(format!("failed to create policy runtime: {}", e)))?,
+            PolicyRuntime::new(agent_config, clock.clone(), Some(audit_gate.clone()))
+                .map_err(|e| {
+                    RuntimeError::Policy(format!("failed to create policy runtime: {}", e))
+                })?
+                .with_grant_source(granted_rules.clone()),
         );
 
         let browser_manager =
@@ -1149,6 +1178,7 @@ impl AgentRuntime {
             sign_socket_path,
             sign_uid_sockets,
             sign_readiness,
+            granted_rules,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -1897,8 +1927,8 @@ impl AgentRuntime {
             .unwrap_or(3600);
         let deadline = now + Duration::from_secs(ttl_secs);
 
-        let process_digest = super::intent::ProcessIdentityDigest::compute_from_session_identity(
-            &super::intent::SessionIdentityParams {
+        let process_digest = super::identity::ProcessIdentityDigest::compute_from_session_identity(
+            &super::identity::SessionIdentityParams {
                 uid: session.identity.uid,
                 gid: session.identity.gid,
                 pid: session.identity.pid,
@@ -2218,89 +2248,6 @@ impl AgentRuntime {
         }
     }
 
-    fn handle_show_intent(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        _profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        if status.kind != super::policy_engine::PendingRequestKind::IsolatedIntent {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not an intent",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        Ok(PrincipalResponse::IntentStatus {
-            request_id: request_id.clone(),
-            state: status.to_intent_state(),
-        })
-    }
-
-    fn handle_cancel_intent(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let _lifecycle = super::lock_order::lock(
-            &profile.lifecycle_lock,
-            super::lock_order::LockLevel::ProfileLifecycle,
-        );
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        if status.kind != super::policy_engine::PendingRequestKind::IsolatedIntent {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not an intent",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let _ = self
-            .policy_runtime
-            .principal_cancel_pending(request_id, session_id);
-
-        let cancel_event =
-            super::audit_events::IntentCancelBuilder::new(status.intent_id.clone()).build();
-        let _ = self.audit_gate.record(cancel_event);
-
-        Ok(PrincipalResponse::IntentCancelled)
-    }
-
     fn handle_request_delegation(
         &self,
         _params: RequestDelegationParams<'_>,
@@ -2335,14 +2282,6 @@ impl AgentRuntime {
                 ),
             })?;
 
-        if status.kind != super::policy_engine::PendingRequestKind::DelegatedAuth {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not a delegation",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
         Ok(PrincipalResponse::DelegationStatus {
             request_id: request_id.clone(),
             state: status.to_delegation_state(),
@@ -2376,14 +2315,6 @@ impl AgentRuntime {
                 ),
             })?;
 
-        if status.kind != super::policy_engine::PendingRequestKind::DelegatedAuth {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not a delegation",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
         let grant_request_id = status.grant_request_id;
 
         if let Some(ref grant_req_id) = grant_request_id
@@ -2397,10 +2328,6 @@ impl AgentRuntime {
         let _ = self
             .policy_runtime
             .principal_cancel_pending(request_id, session_id);
-
-        let cancel_event =
-            super::audit_events::IntentCancelBuilder::new(status.intent_id.clone()).build();
-        let _ = self.audit_gate.record(cancel_event);
 
         Ok(PrincipalResponse::DelegationCancelled)
     }
@@ -2718,9 +2645,6 @@ impl AgentRuntime {
         let active_grants = self
             .policy_runtime
             .active_grant_count_for_profile(profile_id);
-        let pending_intents = self
-            .policy_runtime
-            .pending_intent_count_for_profile(profile_id);
         let active_sessions =
             u32::try_from(self.active_session_count(profile_id)).unwrap_or(u32::MAX);
 
@@ -2733,7 +2657,6 @@ impl AgentRuntime {
                 policy_generation: policy_gen,
                 active_grants,
                 active_sessions,
-                pending_intents,
             },
         ))
     }
@@ -2830,6 +2753,29 @@ impl AgentRuntime {
                 message: e.message,
             },
         });
+        // The granted-rules store and the escalation configuration (ADR 0014 sections 8.2, 8.4).
+        report.checks.push(super::doctor::granted_rules_check(
+            self.granted_rules.profile(profile_id).as_deref(),
+            &self.granted_rules.path_for(profile_id),
+        ));
+        {
+            let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+            let config = self
+                .agent_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let profile_config = config
+                .profiles
+                .get(profile_id.as_str())
+                .unwrap_or(&profile.profile_config);
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            report.checks.push(super::doctor::escalation_check(
+                &config,
+                profile_config,
+                euid,
+            ));
+        }
         // Deprecated config vocabulary is accepted with a warning for one minor release (plan R8):
         // a warning never makes the profile unhealthy, so the check passes and carries the text.
         for warning in profile.profile_config.deprecation_warnings(profile_id) {
@@ -2958,6 +2904,7 @@ impl AgentRuntime {
                 profile_id: profile_id.to_string(),
                 policy_generation: gen_num,
                 digest: digest_hex,
+                grants_digest: self.granted_rules.grants_digest(profile_id),
             },
         ))
     }
@@ -3034,6 +2981,140 @@ impl AgentRuntime {
         }
 
         Ok(AdminResponse::PolicyRecompiled)
+    }
+
+    fn require_profile(&self, profile_id: &ProfileId) -> Result<(), ProtocolError> {
+        if self.profiles.contains_key(profile_id) {
+            Ok(())
+        } else {
+            Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            ))
+        }
+    }
+
+    /// List the persistent granted rules (ADR 0014 section 8.4).
+    fn handle_list_granted_rules(
+        &self,
+        profile_filter: Option<&ProfileId>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        if let Some(profile_id) = profile_filter {
+            self.require_profile(profile_id)?;
+        }
+        let profiles = self
+            .granted_rules
+            .list()
+            .into_iter()
+            .filter(|(profile_id, _)| profile_filter.is_none_or(|filter| filter == profile_id))
+            .map(
+                |(profile_id, view)| passless_core::agent::ProfileGrantedRules {
+                    profile_id: profile_id.to_string(),
+                    enabled: view.disabled_reason().is_none(),
+                    disabled_reason: view.disabled_reason().map(str::to_string),
+                    digest: self
+                        .granted_rules
+                        .grants_digest(&profile_id)
+                        .unwrap_or_default(),
+                    rules: view
+                        .rules()
+                        .iter()
+                        .map(|rule| passless_core::agent::GrantedRuleInfo {
+                            rp_id: rule.rp_id.clone(),
+                            action: rule.action.as_str().to_string(),
+                            kind: rule.kind.as_str().to_string(),
+                            granted_at: rule.granted_at.clone(),
+                            request_id: rule.request_id.clone(),
+                            origin: rule.origin.clone(),
+                            rule: rule.rule.as_str().to_string(),
+                            credential_ref: rule.credential_ref.as_ref().map(|r| r.to_hex()),
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        Ok(AdminResponse::GrantedRuleList(
+            passless_core::agent::GrantedRuleList { profiles },
+        ))
+    }
+
+    /// Revoke the granted rule of one RP. Revocation bumps the revocation epoch, so every bearer
+    /// session is revoked and its browser closed, exactly as a policy change does.
+    fn handle_revoke_granted_rule(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        action: &passless_core::agent::IntentAction,
+    ) -> Result<AdminResponse, ProtocolError> {
+        self.require_profile(profile_id)?;
+        let action = match action {
+            passless_core::agent::IntentAction::Authenticate => {
+                super::granted_rules::GrantedAction::Authenticate
+            }
+            passless_core::agent::IntentAction::Register => {
+                return Err(ProtocolError::new(
+                    ErrorCode::BadRequest,
+                    "only authenticate rules are granted; registration is never granted",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        };
+        let outcome = self
+            .granted_rules
+            .revoke(&self.policy_runtime, profile_id, rp_id, action)
+            .map_err(granted_rules_error)?;
+        let event = super::audit_events::GrantedRuleRevokeBuilder::new(
+            profile_id.clone(),
+            Some(rp_id.trim().to_ascii_lowercase()),
+            outcome.revoked,
+        )
+        .build();
+        let _ = self.audit_gate.record(event);
+        self.revoke_sessions_after_grant_revocation(outcome);
+        Ok(AdminResponse::GrantedRulesRevoked {
+            revoked: outcome.revoked as u32,
+        })
+    }
+
+    /// Revoke every granted rule of a profile.
+    fn handle_clear_granted_rules(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<AdminResponse, ProtocolError> {
+        self.require_profile(profile_id)?;
+        let outcome = self
+            .granted_rules
+            .clear(&self.policy_runtime, profile_id)
+            .map_err(granted_rules_error)?;
+        if outcome.revoked > 0 {
+            let event = super::audit_events::GrantedRuleRevokeBuilder::new(
+                profile_id.clone(),
+                None,
+                outcome.revoked,
+            )
+            .build();
+            let _ = self.audit_gate.record(event);
+            self.revoke_sessions_after_grant_revocation(outcome);
+        }
+        Ok(AdminResponse::GrantedRulesRevoked {
+            revoked: outcome.revoked as u32,
+        })
+    }
+
+    /// The revocation epoch moved: revoke the stale bearers and close their browsers, as a reload
+    /// that changed the policy does (the epoch is global, so every profile is affected).
+    fn revoke_sessions_after_grant_revocation(&self, outcome: super::granted_rules::RevokeOutcome) {
+        let revoked = self
+            .sign_registry
+            .revoke_stale_sessions(outcome.revocation_epoch);
+        info!(
+            "granted rules revoked: {} rule(s), revocation epoch {}; {} bearer(s) revoked",
+            outcome.revoked, outcome.revocation_epoch, revoked
+        );
+        for profile in self.profiles.values() {
+            self.cleanup_all_browsers_for_profile(profile);
+        }
     }
 
     fn handle_admin_list_credentials(
@@ -4028,7 +4109,7 @@ impl AgentRuntime {
                 Ok(request_id) => {
                     match self
                         .policy_runtime
-                        .admin_approve_grant(&request_id, &super::intent::admin_authority())
+                        .admin_approve_grant(&request_id, &super::identity::admin_authority())
                     {
                         Ok(grant_id) => {
                             let _ = session.bind_grant(grant_id.clone());
@@ -4203,6 +4284,17 @@ impl AdminHandler for AgentRuntime {
             AdminRequest::AuditVerify => self.handle_audit_verify(),
             AdminRequest::AuditExport { format } => self.handle_audit_export(format),
             AdminRequest::ProfileCheck { profile_id } => self.handle_profile_check(profile_id),
+            AdminRequest::ListGrantedRules { profile_id } => {
+                self.handle_list_granted_rules(profile_id.as_ref())
+            }
+            AdminRequest::RevokeGrantedRule {
+                profile_id,
+                rp_id,
+                action,
+            } => self.handle_revoke_granted_rule(profile_id, rp_id, action),
+            AdminRequest::ClearGrantedRules { profile_id } => {
+                self.handle_clear_granted_rules(profile_id)
+            }
             AdminRequest::RequestDelegation {
                 profile_id,
                 rp_id,
@@ -4372,20 +4464,6 @@ impl PrincipalHandler for AgentRuntime {
             }
             // Agent ceremonies run only through the browser extension (ADR 0014 section 5); the
             // per-ceremony intent hand-off belonged to the removed UHID route.
-            PrincipalRequest::CreateIntent { .. } => Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "intents are not available: agent ceremonies use the browser extension path",
-                RecommendedAction::FixRequest,
-            )),
-            PrincipalRequest::ShowIntent { request_id } => {
-                self.handle_show_intent(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::WaitIntent { request_id } => {
-                self.handle_show_intent(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::CancelIntent { request_id } => {
-                self.handle_cancel_intent(&profile_id, &managed.session_id, request_id, profile)
-            }
             PrincipalRequest::RequestDelegation {
                 profile_id: _req_profile_id,
                 rp_id,
@@ -4596,13 +4674,7 @@ register = "deny"
             human_state_path: None,
         };
         let config = source.load().expect("the initial configuration is valid");
-        let runtime = PolicyRuntime::new(
-            &config,
-            Arc::new(SystemClock),
-            Arc::new(IntentSystemClock::new()),
-            None,
-        )
-        .unwrap();
+        let runtime = PolicyRuntime::new(&config, Arc::new(SystemClock), None).unwrap();
         (dir, source, config, runtime)
     }
 

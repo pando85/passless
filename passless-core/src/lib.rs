@@ -12,9 +12,9 @@ pub use agent::{
 #[cfg(feature = "agent")]
 pub use config::{
     AdminAuditAction, AdminAuditExportFormat, AdminBrowserAction, AdminCredentialAction,
-    AdminDelegationAction, AdminPolicyAction, AdminProfileAction, AdminSessionAction,
-    AgentAdminAction, AgentCommand, AgentCredentialAction, AgentDelegationAction,
-    AgentIntentAction, AgentIntentActionType,
+    AdminGrantAction, AdminGrantsAction, AdminPolicyAction, AdminPrincipalsAction,
+    AdminProfileAction, AdminSessionsAction, AgentAdminAction, AgentCommand, AgentCredentialAction,
+    AgentDelegationAction,
 };
 pub use config::{
     AgentSkillScope, AgentSkillTarget, AppConfig, Args, BackendConfig, ClientAction, Commands,

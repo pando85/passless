@@ -7,10 +7,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use passless_core::agent::protocol::{DoctorCheck, EndpointDiagnosticState};
-use passless_core::agent::{AgentMode, ProfileId};
+use passless_core::agent::{AgentConfig, AgentMode, AgentProfileConfig, ProfileId, RuleAction};
 
 use super::audit::AuditGate;
 use super::browser::{BrowserManifest, ProcessIdentity};
+use super::granted_rules::ProfileGrants;
 
 use passless_core::agent::ProfileDiagnosticReport;
 
@@ -635,6 +636,75 @@ pub fn build_profile_diagnostic_report(
     }
 }
 
+/// The profile's granted-rules store (ADR 0014 section 8.4). A disabled store fails the check:
+/// escalation is denied with `grants_unavailable` and no grant is honored until it is fixed.
+pub fn granted_rules_check(view: Option<&ProfileGrants>, path: &Path) -> DoctorCheck {
+    match view {
+        Some(ProfileGrants::Enabled(rules)) => DoctorCheck {
+            name: "granted_rules".into(),
+            passed: true,
+            message: format!("{} granted rule(s) in {}", rules.len(), path.display()),
+        },
+        Some(ProfileGrants::Disabled(reason)) => DoctorCheck {
+            name: "granted_rules".into(),
+            passed: false,
+            message: format!(
+                "granted rules disabled (fail closed): {reason}; fix or remove the file and \
+                 restart the daemon"
+            ),
+        },
+        None => DoctorCheck {
+            name: "granted_rules".into(),
+            passed: false,
+            message: "no granted-rules store for this profile".into(),
+        },
+    }
+}
+
+/// Whether the escalation configuration can reach a notification user (ADR 0014 section 8.2).
+///
+/// A root daemon without `agents.notify_user` cannot prompt: the check fails when the profile has
+/// a `request` rule (those requests are denied with `escalation_unavailable`) and only warns
+/// otherwise. A `notify_user` the daemon cannot use (unknown, or another user than a non-root
+/// daemon's own, or a principal or browser user of a root daemon) fails.
+pub fn escalation_check(
+    config: &AgentConfig,
+    profile: &AgentProfileConfig,
+    daemon_uid: u32,
+) -> DoctorCheck {
+    if let Err(e) =
+        config.validate_escalation(daemon_uid, &passless_core::agent::config::lookup_user_uid)
+    {
+        return DoctorCheck {
+            name: "escalation".into(),
+            passed: false,
+            message: e.to_string(),
+        };
+    }
+    let requests = profile.rules.iter().any(|rule| {
+        rule.authenticate == RuleAction::Request || rule.register == RuleAction::Request
+    });
+    match config.escalation_unavailable_reason(daemon_uid) {
+        Some(reason) => DoctorCheck {
+            name: "escalation".into(),
+            passed: !requests,
+            message: if requests {
+                reason
+            } else {
+                format!("warning: {reason}")
+            },
+        },
+        None => DoctorCheck {
+            name: "escalation".into(),
+            passed: true,
+            message: match &config.notify_user {
+                Some(user) => format!("escalation prompts go to '{user}'"),
+                None => "escalation prompts go to the daemon user's session bus".into(),
+            },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1210,66 @@ mod tests {
         assert_eq!(run(&good).unwrap(), "1.2.3+abc");
         let failing = script("failing-sign-proxy", "#!/bin/sh\nexit 3\n");
         assert!(run(&failing).is_err());
+    }
+
+    fn escalation_config(notify_user: Option<&str>, request: bool) -> AgentConfig {
+        let action = if request { "request" } else { "allow" };
+        let mut config = AgentConfig::from_toml_str(
+            &format!(
+                "[agents]\nenabled = true\n\n[agents.profiles.p]\nmode = \"same-user\"\n\
+                 principal_user = \"root\"\n\n[[agents.profiles.p.rules]]\n\
+                 rp_id = \"example.com\"\nauthenticate = \"{action}\"\nregister = \"deny\"\n"
+            ),
+            "test",
+        )
+        .unwrap();
+        config.notify_user = notify_user.map(str::to_string);
+        config
+    }
+
+    #[test]
+    fn escalation_check_fails_for_a_root_daemon_without_notify_user() {
+        let config = escalation_config(None, true);
+        let check = escalation_check(&config, &config.profiles["p"], 0);
+        assert!(!check.passed, "{check:?}");
+        assert!(check.message.contains("notify_user"), "{check:?}");
+
+        // Without a `request` rule nothing needs a prompt: only a warning.
+        let config = escalation_config(None, false);
+        let check = escalation_check(&config, &config.profiles["p"], 0);
+        assert!(check.passed, "{check:?}");
+        assert!(check.message.starts_with("warning:"), "{check:?}");
+    }
+
+    #[test]
+    fn escalation_check_reports_an_unusable_notify_user() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let own = unsafe { libc::geteuid() };
+        let other = if own == 0 { 1 } else { 0 };
+        let config = escalation_config(Some(&other.to_string()), true);
+        let check = escalation_check(&config, &config.profiles["p"], own.max(1));
+        assert!(!check.passed, "{check:?}");
+
+        let config = escalation_config(Some(&own.max(1).to_string()), true);
+        let check = escalation_check(&config, &config.profiles["p"], own.max(1));
+        assert!(check.passed, "{check:?}");
+
+        let config = escalation_config(None, true);
+        let check = escalation_check(&config, &config.profiles["p"], own.max(1));
+        assert!(check.passed, "{check:?}");
+    }
+
+    #[test]
+    fn granted_rules_check_fails_for_a_disabled_store() {
+        let path = Path::new("/state/granted-rules/p.toml");
+        let ok = granted_rules_check(Some(&ProfileGrants::Enabled(Vec::new())), path);
+        assert!(ok.passed);
+        let disabled = granted_rules_check(
+            Some(&ProfileGrants::Disabled("mode 0644".to_string())),
+            path,
+        );
+        assert!(!disabled.passed);
+        assert!(disabled.message.contains("mode 0644"), "{disabled:?}");
+        assert!(!granted_rules_check(None, path).passed);
     }
 }

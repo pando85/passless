@@ -380,7 +380,7 @@ test_admin_ipc() {
 
     # Test delegation list
     log_info "Listing delegations..."
-    if "$BINARY" agent-admin delegation list --output json 2>&1 | jq -e '.data.grants' > /dev/null; then
+    if "$BINARY" agent-admin sessions list --output json 2>&1 | jq -e '.data.grants' > /dev/null; then
         log_info "Delegation list successful"
     else
         log_warn "Could not list delegations"

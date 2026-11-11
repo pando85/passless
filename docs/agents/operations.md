@@ -196,14 +196,25 @@ Disable a profile immediately:
 passless agent-admin profile disable <profile>
 ```
 
-Revoke active session/delegation authority represented by the current admin API:
+Revoke active browser session grants and principal sessions:
 
 ```bash
-passless agent-admin delegation revoke <grant-id> --confirm
-passless agent-admin session revoke <session-id> --confirm
+passless agent-admin sessions revoke <grant-id> --confirm
+passless agent-admin principals revoke <session-id> --confirm
 ```
 
-The `delegation` command name remains part of the authorization/grant administration API; it does **not** mean that the removed `delegated-session` identity mode still exists.
+`sessions` and `principals` were `delegation` and `session` before; the old names remain hidden
+aliases for one release.
+
+Granted rules (persistent escalation approvals) are listed and revoked with `grants`:
+
+```bash
+passless agent-admin grants list [--profile <profile>]
+passless agent-admin grants revoke --profile <profile> --rp <rp-id> --confirm
+passless agent-admin grants clear --profile <profile> --confirm
+```
+
+Revoking a granted rule revokes every active bearer session, like a policy change.
 
 For compromise response also terminate managed browsers and use the RP's own session-revocation controls when server-side sessions may survive local teardown.
 

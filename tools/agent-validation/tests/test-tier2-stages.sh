@@ -503,18 +503,18 @@ test_agent_ceremonies_requires_explicit_config() {
 }
 
 test_agent_ceremonies_uses_intents() {
-    log_test "agent-ceremonies uses intents for isolated flow"
+    log_test "principal driver no longer uses the removed intent protocol"
 
-    if grep -q "intent create register" "${VALIDATION_DIR}/browser/principal-driver.sh"; then
-        log_pass "agent-ceremonies uses intent create"
+    if grep -q "intent create" "${VALIDATION_DIR}/browser/principal-driver.sh"; then
+        log_fail "principal-driver still uses intent create"
     else
-        log_fail "agent-ceremonies does not use intent create"
+        log_pass "principal-driver does not use intent create"
     fi
 
     if grep -q "intent wait" "${VALIDATION_DIR}/browser/principal-driver.sh"; then
-        log_pass "agent-ceremonies uses intent wait"
+        log_fail "principal-driver still uses intent wait"
     else
-        log_fail "agent-ceremonies does not use intent wait"
+        log_pass "principal-driver does not use intent wait"
     fi
 }
 

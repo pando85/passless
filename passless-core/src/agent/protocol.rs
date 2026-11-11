@@ -405,6 +405,22 @@ pub enum AdminRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         start_url: Option<String>,
     },
+    /// List the persistent granted rules (ADR 0014 section 8.4). Distinct from `ListGrants`,
+    /// which lists browser session grants.
+    ListGrantedRules {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile_id: Option<ProfileId>,
+    },
+    /// Revoke the granted rule of one RP and action.
+    RevokeGrantedRule {
+        profile_id: ProfileId,
+        rp_id: String,
+        action: IntentAction,
+    },
+    /// Revoke every granted rule of a profile.
+    ClearGrantedRules {
+        profile_id: ProfileId,
+    },
     Shutdown,
 }
 
@@ -444,6 +460,8 @@ pub enum AdminResponse {
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
     DelegationRequested { request_id: PendingRequestId },
+    GrantedRuleList(GrantedRuleList),
+    GrantedRulesRevoked { revoked: u32 },
     ShutdownAccepted,
 }
 
@@ -456,28 +474,6 @@ pub enum PrincipalRequest {
     Authority,
     Instructions,
     Doctor,
-    CreateIntent {
-        profile_id: ProfileId,
-        action: IntentAction,
-        rp_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        credential_ref: Option<CredentialRef>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        grant_ttl_secs: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_ttl_secs: Option<u64>,
-    },
-    ShowIntent {
-        request_id: PendingRequestId,
-    },
-    WaitIntent {
-        request_id: PendingRequestId,
-    },
-    CancelIntent {
-        request_id: PendingRequestId,
-    },
     RequestDelegation {
         profile_id: ProfileId,
         rp_id: String,
@@ -527,14 +523,6 @@ pub enum PrincipalResponse {
     Authority(EffectiveAuthority),
     Instructions(PrincipalInstructions),
     Doctor(DoctorResponse),
-    IntentCreated {
-        request_id: PendingRequestId,
-    },
-    IntentStatus {
-        request_id: PendingRequestId,
-        state: IntentState,
-    },
-    IntentCancelled,
     DelegationRequested {
         request_id: PendingRequestId,
     },
@@ -733,28 +721,6 @@ pub struct PrincipalInstructions {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntentState {
-    Pending,
-    Approved,
-    Denied,
-    Cancelled,
-    Expired,
-}
-
-impl fmt::Display for IntentState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Approved => write!(f, "approved"),
-            Self::Denied => write!(f, "denied"),
-            Self::Cancelled => write!(f, "cancelled"),
-            Self::Expired => write!(f, "expired"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum DelegationState {
     Pending,
     Approved,
@@ -801,7 +767,6 @@ pub struct ProfileStatusResponse {
     pub policy_generation: u64,
     pub active_grants: u32,
     pub active_sessions: u32,
-    pub pending_intents: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -821,6 +786,46 @@ pub struct GrantInfo {
 pub struct GrantList {
     pub grants: Vec<GrantInfo>,
     pub total: u32,
+}
+
+/// One persistent granted rule (ADR 0014 section 8.4).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantedRuleInfo {
+    pub rp_id: String,
+    pub action: String,
+    /// `escalation` or `registration`.
+    pub kind: String,
+    /// RFC 3339 time of the approval.
+    pub granted_at: String,
+    /// The approving escalation's ID.
+    pub request_id: String,
+    /// The origin of the ceremony that requested it.
+    pub origin: String,
+    /// The permitting configuration rule: the exact RP ID or `*`.
+    pub rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+}
+
+/// The granted rules of one profile. A store that failed to load is disabled (fail closed) and
+/// lists no rules.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileGrantedRules {
+    pub profile_id: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// Digest of the profile's granted rules (separate from the policy digest).
+    pub digest: String,
+    pub rules: Vec<GrantedRuleInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantedRuleList {
+    pub profiles: Vec<ProfileGrantedRules>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1049,7 +1054,6 @@ pub struct ProfileInfo {
     pub policy_generation: u64,
     pub active_grants: u32,
     pub active_sessions: u32,
-    pub pending_intents: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1058,6 +1062,10 @@ pub struct PolicyInfo {
     pub profile_id: String,
     pub policy_generation: u64,
     pub digest: String,
+    /// Digest of the profile's granted rules (ADR 0014 section 8.4), reported next to the
+    /// configuration digest and never folded into it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1332,6 +1340,10 @@ impl Validate for AdminRequest {
             Self::ShowProfile { .. } | Self::ShowPolicy { .. } | Self::ProfileCheck { .. } => {}
             Self::AuditExport { .. } => {}
             Self::LaunchBrowser { .. } => {}
+            Self::ListGrantedRules { .. } | Self::ClearGrantedRules { .. } => {}
+            Self::RevokeGrantedRule { rp_id, .. } => {
+                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+            }
             Self::LaunchPrincipal { command, .. } => {
                 if command.is_empty() {
                     errors.push("launch_principal: command must not be empty".into());
@@ -1396,24 +1408,6 @@ impl Validate for PrincipalRequest {
             | Self::Doctor
             | Self::BrowserStatus
             | Self::EndpointStatus => {}
-            Self::CreateIntent {
-                profile_id,
-                rp_id,
-                reason,
-                ..
-            } => {
-                check_str(
-                    profile_id.as_str(),
-                    "profile_id",
-                    MAX_PROFILE_ID_LEN,
-                    &mut errors,
-                );
-                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                if let Some(r) = reason {
-                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
-                }
-            }
-            Self::ShowIntent { .. } | Self::WaitIntent { .. } | Self::CancelIntent { .. } => {}
             Self::RequestDelegation {
                 profile_id,
                 rp_id,
@@ -2090,6 +2084,76 @@ mod tests {
     }
 
     #[test]
+    fn admin_granted_rule_requests_roundtrip() {
+        let profile_id = ProfileId::new("agent").unwrap();
+        for (seq, request) in [
+            AdminRequest::ListGrantedRules { profile_id: None },
+            AdminRequest::ListGrantedRules {
+                profile_id: Some(profile_id.clone()),
+            },
+            AdminRequest::RevokeGrantedRule {
+                profile_id: profile_id.clone(),
+                rp_id: "example.com".into(),
+                action: IntentAction::Authenticate,
+            },
+            AdminRequest::ClearGrantedRules { profile_id },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(request.validate().is_ok());
+            let frame = RequestFrame::Admin(AdminRequestFrame::new(seq as u64 + 1, request));
+            assert_eq!(json_roundtrip(&frame), frame);
+        }
+        let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":9,"action":{"revoke_granted_rule":{"profile_id":"agent","rp_id":"example.com","action":"authenticate"}}}"#;
+        assert!(serde_json::from_str::<RequestFrame>(json).is_ok());
+        let empty_rp = AdminRequest::RevokeGrantedRule {
+            profile_id: ProfileId::new("agent").unwrap(),
+            rp_id: String::new(),
+            action: IntentAction::Authenticate,
+        };
+        assert!(empty_rp.validate().is_err());
+    }
+
+    #[test]
+    fn admin_granted_rule_responses_roundtrip() {
+        let list = GrantedRuleList {
+            profiles: vec![
+                ProfileGrantedRules {
+                    profile_id: "agent".into(),
+                    enabled: true,
+                    disabled_reason: None,
+                    digest: "00".repeat(32),
+                    rules: vec![GrantedRuleInfo {
+                        rp_id: "example.com".into(),
+                        action: "authenticate".into(),
+                        kind: "registration".into(),
+                        granted_at: "2026-11-11T00:00:00Z".into(),
+                        request_id: "esc-1".into(),
+                        origin: "https://example.com".into(),
+                        rule: "example.com".into(),
+                        credential_ref: Some("ab".repeat(16)),
+                    }],
+                },
+                ProfileGrantedRules {
+                    profile_id: "broken".into(),
+                    enabled: false,
+                    disabled_reason: Some("mode 0644".into()),
+                    digest: "00".repeat(32),
+                    rules: vec![],
+                },
+            ],
+        };
+        for response in [
+            AdminResponse::GrantedRuleList(list),
+            AdminResponse::GrantedRulesRevoked { revoked: 3 },
+        ] {
+            let frame = ResponseFrame::Admin(AdminResponseFrame::ok(4, response));
+            assert_eq!(json_roundtrip(&frame), frame);
+        }
+    }
+
+    #[test]
     fn admin_pong_response_roundtrip() {
         let frame = ResponseFrame::Admin(AdminResponseFrame::ok(1, AdminResponse::Pong));
         assert_eq!(json_roundtrip(&frame), frame);
@@ -2191,24 +2255,6 @@ mod tests {
     }
 
     #[test]
-    fn principal_create_intent_roundtrip() {
-        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
-            4,
-            PrincipalRequest::CreateIntent {
-                profile_id: ProfileId::new("test").unwrap(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".into(),
-                credential_ref: Some(test_cred_ref("abcdef01")),
-                reason: Some("login".into()),
-                grant_ttl_secs: None,
-                session_ttl_secs: None,
-            },
-            test_capability_proof(),
-        ));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
     fn principal_request_delegation_roundtrip() {
         let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
             5,
@@ -2219,17 +2265,6 @@ mod tests {
                 max_session_ttl: 900,
                 reason: None,
             },
-            test_capability_proof(),
-        ));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
-    fn principal_cancel_intent_roundtrip() {
-        let req_id = PendingRequestId::new();
-        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
-            6,
-            PrincipalRequest::CancelIntent { request_id: req_id },
             test_capability_proof(),
         ));
         assert_eq!(json_roundtrip(&frame), frame);
@@ -2466,35 +2501,6 @@ mod tests {
     #[test]
     fn validate_principal_ping_ok() {
         assert!(PrincipalRequest::Ping.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_principal_create_intent_ok() {
-        let req = PrincipalRequest::CreateIntent {
-            profile_id: ProfileId::new("test").unwrap(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".into(),
-            credential_ref: Some(test_cred_ref("abcdef01")),
-            reason: None,
-            grant_ttl_secs: None,
-            session_ttl_secs: None,
-        };
-        assert!(req.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_principal_create_intent_empty_profile() {
-        let req = PrincipalRequest::CreateIntent {
-            profile_id: ProfileId::from_string_unchecked(String::new()),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".into(),
-            credential_ref: None,
-            reason: None,
-            grant_ttl_secs: None,
-            session_ttl_secs: None,
-        };
-        let errs = req.validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("profile_id")));
     }
 
     #[test]
@@ -2804,7 +2810,7 @@ mod tests {
 
     #[test]
     fn admin_frame_rejects_principal_action() {
-        let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":1,"action":{"create_intent":{"profile_id":"t","action":"authenticate","rp_id":"x"}}}"#;
+        let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":1,"action":"capabilities"}"#;
         assert!(serde_json::from_str::<RequestFrame>(json).is_err());
     }
 

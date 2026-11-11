@@ -8,166 +8,16 @@ use passless_core::agent::config::{ANY_RP_ID, validate_rp_id};
 use passless_core::agent::protocol::IntentAction;
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
-    EndpointId, GrantId, GrantSource, IntentId, MatchedRule, NoGrantedRules, PendingRequestId,
-    Policy, PolicyAction, PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId,
-    ProfileId, RuleAction, resolve_rules,
+    EndpointId, GrantId, GrantSource, MatchedRule, NoGrantedRules, PendingRequestId, Policy,
+    PolicyAction, PolicyDigest, PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId,
+    RuleAction, resolve_rules,
 };
 
 use super::audit::AuditGate;
 use super::browser::Clock;
-use super::grant::{CeremonyId, GrantError, GrantRegistry, GrantRequestId, GrantRequestParams};
-use super::intent::{
-    AdminAuthority, CreateIntentParams, IntentConsumeInfo, IntentError, IntentQueryParams,
-    IntentStore, MonotonicClock, ProcessIdentityDigest,
-};
+use super::grant::{GrantError, GrantRegistry, GrantRequestId, GrantRequestParams};
+use super::identity::{AdminAuthority, ProcessIdentityDigest};
 use super::lock_order::{self, LockLevel, Tracked};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    Allow,
-    Deny,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasonCode {
-    DefaultDeny,
-    InvalidConfig,
-    ProfileNotFound,
-    SessionUnbound,
-    ModeMismatch,
-    ActionNotAllowed,
-    RpIdNotExactMatch,
-    CredentialNotExactMatch,
-    GrantExpired,
-    GrantNotFound,
-    IntentConsumed,
-    IntentExpired,
-    IntentNotFound,
-    UvRequired,
-    Allowed,
-    UnknownAction,
-    UnknownMode,
-    EmptyRpList,
-    EmptyCredentialList,
-    StaleGeneration,
-    SuffixNotExact,
-    DelegatedRegistrationDenied,
-    GrantMissingForDelegated,
-    IntentMissingForDelegated,
-    IntentNotApproved,
-    GrantIntentMismatch,
-    SessionMismatch,
-    EndpointMismatch,
-    ProcessMismatch,
-    GenerationStale,
-    GrantRevoked,
-    CeremonyInvalidated,
-    PartialClaimFailed,
-}
-
-impl ReasonCode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::DefaultDeny => "default_deny",
-            Self::InvalidConfig => "invalid_config",
-            Self::ProfileNotFound => "profile_not_found",
-            Self::SessionUnbound => "session_unbound",
-            Self::ModeMismatch => "mode_mismatch",
-            Self::ActionNotAllowed => "action_not_allowed",
-            Self::RpIdNotExactMatch => "rp_id_not_exact_match",
-            Self::CredentialNotExactMatch => "credential_not_exact_match",
-            Self::GrantExpired => "grant_expired",
-            Self::GrantNotFound => "grant_not_found",
-            Self::IntentConsumed => "intent_consumed",
-            Self::IntentExpired => "intent_expired",
-            Self::IntentNotFound => "intent_not_found",
-            Self::UvRequired => "uv_required",
-            Self::Allowed => "allowed",
-            Self::UnknownAction => "unknown_action",
-            Self::UnknownMode => "unknown_mode",
-            Self::EmptyRpList => "empty_rp_list",
-            Self::EmptyCredentialList => "empty_credential_list",
-            Self::StaleGeneration => "stale_generation",
-            Self::SuffixNotExact => "suffix_not_exact",
-            Self::DelegatedRegistrationDenied => "delegated_registration_denied",
-            Self::GrantMissingForDelegated => "grant_missing_for_delegated",
-            Self::IntentMissingForDelegated => "intent_missing_for_delegated",
-            Self::IntentNotApproved => "intent_not_approved",
-            Self::GrantIntentMismatch => "grant_intent_mismatch",
-            Self::SessionMismatch => "session_mismatch",
-            Self::EndpointMismatch => "endpoint_mismatch",
-            Self::ProcessMismatch => "process_mismatch",
-            Self::GenerationStale => "generation_stale",
-            Self::GrantRevoked => "grant_revoked",
-            Self::CeremonyInvalidated => "ceremony_invalidated",
-            Self::PartialClaimFailed => "partial_claim_failed",
-        }
-    }
-}
-
-impl fmt::Display for ReasonCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorAction {
-    None,
-    Retry,
-    RecreateSession,
-    ContactAdmin,
-    ReloadPolicy,
-    VerifyUser,
-}
-
-impl OperatorAction {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Retry => "retry",
-            Self::RecreateSession => "recreate_session",
-            Self::ContactAdmin => "contact_admin",
-            Self::ReloadPolicy => "reload_policy",
-            Self::VerifyUser => "verify_user",
-        }
-    }
-}
-
-impl fmt::Display for OperatorAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Decision {
-    pub outcome: Outcome,
-    pub reason: ReasonCode,
-    pub operator_action: OperatorAction,
-}
-
-impl Decision {
-    pub fn allow(reason: ReasonCode) -> Self {
-        Self {
-            outcome: Outcome::Allow,
-            reason,
-            operator_action: OperatorAction::None,
-        }
-    }
-
-    pub fn deny(reason: ReasonCode, action: OperatorAction) -> Self {
-        Self {
-            outcome: Outcome::Deny,
-            reason,
-            operator_action: action,
-        }
-    }
-
-    pub fn is_allowed(&self) -> bool {
-        self.outcome == Outcome::Allow
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PolicySnapshot {
@@ -182,6 +32,8 @@ pub struct PolicySnapshot {
     pub max_concurrent_grants: u64,
     /// Operation budget of one bearer session, read live by every ceremony (ADR 0014 section 9).
     pub max_operations: u16,
+    /// Cap on the profile's persistent granted rules (ADR 0014 section 8.4), read live.
+    pub max_granted_rules: u16,
     pub allowed_actions: BTreeSet<String>,
     /// Profile default credential selection (a rule may override it; the wildcard is `single`).
     pub credential_selection: CredentialSelection,
@@ -250,6 +102,22 @@ fn policy_action(action: &IntentAction) -> PolicyAction {
     }
 }
 
+/// The global escalation keys that are part of every profile's policy digest.
+#[derive(Debug, Clone, Copy)]
+struct EscalationSettings {
+    timeout_secs: u64,
+    cooldown_secs: u64,
+}
+
+impl EscalationSettings {
+    fn of(config: &AgentConfig) -> Self {
+        Self {
+            timeout_secs: config.escalation_timeout.unwrap_or(0),
+            cooldown_secs: config.escalation_cooldown,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyGenerationSnapshot {
     pub generation_id: PolicyGenerationId,
@@ -282,100 +150,6 @@ pub struct GrantSignSnapshot {
     pub state: super::grant::GrantState,
     pub expiry_mono: u64,
     pub is_revoked: bool,
-}
-
-pub struct AuthorizationHandle {
-    ceremony_id: CeremonyId,
-    grant_id: Option<passless_core::agent::GrantId>,
-    intent_id: Option<IntentId>,
-    profile_id: ProfileId,
-    session_id: PrincipalSessionId,
-    endpoint_id: EndpointId,
-    process_digest: ProcessIdentityDigest,
-    policy_generation: PolicyGenerationId,
-    policy_digest: PolicyDigest,
-    action: IntentAction,
-    rp_id: String,
-    credential_ref: Option<CredentialRef>,
-}
-
-impl AuthorizationHandle {
-    pub fn ceremony_id(&self) -> &CeremonyId {
-        &self.ceremony_id
-    }
-
-    pub fn grant_id(&self) -> Option<&passless_core::agent::GrantId> {
-        self.grant_id.as_ref()
-    }
-
-    pub fn intent_id(&self) -> Option<&IntentId> {
-        self.intent_id.as_ref()
-    }
-
-    pub fn profile_id(&self) -> &ProfileId {
-        &self.profile_id
-    }
-
-    pub fn action(&self) -> &IntentAction {
-        &self.action
-    }
-
-    pub fn rp_id(&self) -> &str {
-        &self.rp_id
-    }
-
-    pub fn credential_ref(&self) -> Option<&CredentialRef> {
-        self.credential_ref.as_ref()
-    }
-}
-
-impl fmt::Debug for AuthorizationHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthorizationHandle")
-            .field("ceremony_id", &self.ceremony_id)
-            .field("grant_id", &self.grant_id)
-            .field("intent_id", &self.intent_id)
-            .field("profile_id", &self.profile_id)
-            .field("action", &self.action)
-            .field("rp_id", &self.rp_id)
-            .field("credential_ref", &self.credential_ref)
-            .finish()
-    }
-}
-
-pub struct AuthorizationRequest {
-    pub profile_id: ProfileId,
-    pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
-    pub process_digest: ProcessIdentityDigest,
-    pub policy_generation_id: PolicyGenerationId,
-    pub policy_digest: PolicyDigest,
-    pub action: IntentAction,
-    pub rp_id: String,
-    pub credential_ref: Option<CredentialRef>,
-    pub uv_enforced: bool,
-}
-
-struct PendingAuthorization {
-    ceremony_id: CeremonyId,
-    grant_id: Option<passless_core::agent::GrantId>,
-    intent_id: Option<IntentId>,
-    profile_id: ProfileId,
-    session_id: PrincipalSessionId,
-    endpoint_id: EndpointId,
-    process_digest: ProcessIdentityDigest,
-    policy_generation: PolicyGenerationId,
-    policy_digest: PolicyDigest,
-    action: IntentAction,
-    rp_id: String,
-    credential_ref: Option<CredentialRef>,
-    invalidated: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingRequestKind {
-    IsolatedIntent,
-    DelegatedAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +185,6 @@ impl fmt::Display for PendingState {
 
 pub struct PendingPrincipalRequest {
     id: PendingRequestId,
-    kind: PendingRequestKind,
     profile_id: ProfileId,
     session_id: PrincipalSessionId,
     endpoint_id: EndpointId,
@@ -421,89 +194,14 @@ pub struct PendingPrincipalRequest {
     action: IntentAction,
     rp_id: String,
     credential_ref: Option<CredentialRef>,
-    intent_id: IntentId,
     grant_request_id: Option<GrantRequestId>,
     state: PendingState,
     created_at_mono: u64,
     deadline_mono: u64,
 }
 
-pub struct BoundApprovalResult {
-    intent_id: IntentId,
-    grant_id: Option<GrantId>,
-    profile_id: ProfileId,
-    session_id: PrincipalSessionId,
-    endpoint_id: EndpointId,
-    process_digest: ProcessIdentityDigest,
-    policy_generation: PolicyGenerationId,
-    policy_digest: PolicyDigest,
-    action: IntentAction,
-    rp_id: String,
-    credential_ref: Option<CredentialRef>,
-}
-
-impl BoundApprovalResult {
-    pub fn intent_id(&self) -> &IntentId {
-        &self.intent_id
-    }
-
-    pub fn grant_id(&self) -> Option<&GrantId> {
-        self.grant_id.as_ref()
-    }
-
-    pub fn profile_id(&self) -> &ProfileId {
-        &self.profile_id
-    }
-
-    pub fn session_id(&self) -> &PrincipalSessionId {
-        &self.session_id
-    }
-
-    pub fn endpoint_id(&self) -> &EndpointId {
-        &self.endpoint_id
-    }
-
-    pub fn process_digest(&self) -> &ProcessIdentityDigest {
-        &self.process_digest
-    }
-
-    pub fn policy_generation(&self) -> &PolicyGenerationId {
-        &self.policy_generation
-    }
-
-    pub fn policy_digest(&self) -> &PolicyDigest {
-        &self.policy_digest
-    }
-
-    pub fn action(&self) -> &IntentAction {
-        &self.action
-    }
-
-    pub fn rp_id(&self) -> &str {
-        &self.rp_id
-    }
-
-    pub fn credential_ref(&self) -> Option<&CredentialRef> {
-        self.credential_ref.as_ref()
-    }
-}
-
-impl fmt::Debug for BoundApprovalResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoundApprovalResult")
-            .field("intent_id", &self.intent_id)
-            .field("grant_id", &self.grant_id)
-            .field("profile_id", &self.profile_id)
-            .field("action", &self.action)
-            .field("rp_id", &self.rp_id)
-            .field("credential_ref", &self.credential_ref)
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingCreateError {
-    IntentCreationFailed(IntentError),
     GrantRequestFailed(GrantError),
     DuplicatePending,
     Internal(String),
@@ -512,7 +210,6 @@ pub enum PendingCreateError {
 impl fmt::Display for PendingCreateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IntentCreationFailed(e) => write!(f, "intent creation failed: {}", e),
             Self::GrantRequestFailed(e) => write!(f, "grant request failed: {}", e),
             Self::DuplicatePending => write!(f, "duplicate pending request for this tuple"),
             Self::Internal(s) => write!(f, "internal error: {}", s),
@@ -521,39 +218,6 @@ impl fmt::Display for PendingCreateError {
 }
 
 impl std::error::Error for PendingCreateError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CeremonyResolveError {
-    PendingNotFound,
-    AmbiguousPending(usize),
-    AlreadyResolved,
-    TimedOut,
-    Cancelled,
-    PolicyDenied(ReasonCode),
-    IntentApprovalFailed(String),
-    GrantFailed(String),
-    TupleMismatch,
-}
-
-impl fmt::Display for CeremonyResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PendingNotFound => write!(f, "no pending request found for tuple"),
-            Self::AmbiguousPending(n) => {
-                write!(f, "ambiguous: {} pending requests match tuple", n)
-            }
-            Self::AlreadyResolved => write!(f, "pending request already resolved"),
-            Self::TimedOut => write!(f, "pending request timed out"),
-            Self::Cancelled => write!(f, "pending request cancelled"),
-            Self::PolicyDenied(r) => write!(f, "policy denied on re-evaluation: {}", r),
-            Self::IntentApprovalFailed(s) => write!(f, "intent approval failed: {}", s),
-            Self::GrantFailed(s) => write!(f, "grant operation failed: {}", s),
-            Self::TupleMismatch => write!(f, "bound result tuple does not match request"),
-        }
-    }
-}
-
-impl std::error::Error for CeremonyResolveError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingCancelError {
@@ -595,14 +259,11 @@ impl std::error::Error for PolicyRuntimeError {}
 
 pub struct PolicyRuntime {
     current: RwLock<Arc<PolicyGenerationSnapshot>>,
-    intents: Mutex<IntentStore>,
     grants: Mutex<HashMap<String, GrantRegistry>>,
-    pending: Mutex<HashMap<String, PendingAuthorization>>,
     pending_requests: Mutex<HashMap<String, PendingPrincipalRequest>>,
     clock: Arc<dyn Clock>,
     audit_gate: Option<Arc<AuditGate>>,
-    /// The granted-rules store consulted to upgrade a `request` (ADR 0014 section 6.2). It holds
-    /// nothing until the escalation service lands (P7).
+    /// The granted-rules store consulted to upgrade a `request` (ADR 0014 sections 6.2 and 8.4).
     granted_rules: Arc<dyn GrantSource>,
     /// Serializes reloads, so the numeric generation is read, bumped and published atomically:
     /// concurrent reloads get distinct, strictly increasing generations.
@@ -638,15 +299,10 @@ impl PolicyRuntime {
     pub fn new(
         config: &AgentConfig,
         clock: Arc<dyn Clock>,
-        monotonic_clock: Arc<dyn MonotonicClock>,
         audit_gate: Option<Arc<AuditGate>>,
     ) -> Result<Self, PolicyRuntimeError> {
         let generation = Self::compile_generation(config, clock.monotonic_secs(), 1)?;
         let gen_arc = Arc::new(generation);
-
-        let intent_store = IntentStore::with_defaults(Box::new(ArcMonotonicClockAdapter(
-            Arc::clone(&monotonic_clock),
-        )));
 
         let mut grant_registries = HashMap::new();
         for snapshot in &gen_arc.snapshots {
@@ -665,9 +321,7 @@ impl PolicyRuntime {
 
         Ok(Self {
             current: RwLock::new(gen_arc),
-            intents: Mutex::new(intent_store),
             grants: Mutex::new(grant_registries),
-            pending: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashMap::new()),
             clock,
             audit_gate,
@@ -702,6 +356,7 @@ impl PolicyRuntime {
                 profile_config,
                 config.acknowledge_global_same_user.contains(name),
                 config.acknowledge_same_user_registration.contains(name),
+                EscalationSettings::of(config),
             )?;
             snapshots.push(snapshot);
         }
@@ -736,6 +391,7 @@ impl PolicyRuntime {
         config: &AgentProfileConfig,
         acknowledged_global_same_user: bool,
         acknowledged_same_user_registration: bool,
+        escalation: EscalationSettings,
     ) -> Result<PolicySnapshot, PolicyRuntimeError> {
         let mut rules = config.rules.clone();
         rules.sort_by_key(|rule| rule.rp_id.trim().to_ascii_lowercase());
@@ -806,6 +462,9 @@ impl PolicyRuntime {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             rules: rules.clone(),
+            max_granted_rules: u64::from(config.max_granted_rules),
+            escalation_timeout: escalation.timeout_secs,
+            escalation_cooldown: escalation.cooldown_secs,
         };
 
         let policy = Policy::from_params(params)
@@ -824,6 +483,7 @@ impl PolicyRuntime {
             max_session_ttl_secs,
             max_concurrent_grants,
             max_operations: config.max_operations,
+            max_granted_rules: config.max_granted_rules,
             allowed_actions,
             credential_selection: config.credential_selection.clone(),
             rules,
@@ -838,16 +498,8 @@ impl PolicyRuntime {
             .clone()
     }
 
-    fn lock_intents(&self) -> Tracked<MutexGuard<'_, IntentStore>> {
-        lock_order::lock(&self.intents, LockLevel::Policy)
-    }
-
     fn lock_grants(&self) -> Tracked<MutexGuard<'_, HashMap<String, GrantRegistry>>> {
         lock_order::lock(&self.grants, LockLevel::Policy)
-    }
-
-    fn lock_pending(&self) -> Tracked<MutexGuard<'_, HashMap<String, PendingAuthorization>>> {
-        lock_order::lock(&self.pending, LockLevel::Policy)
     }
 
     fn lock_pending_requests(
@@ -957,7 +609,7 @@ impl PolicyRuntime {
         &self,
         grant_id: &GrantId,
     ) -> Result<super::grant::GrantState, super::grant::GrantError> {
-        let authority = super::intent::admin_authority();
+        let authority = super::identity::admin_authority();
         let grants = self.lock_grants();
         for registry in grants.values() {
             if registry.show_grant(grant_id).is_some() {
@@ -1025,20 +677,12 @@ impl PolicyRuntime {
             .unwrap_or(0)
     }
 
-    pub fn pending_intent_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
-        let pending = self.lock_pending();
-        pending
-            .values()
-            .filter(|pa| pa.profile_id == *profile_id && !pa.invalidated)
-            .count() as u32
-    }
-
     /// Replace the compiled policy with `config` (already read and validated by the caller).
     ///
     /// A reload whose digest is unchanged is a no-op: the generation, the session grants and the
     /// revocation epoch stay as they are, so live sessions continue. A reload that changes the
     /// effective policy compiles a new generation, replaces the session-grant registries, cancels
-    /// pending intents and bumps the revocation epoch, which revokes every bearer session (ADR 0014
+    /// pending delegation requests and bumps the revocation epoch, which revokes every bearer session (ADR 0014
     /// sections 6.4 and 9, invariant 18). An invalid configuration leaves everything untouched.
     pub fn reload(&self, config: &AgentConfig) -> Result<ReloadOutcome, PolicyRuntimeError> {
         let _reload = lock_order::lock(&self.reload_lock, LockLevel::PolicyReload);
@@ -1072,10 +716,6 @@ impl PolicyRuntime {
         }
 
         // Each policy lock is taken alone (LOCKING.md): no policy guard is held across another.
-        self.lock_intents().invalidate_all();
-        for pa in self.lock_pending().values_mut() {
-            pa.invalidated = true;
-        }
         for pr in self.lock_pending_requests().values_mut() {
             if pr.state == PendingState::Waiting {
                 pr.state = PendingState::Cancelled;
@@ -1102,323 +742,15 @@ impl PolicyRuntime {
         })
     }
 
-    /// Authorization decision follows documented precedence:
-    ///
-    /// 1. Profile must exist in current generation
-    /// 2. RP ID must be exact match (suffix denied)
-    /// 3. Credential must be exact match if specified
-    /// 4. Mode-specific rules:
-    ///    a. Delegated registration: always denied
-    ///    b. Delegated authentication: requires BOTH active grant AND approved one-shot intent
-    ///    c. Isolated authentication: requires approved one-shot intent
-    ///
-    ///    Registration does not go through this function: registration authority is the
-    ///    exact-RP `register = "allow"` rule, checked by `RegisterHandler` on the extension path
-    ///    (ADR 0014 section 10.3). The intent hand-off here belonged to the removed UHID route
-    ///    and goes away with the principal intent protocol (P7).
-    /// 5. UV must be satisfied if policy requires it
-    /// 6. Returns unconsumed AuthorizationHandle bound to exact claims
-    ///
-    /// Lock ordering: intents lock is acquired first, then grants lock.
-    /// This prevents deadlocks and ensures atomic claim of both intent and grant.
-    pub fn authorize(
-        &self,
-        request: &AuthorizationRequest,
-    ) -> (Decision, Option<AuthorizationHandle>) {
-        let generation = self.current_generation();
-
-        if request.policy_generation_id != generation.generation_id
-            || request.policy_digest != generation.digest
-        {
-            return (
-                Decision::deny(ReasonCode::GenerationStale, OperatorAction::ReloadPolicy),
-                None,
-            );
-        }
-
-        let snapshot = match generation.find_snapshot(&request.profile_id) {
-            Some(s) => s,
-            None => {
-                return (
-                    Decision::deny(ReasonCode::ProfileNotFound, OperatorAction::ContactAdmin),
-                    None,
-                );
-            }
-        };
-
-        if snapshot.normalized_rp_ids.is_empty() {
-            return (
-                Decision::deny(ReasonCode::EmptyRpList, OperatorAction::ContactAdmin),
-                None,
-            );
-        }
-
-        if !snapshot.is_rp_exact_match(&request.rp_id) {
-            if snapshot.is_suffix_only(&request.rp_id) {
-                return (
-                    Decision::deny(ReasonCode::SuffixNotExact, OperatorAction::Retry),
-                    None,
-                );
-            }
-            return (
-                Decision::deny(ReasonCode::RpIdNotExactMatch, OperatorAction::Retry),
-                None,
-            );
-        }
-
-        // `request` denies here: escalation lands with P7, and this intent hand-off is removed there.
-        let matched =
-            snapshot.resolve(&request.action, &request.rp_id, self.granted_rules.as_ref());
-        if matched.action != RuleAction::Allow {
-            return (
-                Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
-                None,
-            );
-        }
-
-        if let Some(ref cred_ref) = request.credential_ref
-            && !snapshot.credential_refs.is_empty()
-            && !snapshot.credential_ref_set().contains(cred_ref)
-        {
-            return (
-                Decision::deny(ReasonCode::CredentialNotExactMatch, OperatorAction::Retry),
-                None,
-            );
-        }
-
-        match snapshot.mode {
-            AgentMode::SameUser | AgentMode::Isolated => {
-                if !snapshot.action_allowed(&request.action) {
-                    return (
-                        Decision::deny(ReasonCode::ActionNotAllowed, OperatorAction::None),
-                        None,
-                    );
-                }
-
-                self.authorize_isolated(snapshot, request, &generation)
-            }
-        }
-    }
-
-    /// Lock ordering: intents only (no grants needed for isolated mode).
-    fn authorize_isolated(
-        &self,
-        snapshot: &PolicySnapshot,
-        request: &AuthorizationRequest,
-        _generation: &PolicyGenerationSnapshot,
-    ) -> (Decision, Option<AuthorizationHandle>) {
-        let mut intents = self.lock_intents();
-
-        let intent_id = match intents.claim_approved(&IntentQueryParams {
-            profile_id: snapshot.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: Some(request.policy_generation_id.clone()),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-        }) {
-            Ok(iid) => iid,
-            Err(IntentError::NotFound) => {
-                return (
-                    Decision::deny(ReasonCode::IntentNotFound, OperatorAction::Retry),
-                    None,
-                );
-            }
-            Err(_) => {
-                return (
-                    Decision::deny(ReasonCode::IntentNotApproved, OperatorAction::Retry),
-                    None,
-                );
-            }
-        };
-
-        let ceremony_id = CeremonyId::new();
-
-        let handle = AuthorizationHandle {
-            ceremony_id: ceremony_id.clone(),
-            grant_id: None,
-            intent_id: Some(intent_id.clone()),
-            profile_id: snapshot.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: request.policy_generation_id.clone(),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-        };
-
-        let pending_auth = PendingAuthorization {
-            ceremony_id: ceremony_id.clone(),
-            grant_id: None,
-            intent_id: Some(intent_id),
-            profile_id: snapshot.profile_id.clone(),
-            session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
-            process_digest: request.process_digest.clone(),
-            policy_generation: request.policy_generation_id.clone(),
-            policy_digest: request.policy_digest.clone(),
-            action: request.action.clone(),
-            rp_id: request.rp_id.clone(),
-            credential_ref: request.credential_ref.clone(),
-            invalidated: false,
-        };
-
-        drop(intents);
-
-        {
-            let mut pending = self.lock_pending();
-            pending.insert(ceremony_id.as_str().to_string(), pending_auth);
-        }
-
-        (Decision::allow(ReasonCode::Allowed), Some(handle))
-    }
-
-    pub fn consume_authorization(
-        &self,
-        handle: &AuthorizationHandle,
-    ) -> Result<IntentConsumeInfo, ReasonCode> {
-        let ceremony_key = handle.ceremony_id.as_str().to_string();
-
-        {
-            let pending = self.lock_pending();
-            match pending.get(&ceremony_key) {
-                Some(pa)
-                    if !pa.invalidated
-                        && pa.grant_id == handle.grant_id
-                        && pa.intent_id == handle.intent_id
-                        && pa.profile_id == handle.profile_id
-                        && pa.session_id == handle.session_id
-                        && pa.endpoint_id == handle.endpoint_id
-                        && pa.process_digest == handle.process_digest
-                        && pa.policy_generation == handle.policy_generation
-                        && pa.policy_digest == handle.policy_digest
-                        && pa.action == handle.action
-                        && pa.rp_id == handle.rp_id
-                        && pa.credential_ref == handle.credential_ref => {}
-                Some(_) => return Err(ReasonCode::CeremonyInvalidated),
-                None => return Err(ReasonCode::CeremonyInvalidated),
-            }
-        }
-
-        let generation = self.current_generation();
-        if handle.policy_generation != generation.generation_id
-            || handle.policy_digest != generation.digest
-        {
-            self.invalidate_ceremony(&ceremony_key);
-            return Err(ReasonCode::GenerationStale);
-        }
-
-        if let Some(ref grant_id) = handle.grant_id {
-            let profile_key = handle.profile_id.as_str().to_string();
-            let grants_map = self.lock_grants();
-            if let Some(grants) = grants_map.get(&profile_key) {
-                if !grants.is_grant_active(grant_id) {
-                    drop(grants_map);
-                    self.invalidate_ceremony(&ceremony_key);
-                    return Err(ReasonCode::GrantRevoked);
-                }
-                if grants.current_policy_generation() != &handle.policy_generation {
-                    drop(grants_map);
-                    self.invalidate_ceremony(&ceremony_key);
-                    return Err(ReasonCode::GenerationStale);
-                }
-            } else {
-                drop(grants_map);
-                self.invalidate_ceremony(&ceremony_key);
-                return Err(ReasonCode::ProfileNotFound);
-            }
-        }
-
-        let intent_id = handle
-            .intent_id
-            .as_ref()
-            .ok_or(ReasonCode::IntentNotFound)?;
-        let consume_info = {
-            let mut intents = self.lock_intents();
-            match intents.consume_claimed(intent_id) {
-                Ok(info) => info,
-                Err(IntentError::InvalidTransition { .. }) => {
-                    return Err(ReasonCode::IntentConsumed);
-                }
-                Err(IntentError::NotFound) => {
-                    return Err(ReasonCode::IntentNotFound);
-                }
-                Err(_) => {
-                    return Err(ReasonCode::IntentConsumed);
-                }
-            }
-        };
-
-        if let Some(ref _grant_id) = handle.grant_id {
-            let profile_key = handle.profile_id.as_str().to_string();
-            let grant_consume_ok = {
-                let grants_map = self.lock_grants();
-                if let Some(grants) = grants_map.get(&profile_key) {
-                    grants
-                        .consume_claim_by_ceremony(&handle.ceremony_id)
-                        .is_ok()
-                } else {
-                    false
-                }
-            };
-            if !grant_consume_ok {
-                {
-                    let mut intents = self.lock_intents();
-                    let _ = intents.rollback_claim(intent_id);
-                }
-                self.invalidate_ceremony(&ceremony_key);
-                return Err(ReasonCode::PartialClaimFailed);
-            }
-        }
-
-        self.invalidate_ceremony(&ceremony_key);
-        Ok(consume_info)
-    }
-
-    fn invalidate_ceremony(&self, ceremony_key: &str) {
-        let (intent_id, grant_claim) = {
-            let mut pending = self.lock_pending();
-            let Some(pa) = pending.get_mut(ceremony_key) else {
-                return;
-            };
-            pa.invalidated = true;
-            (
-                pa.intent_id.clone(),
-                pa.grant_id
-                    .as_ref()
-                    .map(|_| (pa.profile_id.as_str().to_string(), pa.ceremony_id.clone())),
-            )
-        };
-        if let Some(intent_id) = intent_id {
-            let _ = self.lock_intents().rollback_claim(&intent_id);
-        }
-        if let Some((profile_key, ceremony_id)) = grant_claim
-            && let Some(grants) = self.lock_grants().get_mut(&profile_key)
-        {
-            grants.cancel_claim(&ceremony_id);
-        }
-    }
-
-    /// Deny the intents and withdraw the grant requests of pending principal requests that were
-    /// just cancelled or timed out. Runs after the `pending_requests` guard is released.
-    fn abandon_pending(&self, abandoned: Vec<(IntentId, ProfileId, Option<GrantRequestId>)>) {
+    /// Withdraw the grant requests of pending principal requests that were just cancelled or
+    /// timed out. Runs after the `pending_requests` guard is released.
+    fn abandon_pending(&self, abandoned: Vec<(ProfileId, Option<GrantRequestId>)>) {
         if abandoned.is_empty() {
             return;
         }
-        let authority = super::intent::admin_authority();
-        {
-            let mut intents = self.lock_intents();
-            for (intent_id, _, _) in &abandoned {
-                let _ = intents.deny(intent_id, &authority);
-            }
-        }
+        let authority = super::identity::admin_authority();
         let mut grants_map = self.lock_grants();
-        for (_, profile_id, grant_request_id) in &abandoned {
+        for (profile_id, grant_request_id) in &abandoned {
             if let Some(grant_request_id) = grant_request_id
                 && let Some(grants) = grants_map.get_mut(profile_id.as_str())
             {
@@ -1428,32 +760,6 @@ impl PolicyRuntime {
                 let _ = grants.cancel_request(grant_request_id);
             }
         }
-    }
-
-    pub fn admin_approve_intent(
-        &self,
-        intent_id: &IntentId,
-        authority: &AdminAuthority,
-    ) -> Result<(), IntentError> {
-        let mut intents = self.lock_intents();
-        intents.approve(intent_id, authority)
-    }
-
-    pub fn admin_deny_intent(
-        &self,
-        intent_id: &IntentId,
-        authority: &AdminAuthority,
-    ) -> Result<(), IntentError> {
-        let mut intents = self.lock_intents();
-        intents.deny(intent_id, authority)
-    }
-
-    pub fn admin_create_intent(
-        &self,
-        params: CreateIntentParams,
-    ) -> Result<(IntentId, super::intent::ClaimToken), IntentError> {
-        let mut intents = self.lock_intents();
-        intents.create(params)
     }
 
     pub fn admin_request_grant(
@@ -1531,20 +837,11 @@ impl PolicyRuntime {
             }
         }
 
-        drop(grants_map);
-        if result.is_ok() {
-            let mut pending = self.lock_pending();
-            for pa in pending.values_mut() {
-                if pa.grant_id.as_ref() == Some(grant_id) {
-                    pa.invalidated = true;
-                }
-            }
-        }
         result
     }
 
     pub fn rollback_grant(&self, grant_id: &passless_core::agent::GrantId) {
-        let authority = super::intent::admin_authority();
+        let authority = super::identity::admin_authority();
         let _ = self.admin_revoke_grant(grant_id, &authority);
     }
 
@@ -1560,34 +857,12 @@ impl PolicyRuntime {
             .and_then(|g| g.resolved_grant_id(grant_request_id))
     }
 
-    pub fn principal_cancel_intent(
-        &self,
-        intent_id: &IntentId,
-        profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-    ) -> Result<(), IntentError> {
-        let mut intents = self.lock_intents();
-        intents.cancel_by_principal(intent_id, profile_id, session_id)
-    }
-
     pub fn principal_exit(&self, session_id: &PrincipalSessionId) {
-        {
-            let mut intents = self.lock_intents();
-            intents.cancel_by_session(session_id);
-        }
         {
             let mut grants_map = self.lock_grants();
             for grants in grants_map.values_mut() {
                 grants.on_principal_exit(session_id);
                 grants.cancel_claims_for_session(session_id);
-            }
-        }
-        {
-            let mut pending = self.lock_pending();
-            for pa in pending.values_mut() {
-                if pa.session_id == *session_id {
-                    pa.invalidated = true;
-                }
             }
         }
         {
@@ -1602,39 +877,20 @@ impl PolicyRuntime {
 
     #[cfg(test)]
     pub fn admin_authority(&self) -> AdminAuthority {
-        super::intent::admin_authority()
+        super::identity::admin_authority()
     }
 
-    pub fn principal_create_pending_intent(
+    pub fn principal_create_pending_delegated(
         &self,
-        params: CreateIntentParams,
-    ) -> Result<PendingRequestId, PendingCreateError> {
+        params: PendingDelegationParams,
+        grant_params: GrantRequestParams,
+    ) -> Result<(PendingRequestId, super::grant::GrantRequestId), PendingCreateError> {
         let now_mono = self.clock.monotonic_secs();
         let ttl_ms = params.ttl_ms.unwrap_or(300_000);
         let ttl_secs = ttl_ms.div_ceil(1000);
 
         let normalized_rp = params.rp_id.trim().to_ascii_lowercase();
-        let profile_id = params.profile_id.clone();
-        let session_id = params.session_id.clone();
-        let endpoint_id = params.endpoint_id.clone();
-        let process_digest = params.process_digest.clone();
-        let policy_generation = params.policy_generation.clone();
-        let policy_digest = params.policy_digest.clone();
-        let action = params.action.clone();
-        let credential_ref = params.credential_ref.clone();
-
-        let (intent_id, _claim_token) = {
-            let mut intents = self.lock_intents();
-            intents
-                .create(params)
-                .map_err(PendingCreateError::IntentCreationFailed)?
-        };
-
-        let pending_id = PendingRequestId::new();
-
-        let request = PendingPrincipalRequest {
-            id: pending_id.clone(),
-            kind: PendingRequestKind::IsolatedIntent,
+        let PendingDelegationParams {
             profile_id,
             session_id,
             endpoint_id,
@@ -1642,45 +898,9 @@ impl PolicyRuntime {
             policy_generation,
             policy_digest,
             action,
-            rp_id: normalized_rp,
             credential_ref,
-            intent_id,
-            grant_request_id: None,
-            state: PendingState::Waiting,
-            created_at_mono: now_mono,
-            deadline_mono: now_mono.saturating_add(ttl_secs),
-        };
-
-        let mut pending_requests = self.lock_pending_requests();
-        pending_requests.insert(pending_id.as_str().to_string(), request);
-        Ok(pending_id)
-    }
-
-    pub fn principal_create_pending_delegated(
-        &self,
-        intent_params: CreateIntentParams,
-        grant_params: GrantRequestParams,
-    ) -> Result<(PendingRequestId, super::grant::GrantRequestId), PendingCreateError> {
-        let now_mono = self.clock.monotonic_secs();
-        let ttl_ms = intent_params.ttl_ms.unwrap_or(300_000);
-        let ttl_secs = ttl_ms.div_ceil(1000);
-
-        let normalized_rp = intent_params.rp_id.trim().to_ascii_lowercase();
-        let profile_id = intent_params.profile_id.clone();
-        let session_id = intent_params.session_id.clone();
-        let endpoint_id = intent_params.endpoint_id.clone();
-        let process_digest = intent_params.process_digest.clone();
-        let policy_generation = intent_params.policy_generation.clone();
-        let policy_digest = intent_params.policy_digest.clone();
-        let action = intent_params.action.clone();
-        let credential_ref = intent_params.credential_ref.clone();
-
-        let (intent_id, _claim_token) = {
-            let mut intents = self.lock_intents();
-            intents
-                .create(intent_params)
-                .map_err(PendingCreateError::IntentCreationFailed)?
-        };
+            ..
+        } = params;
 
         let grant_request_id =
             {
@@ -1698,7 +918,6 @@ impl PolicyRuntime {
 
         let request = PendingPrincipalRequest {
             id: pending_id.clone(),
-            kind: PendingRequestKind::DelegatedAuth,
             profile_id,
             session_id,
             endpoint_id,
@@ -1708,7 +927,6 @@ impl PolicyRuntime {
             action,
             rp_id: normalized_rp,
             credential_ref,
-            intent_id,
             grant_request_id: Some(grant_request_id.clone()),
             state: PendingState::Waiting,
             created_at_mono: now_mono,
@@ -1739,11 +957,7 @@ impl PolicyRuntime {
         }
 
         request.state = PendingState::Cancelled;
-        let abandoned = vec![(
-            request.intent_id.clone(),
-            request.profile_id.clone(),
-            request.grant_request_id.clone(),
-        )];
+        let abandoned = vec![(request.profile_id.clone(), request.grant_request_id.clone())];
         drop(pending_requests);
         self.abandon_pending(abandoned);
 
@@ -1774,7 +988,6 @@ impl PolicyRuntime {
 
         Ok(PendingStatusSnapshot {
             id: request.id.clone(),
-            kind: request.kind,
             state: effective_state,
             profile_id: request.profile_id.clone(),
             session_id: request.session_id.clone(),
@@ -1785,7 +998,6 @@ impl PolicyRuntime {
             action: request.action.clone(),
             rp_id: request.rp_id.clone(),
             credential_ref: request.credential_ref.clone(),
-            intent_id: request.intent_id.clone(),
             grant_request_id: request.grant_request_id.clone(),
             created_at_mono: request.created_at_mono,
             deadline_mono: request.deadline_mono,
@@ -1800,11 +1012,7 @@ impl PolicyRuntime {
             if request.state == PendingState::Waiting && now_mono >= request.deadline_mono {
                 request.state = PendingState::TimedOut;
                 expired.push(request.id.clone());
-                abandoned.push((
-                    request.intent_id.clone(),
-                    request.profile_id.clone(),
-                    request.grant_request_id.clone(),
-                ));
+                abandoned.push((request.profile_id.clone(), request.grant_request_id.clone()));
             }
         }
         self.abandon_pending(abandoned);
@@ -1816,21 +1024,30 @@ impl PolicyRuntime {
         for request in self.lock_pending_requests().values_mut() {
             if request.session_id == *session_id && request.state == PendingState::Waiting {
                 request.state = PendingState::Cancelled;
-                abandoned.push((
-                    request.intent_id.clone(),
-                    request.profile_id.clone(),
-                    request.grant_request_id.clone(),
-                ));
+                abandoned.push((request.profile_id.clone(), request.grant_request_id.clone()));
             }
         }
         self.abandon_pending(abandoned);
     }
 }
 
+/// The request half of a pending delegation (the grant request is separate).
+pub struct PendingDelegationParams {
+    pub profile_id: ProfileId,
+    pub session_id: PrincipalSessionId,
+    pub endpoint_id: EndpointId,
+    pub process_digest: ProcessIdentityDigest,
+    pub action: IntentAction,
+    pub rp_id: String,
+    pub credential_ref: Option<CredentialRef>,
+    pub policy_generation: PolicyGenerationId,
+    pub policy_digest: PolicyDigest,
+    pub ttl_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingStatusSnapshot {
     pub id: PendingRequestId,
-    pub kind: PendingRequestKind,
     pub state: PendingState,
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
@@ -1841,7 +1058,6 @@ pub struct PendingStatusSnapshot {
     pub action: IntentAction,
     pub rp_id: String,
     pub credential_ref: Option<CredentialRef>,
-    pub intent_id: IntentId,
     pub grant_request_id: Option<GrantRequestId>,
     pub created_at_mono: u64,
     pub deadline_mono: u64,
@@ -1854,16 +1070,6 @@ impl PendingStatusSnapshot {
 
     pub fn is_expired(&self) -> bool {
         self.state == PendingState::TimedOut
-    }
-
-    pub fn to_intent_state(&self) -> passless_core::agent::protocol::IntentState {
-        match self.state {
-            PendingState::Waiting => passless_core::agent::protocol::IntentState::Pending,
-            PendingState::Approved => passless_core::agent::protocol::IntentState::Approved,
-            PendingState::Denied => passless_core::agent::protocol::IntentState::Denied,
-            PendingState::TimedOut => passless_core::agent::protocol::IntentState::Expired,
-            PendingState::Cancelled => passless_core::agent::protocol::IntentState::Cancelled,
-        }
     }
 
     pub fn to_delegation_state(&self) -> passless_core::agent::protocol::DelegationState {
@@ -1894,20 +1100,12 @@ impl std::fmt::Display for PendingStatusError {
 
 impl std::error::Error for PendingStatusError {}
 
-struct ArcMonotonicClockAdapter(Arc<dyn MonotonicClock>);
-
-impl MonotonicClock for ArcMonotonicClockAdapter {
-    fn now(&self) -> super::intent::MonotonicTime {
-        self.0.now()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use passless_core::agent::{
         AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, AgentStorageConfig, BrowserScope,
-        CredentialRef, ProfileId, RuleAction, RuleIdentity,
+        ProfileId, RuleAction, RuleIdentity,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1915,9 +1113,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::browser::Clock;
-    use super::super::intent::{
-        CreateIntentParams, MonotonicClock, MonotonicTime, ProcessIdentityDigest,
-    };
+    use super::super::identity::ProcessIdentityDigest;
     use passless_core::agent::protocol::IntentAction;
 
     struct MockClock {
@@ -1955,12 +1151,6 @@ mod tests {
         }
     }
 
-    impl MonotonicClock for MockClock {
-        fn now(&self) -> MonotonicTime {
-            MonotonicTime::from_millis(self.inner.lock().unwrap().offset.as_millis() as u64)
-        }
-    }
-
     fn test_clock() -> Arc<MockClock> {
         Arc::new(MockClock::new())
     }
@@ -1974,6 +1164,7 @@ mod tests {
         profiles.insert(
             profile_name.to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2011,6 +1202,10 @@ mod tests {
             },
         );
         AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2022,31 +1217,41 @@ mod tests {
 
     fn make_runtime(config: &AgentConfig) -> (PolicyRuntime, Arc<MockClock>) {
         let clock = test_clock();
-        let runtime = PolicyRuntime::new(config, clock.clone(), clock.clone(), None).unwrap();
+        let runtime = PolicyRuntime::new(config, clock.clone(), None).unwrap();
         (runtime, clock)
     }
 
-    fn make_auth_request(
+    /// Register a waiting delegation request directly (the principal path is refused by the
+    /// runtime; the pending-request bookkeeping is what these tests exercise).
+    fn insert_pending(
         runtime: &PolicyRuntime,
-        profile_id: ProfileId,
-        action: IntentAction,
-        rp_id: &str,
-        credential_ref: Option<CredentialRef>,
-        uv_enforced: bool,
-    ) -> AuthorizationRequest {
+        profile_id: &ProfileId,
+        session_id: &PrincipalSessionId,
+        ttl_ms: u64,
+    ) -> PendingRequestId {
         let generation = runtime.current_generation();
-        AuthorizationRequest {
-            profile_id,
-            session_id: passless_core::agent::PrincipalSessionId::new(),
-            endpoint_id: passless_core::agent::EndpointId::new(),
-            process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action,
-            rp_id: rp_id.to_string(),
-            credential_ref,
-            uv_enforced,
-        }
+        let now_mono = runtime.clock.monotonic_secs();
+        let id = PendingRequestId::new();
+        runtime.lock_pending_requests().insert(
+            id.as_str().to_string(),
+            PendingPrincipalRequest {
+                id: id.clone(),
+                profile_id: profile_id.clone(),
+                session_id: session_id.clone(),
+                endpoint_id: EndpointId::new(),
+                process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
+                policy_generation: generation.generation_id.clone(),
+                policy_digest: generation.digest.clone(),
+                action: IntentAction::Authenticate,
+                rp_id: "example.com".to_string(),
+                credential_ref: None,
+                grant_request_id: None,
+                state: PendingState::Waiting,
+                created_at_mono: now_mono,
+                deadline_mono: now_mono.saturating_add(ttl_ms.div_ceil(1000)),
+            },
+        );
+        id
     }
 
     fn rule(rp_id: &str, authenticate: RuleAction, register: RuleAction) -> AgentRpRule {
@@ -2242,7 +1447,7 @@ mod tests {
             ],
         );
         let clock = test_clock();
-        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+        let runtime = PolicyRuntime::new(&config, clock, None)
             .unwrap()
             .with_grant_source(TestGrants::of(&[
                 ("granted", "github.com"),
@@ -2287,7 +1492,7 @@ mod tests {
             rule("alsodenied.example.com", RuleAction::Deny, RuleAction::Deny),
         ];
         let clock = test_clock();
-        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+        let runtime = PolicyRuntime::new(&config, clock, None)
             .unwrap()
             .with_grant_source(TestGrants::of(&[
                 ("orphan", "denied.example.com"),
@@ -2311,7 +1516,7 @@ mod tests {
         config.profiles.get_mut("regreq").unwrap().rules =
             vec![rule("example.com", RuleAction::Allow, RuleAction::Request)];
         let clock = test_clock();
-        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+        let runtime = PolicyRuntime::new(&config, clock, None)
             .unwrap()
             .with_grant_source(TestGrants::of(&[("regreq", "example.com")]));
         let pid = ProfileId::new("regreq").unwrap();
@@ -2326,7 +1531,7 @@ mod tests {
         config.profiles.get_mut("p_one").unwrap().rules =
             vec![rule("example.com", RuleAction::Request, RuleAction::Deny)];
         let clock = test_clock();
-        let runtime = PolicyRuntime::new(&config, clock.clone(), clock, None)
+        let runtime = PolicyRuntime::new(&config, clock, None)
             .unwrap()
             .with_grant_source(TestGrants::of(&[("someone_else", "example.com")]));
         let pid = ProfileId::new("p_one").unwrap();
@@ -2481,7 +1686,7 @@ mod tests {
             )
             .unwrap();
         let grant_id = runtime
-            .admin_approve_grant(&request, &super::super::intent::admin_authority())
+            .admin_approve_grant(&request, &super::super::identity::admin_authority())
             .unwrap();
 
         runtime.reload(&config).unwrap();
@@ -2522,7 +1727,7 @@ mod tests {
             .admin_request_session_grant(params(3600), true)
             .expect("a session grant up to max_session_ttl is accepted");
         let grant_id = runtime
-            .admin_approve_grant(&request, &super::super::intent::admin_authority())
+            .admin_approve_grant(&request, &super::super::identity::admin_authority())
             .unwrap();
         let grant = runtime.resolve_grant_for_sign(&pid, &grant_id).unwrap();
         assert_eq!(grant.expiry_mono, 3600, "the full session TTL is granted");
@@ -2590,6 +1795,38 @@ mod tests {
     }
 
     #[test]
+    fn test_digest_covers_escalation_settings_and_grant_cap() {
+        let base = make_isolated_config("esc", vec!["example.com"], false);
+        let digest = |config: &AgentConfig| {
+            PolicyRuntime::compile_generation(config, 0, 1)
+                .unwrap()
+                .digest
+        };
+        let mut cooldown = base.clone();
+        cooldown.escalation_cooldown += 1;
+        let mut timeout = base.clone();
+        timeout.escalation_timeout = Some(300);
+        let mut cap = base.clone();
+        cap.profiles.get_mut("esc").unwrap().max_granted_rules = 8;
+        for changed in [&cooldown, &timeout, &cap] {
+            assert_ne!(digest(&base), digest(changed));
+        }
+        // Restart-only keys are not policy: they never reach the digest.
+        let mut restart_only = base.clone();
+        restart_only.notify_user = Some("someone".to_string());
+        restart_only.state_dir = Some(PathBuf::from("/srv/state"));
+        assert_eq!(digest(&base), digest(&restart_only));
+        let snapshot_cap = PolicyRuntime::compile_generation(&cap, 0, 1).unwrap();
+        assert_eq!(
+            snapshot_cap
+                .find_snapshot(&ProfileId::new("esc").unwrap())
+                .unwrap()
+                .max_granted_rules,
+            8
+        );
+    }
+
+    #[test]
     fn test_digest_changes_with_rule_action() {
         let allow = make_isolated_config("dig", vec!["example.com"], false);
         let mut request = allow.clone();
@@ -2604,729 +1841,13 @@ mod tests {
     }
 
     #[test]
-    fn test_authorize_denies_non_allow_rule_actions() {
-        let mut config = make_isolated_config("nonallow", vec![], false);
-        config.profiles.get_mut("nonallow").unwrap().rules = vec![
-            rule("request.example.com", RuleAction::Request, RuleAction::Deny),
-            rule("deny.example.com", RuleAction::Deny, RuleAction::Deny),
-        ];
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("nonallow").unwrap();
-        for rp in ["request.example.com", "deny.example.com"] {
-            let request = make_auth_request(
-                &runtime,
-                pid.clone(),
-                IntentAction::Authenticate,
-                rp,
-                None,
-                false,
-            );
-            let (decision, handle) = runtime.authorize(&request);
-            assert_eq!(decision.outcome, Outcome::Deny, "{rp}");
-            assert_eq!(decision.reason, ReasonCode::ActionNotAllowed, "{rp}");
-            assert!(handle.is_none());
-        }
-    }
-
-    #[test]
-    fn test_isolated_auth_requires_intent() {
-        let config = make_isolated_config("iso", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("iso").unwrap();
-
-        let request = make_auth_request(
-            &runtime,
-            pid,
-            IntentAction::Authenticate,
-            "example.com",
-            None,
-            false,
-        );
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::IntentNotFound);
-    }
-
-    #[test]
-    fn test_isolated_auth_with_intent_allowed() {
-        let config = make_isolated_config("isook", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("isook").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _token) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, handle) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Allow);
-        assert!(handle.is_some());
-    }
-
-    #[test]
-    fn test_suffix_rp_denied() {
-        let config = make_isolated_config("suf", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("suf").unwrap();
-
-        let request = make_auth_request(
-            &runtime,
-            pid,
-            IntentAction::Authenticate,
-            "sub.example.com",
-            None,
-            false,
-        );
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::SuffixNotExact);
-    }
-
-    #[test]
-    fn test_reload_invalidates_stores() {
-        let config1 = make_isolated_config("reload", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config1);
-        let pid = ProfileId::new("reload").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let config2 = make_isolated_config("reload", vec!["example.com", "github.com"], false);
-        let _new_digest = runtime.reload(&config2).unwrap();
-
-        let pending = runtime.pending.lock().unwrap();
-        assert!(pending.values().all(|p| p.invalidated));
-    }
-
-    #[test]
-    fn test_handle_consume_exactly_once() {
-        let config = make_isolated_config("consume", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("consume").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, handle) = runtime.authorize(&request);
-        assert!(decision.is_allowed());
-        let h = handle.unwrap();
-
-        assert!(runtime.consume_authorization(&h).is_ok());
-        assert!(matches!(
-            runtime.consume_authorization(&h),
-            Err(ReasonCode::CeremonyInvalidated)
-        ));
-    }
-
-    #[test]
-    fn test_public_principal_cannot_approve() {
-        let config = make_isolated_config("noapprove", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-
-        let _authority = runtime.admin_authority();
-    }
-
-    #[test]
-    fn test_concurrent_authorize_one_claim() {
-        let config = make_isolated_config("concurrent", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("concurrent").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (_decision, handle) = runtime.authorize(&request);
-        let h = handle.unwrap();
-
-        let results: Vec<bool> = (0..10)
-            .map(|_| runtime.consume_authorization(&h).is_ok())
-            .collect();
-        let successes = results.iter().filter(|&&r| r).count();
-        assert_eq!(successes, 1);
-    }
-
-    #[test]
-    fn test_intent_replay_denied() {
-        let config = make_isolated_config("replay", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("replay").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-    }
-
-    #[test]
-    fn test_two_authorize_races_one_intent_one_succeeds() {
-        let config = make_isolated_config("race", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("race").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid.clone(),
-            session_id: session.clone(),
-            endpoint_id: endpoint.clone(),
-            process_digest: process_digest.clone(),
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (d1, h1) = runtime.authorize(&request);
-        let (d2, h2) = runtime.authorize(&request);
-
-        assert!(d1.is_allowed());
-        assert_eq!(d2.outcome, Outcome::Deny);
-        assert!(h1.is_some());
-        assert!(h2.is_none());
-    }
-
-    #[test]
-    fn test_cross_session_denied() {
-        let config = make_isolated_config("crosssession", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("crosssession").unwrap();
-        let authority = runtime.admin_authority();
-        let session1 = passless_core::agent::PrincipalSessionId::new();
-        let session2 = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session1.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session2,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::IntentNotFound);
-    }
-
-    #[test]
-    fn test_cross_endpoint_denied() {
-        let config = make_isolated_config("crossendpoint", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("crossendpoint").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint1 = passless_core::agent::EndpointId::new();
-        let endpoint2 = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint1.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint2,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::IntentNotFound);
-    }
-
-    #[test]
-    fn test_cross_process_denied() {
-        let config = make_isolated_config("crossprocess", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("crossprocess").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest1 = ProcessIdentityDigest::compute(1000, 1000, 42, b"test-a");
-        let process_digest2 = ProcessIdentityDigest::compute(1000, 1000, 42, b"test-b");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest1.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest: process_digest2,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::IntentNotFound);
-    }
-
-    #[test]
-    fn test_cross_generation_denied() {
-        let config = make_isolated_config("crossgen", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("crossgen").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let stale_gen = PolicyGenerationId::new();
-        let stale_digest = PolicyDigest::from_cbor_bytes(b"stale");
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: stale_gen,
-            policy_digest: stale_digest,
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, _) = runtime.authorize(&request);
-        assert_eq!(decision.outcome, Outcome::Deny);
-        assert_eq!(decision.reason, ReasonCode::GenerationStale);
-    }
-
-    #[test]
-    fn test_reload_denies_consume() {
-        let config1 = make_isolated_config("reloadconsume", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config1);
-        let pid = ProfileId::new("reloadconsume").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid,
-            session_id: session,
-            endpoint_id: endpoint,
-            process_digest,
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (decision, handle) = runtime.authorize(&request);
-        assert!(decision.is_allowed());
-        let h = handle.unwrap();
-
-        let config2 =
-            make_isolated_config("reloadconsume", vec!["example.com", "github.com"], false);
-        runtime.reload(&config2).unwrap();
-
-        let result = runtime.consume_authorization(&h);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_no_partial_claim_reusable() {
-        let config = make_isolated_config("nopartial", vec!["example.com"], false);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("nopartial").unwrap();
-        let authority = runtime.admin_authority();
-        let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let (intent_id, _) = runtime
-            .admin_create_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-        runtime
-            .admin_approve_intent(&intent_id, &authority)
-            .unwrap();
-
-        let request = AuthorizationRequest {
-            profile_id: pid.clone(),
-            session_id: session.clone(),
-            endpoint_id: endpoint.clone(),
-            process_digest: process_digest.clone(),
-            policy_generation_id: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            uv_enforced: false,
-        };
-
-        let (d1, h1) = runtime.authorize(&request);
-        assert!(d1.is_allowed());
-        let mut handle = h1.unwrap();
-
-        let (d2, h2) = runtime.authorize(&request);
-        assert_eq!(d2.outcome, Outcome::Deny);
-        assert!(h2.is_none());
-
-        handle.rp_id = "other.example".to_string();
-        assert_eq!(
-            runtime.consume_authorization(&handle),
-            Err(ReasonCode::CeremonyInvalidated)
-        );
-        handle.rp_id = "example.com".to_string();
-
-        let result = runtime.consume_authorization(&handle);
-        assert!(result.is_ok());
-
-        let result2 = runtime.consume_authorization(&handle);
-        assert!(result2.is_err());
-    }
-
-    #[test]
-    fn test_principal_create_pending_intent_isolated() {
-        let config = make_isolated_config("pendiso", vec!["example.com"], true);
-        let (runtime, _clock) = make_runtime(&config);
-        let pid = ProfileId::new("pendiso").unwrap();
-        let session = PrincipalSessionId::new();
-        let endpoint = EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
-
-        let pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid,
-                session_id: session,
-                endpoint_id: endpoint,
-                process_digest,
-                action: IntentAction::Register,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
-
-        assert!(!pending_id.as_str().is_empty());
-
-        let pr = runtime.pending_requests.lock().unwrap();
-        let req = pr.get(pending_id.as_str()).unwrap();
-        assert_eq!(req.state, PendingState::Waiting);
-        assert_eq!(req.kind, PendingRequestKind::IsolatedIntent);
-        assert!(req.grant_request_id.is_none());
-    }
-
-    #[test]
     fn test_principal_cancel_pending() {
         let config = make_isolated_config("cancelpending", vec!["example.com"], true);
         let (runtime, _clock) = make_runtime(&config);
         let pid = ProfileId::new("cancelpending").unwrap();
         let session = PrincipalSessionId::new();
-        let endpoint = EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
+        let pending_id = insert_pending(&runtime, &pid, &session, 60_000);
 
         let result = runtime.principal_cancel_pending(&pending_id, &session);
         assert!(result.is_ok());
@@ -3343,25 +1864,8 @@ mod tests {
         let pid = ProfileId::new("cancelwrong").unwrap();
         let session = PrincipalSessionId::new();
         let wrong_session = PrincipalSessionId::new();
-        let endpoint = EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
+        let pending_id = insert_pending(&runtime, &pid, &session, 60_000);
 
         let result = runtime.principal_cancel_pending(&pending_id, &wrong_session);
         assert_eq!(result, Err(PendingCancelError::SessionMismatch));
@@ -3373,25 +1877,8 @@ mod tests {
         let (runtime, _clock) = make_runtime(&config1);
         let pid = ProfileId::new("reloadcancel").unwrap();
         let session = PrincipalSessionId::new();
-        let endpoint = EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let _pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
+        let _pending_id = insert_pending(&runtime, &pid, &session, 60_000);
 
         let config2 = make_isolated_config("reloadcancel", vec!["example.com", "github.com"], true);
         runtime.reload(&config2).unwrap();
@@ -3408,25 +1895,8 @@ mod tests {
         let (runtime, _clock) = make_runtime(&config);
         let pid = ProfileId::new("exitcancel").unwrap();
         let session = PrincipalSessionId::new();
-        let endpoint = EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let _pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
+        let _pending_id = insert_pending(&runtime, &pid, &session, 60_000);
 
         runtime.principal_exit(&session);
 
@@ -3443,25 +1913,8 @@ mod tests {
         let pid = ProfileId::new("status_wrong_sess").unwrap();
         let session = passless_core::agent::PrincipalSessionId::new();
         let wrong_session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(60_000),
-            })
-            .unwrap();
+        let pending_id = insert_pending(&runtime, &pid, &session, 60_000);
 
         let result = runtime.principal_pending_status(&pending_id, &wrong_session);
         assert!(matches!(result, Err(PendingStatusError::SessionMismatch)));
@@ -3484,31 +1937,13 @@ mod tests {
         let (runtime, clock) = make_runtime(&config);
         let pid = ProfileId::new("status_expiry").unwrap();
         let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(5_000),
-            })
-            .unwrap();
+        let pending_id = insert_pending(&runtime, &pid, &session, 5_000);
 
         let status = runtime
             .principal_pending_status(&pending_id, &session)
             .unwrap();
         assert_eq!(status.state, PendingState::Waiting);
-        assert_eq!(status.kind, PendingRequestKind::IsolatedIntent);
 
         clock.advance(Duration::from_secs(10));
 
@@ -3526,25 +1961,8 @@ mod tests {
         let (runtime, clock) = make_runtime(&config);
         let pid = ProfileId::new("cleanup_exp").unwrap();
         let session = passless_core::agent::PrincipalSessionId::new();
-        let endpoint = passless_core::agent::EndpointId::new();
-        let process_digest = ProcessIdentityDigest::compute(1000, 1000, 42, b"test");
-        let generation = runtime.current_generation();
 
-        let pending_id = runtime
-            .principal_create_pending_intent(CreateIntentParams {
-                profile_id: pid.clone(),
-                session_id: session.clone(),
-                endpoint_id: endpoint.clone(),
-                process_digest: process_digest.clone(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".to_string(),
-                credential_ref: None,
-                policy_generation: generation.generation_id.clone(),
-                policy_digest: generation.digest.clone(),
-                require_uv: false,
-                ttl_ms: Some(5_000),
-            })
-            .unwrap();
+        let pending_id = insert_pending(&runtime, &pid, &session, 5_000);
 
         let expired = runtime.cleanup_expired_pending();
         assert!(expired.is_empty());
@@ -3562,36 +1980,9 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_status_mapping_intent_state() {
-        let snapshot = PendingStatusSnapshot {
-            id: PendingRequestId::new(),
-            kind: PendingRequestKind::IsolatedIntent,
-            state: PendingState::Waiting,
-            profile_id: ProfileId::new("test").unwrap(),
-            session_id: passless_core::agent::PrincipalSessionId::new(),
-            endpoint_id: passless_core::agent::EndpointId::new(),
-            process_digest: ProcessIdentityDigest::compute(1000, 1000, 42, b"test"),
-            policy_generation: PolicyGenerationId::new(),
-            policy_digest: PolicyDigest::from_cbor_bytes(b"test"),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".to_string(),
-            credential_ref: None,
-            intent_id: IntentId::new(),
-            grant_request_id: None,
-            created_at_mono: 0,
-            deadline_mono: 100,
-        };
-        assert_eq!(
-            snapshot.to_intent_state(),
-            passless_core::agent::protocol::IntentState::Pending
-        );
-    }
-
-    #[test]
     fn test_pending_status_mapping_delegation_state() {
         let snapshot = PendingStatusSnapshot {
             id: PendingRequestId::new(),
-            kind: PendingRequestKind::DelegatedAuth,
             state: PendingState::Approved,
             profile_id: ProfileId::new("test").unwrap(),
             session_id: passless_core::agent::PrincipalSessionId::new(),
@@ -3602,7 +1993,6 @@ mod tests {
             action: IntentAction::Authenticate,
             rp_id: "example.com".to_string(),
             credential_ref: None,
-            intent_id: IntentId::new(),
             grant_request_id: None,
             created_at_mono: 0,
             deadline_mono: 100,

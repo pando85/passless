@@ -964,15 +964,22 @@ pub enum AgentAdminAction {
         #[command(subcommand)]
         action: AdminCredentialAction,
     },
-    /// Delegation management
-    Delegation {
+    /// Persistent granted rules (escalation approvals)
+    Grants {
         #[command(subcommand)]
-        action: AdminDelegationAction,
+        action: AdminGrantsAction,
     },
-    /// Session management
-    Session {
+    /// Browser bearer sessions (session grants)
+    #[command(alias = "delegation")]
+    Sessions {
         #[command(subcommand)]
-        action: AdminSessionAction,
+        action: AdminSessionsAction,
+    },
+    /// Principal sessions
+    #[command(alias = "session")]
+    Principals {
+        #[command(subcommand)]
+        action: AdminPrincipalsAction,
     },
     /// Browser session management
     Browser {
@@ -1085,23 +1092,66 @@ pub enum AdminCredentialAction {
     },
 }
 
-/// Admin delegation actions
+/// Admin granted-rule actions (ADR 0014 section 8.4)
 #[cfg(feature = "agent")]
 #[derive(Subcommand, Debug, Clone)]
-pub enum AdminDelegationAction {
-    /// Show delegation details
-    Show {
-        /// Grant identifier (hex)
-        #[arg(value_name = "GRANT_ID")]
-        grant_id: String,
-    },
-    /// List all delegations
+pub enum AdminGrantsAction {
+    /// List granted rules
     List {
         /// Filter by profile
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
-    /// Revoke a delegation
+    /// Revoke the granted rule of one RP
+    Revoke {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Relying party ID
+        #[arg(long = "rp", value_name = "RP_ID")]
+        rp_id: String,
+        /// Action of the granted rule
+        #[arg(long, value_enum, default_value_t = AdminGrantAction::Authenticate)]
+        action: AdminGrantAction,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Revoke every granted rule of a profile
+    Clear {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Action of a granted rule (only `authenticate` is ever granted)
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminGrantAction {
+    Authenticate,
+}
+
+/// Admin browser bearer session actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminSessionsAction {
+    /// Show session grant details
+    Show {
+        /// Grant identifier (hex)
+        #[arg(value_name = "GRANT_ID")]
+        grant_id: String,
+    },
+    /// List all session grants
+    List {
+        /// Filter by profile
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Revoke a session grant
     Revoke {
         /// Grant identifier (hex)
         #[arg(value_name = "GRANT_ID")]
@@ -1112,11 +1162,11 @@ pub enum AdminDelegationAction {
     },
 }
 
-/// Admin session actions
+/// Admin principal session actions
 #[cfg(feature = "agent")]
 #[derive(Subcommand, Debug, Clone)]
-pub enum AdminSessionAction {
-    /// Show session details
+pub enum AdminPrincipalsAction {
+    /// Show principal session details
     Show {
         /// Session identifier (hex)
         #[arg(value_name = "SESSION_ID")]
@@ -1303,11 +1353,6 @@ pub enum AgentCommand {
     Capabilities,
     /// Show principal instructions
     Instructions,
-    /// Intent management
-    Intent {
-        #[command(subcommand)]
-        action: AgentIntentAction,
-    },
     /// Delegation management
     Delegation {
         #[command(subcommand)]
@@ -1359,60 +1404,6 @@ pub enum AgentCommand {
         #[arg(last = true, required = true)]
         command: Vec<std::path::PathBuf>,
     },
-}
-
-/// Agent intent actions
-#[cfg(feature = "agent")]
-#[derive(Subcommand, Debug, Clone)]
-pub enum AgentIntentAction {
-    /// Create a new intent (unavailable: the daemon refuses it; removed with the intent protocol in P7)
-    #[command(hide = true)]
-    Create {
-        /// Action type
-        #[arg(value_enum)]
-        action: AgentIntentActionType,
-        /// Relying party ID
-        #[arg(long, value_name = "RP_ID")]
-        rp: String,
-        /// Credential reference (hex)
-        #[arg(long, value_name = "CREDENTIAL_REF")]
-        credential: Option<String>,
-        /// Reason for the intent
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-    },
-    /// Show intent status
-    Show {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
-    /// Wait for intent to reach terminal state
-    Wait {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-        /// Timeout in seconds
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<u64>,
-        /// Poll interval in milliseconds
-        #[arg(long, value_name = "MS")]
-        poll_interval: Option<u64>,
-    },
-    /// Cancel a pending intent
-    Cancel {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
-}
-
-/// Intent action type for CLI
-#[cfg(feature = "agent")]
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentIntentActionType {
-    Register,
-    Authenticate,
 }
 
 /// Agent delegation actions
@@ -1806,29 +1797,82 @@ mod tests {
 
     #[cfg(feature = "agent")]
     #[test]
-    fn test_agent_intent_create_parses() {
+    fn test_agent_admin_grants_parse() {
         let args = Args::try_parse_from([
             "passless",
-            "agent",
-            "intent",
-            "create",
-            "register",
+            "agent-admin",
+            "grants",
+            "revoke",
+            "--profile",
+            "coding",
             "--rp",
             "example.com",
+            "--confirm",
         ])
         .unwrap();
         assert!(matches!(
             args.command,
-            Some(Commands::Agent {
-                action: AgentCommand::Intent {
-                    action: AgentIntentAction::Create {
-                        action: AgentIntentActionType::Register,
-                        ..
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Grants {
+                    action: AdminGrantsAction::Revoke {
+                        ref profile,
+                        ref rp_id,
+                        action: AdminGrantAction::Authenticate,
+                        confirm: true,
                     },
+                },
+                ..
+            }) if profile == "coding" && rp_id == "example.com"
+        ));
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "grants",
+            "clear",
+            "--profile",
+            "p",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Grants {
+                    action: AdminGrantsAction::Clear { confirm: false, .. },
                 },
                 ..
             })
         ));
+        assert!(Args::try_parse_from(["passless", "agent-admin", "grants", "list"]).is_ok());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_renamed_session_commands_keep_hidden_aliases() {
+        for (spelling, expect_sessions) in [
+            ("sessions", true),
+            ("delegation", true),
+            ("principals", false),
+            ("session", false),
+        ] {
+            let args = Args::try_parse_from(["passless", "agent-admin", spelling, "list"]).unwrap();
+            let is_sessions = matches!(
+                args.command,
+                Some(Commands::AgentAdmin {
+                    action: AgentAdminAction::Sessions { .. },
+                    ..
+                })
+            );
+            let is_principals = matches!(
+                args.command,
+                Some(Commands::AgentAdmin {
+                    action: AgentAdminAction::Principals { .. },
+                    ..
+                })
+            );
+            assert_eq!(is_sessions, expect_sessions, "{spelling}");
+            assert_eq!(is_principals, !expect_sessions, "{spelling}");
+        }
+        assert!(Args::try_parse_from(["passless", "agent", "intent", "show", "x"]).is_err());
     }
 
     #[cfg(feature = "agent")]
@@ -1863,7 +1907,9 @@ mod tests {
             "agent",
             "install",
             "browser-control",
-            "intent",
+            "grants",
+            "sessions",
+            "principals",
             "delegation",
             "doctor",
             "capabilities",

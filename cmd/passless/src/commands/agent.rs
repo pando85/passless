@@ -1,12 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use passless_core::agent::protocol::{
-    AuthorityRisk, DelegationState, IntentAction, IntentState, PrincipalCredentialSummary,
-};
+use passless_core::agent::protocol::{AuthorityRisk, DelegationState, PrincipalCredentialSummary};
 use passless_core::{
-    AgentCommand, AgentCredentialAction, AgentDelegationAction, AgentIntentAction,
-    AgentIntentActionType, CredentialRef, Error, OutputFormat, PendingRequestId, ProfileId, Result,
+    AgentCommand, AgentCredentialAction, AgentDelegationAction, CredentialRef, Error, OutputFormat,
+    PendingRequestId, ProfileId, Result,
 };
 
 use serde::Serialize;
@@ -120,7 +118,6 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
                 AgentCommand::Doctor => dispatch_doctor(output, profile),
                 AgentCommand::Capabilities => dispatch_capabilities(output, profile),
                 AgentCommand::Instructions => dispatch_instructions(output, profile),
-                AgentCommand::Intent { action } => dispatch_intent(output, profile, action),
                 AgentCommand::Delegation { action } => dispatch_delegation(output, profile, action),
                 AgentCommand::Credential { action } => dispatch_credential(output, profile, action),
                 AgentCommand::BrowserStatus => dispatch_browser_status(output, profile),
@@ -311,180 +308,6 @@ fn dispatch_instructions(output: OutputFormat, profile: &str) -> Result<()> {
         },
         _ => Err(Error::Other("unexpected response".to_string())),
     }
-}
-
-fn dispatch_intent(output: OutputFormat, profile: &str, action: &AgentIntentAction) -> Result<()> {
-    match action {
-        AgentIntentAction::Create {
-            action: intent_type,
-            rp,
-            credential,
-            reason,
-        } => {
-            let mut client = connect_principal(profile)?;
-            let action = match intent_type {
-                AgentIntentActionType::Register => IntentAction::Register,
-                AgentIntentActionType::Authenticate => IntentAction::Authenticate,
-            };
-            let cred_ref = credential
-                .as_deref()
-                .map(parse_credential_ref)
-                .transpose()?;
-            let req = passless_core::agent::PrincipalRequest::CreateIntent {
-                profile_id: parse_profile_id(profile)?,
-                action,
-                rp_id: rp.clone(),
-                credential_ref: cred_ref,
-                reason: reason.clone(),
-                grant_ttl_secs: None,
-                session_ttl_secs: None,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::IntentCreated { request_id } => {
-                    #[derive(Serialize)]
-                    struct IntentCreated {
-                        request_id: String,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&IntentCreated {
-                            request_id: request_id.to_string(),
-                        }),
-                        OutputFormat::Plain => {
-                            println!("request_id: {}", request_id);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-        AgentIntentAction::Show { request_id } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::ShowIntent {
-                request_id: parse_pending_request_id(request_id)?,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::IntentStatus { request_id, state } => {
-                    #[derive(Serialize)]
-                    struct IntentStatusOut {
-                        request_id: String,
-                        state: String,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&IntentStatusOut {
-                            request_id: request_id.to_string(),
-                            state: state.to_string(),
-                        }),
-                        OutputFormat::Plain => {
-                            println!("request_id: {}", request_id);
-                            println!("state: {}", state);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-        AgentIntentAction::Wait {
-            request_id,
-            timeout,
-            poll_interval,
-        } => {
-            let mut client = connect_principal(profile)?;
-            let req_id = parse_pending_request_id(request_id)?;
-            let timeout_dur = timeout.map(Duration::from_secs);
-            let poll_dur = poll_interval.map(Duration::from_millis);
-
-            let result = wait_with_poll(
-                WaitTarget::Intent,
-                &req_id,
-                timeout_dur,
-                poll_dur,
-                || -> std::result::Result<bool, ClientError> {
-                    let show_req = passless_core::agent::PrincipalRequest::ShowIntent {
-                        request_id: req_id.clone(),
-                    };
-                    let resp = client.request(show_req)?;
-                    match resp {
-                        passless_core::agent::PrincipalResponse::IntentStatus { state, .. } => {
-                            Ok(is_terminal_intent(state))
-                        }
-                        _ => Ok(false),
-                    }
-                },
-            );
-
-            match result {
-                Ok(()) => {
-                    let show_req = passless_core::agent::PrincipalRequest::ShowIntent {
-                        request_id: req_id.clone(),
-                    };
-                    let resp = client.request(show_req).map_err(client_error_to_result)?;
-                    match resp {
-                        passless_core::agent::PrincipalResponse::IntentStatus {
-                            request_id,
-                            state,
-                        } => {
-                            #[derive(Serialize)]
-                            struct IntentWaitOut {
-                                request_id: String,
-                                state: String,
-                            }
-                            match output {
-                                OutputFormat::Json => output_json(&IntentWaitOut {
-                                    request_id: request_id.to_string(),
-                                    state: state.to_string(),
-                                }),
-                                OutputFormat::Plain => {
-                                    println!("request_id: {}", request_id);
-                                    println!("state: {}", state);
-                                    Ok(())
-                                }
-                            }
-                        }
-                        _ => Err(Error::Other("unexpected response".to_string())),
-                    }
-                }
-                Err(ClientError::Timeout) => {
-                    let _ = output_error("timeout", "wait timed out", "retry");
-                    Err(Error::Other("wait timed out".to_string()))
-                }
-                Err(e) => Err(client_error_to_result(e)),
-            }
-        }
-        AgentIntentAction::Cancel { request_id } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::CancelIntent {
-                request_id: parse_pending_request_id(request_id)?,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::IntentCancelled => {
-                    #[derive(Serialize)]
-                    struct CancelledOut {
-                        cancelled: bool,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&CancelledOut { cancelled: true }),
-                        OutputFormat::Plain => {
-                            println!("cancelled: true");
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-    }
-}
-
-fn is_terminal_intent(state: IntentState) -> bool {
-    matches!(
-        state,
-        IntentState::Approved | IntentState::Denied | IntentState::Cancelled | IntentState::Expired
-    )
 }
 
 fn is_terminal_delegation(state: DelegationState) -> bool {
@@ -1143,15 +966,6 @@ mod tests {
         );
         assert!(!plain.contains("PrincipalCapabilities"));
         assert!(!plain.contains("{"));
-    }
-
-    #[test]
-    fn terminal_intent_states() {
-        assert!(!is_terminal_intent(IntentState::Pending));
-        assert!(is_terminal_intent(IntentState::Approved));
-        assert!(is_terminal_intent(IntentState::Denied));
-        assert!(is_terminal_intent(IntentState::Cancelled));
-        assert!(is_terminal_intent(IntentState::Expired));
     }
 
     #[test]

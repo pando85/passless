@@ -12,7 +12,7 @@ use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease
 use crate::agent::browser::{
     BrowserConfig, INTERCEPTION_ATTACH_TIMEOUT, InterceptionState, LeaseState,
 };
-use crate::agent::intent::ProcessIdentityDigest;
+use crate::agent::identity::ProcessIdentityDigest;
 use crate::agent::sign::BrowserLeaseActivation;
 use crate::storage::CredentialFilter;
 
@@ -456,7 +456,7 @@ impl AgentRuntime {
             // after principal capability/peer/process verification and explicit trusted port mode.
             let grant_id = self
                 .policy_runtime
-                .admin_approve_grant(&request_id, &crate::agent::intent::admin_authority())
+                .admin_approve_grant(&request_id, &crate::agent::identity::admin_authority())
                 .map_err(|e| {
                     ProtocolError::new(
                         ErrorCode::Internal,
@@ -500,7 +500,7 @@ impl AgentRuntime {
             ) {
                 let _ = self
                     .policy_runtime
-                    .admin_revoke_grant(&grant_id, &crate::agent::intent::admin_authority());
+                    .admin_revoke_grant(&grant_id, &crate::agent::identity::admin_authority());
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to register browser sign context: {e}"),
@@ -514,7 +514,7 @@ impl AgentRuntime {
                 self.sign_registry.revoke(bearer_token);
                 let _ = self
                     .policy_runtime
-                    .admin_revoke_grant(&grant_id, &crate::agent::intent::admin_authority());
+                    .admin_revoke_grant(&grant_id, &crate::agent::identity::admin_authority());
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to bind browser sign context: {e}"),

@@ -22,10 +22,20 @@ use super::config::{
 /// The granted-rules store as seen by resolution (ADR 0014 section 8.4). It is consulted only to
 /// upgrade a configured `request` for `authenticate`, and only for an exact RP.
 ///
-/// The store itself lands with P7; until then every runtime uses [`NoGrantedRules`].
+/// The daemon installs its persistent store; [`NoGrantedRules`] is the empty source.
 pub trait GrantSource: Send + Sync {
     /// Whether `profile_id` holds a granted `authenticate = allow` entry for exactly `rp_id`.
     fn is_granted(&self, profile_id: &super::ids::ProfileId, rp_id: &str) -> bool;
+
+    /// The credential references that registration grants for exactly `rp_id` pinned (ADR 0014
+    /// section 8.3); they join the RP's pinned credential set.
+    fn granted_credential_refs(
+        &self,
+        _profile_id: &super::ids::ProfileId,
+        _rp_id: &str,
+    ) -> Vec<super::ids::CredentialRef> {
+        Vec::new()
+    }
 }
 
 /// A granted-rules store that holds nothing.

@@ -19,8 +19,6 @@ AV_STAGE_SECRET_SCANNING_LOADED=true
 
 AV_REDACTION_TEST_FILTERS=(
     "passless-rs|agent::audit_events::tests::test_no_secret_value_patterns"
-    "passless-rs|agent::intent::tests::test_claim_token_display_redacted"
-    "passless-rs|agent::intent::tests::test_claim_token_debug_redacted"
     "passless-rs|agent::launcher::tests::test_session_capability_debug_redacted"
     "passless-rs|agent::launcher::tests::test_session_capability_display_redacted"
 )

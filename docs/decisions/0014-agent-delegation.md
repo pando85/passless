@@ -480,19 +480,28 @@ fails after approval, nothing is persisted.
   permitting config rule (`exact` or `*`).
 - **Write:** temporary file, fsync, rename, fsync directory. A failed write fails the approval and
   the ceremony is denied.
-- **Read:** loaded at startup and after every write; included in the policy digest. A malformed
-  or wrongly owned store disables grants for that profile (fail closed) and is reported by
-  `passless doctor`.
-- **Administration:** `passless agent grants list [--profile P]`,
-  `passless agent grants revoke --profile P --rp R [--action A]`,
-  `passless agent grants clear --profile P`. Revocation is audited. The commands that administer
-  session grants (§9) are `passless agent sessions …`; their former spelling under
-  `passless agent grants` remains a hidden alias for one release.
+- **Read:** loaded at startup and after every write. A malformed or wrongly owned store disables
+  grants for that profile (fail closed) and is reported by `passless doctor` (`agent-admin
+  profile check`). The store has its own `grants_digest`, reported next to the policy digest;
+  the policy digest covers the configuration only, so a reload's no-op comparison is unaffected
+  by grants (amended in P7).
+- **Administration** (amended in P7): `passless agent` is the principal CLI, so the operator
+  commands live under `passless agent-admin`: `grants list [--profile P]`,
+  `grants revoke --profile P --rp R [--action A] --confirm` and
+  `grants clear --profile P --confirm`, over the admin socket. Revocation is audited
+  (`granted_rule.revoke`). Session grants (§9) are administered with `agent-admin sessions …` and
+  principal sessions with `agent-admin principals …`; their former spellings `delegation` and
+  `session` remain hidden aliases for one release.
 - **Lifetime:** permanent until revoked or made inert by a config change (§6.2); no TTL.
 - **Epochs:** adding a grant bumps the grant epoch without invalidating active sessions, because it
   only widens authority the human just approved. Revoking a grant, reloading the configuration or
-  changing the config bumps the revocation epoch and invalidates the active sessions of the affected
-  profile (§6.4).
+  changing the config bumps the revocation epoch and invalidates active sessions (§6.4). The
+  revocation epoch is global (amended in P7): a revocation invalidates the sessions of every
+  profile, not only the affected one, which errs on the safe side.
+- **Locking** (amended in P7): `cmd/passless/src/agent/LOCKING.md` is normative where it differs
+  from the plan's D3. The escalation mutex is a leaf, the store's per-profile write lock ranks
+  below the policy locks and its loaded view is a leaf, and no wait holds a lock. D3's
+  `bump_generation_additive` is `bump_grant_epoch`.
 - **Cap:** `max_granted_rules` per profile, default 64; above it requests are denied.
 
 In shared-UID deployments the agent can write this file as it can write the config; that is inside
@@ -840,6 +849,8 @@ sessions; external audit checkpoints; RP-integrated session revocation; remote p
 - Daemon agent runtime: `cmd/passless/src/agent/` (`runtime.rs`, `sign.rs`, `register.rs`,
   `policy_engine.rs`, `grant.rs`, `prompt.rs`, `audit.rs`, `audit_events.rs`, `backend.rs`,
   `browser.rs`, `launcher.rs`, `cdp_bootstrap.rs`).
+- Granted-rules store: `cmd/passless/src/agent/granted_rules.rs`; principal identity and the
+  admin authority token: `agent/identity.rs`.
 - Configuration and policy digest: `passless-core/src/agent/config.rs`, `policy.rs`.
 - Extension: `cmd/passless/assets/agent-extension/`; native host: `cmd/passless/src/bin/sign-proxy.rs`.
 - Systemd units: `contrib/systemd/passless-agent.service`, `contrib/systemd/passless.service`.
@@ -868,9 +879,9 @@ References are `file:line` at commit `130eaa5`.
 | Replay | **Done (P5).** `SHA-256(action ‖ rp_id ‖ origin ‖ top_origin ‖ challenge)` with length-prefixed fields and a presence tag for `top_origin` (`session.rs`); per bearer session; a duplicate joins the in-flight request until its own deadline (an aborted duplicate detaches alone) or gets the original outcome for 120 s; a reused challenge under another key is rejected; failures consume the key | — |
 | Registration bearers | **Done (P3).** Bound to the browser lease and revoked by `revoke_by_lease`; a late use is refused with `401 invalid_bearer` and audited as `policy.deny(reason=bearer_revoked)` (at most 16 records per bearer) | — |
 | Operator-minted enrollment grants (#411) | **Done (P3).** `RegistrationGrantRegistry`, the `RequestRegistration` admin request, its CLI and handler are removed; registration authority is the exact-RP `register = "allow"` rule (`register = "request"` denies with audit until P7); a wildcard rule never permits registration | — |
-| Isolated UHID route | **Done (P3).** `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, `interaction.rs`, the endpoint wiring in `runtime.rs`, the agent UHID doctor check and the agent udev rule are removed; a legacy `[device]` key is warned about and ignored (R6). `agent/storage.rs` (ceremony-scoped storage views) is removed too. Residue: the `passless-uhid` crate and `tools/agent-uhid-feasibility` (still used by `tools/agent-validation`; P11), and the principal intent protocol (P7) | — |
+| Isolated UHID route | **Done (P3).** `endpoint_manager.rs`, `ceremony.rs`, `ceremony_observer.rs`, `device.rs`, `interaction.rs`, the endpoint wiring in `runtime.rs`, the agent UHID doctor check and the agent udev rule are removed; a legacy `[device]` key is warned about and ignored (R6). `agent/storage.rs` (ceremony-scoped storage views) is removed too. Residue: the `passless-uhid` crate and `tools/agent-uhid-feasibility` (still used by `tools/agent-validation`; P11). The principal intent protocol was removed in P7 | — |
 | Principal digest at signing | **Done (P5).** The session records the principal digest; sign and registration deny `principal_mismatch` when it differs from the session grant's | — |
-| Policy digest | **Done (P4), grants in P7.** Version 4 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits and the browser fields; a profile whose rules are all `deny` loads (B4) | Planned (P7): granted-rules store content |
+| Policy digest | **Done (P4, P7).** Version 5 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits, the browser fields, `max_granted_rules` and the escalation timeout and cooldown; a profile whose rules are all `deny` loads (B4). Granted rules have a separate `grants_digest` (§8.4) | — |
 | Audit content | No session, operation, origin, credential or result in `PolicyAllowMeta` (`audit_events.rs:659-666`); "generation" is an ID length (`runtime.rs:4079`) | Planned (P8): fields of §12, including `top_origin = null` with `cross_origin` |
 | Escalation audit events | Not implemented | Planned (P8): timeout or abort recorded as `escalation_expired` with a reason; `escalation_revoked` only for operator revocation (§12) |
 | Interception mechanism | **Done (P6).** Worker-only extension on `chrome.webAuthenticationProxy`; no content script; `main.js` and `broker.js` removed; manifest `key` fixes the extension ID; launch waits for the worker's attached `hello` and opens the start URL only then (B2) | — |
@@ -882,13 +893,13 @@ References are `file:line` at commit `130eaa5`.
 | Unsupported options | **Done (P5).** Unsupported extensions, enterprise attestation and no supported algorithm return `NotSupportedError` before budget or storage; `excludeCredentials` matches return `InvalidStateError`; origin failures `SecurityError`; daemon errors carry the DOMException name and `busy` (R11 caps) maps to `NotAllowedError` | — |
 | Transport | **Done (P6).** `connectNative` port, framed relay, one multiplexed connection per worker with keepalive both ways; per-browser-UID sockets and a `SO_PEERCRED` check at `hello` (§4.4) | — |
 | Unfocused-tab registration | **Documented (P6)** as a limitation (orphan credential, audit records it; `agent-admin credential delete` removes it) | Planned (P10): adapters bring the page to the front (§11) |
-| Escalation, granted-rules store, `passless agent grants` | Not implemented | Planned (P7): §8 |
+| Escalation, granted-rules store, grants CLI | **Store and CLI done (P7 WP1).** `agent/granted_rules.rs` (fail-closed load, atomic write, epochs), installed as the policy runtime's grant source; `agent-admin grants list/revoke/clear` | Planned (P7): escalation (§8.1) |
 | Registration escalation | Not implemented | Planned (P7): not joinable; one-use token bound to the creating ceremony; the credential reference joins the pinned set (§8.3) |
 | Abort handling and in-flight tracking | **Done (P6)** for the worker: pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11) | Planned (P7): withdrawn or aborted escalations rate-limited, 3 per key per 10 minutes, then cooldown (§8.1) |
 | Escalation waiters | Not implemented | Planned (P7): parked continuations holding no thread; caps of 4 per session and 16 per profile (§8.2) |
 | Notification bus for a root daemon | Prompt uses the daemon's own session bus | Planned (P7): `agents.notify_user`; dedicated per-prompt privilege-dropping child; no bus means deny and audit (§8.2) |
-| Granted-rules location | Not implemented | Planned (P7): `agents.state_dir` with unit-specific defaults (§8.4) |
-| CLI naming | Session-grant commands use the name `grants` (`commands/agent_admin.rs`) | Planned (P7): granted rules under `passless agent grants`; session commands under `passless agent sessions` with a hidden alias for one release (§8.4) |
+| Granted-rules location | **Done (P7).** `agents.state_dir` with unit-specific defaults; `agents.notify_user` validated (§8.2, §8.4) | — |
+| CLI naming | **Done (P7).** Granted rules under `passless agent-admin grants`; session grants under `agent-admin sessions` and principal sessions under `agent-admin principals`, with the old `delegation` and `session` names as hidden aliases for one release (§8.4) | — |
 | Same-UID self-approval | Not documented | Planned (P11): documented residual risk; `notify_user` differs from every principal and browser user (§8.2, §13, §15) |
 | Supported browsers | No detection; the launcher can start with `--disable-extensions` (`browser.rs:2040-2044`) | Planned (P2, P10): launch error without the extension; Chromium and Chrome for Testing accepted; branded Chrome and `chrome-headless-shell` rejected; root-owned binaries only in distinct-UID deployments (§4.2) |
 | Incognito and CDP-created contexts | The extension is not active in them; requests go native | Planned (P10): `Default/Preferences` seeded with `incognito = true` for the manifest-key extension ID; startup verification fails closed (§4.2) |

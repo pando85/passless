@@ -83,33 +83,6 @@ This is a security invariant, not merely a directory-layout preference.
 
 For portable TPM credentials, the configured TPM provider remains the signer; agent mode must not silently substitute software keys.
 
-## One-shot intents
-
-The isolated compatibility/native ceremony path requires an intent immediately before the matching WebAuthn operation.
-
-### Registration
-
-```bash
-passless agent --profile release-bot intent create register \
-  --rp github.com \
-  --reason "initial release-bot enrollment"
-```
-
-The intent is bound to the requested action/RP and current principal/policy state. An autonomous rule does not require per-operation administrator approval, but the ceremony still passes the daemon's policy, storage, audit, and operation gates.
-
-### Authentication
-
-```bash
-passless agent --profile release-bot intent create authenticate \
-  --rp github.com \
-  --credential <credential-ref-hex> \
-  --reason "release push"
-```
-
-The credential reference is non-secret. The private key remains in the isolated backend/key provider.
-
-Treat success, denial, cancellation, expiry, and terminal failure as consuming the operation authority. Create a new intent for a genuinely new operation rather than replaying a completed one.
-
 ## Managed browser path
 
 Isolated profiles can also use the daemon-managed browser/extension pipeline where configured. The production extension forwards bounded WebAuthn requests to the daemon; it does not receive private keys or PINs.
@@ -145,7 +118,7 @@ The managed browser session is still application authority. After an isolated cr
    passless agent --profile release-bot capabilities
    passless agent --profile release-bot instructions
    ```
-7. Create the required one-shot intent immediately before each isolated native ceremony, or use the managed browser path according to the profile/runtime configuration.
+7. Run ceremonies through the managed browser path; the per-operation intent commands were removed.
 8. Review audit and RP-side account/session state after enrollment or sensitive automation.
 
 ## Registration

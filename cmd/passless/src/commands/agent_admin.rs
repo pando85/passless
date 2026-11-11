@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use passless_core::{
     AdminAuditAction, AdminAuditExportFormat, AdminBrowserAction, AdminCredentialAction,
-    AdminDelegationAction, AdminPolicyAction, AdminProfileAction, AdminSessionAction,
-    AgentAdminAction, AgentSkillScope, AgentSkillTarget, CredentialRef, Error, GrantId,
-    OutputFormat, ProfileId, Result,
+    AdminGrantAction, AdminGrantsAction, AdminPolicyAction, AdminPrincipalsAction,
+    AdminProfileAction, AdminSessionsAction, AgentAdminAction, AgentSkillScope, AgentSkillTarget,
+    CredentialRef, Error, GrantId, OutputFormat, ProfileId, Result,
 };
 
 use passless_core::agent::PrincipalSessionId;
@@ -169,8 +169,9 @@ pub fn dispatch_admin(output: OutputFormat, action: &AgentAdminAction) -> Result
         AgentAdminAction::Profile { action } => dispatch_profile(output, action),
         AgentAdminAction::Policy { action } => dispatch_policy(output, action),
         AgentAdminAction::Credential { action } => dispatch_admin_credential(output, action),
-        AgentAdminAction::Delegation { action } => dispatch_admin_delegation(output, action),
-        AgentAdminAction::Session { action } => dispatch_admin_session(output, action),
+        AgentAdminAction::Grants { action } => dispatch_admin_grants(output, action),
+        AgentAdminAction::Sessions { action } => dispatch_admin_sessions(output, action),
+        AgentAdminAction::Principals { action } => dispatch_admin_principals(output, action),
         AgentAdminAction::Browser { action } => dispatch_browser(output, action),
         AgentAdminAction::Audit { action } => dispatch_audit(output, action),
         AgentAdminAction::Shutdown { confirm } => dispatch_shutdown(output, *confirm),
@@ -227,7 +228,6 @@ fn dispatch_profile(output: OutputFormat, action: &AdminProfileAction) -> Result
                         println!("policy_generation: {}", info.policy_generation);
                         println!("active_grants: {}", info.active_grants);
                         println!("active_sessions: {}", info.active_sessions);
-                        println!("pending_intents: {}", info.pending_intents);
                         Ok(())
                     }
                 },
@@ -543,10 +543,108 @@ fn dispatch_admin_credential(output: OutputFormat, action: &AdminCredentialActio
     }
 }
 
-fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationAction) -> Result<()> {
+/// `agent-admin grants`: the persistent granted rules (ADR 0014 section 8.4).
+fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Result<()> {
+    let request = match action {
+        AdminGrantsAction::List { profile } => AdminRequest::ListGrantedRules {
+            profile_id: profile.as_deref().map(parse_profile_id).transpose()?,
+        },
+        AdminGrantsAction::Revoke {
+            profile,
+            rp_id,
+            action,
+            confirm,
+        } => {
+            require_confirm(*confirm)?;
+            AdminRequest::RevokeGrantedRule {
+                profile_id: parse_profile_id(profile)?,
+                rp_id: rp_id.clone(),
+                action: match action {
+                    AdminGrantAction::Authenticate => {
+                        passless_core::agent::IntentAction::Authenticate
+                    }
+                },
+            }
+        }
+        AdminGrantsAction::Clear { profile, confirm } => {
+            require_confirm(*confirm)?;
+            AdminRequest::ClearGrantedRules {
+                profile_id: parse_profile_id(profile)?,
+            }
+        }
+    };
+    let mut client = connect_admin_client()?;
+    let resp = client
+        .request(request)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    match resp {
+        passless_core::agent::AdminResponse::GrantedRuleList(list) => match output {
+            OutputFormat::Json => admin_output_json(&list),
+            OutputFormat::Plain => {
+                for profile in &list.profiles {
+                    match &profile.disabled_reason {
+                        Some(reason) => {
+                            println!("{}: DISABLED ({})", profile.profile_id, reason)
+                        }
+                        None => println!(
+                            "{}: {} rule(s), digest {}",
+                            profile.profile_id,
+                            profile.rules.len(),
+                            profile.digest
+                        ),
+                    }
+                    for rule in &profile.rules {
+                        print!(
+                            "  {} {} kind={} rule={} granted_at={} request={} origin={}",
+                            rule.rp_id,
+                            rule.action,
+                            rule.kind,
+                            rule.rule,
+                            rule.granted_at,
+                            rule.request_id,
+                            rule.origin
+                        );
+                        if let Some(credential_ref) = &rule.credential_ref {
+                            print!(" credential={}", credential_ref);
+                        }
+                        println!();
+                    }
+                }
+                Ok(())
+            }
+        },
+        passless_core::agent::AdminResponse::GrantedRulesRevoked { revoked } => {
+            #[derive(Serialize)]
+            struct RevokedOut {
+                revoked: u32,
+            }
+            match output {
+                OutputFormat::Json => admin_output_json(&RevokedOut { revoked }),
+                OutputFormat::Plain => {
+                    println!("revoked: {}", revoked);
+                    Ok(())
+                }
+            }
+        }
+        _ => Err(Error::Other("unexpected response".to_string())),
+    }
+}
+
+fn require_confirm(confirm: bool) -> Result<()> {
+    if confirm {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "destructive action requires --confirm flag".to_string(),
+        ))
+    }
+}
+
+/// `agent-admin sessions` (formerly `delegation`): browser bearer session grants.
+fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -> Result<()> {
     let mut client = connect_admin_client()?;
     match action {
-        AdminDelegationAction::Show { grant_id } => {
+        AdminSessionsAction::Show { grant_id } => {
             let req = AdminRequest::ShowDelegation {
                 grant_id: parse_grant_id(grant_id)?,
             };
@@ -570,7 +668,7 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminDelegationAction::List { profile } => {
+        AdminSessionsAction::List { profile } => {
             let profile_id = profile.as_deref().map(parse_profile_id).transpose()?;
             let req = AdminRequest::ListDelegations { profile_id };
             let resp = client
@@ -593,7 +691,7 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminDelegationAction::Revoke { grant_id, confirm } => {
+        AdminSessionsAction::Revoke { grant_id, confirm } => {
             if !confirm {
                 return Err(Error::Other(
                     "destructive action requires --confirm flag".to_string(),
@@ -630,10 +728,11 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
     }
 }
 
-fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> Result<()> {
+/// `agent-admin principals` (formerly `session`): principal sessions.
+fn dispatch_admin_principals(output: OutputFormat, action: &AdminPrincipalsAction) -> Result<()> {
     let mut client = connect_admin_client()?;
     match action {
-        AdminSessionAction::Show { session_id } => {
+        AdminPrincipalsAction::Show { session_id } => {
             let req = AdminRequest::ShowSession {
                 session_id: parse_session_id(session_id)?,
             };
@@ -655,7 +754,7 @@ fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> 
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminSessionAction::List { profile } => {
+        AdminPrincipalsAction::List { profile } => {
             let profile_id = profile.as_deref().map(parse_profile_id).transpose()?;
             let req = AdminRequest::ListSessions { profile_id };
             let resp = client
@@ -675,7 +774,7 @@ fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> 
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminSessionAction::Revoke {
+        AdminPrincipalsAction::Revoke {
             session_id,
             confirm,
         } => {

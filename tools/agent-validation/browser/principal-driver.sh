@@ -26,37 +26,12 @@ write_event() {
     mv -f -- "$tmp" "${COORD_DIR}/${name}.json"
 }
 
-wait_terminal_intent() {
-    local request_id="$1"
-    agent_json intent wait "$request_id" --timeout "$TIMEOUT_SECS" --poll-interval 100
-}
-
 run_isolated() {
-    local created request_id terminal state credentials credential_ref
-
-    created=$(agent_json intent create register --rp "$RP_ID" --reason "validation registration")
-    request_id=$(jq -er '.request_id' <<<"$created")
-    write_event register_ready ready
-    terminal=$(wait_terminal_intent "$request_id")
-    state=$(jq -er '.state' <<<"$terminal")
-    [[ "$state" == "approved" ]] || exit 10
-    write_event register_complete approved
-
-    credentials=$(agent_json credential list)
-    credential_ref=$(jq -er --arg rp "$RP_ID" \
-        '.credentials | map(select(.rp_id == $rp)) | if length == 1 then .[0].credential_ref else error("expected one RP credential") end' \
-        <<<"$credentials")
-
-    created=$(agent_json intent create authenticate --rp "$RP_ID" \
-        --credential "$credential_ref" --reason "validation authentication")
-    request_id=$(jq -er '.request_id' <<<"$created")
-    write_event authenticate_ready ready
-    terminal=$(wait_terminal_intent "$request_id")
-    state=$(jq -er '.state' <<<"$terminal")
-    [[ "$state" == "approved" ]] || exit 11
-    write_event authenticate_complete approved
-
-    jq -n '{flow:"isolated", registration:"approved", authentication:"approved"}'
+    # The principal intent protocol (`passless agent intent ...`) was removed in ADR 0014 P7.
+    # Isolated ceremonies run through the managed browser extension path, which this driver
+    # does not drive, so the flow fails closed instead of reporting a result.
+    echo "principal-driver: the isolated intent flow was removed (ADR 0014 P7)" >&2
+    exit 3
 }
 
 browser_evaluate() {

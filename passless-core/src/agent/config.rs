@@ -20,6 +20,21 @@ pub const LOCALHOST_RP_ID: &str = "localhost";
 /// The most RP IDs one browser session grant can cover (see `AgentProfileConfig::rule_rp_ids`).
 pub const MAX_GRANT_RP_IDS: usize = 32;
 
+/// Default cap on a profile's persistent granted rules (ADR 0014 section 8.4).
+pub const DEFAULT_MAX_GRANTED_RULES: u16 = 64;
+/// Upper bound for `max_granted_rules`; it keeps a full store under the 256 KiB file cap.
+pub const MAX_GRANTED_RULES_LIMIT: u16 = 256;
+/// Default `agents.escalation_cooldown` in seconds.
+pub const DEFAULT_ESCALATION_COOLDOWN_SECS: u64 = 600;
+/// Smallest `agents.escalation_cooldown`: 1 s is accepted by debug builds only, for tests.
+pub const MIN_ESCALATION_COOLDOWN_SECS: u64 = if cfg!(debug_assertions) { 1 } else { 60 };
+/// Largest `agents.escalation_cooldown` in seconds.
+pub const MAX_ESCALATION_COOLDOWN_SECS: u64 = 86_400;
+/// Largest `agents.escalation_timeout`: Chromium's 20 hour ceremony maximum.
+pub const MAX_ESCALATION_TIMEOUT_SECS: u64 = 72_000;
+/// Default `agents.state_dir` of a root (system unit) daemon.
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/passless-agent";
+
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
 const MAX_OPERATIONS: u16 = 4096;
 const DEFAULT_MAX_CONCURRENT_SESSIONS: u16 = MAX_CONCURRENT_SESSIONS;
@@ -31,6 +46,14 @@ fn default_max_operations() -> u16 {
 
 fn default_max_concurrent_sessions() -> u16 {
     DEFAULT_MAX_CONCURRENT_SESSIONS
+}
+
+fn default_max_granted_rules() -> u16 {
+    DEFAULT_MAX_GRANTED_RULES
+}
+
+fn default_escalation_cooldown() -> u64 {
+    DEFAULT_ESCALATION_COOLDOWN_SECS
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -691,6 +714,9 @@ pub struct AgentProfileConfig {
     pub max_concurrent_sessions: u16,
     #[serde(default)]
     pub browser_scope: BrowserScope,
+    /// Most persistent granted rules this profile may hold; escalations beyond it are denied.
+    #[serde(default = "default_max_granted_rules")]
+    pub max_granted_rules: u16,
     /// Profile default selection; a rule may override it, and the wildcard rule is always `single`.
     #[serde(default)]
     pub credential_selection: CredentialSelection,
@@ -743,6 +769,8 @@ struct AgentProfileConfigRepr {
     max_concurrent_sessions: u16,
     #[serde(default)]
     browser_scope: BrowserScope,
+    #[serde(default = "default_max_granted_rules")]
+    max_granted_rules: u16,
     #[serde(default)]
     credential_selection: CredentialSelection,
     #[serde(default)]
@@ -806,6 +834,7 @@ impl From<AgentProfileConfigRepr> for AgentProfileConfig {
             max_operations: repr.max_operations,
             max_concurrent_sessions: repr.max_concurrent_sessions,
             browser_scope: repr.browser_scope,
+            max_granted_rules: repr.max_granted_rules,
             credential_selection: repr.credential_selection,
             storage: repr.storage,
             rules,
@@ -955,6 +984,12 @@ impl AgentProfileConfig {
             return Err(Error::Config(format!(
                 "agent profile '{}': max_operations must be between 1 and {}",
                 profile_id, MAX_OPERATIONS
+            )));
+        }
+        if self.max_granted_rules == 0 || self.max_granted_rules > MAX_GRANTED_RULES_LIMIT {
+            return Err(Error::Config(format!(
+                "agent profile '{}': max_granted_rules must be between 1 and {}",
+                profile_id, MAX_GRANTED_RULES_LIMIT
             )));
         }
         if self.browser_scope == BrowserScope::Session {
@@ -1140,7 +1175,7 @@ impl AgentProfileConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
@@ -1163,6 +1198,27 @@ pub struct AgentConfig {
     /// Concurrency caps of the agent ceremony server (plan R11). Read when the daemon starts.
     #[serde(default)]
     pub limits: AgentRequestLimits,
+
+    /// User whose session bus receives escalation prompts (ADR 0014 section 8.2). A root daemon
+    /// needs it for escalation; a non-root daemon may only name its own user. Read when the
+    /// daemon starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_user: Option<String>,
+
+    /// Directory of persistent agent state such as the granted-rules store (ADR 0014 section
+    /// 8.4). Defaults to `$XDG_STATE_HOME/passless/agent`, or `/var/lib/passless-agent` for a
+    /// root daemon. Read when the daemon starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<PathBuf>,
+
+    /// Optional cap in seconds on how long a ceremony waits for an escalation decision (unset:
+    /// the ceremony's own timeout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_timeout: Option<u64>,
+
+    /// Seconds during which a denied or expired escalation key is denied without a prompt.
+    #[serde(default = "default_escalation_cooldown")]
+    pub escalation_cooldown: u64,
 }
 
 /// Default global cap on concurrent agent ceremony requests.
@@ -1245,7 +1301,165 @@ impl AgentRequestLimits {
     }
 }
 
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profiles: BTreeMap::new(),
+            audit_path: None,
+            acknowledge_global_same_user: Vec::new(),
+            acknowledge_same_user_registration: Vec::new(),
+            limits: AgentRequestLimits::default(),
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: DEFAULT_ESCALATION_COOLDOWN_SECS,
+        }
+    }
+}
+
+/// Look up a user name's UID; `None` when the user does not exist.
+pub type UidLookup<'a> = &'a dyn Fn(&str) -> Option<u32>;
+
+/// Resolve a user name (or a numeric UID) through the system user database.
+pub fn lookup_user_uid(name: &str) -> Option<u32> {
+    if let Ok(uid) = name.parse::<u32>() {
+        return Some(uid);
+    }
+    nix::unistd::User::from_name(name)
+        .ok()
+        .flatten()
+        .map(|user| user.uid.as_raw())
+}
+
 impl AgentConfig {
+    /// The state directory in force: `agents.state_dir`, else `/var/lib/passless-agent` for a
+    /// root daemon, else `$XDG_STATE_HOME/passless/agent` (`~/.local/state/passless/agent`).
+    pub fn effective_state_dir(&self, daemon_uid: u32) -> Option<PathBuf> {
+        if let Some(dir) = &self.state_dir {
+            return Some(dir.clone());
+        }
+        if daemon_uid == 0 {
+            return Some(PathBuf::from(SYSTEM_STATE_DIR));
+        }
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))?;
+        Some(base.join("passless").join("agent"))
+    }
+
+    /// The escalation timeout cap, if configured.
+    pub fn escalation_timeout(&self) -> Option<Duration> {
+        self.escalation_timeout.map(Duration::from_secs)
+    }
+
+    /// The escalation cooldown.
+    pub fn escalation_cooldown(&self) -> Duration {
+        Duration::from_secs(self.escalation_cooldown)
+    }
+
+    /// Why escalation prompts cannot be shown under this configuration, if they cannot: a root
+    /// daemon without `agents.notify_user`. Reported by `doctor`; the request is then denied with
+    /// `escalation_unavailable`.
+    pub fn escalation_unavailable_reason(&self, daemon_uid: u32) -> Option<String> {
+        if daemon_uid == 0 && self.notify_user.is_none() {
+            return Some(
+                "the daemon runs as root and agents.notify_user is not set: escalation prompts \
+                 have no session bus, so `request` rules are denied with escalation_unavailable"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Validate the escalation keys (ADR 0014 section 8.2) for a daemon running as `daemon_uid`.
+    ///
+    /// - `escalation_cooldown` and `escalation_timeout` must be in range;
+    /// - a root daemon's `notify_user` must resolve and differ from every `principal_user` and
+    ///   `browser_user` (distinct-UID escalation integrity);
+    /// - a non-root daemon can only reach its own session bus, so its `notify_user` must be its
+    ///   own user.
+    pub fn validate_escalation(&self, daemon_uid: u32, lookup: UidLookup<'_>) -> Result<()> {
+        if self.escalation_cooldown < MIN_ESCALATION_COOLDOWN_SECS
+            || self.escalation_cooldown > MAX_ESCALATION_COOLDOWN_SECS
+        {
+            return Err(Error::Config(format!(
+                "agents.escalation_cooldown must be between {} and {} seconds",
+                MIN_ESCALATION_COOLDOWN_SECS, MAX_ESCALATION_COOLDOWN_SECS
+            )));
+        }
+        if let Some(timeout) = self.escalation_timeout
+            && (timeout == 0 || timeout > MAX_ESCALATION_TIMEOUT_SECS)
+        {
+            return Err(Error::Config(format!(
+                "agents.escalation_timeout must be between 1 and {} seconds",
+                MAX_ESCALATION_TIMEOUT_SECS
+            )));
+        }
+        if let Some(state_dir) = &self.state_dir
+            && !state_dir.is_absolute()
+        {
+            return Err(Error::Config(format!(
+                "agents.state_dir must be an absolute path, got '{}'",
+                state_dir.display()
+            )));
+        }
+        let Some(notify_user) = self.notify_user.as_deref() else {
+            return Ok(());
+        };
+        if notify_user.is_empty() {
+            return Err(Error::Config(
+                "agents.notify_user must not be empty".to_string(),
+            ));
+        }
+        let Some(notify_uid) = lookup(notify_user) else {
+            return Err(Error::Config(format!(
+                "agents.notify_user '{}' does not exist",
+                notify_user
+            )));
+        };
+        if daemon_uid != 0 {
+            if notify_uid != daemon_uid {
+                return Err(Error::Config(format!(
+                    "agents.notify_user '{}' (uid {}) differs from the daemon's user (uid {}): a \
+                     non-root daemon can only prompt on its own session bus; remove notify_user \
+                     or set it to the daemon's user",
+                    notify_user, notify_uid, daemon_uid
+                )));
+            }
+            return Ok(());
+        }
+        if notify_uid == 0 {
+            return Err(Error::Config(
+                "agents.notify_user must not be root".to_string(),
+            ));
+        }
+        for (name, profile) in &self.profiles {
+            let principal_and_browser =
+                std::iter::once(("principal_user", &profile.principal_user)).chain(
+                    profile
+                        .browser_user
+                        .iter()
+                        .map(|user| ("browser_user", user)),
+                );
+            for (key, user) in principal_and_browser {
+                let same = user == notify_user || lookup(user).is_some_and(|uid| uid == notify_uid);
+                if same {
+                    return Err(Error::Config(format!(
+                        "agent profile '{}': {} '{}' is agents.notify_user: in a distinct-UID \
+                         deployment the notification user must differ from every principal and \
+                         browser user, or the agent could approve its own escalations (ADR 0014 \
+                         section 8.2)",
+                        name, key, user
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Parse the `[agents]` table of a Passless TOML configuration. A missing table is the default
     /// (disabled) configuration. Validation is separate ([`Self::validate`]).
     pub fn from_toml_str(content: &str, source: &str) -> Result<Self> {
@@ -1295,6 +1509,12 @@ impl AgentConfig {
         if self.limits != next.limits {
             return Some("agents.limits changed".to_string());
         }
+        if self.notify_user != next.notify_user {
+            return Some("agents.notify_user changed".to_string());
+        }
+        if self.state_dir != next.state_dir {
+            return Some("agents.state_dir changed".to_string());
+        }
         if !self.profiles.keys().eq(next.profiles.keys()) {
             return Some("the set of agent profiles changed".to_string());
         }
@@ -1331,6 +1551,7 @@ impl AgentConfig {
         }
 
         self.limits.validate()?;
+        self.validate_escalation(nix::unistd::geteuid().as_raw(), &lookup_user_uid)?;
 
         if self.audit_path.is_none() {
             return Err(Error::Config(
@@ -1395,6 +1616,13 @@ impl AgentConfig {
             all_roots.push((
                 "audit_path".to_string(),
                 crate::config::BackendConfig::canonicalize_path(audit),
+            ));
+        }
+
+        if let Some(ref state_dir) = self.state_dir {
+            all_roots.push((
+                "state_dir/granted-rules".to_string(),
+                crate::config::BackendConfig::canonicalize_path(&state_dir.join("granted-rules")),
             ));
         }
 
@@ -1807,6 +2035,7 @@ mod tests {
 
     fn make_isolated_profile() -> AgentProfileConfig {
         AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
@@ -1858,6 +2087,10 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert("coding".to_string(), profile);
         AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -1928,6 +2161,10 @@ product_id = 22136
             profiles.insert(name.to_string(), profile);
         }
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2041,6 +2278,7 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2066,6 +2304,10 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2087,6 +2329,7 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2112,6 +2355,10 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2153,6 +2400,10 @@ product_id = 2
     #[test]
     fn test_enabled_requires_audit_path() {
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles: BTreeMap::new(),
@@ -2167,6 +2418,10 @@ product_id = 2
     #[test]
     fn test_disabled_does_not_require_audit_path() {
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: false,
             profiles: BTreeMap::new(),
@@ -2183,6 +2438,7 @@ product_id = 2
         profiles.insert(
             "myprofile".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2208,6 +2464,10 @@ product_id = 2
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2227,6 +2487,7 @@ product_id = 2
             profiles.insert(
                 name.to_string(),
                 AgentProfileConfig {
+                    max_granted_rules: 64,
                     max_operations: 64,
                     max_concurrent_sessions: 1,
                     browser_scope: BrowserScope::Session,
@@ -2353,6 +2614,7 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2378,6 +2640,10 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2409,6 +2675,7 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2434,6 +2701,10 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2457,6 +2728,7 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2482,6 +2754,10 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2802,6 +3078,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2829,6 +3106,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2854,6 +3132,10 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2904,6 +3186,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2931,6 +3214,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -2956,6 +3240,10 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -2975,6 +3263,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
@@ -3000,6 +3289,10 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
             limits: Default::default(),
             enabled: true,
             profiles,
@@ -4312,6 +4605,221 @@ authenticate = "request"
         assert_eq!(
             profile.credential_selection_for_rp("unlisted.example.com"),
             CredentialSelection::Newest
+        );
+    }
+
+    fn escalation_config(principal: &str, browser: Option<&str>) -> AgentConfig {
+        let mut profile = make_isolated_profile();
+        profile.principal_user = principal.to_string();
+        profile.browser_user = browser.map(str::to_string);
+        agent_config(profile, false, false)
+    }
+
+    fn users(name: &str) -> Option<u32> {
+        match name {
+            "root" => Some(0),
+            "alice" => Some(1000),
+            "agent" => Some(1001),
+            "browser" => Some(1002),
+            "alias-of-alice" => Some(1000),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn escalation_keys_have_defaults_and_parse() {
+        let defaults = AgentConfig::from_toml_str("[agents]\nenabled = false\n", "t").unwrap();
+        assert_eq!(
+            defaults.escalation_cooldown,
+            DEFAULT_ESCALATION_COOLDOWN_SECS
+        );
+        assert_eq!(defaults.escalation_timeout, None);
+        assert_eq!(defaults.notify_user, None);
+        assert_eq!(defaults.state_dir, None);
+        assert_eq!(AgentConfig::default().escalation_cooldown, 600);
+
+        let parsed = AgentConfig::from_toml_str(
+            "[agents]\nnotify_user = \"alice\"\nstate_dir = \"/var/lib/x\"\n\
+             escalation_timeout = 900\nescalation_cooldown = 120\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(parsed.notify_user.as_deref(), Some("alice"));
+        assert_eq!(parsed.state_dir, Some(PathBuf::from("/var/lib/x")));
+        assert_eq!(parsed.escalation_timeout(), Some(Duration::from_secs(900)));
+        assert_eq!(parsed.escalation_cooldown(), Duration::from_secs(120));
+
+        let profile = parse_profile("").unwrap();
+        assert_eq!(profile.max_granted_rules, DEFAULT_MAX_GRANTED_RULES);
+        let profile = parse_profile("max_granted_rules = 8").unwrap();
+        assert_eq!(profile.max_granted_rules, 8);
+    }
+
+    #[test]
+    fn max_granted_rules_is_bounded() {
+        for (value, valid) in [(0, false), (1, true), (MAX_GRANTED_RULES_LIMIT, true)] {
+            let mut profile = make_isolated_profile();
+            profile.max_granted_rules = value;
+            assert_eq!(profile.validate(&pid("coding")).is_ok(), valid, "{value}");
+        }
+        let mut profile = make_isolated_profile();
+        profile.max_granted_rules = MAX_GRANTED_RULES_LIMIT + 1;
+        let err = profile.validate(&pid("coding")).unwrap_err().to_string();
+        assert!(err.contains("max_granted_rules"), "{err}");
+    }
+
+    #[test]
+    fn escalation_cooldown_and_timeout_are_bounded() {
+        let mut config = escalation_config("alice", None);
+        for (cooldown, valid) in [
+            (0, false),
+            (1, cfg!(debug_assertions)),
+            (60, true),
+            (MAX_ESCALATION_COOLDOWN_SECS, true),
+            (MAX_ESCALATION_COOLDOWN_SECS + 1, false),
+        ] {
+            config.escalation_cooldown = cooldown;
+            assert_eq!(
+                config.validate_escalation(1000, &users).is_ok(),
+                valid,
+                "cooldown {cooldown}"
+            );
+        }
+        config.escalation_cooldown = 600;
+        for (timeout, valid) in [
+            (0, false),
+            (1, true),
+            (MAX_ESCALATION_TIMEOUT_SECS, true),
+            (MAX_ESCALATION_TIMEOUT_SECS + 1, false),
+        ] {
+            config.escalation_timeout = Some(timeout);
+            assert_eq!(
+                config.validate_escalation(1000, &users).is_ok(),
+                valid,
+                "timeout {timeout}"
+            );
+        }
+        config.escalation_timeout = None;
+        config.state_dir = Some(PathBuf::from("relative/state"));
+        let err = config
+            .validate_escalation(1000, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("state_dir"), "{err}");
+    }
+
+    #[test]
+    fn non_root_daemon_may_only_notify_its_own_user() {
+        let mut config = escalation_config("agent", None);
+        assert!(config.validate_escalation(1000, &users).is_ok());
+        config.notify_user = Some("alice".to_string());
+        assert!(config.validate_escalation(1000, &users).is_ok());
+        config.notify_user = Some("agent".to_string());
+        let err = config
+            .validate_escalation(1000, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("differs from the daemon's user"), "{err}");
+        config.notify_user = Some("ghost".to_string());
+        let err = config
+            .validate_escalation(1000, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        config.notify_user = Some(String::new());
+        assert!(config.validate_escalation(1000, &users).is_err());
+    }
+
+    #[test]
+    fn root_daemon_notify_user_must_differ_from_principal_and_browser_users() {
+        let mut config = escalation_config("agent", Some("browser"));
+        assert!(config.escalation_unavailable_reason(0).is_some());
+        assert!(config.escalation_unavailable_reason(1000).is_none());
+        assert!(config.validate_escalation(0, &users).is_ok());
+
+        config.notify_user = Some("alice".to_string());
+        assert!(config.validate_escalation(0, &users).is_ok());
+        assert!(config.escalation_unavailable_reason(0).is_none());
+
+        config.notify_user = Some("agent".to_string());
+        let err = config
+            .validate_escalation(0, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("principal_user"), "{err}");
+
+        config.notify_user = Some("browser".to_string());
+        let err = config
+            .validate_escalation(0, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("browser_user"), "{err}");
+
+        // The same UID under another name is the same user.
+        let mut aliased = escalation_config("alias-of-alice", None);
+        aliased.notify_user = Some("alice".to_string());
+        assert!(aliased.validate_escalation(0, &users).is_err());
+
+        config.notify_user = Some("root".to_string());
+        let err = config
+            .validate_escalation(0, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be root"), "{err}");
+    }
+
+    #[test]
+    fn notify_user_and_state_dir_are_restart_only() {
+        let current = escalation_config("agent", None);
+        let mut next = current.clone();
+        next.notify_user = Some("alice".to_string());
+        assert_eq!(
+            current.reload_incompatibility(&next).as_deref(),
+            Some("agents.notify_user changed")
+        );
+        let mut next = current.clone();
+        next.state_dir = Some(PathBuf::from("/var/lib/elsewhere"));
+        assert_eq!(
+            current.reload_incompatibility(&next).as_deref(),
+            Some("agents.state_dir changed")
+        );
+        let mut next = current.clone();
+        next.escalation_cooldown = 60;
+        next.escalation_timeout = Some(300);
+        next.profiles.get_mut("coding").unwrap().max_granted_rules = 8;
+        assert_eq!(current.reload_incompatibility(&next), None);
+    }
+
+    #[test]
+    fn explicit_state_dir_store_must_not_overlap_agent_roots() {
+        let mut config = escalation_config("agent", None);
+        config.state_dir = Some(PathBuf::from("/tmp/test-agent/creds"));
+        let err = config.validate(None).unwrap_err().to_string();
+        assert!(err.contains("granted-rules"), "{err}");
+    }
+
+    #[test]
+    fn lookup_user_uid_accepts_numeric_uids() {
+        assert_eq!(lookup_user_uid("1234"), Some(1234));
+        assert_eq!(lookup_user_uid("root"), Some(0));
+        assert_eq!(lookup_user_uid("passless-no-such-user-xyz"), None);
+    }
+
+    #[test]
+    fn effective_state_dir_prefers_the_configured_one() {
+        let mut config = AgentConfig::default();
+        assert_eq!(
+            config.effective_state_dir(0),
+            Some(PathBuf::from(SYSTEM_STATE_DIR))
+        );
+        config.state_dir = Some(PathBuf::from("/srv/passless"));
+        assert_eq!(
+            config.effective_state_dir(0),
+            Some(PathBuf::from("/srv/passless"))
+        );
+        assert_eq!(
+            config.effective_state_dir(1000),
+            Some(PathBuf::from("/srv/passless"))
         );
     }
 }

@@ -11,6 +11,7 @@ use passless_core::agent::{
 
 fn isolated_profile() -> AgentProfileConfig {
     AgentProfileConfig {
+        max_granted_rules: 64,
         max_operations: 64,
         max_concurrent_sessions: 1,
         browser_scope: BrowserScope::Session,
@@ -126,6 +127,10 @@ fn invalid_rp_id_in_profile_rejected() {
 #[test]
 fn agent_config_disabled_skips_validation() {
     let config = AgentConfig {
+        notify_user: None,
+        state_dir: None,
+        escalation_timeout: None,
+        escalation_cooldown: 600,
         limits: Default::default(),
         enabled: false,
         profiles: BTreeMap::new(),
@@ -139,6 +144,10 @@ fn agent_config_disabled_skips_validation() {
 #[test]
 fn agent_config_enabled_requires_audit_path() {
     let config = AgentConfig {
+        notify_user: None,
+        state_dir: None,
+        escalation_timeout: None,
+        escalation_cooldown: 600,
         limits: Default::default(),
         enabled: true,
         profiles: BTreeMap::new(),
@@ -168,6 +177,10 @@ fn agent_config_detects_overlapping_storage_paths() {
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
+        notify_user: None,
+        state_dir: None,
+        escalation_timeout: None,
+        escalation_cooldown: 600,
         limits: Default::default(),
         enabled: true,
         profiles,
@@ -199,6 +212,10 @@ fn agent_config_accepts_profiles_sharing_a_legacy_device_identity() {
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
+        notify_user: None,
+        state_dir: None,
+        escalation_timeout: None,
+        escalation_cooldown: 600,
         limits: Default::default(),
         enabled: true,
         profiles,
@@ -229,6 +246,10 @@ fn agent_config_detects_overlap_with_human_backend() {
     profiles.insert("p".to_string(), p);
 
     let config = AgentConfig {
+        notify_user: None,
+        state_dir: None,
+        escalation_timeout: None,
+        escalation_cooldown: 600,
         limits: Default::default(),
         enabled: true,
         profiles,

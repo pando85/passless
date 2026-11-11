@@ -37,13 +37,12 @@ An `isolated` profile uses profile-owned credentials and does not grant access t
    passless agent --profile <profile> instructions
    ```
 4. Use only the profile, RP scope, actions, identity mode, and browser authority reported by those commands.
-5. For isolated-mode flows that require an intent, create exactly the requested operation intent and do not change RP, credential, or action after creation.
-6. Follow the effective ceremony policy:
+5. Follow the effective ceremony policy:
    - `deny`: stop.
    - `confirm`: wait for the trusted local Passless approval path; never solicit approval/PIN data in chat or stdin.
    - `allow`: the daemon may complete the ceremony autonomously after all current policy, RP/origin, session, credential, operation-budget, and audit checks pass.
-7. Treat denial, expiry, cancellation, replay rejection, policy changes, operation-budget exhaustion, and endpoint teardown as terminal for that operation. Do not invent fallback signing paths.
-8. Stop using the managed browser when its lease/session ends. Local browser shutdown does not prove that the RP invalidated its server-side session.
+6. Treat denial, expiry, cancellation, replay rejection, policy changes, operation-budget exhaustion, and endpoint teardown as terminal for that operation. Do not invent fallback signing paths.
+7. Stop using the managed browser when its lease/session ends. Local browser shutdown does not prove that the RP invalidated its server-side session.
 
 ## Managed browser and WebAuthn
 
@@ -114,7 +113,7 @@ In `isolated` mode, registration affects only the agent-owned namespace.
 - Never emulate Passless with a CDP virtual authenticator, private-key injection, raw signing, a replacement browser extension, or another WebAuthn proxy.
 - Never access `/dev/uhid`, unrelated hidraw nodes, Passless stores, audit files, runtime sockets, browser-profile files, or other principals' runtime data outside the documented principal interface.
 - Never claim that agent-derived UP/UV is ceremony-time human interaction or human local verification.
-- Never request another RP ID, credential, profile, or action after a bounded intent/operation has been established.
+- Never request another RP ID, credential, profile, or action after a bounded operation has been established.
 - Never pass PINs through stdin, environment variables, browser page content, or chat.
 - Prefer RP-supported OAuth, workload identities, service accounts, application installations, or scoped application credentials for unattended work when available.
 - If the installed Passless commands report an unsupported capability or terminal security error, stop and report the limitation. Do not invent a bypass.
