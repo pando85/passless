@@ -5965,6 +5965,33 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn an_approval_after_the_store_revoke_and_before_its_cancel_persists_nothing() {
+            // Review M-d, with the real store: `grants revoke` has revoked the store but its
+            // `cancel_rp` has not run when the human approves. The approval's grant write is
+            // refused (the RP's revocation generation moved), so the ceremony is not signed and
+            // no grant survives.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            assert_eq!(
+                f.store.revoke(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    "example.com",
+                    crate::agent::granted_rules::GrantedAction::Authenticate,
+                ),
+                Err(crate::agent::granted_rules::GrantStoreError::NotFound)
+            );
+            f.prompter.decide(PromptEvent::Approved);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+        }
+
+        #[test]
         fn an_added_grant_bumps_only_the_grant_epoch() {
             let f = escalation_fixture();
             let ctx = f.make_ctx();

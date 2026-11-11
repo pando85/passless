@@ -583,7 +583,12 @@ fails after approval, nothing is persisted.
   `grants clear --profile P --confirm`, over the admin socket. Revocation is audited
   (`granted_rule.revoke`). Both cancel the pending escalations they cover (a revoke those of its
   RP, of any action; a clear those of the profile), so an approval in flight cannot persist the
-  grant again: it is compensated and recorded as `escalation.revoked`. Session grants (§9) are administered with `agent-admin sessions …` and
+  grant again: it is compensated and recorded as `escalation.revoked`. The cancel runs after the
+  store call, so the store closes the window between them itself: an escalation captures its RP's
+  revocation generation when it is raised, a revoke bumps the RP's generation and a clear the
+  profile's (under the store's per-profile writer, also when nothing was stored), and the
+  approval's grant write is refused if the generation moved. The authenticate approval then ends as
+  `escalation.revoked`; an approved registration keeps its credential and persists no grant (§8.3). Session grants (§9) are administered with `agent-admin sessions …` and
   principal sessions with `agent-admin principals …`; their former spellings `delegation` and
   `session` remain hidden aliases for one release.
 - **Lifetime:** permanent until revoked or made inert by a config change (§6.2); no TTL.

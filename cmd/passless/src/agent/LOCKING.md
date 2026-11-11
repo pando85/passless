@@ -165,11 +165,15 @@ gate, 69). After a revoke or clear the admin handler revokes stale sessions and 
 exactly as a reload does (`revoke_stale_bearers_and_close_browsers`, below). A clear also calls
 `EscalationService::cancel_profile`, and a revoke `EscalationService::cancel_rp` for its RP
 (escalation mutex 80, then the prompt driver table 82), after the store call has returned, with
-no lock held. The lock order is unchanged.
+no lock held. The writer also guards the revocation generations: a revoke bumps its RP's and a
+clear the profile's, under the writer, and `add_unless_revoked` compares an escalation's
+`RevokeToken` with them under the same writer before it writes (review M-c, M-d). The lock order
+is unchanged.
 
 **Escalation** (`EscalationService`; the ceremony side is the parked wait above). `join_or_create`
-reads the granted-rules view (71) through the grant writer and takes the escalation mutex (80)
-twice, never together: once to check the cooldown, once to admit the request. The
+reads the granted-rules view (71) through the grant writer, takes the store's writer (64) alone to
+capture the RP's `RevokeToken`, and takes the escalation mutex (80) twice, never together: once to
+check the cooldown, once to admit the request. The
 `escalation.requested` record (90) is written with nothing held. A waiter parks on the escalation
 condvar holding nothing else. A prompt report runs on the profile's prompt driver thread, which
 holds no lock: the approval takes the escalation mutex to move the entry to `Deciding`, releases

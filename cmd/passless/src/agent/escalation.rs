@@ -64,6 +64,7 @@ use super::audit_events::{
 use super::escalation_prompt::{PromptFields, PromptVerb};
 use super::granted_rules::{
     GrantKind, GrantStoreError, GrantedRule, GrantedRulesStore, PermittingRule, ProfileGrants,
+    RevokeToken,
 };
 use super::identity::{MonotonicClock, MonotonicTime};
 use super::lock_order::{self, LockLevel, Tracked};
@@ -248,6 +249,9 @@ pub struct RegistrationApproval {
     origin: String,
     rule: PermittingRule,
     session: WaiterSession,
+    /// The RP's revocation generation when the escalation was raised: the grant is persisted
+    /// only if no `grants revoke` or `grants clear` happened since (review M-c).
+    revoke_token: Option<RevokeToken>,
 }
 
 impl RegistrationApproval {
@@ -383,12 +387,19 @@ pub enum GrantCapacity {
 /// Persists granted rules. Called without the escalation mutex.
 pub trait GrantWriter: Send + Sync {
     fn capacity(&self, profile: &ProfileId) -> GrantCapacity;
-    /// Persist `rule` and bump the grant epoch.
+    /// The RP's revocation generation now ([`GrantedRulesStore::revoke_token`]); `None` when the
+    /// store cannot say (it is disabled, and every write fails anyway).
+    fn revoke_token(&self, _profile: &ProfileId, _rp_id: &str) -> Option<RevokeToken> {
+        None
+    }
+    /// Persist `rule` and bump the grant epoch; refused with [`GrantStoreError::Revoked`] when
+    /// `token` is stale ([`GrantedRulesStore::add_unless_revoked`]).
     fn add(
         &self,
         profile: &ProfileId,
         rule: GrantedRule,
         max_rules: usize,
+        token: Option<RevokeToken>,
     ) -> Result<(), GrantStoreError>;
     /// Remove what the escalation `request_id` persisted and bump the revocation epoch (the
     /// compensation of an approval a reload or a clear overtook). Returns the rules removed;
@@ -414,14 +425,19 @@ impl GrantWriter for StoreGrantWriter {
         }
     }
 
+    fn revoke_token(&self, profile: &ProfileId, rp_id: &str) -> Option<RevokeToken> {
+        self.store.revoke_token(profile, rp_id).ok()
+    }
+
     fn add(
         &self,
         profile: &ProfileId,
         rule: GrantedRule,
         max_rules: usize,
+        token: Option<RevokeToken>,
     ) -> Result<(), GrantStoreError> {
         self.store
-            .add(&self.policy, profile, rule, max_rules)
+            .add_unless_revoked(&self.policy, profile, rule, max_rules, token)
             .map(|_| ())
     }
 
@@ -522,6 +538,8 @@ struct Entry {
     ticket: Option<u64>,
     prompted_at: Option<MonotonicTime>,
     outcome: Option<EntryOutcome>,
+    /// The RP's revocation generation captured before the entry was created (review M-c, M-d).
+    revoke_token: Option<RevokeToken>,
 }
 
 impl Entry {
@@ -933,6 +951,9 @@ impl EscalationService {
             return Err(EscalationRefusal::Cooldown);
         }
         self.check_resources(&request)?;
+        // Before the entry exists, with no lock held (the grant writer, LOCKING.md rank 64): a
+        // revocation from here on makes this escalation's approval persist nothing.
+        let revoke_token = self.grants.revoke_token(&request.profile, &request.rp_id);
 
         let now = self.clock.now();
         let (waiter, announcement) = {
@@ -960,6 +981,7 @@ impl EscalationService {
                         ticket: None,
                         prompted_at: None,
                         outcome: None,
+                        revoke_token,
                     };
                     let announcement = entry.audit_context().requested();
                     inner.entries.insert(serial, entry);
@@ -1187,7 +1209,7 @@ impl EscalationService {
     /// The approval protocol (module documentation).
     fn approve(&self, ticket: &PromptTicket) {
         let now = self.clock.now();
-        let (serial, request, escalation_id, context, latency_ms) = {
+        let (serial, request, escalation_id, context, latency_ms, revoke_token) = {
             let mut inner = self.lock();
             let Some(serial) = inner.prompting(ticket) else {
                 debug!(
@@ -1209,6 +1231,7 @@ impl EscalationService {
                 entry.id.clone(),
                 entry.audit_context(),
                 latency_ms,
+                entry.revoke_token,
             )
         };
 
@@ -1221,7 +1244,13 @@ impl EscalationService {
             reason: PolicyDenyReason::AuditFailure,
             armed: true,
         };
-        let settled = self.settle_approval(&mut guard, &request, &escalation_id, latency_ms);
+        let settled = self.settle_approval(
+            &mut guard,
+            &request,
+            &escalation_id,
+            latency_ms,
+            revoke_token,
+        );
         guard.armed = false;
         let committed = self.finish_deciding(serial, settled.outcome, settled.audit);
         if !committed && settled.grant_written {
@@ -1237,6 +1266,7 @@ impl EscalationService {
         request: &EscalationRequest,
         escalation_id: &EscalationId,
         latency_ms: u64,
+        revoke_token: Option<RevokeToken>,
     ) -> Settled {
         let context = guard.context.clone();
         let denied = |cause: EscalationDenyCause, reason: PolicyDenyReason| Settled {
@@ -1272,6 +1302,7 @@ impl EscalationService {
                     origin: request.origin.clone(),
                     rule: request.rule,
                     session: request.session,
+                    revoke_token,
                 })),
                 audit: None,
                 grant_written: false,
@@ -1325,10 +1356,25 @@ impl EscalationService {
             request.rule,
             None,
         );
-        match self
-            .grants
-            .add(&request.profile, rule, request.max_granted_rules)
-        {
+        match self.grants.add(
+            &request.profile,
+            rule,
+            request.max_granted_rules,
+            revoke_token,
+        ) {
+            Err(GrantStoreError::Revoked) => {
+                // `grants revoke` or `grants clear` ran after the escalation was raised and before
+                // its cancel reached this entry (review M-d): the revocation stands.
+                info!(
+                    "escalation {}: the RP was revoked meanwhile; no grant is written",
+                    escalation_id
+                );
+                Settled {
+                    outcome: EntryOutcome::Revoked,
+                    audit: Some(context.revoked(EscalationRevokeReason::PolicyReload)),
+                    grant_written: false,
+                }
+            }
             Ok(()) => {
                 info!(
                     "escalation {}: approved; {}/{} granted",
@@ -1425,6 +1471,7 @@ impl EscalationService {
             }
             entry.state = match outcome {
                 EntryOutcome::Approved | EntryOutcome::Registration(_) => EscalationState::Approved,
+                EntryOutcome::Revoked => EscalationState::Revoked,
                 _ => EscalationState::Denied,
             };
             entry.outcome = Some(outcome);
@@ -1552,13 +1599,40 @@ impl EscalationService {
             approval.rule,
             Some(credential_ref),
         );
-        if let Err(e) = self.grants.add(&approval.profile, rule, max_granted_rules) {
-            warn!(
-                "escalation {}: the registration grant could not be persisted: {}",
-                approval.escalation_id, e
-            );
-            audit_denial(EscalationDenyCause::GrantWriteFailed);
-            return Err(e);
+        match self.grants.add(
+            &approval.profile,
+            rule,
+            max_granted_rules,
+            approval.revoke_token,
+        ) {
+            Ok(()) => {}
+            Err(GrantStoreError::Revoked) => {
+                // The RP was revoked (or the profile cleared) after the escalation was raised:
+                // the credential stays, no grant is persisted (ADR 0014 section 8.3, review M-c).
+                info!(
+                    "escalation {}: the RP was revoked meanwhile; the credential is kept without \
+                     a registration grant",
+                    approval.escalation_id
+                );
+                if let Err(audit_error) = self
+                    .audit
+                    .record(context.revoked(EscalationRevokeReason::PolicyReload))
+                {
+                    warn!(
+                        "escalation {}: the revocation could not be audited: {}",
+                        approval.escalation_id, audit_error
+                    );
+                }
+                return Err(GrantStoreError::Revoked);
+            }
+            Err(e) => {
+                warn!(
+                    "escalation {}: the registration grant could not be persisted: {}",
+                    approval.escalation_id, e
+                );
+                audit_denial(EscalationDenyCause::GrantWriteFailed);
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -1897,6 +1971,7 @@ pub(crate) mod test_support {
             profile: &ProfileId,
             _rule: GrantedRule,
             _max_rules: usize,
+            _token: Option<RevokeToken>,
         ) -> Result<(), GrantStoreError> {
             Err(GrantStoreError::Unavailable(profile.to_string()))
         }
@@ -2045,6 +2120,33 @@ mod tests {
         adds: AtomicU64,
         /// Runs (with no lock held) after the rule is stored.
         after_add: Mutex<Option<Hook>>,
+        /// The real store's revocation generations, by RP (`GrantedRulesStore::revoke_token`).
+        generations: Mutex<HashMap<String, u64>>,
+    }
+
+    impl FakeGrants {
+        /// What `GrantedRulesStore::revoke` does: bump the RP's generation and drop its rules.
+        fn revoke_rp(&self, rp_id: &str) {
+            *self
+                .generations
+                .lock()
+                .unwrap()
+                .entry(rp_id.to_string())
+                .or_default() += 1;
+            self.rules
+                .lock()
+                .unwrap()
+                .retain(|rule| rule.rp_id != rp_id);
+        }
+
+        fn token(&self, rp_id: &str) -> u64 {
+            self.generations
+                .lock()
+                .unwrap()
+                .get(rp_id)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
     impl GrantWriter for FakeGrants {
@@ -2057,14 +2159,23 @@ mod tests {
             }
         }
 
+        fn revoke_token(&self, _profile: &ProfileId, rp_id: &str) -> Option<RevokeToken> {
+            Some(RevokeToken::for_test(0, self.token(rp_id)))
+        }
+
         fn add(
             &self,
             _profile: &ProfileId,
             rule: GrantedRule,
             max_rules: usize,
+            token: Option<RevokeToken>,
         ) -> Result<(), GrantStoreError> {
             assert!(lock_order::held_levels().is_empty());
             self.adds.fetch_add(1, Ordering::SeqCst);
+            if token.is_some_and(|token| token != RevokeToken::for_test(0, self.token(&rule.rp_id)))
+            {
+                return Err(GrantStoreError::Revoked);
+            }
             if self.panic_writes.load(Ordering::SeqCst) {
                 panic!("injected store panic");
             }
@@ -3166,6 +3277,88 @@ mod tests {
         assert_eq!(h.grants.adds.load(Ordering::SeqCst), 1);
         assert!(h.grants.rules.lock().unwrap().is_empty());
         assert_eq!(h.audit.last("granted_rule.revoke")["rp_id"], "a.example");
+    }
+
+    #[test]
+    fn a_store_revoke_before_the_grant_write_denies_the_late_approval() {
+        // Review M-d: `grants revoke` has revoked the store (bumping the RP's generation) but its
+        // `cancel_rp` has not reached the entry yet when the approval writes its grant. The write
+        // is refused under the store's writer, so nothing persists and nothing needs undoing,
+        // whatever the order of the cancel that follows.
+        let h = harness();
+        let grants = Arc::clone(&h.grants);
+        h.audit
+            .hook("granted_rule.add", move || grants.revoke_rp("a.example"));
+        let outcome = approve_and_join(&h, "a.example");
+        assert!(
+            matches!(outcome, EscalationOutcome::Revoked { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            h.grants.adds.load(Ordering::SeqCst),
+            1,
+            "the write was tried"
+        );
+        assert!(h.grants.rules.lock().unwrap().is_empty(), "and refused");
+        assert_eq!(h.audit.count("escalation.revoked"), 1);
+        assert_eq!(
+            h.audit.count("granted_rule.revoke"),
+            0,
+            "nothing to compensate"
+        );
+        // The cancel arrives late: the entry is gone already, nothing changes.
+        h.service.cancel_rp(&profile("p"), "a.example");
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+
+        // A revoke while the prompt is shown (before the click) has the same effect.
+        let h = harness();
+        let parked = park(
+            h.service
+                .join_or_create(request("p", "a.example", 1))
+                .unwrap(),
+        );
+        h.grants.revoke_rp("a.example");
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        assert!(matches!(
+            parked.join().unwrap(),
+            EscalationOutcome::Revoked { .. }
+        ));
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+
+        // An escalation raised after the revocation is a new question and is granted normally.
+        let outcome = approve_and_join(&h, "a.example");
+        assert!(matches!(outcome, EscalationOutcome::Approved { .. }));
+        assert_eq!(h.grants.rules.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_registration_grant_after_a_grants_revoke_is_not_persisted() {
+        // Review M-c: the registration was approved and its credential written; `grants revoke`
+        // runs before `record_registration_grant` (its cancel skips the approved entry). The
+        // credential stays, the grant is not persisted (ADR 0014 section 8.3).
+        let h = harness();
+        let parked = park(
+            h.service
+                .join_or_create(register("p", "r.example", 1))
+                .unwrap(),
+        );
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        let EscalationOutcome::RegistrationApproved(approval) = parked.join().unwrap() else {
+            panic!("the registration was not approved");
+        };
+        h.grants.revoke_rp("r.example");
+        h.service.cancel_rp(&profile("p"), "r.example");
+        let recorded = h.service.record_registration_grant(
+            &approval,
+            CredentialRef::with_default_domain(b"cred"),
+            64,
+        );
+        assert_eq!(recorded, Err(GrantStoreError::Revoked));
+        assert!(h.grants.rules.lock().unwrap().is_empty());
+        assert_eq!(h.audit.count("escalation.revoked"), 1);
+        assert_eq!(h.audit.count("escalation.denied"), 0);
     }
 
     #[test]

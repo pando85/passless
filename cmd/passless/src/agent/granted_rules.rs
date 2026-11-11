@@ -196,6 +196,9 @@ pub enum GrantStoreError {
     NotFound,
     /// Writing the store failed; nothing changed.
     Io(String),
+    /// The RP's grants were revoked (or the profile's cleared) after the escalation captured its
+    /// [`RevokeToken`]: the late approval persists nothing (review M-c, M-d).
+    Revoked,
 }
 
 impl fmt::Display for GrantStoreError {
@@ -209,6 +212,10 @@ impl fmt::Display for GrantStoreError {
             Self::InvalidRpId(e) => write!(f, "invalid RP ID: {}", e),
             Self::NotFound => write!(f, "no matching granted rule"),
             Self::Io(e) => write!(f, "granted-rules store write failed: {}", e),
+            Self::Revoked => write!(
+                f,
+                "the RP's granted rules were revoked after this escalation was raised"
+            ),
         }
     }
 }
@@ -233,6 +240,41 @@ pub struct RevokeOutcome {
     pub revocation_epoch: u64,
 }
 
+/// The revocation generations of one `(profile, RP)`, captured when an escalation is raised
+/// ([`GrantedRulesStore::revoke_token`]) and checked when its approval persists a grant
+/// ([`GrantedRulesStore::add_unless_revoked`]). `grants revoke` bumps the RP's generation and
+/// `grants clear` the profile's, both under the profile's writer, so an approval in flight across a
+/// revocation persists nothing whatever the interleaving with the escalation cancel that follows
+/// it (review M-c, M-d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeToken {
+    profile: u64,
+    rp: u64,
+}
+
+/// What a profile's writer guards besides the file: its revocation generations.
+#[derive(Debug, Default)]
+struct WriterState {
+    profile_generation: u64,
+    rp_generations: HashMap<String, u64>,
+}
+
+#[cfg(test)]
+impl RevokeToken {
+    pub fn for_test(profile: u64, rp: u64) -> Self {
+        Self { profile, rp }
+    }
+}
+
+impl WriterState {
+    fn token(&self, normalized_rp: &str) -> RevokeToken {
+        RevokeToken {
+            profile: self.profile_generation,
+            rp: self.rp_generations.get(normalized_rp).copied().unwrap_or(0),
+        }
+    }
+}
+
 /// The granted-rules store of every configured profile.
 pub struct GrantedRulesStore {
     /// `<state_dir>/granted-rules`.
@@ -243,8 +285,8 @@ pub struct GrantedRulesStore {
     views: RwLock<HashMap<ProfileId, Arc<ProfileGrants>>>,
     /// Per-profile write mutex (`LockLevel::GrantedRulesFile`): held across the file write, the
     /// reload and the view swap, released before any epoch bump. The profile set is fixed at
-    /// startup (adding a profile needs a restart).
-    writers: HashMap<ProfileId, Mutex<()>>,
+    /// startup (adding a profile needs a restart). It also guards the revocation generations.
+    writers: HashMap<ProfileId, Mutex<WriterState>>,
 }
 
 impl fmt::Debug for GrantedRulesStore {
@@ -283,7 +325,7 @@ impl GrantedRulesStore {
                 );
             }
             views.insert(profile.clone(), Arc::new(loaded));
-            writers.insert(profile, Mutex::new(()));
+            writers.insert(profile, Mutex::new(WriterState::default()));
         }
         Self {
             dir,
@@ -307,7 +349,7 @@ impl GrantedRulesStore {
                 profile.clone(),
                 Arc::new(ProfileGrants::Disabled(reason.to_string())),
             );
-            writers.insert(profile, Mutex::new(()));
+            writers.insert(profile, Mutex::new(WriterState::default()));
         }
         Self {
             dir: PathBuf::new(),
@@ -353,8 +395,33 @@ impl GrantedRulesStore {
         &self,
         policy: &PolicyRuntime,
         profile: &ProfileId,
+        rule: GrantedRule,
+        max_rules: usize,
+    ) -> Result<AddOutcome, GrantStoreError> {
+        self.add_unless_revoked(policy, profile, rule, max_rules, None)
+    }
+
+    /// The current [`RevokeToken`] of `rp_id` in `profile`.
+    pub fn revoke_token(
+        &self,
+        profile: &ProfileId,
+        rp_id: &str,
+    ) -> Result<RevokeToken, GrantStoreError> {
+        let normalized =
+            validate_rp_id(rp_id).map_err(|e| GrantStoreError::InvalidRpId(e.to_string()))?;
+        Ok(self.lock_writer(profile)?.token(&normalized))
+    }
+
+    /// [`Self::add`], refused with [`GrantStoreError::Revoked`] when `token` is given and the
+    /// rule's RP was revoked or the profile cleared since it was captured. The check and the write
+    /// happen under the same writer as the revocations, so they are atomic with respect to them.
+    pub fn add_unless_revoked(
+        &self,
+        policy: &PolicyRuntime,
+        profile: &ProfileId,
         mut rule: GrantedRule,
         max_rules: usize,
+        token: Option<RevokeToken>,
     ) -> Result<AddOutcome, GrantStoreError> {
         let normalized =
             validate_rp_id(&rule.rp_id).map_err(|e| GrantStoreError::InvalidRpId(e.to_string()))?;
@@ -365,7 +432,10 @@ impl GrantedRulesStore {
         }
         rule.rp_id = normalized;
         {
-            let _writer = self.lock_writer(profile)?;
+            let writer = self.lock_writer(profile)?;
+            if token.is_some_and(|token| token != writer.token(&rule.rp_id)) {
+                return Err(GrantStoreError::Revoked);
+            }
             let mut rules = self.enabled_rules(profile)?;
             if rules.iter().any(|existing| existing.key() == rule.key()) {
                 return Ok(AddOutcome::AlreadyGranted);
@@ -393,7 +463,10 @@ impl GrantedRulesStore {
         let normalized =
             validate_rp_id(rp_id).map_err(|e| GrantStoreError::InvalidRpId(e.to_string()))?;
         let revoked = {
-            let _writer = self.lock_writer(profile)?;
+            let mut writer = self.lock_writer(profile)?;
+            // Bumped first, also when nothing is stored: an approval between its escalation and
+            // its store write must not persist what the operator just revoked.
+            *writer.rp_generations.entry(normalized.clone()).or_default() += 1;
             let rules = self.enabled_rules(profile)?;
             let before = rules.len();
             let kept: Vec<_> = rules
@@ -452,7 +525,8 @@ impl GrantedRulesStore {
         profile: &ProfileId,
     ) -> Result<RevokeOutcome, GrantStoreError> {
         let revoked = {
-            let _writer = self.lock_writer(profile)?;
+            let mut writer = self.lock_writer(profile)?;
+            writer.profile_generation += 1;
             let rules = self.enabled_rules(profile)?;
             if !rules.is_empty() {
                 self.persist_and_swap(profile, Vec::new())?;
@@ -480,7 +554,7 @@ impl GrantedRulesStore {
     fn lock_writer(
         &self,
         profile: &ProfileId,
-    ) -> Result<lock_order::Tracked<std::sync::MutexGuard<'_, ()>>, GrantStoreError> {
+    ) -> Result<lock_order::Tracked<std::sync::MutexGuard<'_, WriterState>>, GrantStoreError> {
         let writer = self
             .writers
             .get(profile)
@@ -1533,6 +1607,74 @@ rule = "exact"
             store.add(&policy(), &profile(), escalation("example.com"), 64),
             Err(GrantStoreError::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn a_revoke_or_clear_after_the_token_refuses_the_add_atomically() {
+        // Review M-c, M-d: the token captured when the escalation was raised goes stale with a
+        // revoke of its RP (also one that found nothing to remove) or a clear of the profile.
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let policy = policy();
+        let token = store.revoke_token(&profile(), "Example.COM").unwrap();
+        assert_eq!(
+            store.revoke(
+                &policy,
+                &profile(),
+                "example.com",
+                GrantedAction::Authenticate
+            ),
+            Err(GrantStoreError::NotFound)
+        );
+        assert_eq!(
+            store.add_unless_revoked(
+                &policy,
+                &profile(),
+                escalation("example.com"),
+                64,
+                Some(token)
+            ),
+            Err(GrantStoreError::Revoked)
+        );
+        assert!(!store.is_granted(&profile(), "example.com"));
+
+        // Another RP's token is unaffected by that revoke.
+        let other = store.revoke_token(&profile(), "other.example").unwrap();
+        store
+            .add_unless_revoked(
+                &policy,
+                &profile(),
+                escalation("other.example"),
+                64,
+                Some(other),
+            )
+            .unwrap();
+        assert!(store.is_granted(&profile(), "other.example"));
+
+        // A fresh token works; a clear makes every token of the profile stale.
+        let fresh = store.revoke_token(&profile(), "example.com").unwrap();
+        let before_clear = store.revoke_token(&profile(), "third.example").unwrap();
+        store
+            .add_unless_revoked(
+                &policy,
+                &profile(),
+                escalation("example.com"),
+                64,
+                Some(fresh),
+            )
+            .unwrap();
+        store.clear(&policy, &profile()).unwrap();
+        assert_eq!(
+            store.add_unless_revoked(
+                &policy,
+                &profile(),
+                escalation("third.example"),
+                64,
+                Some(before_clear)
+            ),
+            Err(GrantStoreError::Revoked)
+        );
+        assert!(store.profile(&profile()).unwrap().rules().is_empty());
     }
 
     #[test]

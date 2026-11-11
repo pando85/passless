@@ -148,7 +148,9 @@ fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> Protocol
     let code = match &error {
         GrantStoreError::UnknownProfile(_) | GrantStoreError::NotFound => ErrorCode::NotFound,
         GrantStoreError::InvalidRpId(_) => ErrorCode::BadRequest,
-        GrantStoreError::Unavailable(_) | GrantStoreError::CapReached(_) => ErrorCode::Conflict,
+        GrantStoreError::Unavailable(_)
+        | GrantStoreError::CapReached(_)
+        | GrantStoreError::Revoked => ErrorCode::Conflict,
         GrantStoreError::Io(_) => ErrorCode::Internal,
     };
     ProtocolError::new(code, error.to_string(), RecommendedAction::FixRequest)
