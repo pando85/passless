@@ -222,15 +222,13 @@ fn hidraw_node_names(dev_dir: &Path) -> String {
 
 /// What one `faccessat2` failure means for the browser: the node cannot be opened for reading
 /// and writing (`EACCES`: mode bits or ACL; `ENOENT`: gone, or a dangling symlink; `EROFS`:
-/// read-only file system; `EPERM`: write access to an immutable inode, or an LSM denial, either of
-/// which also fails the browser's `open(O_RDWR)`), or the check is inconclusive (anything else, in
-/// particular `ENOSYS`: no `faccessat2` before Linux 5.8, whose `faccessat` fallback in libc would
-/// ignore ACLs).
+/// read-only file system), or the check is inconclusive (anything else). `EPERM` is deliberately
+/// inconclusive: besides an immutable inode, some seccomp profiles answer a syscall they do not
+/// know (`faccessat2`) with `EPERM`, and that says nothing about the device. `ENOSYS` is
+/// inconclusive too: no `faccessat2` before Linux 5.8, whose `faccessat` fallback in libc would
+/// ignore ACLs.
 fn access_error_means_inaccessible(errno: i32) -> bool {
-    matches!(
-        errno,
-        libc::EACCES | libc::ENOENT | libc::EROFS | libc::EPERM
-    )
+    matches!(errno, libc::EACCES | libc::ENOENT | libc::EROFS)
 }
 
 /// A `getdents64` buffer on the stack, aligned for `linux_dirent64`.
@@ -775,8 +773,8 @@ pub(crate) mod tests {
         assert!(access_error_means_inaccessible(libc::EACCES));
         assert!(access_error_means_inaccessible(libc::ENOENT));
         assert!(access_error_means_inaccessible(libc::EROFS));
-        assert!(access_error_means_inaccessible(libc::EPERM));
         for errno in [
+            libc::EPERM,
             libc::ENOSYS,
             libc::EINVAL,
             libc::EIO,

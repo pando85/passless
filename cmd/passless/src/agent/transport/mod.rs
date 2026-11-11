@@ -211,22 +211,32 @@ pub fn peer_uid_from_socket(stream: &UnixStream) -> Option<u32> {
 pub struct SignTransportServer {
     listeners: Vec<(UnixListener, PathBuf)>,
     socket_path: PathBuf,
+    /// The sign directory, opened without following a symlink and owned by the daemon.
+    sign_dir: crate::agent::safe_fs::Dir,
     shutdown: Arc<AtomicBool>,
     peer_uid: PeerUidSource,
 }
 
 impl SignTransportServer {
-    /// Bind `socket_path` (mode 0600, in a directory of mode 0700).
+    /// Bind `socket_path` (mode 0600, in a directory of mode 0700). The sign directory and the two
+    /// directories above it are created without following a symlink and must be owned by the
+    /// daemon: a pre-existing one that another user owns (a planted `/tmp/passless-agent-<uid>`)
+    /// is refused, never chmodded or used.
     pub fn bind(socket_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self, String> {
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create socket directory: {}", e))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("set socket dir permissions: {}", e))?;
-        }
+        let sign_path = socket_path
+            .parent()
+            .ok_or("the sign socket has no directory")?;
+        let trusted = sign_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("/"));
+        let sign_dir =
+            crate::agent::safe_fs::Dir::open_or_create_path(sign_path, 0o700, trusted)
+                .map_err(|e| format!("create the sign directory {}: {e}", sign_path.display()))?;
         let listener = bind_socket(&socket_path)?;
         Ok(Self {
             listeners: vec![(listener, socket_path.clone())],
+            sign_dir,
             socket_path,
             shutdown,
             peer_uid: Arc::new(peer_uid_from_socket),
@@ -262,7 +272,8 @@ impl SignTransportServer {
                  passless-agent.service) or set browser_user to the daemon's user"
             ));
         }
-        std::fs::set_permissions(&sign_dir, std::fs::Permissions::from_mode(0o711))
+        self.sign_dir
+            .chmod(0o711)
             .map_err(|e| format!("set {} permissions: {e}", sign_dir.display()))?;
         if let Some(blocking) = untraversable_ancestor(&sign_dir, uid, gid) {
             return Err(format!(
@@ -285,9 +296,8 @@ impl SignTransportServer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("inspect {}: {e}", uid_dir.display())),
         }
-        let sign = crate::agent::safe_fs::Dir::open_path(&sign_dir)
-            .map_err(|e| format!("open {}: {e}", sign_dir.display()))?;
-        let pinned = sign
+        let pinned = self
+            .sign_dir
             .create_dir(&name, 0o700)
             .map_err(|e| format!("create {}: {e}", uid_dir.display()))?;
         let socket_path = uid_dir.join("sock");

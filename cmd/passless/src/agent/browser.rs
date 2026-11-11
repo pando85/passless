@@ -1025,7 +1025,13 @@ impl BrowserProcessManager {
             )?;
             // Verified before anything is spawned: a missing or unreadable extension is a launch
             // error, never a browser without interception.
-            verify_extension_dir(&ext_dir)?;
+            let ext_pinned = lease_dir.open_dir(AGENT_EXTENSION_DIR).map_err(|e| {
+                extension_check_failure(format!(
+                    "extension directory {} is unavailable: {e}",
+                    ext_dir.display()
+                ))
+            })?;
+            verify_extension_dir_in(&ext_pinned, &ext_dir, config.target_uid)?;
             // Without the relay the worker cannot reach the daemon, so nothing is intercepted: a
             // missing relay is a launch error too.
             let sign_proxy = self
@@ -2373,16 +2379,28 @@ pub fn compute_extension_id(manifest_json: &str) -> Result<String, LaunchError> 
         .collect())
 }
 
-/// The ID of the extension in `ext_dir`, from its `manifest.json`.
+/// The most `manifest.json` the daemon reads from an extension directory.
+const EXTENSION_MANIFEST_LIMIT: u64 = 64 * 1024;
+/// The most `worker.js` the daemon reads from an extension directory.
+const EXTENSION_WORKER_LIMIT: u64 = 1024 * 1024;
+
+/// The ID of the extension in `ext_dir`, from its `manifest.json`, read through the pinned
+/// directory (never by path, never through a symlink; a regular file the daemon owns).
 pub fn extension_id_of_dir(ext_dir: &Path) -> Result<String, LaunchError> {
-    let manifest = fs::read_to_string(ext_dir.join("manifest.json")).map_err(|e| {
+    let fail = |e: io::Error| {
         LaunchError::ExtensionSetupFailed(format!(
             "read {}: {}",
             ext_dir.join("manifest.json").display(),
             e
         ))
-    })?;
-    compute_extension_id(&manifest)
+    };
+    let dir = Dir::open_path(ext_dir).map_err(fail)?;
+    // SAFETY: no preconditions.
+    let daemon = unsafe { libc::geteuid() };
+    let manifest = dir
+        .read_whole_file("manifest.json", &[daemon], EXTENSION_MANIFEST_LIMIT)
+        .map_err(fail)?;
+    compute_extension_id(&String::from_utf8_lossy(&manifest))
 }
 
 /// Where the launcher expects the `sign-proxy` relay: next to the running executable. `None` if
@@ -2463,35 +2481,47 @@ const EXTENSION_WORKER: &str = "worker.js";
 ///   before registering its listeners if one is left, and requests would go native).
 ///
 /// A failure is a launch error with an actionable message; the caller must not start any browser.
-pub(crate) fn verify_extension_dir(ext_dir: &Path) -> Result<(), LaunchError> {
-    let fail = |why: String| {
-        LaunchError::ExtensionSetupFailed(format!(
-            "{why}; refusing to launch the managed browser without the passless agent extension \
-             (it is required so that WebAuthn requests never reach the human authenticator). \
-             Check that the browser runtime root is writable and has free space, then retry; \
-             if it persists, reinstall passless"
-        ))
-    };
-    let meta = fs::metadata(ext_dir).map_err(|e| {
-        fail(format!(
+pub(crate) fn verify_extension_dir(ext_dir: &Path, worker_owner: u32) -> Result<(), LaunchError> {
+    let dir = Dir::open_path(ext_dir).map_err(|e| {
+        extension_check_failure(format!(
             "extension directory {} is unavailable: {e}",
             ext_dir.display()
         ))
     })?;
-    if !meta.is_dir() {
-        return Err(fail(format!(
-            "extension path {} is not a directory",
-            ext_dir.display()
-        )));
-    }
-    let manifest_path = ext_dir.join("manifest.json");
-    let manifest = fs::read_to_string(&manifest_path).map_err(|e| {
-        fail(format!(
-            "extension manifest {} is not readable: {e}",
-            manifest_path.display()
-        ))
-    })?;
-    let manifest: serde_json::Value = match serde_json::from_str(&manifest) {
+    verify_extension_dir_in(&dir, ext_dir, worker_owner)
+}
+
+fn extension_check_failure(why: String) -> LaunchError {
+    LaunchError::ExtensionSetupFailed(format!(
+        "{why}; refusing to launch the managed browser without the passless agent extension \
+         (it is required so that WebAuthn requests never reach the human authenticator). \
+         Check that the browser runtime root is writable and has free space, then retry; \
+         if it persists, reinstall passless"
+    ))
+}
+
+/// [`verify_extension_dir`] on an already pinned directory (`label` is only for messages). The
+/// files are read through the descriptor: `O_NOFOLLOW`, regular files only (a planted symlink to
+/// `/dev/zero` or a FIFO is refused, never read), owned by the daemon (`manifest.json`) or by the
+/// daemon or the browser user (`worker.js`, handed to the browser user), and bounded.
+pub(crate) fn verify_extension_dir_in(
+    ext: &Dir,
+    label: &Path,
+    worker_owner: u32,
+) -> Result<(), LaunchError> {
+    let fail = extension_check_failure;
+    // SAFETY: no preconditions.
+    let daemon = unsafe { libc::geteuid() };
+    let manifest_path = label.join("manifest.json");
+    let manifest = ext
+        .read_whole_file("manifest.json", &[daemon], EXTENSION_MANIFEST_LIMIT)
+        .map_err(|e| {
+            fail(format!(
+                "extension manifest {} is not readable: {e}",
+                manifest_path.display()
+            ))
+        })?;
+    let manifest: serde_json::Value = match serde_json::from_slice(&manifest) {
         Ok(v @ serde_json::Value::Object(_)) => v,
         _ => {
             return Err(fail(format!(
@@ -2542,27 +2572,26 @@ pub(crate) fn verify_extension_dir(ext_dir: &Path) -> Result<(), LaunchError> {
         ));
     }
 
-    let worker_path = ext_dir.join(EXTENSION_WORKER);
-    let worker = match fs::metadata(&worker_path) {
-        Ok(m) if m.is_file() && m.len() > 0 => fs::read_to_string(&worker_path).map_err(|e| {
+    let worker_path = label.join(EXTENSION_WORKER);
+    let worker = ext
+        .read_whole_file(
+            EXTENSION_WORKER,
+            &[daemon, worker_owner],
+            EXTENSION_WORKER_LIMIT,
+        )
+        .map_err(|e| {
             fail(format!(
-                "extension script {} is not readable: {e}",
+                "extension script {} is missing, unreadable or not a regular file: {e}",
                 worker_path.display()
             ))
-        })?,
-        Ok(_) => {
-            return Err(fail(format!(
-                "extension script {} is empty or not a regular file",
-                worker_path.display()
-            )));
-        }
-        Err(e) => {
-            return Err(fail(format!(
-                "extension script {} is missing or unreadable: {e}",
-                worker_path.display()
-            )));
-        }
-    };
+        })?;
+    if worker.is_empty() {
+        return Err(fail(format!(
+            "extension script {} is empty",
+            worker_path.display()
+        )));
+    }
+    let worker = String::from_utf8_lossy(&worker);
     if worker.contains(EXTENSION_PLACEHOLDER_PREFIX) {
         return Err(fail(format!(
             "extension script {} has an unreplaced {EXTENSION_PLACEHOLDER_PREFIX} placeholder",
@@ -2626,7 +2655,7 @@ fn build_browser_command_inner(
         .unwrap_or(profile_dir)
         .join(AGENT_EXTENSION_DIR);
     if require_extension {
-        verify_extension_dir(&ext_dir)?;
+        verify_extension_dir(&ext_dir, config.target_uid)?;
     }
     cmd.arg(format!("--load-extension={}", ext_dir.display()));
     cmd.arg("--disable-save-password-bubble");
@@ -7714,6 +7743,52 @@ mod tests {
         assert!(msg.contains("refusing to launch"), "{msg}");
     }
 
+    /// [`verify_extension_dir`] with the test user as the worker's owner.
+    fn verify_ext(ext_dir: &Path) -> Result<(), LaunchError> {
+        verify_extension_dir(ext_dir, unsafe { libc::geteuid() })
+    }
+
+    /// A planted `manifest.json` or `worker.js` symlink to an endless device or a FIFO must be
+    /// refused promptly, not read (the daemon runs as root and would hang or exhaust memory).
+    #[test]
+    fn test_verify_extension_dir_never_reads_a_planted_device_symlink_or_fifo() {
+        for victim in [EXTENSION_WORKER, "manifest.json"] {
+            for kind in ["symlink", "fifo", "oversize"] {
+                let dir = tempfile::tempdir().unwrap();
+                let ext = dir.path().join("ext");
+                write_valid_extension(&ext);
+                let planted = ext.join(victim);
+                fs::remove_file(&planted).unwrap();
+                match kind {
+                    "symlink" => std::os::unix::fs::symlink("/dev/zero", &planted).unwrap(),
+                    "fifo" => {
+                        let c = std::ffi::CString::new(planted.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+                    }
+                    _ => fs::write(&planted, vec![b' '; 2 * 1024 * 1024]).unwrap(),
+                }
+                let started = std::time::Instant::now();
+                let err = verify_ext(&ext).unwrap_err();
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "{victim} {kind}"
+                );
+                assert!(
+                    matches!(err, LaunchError::ExtensionSetupFailed(_)),
+                    "{victim} {kind}: {err}"
+                );
+                if kind != "oversize" {
+                    assert!(extension_id_of_dir(&ext).is_err() || victim == EXTENSION_WORKER);
+                }
+            }
+        }
+        // The extension directory itself must not be a symlink either.
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_extension(&dir.path().join("real"));
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("ext")).unwrap();
+        assert!(verify_ext(&dir.path().join("ext")).is_err());
+    }
+
     /// Writes an extension directory that has what the generator emits: the real manifest template
     /// and a rendered worker.
     fn write_valid_extension(ext_dir: &Path) {
@@ -7742,7 +7817,7 @@ mod tests {
     fn test_verify_extension_dir_accepts_the_generated_extension() {
         let dir = tempfile::tempdir().unwrap();
         write_valid_extension(&dir.path().join("ext"));
-        verify_extension_dir(&dir.path().join("ext")).unwrap();
+        verify_ext(&dir.path().join("ext")).unwrap();
 
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
@@ -7750,7 +7825,7 @@ mod tests {
         };
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let generated = generate_agent_extension(dir.path(), &metadata, uid, gid).unwrap();
-        verify_extension_dir(&generated).unwrap();
+        verify_ext(&generated).unwrap();
     }
 
     #[test]
@@ -7758,28 +7833,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Missing directory.
-        assert!(verify_extension_dir(&dir.path().join("missing")).is_err());
+        assert!(verify_ext(&dir.path().join("missing")).is_err());
 
         // A file instead of a directory.
         let file = dir.path().join("file");
         fs::write(&file, "{}").unwrap();
-        assert!(verify_extension_dir(&file).is_err());
+        assert!(verify_ext(&file).is_err());
 
         // Directory without a manifest.
         let empty = dir.path().join("empty");
         fs::create_dir(&empty).unwrap();
-        assert!(verify_extension_dir(&empty).is_err());
+        assert!(verify_ext(&empty).is_err());
 
         // Unreadable manifest (a directory where the file should be).
         let unreadable = dir.path().join("unreadable");
         fs::create_dir_all(unreadable.join("manifest.json")).unwrap();
-        assert!(verify_extension_dir(&unreadable).is_err());
+        assert!(verify_ext(&unreadable).is_err());
 
         // Manifest that is not a JSON object.
         let garbage = dir.path().join("garbage");
         fs::create_dir(&garbage).unwrap();
         fs::write(garbage.join("manifest.json"), "not json").unwrap();
-        assert!(verify_extension_dir(&garbage).is_err());
+        assert!(verify_ext(&garbage).is_err());
     }
 
     #[test]
@@ -7790,16 +7865,16 @@ mod tests {
         let worker = ext.join(EXTENSION_WORKER);
 
         fs::remove_file(&worker).unwrap();
-        let err = verify_extension_dir(&ext).unwrap_err().to_string();
+        let err = verify_ext(&ext).unwrap_err().to_string();
         assert!(err.contains("worker.js"), "missing worker: {err}");
 
         fs::write(&worker, "").unwrap();
-        let err = verify_extension_dir(&ext).unwrap_err().to_string();
+        let err = verify_ext(&ext).unwrap_err().to_string();
         assert!(err.contains("worker.js"), "empty worker: {err}");
 
         // The unrendered template: every placeholder is still there.
         fs::write(&worker, EXTENSION_WORKER_TEMPLATE).unwrap();
-        let err = verify_extension_dir(&ext).unwrap_err().to_string();
+        let err = verify_ext(&ext).unwrap_err().to_string();
         assert!(err.contains("placeholder"), "template worker: {err}");
 
         // A single placeholder left behind is enough to refuse.
@@ -7809,7 +7884,7 @@ mod tests {
             "__PASSLESS_BUILD_VERSION__",
         ] {
             fs::write(&worker, format!("f(\"tok\", {placeholder});")).unwrap();
-            let err = verify_extension_dir(&ext).unwrap_err();
+            let err = verify_ext(&ext).unwrap_err();
             assert!(
                 matches!(err, LaunchError::ExtensionSetupFailed(_)),
                 "{placeholder}: {err}"
@@ -7818,7 +7893,7 @@ mod tests {
         }
 
         fs::write(&worker, "// ok").unwrap();
-        verify_extension_dir(&ext).unwrap();
+        verify_ext(&ext).unwrap();
     }
 
     #[test]
@@ -7878,7 +7953,7 @@ mod tests {
             let ext = dir.path().join("ext");
             write_valid_extension(&ext);
             fs::write(ext.join("manifest.json"), manifest_with(edit)).unwrap();
-            let err = verify_extension_dir(&ext);
+            let err = verify_ext(&ext);
             assert!(
                 matches!(err, Err(LaunchError::ExtensionSetupFailed(_))),
                 "{name} must be rejected"

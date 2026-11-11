@@ -125,6 +125,71 @@ impl Dir {
         Ok(dir)
     }
 
+    /// Open `path`, an absolute path below `trusted_prefix`, creating what is missing, without
+    /// following a symlink anywhere. `trusted_prefix` itself is only opened (it is the system's:
+    /// `/tmp`, `/run/user/0`). Every component below it must be a directory owned by the daemon's
+    /// effective UID: a missing one is created (mode 0700), a pre-existing one that someone else
+    /// owns, or that is a symlink or not a directory, is refused rather than used or chmodded.
+    /// The last component is set to exactly `mode`.
+    pub fn open_or_create_path(path: &Path, mode: u32, trusted_prefix: &Path) -> io::Result<Self> {
+        let relative = path.strip_prefix(trusted_prefix).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not below {}",
+                    path.display(),
+                    trusted_prefix.display()
+                ),
+            )
+        })?;
+        let owner = effective_uid();
+        let mut dir = Self::open_path(trusted_prefix)?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a normalized path", path.display()),
+                ));
+            };
+            let name = name.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
+            })?;
+            let next = match dir.open_dir(name) {
+                Ok(existing) => {
+                    let st = existing.stat()?;
+                    if st.st_uid != owner {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "{} already exists and is owned by uid {}, not by the daemon \
+                                 (uid {owner}); refusing to use it",
+                                trusted_prefix.join(relative).display(),
+                                st.st_uid
+                            ),
+                        ));
+                    }
+                    existing
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    dir.create_dir_owned_by(name, 0o700, owner)?
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "open {} below {} without following symlinks: {e}",
+                            name,
+                            trusted_prefix.display()
+                        ),
+                    ));
+                }
+            };
+            dir = next;
+        }
+        dir.chmod(mode)?;
+        Ok(dir)
+    }
+
     /// Open the existing subdirectory `name`, not following a symlink.
     pub fn open_dir(&self, name: &str) -> io::Result<Self> {
         Ok(Self {
@@ -135,6 +200,12 @@ impl Dir {
     /// Create the subdirectory `name` with `mode` and open it. It must not exist; the opened
     /// directory must be the daemon's (a replacement between `mkdirat` and `openat` is refused).
     pub fn create_dir(&self, name: &str, mode: u32) -> io::Result<Self> {
+        self.create_dir_owned_by(name, mode, effective_uid())
+    }
+
+    /// [`Dir::create_dir`] with the owner the new directory must have (the daemon's effective UID
+    /// outside tests).
+    fn create_dir_owned_by(&self, name: &str, mode: u32, owner: u32) -> io::Result<Self> {
         let c_name = cstr(name)?;
         // SAFETY: `c_name` is NUL-terminated; the result is checked.
         if unsafe { libc::mkdirat(self.fd.as_raw_fd(), c_name.as_ptr(), mode as libc::mode_t) } != 0
@@ -145,7 +216,7 @@ impl Dir {
             fd: open_dir_at(self.fd.as_raw_fd(), &c_name)?,
         };
         let st = fstat(dir.fd.as_raw_fd())?;
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != effective_uid() {
+        if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != owner {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("{name} was replaced after it was created"),
@@ -218,6 +289,33 @@ impl Dir {
     /// file type or another owner (for example a hard link to someone else's file) is refused, so
     /// a file planted in a browser-owned directory cannot make the daemon read anything else.
     pub fn read_owned_file(&self, name: &str, owner: u32, limit: u64) -> io::Result<Vec<u8>> {
+        let file = self.open_regular_file(name, &[owner])?;
+        let mut contents = Vec::new();
+        file.take(limit).read_to_end(&mut contents)?;
+        Ok(contents)
+    }
+
+    /// Read the regular file `name`, owned by one of `owners`, and refuse (`InvalidData`) a file
+    /// longer than `limit` bytes instead of truncating it: for files whose whole content matters.
+    /// The same refusals as [`Dir::read_owned_file`]: no symlink, and only a regular file, so a
+    /// device such as `/dev/zero` is never read.
+    pub fn read_whole_file(&self, name: &str, owners: &[u32], limit: u64) -> io::Result<Vec<u8>> {
+        let file = self.open_regular_file(name, owners)?;
+        let mut contents = Vec::new();
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name} is longer than {limit} bytes"),
+            ));
+        }
+        Ok(contents)
+    }
+
+    /// Open `name` read-only without following a symlink or blocking, and check that it is a
+    /// regular file owned by one of `owners`.
+    fn open_regular_file(&self, name: &str, owners: &[u32]) -> io::Result<File> {
         let c_name = cstr(name)?;
         // SAFETY: `c_name` is NUL-terminated; the result is checked.
         let fd = unsafe {
@@ -233,15 +331,13 @@ impl Dir {
         // SAFETY: a fresh descriptor this function owns.
         let file = unsafe { File::from_raw_fd(fd) };
         let st = fstat(file.as_raw_fd())?;
-        if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_uid != owner {
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG || !owners.contains(&st.st_uid) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{name} is not a regular file owned by uid {owner}"),
+                format!("{name} is not a regular file owned by uid {owners:?}"),
             ));
         }
-        let mut contents = Vec::new();
-        file.take(limit).read_to_end(&mut contents)?;
-        Ok(contents)
+        Ok(file)
     }
 
     /// `fchown` this directory.
@@ -371,6 +467,129 @@ mod tests {
         real.create_file("cdp-endpoint", 0o600, b"ws://x").unwrap();
         assert!(root.join("moved").join("cdp-endpoint").is_file());
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_symlink_in_the_middle_of_a_multi_component_path_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("sub")).unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // `root/profile` is a symlink, and the path goes through it to `sub`, a real directory
+        // there: a path-based open would succeed, `open_path` refuses at `profile`.
+        symlink(&elsewhere, root.join("profile")).unwrap();
+        let err = Dir::open_path(&root.join("profile").join("sub")).unwrap_err();
+        assert!(
+            err.to_string().contains("without following symlinks"),
+            "{err}"
+        );
+        // The same path with a real `profile` opens.
+        fs::remove_file(root.join("profile")).unwrap();
+        fs::create_dir_all(root.join("profile").join("sub")).unwrap();
+        Dir::open_path(&root.join("profile").join("sub")).unwrap();
+    }
+
+    #[test]
+    fn open_or_create_path_creates_owned_directories_and_refuses_strangers_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trusted = tmp.path();
+        let uid = unsafe { libc::geteuid() };
+
+        // Missing components are created, 0700, and the last one gets the exact mode.
+        let leaf = trusted.join("base").join("agent").join("sign");
+        let dir = Dir::open_or_create_path(&leaf, 0o700, trusted).unwrap();
+        assert_eq!(dir.stat().unwrap().st_uid, uid);
+        assert_eq!(
+            fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Idempotent; the mode is re-applied to a pre-existing directory the daemon owns.
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755)).unwrap();
+        Dir::open_or_create_path(&leaf, 0o700, trusted).unwrap();
+        assert_eq!(
+            fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // A symlink at any owned component is refused, and nothing is written through it.
+        let elsewhere = trusted.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&elsewhere, trusted.join("linked")).unwrap();
+        assert!(Dir::open_or_create_path(&trusted.join("linked"), 0o700, trusted).is_err());
+        let through = trusted.join("linked").join("agent").join("sign");
+        assert!(Dir::open_or_create_path(&through, 0o700, trusted).is_err());
+        symlink(&elsewhere, trusted.join("base").join("agent").join("link")).unwrap();
+        let below = trusted.join("base").join("agent").join("link").join("sign");
+        assert!(Dir::open_or_create_path(&below, 0o700, trusted).is_err());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert_eq!(
+            fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the symlink target was not chmodded"
+        );
+
+        // A file in the way is refused; a path outside the trusted prefix is too.
+        fs::write(trusted.join("file"), b"x").unwrap();
+        assert!(Dir::open_or_create_path(&trusted.join("file"), 0o700, trusted).is_err());
+        assert!(Dir::open_or_create_path(Path::new("/tmp/x"), 0o700, trusted).is_err());
+    }
+
+    /// A pre-existing directory owned by another user is refused, not used. Needs a second UID
+    /// that owns a directory the test can open: `/` is root's, so this runs for a non-root user.
+    #[test]
+    fn open_or_create_path_refuses_a_pre_existing_directory_of_another_owner() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // `/proc` and `/sys` are root-owned directories every user can open.
+        let err = Dir::open_or_create_path(Path::new("/proc/sys"), 0o700, Path::new("/proc"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("not by the daemon"), "{err}");
+    }
+
+    #[test]
+    fn create_dir_refuses_a_directory_the_daemon_does_not_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::open_path(tmp.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        // As if another user had swapped the directory between `mkdirat` and `openat`.
+        let err = dir
+            .create_dir_owned_by("swapped", 0o700, uid.wrapping_add(1))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("replaced"), "{err}");
+        // The real owner passes, and an existing entry is still refused.
+        dir.create_dir_owned_by("mine", 0o700, uid).unwrap();
+        assert!(dir.create_dir("mine", 0o700).is_err());
+    }
+
+    #[test]
+    fn whole_file_reads_refuse_devices_symlinks_oversize_and_strangers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::open_path(tmp.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        fs::write(tmp.path().join("ok"), b"12345").unwrap();
+        assert_eq!(dir.read_whole_file("ok", &[uid], 5).unwrap(), b"12345");
+        let err = dir.read_whole_file("ok", &[uid], 4).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            dir.read_whole_file("ok", &[uid.wrapping_add(1)], 64)
+                .is_err()
+        );
+        assert!(
+            dir.read_whole_file("ok", &[uid.wrapping_add(1), uid], 64)
+                .is_ok()
+        );
+        // A planted symlink to an endless device is refused, never read.
+        symlink("/dev/zero", tmp.path().join("zero")).unwrap();
+        assert!(dir.read_whole_file("zero", &[uid], u64::MAX).is_err());
+        // So is a FIFO nobody writes to (it would block a plain read).
+        let fifo = std::ffi::CString::new(tmp.path().join("fifo").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(dir.read_whole_file("fifo", &[uid], 64).is_err());
     }
 
     #[test]

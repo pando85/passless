@@ -502,6 +502,29 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+/// The daemon's runtime base: the XDG runtime directory, or `/tmp/passless-agent-<uid>`. The
+/// `/tmp` fallback sits in a world-writable sticky directory, so it is created without following
+/// a symlink, owned by the daemon and mode 0700; a pre-existing entry of that name that the
+/// daemon does not own (planted by another user) is refused, never chmodded or used.
+fn daemon_runtime_base() -> Result<PathBuf, RuntimeError> {
+    if let Some(dir) = dirs::runtime_dir() {
+        return Ok(dir);
+    }
+    // SAFETY: no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let base = PathBuf::from(format!("/tmp/passless-agent-{uid}"));
+    super::safe_fs::Dir::open_or_create_path(&base, 0o700, std::path::Path::new("/tmp")).map_err(
+        |e| {
+            RuntimeError::Config(format!(
+                "cannot create the runtime directory {}: {e}; remove it if it is not yours, or set \
+             XDG_RUNTIME_DIR",
+                base.display()
+            ))
+        },
+    )?;
+    Ok(base)
+}
+
 #[derive(Clone)]
 struct ResolvedUser {
     uid: u32,
@@ -1109,12 +1132,7 @@ impl AgentRuntime {
         }
 
         let ipc_server = if !agent_config.profiles.is_empty() {
-            let runtime_base = dirs::runtime_dir()
-                .or_else(|| {
-                    let uid = unsafe { libc::getuid() };
-                    Some(PathBuf::from(format!("/tmp/passless-agent-{}", uid)))
-                })
-                .ok_or_else(|| RuntimeError::Config("cannot resolve runtime directory".into()))?;
+            let runtime_base = daemon_runtime_base()?;
 
             let agent_runtime_dir = runtime_base.join("agent");
             let runtime_dir =
@@ -1143,12 +1161,7 @@ impl AgentRuntime {
 
         let sign_registry = Arc::new(SignContextRegistry::new());
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));
-        let sign_socket_base = dirs::runtime_dir()
-            .or_else(|| {
-                let uid = unsafe { libc::getuid() };
-                Some(PathBuf::from(format!("/tmp/passless-agent-{}", uid)))
-            })
-            .ok_or_else(|| RuntimeError::Config("cannot resolve runtime directory".into()))?;
+        let sign_socket_base = daemon_runtime_base()?;
         let sign_socket_path = sign_socket_base.join("agent").join("sign").join("sock");
         let mut sign_server =
             SignTransportServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone())

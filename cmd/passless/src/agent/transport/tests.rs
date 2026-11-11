@@ -1933,3 +1933,52 @@ fn the_transport_deadline_follows_chromiums_clamp() {
         "a long page timeout is capped at 20 h"
     );
 }
+
+/// The sign directory is created without following a symlink and must be the daemon's: a symlink
+/// planted at `agent` or `sign` (for example under the `/tmp/passless-agent-<uid>` fallback) is
+/// refused, and its target is neither chmodded nor given a socket.
+#[test]
+fn bind_refuses_a_planted_symlink_for_the_sign_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let base = tmp.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+
+    // `sign` itself is a symlink to a directory the attacker chose.
+    std::fs::create_dir(base.join("agent")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, base.join("agent").join("sign")).unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let sock = base.join("agent").join("sign").join("sock");
+    let err = SignTransportServer::bind(sock, shutdown.clone())
+        .err()
+        .expect("a symlinked sign directory is refused");
+    assert!(err.contains("sign directory"), "{err}");
+
+    // So is a symlinked `agent` directory.
+    std::fs::remove_file(base.join("agent").join("sign")).unwrap();
+    std::fs::remove_dir(base.join("agent")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, base.join("agent")).unwrap();
+    let sock = base.join("agent").join("sign").join("sock");
+    assert!(SignTransportServer::bind(sock, shutdown.clone()).is_err());
+
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    // A fresh path is created 0700 and works.
+    let sock = base.join("fresh").join("sign").join("sock");
+    let server = SignTransportServer::bind(sock.clone(), shutdown).unwrap();
+    assert_eq!(server.socket_path(), sock);
+    assert_eq!(
+        std::fs::metadata(sock.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
