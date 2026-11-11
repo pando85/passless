@@ -51,12 +51,9 @@ scenario({ id: 'E2E-12', title: 'exact allow beats wildcard request', ci: true }
   assert.equal(policyEvents(audit, 'policy.deny').filter(e => e.rp_id === 'rp-a.test').length, 0, 'the exact rule must not also deny rp-a.test');
 });
 
-// V-M6: the audit carries no rule identity before P8 (`audit_events.rs`: `PolicyAllowMeta` has no `rule`), so the
-// `rule = "*"` assertion for the wildcard path is tagged until then. It runs in the same stack shape as E2E-12.
-scenario({
-  id: 'E2E-12/audit-rule', title: 'wildcard match is audited rule="*"', ci: true,
-  xfailUntil: 'P8', xfailMatch: /audit carries no rule identity/, xfailReason: 'policy.allow/deny events have no `rule` field until the P8 audit rework (V-M6)',
-}, async ctx => {
+// V-M6: the audit's matched `rule` (ADR 0014 section 12, P8) is asserted here for the wildcard path: a wildcard match is
+// audited `rule = "*"` with `grant_source = "config"`. It runs in the same stack shape as E2E-12.
+scenario({ id: 'E2E-12/audit-rule', title: 'wildcard match is audited rule="*"', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } }, profiles: PROFILES, notify: NOTIFY });
   const rpB = stack.rp.b;
   await stack.seedHuman(rpB, 'bob');
@@ -67,6 +64,7 @@ scenario({
   const audit = await stack.daemon.audit();
   const denies = policyEvents(audit, 'policy.deny').filter(e => e.profile_id === 'agent' && e.rp_id === 'rp-b.test');
   assert.equal(denies.length, 1);
-  assert.ok('rule' in denies[0], 'audit carries no rule identity yet');
   assert.equal(denies[0].rule, '*', 'a wildcard match is audited as rule="*"');
+  assert.equal(denies[0].grant_source, 'config');
+  assert.deepEqual(escalationEvents(audit, 'requested').map(e => e.rule), ['*'], 'the escalation names the same rule');
 });

@@ -1408,8 +1408,8 @@ pub struct PromptErrorMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantedRuleRevokeMeta {
     profile_id: ProfileId,
-    /// The revoked RP; absent when every granted rule of the profile was cleared.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The revoked RP; null when every granted rule of the profile was cleared.
+    #[serde(default)]
     rp_id: Option<String>,
     revoked: u32,
 }
@@ -1424,8 +1424,8 @@ pub struct GrantedRuleAddMeta {
     escalation_id: String,
     /// The permitting rule: `exact` or `*`.
     rule: String,
-    /// The credential a registration grant pins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The credential a registration grant pins; null for an authentication grant.
+    #[serde(default)]
     credential_ref: Option<CredentialRef>,
 }
 
