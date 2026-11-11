@@ -27,7 +27,7 @@ use super::session::{
 };
 use super::sign::{
     Escalation, PreparedEscalation, aborted_error, b64u_decode, b64u_encode, claim_rejection_error,
-    decode_challenge, extensions_supported, join_failure, session_invalid_error,
+    decode_challenge, extensions_supported, join_timeout_error, session_invalid_error,
     verify_origin_context,
 };
 
@@ -512,7 +512,7 @@ impl RegisterHandler {
                 }
                 // The browser cancelled the duplicate while it waited: audited like any abort.
                 JoinResult::Detached => Err(self.deny(target, aborted_error())),
-                other => Err(join_failure(other)),
+                JoinResult::DeadlineExceeded => Err(self.deny(target, join_timeout_error())),
             },
             Claim::Completed(outcome, audit) => {
                 self.serve_duplicate(ctx, target, audit)?;
@@ -2457,6 +2457,95 @@ mod tests {
             records_of_kind(&f, "policy.deny").is_empty(),
             "after the reservation a failure is the terminal record, not a second refusal"
         );
+    }
+
+    /// A key provider whose `generate` panics.
+    struct PanickingKeyProvider;
+
+    impl soft_fido2::CredentialKeyProvider for PanickingKeyProvider {
+        fn provider_id(&self) -> soft_fido2::CredentialKeyProviderId {
+            SoftwareCredentialKeyProvider.provider_id()
+        }
+        fn supports_algorithm(&self, algorithm: i32) -> bool {
+            SoftwareCredentialKeyProvider.supports_algorithm(algorithm)
+        }
+        fn generate(
+            &self,
+            _algorithm: i32,
+        ) -> Result<soft_fido2::GeneratedCredentialKey, soft_fido2::CredentialKeyError> {
+            panic!("the key provider panicked");
+        }
+        fn sign(
+            &self,
+            _key: &soft_fido2::CredentialKey,
+            _algorithm: i32,
+            _data: &[u8],
+        ) -> Result<Vec<u8>, soft_fido2::CredentialKeyError> {
+            unreachable!("registration never signs")
+        }
+    }
+
+    #[test]
+    fn a_panic_in_key_generation_still_gets_exactly_one_abandoned_terminal_record() {
+        let f = RegisterTestFixture::new();
+        let handler = RegisterHandler {
+            key_provider: Arc::new(PanickingKeyProvider),
+            ..f.make_handler()
+        };
+        let ctx = f.make_ctx();
+        let req = f.make_req();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = handler.register(&ctx, &req);
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(records_of_kind(&f, "policy.allow").len(), 1);
+        let terminals = records_of_kind(&f, "operation.terminal");
+        assert_eq!(terminals.len(), 1, "exactly one terminal record");
+        assert_eq!(terminals[0]["result"], "error");
+        assert_eq!(terminals[0]["failure_class"], "abandoned");
+        assert_eq!(
+            terminals[0]["request_id"],
+            records_of_kind(&f, "policy.allow")[0]["request_id"]
+        );
+        assert!(records_of_kind(&f, "policy.deny").is_empty());
+    }
+
+    #[test]
+    fn an_abort_between_the_reservation_and_key_generation_ends_in_an_aborted_terminal_record() {
+        let f = RegisterTestFixture::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // The first check (before the replay key) passes; the re-check before key use sees it.
+        let cancelled = || calls.fetch_add(1, Ordering::AcqRel) >= 1;
+        let deadline = ceremony_deadline(None, Instant::now());
+        f.make_handler()
+            .register_with(&f.make_ctx(), &f.make_req(), deadline, &cancelled)
+            .unwrap_err();
+        assert_eq!(records_of_kind(&f, "policy.allow").len(), 1);
+        let terminals = records_of_kind(&f, "operation.terminal");
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["result"], "aborted");
+        assert_eq!(terminals[0]["failure_class"], "aborted");
+        assert!(terminals[0]["credential_ref"].is_null());
+        assert!(records_of_kind(&f, "policy.deny").is_empty());
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+    }
+
+    #[test]
+    fn a_bearer_revoked_between_the_reservation_and_key_generation_ends_in_a_revoked_terminal() {
+        let f = RegisterTestFixture::new();
+        let ctx = f.make_ctx();
+        let session = ctx.session.clone();
+        let _hook = crate::agent::session::test_hooks::set_before_key_use(move || {
+            session.revoke();
+        });
+        f.make_handler().register(&ctx, &f.make_req()).unwrap_err();
+        assert_eq!(records_of_kind(&f, "policy.allow").len(), 1);
+        let terminals = records_of_kind(&f, "operation.terminal");
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["result"], "revoked");
+        assert!(terminals[0]["failure_class"].is_string());
+        assert!(records_of_kind(&f, "policy.deny").is_empty());
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
     }
 
     #[test]

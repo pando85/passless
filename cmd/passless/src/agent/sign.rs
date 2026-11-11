@@ -1009,20 +1009,17 @@ pub(crate) fn claim_rejection_error(
     }
 }
 
-/// The error of a duplicate that did not get the original's outcome.
-pub(crate) fn join_failure(result: JoinResult) -> ProtocolError {
-    match result {
-        JoinResult::Detached => ProtocolError::new(
-            ErrorCode::Aborted,
-            "request aborted while waiting for an identical request",
-            RecommendedAction::Abort,
-        ),
-        _ => ProtocolError::new(
+/// A duplicate whose own ceremony deadline passed while it waited for the identical in-flight
+/// request: audited as a refusal with the `join_timeout` failure class (ADR 0014 section 12).
+pub(crate) fn join_timeout_error() -> (PolicyDenyReason, ProtocolError) {
+    (
+        PolicyDenyReason::JoinTimeout,
+        ProtocolError::new(
             ErrorCode::Timeout,
             "ceremony deadline passed while waiting for an identical request",
             RecommendedAction::Abort,
         ),
-    }
+    )
 }
 
 /// The browser cancelled the request before key use (ADR 0014 section 11: `onRequestCanceled`).
@@ -1641,7 +1638,7 @@ impl SignHandler {
                 }
                 // The browser cancelled the duplicate while it waited: audited like any abort.
                 JoinResult::Detached => Err(self.deny(target, aborted_error())),
-                other => Err(join_failure(other)),
+                JoinResult::DeadlineExceeded => Err(self.deny(target, join_timeout_error())),
             },
             Claim::Completed(outcome, audit) => {
                 self.serve_duplicate(ctx, target, audit)?;
@@ -6221,6 +6218,92 @@ pub(crate) mod tests {
             let terminal = only_terminal(&f);
             assert_eq!(terminal["result"], "error");
             assert_eq!(terminal["failure_class"], "abandoned");
+        }
+
+        #[test]
+        fn a_durable_but_unacknowledged_reservation_blocks_key_use_and_is_closed_at_restart() {
+            use crate::agent::audit::{FailAt, FaultPoint};
+            let mut f = AuditTestFixture::default_allow();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit");
+            // The reservation's frame is synced, then the directory fsync fails: the gate breaks
+            // its circuit although the record is on disk.
+            f.audit_gate = Arc::new(
+                AuditGate::open_with_faults(
+                    &path,
+                    8 * 1024 * 1024,
+                    Box::new(FailAt(FaultPoint::FsyncDir)),
+                )
+                .unwrap(),
+            );
+            f.audit_dir = path.clone();
+            let handler = f.make_handler();
+            let err = handler.sign(&f.make_ctx(), &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                0,
+                "no key use without a reservation ack"
+            );
+            let events = read_audit_events(&path);
+            assert_eq!(
+                records_of_kind(&events, "policy.allow").len(),
+                1,
+                "it is durable"
+            );
+            assert!(
+                records_of_kind(&events, "operation.terminal").is_empty(),
+                "the broken circuit refuses the terminal record"
+            );
+            // The next start closes it.
+            drop(handler);
+            let other = tempfile::tempdir().unwrap();
+            f.audit_gate = Arc::new(AuditGate::open(other.path().join("audit")).unwrap());
+            let gate = AuditGate::open(&path).unwrap();
+            assert_eq!(
+                crate::agent::operation_audit::recover_orphan_reservations(&gate),
+                1
+            );
+            let events = read_audit_events(&path);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(terminals[0]["failure_class"], "abandoned");
+        }
+
+        #[test]
+        fn a_duplicate_whose_deadline_passes_while_it_waits_is_audited_as_a_join_timeout() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    // Park the original between its audit reservation and key use.
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                let deadline = Instant::now() + Duration::from_millis(100);
+                let err = handler
+                    .sign_with(&ctx, &req, deadline, &|| false)
+                    .unwrap_err();
+                assert_eq!(err.code, ErrorCode::Timeout);
+                release_tx.send(()).unwrap();
+                original.join().unwrap().expect("the original signs");
+            });
+            let events = read_audit_events(&f.audit_dir);
+            let denies = records_of_kind(&events, "policy.deny");
+            assert_eq!(denies.len(), 1, "{events:#?}");
+            assert_eq!(denies[0]["failure_class"], "join_timeout");
+            assert_eq!(denies[0]["result"], "timeout");
+            assert_eq!(denies[0]["reason"], "join_timeout");
+            assert_eq!(assert_one_terminal_per_reservation(&events).len(), 1);
         }
 
         #[test]

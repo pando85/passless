@@ -842,6 +842,9 @@ impl AgentRuntime {
                 .map_err(|e| RuntimeError::Audit(format!("failed to open audit gate: {}", e)))?,
         );
 
+        // Close the reservations that the previous run left open, before this run writes.
+        super::operation_audit::recover_orphan_reservations(&audit_gate);
+
         let start_event = DaemonStartBuilder::new(std::process::id(), human_backend_kind).build();
         let _ = audit_gate.record(start_event);
 

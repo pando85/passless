@@ -271,6 +271,38 @@ impl AuditEvent {
     pub fn kind_name(&self) -> &'static str {
         self.payload.kind_name()
     }
+
+    /// The request ID of an operation reservation (`policy.allow`), if this is one.
+    pub fn reservation_request_id(&self) -> Option<&str> {
+        match &self.payload {
+            AuditPayload::PolicyAllow(meta) => meta.op.request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The request ID of the reservation an `operation.terminal` record closes, if this is one.
+    pub fn terminal_request_id(&self) -> Option<&str> {
+        match &self.payload {
+            AuditPayload::OperationTerminal(meta) => meta.op.request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// For a reservation (`policy.allow`): the terminal record that closes it as abandoned (a
+    /// restart found it open). The reservation's fields are copied; the result is `error` and the
+    /// failure class `abandoned`.
+    pub fn abandoned_terminal(&self) -> Option<AuditEvent> {
+        match &self.payload {
+            AuditPayload::PolicyAllow(meta) if meta.op.request_id.is_some() => Some(
+                OperationTerminalBuilder::new(
+                    (*meta.op).clone(),
+                    Some(PolicyDenyReason::Abandoned),
+                )
+                .build(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -987,7 +1019,7 @@ impl OperationResult {
             | R::BearerRevoked
             | R::SessionExpired
             | R::StaleGeneration => Self::Revoked,
-            R::EscalationExpired => Self::Timeout,
+            R::EscalationExpired | R::JoinTimeout => Self::Timeout,
             R::EscalationBusy | R::EscalationQueueFull | R::EscalationWaiterCap => Self::Busy,
             R::ReplayServed => Self::ReplayServed,
             R::AuditFailure
@@ -999,7 +1031,29 @@ impl OperationResult {
             | R::CredentialUnavailable
             | R::InternalFailure
             | R::Abandoned => Self::Error,
-            _ => Self::Denied,
+            R::DefaultDeny
+            | R::ActionNotAllowed
+            | R::RpIdNotMatch
+            | R::CredentialNotMatch
+            | R::GrantNotFound
+            | R::SessionMismatch
+            | R::UvRequired
+            | R::OriginInvalid
+            | R::OriginMismatch
+            | R::AllowCredentialsMismatch
+            | R::EscalationUnavailable
+            | R::EscalationCooldown
+            | R::GrantCapReached
+            | R::GrantsUnavailable
+            | R::EscalationDenied
+            | R::CrossOriginDenied
+            | R::AlgorithmUnsupported
+            | R::PrincipalMismatch
+            | R::Replayed
+            | R::ChallengeReused
+            | R::BudgetExhausted
+            | R::UnsupportedOption
+            | R::CredentialExcluded => Self::Denied,
         }
     }
 }
@@ -1299,9 +1353,13 @@ pub enum PolicyDenyReason {
     CredentialUnavailable,
     /// An internal failure after the reservation that no other class names.
     InternalFailure,
-    /// The ceremony ended without recording an outcome (a panic); the terminal record is written
-    /// by the drop guard.
+    /// The ceremony ended without recording an outcome (a panic, or a daemon exit or kill that
+    /// recovery found at the next start); the terminal record comes from the drop guard or from
+    /// recovery.
     Abandoned,
+    /// A duplicate's own ceremony deadline passed while it waited for the identical request that
+    /// is still in flight (ADR 0014 section 9). Nothing was signed or created for the duplicate.
+    JoinTimeout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

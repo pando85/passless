@@ -57,8 +57,14 @@ pub enum AuditError {
     SymlinkDetected(String),
     LockFailed(String),
     InvalidFrame(String),
-    HashMismatch { expected: String, actual: String },
-    SequenceGap { expected: u64, actual: u64 },
+    HashMismatch {
+        expected: String,
+        actual: String,
+    },
+    SequenceGap {
+        expected: u64,
+        actual: u64,
+    },
     CircuitBroken(String),
     SchemaViolation(String),
     RotationFailed(String),
@@ -67,6 +73,11 @@ pub enum AuditError {
     OwnerMismatch(String),
     ModeMismatch(String),
     AnchorViolation(String),
+    /// The record is durable (written and fsynced) but a later step failed (directory fsync or
+    /// anchor update), so the gate did not acknowledge it and has broken its circuit. A caller that
+    /// needs the record to be on disk (an operation reservation) must treat it as written: a
+    /// restart's recovery finds it (`AuditGate::open_reservations`).
+    DurableUnacknowledged(String),
 }
 
 impl std::fmt::Display for AuditError {
@@ -90,6 +101,9 @@ impl std::fmt::Display for AuditError {
             Self::OwnerMismatch(msg) => write!(f, "owner mismatch: {}", msg),
             Self::ModeMismatch(msg) => write!(f, "mode mismatch: {}", msg),
             Self::AnchorViolation(msg) => write!(f, "anchor violation: {}", msg),
+            Self::DurableUnacknowledged(msg) => {
+                write!(f, "record durable but not acknowledged: {}", msg)
+            }
         }
     }
 }
@@ -1381,12 +1395,19 @@ impl AuditGate {
         #[cfg(test)]
         if self.fault_injector.should_fail(FaultPoint::FsyncDir) {
             self.circuit_broken.store(true, Ordering::SeqCst);
-            return Err(AuditError::Io("injected fsync dir failure".into()));
+            return Err(AuditError::DurableUnacknowledged(
+                "injected fsync dir failure".into(),
+            ));
         }
 
+        // From here the frame is durable: its data was fsynced above. A failure of the steps that
+        // follow is reported as `DurableUnacknowledged`, not as a failed write.
         if let Err(e) = fsync_dir(&self.dir_fd) {
             self.circuit_broken.store(true, Ordering::SeqCst);
-            return Err(AuditError::Io(format!("fsync dir: {}", e)));
+            return Err(AuditError::DurableUnacknowledged(format!(
+                "fsync dir: {}",
+                e
+            )));
         }
 
         let seg_idx = *self.segment_index.lock().unwrap();
@@ -1398,7 +1419,10 @@ impl AuditGate {
 
         if let Err(e) = self.write_anchor(&new_anchor) {
             self.circuit_broken.store(true, Ordering::SeqCst);
-            return Err(AuditError::Io(format!("write anchor: {}", e)));
+            return Err(AuditError::DurableUnacknowledged(format!(
+                "write anchor: {}",
+                e
+            )));
         }
 
         *seq_guard = next_seq;
@@ -1535,6 +1559,74 @@ impl AuditGate {
         )
         .build();
         self.record(event)
+    }
+
+    /// The operation reservations (`policy.allow` records with a request ID) that have no
+    /// `operation.terminal` record, found in the last `max_segments` segments (ADR 0014 section
+    /// 12). A crash between a reservation and its terminal record leaves such an orphan at the end
+    /// of the log; opening the gate may rotate to a new segment, so a bound of two segments always
+    /// reaches the previous run's tail. Older segments are not scanned. Nothing is verified or
+    /// modified here.
+    pub fn open_reservations(&self, max_segments: usize) -> Result<Vec<AuditEvent>, AuditError> {
+        let segments = self.list_segments()?;
+        let first = segments.len().saturating_sub(max_segments);
+        let mut reservations: Vec<AuditEvent> = Vec::new();
+        let mut closed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for seg_path in &segments[first..] {
+            let seg_name = seg_path.file_name().unwrap().to_str().unwrap();
+            check_file_at(&self.dir_fd, seg_name)?;
+            let mut file = open_file_at(
+                &self.dir_fd,
+                seg_name,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )?;
+            if file.metadata()?.len() <= HEADER_SIZE as u64 {
+                continue;
+            }
+            let mut header_buf = [0u8; HEADER_SIZE];
+            file.read_exact(&mut header_buf)?;
+            SegmentHeader::decode(&header_buf)?;
+            loop {
+                let mut magic_buf = [0u8; 4];
+                match file.read_exact(&mut magic_buf) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let mut len_buf = [0u8; 8];
+                file.read_exact(&mut len_buf)?;
+                let frame_len = u64::from_le_bytes(len_buf);
+                if u32::from_le_bytes(magic_buf) != FRAME_MAGIC
+                    || !(FRAME_OVERHEAD as u64..=MAX_FRAME_SIZE).contains(&frame_len)
+                {
+                    return Err(AuditError::InvalidFrame(
+                        "bad frame in reservation scan".into(),
+                    ));
+                }
+                let mut frame_buf = vec![0u8; frame_len as usize];
+                file.read_exact(&mut frame_buf)?;
+                let mut full_frame = Vec::with_capacity(12 + frame_buf.len());
+                full_frame.extend_from_slice(&magic_buf);
+                full_frame.extend_from_slice(&len_buf);
+                full_frame.extend_from_slice(&frame_buf);
+                let decoded = decode_frame(&full_frame)?;
+                let Ok(event) = serde_json::from_slice::<AuditEvent>(&decoded.payload) else {
+                    continue;
+                };
+                if let Some(id) = event.terminal_request_id() {
+                    closed.insert(id.to_string());
+                } else if event.reservation_request_id().is_some() {
+                    reservations.push(event);
+                }
+            }
+        }
+        reservations.retain(|event| {
+            event
+                .reservation_request_id()
+                .is_some_and(|id| !closed.contains(id))
+        });
+        Ok(reservations)
     }
 
     pub fn export_verified(

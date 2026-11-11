@@ -28,7 +28,7 @@ use passless_core::agent::config::{ANY_RP_ID, CredentialSelection};
 use passless_core::agent::protocol::ProtocolError;
 use passless_core::agent::{AgentMode, CredentialRef, MatchedRule, ProfileId, RuleIdentity};
 
-use super::audit::AuditGate;
+use super::audit::{AuditError, AuditGate};
 use super::audit_events::{
     AuditAction, BackendKind, OperationRecord, OperationTerminalBuilder, PolicyAllowBuilder,
     PolicyDenyBuilder, PolicyDenyReason, RuleGrantSource,
@@ -309,15 +309,23 @@ impl CeremonyAudit {
                 .operation(op)
                 .build()
         };
-        self.gate.record(event).map_err(|_| {
+        let written = self.gate.record(event);
+        // A reservation that is durable but was not acknowledged (the directory fsync or the
+        // anchor update failed after the frame was synced) is still a reservation: it is on
+        // disk, so its terminal record is owed. The attempt will probably fail on the broken
+        // circuit; the next start's recovery closes it (`recover_orphan_reservations`). Key use
+        // is blocked either way.
+        let durable = matches!(written, Ok(_) | Err(AuditError::DurableUnacknowledged(_)));
+        if durable {
+            self.state.borrow_mut().reservation = Some(Self::snapshot(target));
+        }
+        written.map(|_| ()).map_err(|_| {
             ProtocolError::new(
                 passless_core::agent::protocol::ErrorCode::Internal,
                 "audit record failed",
                 passless_core::agent::protocol::RecommendedAction::Retry,
             )
-        })?;
-        self.state.borrow_mut().reservation = Some(Self::snapshot(target));
-        Ok(())
+        })
     }
 
     /// The single exit point: close the open reservation, if any, with its terminal record. The
@@ -359,5 +367,205 @@ impl Drop for CeremonyAudit {
     /// A ceremony that unwinds with its reservation open still owes the terminal record.
     fn drop(&mut self) {
         self.terminal(Some(PolicyDenyReason::Abandoned));
+    }
+}
+
+/// How many of the newest audit segments the recovery scan covers. A crash leaves its orphan at the
+/// tail of the log, and opening the gate (or the first records of the next run) may rotate to a
+/// new segment, so two segments always reach the previous run's tail. An older orphan is not
+/// recovered; the audit log still shows it as a reservation with no terminal record.
+pub const RECOVERY_SCAN_SEGMENTS: usize = 2;
+
+/// Close the reservations that a daemon exit or a kill left open (ADR 0014 section 12): every
+/// `policy.allow` record in the newest [`RECOVERY_SCAN_SEGMENTS`] segments without an
+/// `operation.terminal` record of the same request ID gets one, with the reservation's fields
+/// copied, `result = error` and `failure_class = abandoned`. Run once at start, before the new run
+/// writes anything of its own. Returns how many terminal records were written.
+///
+/// A failure to scan or to write is logged and stops the recovery: the gate is then broken (agent
+/// support is degraded until an administrator repairs it), and the next start scans again.
+pub fn recover_orphan_reservations(gate: &AuditGate) -> usize {
+    let orphans = match gate.open_reservations(RECOVERY_SCAN_SEGMENTS) {
+        Ok(orphans) => orphans,
+        Err(e) => {
+            warn!("agent audit: the scan for open reservations failed: {}", e);
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for orphan in orphans {
+        let Some(terminal) = orphan.abandoned_terminal() else {
+            continue;
+        };
+        match gate.record(terminal) {
+            Ok(_) => closed += 1,
+            Err(e) => {
+                warn!(
+                    "agent audit: an abandoned reservation could not be closed: {}",
+                    e
+                );
+                break;
+            }
+        }
+    }
+    if closed > 0 {
+        warn!(
+            "agent audit: closed {} operation reservation(s) that the previous run left open",
+            closed
+        );
+    }
+    closed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::agent::audit::test_support::read_audit_events;
+    use crate::agent::audit_events::{AuditEvent, OperationRecord, OperationTerminalBuilder};
+
+    fn reservation(request_id: &str, rp_id: &str) -> AuditEvent {
+        let profile = ProfileId::new("test-profile").unwrap();
+        let op = OperationRecord::new(profile.clone(), AuditAction::Authenticate, rp_id)
+            .session(Some("ab".repeat(32)), Some(request_id.to_string()))
+            .matched(Some("exact".to_string()), Some(RuleGrantSource::Config))
+            .credential(
+                Some(CredentialRef::with_default_domain(b"credential")),
+                Some("single".to_string()),
+            )
+            .counters(Some(7), None);
+        PolicyAllowBuilder::new(profile, AuditAction::Authenticate, rp_id)
+            .evidence_sources("allow", "agent", "agent")
+            .operation(op)
+            .build()
+    }
+
+    /// A genuine (success) terminal record of the reservation `request_id`.
+    fn terminal(request_id: &str, rp_id: &str) -> AuditEvent {
+        let profile = ProfileId::new("test-profile").unwrap();
+        OperationTerminalBuilder::new(
+            OperationRecord::new(profile, AuditAction::Authenticate, rp_id)
+                .session(None, Some(request_id.to_string())),
+            None,
+        )
+        .build()
+    }
+
+    fn records<'a>(events: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+        events.iter().filter(|e| e["kind"] == kind).collect()
+    }
+
+    #[test]
+    fn a_reservation_left_open_by_a_dead_daemon_is_closed_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit");
+        {
+            let gate = AuditGate::open(&path).unwrap();
+            // One ceremony finished; one was killed between its reservation and its terminal.
+            gate.record(reservation("req-done", "done.example"))
+                .unwrap();
+            gate.record(terminal("req-done", "done.example")).unwrap();
+            gate.record(reservation("req-killed", "killed.example"))
+                .unwrap();
+        }
+        let gate = AuditGate::open(&path).unwrap();
+        assert_eq!(recover_orphan_reservations(&gate), 1);
+        let events = read_audit_events(&path);
+        let terminals = records(&events, "operation.terminal");
+        assert_eq!(terminals.len(), 2, "{events:#?}");
+        let recovered = terminals
+            .iter()
+            .find(|t| t["request_id"] == "req-killed")
+            .expect("the orphan got a terminal record");
+        assert_eq!(recovered["result"], "error");
+        assert_eq!(recovered["failure_class"], "abandoned");
+        // The reservation's fields are copied.
+        assert_eq!(recovered["rp_id"], "killed.example");
+        assert_eq!(recovered["session_id_hash"], "ab".repeat(32));
+        assert_eq!(recovered["rule"], "exact");
+        assert_eq!(recovered["grant_source"], "config");
+        assert_eq!(recovered["selection_rule"], "single");
+        assert_eq!(recovered["counter_before"], 7);
+        assert!(recovered["counter_after"].is_null());
+        assert_eq!(recovered["decision"], "allow");
+        // The finished ceremony is untouched, and a second start finds nothing more to close.
+        assert_eq!(
+            terminals
+                .iter()
+                .filter(|t| t["request_id"] == "req-done")
+                .count(),
+            1
+        );
+        assert_eq!(recover_orphan_reservations(&gate), 0);
+    }
+
+    #[test]
+    fn recovery_scans_only_the_newest_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit");
+        {
+            // Tiny segments: every record or two rotates.
+            let gate = AuditGate::open_with_max_size(&path, 600).unwrap();
+            gate.record(reservation("req-ancient", "ancient.example"))
+                .unwrap();
+            for i in 0..12 {
+                let id = format!("req-{i}");
+                gate.record(reservation(&id, "x.example")).unwrap();
+                gate.record(terminal(&id, "x.example")).unwrap();
+            }
+            gate.record(reservation("req-recent", "recent.example"))
+                .unwrap();
+        }
+        let segments = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("audit-"))
+            .count();
+        assert!(
+            segments > RECOVERY_SCAN_SEGMENTS,
+            "the log rotated: {segments} segments"
+        );
+        let gate = AuditGate::open_with_max_size(&path, 600).unwrap();
+        assert_eq!(recover_orphan_reservations(&gate), 1);
+        let events = read_audit_events(&path);
+        let ids: Vec<_> = records(&events, "operation.terminal")
+            .iter()
+            .filter(|t| t["failure_class"] == "abandoned")
+            .map(|t| t["request_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["req-recent".to_string()],
+            "the ancient orphan is beyond the bound"
+        );
+    }
+
+    #[test]
+    fn a_durable_but_unacknowledged_reservation_stays_open_and_is_recovered() {
+        use crate::agent::audit::{FailAt, FaultPoint};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit");
+        {
+            let gate = AuditGate::open_with_faults(
+                &path,
+                8 * 1024 * 1024,
+                Box::new(FailAt(FaultPoint::FsyncDir)),
+            )
+            .unwrap();
+            let err = gate
+                .record(reservation("req-unacked", "unacked.example"))
+                .unwrap_err();
+            assert!(matches!(err, AuditError::DurableUnacknowledged(_)), "{err}");
+            assert!(gate.is_circuit_broken(), "the gate stops accepting records");
+        }
+        // The frame is on disk although the write was not acknowledged: recovery closes it.
+        assert_eq!(records(&read_audit_events(&path), "policy.allow").len(), 1);
+        let gate = AuditGate::open(&path).unwrap();
+        assert_eq!(recover_orphan_reservations(&gate), 1);
+        let events = read_audit_events(&path);
+        let terminals = records(&events, "operation.terminal");
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["request_id"], "req-unacked");
+        assert_eq!(terminals[0]["failure_class"], "abandoned");
     }
 }
