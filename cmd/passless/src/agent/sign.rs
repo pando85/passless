@@ -1851,7 +1851,12 @@ impl SignHandler {
             )
         })?;
 
-        if cred.extensions.cred_protect == Some(3) && !uv {
+        // credProtect against the agent evidence (ADR 0014 sections 7 and 10.2, invariant 15).
+        if !super::cred_protect::satisfied(
+            cred.extensions.cred_protect,
+            uv,
+            !req.allow_credentials.is_empty(),
+        ) {
             self.record_policy_deny(target, PolicyDenyReason::UvRequired);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,

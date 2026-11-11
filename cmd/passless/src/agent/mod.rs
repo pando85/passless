@@ -8,6 +8,7 @@ pub mod cdp_bootstrap;
 pub mod cdp_filter;
 pub mod client;
 pub mod containment;
+pub mod cred_protect;
 pub mod deployment;
 pub mod doctor;
 pub mod doctor_agents;
