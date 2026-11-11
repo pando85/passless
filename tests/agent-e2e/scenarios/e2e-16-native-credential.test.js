@@ -52,5 +52,32 @@ scenario({ id: 'E2E-16', title: 'native PublicKeyCredential for create and get; 
 
   const audit = await stack.daemon.audit();
   assert.equal(policyEvents(audit, 'policy.allow').filter(e => e.profile_id === 'iso').length, 2, 'both ceremonies on the agent path');
+
+  // ADR 0014 §7 (E-03): credential types other than `public-key` (passwords, federated) are the browser's own business and
+  // never reach an authenticator, so neither the extension nor the daemon sees them. The page may get null or an error
+  // (what the browser does with them is not Passless's concern); what matters is that no operation record appears.
+  const operationRecords = events => events.filter(e => /^(policy|operation)\./.test(e.kind || '')).length;
+  const nonPublicKey = await b.page.evaluate(async () => {
+    const outcome = {};
+    const attempts = [
+      ['password', { password: true }],
+      ['federated', { federated: { providers: ['https://idp.example'] } }],
+    ];
+    for (const [name, options] of attempts) {
+      try {
+        const credential = await Promise.race([
+          navigator.credentials.get(options),
+          new Promise(resolve => setTimeout(() => resolve('timeout'), 5000)),
+        ]);
+        outcome[name] = credential === null ? 'null' : typeof credential === 'string' ? credential : credential.type;
+      } catch (e) {
+        outcome[name] = `error:${e && e.name}`;
+      }
+    }
+    return outcome;
+  });
+  const afterNonPublicKey = await stack.daemon.audit();
+  assert.equal(operationRecords(afterNonPublicKey), operationRecords(audit),
+    `a non-public-key credential call must not reach the daemon (page saw ${JSON.stringify(nonPublicKey)})`);
   assertNoNotification(stack);
 });
