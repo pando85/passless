@@ -471,64 +471,54 @@ This requires PIN authentication and restores UV retries to the configured maxim
 
 ## Agent Mode Permissions
 
-Agent mode extends Passless with principal sessions and browser leases. Agents have no UHID device of their own: they use the browser extension path only.
-It requires additional permissions and a different security model than the human authenticator.
+Agent mode (an optional build, `--features agent`) lets agents use the managed browser path. Agents
+have no UHID or hidraw device of their own, and the managed browser must not be able to open yours. See
+[docs/agents/](agents/README.md) for how it works. Two deployments exist; the permissions differ.
 
-### Daemon runs as root
+### User daemon (agent shares your Unix user)
 
-The agent daemon **must run as root** to:
+The ordinary `passless.service` user unit needs nothing extra beyond the core requirements above:
 
-- Enforce principal isolation (separate UIDs, namespaces, device policy).
-- Manage browser leases and ephemeral profiles.
-- Write audit events to owner-only paths.
+- `agents.audit_path`: a directory owned by you, mode `0700`.
+- `agents.state_dir` (granted rules): defaults to `$XDG_STATE_HOME/passless/agent`, created `0700`.
+- `bwrap` (bubblewrap) and unprivileged user namespaces, so the managed browser gets a private
+  `/dev` without hidraw nodes ([Containment](agents/containment.md#private-dev-and-bubblewrap)).
+- A notification server with actions on your session bus, for `request` rules.
 
-**Do not** add `User=` or `Group=` directives to the agent systemd service.
+There is no operating-system boundary between the agent and the daemon here; the boundary is policy,
+sessions and audit ([ADR 0014 section 13](decisions/0014-agent-delegation.md#13-deployment-axes-and-hardening-scope)).
+`passless doctor --agents` checks the host.
 
-### Principal and browser users
+### System daemon (agent runs as another user)
 
-Each agent profile requires:
+For a separate Unix user per agent, run `contrib/systemd/passless-agent.service` as root.
 
-- **Principal user:** A separate Unix user that owns the principal session (configured as `principal_user`).
-- **Browser user:** A separate Unix user for the ephemeral browser (configured as `browser_user`, delegated-session only). Must differ from `principal_user`.
-
-Create these users as system users with no login shell:
+- **Root:** the daemon needs root to start principal and browser processes as other users and to keep
+  its storage, config and audit out of their reach. **Do not** add `User=` or `Group=` to the unit.
+  `NoNewPrivileges=false` is required for the same reason.
+- **Users:** each profile needs a `principal_user`, and optionally a `browser_user` that differs from it
+  and cannot open hidraw devices. `agents.notify_user` names the human whose session bus receives
+  prompts, and must differ from every `principal_user` and `browser_user`.
 
 ```bash
 sudo useradd -r -s /usr/sbin/nologin passless-<profile>
 sudo useradd -r -s /usr/sbin/nologin passless-browser-<profile>
 ```
 
-### Device permissions
-
-Agent profiles use only the browser-extension path and have no UHID or hidraw device of their own, so no agent udev rule is needed.
-
-**Do not** grant principals or browser users access to `/dev/uhid`. Only the human authenticator uses it (group `fido`, see `contrib/udev/90-passless.rules`).
-
-### Storage and audit paths
-
-Agent storage and audit paths must be:
-
-- Owned by root with mode `0700`.
-- Non-overlapping with each other, with the human backend, and with browser runtime roots.
-- Outside every principal boundary.
+- **Devices:** **do not** grant principals or browser users access to `/dev/uhid` or your hidraw nodes.
+  Only the human authenticator uses `/dev/uhid` (group `fido`, `contrib/udev/90-passless.rules`).
+- **Storage, audit and state paths** (`/var/lib/passless-agent/...`): owned by root, mode `0700`, not
+  overlapping each other, your backend or a browser runtime root, and outside every principal's reach.
+  The system unit's `agents.state_dir` defaults to `/var/lib/passless-agent`, which the unit already makes writable.
 
 ```bash
-sudo mkdir -p /var/lib/passless-agent/<profile>
-sudo chown root:root /var/lib/passless-agent/<profile>
-sudo chmod 0700 /var/lib/passless-agent/<profile>
-
-sudo mkdir -p /var/lib/passless-agent/audit
-sudo chown root:root /var/lib/passless-agent/audit
-sudo chmod 0700 /var/lib/passless-agent/audit
+sudo mkdir -p /var/lib/passless-agent/<profile> /var/lib/passless-agent/audit
+sudo chown root:root /var/lib/passless-agent/<profile> /var/lib/passless-agent/audit
+sudo chmod 0700 /var/lib/passless-agent/<profile> /var/lib/passless-agent/audit
 ```
 
-### Browser runtime root
-
-The browser runtime root (delegated-session only) must be:
-
-- Owned by the configured `browser_user` with mode `0700`.
-- Absolute and contain no NUL bytes.
-- Non-overlapping with other paths.
+- **Browser runtime root** (`browser_runtime_root`, with `browser_user`): owned by the browser user,
+  mode `0700`, absolute, not overlapping other paths.
 
 ```bash
 sudo mkdir -p /var/run/passless-browser/<profile>
@@ -536,16 +526,15 @@ sudo chown passless-browser-<profile>:passless-browser-<profile> /var/run/passle
 sudo chmod 0700 /var/run/passless-browser/<profile>
 ```
 
-### Systemd service
+- **Browser binary:** only a root-owned binary on a path nobody else can write is accepted for a
+  different-user browser.
 
-Use the provided `contrib/systemd/passless-agent.service` as a starting point. Key directives:
-
-- `NoNewPrivileges=false` — required because the daemon uses setuid to launch principal and browser processes.
-- `ProtectSystem=strict` — read-only system mounts.
-- `ProtectHome=read-only` — prevent writes to home directories.
-- `ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent` — daemon-owned storage and runtime.
-- `LimitMEMLOCK=64M` — sufficient memory locking for agent operations.
+Key unit directives (`contrib/systemd/passless-agent.service`): `NoNewPrivileges=false`,
+`ProtectSystem=strict`, `ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent
+/var/run/passless-browser`, `LimitMEMLOCK`, and the baseline hardening listed there.
+Namespaces, seccomp and further systemd directives are not applied yet
+([FURTHER_ANALYSIS](security/FURTHER_ANALYSIS.md)).
 
 ### Troubleshooting
 
-See [docs/agents/troubleshooting.md](agents/troubleshooting.md) for common agent mode issues.
+See [docs/agents/troubleshooting.md](agents/troubleshooting.md).

@@ -12,6 +12,24 @@ This document catalogs critical and high-severity security issues identified in 
 
 Each issue is analyzed with current state, attack scenarios, proposed solutions, and an implementation plan. These are not theoretical concerns — they represent concrete gaps between the documented security architecture and the actual implementation.
 
+## Status (updated with ADR 0014 phase P11)
+
+The analysis below was written against the code before ADR 0014 was implemented. Code references
+(`intent.rs`, `browser.rs:2020`, `prompt.rs`) point at code that has since changed or been removed, and
+the `confirm` approval model it discusses no longer exists (rules are `deny`, `allow` or `request`;
+see [ADR 0014 §6](../decisions/0014-agent-delegation.md#6-policy) and
+[§8](../decisions/0014-agent-delegation.md#8-escalation-and-granted-rules)). Read it as history; the
+status of each item is:
+
+| Item | Status | Where it stands |
+|---|---|---|
+| C-1 Same-user port-mode browser hardening | **Accepted by design; resilience follow-ups done** | No kernel boundary exists between same-UID processes ([ADR §13](../decisions/0014-agent-delegation.md#13-deployment-axes-and-hardening-scope)). Descriptors are close-on-exec and `PR_SET_PDEATHSIG` is armed after any credential drop (P10a). The browser also runs under a private `/dev` ([containment](../agents/containment.md)). `NoNewPrivileges` stays unset in the same-UID spawn on purpose. |
+| C-2 Root daemon, `NoNewPrivileges=false`, full `/dev` | **Open, root multi-principal deployment only** | The systemd baseline is enabled. `PrivateDevices`, `RestrictAddressFamilies`, `RestrictNamespaces`, `ProtectProc`, `MemoryDenyWriteExecute`, `CapabilityBoundingSet` and `SystemCallFilter` remain to be evaluated. Running the daemon non-root is not designed. |
+| H-2 No namespace isolation for browsers | **Open, distinct-UID deployment only; partly mitigated** | The managed browser runs under `bwrap` with a private `/dev` (hidraw and uhid hidden) when `bwrap` works (P10a). Mount, PID and network namespaces with an allowlist are not implemented. |
+| H-3 No seccomp-BPF on spawned processes | **Open, distinct-UID deployment only** | Not implemented. A principal-process deny-list is the first step; browser seccomp needs per-version profiling. |
+| C-3 Self-approval of authentication grants | **Accepted (design); audit done** | Autonomous operation within the operator's rules is the designed behaviour. Session grant request and approval are audited (P8 schema). Approval of a `request` rule comes from a notification click, not from the agent; a same-UID agent can still drive the notification server (residual risk, [ADR §15](../decisions/0014-agent-delegation.md#15-threats-and-residual-risk)). |
+| H-1 D-Bus notification action injection | **Done for sender validation; same-UID residual remains** | `ActionInvoked` is accepted only from the notification server's verified unique bus name, in the prompt child (P7). A same-UID process can still use the real server's own tools (`dunstctl`, `makoctl`). Shipping a D-Bus policy file is not planned. |
+
 ---
 
 ## Priority 1: Same-User Browser Hardening
@@ -23,7 +41,8 @@ Each issue is analyzed with current state, attack scenarios, proposed solutions,
 > and daemon share a UID, so no kernel boundary exists regardless of spawn-time hardening;
 > the security controls live in the policy layer. The analysis below is kept for
 > historical context but its severity framing no longer applies. Residual items (FD
-> hygiene, PDEATHSIG, rlimits) are resilience follow-ups, not security fixes.
+> hygiene, PDEATHSIG, rlimits) are resilience follow-ups, not security fixes: FD hygiene and
+> PDEATHSIG are **done** (P10a); rlimits are optional.
 
 **File:** `cmd/passless/src/agent/browser.rs:1998-2035`
 
@@ -150,6 +169,7 @@ If the daemon process itself is compromised (e.g., through a vulnerability in CT
 > mode (ADR 0014 §13). Deferred backlog: mount namespace first with bind-mount allowlist,
 > PID namespace as stretch, network namespace only in pipe mode (port mode incompatible).
 > Terminology: `AgentMode::Isolated` means credential isolation, not OS namespaces.
+> Partly mitigated since P10a: the browser runs under `bwrap` with a private `/dev`.
 
 **File:** `cmd/passless/src/agent/browser.rs:1869-1912, 2000-2035`
 
@@ -220,11 +240,11 @@ A compromised browser or principal process has access to the full kernel syscall
 
 ### C-3: Self-Approval of Authentication Grants
 
-> **Status: Accepted (approval mechanism) / Open backlog (audit).** See
+> **Status: Accepted (approval mechanism) / Done (audit).** See
 > [ADR 0014 §9](../decisions/0014-agent-delegation.md#9-sessions-and-replay). Self-approval within
 > configured policy is the designed autonomous behavior (ADR 0014 §9); the
-> `AdminAuthority` seal is cosmetic and accepted as such. Open item: grant
-> request/approval are not audited in production despite builders existing — backlog fix.
+> `AdminAuthority` seal is cosmetic and accepted as such. Grant request and approval are audited
+> (P7, P8). `intent.rs` and the principal intent protocol were removed in P7.
 
 **File:** `cmd/passless/src/agent/runtime/browser_ensure.rs:398-409`
 
@@ -284,12 +304,14 @@ The current design relies on the assumption that the initial verification steps 
 
 ### H-1: D-Bus Notification Action Injection
 
-> **Status: Open backlog — in scope for same-user mode.** See
-> [ADR 0014 §8.2](../decisions/0014-agent-delegation.md#82-integrity-and-abuse-limits). Injection collapses
-> the human/agent distinction that `authorization="confirm"` relies on, so ADR 0014 §13's
-> trust-boundary reasoning does not exempt it. Planned fix: raw zbus signal handling that
-> validates the `ActionInvoked` sender against the notification server's bus name
-> (notify-rust 4.x `wait_for_action` does not expose the sender).
+> **Status: Done (sender validation) with a same-UID residual.** See
+> [ADR 0014 §8.2](../decisions/0014-agent-delegation.md#82-integrity-and-abuse-limits). The prompt
+> now handles the signal with zbus and rejects any `ActionInvoked` whose sender is not the
+> notification server's unique bus name (the prompt child, P7); the only actions are Allow always and
+> Deny. A process of the same user can still approve through the real server's own tools, which
+> cannot be prevented in a shared-UID deployment ([ADR §15](../decisions/0014-agent-delegation.md#15-threats-and-residual-risk)).
+> Shipping a D-Bus policy file stays an open packaging question. The analysis below is the original
+> finding.
 
 **File:** `cmd/passless/src/agent/prompt.rs:616-633`
 
@@ -543,35 +565,35 @@ Chromium requires one of two sandboxing mechanisms:
 
 These changes are low-risk, high-impact, and can be implemented without architectural changes:
 
-| Issue | Action | Files | Risk |
-|-------|--------|-------|------|
-| C-1 | Apply selective hardening in same-user mode (close_range, setsid, PDEATHSIG, rlimits) | `browser.rs:2020-2034` | Low |
-| C-2 | Add missing systemd hardening directives | `passless-agent.service` | Low |
-| H-3 | Add seccomp-BPF blacklist for obviously dangerous syscalls | `launcher.rs:690-756` | Low |
-| H-1 | Verify D-Bus signal sender matches notification server | `prompt.rs:627-633` | Low |
-| C-3 | Add structured audit logging for grant self-approval | `browser_ensure.rs:398-409` | Low |
+| Issue | Action | Files | Risk | Status |
+|-------|--------|-------|------|--------|
+| C-1 | Apply selective hardening in same-user mode (close_range, setsid, PDEATHSIG, rlimits) | `browser.rs:2020-2034` | Low | Done (close-on-exec, PDEATHSIG; rlimits optional) |
+| C-2 | Add missing systemd hardening directives | `passless-agent.service` | Low | Baseline done; the rest open |
+| H-3 | Add seccomp-BPF blacklist for obviously dangerous syscalls | `launcher.rs:690-756` | Low | Open |
+| H-1 | Verify D-Bus signal sender matches notification server | `prompt.rs:627-633` | Low | Done |
+| C-3 | Add structured audit logging for grant self-approval | `browser_ensure.rs:398-409` | Low | Done |
 
 ### Phase 2: Medium-Term (Requires Design Work)
 
 These changes require design decisions, testing infrastructure, and careful rollout:
 
-| Issue | Action | Dependencies |
-|-------|--------|-------------|
-| C-1 | Remove NNP bypass, rely on Chromium's user namespace sandbox | System compatibility testing |
-| H-3 | Implement Chromium-specific seccomp-BPF whitelist | Syscall profiling |
-| H-1 | Install D-Bus policy file for notification sender restriction | Packaging changes |
-| C-3 | Implement per-profile approval policy (auto vs. human) | Policy engine extension |
+| Issue | Action | Dependencies | Status |
+|-------|--------|-------------|--------|
+| C-1 | Remove NNP bypass, rely on Chromium's user namespace sandbox | System compatibility testing | Not planned (accepted by design) |
+| H-3 | Implement Chromium-specific seccomp-BPF whitelist | Syscall profiling | Open |
+| H-1 | Install D-Bus policy file for notification sender restriction | Packaging changes | Open (packaging question) |
+| C-3 | Implement per-profile approval policy (auto vs. human) | Policy engine extension | Done (per-rule `deny`, `allow`, `request`) |
 
 ### Phase 3: Long-Term (Architectural Changes)
 
 These changes require significant architectural work and may affect backward compatibility:
 
-| Issue | Action | Dependencies |
-|-------|--------|-------------|
-| H-2 | Implement mount namespace isolation for browser | Filesystem allowlist design |
-| H-2 | Implement PID namespace isolation | Process lifecycle redesign |
-| C-2 | Evaluate running daemon as non-root with capability dropping | UHID access model redesign |
-| C-3 | Implement external approval mechanism (hardware token, separate service) | Protocol design |
+| Issue | Action | Dependencies | Status |
+|-------|--------|-------------|--------|
+| H-2 | Implement mount namespace isolation for browser | Filesystem allowlist design | Open (private `/dev` only) |
+| H-2 | Implement PID namespace isolation | Process lifecycle redesign | Open |
+| C-2 | Evaluate running daemon as non-root with capability dropping | UHID access model redesign | Open |
+| C-3 | Implement external approval mechanism (hardware token, separate service) | Protocol design | Not planned (the notification prompt is the mechanism) |
 
 ---
 
@@ -709,18 +731,18 @@ H-1 (D-Bus injection)
 
 ## Open Questions
 
-1. **Chromium user namespace compatibility:** What is the minimum Chromium version that reliably falls back to user namespace sandboxing? Can we detect sandbox initialization failure and fall back gracefully?
+1. **Chromium user namespace compatibility:** What is the minimum Chromium version that reliably falls back to user namespace sandboxing? Can we detect sandbox initialization failure and fall back gracefully? **Status: Open.**
 
-2. **Daemon non-root operation:** Can the daemon be restructured to drop root after UHID endpoint creation? This would eliminate the need for `NoNewPrivileges=false` and significantly reduce the impact of daemon compromise. What UHID operations require root beyond initial device creation?
+2. **Daemon non-root operation:** Can the daemon be restructured to drop root after UHID endpoint creation? This would eliminate the need for `NoNewPrivileges=false` and significantly reduce the impact of daemon compromise. What UHID operations require root beyond initial device creation? **Status: Open.**
 
-3. **Grant approval model:** Should the approval model be per-profile configurable? Some profiles (e.g., development/testing) may want auto-approval, while production profiles should require human interaction. What is the right granularity?
+3. **Grant approval model:** Should the approval model be per-profile configurable? Some profiles (e.g., development/testing) may want auto-approval, while production profiles should require human interaction. What is the right granularity? **Status: Resolved: approval is per rule (`deny`, `allow`, `request`).**
 
-4. **Notification channel replacement:** Is there a viable alternative to D-Bus notifications that works across all Linux desktop environments? A custom GUI dialog (GTK/Qt) would avoid D-Bus but adds dependencies. A terminal prompt would break headless operation.
+4. **Notification channel replacement:** Is there a viable alternative to D-Bus notifications that works across all Linux desktop environments? A custom GUI dialog (GTK/Qt) would avoid D-Bus but adds dependencies. A terminal prompt would break headless operation. **Status: Open; the prompt stays a desktop notification.**
 
-5. **Namespace isolation scope:** For mount namespace isolation, what is the minimum set of paths that must be bind-mounted for Chromium to function? This varies by desktop environment (X11 vs Wayland, GNOME vs KDE vs Sway). Can we auto-detect the required paths?
+5. **Namespace isolation scope:** For mount namespace isolation, what is the minimum set of paths that must be bind-mounted for Chromium to function? This varies by desktop environment (X11 vs Wayland, GNOME vs KDE vs Sway). Can we auto-detect the required paths? **Status: Open.**
 
-6. **seccomp-BPF maintenance:** How do we maintain a seccomp-BPF whitelist across Chromium versions? Chromium's own sandbox policy changes with each release. Do we vendor Chromium's policy, or do we maintain our own?
+6. **seccomp-BPF maintenance:** How do we maintain a seccomp-BPF whitelist across Chromium versions? Chromium's own sandbox policy changes with each release. Do we vendor Chromium's policy, or do we maintain our own? **Status: Open.**
 
-7. **D-Bus policy distribution:** How do we distribute a D-Bus policy file that restricts `ActionInvoked` signals? This requires installation in `/etc/dbus-1/system.d/` or `/usr/share/dbus-1/services/`, which varies by distribution.
+7. **D-Bus policy distribution:** How do we distribute a D-Bus policy file that restricts `ActionInvoked` signals? This requires installation in `/etc/dbus-1/system.d/` or `/usr/share/dbus-1/services/`, which varies by distribution. **Status: Open.**
 
-8. **Audit log integrity:** If the daemon is compromised, audit logs are also compromised. Should audit logs be sent to an external collector (e.g., journald, syslog, remote SIEM) for tamper resistance?
+8. **Audit log integrity:** If the daemon is compromised, audit logs are also compromised. Should audit logs be sent to an external collector (e.g., journald, syslog, remote SIEM) for tamper resistance? **Status: Open.**

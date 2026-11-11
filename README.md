@@ -100,6 +100,7 @@ For unattended automation, prefer RP-native scoped mechanisms such as OAuth, app
 installations, service accounts, or workload identity when they are available. Agent mode is most
 useful when a workflow genuinely needs to authenticate through WebAuthn.
 
+To let an agent sign in through Playwright MCP, follow the [agent quick start](docs/agents/quick-start.md).
 See the [agent-mode overview](docs/agents/README.md) for configuration and threat-model guidance,
 and read the [agent security model](docs/agents/security.md) before enabling autonomous
 authentication.

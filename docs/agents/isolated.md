@@ -1,175 +1,77 @@
 # Isolated mode
 
-> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+> **EXPERIMENTAL.** Agent mode is implemented but not yet validated for production use.
 
-Isolated profiles use agent-owned credentials with independent credential storage, verification/PIN state, key-provider state, operation locking, and revocation lifecycle. They cannot enumerate or sign with the human credential namespace.
-
-Use isolated mode as the default choice for unattended automation when the relying party can support a separate automation account or service identity.
-
-## Trust model
-
-An isolated agent may still be fully autonomous, but it authenticates as an agent-owned RP identity rather than the human's existing passkey identity.
+An `isolated` profile has its own credential store, PIN state and key provider. The agent
+authenticates as an identity of its own, not as you, and cannot list or sign with your passkeys. Use
+it for unattended automation where the site supports a separate automation account or service
+identity.
 
 ```text
 Passless daemon
-  ├─ human credential backend
-  │    └─ unavailable to isolated profile
-  │
-  └─ isolated profile: release-bot
-       ├─ isolated credential backend
-       ├─ isolated verification/PIN state
-       ├─ configured key provider (software/pass/TPM)
-       ├─ exact RP/action policy
-       ├─ bounded session / one-shot operation state
-       └─ audit
+  |- your credential store           (not available to an isolated profile)
+  `- isolated profile "release"
+       |- its own credential store, PIN state and key provider (local, pass or TPM)
+       |- exact-RP rules
+       `- audit
 ```
 
-Autonomy is an action policy, not a credential-ownership mode. An isolated profile can use:
-
-- `deny` — operation not allowed;
-- `supervised` — human confirmation/evidence;
-- `autonomous` — agent-derived UP/UV after the bound agent/session gates succeed.
-
-Agent-derived evidence is not human interaction and must be recorded as `agent`, not `human`, in operator/audit surfaces.
-
-## Example autonomous profile
+## Example
 
 ```toml
 [agents]
 enabled = true
 audit_path = "/var/lib/passless-agent/audit"
 
-[agents.profiles.release-bot]
+[agents.profiles.release]
 mode = "isolated"
 principal_user = "passless-release"
 max_session_ttl = 300
 max_operations = 8
-credential_selection = "single"
+browser_cdp_expose = "port"
 
-[[agents.profiles.release-bot.rules]]
-rp_id = "github.com"
-register = "autonomous"
-authenticate = "autonomous"
+[agents.profiles.release.storage.local]
+path = "/var/lib/passless-agent/release/credentials"
+pin_path = "/var/lib/passless-agent/release/pin"
 
-[agents.profiles.release-bot.storage.local]
-path = "/var/lib/passless-agent/release-bot/credentials"
-pin_path = "/var/lib/passless-agent/release-bot/pin"
+[[agents.profiles.release.rules]]
+rp_id = "git.example.com"
+authenticate = "allow"
+register = "allow"
 ```
 
-The expanded autonomous policy is:
+Storage roots must not overlap your backend, another profile, the audit path or the granted-rules
+directory ([Configuration](configuration.md#same-user-and-isolated-storage)). For a portable TPM
+credential the TPM stays the signer; agent mode never substitutes a software key.
 
-```toml
-authenticate = {
-  authorization = "allow",
-  user_presence = "agent",
-  user_verification = "agent"
-}
-```
+An isolated profile does not take `browser_user`. Whether its agent also runs as a different Unix user
+decides how real the separation is: with the same Unix user as the daemon the agent can read your
+store, the separation is administrative only and startup warns. See
+[Containment](containment.md#same-user-and-different-user).
 
-The legacy evidence spelling `policy` may still parse as an alias, but current configuration, documentation, and audit terminology should use `agent`.
+## Enrolling and unattended use
 
-## Storage isolation
+1. Create the Unix user and storage directories (mode 0700).
+2. Set the narrowest exact rules. Enrol with `register = "allow"`, then change it to `deny` and
+   reload the policy.
+3. Check: `passless doctor --agents` and `passless agent-admin profile check release`.
+4. Run the agent: `passless agent run --profile release -- <absolute command>`, or use the MCP adapter
+   from [Browser tools](browser-tools.md).
+5. Review the [audit](audit.md) and the account's state at the site after enrollment or sensitive work.
 
-Each isolated profile has its own backend namespace. Supported backends follow the Passless build/configuration: local, pass-backed, and TPM where available.
-
-Validation rejects overlapping roots between:
-
-- isolated profiles;
-- isolated credential and PIN state where overlap is unsafe;
-- agent audit state;
-- the human backend state.
-
-This is a security invariant, not merely a directory-layout preference.
-
-For portable TPM credentials, the configured TPM provider remains the signer; agent mode must not silently substitute software keys.
-
-## Managed browser path
-
-Isolated profiles can also use the daemon-managed browser/extension pipeline where configured. The production extension forwards bounded WebAuthn requests to the daemon; it does not receive private keys or PINs.
-
-For the managed browser path:
-
-- origin/top-origin come from browser extension sender metadata rather than page claims;
-- RP/origin relationship is revalidated in the daemon;
-- conditional mediation/passkey autofill remains native;
-- unverifiable cross-origin Permissions Policy delegation remains native;
-- session operation budgets and replay detection apply;
-- audit gates credential use.
-
-The managed browser session is still application authority. After an isolated credential signs into its RP account, an agent controlling that browser can perform whatever actions that isolated account is allowed to perform.
-
-## Fully unattended workflow
-
-1. Create the principal Unix identity and isolated storage roots.
-2. Configure the narrowest exact RP rules required by the automation.
-3. Keep `max_session_ttl` and `max_operations` small.
-4. Validate before launch:
-   ```bash
-   passless agent-admin profile check release-bot
-   passless agent-admin policy check release-bot
-   ```
-5. Launch the principal:
-   ```bash
-   passless agent run --profile release-bot -- /usr/local/bin/agent-command
-   ```
-6. Inside the principal session, inspect:
-   ```bash
-   passless agent --profile release-bot doctor
-   passless agent --profile release-bot capabilities
-   passless agent --profile release-bot instructions
-   ```
-7. Run ceremonies through the managed browser path; the per-operation intent commands were removed.
-8. Review audit and RP-side account/session state after enrollment or sensitive automation.
-
-## Registration
-
-Registration creates identity state. Allow it only where unattended enrollment is actually intended.
-
-After initial enrollment, a common safer policy is:
-
-```toml
-[[agents.profiles.release-bot.rules]]
-rp_id = "github.com"
-register = "deny"
-authenticate = "autonomous"
-```
-
-Restart the daemon after editing on-disk configuration. `agent-admin policy reload` recompiles the daemon's current in-memory configuration snapshot; it is not a configuration-file reload mechanism.
-
-## Credential selection
-
-`credential_selection = "single"` is the safest default. It fails closed if discoverable authentication leaves multiple eligible isolated credentials.
-
-`first-matching`, `newest`, and explicit credential references are deterministic alternatives. Prefer explicit identity/account mapping when selecting the wrong RP account would be consequential.
+Isolated registration affects only the profile's own store. `credential_selection = "single"` is the
+safest default.
 
 ## Revocation
 
-List and revoke isolated credentials with the administrator CLI:
-
 ```bash
-passless agent-admin credential list --profile release-bot
+passless agent-admin credential list [--domain git.example.com]
 passless agent-admin credential revoke <credential-ref> --confirm
 passless agent-admin credential delete <credential-ref> --confirm
+passless agent-admin profile disable release
 ```
 
-Local revocation/deletion does not automatically revoke RP-side sessions or remove the credential from the RP account. Use the RP's own controls as well when necessary.
+Revoking or deleting a credential locally does not remove it from the site's account or end a
+session the site has already started; use the site's own controls too.
 
-Disable the entire profile immediately with:
-
-```bash
-passless agent-admin profile disable release-bot
-```
-
-## Boundaries retained under autonomy
-
-Even with `authenticate = "autonomous"`:
-
-- isolated code cannot select the human credential namespace;
-- policy is evaluated for the concrete action/RP;
-- the current principal/session and policy generation remain relevant;
-- credential scope/selection is daemon-controlled;
-- replay and operation-budget controls remain active on the managed browser path;
-- audit reservation is required before credential use/creation;
-- the principal cannot edit administrator policy or gain the admin socket merely because authentication is autonomous.
-
-See [security.md](security.md) for the shared threat model and [operations.md](operations.md) for browser/session authority, audit, and recovery guidance.
+The shared threat model is in [Security](security.md); audit and recovery in [Operations](operations.md).
