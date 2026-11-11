@@ -11,6 +11,10 @@
   var MAX_USER_NAME_LEN = 256;
   var MAX_USER_ID_B64U_LEN = 128;
   var MAX_ALGORITHMS = 16;
+  var MAX_EXTENSIONS = 32;
+  var MAX_EXTENSION_NAME_LEN = 64;
+  var MAX_TIMEOUT_MS = 120000;
+  var DOM_NAMES = ["NotAllowedError", "NotSupportedError", "InvalidStateError", "SecurityError", "AbortError"];
 
   var NATIVE_HOST = "rs.passless.sign_proxy";
   var MAX_COMPLETED_REQUESTS = 128;
@@ -63,6 +67,21 @@
     };
   }
 
+  // `extensions`, `attestation` and `timeout_ms` are optional; absent ones are not forwarded.
+  function validateCommon(req) {
+    if (req.extensions !== undefined) {
+      if (!Array.isArray(req.extensions) || req.extensions.length > MAX_EXTENSIONS) return false;
+      for (var i = 0; i < req.extensions.length; i++) {
+        var name = req.extensions[i];
+        if (typeof name !== "string" || name.length === 0 || name.length > MAX_EXTENSION_NAME_LEN) return false;
+      }
+    }
+    if (req.attestation !== undefined && req.attestation !== null &&
+        (typeof req.attestation !== "string" || req.attestation.length > 32)) return false;
+    if (req.timeout_ms === undefined) return true;
+    return Number.isInteger(req.timeout_ms) && req.timeout_ms > 0 && req.timeout_ms <= MAX_TIMEOUT_MS;
+  }
+
   function validateGetRequest(req) {
     if (typeof req.rp_id !== "string" || req.rp_id.length === 0 || req.rp_id.length > MAX_RP_ID_LEN) return false;
     if (typeof req.challenge_b64u !== "string" || req.challenge_b64u.length === 0 || req.challenge_b64u.length > MAX_CHALLENGE_B64U_LEN) return false;
@@ -71,7 +90,7 @@
       var c = req.allow_credentials[i];
       if (typeof c !== "string" || c.length === 0 || c.length > MAX_CREDENTIAL_ID_B64U_LEN) return false;
     }
-    return typeof req.user_verification === "boolean";
+    return typeof req.user_verification === "boolean" && validateCommon(req);
   }
 
   function validateCreateRequest(req) {
@@ -88,7 +107,7 @@
     for (var j = 0; j < req.pub_key_cred_params.length; j++) {
       if (!Number.isInteger(req.pub_key_cred_params[j])) return false;
     }
-    return typeof req.user_verification === "boolean";
+    return typeof req.user_verification === "boolean" && validateCommon(req);
   }
 
   function rememberCompletedRequest(requestId, response) {
@@ -148,7 +167,8 @@
         completeRequest(requestId, {
           ok: false,
           type: type,
-          error: response.error
+          error: response.error,
+          dom: DOM_NAMES.indexOf(response.dom) !== -1 ? response.dom : null
         });
         return;
       }
@@ -176,7 +196,9 @@
       challenge_b64u: req.challenge_b64u,
       allow_credentials: req.allow_credentials,
       user_verification: req.user_verification,
-      cross_origin: origins.cross_origin
+      cross_origin: origins.cross_origin,
+      extensions: req.extensions,
+      timeout_ms: req.timeout_ms
     }, sendResponse, "sign_assertion_result", "get");
   }
 
@@ -193,7 +215,10 @@
       exclude_credentials: req.exclude_credentials,
       pub_key_cred_params: req.pub_key_cred_params,
       user_verification: req.user_verification,
-      cross_origin: origins.cross_origin
+      cross_origin: origins.cross_origin,
+      extensions: req.extensions,
+      attestation: req.attestation,
+      timeout_ms: req.timeout_ms
     }, sendResponse, "create_attestation_result", "create");
   }
 

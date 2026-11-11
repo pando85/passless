@@ -75,6 +75,18 @@
         return { ...verification, received: describe(credential), options };
       } catch (e) { return err(e); }
     },
+    // Replay helpers (raw page): ONE set of options from the RP, then the same navigator.credentials.get call
+    // issued `count` times with identical options, concurrently or one after the other. Each entry is the
+    // serialised assertion ({ok:true, json}) or the error ({ok:false, name, message}); nothing is verified here.
+    authOptions: ({ username, userVerification, allowCredentials, timeout } = {}) => post('/api/auth/options', { username, userVerification, allowCredentials, timeout }),
+    async getIdentical(options, { count = 2, concurrent = false } = {}) {
+      const one = () => navigator.credentials.get({ publicKey: toRequestOptions(options) }).then(c => ({ ok: true, json: assertJSON(c) }), err);
+      if (concurrent) return Promise.all(Array.from({ length: count }, one));
+      const out = [];
+      for (let i = 0; i < count; i++) out.push(await one());
+      return out;
+    },
+    verifyAuth: response => post('/api/auth/verify', { response }),
     state: () => fetch('/api/state').then(r => r.json()),
   };
   window.dispatchEvent(new Event('e2e-ready'));

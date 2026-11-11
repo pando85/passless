@@ -19,7 +19,20 @@ struct NativeResponse {
     body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The WebAuthn DOMException name the daemon chose for this error (ADR 0014 section 11).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dom: Option<String>,
 }
+
+/// The DOMException names the daemon may report; anything else is dropped (the extension then
+/// uses `NotAllowedError`).
+const DOM_EXCEPTION_NAMES: &[&str] = &[
+    "NotAllowedError",
+    "NotSupportedError",
+    "InvalidStateError",
+    "SecurityError",
+    "AbortError",
+];
 
 fn read_native_message() -> Option<NativeRequest> {
     let mut len_buf = [0u8; 4];
@@ -42,6 +55,27 @@ fn write_native_response(resp: &NativeResponse) {
     let _ = stdout.flush();
 }
 
+/// Ceremony timeout assumed when the request carries none (the daemon's default).
+const DEFAULT_CEREMONY_TIMEOUT: Duration = Duration::from_secs(120);
+/// The daemon's longest ceremony timeout (Chromium's upper clamp, 20 h).
+const MAX_CEREMONY_TIMEOUT: Duration = Duration::from_secs(20 * 3600);
+/// Added to the ceremony timeout so the daemon's own deadline answer arrives first.
+const READ_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for the daemon's answer to `body`: its `timeout_ms` (or the default) plus a
+/// margin, never more than the ceremony maximum.
+fn read_timeout_for(body: &str) -> Duration {
+    let timeout = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("timeout_ms").and_then(|t| t.as_u64()))
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_CEREMONY_TIMEOUT);
+    timeout
+        .saturating_add(READ_TIMEOUT_MARGIN)
+        .min(MAX_CEREMONY_TIMEOUT)
+}
+
 fn forward_to_sign_server(req: &NativeRequest) -> NativeResponse {
     let socket_path =
         std::env::var("PASSLESS_SIGN_SOCKET").unwrap_or_else(|_| req.socket_path.clone());
@@ -50,14 +84,17 @@ fn forward_to_sign_server(req: &NativeRequest) -> NativeResponse {
         Ok(s) => s,
         Err(e) => {
             return NativeResponse {
+                dom: None,
                 body: None,
                 error: Some(format!("connect: {}", e)),
             };
         }
     };
 
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    // The daemon may hold the request until the ceremony's own deadline (a joined duplicate, a
+    // pending escalation), so the read timeout follows the request's `timeout_ms`.
+    let _ = stream.set_read_timeout(Some(read_timeout_for(&req.body)));
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
 
     let http_req = format!(
         "POST {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -71,6 +108,7 @@ fn forward_to_sign_server(req: &NativeRequest) -> NativeResponse {
         return NativeResponse {
             body: None,
             error: Some("write".to_string()),
+            dom: None,
         };
     }
 
@@ -92,6 +130,7 @@ fn forward_to_sign_server(req: &NativeRequest) -> NativeResponse {
                             return NativeResponse {
                                 body: None,
                                 error: Some("invalid_utf8".to_string()),
+                                dom: None,
                             };
                         }
                     };
@@ -121,6 +160,7 @@ fn forward_to_sign_server(req: &NativeRequest) -> NativeResponse {
             return NativeResponse {
                 body: None,
                 error: Some("invalid_response".to_string()),
+                dom: None,
             };
         }
     };
@@ -135,15 +175,23 @@ fn forward_to_sign_server(req: &NativeRequest) -> NativeResponse {
         NativeResponse {
             body: Some(body.to_string()),
             error: None,
+            dom: None,
         }
     } else {
-        let error = serde_json::from_str::<serde_json::Value>(body)
-            .ok()
+        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+        let error = parsed
+            .as_ref()
             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
             .unwrap_or_else(|| "request_denied".to_string());
+        let dom = parsed
+            .as_ref()
+            .and_then(|v| v.get("dom").and_then(|d| d.as_str()))
+            .filter(|name| DOM_EXCEPTION_NAMES.contains(name))
+            .map(String::from);
         NativeResponse {
             body: None,
             error: Some(error),
+            dom,
         }
     }
 }
@@ -152,5 +200,55 @@ fn main() {
     while let Some(req) = read_native_message() {
         let resp = forward_to_sign_server(&req);
         write_native_response(&resp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_timeout_follows_the_request_timeout_with_a_margin() {
+        assert_eq!(
+            read_timeout_for(r#"{"timeout_ms":60000}"#),
+            Duration::from_secs(65)
+        );
+        assert_eq!(read_timeout_for("{}"), Duration::from_secs(125));
+        assert_eq!(read_timeout_for("not json"), Duration::from_secs(125));
+        assert_eq!(
+            read_timeout_for(r#"{"timeout_ms":18446744073709551615}"#),
+            MAX_CEREMONY_TIMEOUT
+        );
+        assert!(read_timeout_for(r#"{"timeout_ms":1000}"#) > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_slow_daemon_answer_within_the_timeout_is_received() {
+        // A join waits for the original: the proxy must not give up after a fixed 10 s.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(Duration::from_millis(300));
+            let body = r#"{"ok":true}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        });
+        let req = NativeRequest {
+            path: "/sign".to_string(),
+            bearer: "b".to_string(),
+            socket_path: sock.to_string_lossy().into_owned(),
+            body: r#"{"timeout_ms":2000}"#.to_string(),
+        };
+        let resp = forward_to_sign_server(&req);
+        server.join().unwrap();
+        assert_eq!(resp.body.as_deref(), Some(r#"{"ok":true}"#));
     }
 }

@@ -156,6 +156,21 @@ pub enum ErrorCode {
     VersionMismatch,
     MessageTooLarge,
     MalformedMessage,
+    /// The RP asked for an option, extension or algorithm the agent authenticator cannot honor
+    /// (WebAuthn `NotSupportedError`, ADR 0014 section 10.3).
+    NotSupported,
+    /// A credential in `excludeCredentials` already exists (WebAuthn `InvalidStateError`).
+    InvalidState,
+    /// The origin is not valid for the RP ID (WebAuthn `SecurityError`).
+    OriginInvalid,
+    /// The daemon is at a concurrency cap; the request was not processed (plan R11).
+    Busy,
+    /// The ceremony deadline passed before an outcome was available.
+    Timeout,
+    /// The replay key of the request was already used in this session (ADR 0014 section 9).
+    Replayed,
+    /// The session's operation budget is used up.
+    BudgetExhausted,
 }
 
 impl fmt::Display for ErrorCode {
@@ -171,6 +186,13 @@ impl fmt::Display for ErrorCode {
             Self::VersionMismatch => write!(f, "version_mismatch"),
             Self::MessageTooLarge => write!(f, "message_too_large"),
             Self::MalformedMessage => write!(f, "malformed_message"),
+            Self::NotSupported => write!(f, "not_supported"),
+            Self::InvalidState => write!(f, "invalid_state"),
+            Self::OriginInvalid => write!(f, "origin_invalid"),
+            Self::Busy => write!(f, "busy"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::Replayed => write!(f, "replayed"),
+            Self::BudgetExhausted => write!(f, "budget_exhausted"),
         }
     }
 }
@@ -550,6 +572,16 @@ pub struct RegisterCredentialRequest {
     pub pub_key_cred_params: Vec<i32>,
     pub user_verification: bool,
     pub cross_origin: bool,
+    /// Identifiers of the client extensions the RP requested (names only, never their inputs).
+    /// An extension the daemon cannot honor fails with `NotSupportedError` (ADR 0014 section 10.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The RP's attestation conveyance preference (`none`, `indirect`, `direct`, `enterprise`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
+    /// The page's ceremony timeout in milliseconds; bounds how long a duplicate waits (ADR 0014 section 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -576,6 +608,13 @@ pub struct SignAssertionRequest {
     pub user_verification: bool,
     #[serde(default)]
     pub cross_origin: bool,
+    /// Identifiers of the client extensions the RP requested (names only, never their inputs).
+    /// An extension the daemon cannot honor fails with `NotSupportedError` (ADR 0014 section 10.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The page's ceremony timeout in milliseconds; bounds how long a duplicate waits (ADR 0014 section 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1908,6 +1947,13 @@ mod tests {
             ErrorCode::VersionMismatch,
             ErrorCode::MessageTooLarge,
             ErrorCode::MalformedMessage,
+            ErrorCode::NotSupported,
+            ErrorCode::InvalidState,
+            ErrorCode::OriginInvalid,
+            ErrorCode::Busy,
+            ErrorCode::Timeout,
+            ErrorCode::Replayed,
+            ErrorCode::BudgetExhausted,
         ] {
             assert_eq!(json_roundtrip(&code), code);
         }
@@ -3082,6 +3128,8 @@ mod tests {
 
     fn valid_sign_request() -> SignAssertionRequest {
         SignAssertionRequest {
+            extensions: Vec::new(),
+            timeout_ms: None,
             origin: "https://example.com".to_string(),
             top_origin: None,
             rp_id: "example.com".to_string(),

@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use passless_core::agent::config::{ANY_RP_ID, validate_rp_id};
@@ -19,6 +20,7 @@ use super::intent::{
     AdminAuthority, CreateIntentParams, IntentConsumeInfo, IntentError, IntentQueryParams,
     IntentStore, MonotonicClock, ProcessIdentityDigest,
 };
+use super::lock_order::{self, LockLevel, Tracked};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -178,6 +180,8 @@ pub struct PolicySnapshot {
     pub max_grant_ttl_secs: u64,
     pub max_session_ttl_secs: u64,
     pub max_concurrent_grants: u64,
+    /// Operation budget of one bearer session, read live by every ceremony (ADR 0014 section 9).
+    pub max_operations: u16,
     pub allowed_actions: BTreeSet<String>,
     /// Profile default credential selection (a rule may override it; the wildcard is `single`).
     pub credential_selection: CredentialSelection,
@@ -271,6 +275,8 @@ impl PolicyGenerationSnapshot {
 pub struct GrantSignSnapshot {
     pub grant_id: GrantId,
     pub profile_id: ProfileId,
+    /// Digest of the principal the grant was issued to; a session must match it (ADR 0014 section 7).
+    pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credential_refs: Vec<CredentialRef>,
     pub state: super::grant::GrantState,
@@ -601,6 +607,31 @@ pub struct PolicyRuntime {
     /// Serializes reloads, so the numeric generation is read, bumped and published atomically:
     /// concurrent reloads get distinct, strictly increasing generations.
     reload_lock: Mutex<()>,
+    /// Revocation epoch (ADR 0014 section 6.4, plan R16): bumped by a reload that changes the
+    /// effective policy, a granted-rule revocation and any other config change. Every bearer
+    /// session records it at creation and is revoked once it moves.
+    revocation_epoch: AtomicU64,
+    /// Grant epoch: bumped when a granted rule is added (P7). It never revokes sessions.
+    grant_epoch: AtomicU64,
+    /// Key-use gate for the revocation epoch (review M1): ceremonies hold the read side from the
+    /// pre-key-use re-check to the end of key use; [`Self::bump_revocation_epoch`] takes the
+    /// write side, so once a bump returns no ceremony that checked the old epoch can still use a
+    /// key.
+    key_use_gate: RwLock<()>,
+}
+
+/// What a successful [`PolicyRuntime::reload`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    /// The digest now in force.
+    pub digest: PolicyDigest,
+    /// The numeric generation now in force.
+    pub generation: u64,
+    /// Whether the effective policy changed. An unchanged digest leaves the generation, the
+    /// session grants and the revocation epoch untouched.
+    pub changed: bool,
+    /// The revocation epoch now in force.
+    pub revocation_epoch: u64,
 }
 
 impl PolicyRuntime {
@@ -627,7 +658,8 @@ impl PolicyRuntime {
                 snapshot.allowed_actions.clone(),
                 snapshot.max_concurrent_grants,
                 audit_gate.clone(),
-            );
+            )
+            .with_max_session_ttl(snapshot.max_session_ttl_secs);
             grant_registries.insert(snapshot.profile_id.as_str().to_string(), registry);
         }
 
@@ -641,6 +673,9 @@ impl PolicyRuntime {
             audit_gate,
             granted_rules: Arc::new(NoGrantedRules),
             reload_lock: Mutex::new(()),
+            revocation_epoch: AtomicU64::new(1),
+            grant_epoch: AtomicU64::new(1),
+            key_use_gate: RwLock::new(()),
         })
     }
 
@@ -788,6 +823,7 @@ impl PolicyRuntime {
             max_grant_ttl_secs,
             max_session_ttl_secs,
             max_concurrent_grants,
+            max_operations: config.max_operations,
             allowed_actions,
             credential_selection: config.credential_selection.clone(),
             rules,
@@ -795,7 +831,66 @@ impl PolicyRuntime {
     }
 
     pub fn current_generation(&self) -> Arc<PolicyGenerationSnapshot> {
-        self.current.read().unwrap().clone()
+        let _level = lock_order::enter(LockLevel::Policy);
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn lock_intents(&self) -> Tracked<MutexGuard<'_, IntentStore>> {
+        lock_order::lock(&self.intents, LockLevel::Policy)
+    }
+
+    fn lock_grants(&self) -> Tracked<MutexGuard<'_, HashMap<String, GrantRegistry>>> {
+        lock_order::lock(&self.grants, LockLevel::Policy)
+    }
+
+    fn lock_pending(&self) -> Tracked<MutexGuard<'_, HashMap<String, PendingAuthorization>>> {
+        lock_order::lock(&self.pending, LockLevel::Policy)
+    }
+
+    fn lock_pending_requests(
+        &self,
+    ) -> Tracked<MutexGuard<'_, HashMap<String, PendingPrincipalRequest>>> {
+        lock_order::lock(&self.pending_requests, LockLevel::Policy)
+    }
+
+    /// The live revocation epoch (ADR 0014 section 6.4).
+    pub fn revocation_epoch(&self) -> u64 {
+        self.revocation_epoch.load(Ordering::Acquire)
+    }
+
+    /// The live grant epoch. Adding a granted rule bumps it; it never revokes sessions.
+    pub fn grant_epoch(&self) -> u64 {
+        self.grant_epoch.load(Ordering::Acquire)
+    }
+
+    /// Revoke every bearer session: bump the revocation epoch. Called for a policy change, a
+    /// granted-rule revocation (P7) and any other configuration change. Returns the new epoch.
+    ///
+    /// Waits for every ceremony between its pre-key-use re-check and the end of key use.
+    pub fn bump_revocation_epoch(&self) -> u64 {
+        let _gate = lock_order::write(&self.key_use_gate, LockLevel::EpochKeyUse);
+        self.revocation_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Hold off a revocation-epoch bump until the guard is dropped (review M1). Ceremonies take it
+    /// right before the pre-key-use re-check and keep it until key use has finished.
+    pub fn key_use_guard(&self) -> Tracked<std::sync::RwLockReadGuard<'_, ()>> {
+        lock_order::read(&self.key_use_gate, LockLevel::EpochKeyUse)
+    }
+
+    /// Record an additive grant (P7). Additive grants are not a policy change (invariant 18).
+    pub fn bump_grant_epoch(&self) -> u64 {
+        self.grant_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// The live operation budget of a profile's sessions, if the profile exists.
+    pub fn max_operations(&self, profile_id: &ProfileId) -> Option<u16> {
+        self.current_generation()
+            .find_snapshot(profile_id)
+            .map(|snapshot| snapshot.max_operations)
     }
 
     /// Resolve `(action, rp_id)` for `profile_id` against the LIVE compiled policy (the current
@@ -809,7 +904,7 @@ impl PolicyRuntime {
         action: &IntentAction,
         rp_id: &str,
     ) -> MatchedRule {
-        let generation = self.current.read().unwrap().clone();
+        let generation = self.current_generation();
         match generation.find_snapshot(profile_id) {
             Some(snapshot) => snapshot.resolve(action, rp_id, self.granted_rules.as_ref()),
             None => resolve_rules(
@@ -824,18 +919,18 @@ impl PolicyRuntime {
 
     /// The numeric policy generation (1 at start, bumped by every reload).
     pub fn generation_number(&self) -> u64 {
-        self.current.read().unwrap().generation
+        self.current_generation().generation
     }
 
     pub fn digest(&self) -> PolicyDigest {
-        self.current.read().unwrap().digest.clone()
+        self.current_generation().digest.clone()
     }
 
     pub fn list_grants(
         &self,
         profile_filter: Option<&ProfileId>,
     ) -> Vec<super::grant::GrantSnapshot> {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         let mut result = Vec::new();
         for (key, registry) in grants.iter() {
             if let Some(filter) = profile_filter
@@ -849,7 +944,7 @@ impl PolicyRuntime {
     }
 
     pub fn show_grant_details(&self, grant_id: &GrantId) -> Option<super::grant::GrantDetails> {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         for registry in grants.values() {
             if let Some(details) = registry.find_grant_with_details(grant_id) {
                 return Some(details);
@@ -863,7 +958,7 @@ impl PolicyRuntime {
         grant_id: &GrantId,
     ) -> Result<super::grant::GrantState, super::grant::GrantError> {
         let authority = super::intent::admin_authority();
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         for registry in grants.values() {
             if registry.show_grant(grant_id).is_some() {
                 return registry.revoke_grant(grant_id, &authority);
@@ -876,7 +971,7 @@ impl PolicyRuntime {
         &self,
         cred_ref: &passless_core::agent::CredentialRef,
     ) -> Vec<passless_core::agent::GrantId> {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         let mut result = Vec::new();
         for registry in grants.values() {
             result.extend(registry.find_grant_id_by_credential(cred_ref));
@@ -889,7 +984,7 @@ impl PolicyRuntime {
         profile_id: &ProfileId,
         cred_refs: &[passless_core::agent::CredentialRef],
     ) -> Vec<passless_core::agent::GrantId> {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         let registry = match grants.get(profile_id.as_str()) {
             Some(r) => r,
             None => return Vec::new(),
@@ -906,7 +1001,7 @@ impl PolicyRuntime {
         profile_id: &ProfileId,
         grant_id: &GrantId,
     ) -> Option<GrantSignSnapshot> {
-        let mut grants_map = self.grants.lock().unwrap();
+        let mut grants_map = self.lock_grants();
         let registry = grants_map.get_mut(profile_id.as_str())?;
         let _ = registry.check_expired();
         let snap = registry.snapshot_for_sign(grant_id)?;
@@ -914,6 +1009,7 @@ impl PolicyRuntime {
         Some(GrantSignSnapshot {
             grant_id: snap.grant_id,
             profile_id: snap.profile_id,
+            principal_digest: snap.principal_digest,
             rp_ids: snap.rp_ids,
             credential_refs: snap.credential_refs,
             state: snap.state,
@@ -922,7 +1018,7 @@ impl PolicyRuntime {
         })
     }
     pub fn active_grant_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         grants
             .get(profile_id.as_str())
             .map(|r| r.active_count() as u32)
@@ -930,18 +1026,34 @@ impl PolicyRuntime {
     }
 
     pub fn pending_intent_count_for_profile(&self, profile_id: &ProfileId) -> u32 {
-        let pending = self.pending.lock().unwrap();
+        let pending = self.lock_pending();
         pending
             .values()
             .filter(|pa| pa.profile_id == *profile_id && !pa.invalidated)
             .count() as u32
     }
 
-    pub fn reload(&self, config: &AgentConfig) -> Result<PolicyDigest, PolicyRuntimeError> {
-        let _reload = self.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
+    /// Replace the compiled policy with `config` (already read and validated by the caller).
+    ///
+    /// A reload whose digest is unchanged is a no-op: the generation, the session grants and the
+    /// revocation epoch stay as they are, so live sessions continue. A reload that changes the
+    /// effective policy compiles a new generation, replaces the session-grant registries, cancels
+    /// pending intents and bumps the revocation epoch, which revokes every bearer session (ADR 0014
+    /// sections 6.4 and 9, invariant 18). An invalid configuration leaves everything untouched.
+    pub fn reload(&self, config: &AgentConfig) -> Result<ReloadOutcome, PolicyRuntimeError> {
+        let _reload = lock_order::lock(&self.reload_lock, LockLevel::PolicyReload);
+        let current = self.current_generation();
         let now_mono = self.clock.monotonic_secs();
-        let next_generation = self.current.read().unwrap().generation.saturating_add(1);
+        let next_generation = current.generation.saturating_add(1);
         let new_generation = Self::compile_generation(config, now_mono, next_generation)?;
+        if new_generation.digest == current.digest {
+            return Ok(ReloadOutcome {
+                digest: current.digest.clone(),
+                generation: current.generation,
+                changed: false,
+                revocation_epoch: self.revocation_epoch(),
+            });
+        }
         let new_digest = new_generation.digest.clone();
 
         let mut new_registries = HashMap::new();
@@ -954,42 +1066,40 @@ impl PolicyRuntime {
                 snapshot.allowed_actions.clone(),
                 snapshot.max_concurrent_grants,
                 self.audit_gate.clone(),
-            );
+            )
+            .with_max_session_ttl(snapshot.max_session_ttl_secs);
             new_registries.insert(snapshot.profile_id.as_str().to_string(), registry);
         }
 
-        {
-            let mut intents = self.intents.lock().unwrap();
-            intents.invalidate_all();
+        // Each policy lock is taken alone (LOCKING.md): no policy guard is held across another.
+        self.lock_intents().invalidate_all();
+        for pa in self.lock_pending().values_mut() {
+            pa.invalidated = true;
         }
-
-        {
-            let mut pending = self.pending.lock().unwrap();
-            for pa in pending.values_mut() {
-                pa.invalidated = true;
+        for pr in self.lock_pending_requests().values_mut() {
+            if pr.state == PendingState::Waiting {
+                pr.state = PendingState::Cancelled;
             }
         }
-
+        *self.lock_grants() = new_registries;
         {
-            let mut pending_requests = self.pending_requests.lock().unwrap();
-            for pr in pending_requests.values_mut() {
-                if pr.state == PendingState::Waiting {
-                    pr.state = PendingState::Cancelled;
-                }
-            }
-        }
-
-        {
-            let mut grants = self.grants.lock().unwrap();
-            *grants = new_registries;
-        }
-
-        {
-            let mut current = self.current.write().unwrap();
+            let _level = lock_order::enter(LockLevel::Policy);
+            let mut current = self
+                .current
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *current = Arc::new(new_generation);
         }
+        // Published after the new generation, so a ceremony that sees the new epoch also sees the
+        // new rules when it re-resolves.
+        let revocation_epoch = self.bump_revocation_epoch();
 
-        Ok(new_digest)
+        Ok(ReloadOutcome {
+            digest: new_digest,
+            generation: next_generation,
+            changed: true,
+            revocation_epoch,
+        })
     }
 
     /// Authorization decision follows documented precedence:
@@ -1015,7 +1125,7 @@ impl PolicyRuntime {
         &self,
         request: &AuthorizationRequest,
     ) -> (Decision, Option<AuthorizationHandle>) {
-        let generation = self.current.read().unwrap().clone();
+        let generation = self.current_generation();
 
         if request.policy_generation_id != generation.generation_id
             || request.policy_digest != generation.digest
@@ -1097,7 +1207,7 @@ impl PolicyRuntime {
         request: &AuthorizationRequest,
         _generation: &PolicyGenerationSnapshot,
     ) -> (Decision, Option<AuthorizationHandle>) {
-        let mut intents = self.intents.lock().unwrap();
+        let mut intents = self.lock_intents();
 
         let intent_id = match intents.claim_approved(&IntentQueryParams {
             profile_id: snapshot.profile_id.clone(),
@@ -1161,7 +1271,7 @@ impl PolicyRuntime {
         drop(intents);
 
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.lock_pending();
             pending.insert(ceremony_id.as_str().to_string(), pending_auth);
         }
 
@@ -1175,7 +1285,7 @@ impl PolicyRuntime {
         let ceremony_key = handle.ceremony_id.as_str().to_string();
 
         {
-            let pending = self.pending.lock().unwrap();
+            let pending = self.lock_pending();
             match pending.get(&ceremony_key) {
                 Some(pa)
                     if !pa.invalidated
@@ -1195,7 +1305,7 @@ impl PolicyRuntime {
             }
         }
 
-        let generation = self.current.read().unwrap().clone();
+        let generation = self.current_generation();
         if handle.policy_generation != generation.generation_id
             || handle.policy_digest != generation.digest
         {
@@ -1205,7 +1315,7 @@ impl PolicyRuntime {
 
         if let Some(ref grant_id) = handle.grant_id {
             let profile_key = handle.profile_id.as_str().to_string();
-            let grants_map = self.grants.lock().unwrap();
+            let grants_map = self.lock_grants();
             if let Some(grants) = grants_map.get(&profile_key) {
                 if !grants.is_grant_active(grant_id) {
                     drop(grants_map);
@@ -1229,7 +1339,7 @@ impl PolicyRuntime {
             .as_ref()
             .ok_or(ReasonCode::IntentNotFound)?;
         let consume_info = {
-            let mut intents = self.intents.lock().unwrap();
+            let mut intents = self.lock_intents();
             match intents.consume_claimed(intent_id) {
                 Ok(info) => info,
                 Err(IntentError::InvalidTransition { .. }) => {
@@ -1247,7 +1357,7 @@ impl PolicyRuntime {
         if let Some(ref _grant_id) = handle.grant_id {
             let profile_key = handle.profile_id.as_str().to_string();
             let grant_consume_ok = {
-                let grants_map = self.grants.lock().unwrap();
+                let grants_map = self.lock_grants();
                 if let Some(grants) = grants_map.get(&profile_key) {
                     grants
                         .consume_claim_by_ceremony(&handle.ceremony_id)
@@ -1258,7 +1368,7 @@ impl PolicyRuntime {
             };
             if !grant_consume_ok {
                 {
-                    let mut intents = self.intents.lock().unwrap();
+                    let mut intents = self.lock_intents();
                     let _ = intents.rollback_claim(intent_id);
                 }
                 self.invalidate_ceremony(&ceremony_key);
@@ -1271,20 +1381,51 @@ impl PolicyRuntime {
     }
 
     fn invalidate_ceremony(&self, ceremony_key: &str) {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(pa) = pending.get_mut(ceremony_key) {
+        let (intent_id, grant_claim) = {
+            let mut pending = self.lock_pending();
+            let Some(pa) = pending.get_mut(ceremony_key) else {
+                return;
+            };
             pa.invalidated = true;
-            if let Some(ref intent_id) = pa.intent_id {
-                let mut intents = self.intents.lock().unwrap();
-                let _ = intents.rollback_claim(intent_id);
+            (
+                pa.intent_id.clone(),
+                pa.grant_id
+                    .as_ref()
+                    .map(|_| (pa.profile_id.as_str().to_string(), pa.ceremony_id.clone())),
+            )
+        };
+        if let Some(intent_id) = intent_id {
+            let _ = self.lock_intents().rollback_claim(&intent_id);
+        }
+        if let Some((profile_key, ceremony_id)) = grant_claim
+            && let Some(grants) = self.lock_grants().get_mut(&profile_key)
+        {
+            grants.cancel_claim(&ceremony_id);
+        }
+    }
+
+    /// Deny the intents and withdraw the grant requests of pending principal requests that were
+    /// just cancelled or timed out. Runs after the `pending_requests` guard is released.
+    fn abandon_pending(&self, abandoned: Vec<(IntentId, ProfileId, Option<GrantRequestId>)>) {
+        if abandoned.is_empty() {
+            return;
+        }
+        let authority = super::intent::admin_authority();
+        {
+            let mut intents = self.lock_intents();
+            for (intent_id, _, _) in &abandoned {
+                let _ = intents.deny(intent_id, &authority);
             }
-            if let Some(ref grant_id) = pa.grant_id {
-                let profile_key = pa.profile_id.as_str().to_string();
-                let mut grants_map = self.grants.lock().unwrap();
-                if let Some(grants) = grants_map.get_mut(&profile_key) {
-                    grants.cancel_claim(&pa.ceremony_id);
+        }
+        let mut grants_map = self.lock_grants();
+        for (_, profile_id, grant_request_id) in &abandoned {
+            if let Some(grant_request_id) = grant_request_id
+                && let Some(grants) = grants_map.get_mut(profile_id.as_str())
+            {
+                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
+                    let _ = grants.revoke_grant(&grant_id, &authority);
                 }
-                let _ = grant_id;
+                let _ = grants.cancel_request(grant_request_id);
             }
         }
     }
@@ -1294,7 +1435,7 @@ impl PolicyRuntime {
         intent_id: &IntentId,
         authority: &AdminAuthority,
     ) -> Result<(), IntentError> {
-        let mut intents = self.intents.lock().unwrap();
+        let mut intents = self.lock_intents();
         intents.approve(intent_id, authority)
     }
 
@@ -1303,7 +1444,7 @@ impl PolicyRuntime {
         intent_id: &IntentId,
         authority: &AdminAuthority,
     ) -> Result<(), IntentError> {
-        let mut intents = self.intents.lock().unwrap();
+        let mut intents = self.lock_intents();
         intents.deny(intent_id, authority)
     }
 
@@ -1311,7 +1452,7 @@ impl PolicyRuntime {
         &self,
         params: CreateIntentParams,
     ) -> Result<(IntentId, super::intent::ClaimToken), IntentError> {
-        let mut intents = self.intents.lock().unwrap();
+        let mut intents = self.lock_intents();
         intents.create(params)
     }
 
@@ -1320,7 +1461,7 @@ impl PolicyRuntime {
         params: GrantRequestParams,
     ) -> Result<super::grant::GrantRequestId, GrantError> {
         let profile_key = params.profile_id.as_str().to_string();
-        let mut grants_map = self.grants.lock().unwrap();
+        let mut grants_map = self.lock_grants();
         let grants = grants_map
             .get_mut(&profile_key)
             .ok_or(GrantError::ProfileMismatch)?;
@@ -1332,11 +1473,26 @@ impl PolicyRuntime {
         params: GrantRequestParams,
     ) -> Result<super::grant::GrantRequestId, GrantError> {
         let profile_key = params.profile_id.as_str().to_string();
-        let mut grants_map = self.grants.lock().unwrap();
+        let mut grants_map = self.lock_grants();
         let grants = grants_map
             .get_mut(&profile_key)
             .ok_or(GrantError::ProfileMismatch)?;
         grants.request_dynamic_grant(params)
+    }
+
+    /// Request the grant behind a browser bearer session, bounded by the profile's
+    /// `max_session_ttl` (defect B5) rather than `max_grant_ttl`.
+    pub fn admin_request_session_grant(
+        &self,
+        params: GrantRequestParams,
+        dynamic: bool,
+    ) -> Result<super::grant::GrantRequestId, GrantError> {
+        let profile_key = params.profile_id.as_str().to_string();
+        let mut grants_map = self.lock_grants();
+        let grants = grants_map
+            .get_mut(&profile_key)
+            .ok_or(GrantError::ProfileMismatch)?;
+        grants.request_session_grant(params, dynamic)
     }
 
     pub fn admin_approve_grant(
@@ -1344,7 +1500,7 @@ impl PolicyRuntime {
         request_id: &super::grant::GrantRequestId,
         authority: &AdminAuthority,
     ) -> Result<passless_core::agent::GrantId, GrantError> {
-        let mut grants_map = self.grants.lock().unwrap();
+        let mut grants_map = self.lock_grants();
         for grants in grants_map.values_mut() {
             if let Ok(gid) = grants.approve_grant(request_id, authority) {
                 return Ok(gid);
@@ -1358,7 +1514,7 @@ impl PolicyRuntime {
         grant_id: &passless_core::agent::GrantId,
         authority: &AdminAuthority,
     ) -> Result<super::grant::GrantState, GrantError> {
-        let mut grants_map = self.grants.lock().unwrap();
+        let mut grants_map = self.lock_grants();
         let mut result = Err(GrantError::GrantNotFound(grant_id.clone()));
         let mut found_profile: Option<String> = None;
         for (key, grants) in grants_map.iter() {
@@ -1377,7 +1533,7 @@ impl PolicyRuntime {
 
         drop(grants_map);
         if result.is_ok() {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.lock_pending();
             for pa in pending.values_mut() {
                 if pa.grant_id.as_ref() == Some(grant_id) {
                     pa.invalidated = true;
@@ -1397,7 +1553,7 @@ impl PolicyRuntime {
         profile_id: &ProfileId,
         grant_request_id: &super::grant::GrantRequestId,
     ) -> Option<passless_core::agent::GrantId> {
-        let grants = self.grants.lock().unwrap();
+        let grants = self.lock_grants();
         let profile_key = profile_id.as_str().to_string();
         grants
             .get(&profile_key)
@@ -1410,24 +1566,24 @@ impl PolicyRuntime {
         profile_id: &ProfileId,
         session_id: &PrincipalSessionId,
     ) -> Result<(), IntentError> {
-        let mut intents = self.intents.lock().unwrap();
+        let mut intents = self.lock_intents();
         intents.cancel_by_principal(intent_id, profile_id, session_id)
     }
 
     pub fn principal_exit(&self, session_id: &PrincipalSessionId) {
         {
-            let mut intents = self.intents.lock().unwrap();
+            let mut intents = self.lock_intents();
             intents.cancel_by_session(session_id);
         }
         {
-            let mut grants_map = self.grants.lock().unwrap();
+            let mut grants_map = self.lock_grants();
             for grants in grants_map.values_mut() {
                 grants.on_principal_exit(session_id);
                 grants.cancel_claims_for_session(session_id);
             }
         }
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.lock_pending();
             for pa in pending.values_mut() {
                 if pa.session_id == *session_id {
                     pa.invalidated = true;
@@ -1435,7 +1591,7 @@ impl PolicyRuntime {
             }
         }
         {
-            let mut pending_requests = self.pending_requests.lock().unwrap();
+            let mut pending_requests = self.lock_pending_requests();
             for pr in pending_requests.values_mut() {
                 if pr.session_id == *session_id && pr.state == PendingState::Waiting {
                     pr.state = PendingState::Cancelled;
@@ -1468,7 +1624,7 @@ impl PolicyRuntime {
         let credential_ref = params.credential_ref.clone();
 
         let (intent_id, _claim_token) = {
-            let mut intents = self.intents.lock().unwrap();
+            let mut intents = self.lock_intents();
             intents
                 .create(params)
                 .map_err(PendingCreateError::IntentCreationFailed)?
@@ -1495,7 +1651,7 @@ impl PolicyRuntime {
             deadline_mono: now_mono.saturating_add(ttl_secs),
         };
 
-        let mut pending_requests = self.pending_requests.lock().unwrap();
+        let mut pending_requests = self.lock_pending_requests();
         pending_requests.insert(pending_id.as_str().to_string(), request);
         Ok(pending_id)
     }
@@ -1520,7 +1676,7 @@ impl PolicyRuntime {
         let credential_ref = intent_params.credential_ref.clone();
 
         let (intent_id, _claim_token) = {
-            let mut intents = self.intents.lock().unwrap();
+            let mut intents = self.lock_intents();
             intents
                 .create(intent_params)
                 .map_err(PendingCreateError::IntentCreationFailed)?
@@ -1529,7 +1685,7 @@ impl PolicyRuntime {
         let grant_request_id =
             {
                 let profile_key = profile_id.as_str().to_string();
-                let mut grants_map = self.grants.lock().unwrap();
+                let mut grants_map = self.lock_grants();
                 let grants = grants_map.get_mut(&profile_key).ok_or(
                     PendingCreateError::GrantRequestFailed(GrantError::ProfileMismatch),
                 )?;
@@ -1559,7 +1715,7 @@ impl PolicyRuntime {
             deadline_mono: now_mono.saturating_add(ttl_secs),
         };
 
-        let mut pending_requests = self.pending_requests.lock().unwrap();
+        let mut pending_requests = self.lock_pending_requests();
         pending_requests.insert(pending_id.as_str().to_string(), request);
         Ok((pending_id, grant_request_id))
     }
@@ -1569,7 +1725,7 @@ impl PolicyRuntime {
         pending_id: &PendingRequestId,
         session_id: &PrincipalSessionId,
     ) -> Result<(), PendingCancelError> {
-        let mut pending_requests = self.pending_requests.lock().unwrap();
+        let mut pending_requests = self.lock_pending_requests();
         let request = pending_requests
             .get_mut(pending_id.as_str())
             .ok_or(PendingCancelError::NotFound)?;
@@ -1583,21 +1739,13 @@ impl PolicyRuntime {
         }
 
         request.state = PendingState::Cancelled;
-
-        let mut intents = self.intents.lock().unwrap();
-        let authority = super::intent::admin_authority();
-        let _ = intents.deny(&request.intent_id, &authority);
-
-        if let Some(ref grant_request_id) = request.grant_request_id {
-            let profile_key = request.profile_id.as_str().to_string();
-            let mut grants_map = self.grants.lock().unwrap();
-            if let Some(grants) = grants_map.get_mut(&profile_key) {
-                if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
-                    let _ = grants.revoke_grant(&grant_id, &authority);
-                }
-                let _ = grants.cancel_request(grant_request_id);
-            }
-        }
+        let abandoned = vec![(
+            request.intent_id.clone(),
+            request.profile_id.clone(),
+            request.grant_request_id.clone(),
+        )];
+        drop(pending_requests);
+        self.abandon_pending(abandoned);
 
         Ok(())
     }
@@ -1607,7 +1755,7 @@ impl PolicyRuntime {
         pending_id: &PendingRequestId,
         session_id: &PrincipalSessionId,
     ) -> Result<PendingStatusSnapshot, PendingStatusError> {
-        let pending_requests = self.pending_requests.lock().unwrap();
+        let pending_requests = self.lock_pending_requests();
         let request = pending_requests
             .get(pending_id.as_str())
             .ok_or(PendingStatusError::NotFound)?;
@@ -1646,57 +1794,36 @@ impl PolicyRuntime {
 
     pub fn cleanup_expired_pending(&self) -> Vec<PendingRequestId> {
         let now_mono = self.clock.monotonic_secs();
-        let mut pending_requests = self.pending_requests.lock().unwrap();
         let mut expired = Vec::new();
-
-        for (key, request) in pending_requests.iter_mut() {
+        let mut abandoned = Vec::new();
+        for request in self.lock_pending_requests().values_mut() {
             if request.state == PendingState::Waiting && now_mono >= request.deadline_mono {
                 request.state = PendingState::TimedOut;
                 expired.push(request.id.clone());
-
-                let mut intents = self.intents.lock().unwrap();
-                let authority = super::intent::admin_authority();
-                let _ = intents.deny(&request.intent_id, &authority);
-
-                if let Some(ref grant_request_id) = request.grant_request_id {
-                    let profile_key = request.profile_id.as_str().to_string();
-                    let mut grants_map = self.grants.lock().unwrap();
-                    if let Some(grants) = grants_map.get_mut(&profile_key) {
-                        if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
-                            let _ = grants.revoke_grant(&grant_id, &authority);
-                        }
-                        let _ = grants.cancel_request(grant_request_id);
-                    }
-                }
-                let _ = key;
+                abandoned.push((
+                    request.intent_id.clone(),
+                    request.profile_id.clone(),
+                    request.grant_request_id.clone(),
+                ));
             }
         }
-
+        self.abandon_pending(abandoned);
         expired
     }
 
     pub fn cancel_pending_for_session(&self, session_id: &PrincipalSessionId) {
-        let mut pending_requests = self.pending_requests.lock().unwrap();
-        for request in pending_requests.values_mut() {
+        let mut abandoned = Vec::new();
+        for request in self.lock_pending_requests().values_mut() {
             if request.session_id == *session_id && request.state == PendingState::Waiting {
                 request.state = PendingState::Cancelled;
-
-                let mut intents = self.intents.lock().unwrap();
-                let authority = super::intent::admin_authority();
-                let _ = intents.deny(&request.intent_id, &authority);
-
-                if let Some(ref grant_request_id) = request.grant_request_id {
-                    let profile_key = request.profile_id.as_str().to_string();
-                    let mut grants_map = self.grants.lock().unwrap();
-                    if let Some(grants) = grants_map.get_mut(&profile_key) {
-                        if let Some(grant_id) = grants.resolved_grant_id(grant_request_id) {
-                            let _ = grants.revoke_grant(&grant_id, &authority);
-                        }
-                        let _ = grants.cancel_request(grant_request_id);
-                    }
-                }
+                abandoned.push((
+                    request.intent_id.clone(),
+                    request.profile_id.clone(),
+                    request.grant_request_id.clone(),
+                ));
             }
         }
+        self.abandon_pending(abandoned);
     }
 }
 
@@ -1884,6 +2011,7 @@ mod tests {
             },
         );
         AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/test-audit")),
@@ -2295,31 +2423,118 @@ mod tests {
     }
 
     #[test]
-    fn test_generation_number_starts_at_one_and_increments_on_reload() {
+    fn test_generation_number_starts_at_one_and_increments_on_a_changed_reload() {
         let config = make_isolated_config("gen", vec!["example.com"], false);
         let (runtime, _clock) = make_runtime(&config);
         assert_eq!(runtime.generation_number(), 1);
         assert_eq!(runtime.current_generation().generation, 1);
+        assert_eq!(runtime.revocation_epoch(), 1);
 
         let digest_before = runtime.digest();
         let generation_id_before = runtime.current_generation().generation_id.clone();
 
-        // A no-op reload leaves the content digest unchanged, but the numeric generation and the
-        // generation id still advance.
-        let digest_after = runtime.reload(&config).unwrap();
-        assert_eq!(digest_after, digest_before);
+        // A reload with an unchanged digest is a no-op: same generation, same generation id, and
+        // no session is revoked (the revocation epoch stays).
+        let outcome = runtime.reload(&config).unwrap();
+        assert!(!outcome.changed);
+        assert_eq!(outcome.digest, digest_before);
         assert_eq!(runtime.digest(), digest_before);
-        assert_eq!(runtime.generation_number(), 2);
-        assert_ne!(
+        assert_eq!(runtime.generation_number(), 1);
+        assert_eq!(
             runtime.current_generation().generation_id,
             generation_id_before
         );
+        assert_eq!(runtime.revocation_epoch(), 1);
 
         let mut changed = config.clone();
         changed.profiles.get_mut("gen").unwrap().rules[0].authenticate = RuleAction::Request;
-        let digest_changed = runtime.reload(&changed).unwrap();
-        assert_ne!(digest_changed, digest_before);
-        assert_eq!(runtime.generation_number(), 3);
+        let outcome = runtime.reload(&changed).unwrap();
+        assert!(outcome.changed);
+        assert_ne!(outcome.digest, digest_before);
+        assert_eq!(runtime.generation_number(), 2);
+        assert_eq!(outcome.revocation_epoch, 2);
+        assert_eq!(runtime.revocation_epoch(), 2);
+        assert_eq!(
+            runtime.grant_epoch(),
+            1,
+            "a reload never touches the grant epoch"
+        );
+    }
+
+    #[test]
+    fn test_unchanged_reload_keeps_session_grants_and_changed_reload_drops_them() {
+        let config = make_isolated_config("keep", vec!["example.com"], false);
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("keep").unwrap();
+        let request = runtime
+            .admin_request_session_grant(
+                GrantRequestParams {
+                    profile_id: pid.clone(),
+                    session_id: PrincipalSessionId::new(),
+                    endpoint_id: EndpointId::new(),
+                    principal_digest: [3u8; 32],
+                    rp_ids: vec!["example.com".to_string()],
+                    credentials: Vec::new(),
+                    requested_ttl_secs: 60,
+                },
+                true,
+            )
+            .unwrap();
+        let grant_id = runtime
+            .admin_approve_grant(&request, &super::super::intent::admin_authority())
+            .unwrap();
+
+        runtime.reload(&config).unwrap();
+        let grant = runtime.resolve_grant_for_sign(&pid, &grant_id).unwrap();
+        assert_eq!(grant.state, super::super::grant::GrantState::Active);
+        assert_eq!(grant.principal_digest, [3u8; 32]);
+
+        let mut changed = config.clone();
+        changed.profiles.get_mut("keep").unwrap().max_operations = 7;
+        runtime.reload(&changed).unwrap();
+        assert!(runtime.resolve_grant_for_sign(&pid, &grant_id).is_none());
+        assert_eq!(
+            runtime.max_operations(&pid),
+            Some(7),
+            "the budget is read live"
+        );
+    }
+
+    #[test]
+    fn test_session_grant_ttl_is_bounded_by_max_session_ttl_not_max_grant_ttl() {
+        // Defect B5: a `max_session_ttl` above 300 s (the default `max_grant_ttl`) used to fail
+        // session grant creation with `TtlExceedsProfileMax`.
+        let mut config = make_isolated_config("b5", vec!["example.com"], false);
+        config.profiles.get_mut("b5").unwrap().max_session_ttl =
+            Some(passless_core::agent::BoundedDuration::new(3600).unwrap());
+        let (runtime, _clock) = make_runtime(&config);
+        let pid = ProfileId::new("b5").unwrap();
+        let params = |ttl| GrantRequestParams {
+            profile_id: pid.clone(),
+            session_id: PrincipalSessionId::new(),
+            endpoint_id: EndpointId::new(),
+            principal_digest: [0u8; 32],
+            rp_ids: vec!["example.com".to_string()],
+            credentials: Vec::new(),
+            requested_ttl_secs: ttl,
+        };
+        let request = runtime
+            .admin_request_session_grant(params(3600), true)
+            .expect("a session grant up to max_session_ttl is accepted");
+        let grant_id = runtime
+            .admin_approve_grant(&request, &super::super::intent::admin_authority())
+            .unwrap();
+        let grant = runtime.resolve_grant_for_sign(&pid, &grant_id).unwrap();
+        assert_eq!(grant.expiry_mono, 3600, "the full session TTL is granted");
+        assert!(matches!(
+            runtime.admin_request_session_grant(params(3601), true),
+            Err(GrantError::TtlExceedsProfileMax { max: 3600, .. })
+        ));
+        // Intent grants are still bounded by `max_grant_ttl`.
+        assert!(matches!(
+            runtime.admin_request_dynamic_grant(params(301)),
+            Err(GrantError::TtlExceedsProfileMax { max: 300, .. })
+        ));
     }
 
     #[test]
@@ -2344,22 +2559,34 @@ mod tests {
         const RELOADS_PER_THREAD: u64 = 10;
         let observed = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
-            for _ in 0..THREADS {
-                scope.spawn(|| {
-                    for _ in 0..RELOADS_PER_THREAD {
-                        runtime.reload(&config).unwrap();
-                        observed.lock().unwrap().push(runtime.generation_number());
+            for thread in 0..THREADS {
+                let runtime = &runtime;
+                let config = &config;
+                let observed = &observed;
+                scope.spawn(move || {
+                    for reload in 0..RELOADS_PER_THREAD {
+                        // Every reload has its own digest, so every one is a change.
+                        let mut next = config.clone();
+                        next.profiles.get_mut("genrace").unwrap().max_operations =
+                            u16::try_from(2 + thread * RELOADS_PER_THREAD + reload).unwrap();
+                        let outcome = runtime.reload(&next).unwrap();
+                        assert!(outcome.changed);
+                        observed.lock().unwrap().push(outcome.generation);
                     }
                 });
             }
         });
-        // Every reload bumped the generation exactly once: none was lost to a racing reload.
+        // Every reload bumped the generation and the revocation epoch exactly once: none was lost
+        // to a racing reload, and no two reloads got the same generation.
         assert_eq!(
             runtime.generation_number(),
             1 + THREADS * RELOADS_PER_THREAD
         );
-        let observed = observed.into_inner().unwrap();
-        assert!(observed.iter().all(|g| *g >= 2));
+        assert_eq!(runtime.revocation_epoch(), 1 + THREADS * RELOADS_PER_THREAD);
+        let mut observed = observed.into_inner().unwrap();
+        observed.sort_unstable();
+        observed.dedup();
+        assert_eq!(observed.len() as u64, THREADS * RELOADS_PER_THREAD);
     }
 
     #[test]

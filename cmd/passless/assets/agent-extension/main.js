@@ -8,6 +8,8 @@
   var MAX_ALGORITHMS = 16;
   var DEFAULT_TIMEOUT_MS = 30000;
   var MAX_TIMEOUT_MS = 120000;
+  var MAX_EXTENSIONS = 32;
+  var MAX_EXTENSION_NAME_LEN = 64;
 
   var credentials = navigator.credentials;
   if (!credentials || typeof credentials.get !== "function") return;
@@ -46,6 +48,35 @@
 
   function notAllowed() {
     return domError("NotAllowedError", "The operation either timed out or was not allowed.");
+  }
+
+  // DOMException names the daemon may choose (ADR 0014 sections 10.2-10.3 and 11). Anything else, and every
+  // transport failure, is NotAllowedError. Each name has one fixed message, so the page cannot tell a policy denial,
+  // a used-up budget, a replay or a busy daemon apart.
+  var DAEMON_DOM_NAMES = ["NotAllowedError", "NotSupportedError", "InvalidStateError", "SecurityError", "AbortError"];
+  var DOM_MESSAGES = {
+    NotSupportedError: "The authenticator does not support a requested option.",
+    InvalidStateError: "The authenticator already contains a credential in excludeCredentials.",
+    SecurityError: "The origin is not valid for the relying party.",
+    AbortError: "The operation was aborted."
+  };
+
+  function daemonError(message) {
+    var name = typeof message.dom === "string" && DAEMON_DOM_NAMES.indexOf(message.dom) !== -1 ? message.dom : "NotAllowedError";
+    if (name === "NotAllowedError") return notAllowed();
+    return domError(name, DOM_MESSAGES[name]);
+  }
+
+  // Names of the requested client extensions (never their inputs); the daemon rejects ones it cannot honor.
+  function extensionNames(extensions) {
+    if (extensions === undefined || extensions === null) return [];
+    if (typeof extensions !== "object") throw new TypeError("invalid extensions");
+    var names = Object.keys(extensions);
+    if (names.length > MAX_EXTENSIONS) throw new TypeError("too many extensions");
+    for (var i = 0; i < names.length; i++) {
+      if (names[i].length === 0 || names[i].length > MAX_EXTENSION_NAME_LEN) throw new TypeError("invalid extension name");
+    }
+    return names;
   }
 
   function abortError() {
@@ -110,7 +141,9 @@
       rp_id: rpId,
       challenge_b64u: b64urlEncode(challenge),
       allow_credentials: allowCredentials,
-      user_verification: uv === "required"
+      user_verification: uv === "required",
+      extensions: extensionNames(publicKey.extensions),
+      timeout_ms: timeoutFor(publicKey.timeout)
     };
   }
 
@@ -173,7 +206,10 @@
       user_display_name: publicKey.user.displayName || null,
       exclude_credentials: excludeCredentials,
       pub_key_cred_params: algorithms,
-      user_verification: uv === "required"
+      user_verification: uv === "required",
+      extensions: extensionNames(publicKey.extensions),
+      attestation: typeof publicKey.attestation === "string" ? publicKey.attestation.slice(0, 32) : null,
+      timeout_ms: timeoutFor(publicKey.timeout)
     };
   }
 
@@ -283,7 +319,7 @@
     // NotAllowedError. The original navigator.credentials.get/create is never called for a WebAuthn
     // request (ADR 0014 §7, invariant 25).
     if (!message.ok) {
-      operation.reject(notAllowed());
+      operation.reject(daemonError(message));
       return;
     }
 

@@ -93,7 +93,17 @@ Important bounds include:
 - credential scope;
 - replay detection.
 
-An identical completed request body is rejected as `replayed_operation`. Once the shared budget is exhausted, further operations fail with `operation_budget_exhausted`. Treat both as security-terminal conditions for the relevant operation/session rather than retry loops.
+A request that repeats an earlier one exactly (same action, RP, origin and challenge) is never signed twice:
+
+- While the first is in flight, the repeat waits for it and gets the same result.
+- For 120 seconds after it completes, the repeat gets the original result.
+- After that, the repeat is rejected as `replayed_operation`.
+
+A different request that reuses the challenge is also rejected as `replayed_operation`.
+
+Only allowed requests use the shared `max_operations` budget, and repeats do not. Once the budget is used up, further operations fail with `operation_budget_exhausted`. Treat both errors as terminal for the operation or session; do not retry in a loop.
+
+A policy reload that changes the effective policy revokes every session; reloading an unchanged configuration revokes none. The daemon answers `busy` when a concurrency cap (`agents.limits`) is reached.
 
 ## Same-user operations
 

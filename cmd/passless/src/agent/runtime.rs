@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use passless_core::agent::protocol::{
     AdminRequest, AdminResponse, AuthorityBrowser, AuthorityCeremony, AuthorityCredentialScope,
@@ -58,6 +58,28 @@ pub struct RuntimeStartParams<'a> {
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
     pub shutdown: Arc<AtomicBool>,
+    /// Where a policy reload re-reads the configuration from. `None` disables reload.
+    pub config_source: Option<AgentConfigSource>,
+}
+
+/// The configuration file a policy reload re-reads and validates (ADR 0014 section 6.4).
+#[derive(Clone, Debug)]
+pub struct AgentConfigSource {
+    /// The Passless configuration file the daemon started from.
+    pub path: std::path::PathBuf,
+    /// The human backend state path, for the agent root overlap check of `AgentConfig::validate`.
+    pub human_state_path: Option<std::path::PathBuf>,
+}
+
+impl AgentConfigSource {
+    /// Read, parse and validate the `[agents]` table of the configuration file.
+    pub fn load(&self) -> Result<AgentConfig, String> {
+        let config = AgentConfig::from_config_file(&self.path).map_err(|e| e.format_cli())?;
+        config
+            .validate(self.human_state_path.as_deref())
+            .map_err(|e| e.format_cli())?;
+        Ok(config)
+    }
 }
 
 #[allow(dead_code)]
@@ -71,6 +93,38 @@ struct RequestDelegationParams<'a> {
     principal_reason: Option<String>,
     profile: &'a ProfileRuntime,
     session_digest: &'a super::intent::ProcessIdentityDigest,
+}
+
+/// Re-read and validate the configuration file, check it can replace `current` without a restart,
+/// and apply it to `policy_runtime`. On any error nothing changes: the old generation, sessions and
+/// revocation epoch stay in force (ADR 0014 section 6.4).
+fn reload_policy_from_source(
+    source: Option<&AgentConfigSource>,
+    current: &AgentConfig,
+    policy_runtime: &PolicyRuntime,
+) -> Result<(AgentConfig, super::policy_engine::ReloadOutcome), String> {
+    let source =
+        source.ok_or_else(|| "the daemon was started without a configuration file".to_string())?;
+    let config = source.load()?;
+    if let Some(reason) = current.reload_incompatibility(&config) {
+        return Err(format!("{} (restart the daemon to apply it)", reason));
+    }
+    let outcome = policy_runtime
+        .reload(&config)
+        .map_err(|e| format!("policy recompile failed: {}", e))?;
+    Ok((config, outcome))
+}
+
+/// Default bearer session TTL when a profile sets no `max_session_ttl`.
+const DEFAULT_SESSION_TTL_SECS: u64 = 300;
+
+/// The TTL of a profile's bearer sessions and of the session grants behind them.
+fn session_ttl_secs(profile_config: &AgentProfileConfig) -> u64 {
+    profile_config
+        .max_session_ttl
+        .as_ref()
+        .map(|ttl| ttl.as_secs())
+        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
 }
 
 fn extract_cdp_method_for_audit(json: &str) -> String {
@@ -509,6 +563,7 @@ pub struct AgentRuntime {
     daemon_uid: u32,
     daemon_gid: u32,
     agent_config: std::sync::RwLock<AgentConfig>,
+    config_source: Option<AgentConfigSource>,
     sign_registry: Arc<SignContextRegistry>,
     sign_server_shutdown: Arc<AtomicBool>,
     sign_server_handle: Mutex<Option<JoinHandle<()>>>,
@@ -526,6 +581,7 @@ impl AgentRuntime {
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
         shutdown: Arc<AtomicBool>,
+        config_source: Option<AgentConfigSource>,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factories(RuntimeStartParams {
             human_storage,
@@ -535,6 +591,7 @@ impl AgentRuntime {
             agent_config,
             security_config,
             shutdown,
+            config_source,
         })
     }
 
@@ -547,6 +604,7 @@ impl AgentRuntime {
             agent_config,
             security_config,
             shutdown,
+            config_source,
         } = params;
         let human_backend = CredentialBackendHandle::human(
             human_storage,
@@ -937,7 +995,10 @@ impl AgentRuntime {
             "Sign HTTP server listening on {}",
             sign_socket_path.display()
         );
-        let sign_server_handle = sign_server.serve(sign_registry.clone());
+        let sign_server_handle = sign_server.serve_with_limiter(
+            sign_registry.clone(),
+            super::capacity::RequestLimiter::new(agent_config.limits),
+        );
 
         let mut profiles = BTreeMap::new();
 
@@ -1052,6 +1113,7 @@ impl AgentRuntime {
             daemon_uid,
             daemon_gid,
             agent_config: std::sync::RwLock::new(agent_config.clone()),
+            config_source,
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
@@ -1098,7 +1160,10 @@ impl AgentRuntime {
             self.cleanup_expired_pending();
 
             {
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
+                let mut browser_mgr = super::lock_order::lock(
+                    &self.browser_manager,
+                    super::lock_order::LockLevel::BrowserManager,
+                );
                 let exit_infos = browser_mgr.check_exits();
                 for info in &exit_infos {
                     self.revoke_sign_context_for_lease(&info.lease_id);
@@ -1384,7 +1449,10 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
         session_id: &PrincipalSessionId,
     ) {
-        let _lifecycle = profile.lifecycle_lock.lock().ok();
+        let _lifecycle = super::lock_order::lock(
+            &profile.lifecycle_lock,
+            super::lock_order::LockLevel::ProfileLifecycle,
+        );
 
         let active = profile
             .active_browser
@@ -1409,7 +1477,10 @@ impl AgentRuntime {
             };
             if let Some(lease_id) = should_terminate {
                 self.revoke_sign_context_for_lease(&lease_id);
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
+                let mut browser_mgr = super::lock_order::lock(
+                    &self.browser_manager,
+                    super::lock_order::LockLevel::BrowserManager,
+                );
                 let _ = browser_mgr.revoke(&lease_id);
                 let _ = browser_mgr.terminate(&lease_id);
                 let _ = browser_mgr.cleanup(&lease_id);
@@ -1420,12 +1491,43 @@ impl AgentRuntime {
 
         if let Some(active) = active {
             self.revoke_sign_context_for_lease(&active.lease_id);
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
+            let mut browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             let _ = browser_mgr.revoke(&active.lease_id);
             let _ = browser_mgr.terminate(&active.lease_id);
             let _ = browser_mgr.cleanup(&active.lease_id);
             browser_mgr.remove(&active.lease_id);
         }
+    }
+
+    /// The profile's configuration as currently in force (a policy reload replaces it).
+    fn live_profile_config(&self, profile: &ProfileRuntime) -> AgentProfileConfig {
+        let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+        self.agent_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .profiles
+            .get(profile.profile_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| profile.profile_config.clone())
+    }
+
+    /// A new bearer session for a browser launched for `profile_id`: bound to the principal
+    /// digest, the revocation epoch now in force and the session TTL (ADR 0014 section 9).
+    fn new_bearer_session(
+        &self,
+        profile_id: &ProfileId,
+        principal_digest: [u8; 32],
+        profile_config: &AgentProfileConfig,
+    ) -> Arc<super::session::AgentSession> {
+        super::session::AgentSession::new(super::session::SessionBinding {
+            profile_id: profile_id.clone(),
+            principal_digest,
+            revocation_epoch: self.policy_runtime.revocation_epoch(),
+            ttl: Duration::from_secs(session_ttl_secs(profile_config)),
+        })
     }
 
     fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime) {
@@ -1450,7 +1552,10 @@ impl AgentRuntime {
         }
         let mut seen = std::collections::HashSet::new();
         leases.retain(|id| seen.insert(id.clone()));
-        let mut browser_mgr = self.browser_manager.lock().unwrap();
+        let mut browser_mgr = super::lock_order::lock(
+            &self.browser_manager,
+            super::lock_order::LockLevel::BrowserManager,
+        );
         for lease_id in leases {
             self.revoke_sign_context_for_lease(&lease_id);
             let _ = browser_mgr.revoke(&lease_id);
@@ -1488,7 +1593,10 @@ impl AgentRuntime {
         self.shutdown_all_sessions();
 
         {
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
+            let mut browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             browser_mgr.terminate_all();
         }
 
@@ -1511,7 +1619,10 @@ impl AgentRuntime {
         managed: &ManagedPrincipalSession,
     ) -> EffectiveAuthority {
         let acts_as_human = profile.mode == AgentMode::SameUser;
-        let rules = &profile.profile_config.rules;
+        // Report the configuration in force: a policy reload may have replaced it (review L4).
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
+        let rules = &profile_config.rules;
         let wildcard = rules.iter().any(|rule| rule.is_wildcard());
         let autonomous_authentication = rules
             .iter()
@@ -1520,9 +1631,9 @@ impl AgentRuntime {
             && rules
                 .iter()
                 .any(|rule| rule.register != passless_core::agent::RuleAction::Deny);
-        let direct_cdp = profile.profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
+        let direct_cdp = profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
         let ambiguous_selection = matches!(
-            profile.profile_config.credential_selection,
+            profile_config.credential_selection,
             passless_core::agent::config::CredentialSelection::FirstMatching
                 | passless_core::agent::config::CredentialSelection::Newest
         );
@@ -1565,7 +1676,7 @@ impl AgentRuntime {
             })
             .unwrap_or((None, None));
 
-        let selection = serde_json::to_value(&profile.profile_config.credential_selection)
+        let selection = serde_json::to_value(&profile_config.credential_selection)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "unknown".to_string());
@@ -1590,17 +1701,15 @@ impl AgentRuntime {
                 })
                 .collect(),
             credentials: AuthorityCredentialScope {
-                dynamic_per_rp: profile.profile_config.credential_refs.is_none(),
-                configured_reference_count: profile
-                    .profile_config
+                dynamic_per_rp: profile_config.credential_refs.is_none(),
+                configured_reference_count: profile_config
                     .credential_refs
                     .as_ref()
                     .map_or(0, |refs| refs.len() as u32),
                 selection,
             },
             session: AuthoritySession {
-                max_session_ttl_secs: profile
-                    .profile_config
+                max_session_ttl_secs: profile_config
                     .max_session_ttl
                     .map(|ttl| ttl.as_secs())
                     .unwrap_or(300),
@@ -1608,14 +1717,13 @@ impl AgentRuntime {
                     .deadline
                     .saturating_duration_since(Instant::now())
                     .as_secs(),
-                max_operations: profile.profile_config.max_operations,
+                max_operations: profile_config.max_operations,
                 operations_used,
                 operations_remaining,
             },
             browser: AuthorityBrowser {
                 active: active_lease.is_some(),
-                cdp_exposure: profile
-                    .profile_config
+                cdp_exposure: profile_config
                     .browser_cdp_expose
                     .unwrap_or(CdpExposeMode::Pipe)
                     .to_string(),
@@ -1667,13 +1775,8 @@ impl AgentRuntime {
                 RecommendedAction::Abort,
             )
         })?;
-        let mut sessions = session_slot.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "managed session lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut sessions =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
         let limit = usize::from(profile.profile_config.max_concurrent_sessions);
         let unlimited = profile.profile_config.browser_scope == BrowserScope::Profile
             && profile.profile_config.max_concurrent_sessions == 0;
@@ -1810,13 +1913,8 @@ impl AgentRuntime {
                 RecommendedAction::FixRequest,
             )
         })?;
-        let mut sessions = session_slot.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "managed session lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut sessions =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
         if sessions.is_empty() {
             return Err(ProtocolError::new(
                 ErrorCode::NotFound,
@@ -1874,7 +1972,10 @@ impl AgentRuntime {
         loop {
             let mut found = false;
             for (profile_id, session_slot) in &self.managed_sessions {
-                let mut sessions = session_slot.lock().unwrap();
+                let mut sessions = super::lock_order::lock(
+                    session_slot,
+                    super::lock_order::LockLevel::ManagedSession,
+                );
                 if let Some(pos) = sessions
                     .iter()
                     .position(|managed| managed.session_id == *session_id)
@@ -1989,7 +2090,8 @@ impl AgentRuntime {
         )> = Vec::new();
 
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             let mut index = 0;
             while index < sessions.len() {
                 let should_reap = if now >= sessions[index].deadline {
@@ -2069,7 +2171,8 @@ impl AgentRuntime {
 
     fn shutdown_all_sessions(&self) {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             for managed in sessions.drain(..) {
                 info!(
                     "Shutting down principal session {} for profile {}",
@@ -2127,7 +2230,10 @@ impl AgentRuntime {
         request_id: &PendingRequestId,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+        let _lifecycle = super::lock_order::lock(
+            &profile.lifecycle_lock,
+            super::lock_order::LockLevel::ProfileLifecycle,
+        );
         let status = self
             .policy_runtime
             .principal_pending_status(request_id, session_id)
@@ -2218,7 +2324,10 @@ impl AgentRuntime {
         request_id: &PendingRequestId,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+        let _lifecycle = super::lock_order::lock(
+            &profile.lifecycle_lock,
+            super::lock_order::LockLevel::ProfileLifecycle,
+        );
         let status = self
             .policy_runtime
             .principal_pending_status(request_id, session_id)
@@ -2304,7 +2413,10 @@ impl AgentRuntime {
             .map(|lease| lease.lease_id.clone());
 
         if let Some(lease_id) = lease_id {
-            let browser_mgr = self.browser_manager.lock().unwrap();
+            let browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             if let Some(snapshot) = browser_mgr.snapshot(&lease_id) {
                 let cdp_endpoint = browser_mgr.lease_cdp_endpoint(&lease_id).flatten();
                 let shared_browser_context =
@@ -2363,7 +2475,10 @@ impl AgentRuntime {
         let cdp_method = extract_cdp_method_for_audit(request_json);
 
         {
-            let browser_mgr = self.browser_manager.lock().unwrap();
+            let browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             if let Some(false) = browser_mgr.lease_has_cdp_pipes(&lease_id) {
                 let endpoint_msg = browser_mgr
                     .lease_cdp_endpoint(&lease_id)
@@ -2401,7 +2516,10 @@ impl AgentRuntime {
         let timeout = Duration::from_millis(timeout_ms as u64);
 
         let result = {
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
+            let mut browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             let snapshot = browser_mgr.snapshot(&lease_id);
             let state = snapshot
                 .as_ref()
@@ -2713,7 +2831,8 @@ impl AgentRuntime {
         self.cleanup_all_browsers_for_profile(profile);
 
         if let Some(session_slot) = self.managed_sessions.get(profile_id) {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             for managed in sessions.drain(..) {
                 info!(
                     "Disabling profile '{}' terminates session {} (pid {})",
@@ -2774,6 +2893,11 @@ impl AgentRuntime {
         ))
     }
 
+    /// Reload the policy (ADR 0014 sections 6.4 and 9). The configuration file is re-read and
+    /// validated first; an unreadable, invalid or restart-only change keeps the old generation,
+    /// is logged and audited, and returns an error. A reload whose digest is unchanged revokes
+    /// nothing. A changed policy bumps the revocation epoch, which revokes every sign and
+    /// registration bearer (in-flight operations fail before key use) and closes their browsers.
     fn handle_reload_policy(&self, profile_id: &ProfileId) -> Result<AdminResponse, ProtocolError> {
         let _profile = self.profiles.get(profile_id).ok_or_else(|| {
             ProtocolError::new(
@@ -2783,25 +2907,61 @@ impl AgentRuntime {
             )
         })?;
 
-        let config = self.agent_config.read().unwrap().clone();
-        self.policy_runtime.reload(&config).map_err(|e| {
+        let rejected = |message: String| {
+            warn!(
+                "policy reload rejected, keeping generation {}: {}",
+                self.policy_runtime.generation_number(),
+                message
+            );
             ProtocolError::new(
-                ErrorCode::Internal,
-                format!("policy recompile failed: {}", e),
-                RecommendedAction::Abort,
+                ErrorCode::BadRequest,
+                format!("policy reload rejected: {}", message),
+                RecommendedAction::FixRequest,
             )
-        })?;
+        };
 
-        let generation = self.policy_runtime.current_generation();
+        // The configuration lock is held across the reload so concurrent reloads apply in order
+        // and the stored configuration always matches the compiled policy. It is released before
+        // browsers are closed (the browser manager ranks below it, LOCKING.md).
+        let outcome = {
+            let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+            let mut current = self
+                .agent_config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (config, outcome) = reload_policy_from_source(
+                self.config_source.as_ref(),
+                &current,
+                &self.policy_runtime,
+            )
+            .map_err(rejected)?;
+            *current = config;
+            outcome
+        };
+
         let gen_event = super::audit_events::AdminPolicyRecompileBuilder::new(
             profile_id.clone(),
-            generation.generation,
+            outcome.generation,
         )
         .build();
         let _ = self.audit_gate.record(gen_event);
 
-        for profile in self.profiles.values() {
-            self.cleanup_all_browsers_for_profile(profile);
+        if outcome.changed {
+            let revoked = self
+                .sign_registry
+                .revoke_stale_sessions(outcome.revocation_epoch);
+            info!(
+                "policy reloaded: generation {}, revocation epoch {}; {} bearer(s) revoked",
+                outcome.generation, outcome.revocation_epoch, revoked
+            );
+            for profile in self.profiles.values() {
+                self.cleanup_all_browsers_for_profile(profile);
+            }
+        } else {
+            info!(
+                "policy reloaded: unchanged (generation {}); sessions kept",
+                outcome.generation
+            );
         }
 
         Ok(AdminResponse::PolicyRecompiled)
@@ -2814,21 +2974,15 @@ impl AgentRuntime {
         let mut all_credentials = Vec::new();
 
         for profile in self.profiles.values() {
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let mut storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let mut storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             let filter = if let Some(rp) = rp_id {
                 // Only RPs the profile has a rule for (exact, or through the wildcard).
@@ -2914,21 +3068,15 @@ impl AgentRuntime {
                 continue;
             }
 
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let mut storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let mut storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             let mut has_more = true;
             let first_result = storage.read_first(crate::storage::CredentialFilter::None);
@@ -3016,21 +3164,15 @@ impl AgentRuntime {
 
             _found_isolated = true;
 
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let mut storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let mut storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             let first_result = storage.read_first(crate::storage::CredentialFilter::None);
             let mut cred = match first_result {
@@ -3110,21 +3252,15 @@ impl AgentRuntime {
                 continue;
             }
 
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let _storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             return Err(ProtocolError::new(
                 ErrorCode::Internal,
@@ -3307,7 +3443,8 @@ impl AgentRuntime {
             {
                 continue;
             }
-            let sessions = session_slot.lock().unwrap();
+            let sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             for managed in sessions.iter() {
                 let created_at = wall_now.saturating_sub(managed.created_at.elapsed().as_secs());
                 let expires_at = wall_now.saturating_add(
@@ -3345,7 +3482,8 @@ impl AgentRuntime {
             .as_secs();
 
         for (profile_id, session_slot) in &self.managed_sessions {
-            let sessions = session_slot.lock().unwrap();
+            let sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             if let Some(managed) = sessions
                 .iter()
                 .find(|managed| managed.session_id == *session_id)
@@ -3381,7 +3519,8 @@ impl AgentRuntime {
         session_id: &PrincipalSessionId,
     ) -> Result<AdminResponse, ProtocolError> {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             if let Some(pos) = sessions
                 .iter()
                 .position(|managed| managed.session_id == *session_id)
@@ -3508,7 +3647,8 @@ impl AgentRuntime {
             )
         })?;
 
-        let managed_guard = session_slot.lock().unwrap();
+        let managed_guard =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
         let managed = match managed_guard.as_slice() {
             [managed] => managed,
             [] => {
@@ -3527,7 +3667,10 @@ impl AgentRuntime {
             }
         };
 
-        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+        let _lifecycle = super::lock_order::lock(
+            &profile.lifecycle_lock,
+            super::lock_order::LockLevel::ProfileLifecycle,
+        );
         {
             let eid_guard = profile.endpoint_id.lock().unwrap();
             if eid_guard.is_none() {
@@ -3639,13 +3782,10 @@ impl AgentRuntime {
             bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
         };
 
-        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "browser manager lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut browser_manager = super::lock_order::lock(
+            &self.browser_manager,
+            super::lock_order::LockLevel::BrowserManager,
+        );
 
         if let Some(existing_snapshot) = browser_manager.find_live_lease_for_profile(profile_id) {
             let cdp_endpoint = browser_manager
@@ -3674,10 +3814,11 @@ impl AgentRuntime {
 
         // Registration authority is policy only (`register = "allow"` on an exact RP rule); the
         // bearer is bound to the browser lease below and revoked with it.
-        let register_ctx = super::register::RegisterContext::new(
-            profile_id.clone(),
-            profile_config.max_operations,
-        );
+        // An admin-launched browser has no principal process: its session is bound to the
+        // all-zero principal digest, like its session grant.
+        let session = self.new_bearer_session(profile_id, [0u8; 32], profile_config);
+        let register_ctx =
+            super::register::RegisterContext::new(profile_id.clone(), session.clone());
 
         let register_handler = Arc::new(super::register::RegisterHandler {
             policy_runtime: self.policy_runtime.clone(),
@@ -3753,9 +3894,11 @@ impl AgentRuntime {
         // credential scope. Selection for a concrete ceremony happens in the
         // sign handler using allowCredentials/discoverable semantics.
         let mut credential_refs = Vec::new();
-        if let Ok(mut storage) = profile.backend.credential_storage.lock()
-            && let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None)
-        {
+        let mut storage = super::lock_order::lock(
+            &profile.backend.credential_storage,
+            super::lock_order::LockLevel::Storage,
+        );
+        if let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None) {
             loop {
                 let rp_allowed = config
                     .rp_ids
@@ -3777,6 +3920,7 @@ impl AgentRuntime {
             }
         }
 
+        drop(storage);
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
         if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
             let session_id = passless_core::agent::PrincipalSessionId::new();
@@ -3797,12 +3941,9 @@ impl AgentRuntime {
                     .map(|ttl| ttl.as_secs())
                     .unwrap_or(300),
             };
-            let grant_request = if dynamic_credential_scope {
-                self.policy_runtime
-                    .admin_request_dynamic_grant(grant_params)
-            } else {
-                self.policy_runtime.admin_request_grant(grant_params)
-            };
+            let grant_request = self
+                .policy_runtime
+                .admin_request_session_grant(grant_params, dynamic_credential_scope);
             match grant_request {
                 Ok(request_id) => {
                     match self
@@ -3810,10 +3951,13 @@ impl AgentRuntime {
                         .admin_approve_grant(&request_id, &super::intent::admin_authority())
                     {
                         Ok(grant_id) => {
+                            let _ = session.bind_grant(grant_id.clone());
                             let sign_ctx = super::sign::SignContext {
                                 profile_id: profile_id.clone(),
                                 active_grant_id: grant_id,
-                                max_operations: profile_config.max_operations,
+                                session: session.clone(),
+                                // An admin-launched browser is active from the start.
+                                lease_activation: None,
                             };
                             let sign_handler = Arc::new(super::sign::SignHandler {
                                 credential_storage: profile.backend.credential_storage.clone(),
@@ -4035,7 +4179,8 @@ impl PrincipalHandler for AgentRuntime {
             )
         })?;
 
-        let sessions = session_slot.lock().unwrap();
+        let sessions =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
         let supplied_capability = SessionCapability::from_bytes(*capability_proof.as_bytes());
         let managed = sessions
             .iter()
@@ -4104,11 +4249,12 @@ impl PrincipalHandler for AgentRuntime {
             }
             PrincipalRequest::Capabilities => {
                 let mode_str = format!("{:?}", profile.mode);
+                let live_config = self.live_profile_config(profile);
                 Ok(PrincipalResponse::Capabilities(PrincipalCapabilities {
                     profile_id: profile_id.to_string(),
                     mode: mode_str,
-                    allowed_rp_ids: profile.profile_config.allowed_rp_ids(),
-                    registration_allowed: profile.profile_config.allows_registration(),
+                    allowed_rp_ids: live_config.allowed_rp_ids(),
+                    registration_allowed: live_config.allows_registration(),
                 }))
             }
             PrincipalRequest::Authority => Ok(PrincipalResponse::Authority(
@@ -4152,7 +4298,10 @@ impl PrincipalHandler for AgentRuntime {
                 max_session_ttl,
                 reason,
             } => {
-                let _lifecycle = profile.lifecycle_lock.lock().unwrap();
+                let _lifecycle = super::lock_order::lock(
+                    &profile.lifecycle_lock,
+                    super::lock_order::LockLevel::ProfileLifecycle,
+                );
                 {
                     let mut eid_guard = profile.endpoint_id.lock().unwrap();
                     if eid_guard.is_none() {
@@ -4225,6 +4374,144 @@ impl PrincipalHandler for AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- P5: reload re-reads and validates the configuration file (ADR 0014 section 6.4) ---
+
+    fn write_agent_config(path: &std::path::Path, audit: &std::path::Path, extra: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[agents]
+enabled = true
+audit_path = "{}"
+
+[agents.profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+{}
+[[agents.profiles.coding.rules]]
+rp_id = "example.com"
+authenticate = "allow"
+register = "deny"
+"#,
+                audit.display(),
+                extra
+            ),
+        )
+        .unwrap();
+    }
+
+    fn reload_fixture() -> (
+        tempfile::TempDir,
+        AgentConfigSource,
+        AgentConfig,
+        PolicyRuntime,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_agent_config(&path, &dir.path().join("audit"), "");
+        let source = AgentConfigSource {
+            path,
+            human_state_path: None,
+        };
+        let config = source.load().expect("the initial configuration is valid");
+        let runtime = PolicyRuntime::new(
+            &config,
+            Arc::new(SystemClock),
+            Arc::new(IntentSystemClock::new()),
+            None,
+        )
+        .unwrap();
+        (dir, source, config, runtime)
+    }
+
+    #[test]
+    fn reload_with_an_unchanged_file_revokes_nothing() {
+        let (_dir, source, config, runtime) = reload_fixture();
+        let (_, outcome) = reload_policy_from_source(Some(&source), &config, &runtime).unwrap();
+        assert!(!outcome.changed);
+        assert_eq!(runtime.generation_number(), 1);
+        assert_eq!(runtime.revocation_epoch(), 1);
+    }
+
+    #[test]
+    fn reload_reads_a_changed_file_and_bumps_the_revocation_epoch() {
+        let (dir, source, config, runtime) = reload_fixture();
+        write_agent_config(
+            &source.path,
+            &dir.path().join("audit"),
+            "max_operations = 5\n",
+        );
+        let (next, outcome) = reload_policy_from_source(Some(&source), &config, &runtime).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(next.profiles["coding"].max_operations, 5);
+        assert_eq!(runtime.generation_number(), 2);
+        assert_eq!(runtime.revocation_epoch(), 2);
+        assert_eq!(
+            runtime.max_operations(&ProfileId::new("coding").unwrap()),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn reload_of_an_invalid_file_keeps_the_old_generation() {
+        let (dir, source, config, runtime) = reload_fixture();
+        let digest = runtime.digest();
+        let rejected = |runtime: &PolicyRuntime| {
+            assert_eq!(runtime.generation_number(), 1);
+            assert_eq!(runtime.revocation_epoch(), 1);
+            assert_eq!(runtime.digest(), digest);
+        };
+
+        // Not TOML.
+        std::fs::write(&source.path, "[agents\nenabled = ").unwrap();
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        rejected(&runtime);
+
+        // TOML, but an unknown rule action.
+        write_agent_config(&source.path, &dir.path().join("audit"), "");
+        let text = std::fs::read_to_string(&source.path)
+            .unwrap()
+            .replace("authenticate = \"allow\"", "authenticate = \"maybe\"");
+        std::fs::write(&source.path, text).unwrap();
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        rejected(&runtime);
+
+        // Valid, but fails `AgentConfig::validate` (max_operations out of range).
+        write_agent_config(
+            &source.path,
+            &dir.path().join("audit"),
+            "max_operations = 0\n",
+        );
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        rejected(&runtime);
+
+        // A change only a restart can apply.
+        write_agent_config(
+            &source.path,
+            &dir.path().join("audit"),
+            "principal_user = \"bob\"\n",
+        );
+        let text = std::fs::read_to_string(&source.path).unwrap().replacen(
+            "principal_user = \"alice\"\n",
+            "",
+            1,
+        );
+        std::fs::write(&source.path, text).unwrap();
+        let err = reload_policy_from_source(Some(&source), &config, &runtime).unwrap_err();
+        assert!(err.contains("restart"), "{err}");
+        rejected(&runtime);
+
+        // A missing file.
+        std::fs::remove_file(&source.path).unwrap();
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime).is_err());
+        rejected(&runtime);
+
+        // No configuration file at all.
+        assert!(reload_policy_from_source(None, &config, &runtime).is_err());
+        rejected(&runtime);
+    }
 
     #[test]
     fn worker_tracker_try_acquire_respects_limit() {

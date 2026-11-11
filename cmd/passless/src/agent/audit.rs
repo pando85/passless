@@ -545,6 +545,11 @@ pub struct AuditGate {
     #[cfg(test)]
     fault_injector: Box<dyn FaultInjector + Sync>,
     segment_file_ino: Mutex<u64>,
+    /// Serializes `record`, including segment rotation. Every other `AuditGate` mutex is only taken
+    /// under it (or alone, by read-only accessors), so their relative order cannot deadlock, and a
+    /// record cannot interleave with another one between computing its sequence and writing it.
+    /// The audit gate is a leaf: nothing outside it is acquired while it is held (LOCKING.md).
+    append_lock: Mutex<()>,
 }
 
 impl AuditGate {
@@ -621,6 +626,7 @@ impl AuditGate {
             #[cfg(test)]
             fault_injector: fi,
             segment_file_ino: Mutex::new(0),
+            append_lock: Mutex::new(()),
         };
 
         gate.initialize_or_verify()?;
@@ -1274,6 +1280,10 @@ impl AuditGate {
         let wall_time_ms = event.timestamp_ms();
         let monotonic_ms = self.epoch.elapsed().as_millis() as u64;
 
+        let _append = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut seq_guard = self.sequence.lock().unwrap();
         let mut hash_guard = self.last_hash.lock().unwrap();
         let mut writer_guard = self.writer.lock().unwrap();
@@ -1403,6 +1413,7 @@ impl AuditGate {
         })
     }
 
+    /// Called only from `record`, under `append_lock`.
     fn rotate_segment(&self) -> Result<(), AuditError> {
         let seg_idx = self.segment_index.lock().unwrap();
         let mut writer_guard = self.writer.lock().unwrap();

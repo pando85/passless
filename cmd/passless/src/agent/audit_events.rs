@@ -187,6 +187,10 @@ pub enum AuditPayload {
     PolicyAllow(PolicyAllowMeta),
     #[serde(rename = "policy.deny")]
     PolicyDeny(PolicyDenyMeta),
+    /// A duplicate request was served the original outcome without a new key use (ADR 0014
+    /// section 9). The `reason` is always `replay_served`.
+    #[serde(rename = "policy.replay_served")]
+    PolicyReplayServed(PolicyDenyMeta),
 
     #[serde(rename = "ceremony.start")]
     CeremonyStart(CeremonyStartMeta),
@@ -286,6 +290,7 @@ impl AuditPayload {
             Self::GrantConsume(_) => "grant.consume",
             Self::PolicyAllow(_) => "policy.allow",
             Self::PolicyDeny(_) => "policy.deny",
+            Self::PolicyReplayServed(_) => "policy.replay_served",
             Self::CeremonyStart(_) => "ceremony.start",
             Self::CeremonySuccess(_) => "ceremony.success",
             Self::CeremonyFailure(_) => "ceremony.failure",
@@ -700,6 +705,28 @@ pub enum PolicyDenyReason {
     BearerRevoked,
     /// None of the requested public-key algorithms is supported by the selected backend.
     AlgorithmUnsupported,
+    /// The session is not bound to the principal the session grant was issued to (ADR 0014 section 7).
+    PrincipalMismatch,
+    /// The revocation epoch moved, or the rule no longer resolves to `allow`, after the session was
+    /// created or while the operation was in flight (ADR 0014 sections 6.4 and 9).
+    PolicyRevoked,
+    /// The bearer session's TTL passed.
+    SessionExpired,
+    /// The replay key was already used in this session and its outcome is no longer returned.
+    Replayed,
+    /// The challenge was already used by a request with a different action, RP or origin.
+    ChallengeReused,
+    /// The session's operation budget is used up.
+    BudgetExhausted,
+    /// The RP asked for an option or extension the agent authenticator cannot honor.
+    UnsupportedOption,
+    /// A credential in `excludeCredentials` already exists.
+    CredentialExcluded,
+    /// Not a denial of the RP request: a duplicate of a completed or in-flight request was served
+    /// the original outcome without a new key use (ADR 0014 section 9).
+    ReplayServed,
+    /// The assertion was made but the browser lease could not be activated; it was withheld.
+    LeaseActivationFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1643,12 +1670,17 @@ impl PolicyDenyBuilder {
     }
 
     pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::PolicyDeny(PolicyDenyMeta {
+        let meta = PolicyDenyMeta {
             profile_id: self.profile_id,
             action: self.action,
             rp_id: self.rp_id,
             reason: self.reason,
-        }))
+        };
+        if meta.reason == PolicyDenyReason::ReplayServed {
+            AuditEvent::new(AuditPayload::PolicyReplayServed(meta))
+        } else {
+            AuditEvent::new(AuditPayload::PolicyDeny(meta))
+        }
     }
 }
 
@@ -2373,6 +2405,13 @@ mod tests {
                 PolicyDenyReason::DefaultDeny,
             )
             .build(),
+            PolicyDenyBuilder::new(
+                pid.clone(),
+                AuditAction::Authenticate,
+                "example.com",
+                PolicyDenyReason::ReplayServed,
+            )
+            .build(),
             CeremonyStartBuilder::new(
                 &cer_id,
                 Some(gid.clone()),
@@ -2589,12 +2628,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 51);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 50, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 51, "duplicate kind names detected");
     }
 
     #[test]
@@ -2766,6 +2805,7 @@ mod tests {
             "grant.consume",
             "policy.allow",
             "policy.deny",
+            "policy.replay_served",
             "ceremony.start",
             "ceremony.success",
             "ceremony.failure",

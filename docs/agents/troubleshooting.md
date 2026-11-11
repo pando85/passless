@@ -134,7 +134,7 @@ Agent/page-provided strings are sanitized and shown only as explicitly untrusted
 
 **Symptom:** The browser is still running but further WebAuthn operations return replay or operation-budget errors.
 
-**Diagnosis:** Each short-lived session has a bounded shared WebAuthn operation budget, and identical completed request bodies are rejected as replays.
+**Diagnosis:** Each short-lived session has a bounded shared WebAuthn operation budget. Allowed operations use it; denied requests and identical repeats do not. A repeat of a completed request is answered with the original result for 120 seconds and rejected as a replay after that. A policy reload that changes the effective policy also revokes the session.
 
 **Fix:** Treat `replayed_operation` as terminal for that operation. Treat `operation_budget_exhausted` as terminal for the session and launch a new bounded session if the operator still intends the task. Repeated retries are not a recovery strategy.
 

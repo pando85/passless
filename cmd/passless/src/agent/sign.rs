@@ -1,16 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
+use passless_core::agent::AgentRequestLimits;
 use passless_core::agent::config::{ANY_RP_ID, CredentialSelection, LOCALHOST_RP_ID};
 use passless_core::agent::protocol::{
     ErrorCode, IntentAction, PrincipalResponse, ProtocolError, RecommendedAction,
@@ -21,8 +22,14 @@ use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::capacity::{BusyScope, ConnectionSlots, RequestLimiter, decrement, try_increment};
+use super::lock_order::{self, LockLevel, Tracked};
 use super::policy_engine::PolicyRuntime;
 use super::register::{RegisterContext, RegisterHandler};
+use super::session::{
+    AgentSession, CeremonyAction, CeremonyOutcome, CeremonyResult, ChallengeDigest, Claim,
+    ClaimRejection, JoinResult, ReplayKey, SessionInvalid, ceremony_deadline,
+};
 
 use crate::storage::CredentialStorage;
 
@@ -265,227 +272,27 @@ pub fn generate_bearer_token() -> Result<String, String> {
     Ok(b64u_encode(&bytes))
 }
 
-#[derive(Debug, Clone)]
-struct InFlightOutcome {
-    status: &'static str,
-    body: Vec<u8>,
-}
-
-#[derive(Debug)]
-enum InFlightState {
-    Pending,
-    Resolved(InFlightOutcome),
-}
-
-#[derive(Debug)]
-struct InFlightEntry {
-    state: Mutex<InFlightState>,
-    done: Condvar,
-}
-
-impl InFlightEntry {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(InFlightState::Pending),
-            done: Condvar::new(),
-        }
-    }
-
-    fn resolve(&self, outcome: InFlightOutcome) {
-        let mut s = match self.state.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        *s = InFlightState::Resolved(outcome);
-        self.done.notify_all();
-    }
-
-    fn wait(&self, timeout: Duration) -> Option<InFlightOutcome> {
-        let guard = match self.state.lock() {
-            Ok(g) => g,
-            Err(_) => return None,
-        };
-        let (guard, timed_out) = match self
-            .done
-            .wait_timeout_while(guard, timeout, |s| matches!(s, InFlightState::Pending))
-        {
-            Ok(pair) => pair,
-            Err(_) => return None,
-        };
-        if timed_out.timed_out() {
-            return None;
-        }
-        match &*guard {
-            InFlightState::Resolved(o) => Some(o.clone()),
-            InFlightState::Pending => None,
-        }
-    }
-}
-
-// Completed-outcome cache: some relying parties (e.g. Kanidm) submit the same
-// WebAuthn request body more than once for a single user gesture. The first
-// request is signed; an identical follow-up must receive the SAME outcome rather
-// than a `replayed_operation` rejection, otherwise the user-facing ceremony fails.
-//
-// Safety: a cached outcome is returned without re-signing, so the sign counter is
-// incremented exactly once and no new signature is produced. The real replay
-// defence remains the relying party's one-time challenge. After the TTL elapses an
-// identical body is rejected as `Replayed` as before.
-const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(120);
-const MAX_COMPLETED_OUTCOMES: usize = 256;
-
-struct CompletedOutcome {
-    outcome: InFlightOutcome,
-    at: Instant,
-}
-
-struct RequestBudgetInner {
-    used: HashSet<[u8; 32]>,
-    in_flight: HashMap<[u8; 32], Arc<InFlightEntry>>,
-    completed: HashMap<[u8; 32], CompletedOutcome>,
-}
-
-#[derive(Clone)]
-struct RequestBudget {
-    inner: Arc<Mutex<RequestBudgetInner>>,
-    max_requests: usize,
-}
-
-impl RequestBudget {
-    fn claim(&self, body: &[u8]) -> RequestClaim {
-        let hash = Sha256::digest(body);
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(&hash);
-
-        let mut inner = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return RequestClaim::Unavailable,
-        };
-
-        if inner.used.contains(&digest) {
-            if let Some(entry) = inner.in_flight.get(&digest) {
-                return RequestClaim::WaitFor(entry.clone());
-            }
-            let now = Instant::now();
-            if let Some(completed) = inner.completed.get(&digest)
-                && now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL
-            {
-                return RequestClaim::Cached {
-                    outcome: completed.outcome.clone(),
-                };
-            }
-            return RequestClaim::Replayed;
-        }
-
-        if inner.used.len() >= self.max_requests {
-            return RequestClaim::Exhausted;
-        }
-
-        inner.used.insert(digest);
-        let entry = Arc::new(InFlightEntry::new());
-        inner.in_flight.insert(digest, entry);
-        RequestClaim::Claimed { digest }
-    }
-
-    fn resolve(&self, digest: [u8; 32], outcome: InFlightOutcome) {
-        let entry = {
-            let mut inner = match self.inner.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            let entry = inner.in_flight.remove(&digest);
-            let now = Instant::now();
-            inner
-                .completed
-                .retain(|_, completed| now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL);
-            if inner.completed.len() >= MAX_COMPLETED_OUTCOMES
-                && let Some(oldest) = inner
-                    .completed
-                    .iter()
-                    .min_by_key(|(_, completed)| completed.at)
-                    .map(|(digest, _)| *digest)
-            {
-                inner.completed.remove(&oldest);
-            }
-            inner.completed.insert(
-                digest,
-                CompletedOutcome {
-                    outcome: outcome.clone(),
-                    at: now,
-                },
-            );
-            entry
-        };
-        if let Some(entry) = entry {
-            entry.resolve(outcome);
-        }
-    }
-}
-
-struct InFlightGuard {
-    budget: RequestBudget,
-    digest: [u8; 32],
-    resolved: bool,
-}
-
-impl InFlightGuard {
-    fn new(budget: RequestBudget, digest: [u8; 32]) -> Self {
-        Self {
-            budget,
-            digest,
-            resolved: false,
-        }
-    }
-
-    fn resolve(&mut self, outcome: InFlightOutcome) {
-        self.budget.resolve(self.digest, outcome);
-        self.resolved = true;
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if !self.resolved {
-            self.budget.resolve(
-                self.digest,
-                InFlightOutcome {
-                    status: "500 Internal Server Error",
-                    body: b"{\"error\":\"internal_error\"}".to_vec(),
-                },
-            );
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct LeaseEntry {
     pub context: SignContext,
     pub handler: Arc<SignHandler>,
     pub lease_id: Option<String>,
-    request_budget: RequestBudget,
-}
-
-impl LeaseEntry {
-    fn claim_request(&self, body: &[u8]) -> RequestClaim {
-        self.request_budget.claim(body)
-    }
 }
 
 pub struct SignContextRegistry {
     entries: Mutex<HashMap<String, LeaseEntry>>,
     registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
     revoked_registrations: Mutex<RevokedRegistrations>,
-    request_budgets: Mutex<HashMap<String, RequestBudget>>,
 }
 
 /// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
-/// revoked with it (ADR 0014 section 9).
+/// revoked with it (ADR 0014 section 9). It shares the sign bearer's session (replay table, budget,
+/// revocation).
 #[derive(Clone)]
 pub struct RegistrationLeaseEntry {
     pub context: RegisterContext,
     pub handler: Arc<RegisterHandler>,
     pub lease_id: Option<String>,
-    request_budget: RequestBudget,
 }
 
 /// Most revoked registration bearers remembered so a late use can be refused and audited.
@@ -539,20 +346,19 @@ impl RevokedRegistrations {
     }
 }
 
-impl RegistrationLeaseEntry {
-    fn claim_request(&self, body: &[u8]) -> RequestClaim {
-        self.request_budget.claim(body)
-    }
+/// A bearer looked up for a request: the sign or the registration context behind it.
+enum BearerEntry {
+    Sign(LeaseEntry),
+    Register(RegistrationLeaseEntry),
 }
 
-#[derive(Debug, Clone)]
-enum RequestClaim {
-    Claimed { digest: [u8; 32] },
-    Replayed,
-    Exhausted,
-    Unavailable,
-    WaitFor(Arc<InFlightEntry>),
-    Cached { outcome: InFlightOutcome },
+impl BearerEntry {
+    fn session(&self) -> &Arc<AgentSession> {
+        match self {
+            Self::Sign(entry) => &entry.context.session,
+            Self::Register(entry) => &entry.context.session,
+        }
+    }
 }
 
 impl SignContextRegistry {
@@ -561,31 +367,41 @@ impl SignContextRegistry {
             entries: Mutex::new(HashMap::new()),
             registration_entries: Mutex::new(HashMap::new()),
             revoked_registrations: Mutex::new(RevokedRegistrations::default()),
-            request_budgets: Mutex::new(HashMap::new()),
         }
     }
 
-    fn request_budget(&self, token: &str, max_requests: usize) -> Result<RequestBudget, String> {
-        let mut budgets = self
-            .request_budgets
-            .lock()
-            .map_err(|_| "registry lock poisoned")?;
-        if let Some(existing) = budgets.get(token) {
-            if existing.max_requests != max_requests {
-                return Err("operation budget mismatch".into());
-            }
-            return Ok(existing.clone());
+    fn lock_entries(&self) -> Tracked<MutexGuard<'_, HashMap<String, LeaseEntry>>> {
+        lock_order::lock(&self.entries, LockLevel::SignRegistry)
+    }
+
+    fn lock_registration_entries(
+        &self,
+    ) -> Tracked<MutexGuard<'_, HashMap<String, RegistrationLeaseEntry>>> {
+        lock_order::lock(&self.registration_entries, LockLevel::SignRegistry)
+    }
+
+    fn lock_revoked_registrations(&self) -> Tracked<MutexGuard<'_, RevokedRegistrations>> {
+        lock_order::lock(&self.revoked_registrations, LockLevel::SignRegistry)
+    }
+
+    /// The session already registered for `token` by the other context kind, if any.
+    fn existing_session(&self, token: &str) -> Option<Arc<AgentSession>> {
+        if let Some(entry) = self.lock_entries().get(token) {
+            return Some(entry.context.session.clone());
         }
-        let budget = RequestBudget {
-            inner: Arc::new(Mutex::new(RequestBudgetInner {
-                used: HashSet::new(),
-                in_flight: HashMap::new(),
-                completed: HashMap::new(),
-            })),
-            max_requests,
-        };
-        budgets.insert(token.to_string(), budget.clone());
-        Ok(budget)
+        self.lock_registration_entries()
+            .get(token)
+            .map(|entry| entry.context.session.clone())
+    }
+
+    /// One bearer has one session: a sign and a registration context of the same token must share it.
+    fn check_same_session(&self, token: &str, session: &Arc<AgentSession>) -> Result<(), String> {
+        match self.existing_session(token) {
+            Some(existing) if !Arc::ptr_eq(&existing, session) => {
+                Err("bearer session mismatch".into())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn register_pending_registration(
@@ -594,13 +410,8 @@ impl SignContextRegistry {
         context: RegisterContext,
         handler: Arc<RegisterHandler>,
     ) -> Result<(), String> {
-        let context = context.with_fresh_revocation();
-        let max_requests = usize::from(context.max_operations);
-        let request_budget = self.request_budget(&token, max_requests)?;
-        let mut map = self
-            .registration_entries
-            .lock()
-            .map_err(|_| "registry lock poisoned")?;
+        self.check_same_session(&token, &context.session)?;
+        let mut map = self.lock_registration_entries();
         if map.contains_key(&token) {
             return Err("duplicate token".into());
         }
@@ -610,7 +421,6 @@ impl SignContextRegistry {
                 context,
                 handler,
                 lease_id: None,
-                request_budget,
             },
         );
         Ok(())
@@ -619,10 +429,7 @@ impl SignContextRegistry {
     /// Bind a registration bearer to its browser lease. Until it is bound the bearer is unusable,
     /// exactly like a sign bearer.
     pub fn bind_registration_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
-        let mut map = self
-            .registration_entries
-            .lock()
-            .map_err(|_| "registry lock poisoned")?;
+        let mut map = self.lock_registration_entries();
         let entry = map.get_mut(token).ok_or("token not found")?;
         if entry.lease_id.is_some() {
             return Err("already bound".into());
@@ -633,10 +440,7 @@ impl SignContextRegistry {
 
     /// A live (bound, not revoked) registration bearer.
     pub fn lookup_registration(&self, token: &str) -> Option<RegistrationLeaseEntry> {
-        let map = match self.registration_entries.lock() {
-            Ok(m) => m,
-            Err(_) => return None,
-        };
+        let map = self.lock_registration_entries();
         let mut found = None;
         for (k, v) in map.iter() {
             if constant_time_eq(token.as_bytes(), k.as_bytes()) {
@@ -648,7 +452,7 @@ impl SignContextRegistry {
 
     /// A registration bearer that was revoked; used only to refuse and audit a late registration.
     pub fn lookup_revoked_registration(&self, token: &str) -> Option<RevokedRegistration> {
-        let revoked = self.revoked_registrations.lock().ok()?;
+        let revoked = self.lock_revoked_registrations();
         let mut found = None;
         for (k, v) in revoked.entries.iter() {
             if constant_time_eq(token.as_bytes(), k.as_bytes()) {
@@ -659,23 +463,15 @@ impl SignContextRegistry {
     }
 
     pub fn revoke_registration(&self, token: &str) -> bool {
-        let removed = self
-            .registration_entries
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(token));
-        let was_present = removed.is_some();
-        if let Some(entry) = &removed {
-            // Fail any request of this bearer that is already past authentication.
-            entry.context.revoke();
-        }
-        if let Some(entry) = removed
-            && let Ok(mut revoked) = self.revoked_registrations.lock()
-        {
-            revoked.remember(token.to_string(), &entry);
-        }
-        self.cleanup_request_budget(token);
-        was_present
+        let removed = self.lock_registration_entries().remove(token);
+        let Some(entry) = removed else {
+            return false;
+        };
+        // Fail any request of this bearer that is already past authentication.
+        entry.context.session.revoke();
+        self.lock_revoked_registrations()
+            .remember(token.to_string(), &entry);
+        true
     }
 
     pub fn register_pending(
@@ -684,9 +480,8 @@ impl SignContextRegistry {
         context: SignContext,
         handler: Arc<SignHandler>,
     ) -> Result<(), String> {
-        let max_requests = usize::from(context.max_operations);
-        let request_budget = self.request_budget(&token, max_requests)?;
-        let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
+        self.check_same_session(&token, &context.session)?;
+        let mut map = self.lock_entries();
         if map.contains_key(&token) {
             return Err("duplicate token".into());
         }
@@ -696,101 +491,64 @@ impl SignContextRegistry {
                 context,
                 handler,
                 lease_id: None,
-                request_budget,
             },
         );
         Ok(())
     }
 
-    fn cleanup_request_budget(&self, token: &str) {
-        let sign_active = self
-            .entries
-            .lock()
-            .map(|map| map.contains_key(token))
-            .unwrap_or(true);
-        let registration_active = self
-            .registration_entries
-            .lock()
-            .map(|map| map.contains_key(token))
-            .unwrap_or(true);
-        if !sign_active
-            && !registration_active
-            && let Ok(mut budgets) = self.request_budgets.lock()
-        {
-            budgets.remove(token);
-        }
-    }
-
     pub fn bind_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
-        let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
-        if !map.contains_key(token) {
-            return Err("token not found".into());
-        }
-        if map.get(token).unwrap().lease_id.is_some() {
+        let mut map = self.lock_entries();
+        let entry = map.get_mut(token).ok_or("token not found")?;
+        if entry.lease_id.is_some() {
             return Err("already bound".into());
         }
-        map.get_mut(token).unwrap().lease_id = Some(lease_id);
+        entry.lease_id = Some(lease_id);
         Ok(())
     }
 
     pub fn lookup_bound(&self, token: &str) -> Option<LeaseEntry> {
-        let map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return None,
-        };
-        let mut found_key: Option<String> = None;
-        for k in map.keys() {
+        let map = self.lock_entries();
+        let mut found = None;
+        for (k, v) in map.iter() {
             if constant_time_eq(token.as_bytes(), k.as_bytes()) {
-                found_key = Some(k.clone());
+                found = Some(v);
             }
         }
-        match found_key {
-            Some(key) => {
-                let entry = map.get(&key)?;
-                entry.lease_id.is_some().then(|| entry.clone())
-            }
-            None => None,
-        }
+        found.filter(|entry| entry.lease_id.is_some()).cloned()
     }
 
     pub fn revoke(&self, token: &str) -> bool {
-        let removed = self
-            .entries
-            .lock()
-            .map(|mut map| map.remove(token).is_some())
-            .unwrap_or(false);
-        self.cleanup_request_budget(token);
-        removed
+        match self.lock_entries().remove(token) {
+            Some(entry) => {
+                entry.context.session.revoke();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn revoke_by_lease(&self, lease_id: &str) -> usize {
-        let mut map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return 0,
+        let removed: Vec<LeaseEntry> = {
+            let mut map = self.lock_entries();
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.iter().filter_map(|k| map.remove(k)).collect()
         };
-        let keys: Vec<String> = map
+        let mut count = removed.len();
+        for entry in &removed {
+            entry.context.session.revoke();
+        }
+
+        // Registration bearers die with the lease too.
+        let registration_keys: Vec<String> = self
+            .lock_registration_entries()
             .iter()
             .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
             .map(|(k, _)| k.clone())
             .collect();
-        let mut count = keys.len();
-        for k in &keys {
-            map.remove(k);
-        }
-        drop(map);
-        for key in keys {
-            self.cleanup_request_budget(&key);
-        }
-
-        // Registration bearers die with the lease too.
-        let registration_keys: Vec<String> = match self.registration_entries.lock() {
-            Ok(map) => map
-                .iter()
-                .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
-                .map(|(k, _)| k.clone())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
         for key in registration_keys {
             if self.revoke_registration(&key) {
                 count += 1;
@@ -799,51 +557,73 @@ impl SignContextRegistry {
         count
     }
 
-    pub fn revoke_all(&self) {
-        if let Ok(mut map) = self.entries.lock() {
-            map.clear();
+    /// Revoke every bearer whose session was created before `current_epoch` (a policy reload or a
+    /// revocation bumped it). In-flight requests of those bearers fail before key use because they
+    /// re-check the epoch; this also drops the entries so the bearers are refused up front.
+    pub fn revoke_stale_sessions(&self, current_epoch: u64) -> usize {
+        let stale_sign: Vec<LeaseEntry> = {
+            let mut map = self.lock_entries();
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| e.context.session.revocation_epoch() != current_epoch)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.iter().filter_map(|k| map.remove(k)).collect()
+        };
+        for entry in &stale_sign {
+            entry.context.session.revoke();
         }
-        if let Ok(mut map) = self.registration_entries.lock() {
-            for entry in map.values() {
-                entry.context.revoke();
+        let stale_registration: Vec<String> = self
+            .lock_registration_entries()
+            .iter()
+            .filter(|(_, e)| e.context.session.revocation_epoch() != current_epoch)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut count = stale_sign.len();
+        for key in stale_registration {
+            if self.revoke_registration(&key) {
+                count += 1;
             }
-            map.clear();
         }
-        if let Ok(mut revoked) = self.revoked_registrations.lock() {
-            *revoked = RevokedRegistrations::default();
+        count
+    }
+
+    pub fn revoke_all(&self) {
+        for entry in self.lock_entries().drain() {
+            entry.1.context.session.revoke();
         }
-        if let Ok(mut budgets) = self.request_budgets.lock() {
-            budgets.clear();
+        for entry in self.lock_registration_entries().drain() {
+            entry.1.context.session.revoke();
         }
+        *self.lock_revoked_registrations() = RevokedRegistrations::default();
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+        self.lock_entries().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// `(used, max)` operations of the session bound to `lease_id`; `max` is the live budget.
     pub fn budget_snapshot_for_lease(&self, lease_id: &str) -> Option<(usize, usize)> {
-        let budget = {
-            let map = self.entries.lock().ok()?;
-            let entry = map
-                .values()
-                .find(|entry| entry.lease_id.as_deref() == Some(lease_id))?;
-            entry.request_budget.clone()
-        };
-        let used = budget.inner.lock().ok()?.used.len();
-        Some((used, budget.max_requests))
+        let entry = self
+            .lock_entries()
+            .values()
+            .find(|entry| entry.lease_id.as_deref() == Some(lease_id))
+            .cloned()?;
+        let max = entry
+            .handler
+            .policy_runtime
+            .max_operations(&entry.context.profile_id)?;
+        let used = entry.context.session.operations_used();
+        Some((used as usize, usize::from(max)))
     }
 
     #[cfg(test)]
     pub fn all_entries(&self) -> Vec<LeaseEntry> {
-        let map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        map.values().cloned().collect()
+        self.lock_entries().values().cloned().collect()
     }
 }
 
@@ -861,7 +641,8 @@ pub struct SignHttpServer {
 
 const MAX_HTTP_BODY_SIZE: usize = 16_384;
 const MAX_HTTP_HEADER_SIZE: usize = 8192;
-const MAX_CONNECTIONS: usize = 8;
+/// How long the accept loop waits for the request of a connection it answers `busy` inline.
+const INLINE_BUSY_READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 impl SignHttpServer {
     pub fn bind(socket_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self, String> {
@@ -891,32 +672,58 @@ impl SignHttpServer {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    pub fn serve(mut self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
+    /// Serve with the default request caps.
+    pub fn serve(self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
+        self.serve_with_limiter(registry, RequestLimiter::new(AgentRequestLimits::default()))
+    }
+
+    /// Serve until shutdown. Every connection gets an answer (plan R11): within
+    /// [`RequestLimiter::max_connections`] a handler thread reads the request and either serves it
+    /// or answers `busy` when a request cap is reached; beyond that the accept loop answers `busy`
+    /// itself.
+    pub fn serve_with_limiter(
+        mut self,
+        registry: Arc<SignContextRegistry>,
+        limiter: Arc<RequestLimiter>,
+    ) -> thread::JoinHandle<()> {
         let shutdown = self.shutdown.clone();
         let listener = self.listener.take().expect("listener already taken");
         let socket_path = self.socket_path.clone();
         thread::spawn(move || {
             listener.set_nonblocking(true).expect("set_nonblocking");
-            let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let open_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 match listener.accept() {
                     Ok((stream, _addr)) => {
-                        let current = active_count.load(Ordering::Acquire);
-                        if current >= MAX_CONNECTIONS {
+                        let admitted = try_increment(&open_connections, limiter.max_connections());
+                        if !admitted {
+                            limiter.note_overflow(BusyScope::Connections);
+                            answer_busy_inline(stream);
                             continue;
                         }
-                        active_count.fetch_add(1, Ordering::AcqRel);
                         let registry = registry.clone();
-                        let count = active_count.clone();
-                        thread::spawn(move || {
-                            if let Err(e) = handle_http_connection(stream, &registry) {
-                                debug!("sign http connection error: {}", e);
-                            }
-                            count.fetch_sub(1, Ordering::AcqRel);
-                        });
+                        let limiter = limiter.clone();
+                        let count = open_connections.clone();
+                        // One set of connection slots per accepted connection (TODO(P6): one
+                        // connection carries one request until the multiplexed transport).
+                        let connection = ConnectionSlots::new();
+                        let spawned = thread::Builder::new()
+                            .name("agent-sign-conn".to_string())
+                            .spawn(move || {
+                                if let Err(e) =
+                                    handle_http_connection(stream, &registry, &limiter, &connection)
+                                {
+                                    debug!("sign http connection error: {}", e);
+                                }
+                                decrement(&count);
+                            });
+                        if let Err(e) = spawned {
+                            decrement(&open_connections);
+                            warn!("sign http: failed to spawn a connection thread: {}", e);
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -940,6 +747,61 @@ impl Drop for SignHttpServer {
     }
 }
 
+/// Answer a connection over the connection cap without a handler thread: read what the client
+/// already sent (briefly), then reply `busy` and close. Never a silent drop (plan R11).
+fn answer_busy_inline(mut stream: UnixStream) {
+    let _ = stream.set_read_timeout(Some(INLINE_BUSY_READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(INLINE_BUSY_READ_TIMEOUT));
+    let mut buf = [0u8; MAX_HTTP_HEADER_SIZE + MAX_HTTP_BODY_SIZE];
+    let _ = stream.read(&mut buf);
+    send_ceremony_error(&mut stream, ErrorCode::Busy);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// The WebAuthn DOMException name the page receives for a daemon error (ADR 0014 sections
+/// 10.2-10.3 and 11). The extension passes it to `complete*Request` and never invents one.
+pub fn dom_exception_name(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::NotSupported => "NotSupportedError",
+        ErrorCode::InvalidState => "InvalidStateError",
+        ErrorCode::OriginInvalid => "SecurityError",
+        // Policy denials, revocation, replay, budget, `busy`, timeouts and internal failures all
+        // look the same to the page (ADR 0014 section 7).
+        _ => "NotAllowedError",
+    }
+}
+
+/// HTTP status and wire error code of a ceremony error.
+fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
+    match code {
+        ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
+        ErrorCode::MalformedMessage => ("400 Bad Request", "invalid_json"),
+        ErrorCode::NotSupported => ("400 Bad Request", "not_supported"),
+        ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
+        ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
+        ErrorCode::OriginInvalid => ("403 Forbidden", "origin_invalid"),
+        ErrorCode::NotFound => ("404 Not Found", "not_found"),
+        ErrorCode::Conflict => ("409 Conflict", "conflict"),
+        ErrorCode::InvalidState => ("409 Conflict", "invalid_state"),
+        ErrorCode::Replayed => ("409 Conflict", "replayed_operation"),
+        ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
+        ErrorCode::BudgetExhausted => ("429 Too Many Requests", "operation_budget_exhausted"),
+        ErrorCode::Busy => ("503 Service Unavailable", "busy"),
+        ErrorCode::Timeout => ("504 Gateway Timeout", "operation_timeout"),
+        _ => ("500 Internal Server Error", "internal_error"),
+    }
+}
+
+fn error_body(code: ErrorCode) -> (&'static str, Vec<u8>) {
+    let (status, wire) = error_status_code(code);
+    let body = format!(
+        "{{\"error\":\"{}\",\"dom\":\"{}\"}}",
+        wire,
+        dom_exception_name(code)
+    );
+    (status, body.into_bytes())
+}
+
 fn send_http_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
     let content_length = body.map(|b| b.len()).unwrap_or(0);
     let header = format!(
@@ -952,31 +814,50 @@ fn send_http_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>
     }
 }
 
+/// A transport-level error that is not a ceremony outcome (routing, authentication, framing).
 fn send_http_error(stream: &mut UnixStream, status: &str, code: &str) {
-    let body = format!("{{\"error\":\"{}\"}}", code);
+    let body = format!("{{\"error\":\"{}\",\"dom\":\"NotAllowedError\"}}", code);
     send_http_response(stream, status, Some(body.as_bytes()));
 }
 
-fn send_sign_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
-    let content_length = body.map(|b| b.len()).unwrap_or(0);
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        status, content_length
-    );
-    let _ = stream.write_all(header.as_bytes());
-    if let Some(body) = body {
-        let _ = stream.write_all(body);
-    }
+fn send_ceremony_error(stream: &mut UnixStream, code: ErrorCode) {
+    let (status, body) = error_body(code);
+    send_http_response(stream, status, Some(&body));
 }
 
-fn send_sign_error(stream: &mut UnixStream, status: &str, code: &str) {
-    let body = format!("{{\"error\":\"{}\"}}", code);
-    send_sign_response(stream, status, Some(body.as_bytes()));
+/// Whether the client of `stream` has gone away (EOF or error), without blocking or consuming data.
+/// A joined duplicate whose client left detaches (V-L1).
+fn peer_hung_up(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = [0u8; 1];
+    // SAFETY: `recv` reads at most one byte into a valid local buffer from a socket this thread
+    // owns; MSG_PEEK leaves it queued and MSG_DONTWAIT never blocks.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n == 0 {
+        return true;
+    }
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        return !matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        );
+    }
+    false
 }
 
 fn handle_http_connection(
     mut stream: UnixStream,
     registry: &SignContextRegistry,
+    limiter: &Arc<RequestLimiter>,
+    connection: &Arc<ConnectionSlots>,
 ) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -1037,132 +918,51 @@ fn handle_http_connection(
             );
         }
     }
-    let auth = match auth_header {
-        Some(a) => a,
-        None => {
-            send_sign_error(&mut stream, "401 Unauthorized", "missing_authorization");
-            return Ok(());
-        }
+    let Some(auth) = auth_header else {
+        send_http_error(&mut stream, "401 Unauthorized", "missing_authorization");
+        return Ok(());
     };
-    let token = match auth.strip_prefix("Bearer ") {
-        Some(t) => t,
-        None => {
-            send_sign_error(
-                &mut stream,
-                "401 Unauthorized",
-                "invalid_authorization_scheme",
-            );
-            return Ok(());
-        }
-    };
-    let is_register = path == "/register";
-    let entry = match if is_register {
-        None
-    } else {
-        registry.lookup_bound(token)
-    } {
-        Some(e) => e,
-        None => {
-            if is_register {
-                let reg_entry = match registry.lookup_registration(token) {
-                    Some(e) => e,
-                    None => {
-                        // A bearer revoked with its browser lease is refused exactly like an
-                        // unknown one, but the attempt is audited.
-                        if let Some(revoked) = registry.lookup_revoked_registration(token)
-                            && let Some(body) =
-                                read_request_body(&mut stream, header_str, &buf, header_end, total)?
-                        {
-                            revoked.refuse(&body);
-                        }
-                        send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
-                        return Ok(());
-                    }
-                };
-                if let Some(ct) = content_type_header
-                    && !ct.to_ascii_lowercase().starts_with("application/json")
-                {
-                    send_sign_error(
-                        &mut stream,
-                        "415 Unsupported Media Type",
-                        "unsupported_content_type",
-                    );
-                    return Ok(());
-                }
-                let Some(body) =
-                    read_request_body(&mut stream, header_str, &buf, header_end, total)?
-                else {
-                    return Ok(());
-                };
-                match reg_entry.claim_request(&body) {
-                    RequestClaim::Claimed { digest } => {
-                        let mut guard =
-                            InFlightGuard::new(reg_entry.request_budget.clone(), digest);
-                        let outcome = handle_register_body(&mut stream, &reg_entry, &body)?;
-                        guard.resolve(outcome);
-                    }
-                    RequestClaim::WaitFor(in_flight) => {
-                        match in_flight.wait(Duration::from_secs(30)) {
-                            Some(outcome) => {
-                                send_sign_response(
-                                    &mut stream,
-                                    outcome.status,
-                                    Some(&outcome.body),
-                                );
-                            }
-                            None => {
-                                send_sign_error(
-                                    &mut stream,
-                                    "500 Internal Server Error",
-                                    "operation_timeout",
-                                );
-                            }
-                        }
-                        return Ok(());
-                    }
-                    RequestClaim::Cached { outcome } => {
-                        send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
-                        return Ok(());
-                    }
-                    RequestClaim::Replayed => {
-                        send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
-                        return Ok(());
-                    }
-                    RequestClaim::Exhausted => {
-                        send_sign_error(
-                            &mut stream,
-                            "429 Too Many Requests",
-                            "operation_budget_exhausted",
-                        );
-                        return Ok(());
-                    }
-                    RequestClaim::Unavailable => {
-                        send_sign_error(
-                            &mut stream,
-                            "500 Internal Server Error",
-                            "operation_registry_unavailable",
-                        );
-                        return Ok(());
-                    }
-                }
-                return Ok(());
-            }
-            send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
-            return Ok(());
-        }
-    };
-    if is_register {
-        send_sign_error(
+    let Some(token) = auth.strip_prefix("Bearer ") else {
+        send_http_error(
             &mut stream,
-            "400 Bad Request",
-            "sign_token_not_for_register",
+            "401 Unauthorized",
+            "invalid_authorization_scheme",
         );
         return Ok(());
-    }
+    };
+
+    // Authenticate the bearer (ADR 0014 section 9, step 1). Session validity (revocation epoch,
+    // TTL) is checked by the handler, which audits it.
+    let is_register = path == "/register";
+    let entry = if is_register {
+        match registry.lookup_registration(token) {
+            Some(entry) => BearerEntry::Register(entry),
+            None => {
+                // A bearer revoked with its browser lease is refused exactly like an unknown one,
+                // but the attempt is audited.
+                if let Some(revoked) = registry.lookup_revoked_registration(token)
+                    && let Some(body) =
+                        read_request_body(&mut stream, header_str, &buf, header_end, total)?
+                {
+                    revoked.refuse(&body);
+                }
+                send_http_error(&mut stream, "401 Unauthorized", "invalid_bearer");
+                return Ok(());
+            }
+        }
+    } else {
+        match registry.lookup_bound(token) {
+            Some(entry) => BearerEntry::Sign(entry),
+            None => {
+                send_http_error(&mut stream, "401 Unauthorized", "invalid_bearer");
+                return Ok(());
+            }
+        }
+    };
     if let Some(ct) = content_type_header
         && !ct.to_ascii_lowercase().starts_with("application/json")
     {
-        send_sign_error(
+        send_http_error(
             &mut stream,
             "415 Unsupported Media Type",
             "unsupported_content_type",
@@ -1172,52 +972,58 @@ fn handle_http_connection(
     let Some(body) = read_request_body(&mut stream, header_str, &buf, header_end, total)? else {
         return Ok(());
     };
-    match entry.claim_request(&body) {
-        RequestClaim::Claimed { digest } => {
-            let mut guard = InFlightGuard::new(entry.request_budget.clone(), digest);
-            let outcome = handle_sign_body(&mut stream, &entry, &body)?;
-            guard.resolve(outcome);
+
+    // Capacity (plan R11): over any cap the request is answered `busy`, never dropped.
+    let _permit = match limiter.try_acquire(connection, entry.session()) {
+        Ok(permit) => permit,
+        Err(scope) => {
+            limiter.note_overflow(scope);
+            send_ceremony_error(&mut stream, ErrorCode::Busy);
+            return Ok(());
         }
-        RequestClaim::WaitFor(in_flight) => {
-            match in_flight.wait(Duration::from_secs(30)) {
-                Some(outcome) => {
-                    send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
-                }
-                None => {
-                    send_sign_error(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "operation_timeout",
-                    );
+    };
+
+    let probe = stream.try_clone().map_err(|e| format!("clone: {}", e))?;
+    let cancelled = move || peer_hung_up(&probe);
+    let now = Instant::now();
+    let (status, response) = match entry {
+        BearerEntry::Sign(entry) => match serde_json::from_slice::<SignAssertionRequest>(&body) {
+            Err(_) => error_body(ErrorCode::MalformedMessage),
+            Ok(req) => {
+                let deadline = ceremony_deadline(req.timeout_ms, now);
+                match entry
+                    .handler
+                    .sign_with(&entry.context, &req, deadline, &cancelled)
+                {
+                    Ok(resp) => (
+                        "200 OK",
+                        serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?,
+                    ),
+                    Err(e) => error_body(e.code),
                 }
             }
-            return Ok(());
+        },
+        BearerEntry::Register(entry) => {
+            match serde_json::from_slice::<RegisterCredentialRequest>(&body) {
+                Err(_) => error_body(ErrorCode::MalformedMessage),
+                Ok(req) => {
+                    let deadline = ceremony_deadline(req.timeout_ms, now);
+                    match entry
+                        .handler
+                        .register_with(&entry.context, &req, deadline, &cancelled)
+                    {
+                        Ok(resp) => (
+                            "200 OK",
+                            serde_json::to_vec(&resp)
+                                .map_err(|e| format!("json serialize: {}", e))?,
+                        ),
+                        Err(e) => error_body(e.code),
+                    }
+                }
+            }
         }
-        RequestClaim::Cached { outcome } => {
-            send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
-            return Ok(());
-        }
-        RequestClaim::Replayed => {
-            send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
-            return Ok(());
-        }
-        RequestClaim::Exhausted => {
-            send_sign_error(
-                &mut stream,
-                "429 Too Many Requests",
-                "operation_budget_exhausted",
-            );
-            return Ok(());
-        }
-        RequestClaim::Unavailable => {
-            send_sign_error(
-                &mut stream,
-                "500 Internal Server Error",
-                "operation_registry_unavailable",
-            );
-            return Ok(());
-        }
-    }
+    };
+    send_http_response(&mut stream, status, Some(&response));
     Ok(())
 }
 
@@ -1241,7 +1047,7 @@ fn read_request_body(
         })
         .unwrap_or(0);
     if content_length > MAX_HTTP_BODY_SIZE {
-        send_sign_error(stream, "413 Payload Too Large", "body_too_large");
+        send_http_error(stream, "413 Payload Too Large", "body_too_large");
         return Ok(None);
     }
     let mut body = Vec::new();
@@ -1249,7 +1055,7 @@ fn read_request_body(
     let remaining = content_length.saturating_sub(total - body_start);
     if remaining > 0 {
         if remaining > MAX_HTTP_BODY_SIZE {
-            send_sign_error(stream, "413 Payload Too Large", "body_too_large");
+            send_http_error(stream, "413 Payload Too Large", "body_too_large");
             return Ok(None);
         }
         let mut extra = vec![0u8; remaining];
@@ -1259,99 +1065,23 @@ fn read_request_body(
         body.extend_from_slice(&extra);
     }
     if body.len() > MAX_HTTP_BODY_SIZE {
-        send_sign_error(stream, "413 Payload Too Large", "body_too_large");
+        send_http_error(stream, "413 Payload Too Large", "body_too_large");
         return Ok(None);
     }
     Ok(Some(body))
 }
 
-fn handle_sign_body(
-    stream: &mut UnixStream,
-    entry: &LeaseEntry,
-    body: &[u8],
-) -> Result<InFlightOutcome, String> {
-    let req: SignAssertionRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(_) => {
-            let outcome = InFlightOutcome {
-                status: "400 Bad Request",
-                body: b"{\"error\":\"invalid_json\"}".to_vec(),
-            };
-            send_sign_response(stream, outcome.status, Some(&outcome.body));
-            return Ok(outcome);
-        }
-    };
-    let outcome = match entry.handler.sign(&entry.context, &req) {
-        Ok(resp) => {
-            let resp_body =
-                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
-            send_sign_response(stream, "200 OK", Some(&resp_body));
-            InFlightOutcome {
-                status: "200 OK",
-                body: resp_body,
-            }
-        }
-        Err(e) => {
-            let (status, code) = error_status_code(e.code);
-            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
-            send_sign_response(stream, status, Some(&err_body));
-            InFlightOutcome {
-                status,
-                body: err_body,
-            }
-        }
-    };
-    Ok(outcome)
-}
-
-fn handle_register_body(
-    stream: &mut UnixStream,
-    reg_entry: &RegistrationLeaseEntry,
-    body: &[u8],
-) -> Result<InFlightOutcome, String> {
-    let req: RegisterCredentialRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(_) => {
-            let outcome = InFlightOutcome {
-                status: "400 Bad Request",
-                body: b"{\"error\":\"invalid_json\"}".to_vec(),
-            };
-            send_sign_response(stream, outcome.status, Some(&outcome.body));
-            return Ok(outcome);
-        }
-    };
-    let outcome = match reg_entry.handler.register(&reg_entry.context, &req) {
-        Ok(resp) => {
-            let resp_body =
-                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
-            send_sign_response(stream, "200 OK", Some(&resp_body));
-            InFlightOutcome {
-                status: "200 OK",
-                body: resp_body,
-            }
-        }
-        Err(e) => {
-            let (status, code) = error_status_code(e.code);
-            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
-            send_sign_response(stream, status, Some(&err_body));
-            InFlightOutcome {
-                status,
-                body: err_body,
-            }
-        }
-    };
-    Ok(outcome)
-}
-
-fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
-    match code {
-        ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-        ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-        ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-        ErrorCode::NotFound => ("404 Not Found", "not_found"),
-        ErrorCode::Conflict => ("409 Conflict", "conflict"),
-        ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
-        _ => ("500 Internal Server Error", "internal_error"),
+/// The assertion inside a replayed or joined outcome. The replay key includes the action, so an
+/// authentication key never holds an attestation.
+fn assertion_outcome(outcome: CeremonyOutcome) -> Result<PrincipalResponse, ProtocolError> {
+    match outcome {
+        Ok(CeremonyResult::Assertion(response)) => Ok(*response),
+        Ok(CeremonyResult::Attestation(_)) => Err(ProtocolError::new(
+            ErrorCode::Internal,
+            "replay outcome has the wrong ceremony type",
+            RecommendedAction::Abort,
+        )),
+        Err(e) => Err(e),
     }
 }
 
@@ -1359,12 +1089,76 @@ fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
 pub struct SignContext {
     pub profile_id: ProfileId,
     pub active_grant_id: passless_core::agent::GrantId,
-    /// Operation budget, copied from the profile at session creation.
-    ///
-    /// TODO(P5): the budget (and the session TTL) are still frozen at creation. Authorization is
-    /// not: rules, selection and acknowledgements resolve against the live policy on every
-    /// request (`PolicyRuntime::resolve`). P5 replaces this copy with the revocation epoch.
-    pub max_operations: u16,
+    /// The bearer session: principal binding, revocation epoch at creation, TTL, replay table and
+    /// budget usage. The budget limit itself (`max_operations`) is read from the live policy on
+    /// every request, never copied here (plan R16).
+    pub session: Arc<AgentSession>,
+    /// Activates the browser lease after an assertion, outside every backend lock (review H1).
+    /// `None` when the lease needs no activation.
+    pub lease_activation: Option<Arc<dyn LeaseActivation>>,
+}
+
+/// Activation of a browser lease by its first assertion.
+pub trait LeaseActivation: Send + Sync {
+    /// Activate the lease, or confirm it is active. Called with no backend lock held; the
+    /// assertion is released to the page only if this succeeds.
+    fn activate(&self) -> Result<(), String>;
+}
+
+/// Activates a managed browser's lease (`AuthenticationPending` to `Active`) after its first
+/// assertion. Once it has succeeded it never touches the browser manager again, so later
+/// ceremonies never wait on another profile's launch or termination.
+pub struct BrowserLeaseActivation {
+    browser_manager: Arc<Mutex<super::browser::BrowserProcessManager>>,
+    lease_id: passless_core::agent::BrowserLeaseId,
+    active_ttl: Duration,
+    activated: AtomicBool,
+}
+
+impl BrowserLeaseActivation {
+    pub fn new(
+        browser_manager: Arc<Mutex<super::browser::BrowserProcessManager>>,
+        lease_id: passless_core::agent::BrowserLeaseId,
+        active_ttl: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            browser_manager,
+            lease_id,
+            active_ttl,
+            activated: AtomicBool::new(false),
+        })
+    }
+}
+
+impl LeaseActivation for BrowserLeaseActivation {
+    fn activate(&self) -> Result<(), String> {
+        if self.activated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut browser_manager =
+            lock_order::lock(&self.browser_manager, LockLevel::BrowserManager);
+        let state = browser_manager
+            .snapshot(&self.lease_id)
+            .ok_or_else(|| "browser lease not found".to_string())?
+            .state;
+        match state {
+            super::browser::LeaseState::AuthenticationPending => {
+                browser_manager
+                    .activate_after_assertion(&self.lease_id, self.active_ttl)
+                    .map_err(|e| {
+                        format!("failed to activate browser lease after assertion: {e}")
+                    })?;
+            }
+            super::browser::LeaseState::Active => {}
+            current => {
+                return Err(format!(
+                    "browser lease cannot activate after assertion from state {current}"
+                ));
+            }
+        }
+        self.activated.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1375,6 +1169,124 @@ pub struct SignHandler {
     pub security_config: SecurityConfig,
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
     pub operation_lock: Arc<Mutex<()>>,
+}
+
+/// Client extensions an authentication request may name. `appid` is honored by never matching a
+/// U2F AppID credential (its output is `false`); `remoteDesktopClientOverride` is browser metadata,
+/// not an RP extension (ADR 0014 section 10.2).
+const SUPPORTED_GET_EXTENSIONS: &[&str] = &["appid", "remoteDesktopClientOverride"];
+/// Most extension identifiers a request may name, and their longest accepted length.
+pub(crate) const MAX_EXTENSIONS: usize = 32;
+pub(crate) const MAX_EXTENSION_ID_LEN: usize = 64;
+
+/// Check the extension identifiers of a request against `supported`. `Ok(false)` means an
+/// unsupported extension was requested (`NotSupportedError`); `Err` means the list is malformed.
+pub(crate) fn extensions_supported(
+    requested: &[String],
+    supported: &[&str],
+) -> Result<bool, ProtocolError> {
+    if requested.len() > MAX_EXTENSIONS
+        || requested
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_EXTENSION_ID_LEN)
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::BadRequest,
+            "malformed extension list",
+            RecommendedAction::FixRequest,
+        ));
+    }
+    Ok(requested.iter().all(|id| supported.contains(&id.as_str())))
+}
+
+/// Map a session that can no longer be used to its audit reason and error.
+pub(crate) fn session_invalid_error(invalid: SessionInvalid) -> (PolicyDenyReason, ProtocolError) {
+    match invalid {
+        SessionInvalid::Revoked => (
+            PolicyDenyReason::BearerRevoked,
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "bearer session was revoked",
+                RecommendedAction::Abort,
+            ),
+        ),
+        SessionInvalid::EpochChanged => (
+            PolicyDenyReason::PolicyRevoked,
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "bearer session was revoked by a policy change",
+                RecommendedAction::Abort,
+            ),
+        ),
+        SessionInvalid::Expired => (
+            PolicyDenyReason::SessionExpired,
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "bearer session expired",
+                RecommendedAction::Abort,
+            ),
+        ),
+    }
+}
+
+/// Map a refused claim to its audit reason and error. None of these consumed budget.
+pub(crate) fn claim_rejection_error(
+    rejection: ClaimRejection,
+) -> (PolicyDenyReason, ProtocolError) {
+    match rejection {
+        ClaimRejection::Replayed => (
+            PolicyDenyReason::Replayed,
+            ProtocolError::new(
+                ErrorCode::Replayed,
+                "this request was already processed in this session",
+                RecommendedAction::Abort,
+            ),
+        ),
+        ClaimRejection::ChallengeReused => (
+            PolicyDenyReason::ChallengeReused,
+            ProtocolError::new(
+                ErrorCode::Replayed,
+                "this challenge was already used by a different request",
+                RecommendedAction::Abort,
+            ),
+        ),
+        ClaimRejection::BudgetExhausted => (
+            PolicyDenyReason::BudgetExhausted,
+            ProtocolError::new(
+                ErrorCode::BudgetExhausted,
+                "session operation budget exhausted",
+                RecommendedAction::Abort,
+            ),
+        ),
+    }
+}
+
+/// The error of a duplicate that did not get the original's outcome.
+pub(crate) fn join_failure(result: JoinResult) -> ProtocolError {
+    match result {
+        JoinResult::Detached => ProtocolError::new(
+            ErrorCode::Timeout,
+            "request aborted while waiting for an identical request",
+            RecommendedAction::Abort,
+        ),
+        _ => ProtocolError::new(
+            ErrorCode::Timeout,
+            "ceremony deadline passed while waiting for an identical request",
+            RecommendedAction::Abort,
+        ),
+    }
+}
+
+/// Decode the request challenge; a malformed one is rejected before the replay key (no budget).
+pub(crate) fn decode_challenge(challenge_b64u: &str) -> Result<Vec<u8>, ProtocolError> {
+    match b64u_decode(challenge_b64u) {
+        Ok(challenge) if !challenge.is_empty() => Ok(challenge),
+        _ => Err(ProtocolError::new(
+            ErrorCode::BadRequest,
+            "invalid challenge_b64u encoding",
+            RecommendedAction::FixRequest,
+        )),
+    }
 }
 
 impl SignHandler {
@@ -1389,116 +1301,196 @@ impl SignHandler {
         let _ = self.audit_gate.record(deny_event);
     }
 
+    fn deny(
+        &self,
+        ctx: &SignContext,
+        rp_id: &str,
+        (reason, error): (PolicyDenyReason, ProtocolError),
+    ) -> ProtocolError {
+        self.record_policy_deny(ctx, rp_id, reason);
+        error
+    }
+
+    /// Authenticate with the default ceremony deadline and no cancellation (tests and direct use).
     pub fn sign(
         &self,
         ctx: &SignContext,
         req: &SignAssertionRequest,
     ) -> Result<PrincipalResponse, ProtocolError> {
+        let deadline = ceremony_deadline(req.timeout_ms, Instant::now());
+        self.sign_with(ctx, req, deadline, &|| false)
+    }
+
+    /// The bearer session is usable and bound to this context's profile.
+    fn check_session(&self, ctx: &SignContext, rp_id: &str) -> Result<(), ProtocolError> {
+        if ctx.session.profile_id() != &ctx.profile_id {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::SessionMismatch,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "bearer session belongs to another profile",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        ctx.session
+            .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+            .map_err(|invalid| self.deny(ctx, rp_id, session_invalid_error(invalid)))
+    }
+
+    /// The session grant is active, was issued to this session's principal, and covers `rp_id`.
+    fn check_grant(
+        &self,
+        ctx: &SignContext,
+        rp_id: &str,
+    ) -> Result<super::policy_engine::GrantSignSnapshot, ProtocolError> {
+        let grant = self
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
+            .ok_or_else(|| {
+                self.deny(
+                    ctx,
+                    rp_id,
+                    (
+                        PolicyDenyReason::GrantNotFound,
+                        ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            "active grant not valid",
+                            RecommendedAction::FixRequest,
+                        ),
+                    ),
+                )
+            })?;
+        if grant.is_revoked {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::GrantRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "grant revoked",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        if grant.state != super::grant::GrantState::Active {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::GrantExpired,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "grant expired",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        // The session is bound to the principal it was created for (ADR 0014 sections 7 and 9).
+        if grant.profile_id != ctx.profile_id
+            || !constant_time_eq(&grant.principal_digest, ctx.session.principal_digest())
+        {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::PrincipalMismatch,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "bearer session is not bound to the grant's principal",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        if !grant.rp_ids.iter().any(|id| {
+            let scope_rp = normalize_rp_id(id);
+            scope_rp == rp_id || (scope_rp == ANY_RP_ID && rp_id != LOCALHOST_RP_ID)
+        }) {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::RpIdNotMatch,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "RP ID not in active grant",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        Ok(grant)
+    }
+
+    /// Authenticate. The checks run in the order of ADR 0014 section 9 and plan R4; each step
+    /// that rejects returns before any later step, so a rejected request never reaches the replay
+    /// table, the budget, the audit reservation or the key:
+    ///
+    /// 1. bearer session: not revoked, revocation epoch unchanged, TTL not passed, same profile;
+    /// 2. origin and RP validation;
+    /// 3. session grant: active, bound to the session's principal digest, RP in scope;
+    /// 4. resolve the rule against the live policy and granted rules (`deny`, `request`, `allow`);
+    /// 5. options the authenticator cannot honor (`NotSupportedError`) and a malformed challenge;
+    /// 6. replay key, then budget ([`AgentSession::claim`]);
+    /// 7. backend operation lock and credential selection ([`Self::sign_fresh`]);
+    /// 8. durable audit reservation;
+    /// 9. immediately before key use: revocation epoch, live re-resolve, session and grant validity;
+    /// 10. key use: counter update, then the signature.
+    pub fn sign_with(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
 
+        // 1. Bearer session.
+        self.check_session(ctx, &normalized_rp)?;
+
+        // 2. Origin and RP validation.
         if !verify_origin_context(
             &req.origin,
             req.top_origin.as_deref(),
             req.cross_origin,
             &normalized_rp,
         ) {
-            let (reason, message) = if req.cross_origin {
+            let (reason, code, message) = if req.cross_origin {
                 (
                     PolicyDenyReason::CrossOriginDenied,
+                    ErrorCode::Forbidden,
                     "cross-origin frames are not permitted",
                 )
             } else {
-                (PolicyDenyReason::OriginInvalid, "origin not valid for RP")
+                (
+                    PolicyDenyReason::OriginInvalid,
+                    ErrorCode::OriginInvalid,
+                    "origin not valid for RP",
+                )
             };
-            self.record_policy_deny(ctx, &normalized_rp, reason);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                message,
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let _op_lock = self.operation_lock.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "operation lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
-
-        let grant_snapshot = self
-            .policy_runtime
-            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
-            .ok_or_else(|| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
-                    PolicyDenyReason::GrantNotFound,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "active grant not valid",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        if grant_snapshot.is_revoked {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
+            return Err(self.deny(
+                ctx,
                 &normalized_rp,
-                PolicyDenyReason::GrantRevoked,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "grant revoked",
-                RecommendedAction::FixRequest,
+                (
+                    reason,
+                    ProtocolError::new(code, message, RecommendedAction::FixRequest),
+                ),
             ));
         }
 
-        if grant_snapshot.state != super::grant::GrantState::Active {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::GrantExpired,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "grant expired",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // 3. Session grant and principal binding.
+        let grant = self.check_grant(ctx, &normalized_rp)?;
 
-        if !grant_snapshot.rp_ids.iter().any(|id| {
-            let scope_rp = normalize_rp_id(id);
-            scope_rp == normalized_rp || (scope_rp == ANY_RP_ID && normalized_rp != LOCALHOST_RP_ID)
-        }) {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::RpIdNotMatch,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "RP ID not in active grant",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        // Resolve against the live policy and granted rules on every request, never against a copy
-        // of the profile configuration frozen into the session at creation (plan R16).
-        // TODO(P5): also compare the revocation epoch here and again immediately before key use.
+        // 4. Resolve against the live policy and granted rules on every request, never against a
+        //    copy of the profile configuration frozen into the session (plan R16).
         let matched = self.policy_runtime.resolve(
             &ctx.profile_id,
             &IntentAction::Authenticate,
@@ -1506,53 +1498,185 @@ impl SignHandler {
         );
         match matched.action {
             RuleAction::Deny => {
-                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    if matched.rule == RuleIdentity::None {
-                        "RP policy does not allow signing"
-                    } else {
-                        "RP policy denies signing"
-                    },
-                    RecommendedAction::FixRequest,
-                ));
-            }
-            // `request` acts as `deny` until the escalation service lands (P7): an agent ceremony
-            // never shows a prompt and never falls back to the human or native path (ADR 0014
-            // section 7, invariant 25).
-            RuleAction::Request => {
-                self.record_policy_deny(
+                return Err(self.deny(
                     ctx,
                     &normalized_rp,
-                    PolicyDenyReason::EscalationUnavailable,
-                );
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "escalation is unavailable: policy requires approval",
-                    RecommendedAction::FixRequest,
+                    (
+                        PolicyDenyReason::ActionNotAllowed,
+                        ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            if matched.rule == RuleIdentity::None {
+                                "RP policy does not allow signing"
+                            } else {
+                                "RP policy denies signing"
+                            },
+                            RecommendedAction::FixRequest,
+                        ),
+                    ),
+                ));
+            }
+            // P7 SEAM (escalation). `request` acts as `deny` until the escalation service lands: an
+            // agent ceremony never shows a prompt and never falls back to the human or native path
+            // (ADR 0014 section 7, invariant 25). P7 replaces this arm with: cooldown, grant cap,
+            // notification bus and queue checks; then the replay key (a duplicate joins the pending
+            // escalation instead of prompting again); then the wait for the decision, holding no
+            // lock (LOCKING.md); and only after approval continues at step 5 below, so the budget
+            // is claimed after approval (plan R4 as revised by V-H2).
+            RuleAction::Request => {
+                return Err(self.deny(
+                    ctx,
+                    &normalized_rp,
+                    (
+                        PolicyDenyReason::EscalationUnavailable,
+                        ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            "escalation is unavailable: policy requires approval",
+                            RecommendedAction::FixRequest,
+                        ),
+                    ),
                 ));
             }
             RuleAction::Allow => {}
         }
 
+        // 5. Unsupported options fail with `NotSupportedError` before any budget is claimed.
+        if !extensions_supported(&req.extensions, SUPPORTED_GET_EXTENSIONS)? {
+            return Err(self.deny(
+                ctx,
+                &normalized_rp,
+                (
+                    PolicyDenyReason::UnsupportedOption,
+                    ProtocolError::new(
+                        ErrorCode::NotSupported,
+                        "a requested extension is not supported",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        let challenge = decode_challenge(&req.challenge_b64u)?;
+
+        // 6. Replay key, then budget (R1, R4). The budget limit is the live `max_operations`.
+        let key = ReplayKey::derive(
+            CeremonyAction::Authenticate,
+            &normalized_rp,
+            &req.origin,
+            req.top_origin.as_deref(),
+            &challenge,
+        );
+        let max_operations = self
+            .policy_runtime
+            .max_operations(&ctx.profile_id)
+            .unwrap_or(0);
+        match ctx.session.claim(
+            key,
+            ChallengeDigest::of(&challenge),
+            u32::from(max_operations),
+            Instant::now(),
+        ) {
+            Claim::Fresh(guard) => {
+                let mut key_used = false;
+                let outcome =
+                    self.sign_fresh(ctx, req, &normalized_rp, &grant, &matched, &mut key_used);
+                // The operation lock is released: activate the browser lease now (review H1).
+                // The assertion is released only if activation succeeds.
+                let outcome = outcome.and_then(|response| {
+                    self.activate_lease(ctx, &normalized_rp).map(|()| response)
+                });
+                let ceremony = outcome
+                    .clone()
+                    .map(|response| CeremonyResult::Assertion(Box::new(response)));
+                if key_used {
+                    guard.complete(&ceremony);
+                } else {
+                    // Ended before key use: the key stays consumed, the budget is given back.
+                    guard.complete_without_key_use(&ceremony);
+                }
+                outcome
+            }
+            Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled) {
+                JoinResult::Completed(outcome) => {
+                    self.serve_duplicate(ctx, &normalized_rp, audit)?;
+                    assertion_outcome(outcome)
+                }
+                other => Err(join_failure(other)),
+            },
+            Claim::Completed(outcome, audit) => {
+                self.serve_duplicate(ctx, &normalized_rp, audit)?;
+                assertion_outcome(outcome)
+            }
+            Claim::Rejected(rejection) => {
+                Err(self.deny(ctx, &normalized_rp, claim_rejection_error(rejection)))
+            }
+        }
+    }
+
+    /// Before a duplicate gets the stored outcome, its session must still be valid (review L3):
+    /// a revoked or re-epoched session is not served. Served duplicates are audited, at most
+    /// `MAX_AUDITED_SERVES_PER_KEY` per key.
+    fn serve_duplicate(
+        &self,
+        ctx: &SignContext,
+        rp_id: &str,
+        audit: bool,
+    ) -> Result<(), ProtocolError> {
+        ctx.session
+            .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+            .map_err(|invalid| self.deny(ctx, rp_id, session_invalid_error(invalid)))?;
+        if audit {
+            self.record_policy_deny(ctx, rp_id, PolicyDenyReason::ReplayServed);
+        }
+        Ok(())
+    }
+
+    /// Activate the browser lease after key use, with no backend lock held (review H1).
+    fn activate_lease(&self, ctx: &SignContext, rp_id: &str) -> Result<(), ProtocolError> {
+        let Some(activation) = &ctx.lease_activation else {
+            return Ok(());
+        };
+        activation.activate().map_err(|e| {
+            warn!("agent sign: {}", e);
+            self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::LeaseActivationFailed,
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "browser lease activation failed",
+                        RecommendedAction::Retry,
+                    ),
+                ),
+            )
+        })
+    }
+
+    /// Steps 7-10 for a fresh replay key. The backend operation lock is held only here: never
+    /// across a join, an escalation wait, the browser manager or a policy guard (LOCKING.md).
+    /// `key_used` is set right before the key provider signs.
+    fn sign_fresh(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        normalized_rp: &str,
+        grant: &super::policy_engine::GrantSignSnapshot,
+        matched: &passless_core::agent::MatchedRule,
+        key_used: &mut bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
         // `allow` is the only agent evidence: UP and UV come from the validated agent session,
         // never from a rule field or the RP's `userVerification` request (ADR 0014 section 7).
         let up = true;
         let uv = true;
 
-        let mut storage = self.credential_storage.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "storage lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        // 7. Backend operation lock, then storage, for selection, reservation and key use.
+        let _op_lock = lock_order::lock(&self.operation_lock, LockLevel::Operation);
+        let mut storage = lock_order::lock(&self.credential_storage, LockLevel::Storage);
 
-        let credential_scope = if grant_snapshot.credential_refs.is_empty() {
+        let credential_scope = if grant.credential_refs.is_empty() {
             let mut discovered = Vec::new();
             if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::None) {
                 loop {
-                    if credential.rp.id.eq_ignore_ascii_case(&normalized_rp) {
+                    if credential.rp.id.eq_ignore_ascii_case(normalized_rp) {
                         discovered.push(CredentialRef::with_default_domain(&credential.id));
                     }
                     match storage.read_next() {
@@ -1563,13 +1687,13 @@ impl SignHandler {
             }
             discovered
         } else {
-            grant_snapshot.credential_refs.clone()
+            grant.credential_refs.clone()
         };
 
         let mut candidates = Vec::new();
         for credential_ref in &credential_scope {
             if let Ok(credential_id) =
-                Self::resolve_credential_id(&mut storage, credential_ref, &normalized_rp)
+                Self::resolve_credential_id(&mut storage, credential_ref, normalized_rp)
                 && let Ok(credential) = storage.read(&credential_id)
             {
                 candidates.push((credential_id, credential_ref.clone(), credential.created));
@@ -1583,7 +1707,7 @@ impl SignHandler {
         if candidates.is_empty() && !req.allow_credentials.is_empty() {
             self.record_policy_deny(
                 ctx,
-                &normalized_rp,
+                normalized_rp,
                 PolicyDenyReason::AllowCredentialsMismatch,
             );
             return Err(ProtocolError::new(
@@ -1595,13 +1719,14 @@ impl SignHandler {
 
         let cred_id =
             Self::select_credential(candidates, &matched.selection).inspect_err(|_| {
-                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::CredentialNotMatch);
+                self.record_policy_deny(ctx, normalized_rp, PolicyDenyReason::CredentialNotMatch);
             })?;
 
+        // 8. Durable audit reservation before key use (invariant 16).
         let allow_event = PolicyAllowBuilder::new(
             ctx.profile_id.clone(),
             AuditAction::Authenticate,
-            &normalized_rp,
+            normalized_rp,
         )
         .evidence_sources("allow", "agent", "agent")
         .build();
@@ -1621,7 +1746,7 @@ impl SignHandler {
             )
         })?;
         if cred.extensions.cred_protect == Some(3) && !uv {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
+            self.record_policy_deny(ctx, normalized_rp, PolicyDenyReason::UvRequired);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "credential protection policy requires user verification",
@@ -1629,6 +1754,19 @@ impl SignHandler {
             ));
         }
 
+        // 9. Immediately before key use (invariant 13): the revocation epoch, the rule re-resolved
+        //    against the live policy and grants, and the session and its grant. A failure here
+        //    is the terminal record of the reservation above. The key-use gates are held from
+        //    here to the end of key use, so a revocation (session revoke or epoch bump) either
+        //    happens before this check or waits for the signature (review M1).
+        #[cfg(test)]
+        super::session::test_hooks::before_key_use();
+        let _session_gate = ctx.session.key_use_guard();
+        let _epoch_gate = self.policy_runtime.key_use_guard();
+        self.recheck_before_key_use(ctx, normalized_rp)?;
+
+        // 10. Key use: persist the counter, release storage, then sign. The browser lease is
+        //     activated by the caller after the operation lock is released (review H1).
         let new_sign_count =
             if self.security_config.constant_signature_counter || !cred.discoverable {
                 0
@@ -1657,14 +1795,11 @@ impl SignHandler {
                 cred_random: updated_cred.extensions.cred_random.as_ref(),
             };
             storage.write(cred_ref).map_err(|_| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
+                self.record_policy_deny(
+                    ctx,
+                    normalized_rp,
                     PolicyDenyReason::CounterPersistenceFailure,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
+                );
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "failed to write updated credential",
@@ -1672,11 +1807,12 @@ impl SignHandler {
                 )
             })?;
         }
+        drop(storage);
 
         let backup_flags = cred.backup_state.flags();
 
         let authenticator_data =
-            build_authenticator_data(&normalized_rp, up, uv, backup_flags, new_sign_count);
+            build_authenticator_data(normalized_rp, up, uv, backup_flags, new_sign_count);
 
         let client_data_json = build_client_data_json(
             &req.origin,
@@ -1687,6 +1823,7 @@ impl SignHandler {
         let client_data_hash = Sha256::digest(&client_data_json);
 
         let sig_input = [&authenticator_data[..], &client_data_hash[..]].concat();
+        *key_used = true;
         let signature = self
             .key_provider
             .sign(&cred.key, cred.alg, &sig_input)
@@ -1707,6 +1844,50 @@ impl SignHandler {
                 client_data_json_b64u: b64u_encode(&client_data_json),
             },
         ))
+    }
+
+    /// Invariant 13: re-check the revocation epoch and the session, re-resolve the rule against
+    /// the live policy and grants, and re-check the grant, immediately before key use.
+    fn recheck_before_key_use(&self, ctx: &SignContext, rp_id: &str) -> Result<(), ProtocolError> {
+        ctx.session
+            .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+            .map_err(|invalid| self.deny(ctx, rp_id, session_invalid_error(invalid)))?;
+        let matched =
+            self.policy_runtime
+                .resolve(&ctx.profile_id, &IntentAction::Authenticate, rp_id);
+        if matched.action != RuleAction::Allow {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "policy no longer allows this operation",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        let grant_active = self
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
+            .is_some_and(|grant| grant.state == super::grant::GrantState::Active);
+        if !grant_active {
+            return Err(self.deny(
+                ctx,
+                rp_id,
+                (
+                    PolicyDenyReason::GrantRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "grant is no longer active",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Narrow the candidate set (ADR 0014 section 10.1): a `credential:<ref>` selection pins
@@ -1797,6 +1978,22 @@ impl SignHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bearer session for `profile_id`, bound like a session issued with an all-zero principal
+    /// digest at revocation epoch 1 (a fresh `PolicyRuntime`).
+    fn test_session(profile_id: &ProfileId) -> Arc<AgentSession> {
+        test_session_at(profile_id, 1)
+    }
+
+    /// A bearer session created at revocation epoch `epoch`.
+    fn test_session_at(profile_id: &ProfileId, epoch: u64) -> Arc<AgentSession> {
+        AgentSession::new(super::super::session::SessionBinding {
+            profile_id: profile_id.clone(),
+            principal_digest: [0u8; 32],
+            revocation_epoch: epoch,
+            ttl: Duration::from_secs(600),
+        })
+    }
 
     #[test]
     fn test_client_data_json_no_cross_origin() {
@@ -2291,230 +2488,6 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_request_budget_is_shared_for_one_bearer() {
-        let registry = SignContextRegistry::new();
-        let token = generate_bearer_token().unwrap();
-        let first = registry.request_budget(&token, 2).unwrap();
-        let second = registry.request_budget(&token, 2).unwrap();
-
-        assert!(matches!(
-            first.claim(b"register-operation"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(
-            second.claim(b"register-operation"),
-            RequestClaim::WaitFor(_)
-        ));
-        assert!(matches!(
-            second.claim(b"sign-operation"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(
-            first.claim(b"third-operation"),
-            RequestClaim::Exhausted
-        ));
-        assert!(registry.request_budget(&token, 3).is_err());
-    }
-
-    fn make_budget(max_requests: usize) -> RequestBudget {
-        RequestBudget {
-            inner: Arc::new(Mutex::new(RequestBudgetInner {
-                used: HashSet::new(),
-                in_flight: HashMap::new(),
-                completed: HashMap::new(),
-            })),
-            max_requests,
-        }
-    }
-
-    #[test]
-    fn test_claim_duplicate_in_flight_returns_wait_for() {
-        let budget = make_budget(5);
-        let body = b"identical-request-body";
-        let first = budget.claim(body);
-        assert!(matches!(first, RequestClaim::Claimed { .. }));
-        let second = budget.claim(body);
-        assert!(matches!(second, RequestClaim::WaitFor(_)));
-
-        let RequestClaim::Claimed { digest } = first else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"result".to_vec(),
-            },
-        );
-
-        let third = budget.claim(body);
-        assert!(matches!(third, RequestClaim::Cached { .. }));
-    }
-
-    #[test]
-    fn test_completed_expired_returns_replayed() {
-        let budget = make_budget(5);
-        let body = b"expired-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"ok".to_vec(),
-            },
-        );
-        {
-            let mut inner = budget.inner.lock().unwrap();
-            if let Some(completed) = inner.completed.get_mut(&digest) {
-                completed.at = Instant::now() - COMPLETED_OUTCOME_TTL - Duration::from_secs(1);
-            }
-        }
-        assert!(matches!(budget.claim(body), RequestClaim::Replayed));
-    }
-
-    #[test]
-    fn test_claim_different_bodies_both_claimed() {
-        let budget = make_budget(5);
-        assert!(matches!(
-            budget.claim(b"body-a"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(
-            budget.claim(b"body-b"),
-            RequestClaim::Claimed { .. }
-        ));
-    }
-
-    #[test]
-    fn test_claim_budget_exhausted() {
-        let budget = make_budget(2);
-        assert!(matches!(budget.claim(b"one"), RequestClaim::Claimed { .. }));
-        assert!(matches!(budget.claim(b"two"), RequestClaim::Claimed { .. }));
-        assert!(matches!(budget.claim(b"three"), RequestClaim::Exhausted));
-    }
-
-    #[test]
-    fn test_in_flight_waiter_receives_resolved_outcome() {
-        let budget = make_budget(5);
-        let body = b"shared-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
-            panic!("expected WaitFor");
-        };
-
-        let waiter = std::thread::spawn(move || entry.wait(Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(50));
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "403 Forbidden",
-                body: b"{\"error\":\"forbidden\"}".to_vec(),
-            },
-        );
-        let outcome = waiter.join().unwrap().expect("waiter should resolve");
-        assert_eq!(outcome.status, "403 Forbidden");
-        assert_eq!(outcome.body, b"{\"error\":\"forbidden\"}");
-    }
-
-    #[test]
-    fn test_in_flight_waiter_timeout_returns_none() {
-        let budget = make_budget(5);
-        let body = b"timeout-body";
-        assert!(matches!(budget.claim(body), RequestClaim::Claimed { .. }));
-        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
-            panic!("expected WaitFor");
-        };
-        assert!(entry.wait(Duration::from_millis(50)).is_none());
-    }
-
-    #[test]
-    fn test_in_flight_guard_drop_resolves_waiters() {
-        let budget = make_budget(5);
-        let body = b"guard-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
-            panic!("expected WaitFor");
-        };
-        {
-            let guard = InFlightGuard::new(budget.clone(), digest);
-            drop(guard);
-        }
-        let outcome = entry
-            .wait(Duration::from_secs(5))
-            .expect("resolved by drop");
-        assert_eq!(outcome.status, "500 Internal Server Error");
-    }
-
-    #[test]
-    fn test_completed_duplicate_within_ttl_returns_cached() {
-        let budget = make_budget(5);
-        let body = b"cached-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"cached-result".to_vec(),
-            },
-        );
-        let RequestClaim::Cached { outcome } = budget.claim(body) else {
-            panic!("expected Cached");
-        };
-        assert_eq!(outcome.status, "200 OK");
-        assert_eq!(outcome.body, b"cached-result");
-    }
-
-    #[test]
-    fn test_completed_cache_does_not_consume_extra_budget() {
-        let budget = make_budget(2);
-        let body = b"budget-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"ok".to_vec(),
-            },
-        );
-        assert!(matches!(budget.claim(body), RequestClaim::Cached { .. }));
-        assert!(matches!(
-            budget.claim(b"other"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(budget.claim(b"third"), RequestClaim::Exhausted));
-    }
-
-    #[test]
-    fn test_completed_cache_bounded_size() {
-        let budget = make_budget(MAX_COMPLETED_OUTCOMES + 8);
-        for i in 0..MAX_COMPLETED_OUTCOMES + 4 {
-            let body = format!("body-{}", i);
-            let RequestClaim::Claimed { digest } = budget.claim(body.as_bytes()) else {
-                panic!("expected Claimed");
-            };
-            budget.resolve(
-                digest,
-                InFlightOutcome {
-                    status: "200 OK",
-                    body: b"ok".to_vec(),
-                },
-            );
-        }
-        let used = budget.inner.lock().unwrap().completed.len();
-        assert!(used <= MAX_COMPLETED_OUTCOMES);
-    }
-
-    #[test]
     fn test_registry_unknown_token() {
         let registry = SignContextRegistry::new();
         assert!(registry.lookup_bound("nonexistent").is_none());
@@ -2576,6 +2549,33 @@ mod tests {
         assert_eq!(registry.len(), 3);
         registry.revoke_all();
         assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_revoke_stale_sessions_keeps_current_ones() {
+        let registry = SignContextRegistry::new();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let mut stale_ctx = f.make_ctx();
+        stale_ctx.session = test_session_at(&profile, 1);
+        let mut current_ctx = f.make_ctx();
+        current_ctx.session = test_session_at(&profile, 2);
+        let stale = generate_bearer_token().unwrap();
+        let current = generate_bearer_token().unwrap();
+        for (token, ctx) in [(&stale, &stale_ctx), (&current, &current_ctx)] {
+            registry
+                .register_pending(token.clone(), ctx.clone(), handler.clone())
+                .unwrap();
+            registry
+                .bind_lease(token, format!("lease-{token}"))
+                .unwrap();
+        }
+        assert_eq!(registry.revoke_stale_sessions(2), 1);
+        assert!(registry.lookup_bound(&stale).is_none());
+        assert!(stale_ctx.session.is_revoked());
+        assert!(registry.lookup_bound(&current).is_some());
+        assert!(!current_ctx.session.is_revoked());
     }
 
     #[test]
@@ -2671,6 +2671,8 @@ mod tests {
         registry.bind_lease(&token, "lease-rt".to_string()).unwrap();
         let handle = server.serve(registry);
         let body = serde_json::to_vec(&SignAssertionRequest {
+            extensions: Vec::new(),
+            timeout_ms: None,
             origin: "https://example.com".to_string(),
             top_origin: None,
             rp_id: "example.com".to_string(),
@@ -2993,6 +2995,8 @@ mod tests {
             .unwrap();
         let handle = server.serve(registry);
         let body = serde_json::to_vec(&SignAssertionRequest {
+            extensions: Vec::new(),
+            timeout_ms: None,
             origin: "https://example.com".to_string(),
             top_origin: None,
             rp_id: "example.com".to_string(),
@@ -3161,16 +3165,22 @@ mod tests {
         pub struct RecordingKeyProvider {
             inner: SoftwareCredentialKeyProvider,
             sign_count: AtomicUsize,
+            /// Runs inside `sign`, before the signature, on whatever thread signs.
+            on_sign: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
         }
         impl RecordingKeyProvider {
             pub fn new() -> Self {
                 Self {
                     inner: SoftwareCredentialKeyProvider,
                     sign_count: AtomicUsize::new(0),
+                    on_sign: Mutex::new(None),
                 }
             }
             pub fn sign_calls(&self) -> usize {
                 self.sign_count.load(Ordering::Acquire)
+            }
+            pub fn set_on_sign(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+                *self.on_sign.lock().unwrap() = hook;
             }
         }
         impl soft_fido2::CredentialKeyProvider for RecordingKeyProvider {
@@ -3192,6 +3202,10 @@ mod tests {
                 algorithm: i32,
                 data: &[u8],
             ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
+                let hook = self.on_sign.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
                 self.sign_count.fetch_add(1, Ordering::AcqRel);
                 self.inner.sign(key, algorithm, data)
             }
@@ -3339,6 +3353,7 @@ mod tests {
             let mut profiles = BTreeMap::new();
             profiles.insert("test-profile".to_string(), profile_config);
             AgentConfig {
+                limits: Default::default(),
                 enabled: true,
                 profiles,
                 audit_path: Some(std::path::PathBuf::from("/tmp/test-audit")),
@@ -3474,14 +3489,20 @@ mod tests {
 
             pub fn make_ctx(&self) -> SignContext {
                 SignContext {
+                    lease_activation: None,
                     profile_id: self.profile_id.clone(),
                     active_grant_id: self.grant_id.clone(),
-                    max_operations: 64,
+                    session: test_session_at(
+                        &self.profile_id,
+                        self.policy_runtime.revocation_epoch(),
+                    ),
                 }
             }
 
             fn make_req(&self) -> SignAssertionRequest {
                 SignAssertionRequest {
+                    extensions: Vec::new(),
+                    timeout_ms: None,
                     origin: "https://example.com".to_string(),
                     top_origin: None,
                     rp_id: "example.com".to_string(),
@@ -3562,9 +3583,10 @@ mod tests {
             });
 
             let ctx = SignContext {
+                lease_activation: None,
                 profile_id: f.profile_id.clone(),
                 active_grant_id: dynamic_grant_id,
-                max_operations: 64,
+                session: test_session(&f.profile_id),
             };
             let mut req = f.make_req();
             req.allow_credentials = vec![b64u_encode(&new_credential_id)];
@@ -3632,9 +3654,10 @@ mod tests {
             let handler = f.make_handler();
             let fake_grant_id = passless_core::agent::GrantId::new();
             let ctx = SignContext {
+                lease_activation: None,
                 profile_id: f.profile_id.clone(),
                 active_grant_id: fake_grant_id,
-                max_operations: 64,
+                session: test_session(&f.profile_id),
             };
             let req = f.make_req();
             let writes_before = get_write_counting_storage(&f.storage).writes();
@@ -3653,9 +3676,10 @@ mod tests {
             let handler = f.make_handler();
             let wrong_profile = ProfileId::new("wrong-profile").unwrap();
             let ctx = SignContext {
+                lease_activation: None,
+                session: test_session(&wrong_profile),
                 profile_id: wrong_profile,
                 active_grant_id: f.grant_id.clone(),
-                max_operations: 64,
             };
             let req = f.make_req();
             let writes_before = get_write_counting_storage(&f.storage).writes();
@@ -3739,15 +3763,18 @@ mod tests {
             let handler = Arc::new(f.make_handler());
             let ctx = Arc::new(f.make_ctx());
             let mut handles = Vec::new();
-            for _ in 0..4 {
+            for i in 0..4u8 {
                 let h = handler.clone();
                 let c = ctx.clone();
                 handles.push(std::thread::spawn(move || {
+                    // Distinct challenges: four distinct operations, serialized on the counter.
                     let req = SignAssertionRequest {
+                        extensions: Vec::new(),
+                        timeout_ms: None,
                         origin: "https://example.com".to_string(),
                         top_origin: None,
                         rp_id: "example.com".to_string(),
-                        challenge_b64u: "dGVzdA".to_string(),
+                        challenge_b64u: b64u_encode(&[b't', i]),
                         allow_credentials: vec![],
                         user_verification: false,
                         cross_origin: false,
@@ -3887,9 +3914,9 @@ mod tests {
             events
                 .iter()
                 .filter(|e| {
-                    e.get("kind")
-                        .and_then(|k| k.as_str())
-                        .is_some_and(|k| k == "policy.allow" || k == "policy.deny")
+                    e.get("kind").and_then(|k| k.as_str()).is_some_and(|k| {
+                        k == "policy.allow" || k == "policy.deny" || k == "policy.replay_served"
+                    })
                 })
                 .collect()
         }
@@ -4111,14 +4138,20 @@ mod tests {
 
             fn make_ctx(&self) -> SignContext {
                 SignContext {
+                    lease_activation: None,
                     profile_id: self.profile_id.clone(),
                     active_grant_id: self.grant_id.clone(),
-                    max_operations: 64,
+                    session: test_session_at(
+                        &self.profile_id,
+                        self.policy_runtime.revocation_epoch(),
+                    ),
                 }
             }
 
             fn make_req(&self) -> SignAssertionRequest {
                 SignAssertionRequest {
+                    extensions: Vec::new(),
+                    timeout_ms: None,
                     origin: "https://example.com".to_string(),
                     top_origin: None,
                     rp_id: "example.com".to_string(),
@@ -4556,22 +4589,23 @@ mod tests {
         }
 
         #[test]
-        fn grant_from_before_a_reload_is_not_usable_after_it() {
-            // The reload bumps the revocation epoch: the old context's grant is gone, whatever the
-            // new rules say.
+        fn session_from_before_a_changed_reload_is_revoked() {
+            // A reload that changes the policy bumps the revocation epoch: a session created before
+            // it is revoked, whatever the new rules say (ADR 0014 sections 6.4 and 9).
             let mut f = AuditTestFixture::default_allow();
             let stale_ctx = f.make_ctx();
-            f.reload_rules(vec![allow_rule("example.com")]);
+            f.reload_rules(vec![allow_rule("example.com"), allow_rule("other.example")]);
             let err = f
                 .make_handler()
                 .sign(&stale_ctx, &f.make_req())
                 .unwrap_err();
-            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(err.code, ErrorCode::Unauthorized);
             assert_eq!(f.key_provider.sign_calls(), 0);
             assert_eq!(
                 f.policy_records().last().unwrap().1.as_deref(),
-                Some("grant_not_found")
+                Some("policy_revoked")
             );
+            assert_eq!(stale_ctx.session.operations_used(), 0, "no budget consumed");
         }
 
         // --- selection (ADR 0014 section 10.1) ---
@@ -4930,7 +4964,7 @@ mod tests {
             let mut req = f.make_req();
             req.origin = "http://localhost:8080".to_string();
             let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
-            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(err.code, ErrorCode::OriginInvalid);
             assert_eq!(
                 f.policy_records(),
                 vec![("policy.deny".to_string(), Some("origin_invalid".into()))]
@@ -5016,6 +5050,894 @@ mod tests {
             let result_denied = handler2.sign(&ctx2, &req_denied);
             assert!(result_denied.is_err());
         }
+
+        // --- P5: check order, replay, budget, binding and revocation (ADR 0014 section 9) ---
+
+        impl AuditTestFixture {
+            /// Set the live budget. The reload changes the policy, so it revokes every session; the
+            /// fixture approves a fresh grant and `make_ctx` binds new sessions at the new epoch.
+            fn set_budget(&mut self, max_operations: u16) {
+                let mut profile_config = Self::profile_config(&self.spec);
+                profile_config.max_operations = max_operations;
+                self.policy_runtime
+                    .reload(&test_agent_config(profile_config))
+                    .unwrap();
+                self.grant_id =
+                    Self::approve_grant(&self.policy_runtime, &self.profile_id, &self.spec);
+            }
+
+            fn req_with_challenge(&self, challenge: &[u8]) -> SignAssertionRequest {
+                SignAssertionRequest {
+                    challenge_b64u: b64u_encode(challenge),
+                    ..self.make_req()
+                }
+            }
+
+            fn register_handler(&self) -> RegisterHandler {
+                RegisterHandler {
+                    policy_runtime: self.policy_runtime.clone(),
+                    credential_storage: self.storage.clone(),
+                    audit_gate: self.audit_gate.clone(),
+                    key_provider: self.key_provider.clone(),
+                    security_config: self.security_config.clone(),
+                    operation_lock: self.operation_lock.clone(),
+                }
+            }
+
+            fn reasons(&self) -> Vec<String> {
+                self.policy_records()
+                    .into_iter()
+                    .filter_map(|(_, reason)| reason)
+                    .collect()
+            }
+        }
+
+        fn signature_of(result: &Result<PrincipalResponse, ProtocolError>) -> String {
+            match result.as_ref().expect("sign should succeed") {
+                PrincipalResponse::SignAssertionResult(resp) => resp.signature_b64u.clone(),
+                _ => panic!("expected SignAssertionResult"),
+            }
+        }
+
+        fn two_rp_fixture() -> AuditTestFixture {
+            let mut spec = FixtureSpec::new(
+                vec![
+                    rule("example.com", RuleAction::Allow, RuleAction::Allow),
+                    allow_rule("other.example"),
+                    deny_rule("denied.example"),
+                ],
+                vec!["example.com", "other.example", "denied.example"],
+            );
+            spec.dynamic_grant = true;
+            AuditTestFixture::from_spec(spec)
+        }
+
+        #[test]
+        fn rejected_requests_never_consume_budget() {
+            let mut f = two_rp_fixture();
+            f.set_budget(1);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+
+            for i in 0..5u8 {
+                // Origin mismatch.
+                let mut req = f.req_with_challenge(&[1, i]);
+                req.origin = "https://evil.test".to_string();
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::OriginInvalid
+                );
+                // A `deny` rule.
+                let mut req = f.req_with_challenge(&[2, i]);
+                req.rp_id = "denied.example".to_string();
+                req.origin = "https://denied.example".to_string();
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::Forbidden
+                );
+                // An RP outside the session grant.
+                let mut req = f.req_with_challenge(&[3, i]);
+                req.rp_id = "evil.test".to_string();
+                req.origin = "https://evil.test".to_string();
+                assert!(handler.sign(&ctx, &req).is_err());
+                // A malformed challenge.
+                let mut req = f.make_req();
+                req.challenge_b64u = "!!".to_string();
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::BadRequest
+                );
+            }
+            assert_eq!(
+                ctx.session.operations_used(),
+                0,
+                "no rejection claimed budget"
+            );
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // The whole budget is still available to a legitimate request ...
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"good"))
+                .expect("budget intact");
+            assert_eq!(ctx.session.operations_used(), 1);
+            // ... and then it is used up.
+            let err = handler
+                .sign(&ctx, &f.req_with_challenge(b"next"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::BudgetExhausted);
+            assert_eq!(f.reasons().last().unwrap(), "budget_exhausted");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn budget_limit_is_read_from_the_live_policy() {
+            let mut f = AuditTestFixture::default_allow();
+            f.set_budget(1);
+            let ctx = f.make_ctx();
+            let handler = f.make_handler();
+            handler.sign(&ctx, &f.req_with_challenge(b"a")).unwrap();
+            assert_eq!(
+                handler
+                    .sign(&ctx, &f.req_with_challenge(b"b"))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::BudgetExhausted
+            );
+            assert_eq!(
+                f.policy_runtime.max_operations(&f.profile_id),
+                Some(1),
+                "the context carries no copy of the budget"
+            );
+        }
+
+        #[test]
+        fn completed_duplicate_gets_the_original_result_and_is_never_signed_twice() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let first = handler.sign(&ctx, &f.make_req());
+            let second = handler.sign(&ctx, &f.make_req());
+            assert_eq!(signature_of(&first), signature_of(&second));
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                1,
+                "one signature for one replay key"
+            );
+            assert_eq!(
+                ctx.session.operations_used(),
+                1,
+                "a duplicate claims no budget"
+            );
+            let allows = f
+                .policy_records()
+                .iter()
+                .filter(|(kind, _)| kind == "policy.allow")
+                .count();
+            assert_eq!(allows, 1, "one reservation for one replay key");
+        }
+
+        #[test]
+        fn in_flight_duplicate_joins_and_is_never_signed_twice() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    // Park the original between its audit reservation and key use.
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                let (joined_tx, joined_rx) = std::sync::mpsc::channel::<()>();
+                let duplicate = scope.spawn(|| {
+                    // Proves the duplicate took the join path (not the completed cache).
+                    let _join = super::super::super::session::test_hooks::set_on_join(move || {
+                        joined_tx.send(()).unwrap();
+                    });
+                    handler.sign(&ctx, &req)
+                });
+                joined_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the duplicate joined the in-flight original");
+                assert!(
+                    !duplicate.is_finished(),
+                    "the duplicate waits for the original"
+                );
+                release_tx.send(()).unwrap();
+                let original = original.join().unwrap();
+                let duplicate = duplicate.join().unwrap();
+                assert_eq!(signature_of(&original), signature_of(&duplicate));
+            });
+            assert_eq!(f.key_provider.sign_calls(), 1);
+            assert_eq!(ctx.session.operations_used(), 1);
+            assert!(
+                f.policy_records().contains(&(
+                    "policy.replay_served".to_string(),
+                    Some("replay_served".into())
+                )),
+                "a served duplicate is audited"
+            );
+        }
+
+        #[test]
+        fn a_detached_duplicate_does_not_affect_the_original() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                // The duplicate's client is gone: it detaches at once.
+                let detached = handler.sign_with(
+                    &ctx,
+                    &req,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| true,
+                );
+                assert_eq!(detached.unwrap_err().code, ErrorCode::Timeout);
+                // A duplicate whose deadline passes detaches too.
+                let late = handler.sign_with(&ctx, &req, Instant::now(), &|| false);
+                assert_eq!(late.unwrap_err().code, ErrorCode::Timeout);
+                release_tx.send(()).unwrap();
+                original.join().unwrap().expect("the original completes");
+            });
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn a_failure_consumes_the_key_and_is_returned_to_the_duplicate() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.allow_credentials = vec![b64u_encode(&[9u8; 32])];
+            let first = handler.sign(&ctx, &req).unwrap_err();
+            let records_after_first = f.policy_records().len();
+            let second = handler.sign(&ctx, &req).unwrap_err();
+            assert_eq!(first, second, "the duplicate receives the same failure");
+            // The duplicate is not re-evaluated: its only record is the served duplicate.
+            let records = f.policy_records();
+            assert_eq!(records.len(), records_after_first + 1);
+            assert_eq!(records.last().unwrap().0, "policy.replay_served");
+            // `allowCredentials` is not part of the replay key: the same action, RP, origin and
+            // challenge without it is the same key, and gets the same failure without key use.
+            let third = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(third, first);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            // The failure ended before key use: the budget was given back (review M2).
+            assert_eq!(ctx.session.operations_used(), 0);
+        }
+
+        #[test]
+        fn same_challenge_with_another_rp_or_action_is_rejected_not_joined() {
+            let f = two_rp_fixture();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).expect("first use");
+
+            let mut other_rp = f.make_req();
+            other_rp.rp_id = "other.example".to_string();
+            other_rp.origin = "https://other.example".to_string();
+            assert_eq!(
+                handler.sign(&ctx, &other_rp).unwrap_err().code,
+                ErrorCode::Replayed
+            );
+            assert_eq!(f.reasons().last().unwrap(), "challenge_reused");
+
+            // A registration on the same bearer session with the same challenge.
+            let register_ctx = RegisterContext::new(f.profile_id.clone(), ctx.session.clone());
+            let register_req = RegisterCredentialRequest {
+                origin: "https://example.com".to_string(),
+                top_origin: None,
+                rp_id: "example.com".to_string(),
+                challenge_b64u: f.make_req().challenge_b64u,
+                user_id_b64u: b64u_encode(b"user"),
+                user_name: "user".to_string(),
+                user_display_name: None,
+                rp_name: None,
+                exclude_credentials: vec![],
+                pub_key_cred_params: vec![-7],
+                user_verification: true,
+                cross_origin: false,
+                extensions: vec![],
+                attestation: None,
+                timeout_ms: None,
+            };
+            assert_eq!(
+                f.register_handler()
+                    .register(&register_ctx, &register_req)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Replayed
+            );
+            assert_eq!(f.key_provider.sign_calls(), 1);
+            assert_eq!(ctx.session.operations_used(), 1);
+        }
+
+        #[test]
+        fn principal_digest_mismatch_is_denied_and_audited() {
+            let f = AuditTestFixture::default_allow();
+            let mut ctx = f.make_ctx();
+            ctx.session = AgentSession::new(super::super::super::session::SessionBinding {
+                profile_id: f.profile_id.clone(),
+                principal_digest: [9u8; 32],
+                revocation_epoch: f.policy_runtime.revocation_epoch(),
+                ttl: Duration::from_secs(600),
+            });
+            let err = f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["principal_mismatch".to_string()]);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(ctx.session.operations_used(), 0);
+        }
+
+        #[test]
+        fn changed_reload_revokes_an_in_flight_operation_before_key_use() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let runtime = f.policy_runtime.clone();
+            let changed = test_agent_config(AuditTestFixture::profile_config(&FixtureSpec::new(
+                vec![allow_rule("example.com"), allow_rule("other.example")],
+                vec!["example.com"],
+            )));
+            let _hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                assert!(runtime.reload(&changed).unwrap().changed);
+            });
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                0,
+                "no key use after the reload"
+            );
+            // The reservation is followed by an audited terminal record.
+            assert_eq!(
+                f.policy_records(),
+                vec![
+                    ("policy.allow".to_string(), None),
+                    ("policy.deny".to_string(), Some("policy_revoked".into())),
+                ]
+            );
+            // The bearer stays revoked.
+            drop(_hook);
+            let err = handler
+                .sign(&ctx, &f.req_with_challenge(b"again"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+        }
+
+        #[test]
+        fn unchanged_reload_keeps_sessions_and_in_flight_operations() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let runtime = f.policy_runtime.clone();
+            let same = test_agent_config(AuditTestFixture::profile_config(&f.spec));
+            let hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                assert!(!runtime.reload(&same).unwrap().changed);
+            });
+            handler
+                .sign(&ctx, &f.make_req())
+                .expect("an unchanged reload revokes nothing");
+            drop(hook);
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"later"))
+                .expect("the session survives an unchanged reload");
+            assert_eq!(f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn unsupported_extension_is_not_supported_and_claims_no_budget() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.extensions = vec!["prf".to_string()];
+            assert_eq!(
+                handler.sign(&ctx, &req).unwrap_err().code,
+                ErrorCode::NotSupported
+            );
+            assert_eq!(f.reasons(), vec!["unsupported_option".to_string()]);
+            assert_eq!(ctx.session.operations_used(), 0);
+            // Browser metadata and `appid` are not unsupported RP extensions.
+            req.extensions = vec![
+                "remoteDesktopClientOverride".to_string(),
+                "appid".to_string(),
+            ];
+            handler.sign(&ctx, &req).expect("supported extensions");
+            assert_eq!(
+                dom_exception_name(ErrorCode::NotSupported),
+                "NotSupportedError"
+            );
+        }
+
+        #[test]
+        fn expired_session_is_denied_before_anything_else() {
+            let f = AuditTestFixture::default_allow();
+            let mut ctx = f.make_ctx();
+            ctx.session = AgentSession::new(super::super::super::session::SessionBinding {
+                profile_id: f.profile_id.clone(),
+                principal_digest: [0u8; 32],
+                revocation_epoch: f.policy_runtime.revocation_epoch(),
+                ttl: Duration::ZERO,
+            });
+            let err = f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.reasons(), vec!["session_expired".to_string()]);
+        }
+
+        #[test]
+        fn sign_path_follows_the_lock_order() {
+            // Debug builds panic on any out-of-order acquisition (lock_order.rs). A successful
+            // ceremony, a reload before key use and a revocation exercise every tracked lock of
+            // the sign path; none may be left held.
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            assert!(super::super::super::lock_order::held_levels().is_empty());
+            let runtime = f.policy_runtime.clone();
+            let changed = test_agent_config(AuditTestFixture::profile_config(&FixtureSpec::new(
+                vec![deny_rule("example.com")],
+                vec!["example.com"],
+            )));
+            let hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                runtime.reload(&changed).unwrap();
+            });
+            assert!(handler.sign(&ctx, &f.req_with_challenge(b"x")).is_err());
+            drop(hook);
+            assert!(super::super::super::lock_order::held_levels().is_empty());
+        }
+
+        // --- P5 review: H1, M1, M2, L3 and negatives ---
+
+        /// Signals that activation was reached, then waits for the release.
+        type ActivationGate = (
+            Mutex<std::sync::mpsc::Sender<()>>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        );
+
+        /// A lease activation that records calls and can be made to block or fail.
+        struct TestActivation {
+            calls: std::sync::atomic::AtomicUsize,
+            fail: bool,
+            gate: Option<ActivationGate>,
+        }
+
+        impl LeaseActivation for TestActivation {
+            fn activate(&self) -> Result<(), String> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                if let Some((reached, release)) = &self.gate {
+                    reached.lock().unwrap().send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                }
+                if self.fail {
+                    Err("lease gone".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        #[test]
+        fn lease_activation_runs_after_the_operation_lock_is_released() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let activation = Arc::new(TestActivation {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: false,
+                gate: Some((Mutex::new(reached_tx), Mutex::new(release_rx))),
+            });
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(activation.clone());
+            std::thread::scope(|scope| {
+                let signer = scope.spawn(|| handler.sign(&ctx, &f.make_req()));
+                // The slow browser-manager holder (the activation) is now blocking the ceremony.
+                reached_rx.recv().unwrap();
+                // A human CTAP operation gets the operation lock at once.
+                let started = Instant::now();
+                let human = crate::lock_operation(&f.operation_lock);
+                assert!(started.elapsed() < Duration::from_secs(1));
+                drop(human);
+                assert!(!signer.is_finished(), "no assertion before activation");
+                release_tx.send(()).unwrap();
+                signer.join().unwrap().expect("signed after activation");
+            });
+            assert_eq!(activation.calls.load(Ordering::Acquire), 1);
+        }
+
+        #[test]
+        fn failed_lease_activation_withholds_the_assertion() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(Arc::new(TestActivation {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: true,
+                gate: None,
+            }));
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert_eq!(f.reasons().last().unwrap(), "lease_activation_failed");
+            // The key was used, so the operation counts; a duplicate gets the same failure.
+            assert_eq!(ctx.session.operations_used(), 1);
+            assert_eq!(handler.sign(&ctx, &f.make_req()).unwrap_err(), err);
+        }
+
+        #[test]
+        fn sign_path_with_the_real_lease_activation_follows_the_lock_order() {
+            // `BrowserLeaseActivation` takes the real (tracked) browser manager after the
+            // operation lock is released. Here the lease does not exist, so activation fails
+            // and the assertion is withheld; the lock-order checker must not fire.
+            let f = AuditTestFixture::default_allow();
+            let manager = Arc::new(Mutex::new(
+                super::super::super::browser::BrowserProcessManager::new(f.clock.clone()),
+            ));
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(BrowserLeaseActivation::new(
+                manager,
+                passless_core::agent::BrowserLeaseId::new(),
+                Duration::from_secs(60),
+            ));
+            let err = f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert!(super::super::super::lock_order::held_levels().is_empty());
+        }
+
+        #[test]
+        fn a_revocation_after_the_recheck_waits_for_key_use_and_then_holds() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let reached_tx = Mutex::new(reached_tx);
+            let release_rx = Mutex::new(release_rx);
+            let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                reached_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            });
+            f.key_provider.set_on_sign(Some(hook));
+            std::thread::scope(|scope| {
+                let signer = scope.spawn(|| handler.sign(&ctx, &f.make_req()));
+                // The signer is inside key use, past its re-check.
+                reached_rx.recv().unwrap();
+                let session_revoke = scope.spawn(|| ctx.session.revoke());
+                let epoch_bump = scope.spawn(|| f.policy_runtime.bump_revocation_epoch());
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!session_revoke.is_finished(), "revoke waits for key use");
+                assert!(!epoch_bump.is_finished(), "an epoch bump waits for key use");
+                release_tx.send(()).unwrap();
+                signer
+                    .join()
+                    .unwrap()
+                    .expect("the signature that was past its re-check");
+                session_revoke.join().unwrap();
+                epoch_bump.join().unwrap();
+            });
+            f.key_provider.set_on_sign(None);
+            // Once revoke has returned, no later key use by this session.
+            let err = handler
+                .sign(&ctx, &f.req_with_challenge(b"after"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn failures_before_key_use_never_exhaust_the_budget() {
+            let mut f = AuditTestFixture::default_allow();
+            f.set_budget(2);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            for i in 0..6u8 {
+                let mut req = f.req_with_challenge(&[b'g', i]);
+                req.allow_credentials = vec![b64u_encode(&[0xEE; 32])];
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::Forbidden
+                );
+            }
+            assert_eq!(ctx.session.operations_used(), 0);
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"ok1"))
+                .expect("budget intact");
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"ok2"))
+                .expect("budget intact");
+            assert_eq!(f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn a_completed_duplicate_is_not_served_to_a_revoked_session() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            ctx.session.revoke();
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+        }
+
+        #[test]
+        fn a_joined_duplicate_of_a_revoked_session_gets_no_signature() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                let (joined_tx, joined_rx) = std::sync::mpsc::channel::<()>();
+                let duplicate = scope.spawn(|| {
+                    let _join = super::super::super::session::test_hooks::set_on_join(move || {
+                        joined_tx.send(()).unwrap();
+                    });
+                    handler.sign(&ctx, &req)
+                });
+                joined_rx.recv().unwrap();
+                ctx.session.revoke();
+                release_tx.send(()).unwrap();
+                assert_eq!(
+                    original.join().unwrap().unwrap_err().code,
+                    ErrorCode::Unauthorized
+                );
+                assert_eq!(
+                    duplicate.join().unwrap().unwrap_err().code,
+                    ErrorCode::Unauthorized
+                );
+            });
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn an_origin_spelled_differently_with_the_same_challenge_is_rejected() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            let mut variant = f.make_req();
+            variant.origin = "https://EXAMPLE.com".to_string();
+            assert_eq!(
+                handler.sign(&ctx, &variant).unwrap_err().code,
+                ErrorCode::Replayed
+            );
+            assert_eq!(f.reasons().last().unwrap(), "challenge_reused");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        // --- P5: capacity (plan R11): explicit `busy`, never a silent drop ---
+
+        struct CapacityRig {
+            f: AuditTestFixture,
+            sock: std::path::PathBuf,
+            token: String,
+            shutdown: Arc<AtomicBool>,
+            server: Option<thread::JoinHandle<()>>,
+            _dir: tempfile::TempDir,
+        }
+
+        impl CapacityRig {
+            fn new(limits: AgentRequestLimits) -> Self {
+                let f = AuditTestFixture::default_allow();
+                let dir = tempfile::tempdir().unwrap();
+                let sock = dir.path().join("sock");
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
+                let registry = Arc::new(SignContextRegistry::new());
+                let token = generate_bearer_token().unwrap();
+                registry
+                    .register_pending(token.clone(), f.make_ctx(), Arc::new(f.make_handler()))
+                    .unwrap();
+                registry
+                    .bind_lease(&token, "lease-cap".to_string())
+                    .unwrap();
+                let server = server.serve_with_limiter(registry, RequestLimiter::new(limits));
+                Self {
+                    f,
+                    sock,
+                    token,
+                    shutdown,
+                    server: Some(server),
+                    _dir: dir,
+                }
+            }
+
+            fn request(&self, challenge: &[u8]) -> Vec<u8> {
+                let body = serde_json::to_vec(&self.f.req_with_challenge(challenge)).unwrap();
+                let mut request = format!(
+                    "POST /sign HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    self.token,
+                    body.len()
+                )
+                .into_bytes();
+                request.extend_from_slice(&body);
+                request
+            }
+
+            /// Send one request on its own connection and read the whole response.
+            fn send(sock: &Path, request: &[u8]) -> String {
+                let mut stream = UnixStream::connect(sock).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .unwrap();
+                stream.write_all(request).unwrap();
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
+                String::from_utf8_lossy(&response).to_string()
+            }
+        }
+
+        impl Drop for CapacityRig {
+            fn drop(&mut self) {
+                self.shutdown.store(true, Ordering::Release);
+                if let Some(server) = self.server.take() {
+                    let _ = server.join();
+                }
+            }
+        }
+
+        fn is_busy(response: &str) -> bool {
+            response.starts_with("HTTP/1.1 503")
+                && response.contains("\"error\":\"busy\"")
+                && response.contains("\"dom\":\"NotAllowedError\"")
+        }
+
+        #[test]
+        fn requests_over_the_caps_get_an_explicit_busy_and_none_is_dropped() {
+            let rig = CapacityRig::new(AgentRequestLimits {
+                max_concurrent_requests: 2,
+                max_requests_per_profile: 2,
+                max_requests_per_connection: 1,
+                max_requests_per_session: 2,
+            });
+            const CLIENTS: usize = 12;
+            // Hold the backend operation lock: admitted requests park on it, holding their slot.
+            let op = rig.f.operation_lock.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let clients: Vec<_> = (0..CLIENTS)
+                .map(|i| {
+                    let request = rig.request(&[b'c', i as u8]);
+                    let sock = rig.sock.clone();
+                    let tx = tx.clone();
+                    thread::spawn(move || tx.send(CapacityRig::send(&sock, &request)).unwrap())
+                })
+                .collect();
+            let mut responses = Vec::new();
+            for _ in 0..CLIENTS - 2 {
+                responses.push(
+                    rx.recv_timeout(Duration::from_secs(15))
+                        .expect("busy reply"),
+                );
+            }
+            assert!(
+                responses.iter().all(|r| is_busy(r)),
+                "every request over the cap is answered busy: {:?}",
+                responses
+            );
+            assert_eq!(rig.f.key_provider.sign_calls(), 0);
+            drop(op);
+            for _ in 0..2 {
+                responses.push(rx.recv_timeout(Duration::from_secs(15)).expect("served"));
+            }
+            for client in clients {
+                client.join().unwrap();
+            }
+            assert_eq!(responses.len(), CLIENTS, "no request was dropped");
+            assert_eq!(
+                responses
+                    .iter()
+                    .filter(|r| r.starts_with("HTTP/1.1 200"))
+                    .count(),
+                2
+            );
+            assert_eq!(rig.f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn connections_over_the_connection_cap_are_answered_busy_by_the_accept_loop() {
+            let rig = CapacityRig::new(AgentRequestLimits {
+                max_concurrent_requests: 1,
+                max_requests_per_profile: 1,
+                max_requests_per_connection: 1,
+                max_requests_per_session: 1,
+            });
+            let max_connections = 1 + super::super::super::capacity::BUSY_CONNECTION_HEADROOM;
+            // Idle connections occupy every handler thread (each waits for its request).
+            let idle: Vec<UnixStream> = (0..max_connections)
+                .map(|_| UnixStream::connect(&rig.sock).unwrap())
+                .collect();
+            thread::sleep(Duration::from_millis(300));
+            let response = CapacityRig::send(&rig.sock, &rig.request(b"over"));
+            assert!(is_busy(&response), "{response}");
+            drop(idle);
+            assert_eq!(rig.f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn twenty_concurrent_ceremonies_within_the_caps_all_complete() {
+            let rig = CapacityRig::new(AgentRequestLimits {
+                max_concurrent_requests: 32,
+                max_requests_per_profile: 32,
+                max_requests_per_connection: 8,
+                max_requests_per_session: 32,
+            });
+            let responses: Vec<String> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..20u8)
+                    .map(|i| {
+                        let request = rig.request(&[b'p', i]);
+                        let sock = rig.sock.clone();
+                        scope.spawn(move || CapacityRig::send(&sock, &request))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(
+                responses.iter().all(|r| r.starts_with("HTTP/1.1 200")),
+                "{:?}",
+                responses
+            );
+            assert_eq!(rig.f.key_provider.sign_calls(), 20);
+        }
+
+        #[test]
+        fn duplicate_http_requests_are_coalesced_into_one_signature() {
+            let rig = CapacityRig::new(AgentRequestLimits::default());
+            let op = rig.f.operation_lock.lock().unwrap();
+            let request = rig.request(b"same");
+            let responses: Vec<String> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4)
+                    .map(|_| {
+                        let sock = rig.sock.clone();
+                        let request = request.clone();
+                        scope.spawn(move || CapacityRig::send(&sock, &request))
+                    })
+                    .collect();
+                thread::sleep(Duration::from_millis(300));
+                drop(op);
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let bodies: Vec<&str> = responses
+                .iter()
+                .map(|r| r.split("\r\n\r\n").nth(1).unwrap_or(""))
+                .collect();
+            assert!(responses.iter().all(|r| r.starts_with("HTTP/1.1 200")));
+            assert!(bodies.windows(2).all(|w| w[0] == w[1]), "identical results");
+            assert_eq!(rig.f.key_provider.sign_calls(), 1);
+        }
     }
 
     mod integration_tests {
@@ -5088,6 +6010,8 @@ mod tests {
             cross_origin: bool,
         ) -> Vec<u8> {
             serde_json::to_vec(&SignAssertionRequest {
+                extensions: Vec::new(),
+                timeout_ms: None,
                 origin: origin.to_string(),
                 top_origin: None,
                 rp_id: rp_id.to_string(),
@@ -5283,7 +6207,8 @@ mod tests {
             let resp = http_request(&sock_path, &req, &body);
             assert!(resp.contains("403"));
             let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
+            assert!(body_str.contains("origin_invalid"));
+            assert!(body_str.contains("\"dom\":\"SecurityError\""));
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();
         }
@@ -5512,7 +6437,8 @@ mod tests {
                     security_config: SecurityConfig::default(),
                     operation_lock: Arc::new(Mutex::new(())),
                 });
-                let ctx = RegisterContext::new(ProfileId::new("test-profile").unwrap(), 64);
+                let profile_id = ProfileId::new("test-profile").unwrap();
+                let ctx = RegisterContext::new(profile_id.clone(), test_session(&profile_id));
                 Self {
                     registry: Arc::new(SignContextRegistry::new()),
                     handler,
@@ -5524,14 +6450,15 @@ mod tests {
             }
 
             /// Register a bearer, optionally bound to `lease`.
+            /// A registration bearer with its own session (one bearer, one session).
             fn bearer(&self, lease: Option<&str>) -> String {
                 let token = generate_bearer_token().unwrap();
+                let ctx = RegisterContext::new(
+                    self.ctx.profile_id.clone(),
+                    test_session(&self.ctx.profile_id),
+                );
                 self.registry
-                    .register_pending_registration(
-                        token.clone(),
-                        self.ctx.clone(),
-                        self.handler.clone(),
-                    )
+                    .register_pending_registration(token.clone(), ctx, self.handler.clone())
                     .unwrap();
                 if let Some(lease) = lease {
                     self.registry
@@ -5547,6 +6474,9 @@ mod tests {
 
             fn registration_body(&self, challenge: &str) -> Vec<u8> {
                 serde_json::to_vec(&RegisterCredentialRequest {
+                    extensions: Vec::new(),
+                    attestation: None,
+                    timeout_ms: None,
                     origin: "https://example.com".to_string(),
                     top_origin: None,
                     rp_id: "example.com".to_string(),
@@ -5624,12 +6554,27 @@ mod tests {
             let rig = Rig::new();
             let token = rig.bearer(Some("lease-x"));
             let f = sign_handler_tests::TestFixture::new(true);
+            // One bearer, one session: the sign context must share the registration's session.
+            let mut ctx = f.make_ctx();
+            assert!(
+                rig.registry
+                    .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                    .is_err(),
+                "a second session for one bearer is refused"
+            );
+            ctx.session = rig
+                .registry
+                .lookup_registration(&token)
+                .unwrap()
+                .context
+                .session;
             rig.registry
-                .register_pending(token.clone(), f.make_ctx(), Arc::new(f.make_handler()))
+                .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
                 .unwrap();
             rig.registry.bind_lease(&token, "lease-x".into()).unwrap();
 
             assert_eq!(rig.registry.revoke_by_lease("lease-x"), 2);
+            assert!(ctx.session.is_revoked());
             assert!(rig.registry.lookup_bound(&token).is_none());
             assert!(rig.registry.lookup_registration(&token).is_none());
         }

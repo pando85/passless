@@ -616,6 +616,8 @@ list. The schema version is bumped. E2E-32.
   verification (D4); confirm `chrome-headless-shell` detection (D4).
 - Re-check preference MAC behaviour for each supported browser version (D4).
 - Fix B1 and B7 (see Defects found by the P1 baseline) with a regression test.
+- Profile-scoped shared browser: a second principal's bearer must not depend on the first
+  principal's grant; on first-principal exit, rebind or close (P5 review L5).
 
 **P11.**
 
@@ -810,7 +812,7 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 | P2 | ✅ | — | Native fallback removed; cross-origin and `confirm` deny with audit; launch refuses invalid extension; interim MAIN-world hardening (prototype, single read, about:blank/srcdoc/blob frames). E2E-09, 10, 47 pass; E2E-02, 06 XFAIL until P6 |
 | P3 | ✅ | — | UHID route and minted grants removed; registration bearers lease-bound; B3 (COSE_Key) and B6 fixed. E2E-11 pass; E2E-02 XFAIL until P6 (extension `/register` response shape only) |
 | P4 | ✅ | — | `RuleAction`/`PolicyAction`, legacy mapping with warnings (doctor shows them; unmappable legacy values are reported by `validate`, so a disabled `[agents]` section never breaks the human config load), validation (wildcard, `register = request`, `localhost` exact only, at most 32 RP rules without a `*` rule), `resolve_rules`/`MatchedRule`/`GrantSource` hook, ceremonies resolve per request through `PolicyRuntime::resolve` against the compiled in-memory generation (not a copy in the session context), numeric generation (serialized reloads), digest v4, pinning before `allowCredentials`, B4 fixed, launch-URL check by most specific rule. E2E-12, 13 added; E2E-03 uses an all-deny profile. Not yet real: config changes do not reach the runtime (reload re-recompiles the in-memory config; P5 re-reads the file) and there is no re-resolve before key use (P5/invariant 13). Also frozen: `max_operations` in the sign/register contexts (P5); audit `rule` identity (E2E-12/audit-rule XFAIL until P8) |
-| P5 | ⏳ | — | |
+| P5 | ✅ | — | Bearer sessions with length-prefixed replay key (join, 120 s outcome cache, never sign twice); budget only for key use; revocation/grant epochs with key-use gates; reload re-reads config; per-global/profile/session caps with explicit busy; LOCKING.md with debug lock-order checks; two deadlocks fixed; B5 fixed. E2E-14, 15 pass |
 | P6 | ⏳ | — | |
 | P7 | ⏳ | — | |
 | P8 | ⏳ | — | |

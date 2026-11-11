@@ -15,6 +15,14 @@ audit_path = "/var/lib/passless-agent/audit"
 
 - `enabled` (bool, default `false`): master switch.
 - `audit_path` (path, required when enabled): owner-only directory for agent audit state.
+- `[agents.limits]` (optional): concurrency caps of the ceremony server, read at daemon start. A
+  request over a cap is answered `busy` (the page sees `NotAllowedError`), never dropped.
+  - `max_concurrent_requests` (default 32): across all sessions.
+  - `max_requests_per_profile` (default 16): across all sessions of one profile.
+  - `max_requests_per_session` (default 8): per managed browser session.
+  - `max_requests_per_connection` (default 8): per connection.
+
+  Each is between 1 and 1024.
 
 ## Profile structure
 
@@ -263,7 +271,12 @@ The experimental `rp_ids`, `registration_allowed`, and `require_uv` fields remai
 
 ## Policy reload
 
-`agent-admin policy reload` recompiles the daemon's in-memory configuration snapshot; it does not reread an edited TOML file. Restart the daemon to apply configuration-file changes.
+`agent-admin policy reload` re-reads and validates the configuration file the daemon started from.
+
+- **Invalid file.** If the file cannot be read or fails validation, the reload is rejected with an error. The current policy stays in force.
+- **Restart-only changes.** A change to `enabled`, `audit_path`, `limits`, the set of profiles, or a profile's `mode`, `principal_user`, `browser_user`, `storage`, `browser_scope` or `max_concurrent_sessions` is rejected the same way, because it needs a restart.
+- **Unchanged policy.** A reload whose effective policy is unchanged (same digest) changes nothing, and live sessions continue.
+- **Changed policy.** A reload that changes the effective policy revokes every agent session and closes the managed browsers. Operations already in flight fail before key use.
 
 ## Pre-flight
 

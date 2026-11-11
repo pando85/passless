@@ -7,85 +7,16 @@ use passless_core::agent::protocol::{
     BrowserStatusResponse, ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{BrowserLeaseId, BrowserScope, PrincipalSessionId, ProfileId};
-use soft_fido2_ctap::key_provider::{
-    CredentialKey, CredentialKeyError, CredentialKeyProvider, CredentialKeyProviderId,
-    GeneratedCredentialKey,
-};
 
 use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease};
 use crate::agent::browser::{BrowserConfig, LeaseState};
 use crate::agent::intent::ProcessIdentityDigest;
+use crate::agent::sign::BrowserLeaseActivation;
 use crate::storage::CredentialFilter;
 
 const BROWSER_TTL: Duration = Duration::from_secs(3600);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ACTIVE_TTL_SECS: u64 = 86_400;
-
-struct AssertionActivatingKeyProvider {
-    inner: Arc<dyn CredentialKeyProvider + Send + Sync>,
-    browser_manager: Arc<std::sync::Mutex<crate::agent::browser::BrowserProcessManager>>,
-    lease_id: BrowserLeaseId,
-    active_ttl: Duration,
-}
-
-impl CredentialKeyProvider for AssertionActivatingKeyProvider {
-    fn provider_id(&self) -> CredentialKeyProviderId {
-        self.inner.provider_id()
-    }
-
-    fn supports_algorithm(&self, algorithm: i32) -> bool {
-        self.inner.supports_algorithm(algorithm)
-    }
-
-    fn generate(
-        &self,
-        algorithm: i32,
-    ) -> core::result::Result<GeneratedCredentialKey, CredentialKeyError> {
-        self.inner.generate(algorithm)
-    }
-
-    fn sign(
-        &self,
-        key: &CredentialKey,
-        algorithm: i32,
-        message: &[u8],
-    ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
-        let signature = self.inner.sign(key, algorithm, message)?;
-
-        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
-            CredentialKeyError::TransientFailure("browser manager lock poisoned".to_string())
-        })?;
-        let state = browser_manager
-            .snapshot(&self.lease_id)
-            .ok_or_else(|| {
-                CredentialKeyError::TransientFailure("browser lease not found".to_string())
-            })?
-            .state;
-        match state {
-            LeaseState::AuthenticationPending => {
-                browser_manager
-                    .activate_after_assertion(&self.lease_id, self.active_ttl)
-                    .map_err(|e| {
-                        CredentialKeyError::TransientFailure(format!(
-                            "failed to activate browser lease after assertion: {e}"
-                        ))
-                    })?;
-            }
-            LeaseState::Active => {}
-            current => {
-                return Err(CredentialKeyError::TransientFailure(format!(
-                    "browser lease cannot activate after assertion from state {current}"
-                )));
-            }
-        }
-
-        Ok(signature)
-    }
-
-    fn delete(&self, key: &CredentialKey) -> core::result::Result<(), CredentialKeyError> {
-        self.inner.delete(key)
-    }
-}
 
 impl AgentRuntime {
     /// Ensure that the verified principal owns a live trusted-port browser.
@@ -114,21 +45,15 @@ impl AgentRuntime {
             ));
         }
 
-        let _lifecycle = profile.lifecycle_lock.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "profile lifecycle lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let _lifecycle = crate::agent::lock_order::lock(
+            &profile.lifecycle_lock,
+            crate::agent::lock_order::LockLevel::ProfileLifecycle,
+        );
 
-        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "browser manager lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut browser_manager = crate::agent::lock_order::lock(
+            &self.browser_manager,
+            crate::agent::lock_order::LockLevel::BrowserManager,
+        );
 
         if profile.profile_config.browser_scope == BrowserScope::Profile {
             let shared_lease_id = profile
@@ -270,7 +195,10 @@ impl AgentRuntime {
                 )
             })?;
 
-        let profile_config = &profile.profile_config;
+        // Rules, limits and session TTL come from the configuration in force, which a policy reload
+        // may have replaced since the daemon started (ADR 0014 section 6.4).
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
         let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
             ProtocolError::new(
                 ErrorCode::BadRequest,
@@ -327,10 +255,13 @@ impl AgentRuntime {
         // Registration authority is policy only (`register = "allow"` on an exact RP rule); the
         // bearer is bound to the browser lease in `finish_principal_browser_launch` and revoked
         // with it.
-        let registration_ctx = crate::agent::register::RegisterContext::new(
-            profile_id.clone(),
-            profile_config.max_operations,
-        );
+        // One bearer session backs both the sign and the registration context of this bearer: it
+        // is bound to the principal digest, the revocation epoch now in force and the session TTL
+        // (ADR 0014 section 9).
+        let session =
+            self.new_bearer_session(profile_id, *process_digest.as_bytes(), profile_config);
+        let registration_ctx =
+            crate::agent::register::RegisterContext::new(profile_id.clone(), session.clone());
         let registration_handler = Arc::new(crate::agent::register::RegisterHandler {
             policy_runtime: self.policy_runtime.clone(),
             credential_storage: profile.backend.credential_storage.clone(),
@@ -378,6 +309,7 @@ impl AgentRuntime {
             profile_id,
             session_id,
             process_digest,
+            &session,
             profile,
             &config,
             &endpoint_id,
@@ -404,6 +336,7 @@ impl AgentRuntime {
         profile_id: &ProfileId,
         session_id: &PrincipalSessionId,
         process_digest: &ProcessIdentityDigest,
+        session: &Arc<crate::agent::session::AgentSession>,
         profile: &ProfileRuntime,
         config: &BrowserConfig,
         endpoint_id: &passless_core::agent::EndpointId,
@@ -411,7 +344,8 @@ impl AgentRuntime {
         lease_id: &BrowserLeaseId,
         browser_manager: &mut crate::agent::browser::BrowserProcessManager,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let profile_config = &profile.profile_config;
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
         self.sign_registry
             .bind_registration_lease(bearer_token, lease_id.to_string())
             .map_err(|e| {
@@ -422,9 +356,11 @@ impl AgentRuntime {
                 )
             })?;
         let mut credential_refs = Vec::new();
-        if let Ok(mut storage) = profile.backend.credential_storage.lock()
-            && let Ok(mut credential) = storage.read_first(CredentialFilter::None)
-        {
+        let mut storage = crate::agent::lock_order::lock(
+            &profile.backend.credential_storage,
+            crate::agent::lock_order::LockLevel::Storage,
+        );
+        if let Ok(mut credential) = storage.read_first(CredentialFilter::None) {
             loop {
                 let rp_allowed = config
                     .rp_ids
@@ -445,6 +381,7 @@ impl AgentRuntime {
                 }
             }
         }
+        drop(storage);
 
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
         if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
@@ -465,18 +402,17 @@ impl AgentRuntime {
                     .map(|ttl| ttl.as_secs())
                     .unwrap_or(300),
             };
-            let request_id = if dynamic_credential_scope {
-                self.policy_runtime.admin_request_dynamic_grant(params)
-            } else {
-                self.policy_runtime.admin_request_grant(params)
-            }
-            .map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to prepare browser authentication grant: {e}"),
-                    RecommendedAction::Abort,
-                )
-            })?;
+            // The session grant is bounded by `max_session_ttl`, not `max_grant_ttl` (defect B5).
+            let request_id = self
+                .policy_runtime
+                .admin_request_session_grant(params, dynamic_credential_scope)
+                .map_err(|e| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        format!("failed to prepare browser authentication grant: {e}"),
+                        RecommendedAction::Abort,
+                    )
+                })?;
             // This is an internal approval, not admin IPC. The request reached this point only
             // after principal capability/peer/process verification and explicit trusted port mode.
             let grant_id = self
@@ -490,29 +426,32 @@ impl AgentRuntime {
                     )
                 })?;
 
-            let sign_ctx = crate::agent::sign::SignContext {
-                profile_id: profile_id.clone(),
-                active_grant_id: grant_id.clone(),
-                max_operations: profile_config.max_operations,
-            };
+            let _ = session.bind_grant(grant_id.clone());
             let active_ttl = profile_config
                 .max_session_ttl
                 .as_ref()
                 .map(|ttl| ttl.as_secs())
                 .unwrap_or(300)
                 .clamp(1, MAX_ACTIVE_TTL_SECS);
-            let key_provider = Arc::new(AssertionActivatingKeyProvider {
-                inner: profile.backend.key_provider.clone(),
-                browser_manager: self.browser_manager.clone(),
-                lease_id: lease_id.clone(),
-                active_ttl: Duration::from_secs(active_ttl),
-            });
+            // The lease is activated after the first assertion, outside every backend lock
+            // (review H1): the browser manager is global and may be held by another launch.
+            let lease_activation = BrowserLeaseActivation::new(
+                self.browser_manager.clone(),
+                lease_id.clone(),
+                Duration::from_secs(active_ttl),
+            );
+            let sign_ctx = crate::agent::sign::SignContext {
+                profile_id: profile_id.clone(),
+                active_grant_id: grant_id.clone(),
+                session: session.clone(),
+                lease_activation: Some(lease_activation),
+            };
             let sign_handler = Arc::new(crate::agent::sign::SignHandler {
                 credential_storage: profile.backend.credential_storage.clone(),
                 policy_runtime: self.policy_runtime.clone(),
                 audit_gate: self.audit_gate.clone(),
                 security_config: profile.security_config.clone(),
-                key_provider,
+                key_provider: profile.backend.key_provider.clone(),
                 operation_lock: profile.backend.operation_lock.clone(),
             });
             if let Err(e) = self.sign_registry.register_pending(

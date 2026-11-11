@@ -126,6 +126,7 @@ fn invalid_rp_id_in_profile_rejected() {
 #[test]
 fn agent_config_disabled_skips_validation() {
     let config = AgentConfig {
+        limits: Default::default(),
         enabled: false,
         profiles: BTreeMap::new(),
         audit_path: None,
@@ -138,6 +139,7 @@ fn agent_config_disabled_skips_validation() {
 #[test]
 fn agent_config_enabled_requires_audit_path() {
     let config = AgentConfig {
+        limits: Default::default(),
         enabled: true,
         profiles: BTreeMap::new(),
         audit_path: None,
@@ -166,6 +168,7 @@ fn agent_config_detects_overlapping_storage_paths() {
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
+        limits: Default::default(),
         enabled: true,
         profiles,
         audit_path: Some(PathBuf::from("/tmp/agent-overlap/audit")),
@@ -196,6 +199,7 @@ fn agent_config_accepts_profiles_sharing_a_legacy_device_identity() {
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
+        limits: Default::default(),
         enabled: true,
         profiles,
         audit_path: Some(PathBuf::from("/tmp/collision-test/audit")),
@@ -225,6 +229,7 @@ fn agent_config_detects_overlap_with_human_backend() {
     profiles.insert("p".to_string(), p);
 
     let config = AgentConfig {
+        limits: Default::default(),
         enabled: true,
         profiles,
         audit_path: Some(PathBuf::from("/tmp/human-overlap/audit")),

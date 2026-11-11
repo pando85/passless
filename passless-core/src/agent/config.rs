@@ -1159,13 +1159,178 @@ pub struct AgentConfig {
     /// Profile IDs for which the operator explicitly accepts writes to the human credential backend.
     #[serde(default)]
     pub acknowledge_same_user_registration: Vec<String>,
+
+    /// Concurrency caps of the agent ceremony server (plan R11). Read when the daemon starts.
+    #[serde(default)]
+    pub limits: AgentRequestLimits,
+}
+
+/// Default global cap on concurrent agent ceremony requests.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u16 = 32;
+/// Default cap on concurrent requests of one profile (all its sessions).
+pub const DEFAULT_MAX_REQUESTS_PER_PROFILE: u16 = 16;
+/// Default cap on concurrent requests carried by one connection.
+pub const DEFAULT_MAX_REQUESTS_PER_CONNECTION: u16 = 8;
+/// Default cap on concurrent requests of one bearer session.
+pub const DEFAULT_MAX_REQUESTS_PER_SESSION: u16 = 8;
+/// Upper bound for every request cap.
+pub const MAX_REQUEST_LIMIT: u16 = 1024;
+
+fn default_max_concurrent_requests() -> u16 {
+    DEFAULT_MAX_CONCURRENT_REQUESTS
+}
+
+fn default_max_requests_per_profile() -> u16 {
+    DEFAULT_MAX_REQUESTS_PER_PROFILE
+}
+
+fn default_max_requests_per_connection() -> u16 {
+    DEFAULT_MAX_REQUESTS_PER_CONNECTION
+}
+
+fn default_max_requests_per_session() -> u16 {
+    DEFAULT_MAX_REQUESTS_PER_SESSION
+}
+
+/// Concurrency caps of the agent ceremony server. A request over any cap is answered with an
+/// explicit `busy` error instead of being dropped (plan R11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRequestLimits {
+    /// Concurrent ceremony requests across all sessions and connections.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: u16,
+    /// Concurrent ceremony requests of one profile, so that one profile cannot exhaust the global
+    /// cap.
+    #[serde(default = "default_max_requests_per_profile")]
+    pub max_requests_per_profile: u16,
+    /// Concurrent ceremony requests carried by one connection.
+    #[serde(default = "default_max_requests_per_connection")]
+    pub max_requests_per_connection: u16,
+    /// Concurrent ceremony requests of one bearer session (one managed browser).
+    #[serde(default = "default_max_requests_per_session")]
+    pub max_requests_per_session: u16,
+}
+
+impl Default for AgentRequestLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_requests_per_profile: DEFAULT_MAX_REQUESTS_PER_PROFILE,
+            max_requests_per_connection: DEFAULT_MAX_REQUESTS_PER_CONNECTION,
+            max_requests_per_session: DEFAULT_MAX_REQUESTS_PER_SESSION,
+        }
+    }
+}
+
+impl AgentRequestLimits {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("max_concurrent_requests", self.max_concurrent_requests),
+            ("max_requests_per_profile", self.max_requests_per_profile),
+            (
+                "max_requests_per_connection",
+                self.max_requests_per_connection,
+            ),
+            ("max_requests_per_session", self.max_requests_per_session),
+        ] {
+            if value == 0 || value > MAX_REQUEST_LIMIT {
+                return Err(Error::Config(format!(
+                    "agents.limits.{} must be between 1 and {}",
+                    name, MAX_REQUEST_LIMIT
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AgentConfig {
+    /// Parse the `[agents]` table of a Passless TOML configuration. A missing table is the default
+    /// (disabled) configuration. Validation is separate ([`Self::validate`]).
+    pub fn from_toml_str(content: &str, source: &str) -> Result<Self> {
+        let table = toml::from_str::<toml::Table>(content).map_err(|e| {
+            Error::Config(format!(
+                "failed to parse config file {} as TOML: {}",
+                source, e
+            ))
+        })?;
+        match table.get("agents") {
+            Some(agents_value) => {
+                Deserialize::deserialize(agents_value.clone()).map_err(|e: toml::de::Error| {
+                    Error::Config(format!(
+                        "failed to parse [agents] section in {}: {}",
+                        source, e
+                    ))
+                })
+            }
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Read and parse the `[agents]` table of the configuration file at `path`.
+    pub fn from_config_file(path: &std::path::Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            Error::Config(format!(
+                "failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Self::from_toml_str(&content, &path.display().to_string())
+    }
+
+    /// Why `next` cannot replace `self` in a running daemon, if it cannot.
+    ///
+    /// A policy reload applies rules, selection, acknowledgements, budgets and TTLs. It cannot add
+    /// or remove profiles or change what was bound when the daemon started (backends, users, modes,
+    /// browser scope, session concurrency, audit location, request caps); those need a restart.
+    pub fn reload_incompatibility(&self, next: &AgentConfig) -> Option<String> {
+        if self.enabled != next.enabled {
+            return Some("agents.enabled changed".to_string());
+        }
+        if self.audit_path != next.audit_path {
+            return Some("agents.audit_path changed".to_string());
+        }
+        if self.limits != next.limits {
+            return Some("agents.limits changed".to_string());
+        }
+        if !self.profiles.keys().eq(next.profiles.keys()) {
+            return Some("the set of agent profiles changed".to_string());
+        }
+        for (name, current) in &self.profiles {
+            let Some(candidate) = next.profiles.get(name) else {
+                return Some(format!("agent profile '{}' was removed", name));
+            };
+            let storage = |p: &AgentProfileConfig| p.storage.as_ref().map(|s| format!("{:?}", s));
+            let changed = if current.mode != candidate.mode {
+                Some("mode")
+            } else if current.principal_user != candidate.principal_user {
+                Some("principal_user")
+            } else if current.browser_user != candidate.browser_user {
+                Some("browser_user")
+            } else if storage(current) != storage(candidate) {
+                Some("storage")
+            } else if current.browser_scope != candidate.browser_scope {
+                Some("browser_scope")
+            } else if current.max_concurrent_sessions != candidate.max_concurrent_sessions {
+                Some("max_concurrent_sessions")
+            } else {
+                None
+            };
+            if let Some(field) = changed {
+                return Some(format!("agent profile '{}': {} changed", name, field));
+            }
+        }
+        None
+    }
+
     pub fn validate(&self, human_state_path: Option<&std::path::Path>) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
+
+        self.limits.validate()?;
 
         if self.audit_path.is_none() {
             return Err(Error::Config(
@@ -1693,6 +1858,7 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert("coding".to_string(), profile);
         AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/passless-agent-audit-p4")),
@@ -1762,6 +1928,7 @@ product_id = 22136
             profiles.insert(name.to_string(), profile);
         }
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -1899,6 +2066,7 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/agent-audit-roots")),
@@ -1944,6 +2112,7 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -1984,6 +2153,7 @@ product_id = 2
     #[test]
     fn test_enabled_requires_audit_path() {
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles: BTreeMap::new(),
             audit_path: None,
@@ -1997,6 +2167,7 @@ product_id = 2
     #[test]
     fn test_disabled_does_not_require_audit_path() {
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: false,
             profiles: BTreeMap::new(),
             audit_path: None,
@@ -2037,6 +2208,7 @@ product_id = 2
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/overlap-audit")),
@@ -2206,6 +2378,7 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -2261,6 +2434,7 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(audit_link),
@@ -2308,6 +2482,7 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -2679,6 +2854,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/audit")),
@@ -2780,6 +2956,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/audit")),
@@ -2823,6 +3000,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(audit),

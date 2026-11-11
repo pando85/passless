@@ -307,6 +307,8 @@ pub struct GrantRequest {
     pub rp_ids: Vec<String>,
     pub credentials: Vec<CredentialRef>,
     pub requested_ttl_secs: u64,
+    /// The TTL bound the request was validated against; approval clamps to the same bound.
+    pub max_ttl_secs: u64,
     pub allow_empty_credentials: bool,
     pub resolved: bool,
     pub resolved_grant_id: Option<GrantId>,
@@ -397,6 +399,8 @@ impl fmt::Debug for AuthorizationClaim {
 pub struct GrantSnapshotForSign {
     pub grant_id: GrantId,
     pub profile_id: ProfileId,
+    /// Digest of the principal process the grant was issued to (ADR 0014 sections 7 and 9).
+    pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credential_refs: Vec<CredentialRef>,
     pub state: GrantState,
@@ -441,6 +445,10 @@ pub struct GrantRegistry {
     policy_generation: PolicyGenerationId,
     policy_digest: PolicyDigest,
     max_ttl_secs: u64,
+    /// Upper bound for bearer-session grants (`max_session_ttl`), which is independent of the
+    /// intent grant bound `max_ttl_secs` (`max_grant_ttl`). Defect B5: session grants used to be
+    /// validated against `max_grant_ttl` (300 s by default), so a longer session TTL failed.
+    max_session_ttl_secs: u64,
     allowed_actions: BTreeSet<String>,
     max_concurrent_grants: u64,
     last_seen_mono: u64,
@@ -465,6 +473,7 @@ impl GrantRegistry {
             policy_generation,
             policy_digest,
             max_ttl_secs,
+            max_session_ttl_secs: max_ttl_secs,
             allowed_actions,
             max_concurrent_grants,
             last_seen_mono: 0,
@@ -482,24 +491,45 @@ impl GrantRegistry {
         Ok(())
     }
 
+    /// Set the bound for bearer-session grants (`max_session_ttl`, ADR 0014 section 9).
+    pub fn with_max_session_ttl(mut self, max_session_ttl_secs: u64) -> Self {
+        self.max_session_ttl_secs = max_session_ttl_secs;
+        self
+    }
+
     pub fn request_grant(
         &mut self,
         params: GrantRequestParams,
     ) -> Result<GrantRequestId, GrantError> {
-        self.request_grant_inner(params, false)
+        let max_ttl = self.max_ttl_secs;
+        self.request_grant_inner(params, false, max_ttl)
     }
 
     pub fn request_dynamic_grant(
         &mut self,
         params: GrantRequestParams,
     ) -> Result<GrantRequestId, GrantError> {
-        self.request_grant_inner(params, true)
+        let max_ttl = self.max_ttl_secs;
+        self.request_grant_inner(params, true, max_ttl)
+    }
+
+    /// Request the grant that backs a browser bearer session. Its TTL is bounded by the profile's
+    /// `max_session_ttl`, not by `max_grant_ttl` (defect B5). `dynamic` allows an empty credential
+    /// set (credentials are discovered per request).
+    pub fn request_session_grant(
+        &mut self,
+        params: GrantRequestParams,
+        dynamic: bool,
+    ) -> Result<GrantRequestId, GrantError> {
+        let max_ttl = self.max_session_ttl_secs;
+        self.request_grant_inner(params, dynamic, max_ttl)
     }
 
     fn request_grant_inner(
         &mut self,
         params: GrantRequestParams,
         allow_empty_credentials: bool,
+        max_ttl_secs: u64,
     ) -> Result<GrantRequestId, GrantError> {
         self.check_clock()?;
 
@@ -514,10 +544,10 @@ impl GrantRegistry {
         if params.requested_ttl_secs == 0 {
             return Err(GrantError::TtlZero);
         }
-        if params.requested_ttl_secs > self.max_ttl_secs {
+        if params.requested_ttl_secs > max_ttl_secs {
             return Err(GrantError::TtlExceedsProfileMax {
                 requested: params.requested_ttl_secs,
-                max: self.max_ttl_secs,
+                max: max_ttl_secs,
             });
         }
 
@@ -532,6 +562,7 @@ impl GrantRegistry {
             rp_ids: params.rp_ids,
             credentials: cred_set.sorted,
             requested_ttl_secs: params.requested_ttl_secs,
+            max_ttl_secs,
             allow_empty_credentials,
             resolved: false,
             resolved_grant_id: None,
@@ -581,7 +612,7 @@ impl GrantRegistry {
         } else {
             CredentialSet::new(request.credentials.clone())?
         };
-        let ttl = clamp_ttl(request.requested_ttl_secs, self.max_ttl_secs);
+        let ttl = clamp_ttl(request.requested_ttl_secs, request.max_ttl_secs);
         let now = self.clock.monotonic_secs();
         let profile_id = request.profile_id.clone();
 
@@ -912,6 +943,7 @@ impl GrantRegistry {
         Some(GrantSnapshotForSign {
             grant_id: grant.id.clone(),
             profile_id: grant.profile_id.clone(),
+            principal_digest: grant.principal_digest,
             rp_ids,
             credential_refs: cred_refs,
             state,

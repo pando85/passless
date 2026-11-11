@@ -67,6 +67,17 @@ struct CliArgs {
     args: passless_core::Args,
 }
 
+/// Take the backend operation lock. It guards no data (`Mutex<()>`), so a poisoned lock is
+/// recovered: a thread that panicked while holding it (for example an agent ceremony) must not
+/// disable the human authenticator for the rest of the daemon's life.
+pub(crate) fn lock_operation(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        warn!("operation lock was poisoned by a panicked thread; recovering");
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Wrapper for AuthenticatorService that implements CommandHandler
 ///
 /// Lock order (documented): operation_lock → service (storage).
@@ -112,10 +123,7 @@ impl<
             return Err(soft_fido2_transport::Error::InvalidCommand);
         }
 
-        let _op = self.operation_lock.lock().map_err(|e| {
-            error!("Failed to lock operation: {}", e);
-            soft_fido2_transport::Error::Other("Failed to lock operation".to_string())
-        })?;
+        let _op = lock_operation(&self.operation_lock);
 
         let mut service = self.service.lock().map_err(|e| {
             error!("Failed to lock service: {}", e);
@@ -193,6 +201,7 @@ fn spawn_agent_runtime(
     agent_config: passless_core::agent::AgentConfig,
     security_config: passless_core::config::SecurityConfig,
     shutdown: Arc<AtomicBool>,
+    config_source: Option<agent::runtime::AgentConfigSource>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let shutdown_for_runtime = shutdown.clone();
     match std::thread::Builder::new()
@@ -206,6 +215,7 @@ fn spawn_agent_runtime(
                 &agent_config,
                 security_config,
                 shutdown_for_runtime.clone(),
+                config_source,
             ) {
                 Ok(runtime) => {
                     while !shutdown_for_runtime.load(Ordering::Relaxed) {
@@ -435,6 +445,13 @@ fn run() -> Result<()> {
     let config = AppConfig::load(&mut args).inspect_err(|e| {
         error!("{}", e.format_cli());
     })?;
+    // A policy reload re-reads the agent configuration from the same file (ADR 0014 section 6.4).
+    #[cfg(feature = "agent")]
+    let agent_config_source =
+        AppConfig::config_file_path(&args).map(|path| agent::runtime::AgentConfigSource {
+            path,
+            human_state_path: config.backend().ok().map(|backend| backend.state_path()),
+        });
 
     // Validate configuration
     if let Err(e) = config.validate() {
@@ -576,6 +593,7 @@ fn run() -> Result<()> {
                         config.agents.clone(),
                         security_config,
                         shutdown.clone(),
+                        agent_config_source.clone(),
                     );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
@@ -623,6 +641,7 @@ fn run() -> Result<()> {
                         config.agents.clone(),
                         security_config,
                         shutdown.clone(),
+                        agent_config_source.clone(),
                     );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
@@ -668,6 +687,7 @@ fn run() -> Result<()> {
                             config.agents.clone(),
                             security_config,
                             shutdown.clone(),
+                            agent_config_source.clone(),
                         );
 
                         let result =
@@ -700,6 +720,7 @@ fn run() -> Result<()> {
                             config.agents.clone(),
                             security_config,
                             shutdown.clone(),
+                            agent_config_source.clone(),
                         );
 
                         let result =
@@ -858,5 +879,27 @@ fn run() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod operation_lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_holder_does_not_disable_the_human_path() {
+        let lock = Arc::new(Mutex::new(()));
+        let holder = lock.clone();
+        let panicked = std::thread::spawn(move || {
+            let _op = holder.lock().unwrap();
+            panic!("agent ceremony panicked while holding the operation lock");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(lock.is_poisoned());
+        // The human path still gets the lock, and the poison is cleared.
+        drop(lock_operation(&lock));
+        assert!(!lock.is_poisoned());
+        drop(lock_operation(&lock));
     }
 }

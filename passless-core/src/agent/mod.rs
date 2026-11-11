@@ -5,9 +5,9 @@ pub mod protocol;
 pub mod resolve;
 
 pub use config::{
-    AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, AgentStorageConfig, BoundedDuration,
-    BrowserScope, CredentialSelection, DeviceIdentity, LOCALHOST_RP_ID, LegacyConfigUse,
-    MAX_GRANT_RP_IDS, PolicyAction, RuleAction, validate_rp_id,
+    AgentConfig, AgentMode, AgentProfileConfig, AgentRequestLimits, AgentRpRule,
+    AgentStorageConfig, BoundedDuration, BrowserScope, CredentialSelection, DeviceIdentity,
+    LOCALHOST_RP_ID, LegacyConfigUse, MAX_GRANT_RP_IDS, PolicyAction, RuleAction, validate_rp_id,
 };
 pub use ids::{
     BrowserLeaseId, CredentialRef, EndpointId, GrantId, IdError, IntentId, PendingRequestId,

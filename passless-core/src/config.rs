@@ -628,45 +628,28 @@ impl BackendConfig {
 }
 
 impl AppConfig {
+    /// The configuration file [`Self::load`] reads: `--config`/`PASSLESS_CONFIG`, else the default
+    /// `~/.config/passless/config.toml`, if it exists.
+    pub fn config_file_path(args: &Args) -> Option<PathBuf> {
+        let default_config_path = dirs::config_dir().map(|p| p.join("passless/config.toml"));
+        args.config_path
+            .clone()
+            .or(default_config_path)
+            .filter(|p| p.exists())
+    }
+
     /// Load configuration with precedence: CLI > config file > defaults
     pub fn load(args: &mut Args) -> crate::error::Result<Self> {
-        let default_config_path = dirs::config_dir().map(|p| p.join("passless/config.toml"));
+        let config_file_path = Self::config_file_path(args);
 
-        let config_file_path = args
-            .config_path
-            .as_ref()
-            .or(default_config_path.as_ref())
-            .filter(|p| p.exists());
-
-        if let Some(path) = config_file_path
+        if let Some(path) = config_file_path.as_ref()
             && let Ok(f) = File::open(path)
         {
             log::info!("Loading configuration from: {}", path.display());
             let content = std::io::read_to_string(BufReader::new(f)).unwrap_or_default();
 
             #[cfg(feature = "agent")]
-            let agent_config = {
-                match toml::from_str::<toml::Table>(&content) {
-                    Ok(table) => match table.get("agents") {
-                        Some(agents_value) => serde::Deserialize::deserialize(agents_value.clone())
-                            .map_err(|e| {
-                                Error::Config(format!(
-                                    "failed to parse [agents] section in {}: {}",
-                                    path.display(),
-                                    e
-                                ))
-                            })?,
-                        None => AgentConfig::default(),
-                    },
-                    Err(e) => {
-                        return Err(Error::Config(format!(
-                            "failed to parse config file {} as TOML: {}",
-                            path.display(),
-                            e
-                        )));
-                    }
-                }
-            };
+            let agent_config = AgentConfig::from_toml_str(&content, &path.display().to_string())?;
 
             match toml::from_str::<<AppConfig as ClapSerde>::Opt>(&content) {
                 Ok(file_config) => {
