@@ -448,24 +448,40 @@ pub fn render_client_config(
     target: McpConfigTarget,
     profile: &str,
     adapter: McpAdapterKind,
+    command: &str,
 ) -> serde_json::Value {
     use serde_json::json;
     let (name, args) = entry_parts(profile, adapter);
-    let stdio = json!({ "type": "stdio", "command": "passless", "args": args });
+    let stdio = json!({ "type": "stdio", "command": command, "args": args });
     match target {
         McpConfigTarget::ClaudeCode | McpConfigTarget::Cursor => {
             json!({ "mcpServers": { name: stdio } })
         }
         McpConfigTarget::Vscode => json!({ "servers": { name: stdio } }),
         McpConfigTarget::Opencode => {
-            let mut command = vec!["passless".to_string()];
-            command.extend(args);
+            let mut argv = vec![command.to_string()];
+            argv.extend(args);
             json!({
                 "$schema": "https://opencode.ai/config.json",
-                "mcp": { "servers": { name: { "type": "local", "command": command } } }
+                "mcp": { "servers": { name: { "type": "local", "command": argv } } }
             })
         }
     }
+}
+
+/// The command a printed MCP entry runs: the absolute, canonical path of this executable, so the
+/// entry works from a client whose `PATH` does not include where passless was installed (a
+/// `cargo install` goes to `~/.cargo/bin`, which GUI clients often lack). Falls back to the bare
+/// name `passless` (found through the client's `PATH`) when the path is unknown, no longer exists
+/// (a replaced binary reads as `... (deleted)`), is not valid UTF-8 or holds a quote that would
+/// break the shell one-liner printed next to it.
+fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
+    current_exe
+        .and_then(std::fs::canonicalize)
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .filter(|path| Path::new(path).is_absolute() && !path.contains(['\'', '"']))
+        .unwrap_or_else(|| "passless".to_string())
 }
 
 /// `passless agent mcp --print-config <client>`.
@@ -476,7 +492,8 @@ fn print_config(
 ) -> Result<()> {
     // The entry names its profile explicitly, so it keeps working when more are added later.
     let profile = &resolve_profile(profile)?;
-    let config = render_client_config(target, profile, adapter);
+    let command = mcp_entry_command(std::env::current_exe());
+    let config = render_client_config(target, profile, adapter, &command);
     println!(
         "{}",
         serde_json::to_string_pretty(&config).map_err(|e| Error::Other(e.to_string()))?
@@ -904,18 +921,25 @@ mod tests {
         let args = ["agent", "mcp", "playwright", "--profile", "coding"];
 
         // Claude Code `.mcp.json`: `mcpServers`, stdio command and args.
-        let claude = render_client_config(McpConfigTarget::ClaudeCode, "coding", Playwright);
+        let claude = render_client_config(
+            McpConfigTarget::ClaudeCode,
+            "coding",
+            Playwright,
+            "passless",
+        );
         let entry = &claude["mcpServers"]["passless-playwright"];
         assert_eq!(entry["type"], "stdio");
         assert_eq!(entry["command"], "passless");
         assert_eq!(entry["args"], serde_json::json!(args));
 
         // Cursor `.cursor/mcp.json`: the same shape.
-        let cursor = render_client_config(McpConfigTarget::Cursor, "coding", Playwright);
+        let cursor =
+            render_client_config(McpConfigTarget::Cursor, "coding", Playwright, "passless");
         assert_eq!(cursor, claude);
 
         // VS Code `.vscode/mcp.json`: `servers`, not `mcpServers`.
-        let vscode = render_client_config(McpConfigTarget::Vscode, "coding", Playwright);
+        let vscode =
+            render_client_config(McpConfigTarget::Vscode, "coding", Playwright, "passless");
         assert!(vscode.get("mcpServers").is_none());
         assert_eq!(vscode["servers"]["passless-playwright"]["type"], "stdio");
         assert_eq!(
@@ -924,7 +948,8 @@ mod tests {
         );
 
         // opencode `opencode.json`: `mcp.servers.<name>` with a local command array.
-        let opencode = render_client_config(McpConfigTarget::Opencode, "coding", Playwright);
+        let opencode =
+            render_client_config(McpConfigTarget::Opencode, "coding", Playwright, "passless");
         let entry = &opencode["mcp"]["servers"]["passless-playwright"];
         assert_eq!(entry["type"], "local");
         assert_eq!(
@@ -940,10 +965,60 @@ mod tests {
         );
         assert_eq!(opencode["$schema"], "https://opencode.ai/config.json");
 
-        let devtools = render_client_config(McpConfigTarget::ClaudeCode, "coding", ChromeDevtools);
+        let devtools = render_client_config(
+            McpConfigTarget::ClaudeCode,
+            "coding",
+            ChromeDevtools,
+            "passless",
+        );
         assert_eq!(
             devtools["mcpServers"]["passless-chrome-devtools"]["args"][2],
             "chrome-devtools"
         );
+    }
+
+    /// The printed entry names this executable by its absolute, canonical path.
+    #[test]
+    fn the_printed_entry_runs_the_absolute_path_of_this_executable() {
+        use McpAdapterKind::Playwright;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-passless");
+        std::fs::write(&real, b"").unwrap();
+        let link = tmp.path().join("link-passless");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let canonical = canonical.to_str().unwrap();
+
+        // A symlink resolves to the file; the entry carries it in every client's format.
+        let command = mcp_entry_command(Ok(link));
+        assert_eq!(command, canonical);
+        let claude =
+            render_client_config(McpConfigTarget::ClaudeCode, "coding", Playwright, &command);
+        assert_eq!(
+            claude["mcpServers"]["passless-playwright"]["command"],
+            canonical
+        );
+        let opencode =
+            render_client_config(McpConfigTarget::Opencode, "coding", Playwright, &command);
+        assert_eq!(
+            opencode["mcp"]["servers"]["passless-playwright"]["command"][0],
+            canonical
+        );
+
+        // Unknown, vanished (a replaced binary) or shell-hostile paths fall back to the name.
+        assert_eq!(
+            mcp_entry_command(Err(std::io::Error::other("no /proc"))),
+            "passless"
+        );
+        assert_eq!(
+            mcp_entry_command(Ok(tmp.path().join("gone (deleted)"))),
+            "passless"
+        );
+        let quoted = tmp.path().join("it's");
+        std::fs::write(&quoted, b"").unwrap();
+        assert_eq!(mcp_entry_command(Ok(quoted)), "passless");
+        assert_eq!(mcp_entry_command(Ok(PathBuf::from("relative"))), "passless");
+        // The running test binary resolves to an absolute path.
+        assert!(Path::new(&mcp_entry_command(std::env::current_exe())).is_absolute());
     }
 }
