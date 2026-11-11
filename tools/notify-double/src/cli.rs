@@ -7,7 +7,7 @@ use crate::server::Config;
 
 pub const USAGE: &str = "usage: notify-double --log <path> [--script <spec>]... \
 [--ready-file <path>] [--capabilities a,b,c] [--server-name <name>]\n\
-script steps: approve[:ms] | deny[:ms] | ignore | close[:ms] | invoke=<key>[:ms]\n\
+script steps: approve[:ms] (invokes allow_always) | deny[:ms] | ignore | close[:ms] | invoke=<key>[:ms]\n\
 env NOTIFY_DOUBLE_SCRIPT: comma-separated steps (used when no --script is given)";
 
 pub struct Cli {

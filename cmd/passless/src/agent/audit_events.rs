@@ -8,6 +8,7 @@ use passless_core::agent::{
 };
 
 use super::grant::{CeremonyId, GrantRequestId};
+use super::granted_rules::{GrantKind, PermittingRule};
 use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 
 pub const AUDIT_SCHEMA_VERSION: u32 = 2;
@@ -244,6 +245,29 @@ pub enum AuditPayload {
     /// An operator revoked persistent granted rules (ADR 0014 section 8.4).
     #[serde(rename = "granted_rule.revoke")]
     GrantedRuleRevoke(GrantedRuleRevokeMeta),
+    /// An approved escalation (or a registration after one) persisted a granted rule (ADR 0014
+    /// section 8.4).
+    #[serde(rename = "granted_rule.add")]
+    GrantedRuleAdd(GrantedRuleAddMeta),
+
+    /// A ceremony that resolved to `request` raised an escalation (ADR 0014 section 8.1). A failed
+    /// write of this record fails the escalation.
+    #[serde(rename = "escalation.requested")]
+    EscalationRequested(EscalationRequestedMeta),
+    /// The human chose "Allow always" on the escalation prompt.
+    #[serde(rename = "escalation.approved")]
+    EscalationApproved(EscalationApprovedMeta),
+    /// The escalation was denied: by the human, by a dismissal or an early approval, or because the
+    /// prompt, the audit or the grant write failed.
+    #[serde(rename = "escalation.denied")]
+    EscalationDenied(EscalationDeniedMeta),
+    /// The escalation ended without a decision: its last waiter timed out or aborted, or the
+    /// notification server went away.
+    #[serde(rename = "escalation.expired")]
+    EscalationExpired(EscalationExpiredMeta),
+    /// A pending escalation was cancelled by a policy reload.
+    #[serde(rename = "escalation.revoked")]
+    EscalationRevoked(EscalationRevokedMeta),
 
     #[serde(rename = "admin.profile_enable")]
     AdminProfileEnable(AdminProfileEnableMeta),
@@ -328,6 +352,12 @@ impl AuditPayload {
             Self::PromptTimeout(_) => "prompt.timeout",
             Self::PromptError(_) => "prompt.error",
             Self::GrantedRuleRevoke(_) => "granted_rule.revoke",
+            Self::GrantedRuleAdd(_) => "granted_rule.add",
+            Self::EscalationRequested(_) => "escalation.requested",
+            Self::EscalationApproved(_) => "escalation.approved",
+            Self::EscalationDenied(_) => "escalation.denied",
+            Self::EscalationExpired(_) => "escalation.expired",
+            Self::EscalationRevoked(_) => "escalation.revoked",
             Self::AdminProfileEnable(_) => "admin.profile_enable",
             Self::AdminProfileDisable(_) => "admin.profile_disable",
             Self::AdminProfileDisableRequest(_) => "admin.profile_disable_request",
@@ -775,9 +805,25 @@ pub enum PolicyDenyReason {
     AuditFailure,
     CounterPersistenceFailure,
     GrantRevoked,
-    /// A ceremony needed a human decision (`confirm`/`request`, human UP or UV) but the escalation service
-    /// does not exist yet (P7); the ceremony is denied and never reaches a prompt or the native path.
+    /// A ceremony needed a human decision but no escalation prompt can be shown: no session bus
+    /// can be resolved, or the notification server was rejected by the capability gate. The
+    /// ceremony is denied and never reaches a prompt or the native path.
     EscalationUnavailable,
+    /// The escalation key is in its cooldown after a deny, a timeout or repeated withdrawals
+    /// (ADR 0014 section 8.1); denied without a prompt.
+    EscalationCooldown,
+    /// The profile's escalation queue is full (one active prompt plus a bounded FIFO).
+    EscalationQueueFull,
+    /// A waiter cap was reached: per session, per profile or global (ADR 0014 section 8.2).
+    EscalationWaiterCap,
+    /// A registration escalation for the same profile and RP is already pending; registration
+    /// escalations are not joinable (ADR 0014 section 8.3).
+    EscalationBusy,
+    /// The profile holds `max_granted_rules` granted rules already.
+    GrantCapReached,
+    /// The profile's granted-rules store is disabled (unreadable, wrongly owned or corrupt), so no
+    /// grant can be persisted.
+    GrantsUnavailable,
     /// The request came from a frame whose origin differs from its ancestors; cross-origin fails closed.
     CrossOriginDenied,
     /// The request used a bearer whose browser lease was revoked or whose browser exited.
@@ -931,6 +977,103 @@ pub struct GrantedRuleRevokeMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rp_id: Option<String>,
     revoked: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantedRuleAddMeta {
+    profile_id: ProfileId,
+    rp_id: String,
+    /// `escalation` or `registration` (`kind` is the record's own tag).
+    grant_kind: GrantKind,
+    /// The approving escalation's ID.
+    escalation_id: String,
+    rule: PermittingRule,
+    /// The credential a registration grant pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_ref: Option<CredentialRef>,
+}
+
+/// Why an escalation was denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationDenyCause {
+    /// The human chose "Deny".
+    User,
+    /// "Allow always" arrived before the minimum review delay; treated as a deny.
+    EarlyApproval,
+    /// The human dismissed the notification.
+    Dismissed,
+    /// The prompt could not be shown (no bus, rejected server, prompt child failure).
+    PromptUnavailable,
+    /// The approval could not be audited.
+    AuditFailure,
+    /// The approval could not be persisted as a granted rule.
+    GrantWriteFailed,
+}
+
+/// Why an escalation expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationExpireReason {
+    /// The last waiter's ceremony deadline passed.
+    Timeout,
+    /// The last waiter left (the ceremony was aborted, or its session became invalid).
+    Aborted,
+    /// The notification server went away while the prompt was shown.
+    ServerLost,
+}
+
+/// Why a pending escalation was revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationRevokeReason {
+    PolicyReload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationRequestedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    origin: String,
+    rule: PermittingRule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationApprovedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationDeniedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    cause: EscalationDenyCause,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationExpiredMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    reason: EscalationExpireReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationRevokedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    reason: EscalationRevokeReason,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2229,6 +2372,102 @@ impl GrantedRuleRevokeBuilder {
     }
 }
 
+pub struct GrantedRuleAddBuilder {
+    meta: GrantedRuleAddMeta,
+}
+
+impl GrantedRuleAddBuilder {
+    pub fn new(
+        profile_id: ProfileId,
+        rp_id: &str,
+        kind: GrantKind,
+        escalation_id: &str,
+        rule: PermittingRule,
+    ) -> Self {
+        Self {
+            meta: GrantedRuleAddMeta {
+                profile_id,
+                rp_id: rp_id.to_string(),
+                grant_kind: kind,
+                escalation_id: escalation_id.to_string(),
+                rule,
+                credential_ref: None,
+            },
+        }
+    }
+
+    pub fn credential_ref(mut self, credential_ref: Option<CredentialRef>) -> Self {
+        self.meta.credential_ref = credential_ref;
+        self
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::GrantedRuleAdd(self.meta))
+    }
+}
+
+/// The fields every `escalation.*` record carries.
+#[derive(Debug, Clone)]
+pub struct EscalationAuditContext {
+    pub escalation_id: String,
+    pub profile_id: ProfileId,
+    pub action: AuditAction,
+    pub rp_id: String,
+}
+
+impl EscalationAuditContext {
+    pub fn requested(&self, origin: &str, rule: PermittingRule) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationRequested(EscalationRequestedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            origin: origin.to_string(),
+            rule,
+        }))
+    }
+
+    pub fn approved(&self, latency_ms: u64) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationApproved(EscalationApprovedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            latency_ms,
+        }))
+    }
+
+    pub fn denied(&self, cause: EscalationDenyCause) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationDenied(EscalationDeniedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            cause,
+        }))
+    }
+
+    pub fn expired(&self, reason: EscalationExpireReason) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationExpired(EscalationExpiredMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            reason,
+        }))
+    }
+
+    pub fn revoked(&self, reason: EscalationRevokeReason) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationRevoked(EscalationRevokedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            reason,
+        }))
+    }
+}
+
 pub struct AdminProfileEnableBuilder {
     profile_id: ProfileId,
 }
@@ -2490,6 +2729,15 @@ mod tests {
         AuditEvent::new(serde_json::from_value(payload).unwrap())
     }
 
+    fn escalation_context(pid: &ProfileId) -> EscalationAuditContext {
+        EscalationAuditContext {
+            escalation_id: "esc-1".to_string(),
+            profile_id: pid.clone(),
+            action: AuditAction::Authenticate,
+            rp_id: "example.com".to_string(),
+        }
+    }
+
     fn all_test_events() -> Vec<AuditEvent> {
         let pid = test_profile_id();
         let eid = test_endpoint_id();
@@ -2542,6 +2790,20 @@ mod tests {
             GrantClaimBuilder::new(gid.clone(), &cer_id).build(),
             GrantConsumeBuilder::new(gid.clone(), &cer_id).build(),
             GrantedRuleRevokeBuilder::new(pid.clone(), Some("example.com".to_string()), 1).build(),
+            GrantedRuleAddBuilder::new(
+                pid.clone(),
+                "example.com",
+                GrantKind::Registration,
+                "esc-1",
+                PermittingRule::Wildcard,
+            )
+            .credential_ref(Some(cred.clone()))
+            .build(),
+            escalation_context(&pid).requested("https://example.com", PermittingRule::Exact),
+            escalation_context(&pid).approved(1500),
+            escalation_context(&pid).denied(EscalationDenyCause::User),
+            escalation_context(&pid).expired(EscalationExpireReason::Aborted),
+            escalation_context(&pid).revoked(EscalationRevokeReason::PolicyReload),
             PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com").build(),
             PolicyDenyBuilder::new(
                 pid.clone(),
@@ -2779,12 +3041,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 55);
+        assert_eq!(events.len(), 61);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 55, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 61, "duplicate kind names detected");
     }
 
     #[test]
@@ -2875,6 +3137,46 @@ mod tests {
     }
 
     #[test]
+    fn test_escalation_reason_codes_serialize_stably() {
+        for (reason, expected) in [
+            (PolicyDenyReason::EscalationCooldown, "escalation_cooldown"),
+            (
+                PolicyDenyReason::EscalationQueueFull,
+                "escalation_queue_full",
+            ),
+            (
+                PolicyDenyReason::EscalationWaiterCap,
+                "escalation_waiter_cap",
+            ),
+            (PolicyDenyReason::EscalationBusy, "escalation_busy"),
+            (PolicyDenyReason::GrantCapReached, "grant_cap_reached"),
+            (PolicyDenyReason::GrantsUnavailable, "grants_unavailable"),
+            (
+                PolicyDenyReason::EscalationUnavailable,
+                "escalation_unavailable",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+        }
+        for (reason, expected) in [
+            (EscalationExpireReason::Timeout, "timeout"),
+            (EscalationExpireReason::Aborted, "aborted"),
+            (EscalationExpireReason::ServerLost, "server_lost"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(EscalationRevokeReason::PolicyReload).unwrap(),
+            "policy_reload"
+        );
+        let event = escalation_context(&test_profile_id()).expired(EscalationExpireReason::Timeout);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "escalation.expired");
+        assert_eq!(json["reason"], "timeout");
+        assert_eq!(json["escalation_id"], "esc-1");
+    }
+
+    #[test]
     fn test_credential_ref_serializes_as_hex_not_bytes() {
         let cred = test_cred();
         let json = serde_json::to_value(&cred).unwrap();
@@ -2956,6 +3258,12 @@ mod tests {
             "grant.claim",
             "grant.consume",
             "granted_rule.revoke",
+            "granted_rule.add",
+            "escalation.requested",
+            "escalation.approved",
+            "escalation.denied",
+            "escalation.expired",
+            "escalation.revoked",
             "policy.allow",
             "policy.deny",
             "policy.replay_served",

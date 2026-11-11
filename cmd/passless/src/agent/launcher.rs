@@ -757,6 +757,73 @@ impl HardenedChildSetup {
 
         Ok(())
     }
+
+    /// Pre-exec setup of the escalation prompt child (ADR 0014 section 8.2):
+    ///
+    /// 1. close every inherited descriptor above stdio;
+    /// 2. when the target differs from the daemon (a root daemon): `setgroups(0)`, `setresgid`,
+    ///    `setresuid` to the target, irreversibly;
+    /// 3. `PR_SET_PDEATHSIG(SIGKILL)`, after the credential change (which clears it), then
+    ///    confirm `parent` is still the parent (it may have died before the signal was armed);
+    /// 4. no core dumps, then `PR_SET_NO_NEW_PRIVS`.
+    ///
+    /// It allocates nothing and calls only async-signal-safe functions.
+    ///
+    /// # Safety
+    ///
+    /// Must be called in the forked child before `exec`, after stdio is set up.
+    pub unsafe fn apply_prompt_child(&self, parent: libc::pid_t) -> Result<(), io::Error> {
+        let last_error = || Err(io::Error::last_os_error());
+
+        // SAFETY: plain syscalls on this process; no memory is shared with the parent.
+        unsafe {
+            let closed = libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_ulong,
+                !0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            );
+            if closed < 0 {
+                if io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS) {
+                    return last_error();
+                }
+                for fd in 3..get_nofile_limit() {
+                    libc::close(fd);
+                }
+            }
+
+            if !self.same_user() {
+                if libc::setgroups(0, std::ptr::null()) < 0 {
+                    return last_error();
+                }
+                if libc::setresgid(self.target_gid, self.target_gid, self.target_gid) < 0 {
+                    return last_error();
+                }
+                if libc::setresuid(self.target_uid, self.target_uid, self.target_uid) < 0 {
+                    return last_error();
+                }
+            }
+
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) < 0 {
+                return last_error();
+            }
+            if libc::getppid() != parent {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) < 0 {
+                return last_error();
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+                return last_error();
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) unsafe fn close_range_preserving(preserved: &[RawFd]) -> Result<(), io::Error> {

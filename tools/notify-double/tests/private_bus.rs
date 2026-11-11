@@ -281,7 +281,7 @@ async fn approve_after_delay_emits_signals_and_logs() {
         .await
         .expect("ActionInvoked");
     let (sid, key): (u32, String) = msg.body().deserialize().unwrap();
-    assert_eq!((sid, key.as_str()), (1, "approve"));
+    assert_eq!((sid, key.as_str()), (1, "allow_always"));
     assert_eq!(
         msg.header().sender().map(|s| s.to_string()).as_deref(),
         Some(server.unique_name.as_str())
@@ -304,7 +304,7 @@ async fn approve_after_delay_emits_signals_and_logs() {
     assert_eq!(n["hints"]["urgency"], 2);
     assert_eq!(n["hints"]["category"], "x.test");
     assert!(n["sender"].as_str().unwrap().starts_with(':'));
-    assert_eq!(log[1]["action"], "approve");
+    assert_eq!(log[1]["action"], "allow_always");
     assert_eq!(log[1]["delay_ms"], 50);
     assert_eq!(log[2]["origin"], "script");
     let seqs: Vec<u64> = log.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
@@ -358,7 +358,7 @@ async fn nth_step_then_last_repeats() {
         let (_, key): (u32, String) = msg.body().deserialize().unwrap();
         keys.push(key);
     }
-    assert_eq!(keys, ["deny", "approve", "approve"]);
+    assert_eq!(keys, ["deny", "allow_always", "allow_always"]);
     let steps: Vec<String> = server
         .events("Notify")
         .iter()

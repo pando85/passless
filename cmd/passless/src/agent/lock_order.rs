@@ -55,8 +55,13 @@ pub enum LockLevel {
     TransportConnection = 74,
     /// A transport connection's write mutex (one frame at a time). A leaf.
     TransportWrite = 76,
-    /// Reserved for the P7 escalation service mutex (a leaf).
+    /// The escalation service mutex (`EscalationService::inner`) and its condvar. A leaf: no audit,
+    /// store, prompt or D-Bus call happens under it, and waiters park on its condvar holding
+    /// nothing else.
     Escalation = 80,
+    /// The notification prompt driver's per-profile channel table (`NotificationPrompter`). A
+    /// leaf: only channel sends happen under it.
+    PromptDriver = 82,
 }
 
 impl LockLevel {
@@ -70,6 +75,7 @@ impl LockLevel {
                 | Self::TransportConnection
                 | Self::TransportWrite
                 | Self::Escalation
+                | Self::PromptDriver
         )
     }
 }
@@ -270,6 +276,15 @@ mod tests {
             held_levels(),
             vec![LockLevel::GrantedRulesFile, LockLevel::GrantedRulesView]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn escalation_mutex_is_a_leaf() {
+        let escalation = Mutex::new(());
+        let driver = Mutex::new(());
+        let _escalation = lock(&escalation, LockLevel::Escalation);
+        let _driver = lock(&driver, LockLevel::PromptDriver);
     }
 
     #[test]

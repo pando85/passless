@@ -328,6 +328,16 @@ Run the following commands as root:\n\
   udevadm control --reload-rules && udevadm trigger";
 
 fn main() {
+    // The escalation prompt child (ADR 0014 section 8.2) is this binary re-executed with a hidden
+    // first argument. It is dispatched before argument parsing and before any config is loaded.
+    #[cfg(feature = "agent")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == agent::escalation_prompt::HIDDEN_ARG)
+    {
+        process::exit(agent::escalation_prompt::child_main());
+    }
+
     // Run main logic and format errors cleanly
     if let Err(e) = run() {
         eprintln!("Error: {}", e.format_cli());

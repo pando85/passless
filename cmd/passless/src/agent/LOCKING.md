@@ -20,8 +20,9 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
    `cleanup_expired_pending`, `cancel_pending_for_session`, `principal_exit`, `reload`).
    The only policy lock held across others is `reload_lock`, which ranks below them.
 3. **No lock across a wait on a human, an escalation or a join.** A joined duplicate waits on its
-   in-flight slot's condvar holding no other lock. P7's escalation wait must hold no lock either:
-   its waiters park on the escalation mutex's condvar, which is a leaf.
+   in-flight slot's condvar holding no other lock. An escalation waiter (`Waiter::wait`) holds no
+   lock either: it parks on the escalation mutex's condvar, which is a leaf, and wakes at least
+   every 250 ms to re-check its cancellation, deadline and session with the mutex released.
 4. **The backend operation lock is held only for the bounded key-use section.** In same-user mode
    it is the human authenticator's operation lock (`main.rs`), so agent ceremonies do take it:
    invariant 17 requires counters and credential updates to share the backend lock. They take it
@@ -68,10 +69,12 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 72 T | `ReadinessRegistry::entries` and its condvar | `transport/readiness.rs` | A leaf. The hello path records into it and the launch path reads or waits on it (`status`, `wait_attached`), possibly holding `lifecycle_lock` (10) and `browser_manager` (30). Waiters park on its condvar holding nothing else. The hello path never takes the lifecycle lock or the browser manager. |
 | 74 T | Sign transport: `Shared::connections` and each `Connection::in_flight` | `transport/mod.rs` | Leaves; they never nest with each other. Short map sections only: a connection to supersede is cloned out before it is closed. |
 | 76 T | A transport connection's write mutex (`Connection::writer`) | `transport/mod.rs` | A leaf. Held across one frame write, bounded by the 5 s write timeout. `closed` is set under it, so no frame follows a close. |
-| 80 | P7 escalation service mutex (reserved) | — | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters use its condvar holding nothing else. |
+| 80 T | `EscalationService::inner` and its condvar `changed` | `escalation.rs` | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters park on its condvar holding nothing else and call their `cancelled`/`still_valid` checks with it released. No audit record, store write, prompt show or withdrawal and no D-Bus call happens under it: state changes are made under it and their effects run after it is released. |
+| 82 T | `NotificationPrompter::drivers` (per-profile driver channels) | `prompt.rs` | A leaf: only a channel send (and, on first use, a thread spawn) happens under it. Called by the escalation service after its mutex is released. |
 | 90 | `AuditGate`: `append_lock`, then `sequence`, `last_hash`, `writer`, `current_segment(_name)`, `segment_index`, `anchor`, `anchor_inode`, `segment_file_ino` | `audit.rs` | Terminal leaf (rule 5). |
 | — | TPM `Context` mutex | `storage/tpm/portable/provider.rs` | A leaf inside the TPM key provider. It is released before the provider returns. |
 | — | `runtime_loop`, `sign_server_handle`, `WorkerTracker.handles`, `completed_sessions` | `runtime.rs` | Join-handle and bookkeeping locks. They never nest with the locks above. A `join()` under them only joins threads that do not take them. |
+| — | Prompt child: `Inbox::state` | `escalation_prompt.rs` | A separate process (the re-executed prompt child, or the validation probe). A leaf: it guards the stdin line queue and is never held across an await or another lock. |
 | — | Relay (`sign-proxy`): `Relay::output`, `Relay::in_flight` | `bin/sign-proxy.rs` | A separate process. The two never nest: an id is retired or drained under `in_flight`, which is released before a frame is written under `output`. |
 
 ## Ceremony paths
@@ -128,6 +131,17 @@ held across the file write; under it the view is read and then swapped (71), one
 writer is released before `bump_grant_epoch` (an atomic) or `bump_revocation_epoch` (the epoch
 gate, 69). After a revoke or clear the admin handler revokes stale sessions and closes browsers
 exactly as a reload does (steps 4 and 5 below).
+
+**Escalation** (`EscalationService`, wired into the ceremonies in P7 WP3). `join_or_create`
+reads the granted-rules view (71) through the grant writer and takes the escalation mutex (80)
+twice, never together: once to check the cooldown, once to admit the request. The
+`escalation.requested` record (90) is written with nothing held. A waiter parks on the escalation
+condvar holding nothing else. A prompt report runs on the profile's prompt driver thread, which
+holds no lock: the approval takes the escalation mutex to move the entry to `Deciding`, releases
+it, records `escalation.approved` (90), persists the grant (`GrantedRulesStore::add`: writer 64,
+then view 71; the grant epoch is an atomic), and takes the escalation mutex again to publish the
+outcome. Prompt shows and withdrawals take only the driver table (82), after the escalation mutex
+is released.
 
 **Reload** (`handle_reload_policy`) takes these locks in this order:
 

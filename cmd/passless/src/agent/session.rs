@@ -53,7 +53,7 @@ pub fn ceremony_deadline(timeout_ms: Option<u64>, now: Instant) -> Instant {
     now + timeout
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CeremonyAction {
     Authenticate,
     Register,

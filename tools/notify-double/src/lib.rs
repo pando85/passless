@@ -71,9 +71,13 @@ fn parse_delay(s: &str) -> Result<u64, ScriptError> {
         .map_err(|_| ScriptError::InvalidDelay(s.to_string()))
 }
 
+/// The action key `approve` invokes: Passless's "Allow always" (ADR 0014 section 8.1).
+pub const APPROVE_ACTION: &str = "allow_always";
+
 /// Parse a single script step.
 ///
-/// Grammar: `approve[:ms]`, `deny[:ms]`, `ignore`, `close[:ms]`, `invoke=<key>[:ms]`.
+/// Grammar: `approve[:ms]` (invokes [`APPROVE_ACTION`]), `deny[:ms]`, `ignore`, `close[:ms]`,
+/// `invoke=<key>[:ms]`.
 pub fn parse_step(spec: &str) -> Result<Step, ScriptError> {
     let text = spec.trim();
     if text.is_empty() {
@@ -91,7 +95,7 @@ pub fn parse_step(spec: &str) -> Result<Step, ScriptError> {
         StepAction::Invoke(key.to_string())
     } else {
         match head {
-            "approve" => StepAction::Invoke("approve".to_string()),
+            "approve" => StepAction::Invoke(APPROVE_ACTION.to_string()),
             "deny" => StepAction::Invoke("deny".to_string()),
             "close" => StepAction::Close,
             "ignore" if delay.is_none() => StepAction::Ignore,
@@ -275,7 +279,7 @@ mod tests {
     #[test]
     fn parses_basic_steps() {
         let s = parse_step("approve").unwrap();
-        assert_eq!(s.action, StepAction::Invoke("approve".into()));
+        assert_eq!(s.action, StepAction::Invoke("allow_always".into()));
         assert_eq!(s.delay_ms, 0);
         let s = parse_step("deny:250").unwrap();
         assert_eq!(s.action, StepAction::Invoke("deny".into()));
