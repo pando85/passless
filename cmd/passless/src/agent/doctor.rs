@@ -862,9 +862,9 @@ mod tests {
                 expected_uid: 1000,
             }),
             uid_checks: vec![UidCheck {
-                label: "principal_vs_daemon".into(),
+                label: "principal_not_root".into(),
                 passed: true,
-                message: "principal uid differs from daemon".into(),
+                message: "principal is not root".into(),
             }],
         }
     }

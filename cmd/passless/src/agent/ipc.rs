@@ -15,6 +15,7 @@ use passless_core::agent::protocol::{
     Validate,
 };
 
+use super::deployment::{PrincipalUidError, validate_principal_uid};
 use super::launcher::{PeerIdentity, capture_peer_identity_double_read};
 
 const ADMIN_DIR_NAME: &str = "admin";
@@ -134,7 +135,9 @@ impl RuntimeDir {
             let mut seen_uids: BTreeMap<u32, String> = BTreeMap::new();
             let mut seen_gids: BTreeMap<u32, String> = BTreeMap::new();
             for (id_str, access) in profiles {
-                if access.expected_uid == daemon_uid {
+                if let Err(PrincipalUidError::SameAsDaemon { .. }) =
+                    validate_principal_uid(true, access.expected_uid, daemon_uid)
+                {
                     return Err(IpcError::DuplicateAccess {
                         profile: id_str.clone(),
                         detail: format!("profile uid {} must not equal daemon uid", daemon_uid),

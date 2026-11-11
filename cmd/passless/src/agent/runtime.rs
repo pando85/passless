@@ -881,20 +881,8 @@ impl AgentRuntime {
             let user = resolve_user(&profile.principal_user)?;
 
             let is_root = unsafe { libc::geteuid() == 0 };
-            if is_root {
-                if user.uid == daemon_uid {
-                    return Err(RuntimeError::Config(format!(
-                        "profile '{}': principal uid {} must differ from daemon uid",
-                        name, daemon_uid
-                    )));
-                }
-                if user.uid == 0 {
-                    return Err(RuntimeError::Config(format!(
-                        "profile '{}': principal must not be root",
-                        name
-                    )));
-                }
-            }
+            super::deployment::validate_principal_uid(is_root, user.uid, daemon_uid)
+                .map_err(|e| RuntimeError::Config(format!("profile '{}': {}", name, e)))?;
 
             let cdp_port_mode = profile.browser_cdp_expose
                 == Some(passless_core::agent::config::CdpExposeMode::Port);
@@ -1006,7 +994,8 @@ impl AgentRuntime {
                 if is_root {
                     // A principal that shares the daemon's UID is a legitimate deployment
                     // (ADR 0014 section 13), reported as an axis and not refused here. A root
-                    // daemon cannot have one without a root principal, refused below.
+                    // daemon refuses a principal with its UID or UID 0 earlier, in
+                    // `validate_principal_uid`; `principal_not_root` is the diagnostic record.
                     info.uid_checks.push(super::doctor::UidCheck {
                         label: "principal_not_root".into(),
                         passed: resolved.uid != 0,

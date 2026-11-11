@@ -50,6 +50,46 @@ impl fmt::Display for PrincipalRelationship {
     }
 }
 
+/// Why a principal UID is refused under a root daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrincipalUidError {
+    /// The principal has the daemon's UID. Under a root daemon that is a root principal.
+    SameAsDaemon { daemon_uid: u32 },
+    /// The principal is root.
+    Root,
+}
+
+impl fmt::Display for PrincipalUidError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SameAsDaemon { daemon_uid } => {
+                write!(f, "principal uid {daemon_uid} must differ from daemon uid")
+            }
+            Self::Root => f.write_str("principal must not be root"),
+        }
+    }
+}
+
+/// The principal UID rule of a root daemon: the daemon drops privileges to spawn for the
+/// principal, so the principal must be neither the daemon's UID nor root. A non-root daemon
+/// accepts any principal UID, including its own (a shared-UID deployment, ADR 0014 section 13).
+pub fn validate_principal_uid(
+    daemon_is_root: bool,
+    principal_uid: u32,
+    daemon_uid: u32,
+) -> Result<(), PrincipalUidError> {
+    if !daemon_is_root {
+        return Ok(());
+    }
+    if principal_uid == daemon_uid {
+        return Err(PrincipalUidError::SameAsDaemon { daemon_uid });
+    }
+    if principal_uid == 0 {
+        return Err(PrincipalUidError::Root);
+    }
+    Ok(())
+}
+
 /// One profile's place in the section 13 matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeploymentAxes {
@@ -242,5 +282,42 @@ mod tests {
         let axes = DeploymentAxes::new(AgentMode::Isolated, DAEMON, DAEMON);
         let names: Vec<_> = axes.checks(Some("p")).into_iter().map(|c| c.name).collect();
         assert_eq!(names, ["deployment_axes.p", "isolated_shared_uid.p"]);
+    }
+
+    #[test]
+    fn a_root_daemon_refuses_a_principal_with_its_uid_or_root() {
+        assert_eq!(
+            validate_principal_uid(true, 0, 0),
+            Err(PrincipalUidError::SameAsDaemon { daemon_uid: 0 })
+        );
+        assert_eq!(
+            validate_principal_uid(true, DAEMON, DAEMON),
+            Err(PrincipalUidError::SameAsDaemon { daemon_uid: DAEMON })
+        );
+        assert_eq!(
+            validate_principal_uid(true, 0, DAEMON),
+            Err(PrincipalUidError::Root)
+        );
+        assert_eq!(validate_principal_uid(true, DAEMON + 1, DAEMON), Ok(()));
+        assert_eq!(validate_principal_uid(true, 1000, 0), Ok(()));
+    }
+
+    #[test]
+    fn a_non_root_daemon_accepts_any_principal_uid() {
+        for principal in [0, DAEMON, DAEMON + 1] {
+            assert_eq!(validate_principal_uid(false, principal, DAEMON), Ok(()));
+        }
+    }
+
+    #[test]
+    fn the_principal_uid_errors_keep_their_messages() {
+        assert_eq!(
+            PrincipalUidError::SameAsDaemon { daemon_uid: 0 }.to_string(),
+            "principal uid 0 must differ from daemon uid"
+        );
+        assert_eq!(
+            PrincipalUidError::Root.to_string(),
+            "principal must not be root"
+        );
     }
 }
