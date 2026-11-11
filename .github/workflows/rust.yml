@@ -32,11 +32,11 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v7
 
-      - name: Update apt
-        run: sudo apt update
-
       - name: Install udev and tss2 for TPM support
-        run: sudo apt-get install -y libudev-dev libtss2-dev
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y libudev-dev libtss2-dev && break || sleep 10
+          done
 
       - name: Install stable toolchain
         shell: bash
@@ -57,8 +57,9 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt update
-          sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y dbus-daemon gnupg2 libtss2-dev libudev-dev pass shellcheck swtpm && break || sleep 10
+          done
 
       - name: Install stable toolchain
         shell: bash
@@ -84,8 +85,9 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt update
-          sudo apt-get install -y libudev-dev
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y libudev-dev && break || sleep 10
+          done
 
       - name: Install nightly toolchain
         shell: bash
@@ -110,11 +112,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Update apt
-        run: sudo apt update
-
       - name: Install udev and tss2
-        run: sudo apt-get install -y libudev-dev libtss2-dev
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y libudev-dev libtss2-dev && break || sleep 10
+          done
 
       - name: Install Rust toolchain
         shell: bash
@@ -158,11 +160,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Update apt
-        run: sudo apt update
-
       - name: Install udev and tss2
-        run: sudo apt-get install -y libudev-dev libtss2-dev
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y libudev-dev libtss2-dev && break || sleep 10
+          done
 
       - name: Install Rust toolchain
         shell: bash
