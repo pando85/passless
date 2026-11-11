@@ -54,6 +54,8 @@ mod tests {
                     .to_string(),
             ),
             shared_browser_context: None,
+            interception: Some("attached".to_string()),
+            incognito_allowed: Some(true),
         });
 
         let json = serde_json::to_string(&response).unwrap();

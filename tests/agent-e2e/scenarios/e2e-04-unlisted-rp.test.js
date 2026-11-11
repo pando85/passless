@@ -13,7 +13,7 @@ scenario({ id: 'E2E-04', title: 'unlisted RP without wildcard: NotAllowedError, 
   await stack.seedHuman(rpB, 'alice');
   const storeBefore = storeFingerprint(stack.daemon);
 
-  const b = await stack.open('agent', `${rpB.origin}/sw`);
+  const b = await stack.open('agent', `${rpB.origin}/sw`, { startUrl: false }); // an unlisted RP is no admissible start URL
   assertInterceptionActive(b);
   const res = await authenticate(b.page, { username: 'alice' });
 

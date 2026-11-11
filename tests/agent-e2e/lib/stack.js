@@ -13,6 +13,20 @@ const { RpServer } = require('./rp-server');
 const { ensureTestTls, rpBrowserArgs } = require('./tls');
 const { variantArgs, connect, waitForExtensionWorker, launchPlain } = require('./browser');
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/** The (single) tab of `context` whose URL starts with `url`; waits for the daemon to open it. */
+async function waitForPage(context, url, timeoutMs = 15000) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    const hits = context.pages().filter(p => p.url().startsWith(url));
+    if (hits.length > 1) throw new Error(`more than one tab shows ${url}: ${context.pages().map(p => p.url()).join(', ')}`);
+    if (hits.length === 1) return hits[0];
+    if (Date.now() > end) throw new Error(`no tab shows the start URL ${url}; tabs: ${context.pages().map(p => p.url()).join(', ')}`);
+    await sleep(100);
+  }
+}
+
 /**
  * @param {object} variant  from browser.matrix()
  * @param {object} o
@@ -35,6 +49,7 @@ async function createStack(label, variant, o) {
 
     stack.startDaemon = profiles => startDaemon(env, {
       profiles,
+      limits: o.limits,
       browserExe: variant.browser.exe,
       browserArgs: [...variantArgs(variant), ...rpBrowserArgs(rpList)],
       env: o.daemonEnv,
@@ -71,19 +86,30 @@ async function createStack(label, variant, o) {
   };
 
   /**
-   * Launch the managed browser (no start URL) and navigate its first page to `url` once the Passless
-   * extension's service worker is up. The start URL is deliberately not used: Chromium starts
-   * navigating before the extension is active, so that first page load is NOT intercepted and a
-   * WebAuthn call there would reach the native/HID path (baseline finding, P6 "interception always
-   * ready"). `b.extensionWorker` / `b.injected` report what actually happened.
+   * Launch the managed browser with `url` as its start URL (the product path) and return it with `b.page` set to the
+   * start-URL tab. The launch returns only once the extension worker reported the WebAuthn proxy attached, and the
+   * daemon opens the start URL only after that (defect B2), in a new tab: the browser itself starts on about:blank,
+   * so Playwright sees that blank tab too (`b.blankPages`). The start-URL tab is brought to the front, so a `create()`
+   * from it is not rejected for lack of focus (ADR 0014 section 11).
+   * `b.extensionWorker` reports whether the extension's service worker is running.
+   *
+   * `{startUrl: false}`: launch without a start URL and navigate the blank tab instead. Needed for a URL the
+   * profile's rules do not admit as a start URL (an unlisted or denied RP); interception is attached either way.
    */
-  stack.open = async (profile, url) => {
-    const b = await stack.launch(profile);
-    const page = b.context.pages()[0] || await b.context.newPage();
-    b.extensionWorker = await waitForExtensionWorker(b.context, page);
-    await page.goto(url);
-    b.injected = await page.evaluate(() => document.documentElement.hasAttribute('data-passless-agent-broker')).catch(() => false);
-    b.page = page;
+  stack.open = async (profile, url, { startUrl = true } = {}) => {
+    const b = await stack.launch(profile, startUrl ? url : undefined);
+    b.extensionWorker = await waitForExtensionWorker(b.browser);
+    if (startUrl) {
+      b.page = await waitForPage(b.context, url);
+    } else {
+      const pages = b.context.pages();
+      if (pages.length !== 1) throw new Error(`expected exactly the blank tab, got: ${pages.map(p => p.url()).join(', ')}`);
+      b.page = pages[0];
+      await b.page.goto(url);
+    }
+    b.blankPages = b.context.pages().filter(p => p !== b.page);
+    await b.page.waitForLoadState('load');
+    await b.page.bringToFront();
     return b;
   };
 
@@ -95,8 +121,8 @@ async function createStack(label, variant, o) {
    * node (identified through sysfs), so no real security key or other Passless instance can answer. If the
    * node cannot be identified unambiguously, or the ceremony fails, this fails fast with its own message.
    *
-   * Why not the agent path: today's agent registration cannot be used for seeding (the extension rejects the
-   * /register response, it needs an operator-minted grant, and its COSE key is invalid).
+   * Why not the agent path: a same-user profile's agent registration would also land in the human store, but the
+   * scenarios need credentials that exist independently of the agent path under test.
    */
   stack.seedHuman = async (rp, username, { timeoutMs = 40000 } = {}) => {
     if (!stack.daemon.hidraw) throw new Error(`seeding ${username}@${rp.host}: cannot identify this daemon's hidraw node: ${stack.daemon.hidrawError}`);
@@ -144,4 +170,4 @@ async function saveFailureArtifacts(stack, destDir, extra = {}) {
   fs.writeFileSync(path.join(destDir, 'extra.json'), JSON.stringify(extra, null, 2));
 }
 
-module.exports = { createStack, closeStack, saveFailureArtifacts };
+module.exports = { createStack, closeStack, saveFailureArtifacts, waitForPage };

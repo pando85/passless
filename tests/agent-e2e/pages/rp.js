@@ -13,6 +13,9 @@
     instanceOfPublicKeyCredential: typeof PublicKeyCredential !== 'undefined' && c instanceof PublicKeyCredential,
     hasToJSON: typeof c.toJSON === 'function',
     authenticatorAttachment: c.authenticatorAttachment || null,
+    responseCtor: c.response && c.response.constructor && c.response.constructor.name,
+    responseIsAttestation: typeof AuthenticatorAttestationResponse !== 'undefined' && c.response instanceof AuthenticatorAttestationResponse,
+    responseIsAssertion: typeof AuthenticatorAssertionResponse !== 'undefined' && c.response instanceof AuthenticatorAssertionResponse,
   });
 
   const toCreationOptions = o => ({
@@ -43,10 +46,13 @@
 
   // `flavor` 'sw' uses @simplewebauthn/browser; 'raw' calls navigator.credentials directly.
   const flavor = () => (window.SimpleWebAuthnBrowser ? 'sw' : 'raw');
+  const pending = new Map();
+  let pendingSeq = 0;
 
   window.e2e = {
     describe, b64uToBuf, bufToB64u,
-    async register({ username, userVerification, residentKey, timeout, signal } = {}) {
+    // `viaToJSON`: send the browser's own PublicKeyCredential.toJSON() output to the RP (raw page only).
+    async register({ username, userVerification, residentKey, timeout, signal, viaToJSON } = {}) {
       try {
         const options = await post('/api/register/options', { username, userVerification, residentKey, timeout });
         let response; let credential = null;
@@ -54,14 +60,15 @@
           response = await SimpleWebAuthnBrowser.startRegistration({ optionsJSON: options });
         } else {
           credential = await navigator.credentials.create({ publicKey: toCreationOptions(options), signal });
-          response = attJSON(credential);
+          response = viaToJSON ? credential.toJSON() : attJSON(credential);
         }
         const verification = await post('/api/register/verify', { response });
         return { ...verification, received: describe(credential) };
       } catch (e) { return err(e); }
     },
     // allowCredentials: undefined -> by username (or discoverable when no username); array -> explicit ids.
-    async authenticate({ username, userVerification, allowCredentials, timeout, signal, mediation } = {}) {
+    // `noVerify`: return the serialised assertion ({ok:true, response}) instead of posting it to the RP.
+    async authenticate({ username, userVerification, allowCredentials, timeout, signal, mediation, viaToJSON, noVerify } = {}) {
       try {
         const options = await post('/api/auth/options', { username, userVerification, allowCredentials, timeout });
         let response; let credential = null;
@@ -69,8 +76,9 @@
           response = await SimpleWebAuthnBrowser.startAuthentication({ optionsJSON: options });
         } else {
           credential = await navigator.credentials.get({ publicKey: toRequestOptions(options), signal, mediation });
-          response = assertJSON(credential);
+          response = viaToJSON ? credential.toJSON() : assertJSON(credential);
         }
+        if (noVerify) return { ok: true, response, received: describe(credential) };
         const verification = await post('/api/auth/verify', { response });
         return { ...verification, received: describe(credential), options };
       } catch (e) { return err(e); }
@@ -87,6 +95,39 @@
       return out;
     },
     verifyAuth: response => post('/api/auth/verify', { response }),
+    // Background ceremonies that the harness can abort or poll: start() returns a key at once.
+    start(kind, opts = {}) {
+      const key = `c${++pendingSeq}`;
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      const entry = { controller, settled: false, result: null, startedAt, settledAt: null };
+      const fn = kind === 'register' ? window.e2e.register : window.e2e.authenticate;
+      entry.promise = fn({ ...opts, signal: controller.signal }).then(r => {
+        entry.settled = true; entry.settledAt = Date.now(); entry.result = r; return r;
+      });
+      pending.set(key, entry);
+      return key;
+    },
+    abort(key) { const e = pending.get(key); if (e) e.controller.abort(); return !!e; },
+    /** {settled, result, elapsedMs} without waiting. */
+    peek(key) {
+      const e = pending.get(key);
+      if (!e) return null;
+      return { settled: e.settled, result: e.result, elapsedMs: (e.settledAt || Date.now()) - e.startedAt };
+    },
+    async result(key) { const e = pending.get(key); return e ? e.promise : null; },
+    // What a MAIN-world shim would leave behind: a non-native navigator.credentials, a marker attribute, or a global.
+    shimProbe() {
+      const nativeFn = f => typeof f === 'function' && /\[native code\]/.test(Function.prototype.toString.call(f));
+      return {
+        getNative: nativeFn(navigator.credentials.get), createNative: nativeFn(navigator.credentials.create),
+        credentialsProtoGetNative: nativeFn(CredentialsContainer.prototype.get),
+        ownGet: Object.prototype.hasOwnProperty.call(navigator.credentials, 'get'),
+        ownCreate: Object.prototype.hasOwnProperty.call(navigator.credentials, 'create'),
+        markerAttributes: [...document.documentElement.attributes].map(a => a.name).filter(n => /passless/i.test(n)),
+        passlessGlobals: Object.getOwnPropertyNames(window).filter(n => /passless/i.test(n)),
+      };
+    },
     state: () => fetch('/api/state').then(r => r.json()),
   };
   window.dispatchEvent(new Event('e2e-ready'));

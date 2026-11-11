@@ -21,7 +21,7 @@ scenario({ id: 'E2E-15', title: 'Budget: evil.test floods denied requests', ci: 
   const storeSeeded = storeFingerprint(stack.daemon);
 
   // Flood from evil.test, in the same browser (same bearer session) that is used for rp-a afterwards.
-  const b = await stack.open('agent', `${evil.origin}/raw`);
+  const b = await stack.open('agent', `${evil.origin}/raw`, { startUrl: false }); // unlisted: no admissible start URL
   assertInterceptionActive(b);
   for (let i = 0; i < FLOOD; i++) {
     const res = await authenticate(b.page, { timeout: 20000 }); // each call gets fresh options (a new challenge) with rpId evil.test
@@ -33,7 +33,7 @@ scenario({ id: 'E2E-15', title: 'Budget: evil.test floods denied requests', ci: 
 
   // The budget is intact: exactly max_operations successful authentications at rp-a, each verified by the RP.
   await b.page.goto(`${rp.origin}/sw`);
-  assertInterceptionActive({ ...b, injected: await b.page.evaluate(() => document.documentElement.hasAttribute('data-passless-agent-broker')) });
+  assertInterceptionActive(b);
   let last;
   for (let i = 1; i <= MAX_OPERATIONS; i++) {
     last = assertVerifiedAssertion(rp, await authenticate(b.page, { username: 'alice' }), { username: 'alice' });

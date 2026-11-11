@@ -43,6 +43,13 @@ pub enum LockLevel {
     EpochKeyUse = 69,
     /// Every other `PolicyRuntime` lock. A policy guard is never held across another acquisition.
     Policy = 70,
+    /// The sign transport's readiness registry (`transport::ReadinessRegistry`). A leaf: callers may
+    /// hold the profile lifecycle lock and the browser manager while they read or wait on it.
+    TransportReadiness = 72,
+    /// The sign transport's connection table and a connection's in-flight request table. Leaves.
+    TransportConnection = 74,
+    /// A transport connection's write mutex (one frame at a time). A leaf.
+    TransportWrite = 76,
     /// Reserved for the P7 escalation service mutex (a leaf).
     Escalation = 80,
 }
@@ -50,7 +57,14 @@ pub enum LockLevel {
 impl LockLevel {
     /// A leaf lock is never held across any other tracked acquisition.
     pub fn is_leaf(self) -> bool {
-        matches!(self, Self::Policy | Self::Escalation)
+        matches!(
+            self,
+            Self::Policy
+                | Self::TransportReadiness
+                | Self::TransportConnection
+                | Self::TransportWrite
+                | Self::Escalation
+        )
     }
 }
 

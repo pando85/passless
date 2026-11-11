@@ -24,8 +24,13 @@ scenario({ id: 'E2E-14', title: 'Replay: page resubmits identical options (Kanid
   const options = await b.page.evaluate(o => window.e2e.authOptions(o), { username: 'alice', userVerification: 'preferred', timeout: 20000 });
   assert.ok(options.challenge, 'RP issued options');
 
-  // (a) two identical calls started together.
-  const concurrent = await b.page.evaluate(o => window.e2e.getIdentical(o, { count: 2, concurrent: true }), options);
+  // (a) two identical calls started together, from two tabs of the same origin (Chromium allows one pending WebAuthn
+  // request per tab: a second one in the same tab fails with OperationError "A request is already pending").
+  const twin = await b.context.newPage();
+  await twin.goto(`${rp.origin}/raw`);
+  await twin.waitForFunction(() => window.e2e, null, { timeout: 15000 });
+  await b.page.bringToFront();
+  const concurrent = (await Promise.all([b.page, twin].map(p => p.evaluate(o => window.e2e.getIdentical(o, { count: 1 }), options)))).flat();
   assert.equal(concurrent.length, 2);
   for (const r of concurrent) assert.equal(r.ok, true, `concurrent duplicate failed: ${JSON.stringify(r)}`);
   const storeAfterConcurrent = storeFingerprint(stack.daemon);

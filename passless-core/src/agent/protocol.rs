@@ -171,6 +171,9 @@ pub enum ErrorCode {
     Replayed,
     /// The session's operation budget is used up.
     BudgetExhausted,
+    /// The browser cancelled the request (`onRequestCanceled`) before an outcome was available
+    /// (WebAuthn `AbortError`).
+    Aborted,
 }
 
 impl fmt::Display for ErrorCode {
@@ -193,6 +196,7 @@ impl fmt::Display for ErrorCode {
             Self::Timeout => write!(f, "timeout"),
             Self::Replayed => write!(f, "replayed"),
             Self::BudgetExhausted => write!(f, "budget_exhausted"),
+            Self::Aborted => write!(f, "aborted"),
         }
     }
 }
@@ -582,6 +586,10 @@ pub struct RegisterCredentialRequest {
     /// The page's ceremony timeout in milliseconds; bounds how long a duplicate waits (ADR 0014 section 9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// `authenticatorSelection.authenticatorAttachment`. Passless is a roaming authenticator, so
+    /// `platform` cannot be honored and fails with `NotSupportedError` (ADR 0014 invariant 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticator_attachment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -873,6 +881,13 @@ pub struct BrowserLaunchedResponse {
     pub start_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_endpoint: Option<String>,
+    /// WebAuthn interception of the lease: `attached`, `pending` (re-attaching within the grace
+    /// period) or `degraded` (ADR 0014 section 7, plan D6 layer 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interception: Option<String>,
+    /// The extension's last reported `isAllowedIncognitoAccess()` (enforced from P10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incognito_allowed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -949,6 +964,13 @@ pub struct BrowserStatusResponse {
     pub cdp_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_browser_context: Option<bool>,
+    /// WebAuthn interception of the lease: `attached`, `pending` (re-attaching within the grace
+    /// period) or `degraded` (ADR 0014 section 7, plan D6 layer 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interception: Option<String>,
+    /// The extension's last reported `isAllowedIncognitoAccess()` (enforced from P10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incognito_allowed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1954,6 +1976,7 @@ mod tests {
             ErrorCode::Timeout,
             ErrorCode::Replayed,
             ErrorCode::BudgetExhausted,
+            ErrorCode::Aborted,
         ] {
             assert_eq!(json_roundtrip(&code), code);
         }
@@ -3245,6 +3268,8 @@ mod tests {
             pid: 1234,
             start_url: Some("https://example.com".into()),
             cdp_endpoint: None,
+            interception: None,
+            incognito_allowed: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("cdp_endpoint"));
@@ -3260,6 +3285,8 @@ mod tests {
             pid: 5678,
             start_url: None,
             cdp_endpoint: Some("http://127.0.0.1:9222".into()),
+            interception: Some("attached".into()),
+            incognito_allowed: Some(false),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("cdp_endpoint"));

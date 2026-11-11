@@ -740,6 +740,12 @@ fn dispatch_browser_status(output: OutputFormat, profile: &str) -> Result<()> {
                 if let Some(endpoint) = &status.cdp_endpoint {
                     println!("cdp_endpoint: {}", endpoint);
                 }
+                if let Some(interception) = &status.interception {
+                    println!("interception: {}", interception);
+                }
+                if let Some(incognito_allowed) = status.incognito_allowed {
+                    println!("incognito_allowed: {}", incognito_allowed);
+                }
                 Ok(())
             }
         },

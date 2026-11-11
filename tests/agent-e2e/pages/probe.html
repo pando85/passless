@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>E2E interception probe</title>
+<body>probe page</body>
+<script>
+  // Runs as early as the page can: if this document loaded before the Passless extension attached the WebAuthn
+  // proxy, conditional mediation reports the native value (true) instead of false (defect B2 regression).
+  window.__probe = (async () => ({
+    loadedAt: Date.now(),
+    conditionalMediation: await PublicKeyCredential.isConditionalMediationAvailable(),
+  }))();
+</script>
+<script src="/rp.js"></script>

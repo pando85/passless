@@ -112,7 +112,7 @@ class RpServer {
       if (url.pathname === '/sw-bundle.js') return this._file(res, BROWSER_BUNDLE, 'text/javascript');
       if (url.pathname === '/api/state') return this._json(res, this.state());
       const map = { '/': 'index.html', '/sw': 'sw.html', '/raw': 'raw.html', '/rp.js': 'rp.js',
-        '/popup-opener': 'popup-opener.html', '/iframe-host': 'iframe-host.html', '/embed': 'embed.html' };
+        '/popup-opener': 'popup-opener.html', '/iframe-host': 'iframe-host.html', '/embed': 'embed.html', '/probe': 'probe.html' };
       const f = map[url.pathname];
       if (f) return this._file(res, path.join(PAGES_DIR, f), f.endsWith('.js') ? 'text/javascript' : 'text/html');
       res.writeHead(404); return res.end('not found');

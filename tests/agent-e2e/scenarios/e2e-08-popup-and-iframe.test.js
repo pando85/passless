@@ -1,12 +1,14 @@
 'use strict';
 const { scenario, assert } = require('../lib/scenario');
-const { authenticate, assertVerifiedAssertion, assertInterceptionActive, assertAgentAllowed, storeFingerprint } = require('../lib/helpers');
+const { authenticate, assertVerifiedAssertion, assertInterceptionActive, assertAgentAllowed, HUMAN_CTAP_LOG } = require('../lib/helpers');
 
-// Catalogue: popup and same-origin iframe both work.
+// Catalogue: popup and same-origin iframe both work. Interception is the browser-level WebAuthn proxy (plan D1), so
+// every frame and window of the profile is covered without content scripts; the ceremonies below are verified by the
+// RP and audited as agent allows, and the human UHID authenticator logs no CTAP traffic meanwhile.
 scenario({ id: 'E2E-08', title: 'popup and same-origin iframe' }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
-    profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },
+    profiles: { agent: { mode: 'same-user', max_operations: 32, rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },
   });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -14,9 +16,10 @@ scenario({ id: 'E2E-08', title: 'popup and same-origin iframe' }, async ctx => {
   // Same-origin iframe.
   const b = await stack.open('agent', `${rp.origin}/iframe-host`);
   assertInterceptionActive(b);
-  await b.page.waitForLoadState('load');
+  const logBefore = stack.daemon.log().length;
   const frame = b.page.frames().find(f => f.name() === 'f');
   assert.ok(frame, 'iframe not found');
+  await frame.waitForLoadState('load');
   assertVerifiedAssertion(rp, await authenticate(frame, { username: 'alice' }), { username: 'alice' });
 
   // Popup opened by the page.
@@ -26,20 +29,17 @@ scenario({ id: 'E2E-08', title: 'popup and same-origin iframe' }, async ctx => {
     b.page.evaluate(() => window.openPopup('/sw')),
   ]);
   await popup.waitForLoadState('load');
-  const injected = await popup.evaluate(() => document.documentElement.hasAttribute('data-passless-agent-broker'));
-  assert.equal(injected, true, 'extension content script not injected into the popup');
+  await popup.bringToFront();
   assertVerifiedAssertion(rp, await authenticate(popup, { username: 'alice' }), { username: 'alice' });
+  await popup.close();
 
   await assertAgentAllowed(stack, { rpId: 'rp-a.test', n: 2 });
 
-  // Same-origin about:blank, srcdoc and blob: frames must be intercepted too (manifest match_about_blank and
-  // match_origin_as_fallback), never left to the native path. Their sender.url is not https, so the worker refuses the
-  // request (fail closed): NotAllowedError, no assertion, no key use. A credential exists in the human store, so a
-  // native fallback would succeed.
+  // Same-origin about:blank, srcdoc and blob: frames are covered too (the proxy is browser-level; no content script has
+  // to reach them). Their request carries the parent's origin and is handled by the daemon like any other.
   await b.page.goto(`${rp.origin}/sw`);
+  await b.page.bringToFront();
   await b.page.waitForFunction(() => window.e2e);
-  const storeBefore = storeFingerprint(stack.daemon);
-  const assertionsBefore = rp.authentications.length;
   const results = await b.page.evaluate(async () => {
     const out = {};
     for (const kind of ['blank', 'srcdoc', 'blob']) {
@@ -47,28 +47,28 @@ scenario({ id: 'E2E-08', title: 'popup and same-origin iframe' }, async ctx => {
       f.allow = 'publickey-credentials-get *';
       if (kind === 'srcdoc') f.srcdoc = '<!doctype html><title>x</title>';
       if (kind === 'blob') f.src = URL.createObjectURL(new Blob(['<!doctype html><title>x</title>'], { type: 'text/html' }));
+      const loaded = new Promise(r => f.addEventListener('load', r, { once: true }));
       document.body.appendChild(f);
+      if (kind !== 'blank') await loaded;
       const w = f.contentWindow;
-      const end = Date.now() + 5000;
-      while (Date.now() < end && !(w.document.documentElement && w.document.documentElement.hasAttribute('data-passless-agent-broker'))) {
-        await new Promise(r => setTimeout(r, 50));
-      }
-      const injected = w.document.documentElement.hasAttribute('data-passless-agent-broker');
       const native = /\[native code\]/.test(Function.prototype.toString.call(w.navigator.credentials.get));
       const o = await (await fetch('/api/auth/options', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'alice' }) })).json();
       const publicKey = { ...o, challenge: window.e2e.b64uToBuf(o.challenge), allowCredentials: o.allowCredentials.map(c => ({ ...c, id: window.e2e.b64uToBuf(c.id) })) };
-      let name = 'resolved';
-      try { await w.navigator.credentials.get({ publicKey }); } catch (e) { name = e.name; }
-      out[kind] = { origin: w.location.origin, injected, native, name };
+      let r;
+      try {
+        const cred = await w.navigator.credentials.get({ publicKey });
+        r = { ok: true, ts: (await window.e2e.verifyAuth(cred.toJSON())).ts, credentialId: cred.id };
+      } catch (e) { r = { ok: false, name: e.name, message: e.message }; }
+      out[kind] = { origin: w.location.origin, native, ...r };
     }
     return out;
   });
   for (const kind of ['blank', 'srcdoc', 'blob']) {
     const r = results[kind];
-    assert.equal(r.injected, true, `extension not injected into the ${kind} frame: ${JSON.stringify(results)}`);
-    assert.equal(r.native, false, `${kind} frame has the native navigator.credentials.get`);
-    assert.equal(r.name, 'NotAllowedError', `${kind} frame: ${JSON.stringify(r)}`);
+    assert.equal(r.native, true, `${kind} frame: navigator.credentials.get must be the browser's own (no shim)`);
+    assertVerifiedAssertion(rp, r, { username: 'alice' });
   }
-  assert.equal(rp.authentications.length, assertionsBefore, 'no assertion may come from a blank frame');
-  assert.equal(storeFingerprint(stack.daemon), storeBefore, 'no key use from a blank frame');
+  await assertAgentAllowed(stack, { rpId: 'rp-a.test', n: 5 });
+  const newLog = stack.daemon.log().slice(logBefore);
+  assert.doesNotMatch(newLog, HUMAN_CTAP_LOG, 'the human authenticator handled a request during the agent ceremonies');
 });

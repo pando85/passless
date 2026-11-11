@@ -949,20 +949,6 @@ pub enum AgentAdminAction {
         #[arg(long)]
         force: bool,
     },
-    /// Install native messaging manifest for browser extension
-    InstallNativeMessaging {
-        /// Browser executable path (e.g., /usr/bin/chromium)
-        #[arg(long)]
-        browser: String,
-
-        /// Extension directory path
-        #[arg(long)]
-        ext_dir: PathBuf,
-
-        /// Sign proxy binary path
-        #[arg(long, default_value = "/usr/bin/sign-proxy")]
-        sign_proxy: PathBuf,
-    },
     /// Profile management
     Profile {
         #[command(subcommand)]

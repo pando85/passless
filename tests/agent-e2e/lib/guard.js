@@ -18,7 +18,10 @@ const running = name => { try { return execFileSync('pgrep', ['-x', name], { enc
 const ALWAYS = [
   path.join(home, '.config', 'passless'), path.join(home, '.local', 'state', 'passless'),
   path.join(home, '.local', 'share', 'passless'), path.join(home, '.password-store'),
-  path.join(home, '.config', 'chromium', 'NativeMessagingHosts'), path.join(home, '.config', 'google-chrome', 'NativeMessagingHosts'),
+  // Every Chrome-family config dir a native-messaging manifest could land in. The daemon writes it only into the
+  // managed profile; nothing may write into the browser's own config dir (watched to prove it).
+  ...['chromium', 'google-chrome', 'google-chrome-beta', 'google-chrome-unstable', 'google-chrome-for-testing']
+    .map(d => path.join(home, '.config', d, 'NativeMessagingHosts')),
   path.join(home, '.cache', 'ms-playwright'),
 ];
 // Only when nothing else legitimately changes them: a running real passless owns /run/user/UID/passless and

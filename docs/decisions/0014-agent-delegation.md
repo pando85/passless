@@ -193,16 +193,17 @@ The worker:
 - answers every `onIsUvpaaRequest` with `false`;
 - holds the daemon bearer and talks to the daemon (below).
 
-As implemented (PR #450), the worker calls `chrome.runtime.sendNativeMessage` to the native host
-`rs.passless.sign_proxy` (`cmd/passless/src/bin/sign-proxy.rs`), which forwards an HTTP request
-with the bearer to the daemon's Unix socket (`$XDG_RUNTIME_DIR/agent/sign/sock`, endpoints
-`/sign` and `/register`).
-
-**Required change.** Escalation waits can last minutes or hours, but MV3 bounds `sendNativeMessage`
-and `fetch` by the service worker's 5-minute and 30-second limits, and the sign-proxy has a
-10-second socket timeout. The extension therefore carries agent requests over a
-`chrome.runtime.connectNative` port, and the daemon sends a keepalive on that port at least every
-20 seconds while a request is pending.
+As implemented (P6), the worker keeps one `chrome.runtime.connectNative` port open to the native
+host `rs.passless.sign_proxy` (`cmd/passless/src/bin/sign-proxy.rs`), a stdio relay that holds one
+connection to the daemon's Unix socket. Both hops carry length-prefixed JSON frames (`hello`,
+`request`, `abort`, `result`, `keepalive`); requests are multiplexed by a worker-allocated id, and
+both sides send a keepalive at least every 20 seconds, so an escalation wait is not bounded by
+MV3's `sendNativeMessage` and `fetch` limits. There is no HTTP. The daemon-UID socket is
+`$XDG_RUNTIME_DIR/agent/sign/sock` (mode 0600 in a 0700 directory); a browser that runs as another
+user gets `<sign dir>/<uid>/sock`, in a 0700 directory owned by that user, which needs a root
+daemon. The `hello` authenticates the bearer and the peer: its `SO_PEERCRED` UID must be the
+lease's browser UID. The native host manifest is written only into the lease's profile and admits
+only the extension ID fixed by the committed manifest `key`.
 
 ## 5. Identity modes and backend
 
@@ -356,8 +357,14 @@ on the filesystem and the UID:
   not required. `passless doctor` reports which case applies: required and in place, in place as
   defence in depth, not required, or refused.
 - A missing or unloadable extension is a launch error, never a launch without the extension. The
-  CDP endpoint is not handed out until the worker has attached the proxy, and is withheld again if
-  the attachment is lost.
+  CDP endpoint is not handed out until the worker has attached the proxy, and is withheld again
+  while the daemon cannot confirm the attachment: the lease is degraded when its worker has been
+  disconnected, or has reported `attached = false`, for longer than a 10-second grace period.
+  Degraded does not mean that requests go native: the attachment is browser-side state, and while
+  the extension stays loaded a request wakes the worker (§11). Only a lost or failed attachment
+  leaves the native path, which the private `/dev` contains. In port mode the withholding is
+  advisory until that containment lands, because the browser's `DevToolsActivePort` stays readable
+  by a same-UID agent.
 
 `PASSLESS_INTERACTION_MODE=automatic` (PR #505) affects only the human CTAP path and never approves
 an escalation. Because it would let a request that reaches the native path be signed silently, the
@@ -853,8 +860,8 @@ References are `file:line` at commit `130eaa5`.
 | Native fallback for `confirm`/human rules | Daemon returns `human_interaction_required` (`sign.rs:1383-1414`); worker flags `fallback` (`worker.js:140`); page replays natively (`main.js:282`) | Planned (P2): removed (§7) |
 | Human/confirm evidence in schema | **Done (P4).** `RuleAction` (`deny`, `allow`, `request`) replaces `AgentAuthorization` and the human/agent UP and UV sources; rules carry no evidence fields; `allow` sets UP=1 and UV=1 from session evidence; `request` denies with `escalation_unavailable` until P7 | — |
 | Legacy fields and `policy` alias | **Done (P4).** The legacy evidence tables and presets map (`autonomous`/`allow+agent+agent` to `allow`, `supervised`/`confirm+*` to `request`, `deny+none+none` to `deny`) with one warning per mapped field, logged once per load and shown by `passless agent-admin profile check`; any other combination (including `allow` with human or `none` evidence) and the removed profile keys `rp_ids`, `registration_allowed`, `require_uv`, `human_verification_prompt` fail startup with a migration message. Legacy parsing is removed in the release after next (R8) | — |
-| Cross-origin frames | Accepted with any parseable top origin (`sign.rs:208`) | Planned (P2, P6): fail closed; `sameOriginWithAncestors = false` denied (§11) |
-| `localhost` RP | **Done in the daemon (P4).** `validate_rp_id`, `parse_origin` and the launch URL check accept `localhost` and `http://localhost[:port]` for exact rules only; resolution never matches `localhost` through the wildcard; `*.localhost` and other `http` hosts are rejected. The extension still parses https origins only | Planned (P6): extension origin source |
+| Cross-origin frames | **Done (P2, P6).** `sameOriginWithAncestors = false` from the browser-supplied override is denied and audited with `top_origin = null` (§11) | — |
+| `localhost` RP | **Done in the daemon (P4).** `validate_rp_id`, `parse_origin` and the launch URL check accept `localhost` and `http://localhost[:port]` for exact rules only; resolution never matches `localhost` through the wildcard; `*.localhost` and other `http` hosts are rejected. **Done (P6)** in the extension: the origin comes from the browser-supplied override, which the daemon re-parses | — |
 | `credential:<ref>` vs `allowCredentials` | **Done (P4).** `narrow_candidates` pins first (`credential:<ref>`), `allowCredentials` then chooses within the pinned set, and the wildcard always selects `single` (§10.1) | — |
 | Epochs and live resolution | **Done (P5).** A revocation epoch (bumped by a reload that changes the digest; P7 bumps it on grant revocation) and a grant epoch (P7 bumps it when a grant is added; never revokes). Sessions record the revocation epoch at creation and are checked against it on every request and again immediately before key use, together with a live re-resolve (invariant 13). Reload re-reads and validates the configuration file; an invalid file or a restart-only change keeps the old generation and returns an error; an unchanged digest revokes nothing. `max_operations` is read from the live policy | — |
 | Budget claim order | **Done (P5).** Origin and RP validation, session grant and principal binding, resolve, unsupported options, then replay key, then budget; rejected requests never claim budget. `request` keeps a seam for P7 between resolve and the replay key (`sign.rs`, `register.rs`) | — |
@@ -866,18 +873,18 @@ References are `file:line` at commit `130eaa5`.
 | Policy digest | **Done (P4), grants in P7.** Version 4 covers every rule field, profile and rule `credential_selection`, both acknowledgements, the operation and concurrency limits and the browser fields; a profile whose rules are all `deny` loads (B4) | Planned (P7): granted-rules store content |
 | Audit content | No session, operation, origin, credential or result in `PolicyAllowMeta` (`audit_events.rs:659-666`); "generation" is an ID length (`runtime.rs:4079`) | Planned (P8): fields of §12, including `top_origin = null` with `cross_origin` |
 | Escalation audit events | Not implemented | Planned (P8): timeout or abort recorded as `escalation_expired` with a reason; `escalation_revoked` only for operator revocation (§12) |
-| Interception mechanism | Page-controlled MAIN-world override, duck-typed credential, manifest matches only `https://*/*` (`main.js`, `broker.js`, `manifest.json`) | Planned (P6): `chrome.webAuthenticationProxy` only; MAIN-world override removed (§4.4, §11) |
-| Origin source and `clientDataJSON` | Origin reported by the MAIN-world script; response built by the override | Planned (P6): origin from the browser-supplied `remoteDesktopClientOverride`; the daemon builds `clientDataJSON`; the extension forwards it verbatim (§11) |
-| Conditional mediation and UVPAA | Conditional requests left native and unhandled | Planned (P6): unavailable while attached; `onIsUvpaaRequest` answered `false`; passkey autofill unsupported (§11) |
-| Worker lifecycle | No proxy attachment | Planned (P6): `attach()` on every worker start; never `chrome.runtime.reload()` (§11) |
-| Abort | Local reject only (`main.js:320-325`) | Planned (P6): propagated to daemon (§11) |
-| Extension cache | Keyed by `request_id` only (`worker.js:84-117`) | Planned (P6): in-flight requests tracked by the browser-supplied request ID (§11) |
+| Interception mechanism | **Done (P6).** Worker-only extension on `chrome.webAuthenticationProxy`; no content script; `main.js` and `broker.js` removed; manifest `key` fixes the extension ID; launch waits for the worker's attached `hello` and opens the start URL only then (B2) | — |
+| Origin source and `clientDataJSON` | **Done (P6).** Origin and `sameOriginWithAncestors` from `remoteDesktopClientOverride`, re-parsed by the daemon; the daemon builds `clientDataJSON` and the response JSON; the worker forwards it verbatim (§11) | — |
+| Conditional mediation and UVPAA | **Done (P6).** Unavailable while attached; `onIsUvpaaRequest` answered `false`; passkey autofill unsupported (§11) | — |
+| Worker lifecycle | **Done (P6).** `attach()` on every worker start; never `chrome.runtime.reload()`; readiness per bearer and degraded leases (§7, §11) | — |
+| Abort | **Done (P6).** `onRequestCanceled` and a closed connection cancel the request before key use (§11) | — |
+| Extension cache | **Done (P6).** In-flight requests tracked by the browser-supplied request ID (§11) | — |
 | Unsupported options | **Done (P5).** Unsupported extensions, enterprise attestation and no supported algorithm return `NotSupportedError` before budget or storage; `excludeCredentials` matches return `InvalidStateError`; origin failures `SecurityError`; daemon errors carry the DOMException name and `busy` (R11 caps) maps to `NotAllowedError` | — |
-| Transport | `sendNativeMessage` (`worker.js:126`); sign-proxy 10 s socket timeout | Planned (P6): `connectNative` with keepalive (§4.4) |
-| Unfocused-tab registration | Not handled | Planned (P6, P10): documented limitation (orphan credential, audit records it); adapters bring the page to the front (§11) |
+| Transport | **Done (P6).** `connectNative` port, framed relay, one multiplexed connection per worker with keepalive both ways; per-browser-UID sockets and a `SO_PEERCRED` check at `hello` (§4.4) | — |
+| Unfocused-tab registration | **Documented (P6)** as a limitation (orphan credential, audit records it; `agent-admin credential delete` removes it) | Planned (P10): adapters bring the page to the front (§11) |
 | Escalation, granted-rules store, `passless agent grants` | Not implemented | Planned (P7): §8 |
 | Registration escalation | Not implemented | Planned (P7): not joinable; one-use token bound to the creating ceremony; the credential reference joins the pinned set (§8.3) |
-| Abort handling and in-flight tracking | Not implemented | Planned (P6, P7): withdrawn or aborted escalations rate-limited, 3 per key per 10 minutes, then cooldown (§8.1); pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11) |
+| Abort handling and in-flight tracking | **Done (P6)** for the worker: pending request IDs kept in `chrome.storage.session` and failed with `NotAllowedError` on worker restart (§11) | Planned (P7): withdrawn or aborted escalations rate-limited, 3 per key per 10 minutes, then cooldown (§8.1) |
 | Escalation waiters | Not implemented | Planned (P7): parked continuations holding no thread; caps of 4 per session and 16 per profile (§8.2) |
 | Notification bus for a root daemon | Prompt uses the daemon's own session bus | Planned (P7): `agents.notify_user`; dedicated per-prompt privilege-dropping child; no bus means deny and audit (§8.2) |
 | Granted-rules location | Not implemented | Planned (P7): `agents.state_dir` with unit-specific defaults (§8.4) |

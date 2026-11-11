@@ -1,2256 +1,1051 @@
 "use strict";
 
+// Behavioral tests for the agent extension service worker (cmd/passless/assets/agent-extension/).
+// The worker runs in a node:vm context against a mock `chrome` and fake timers.
+// Run: node cmd/passless/tests/agent_extension_behavioral.js (exits non-zero on failure).
+
 const vm = require("vm");
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
 const ASSETS = path.join(__dirname, "..", "assets", "agent-extension");
+const WORKER_SRC = fs.readFileSync(path.join(ASSETS, "worker.js"), "utf8");
+const MANIFEST_SRC = fs.readFileSync(path.join(ASSETS, "manifest.json"), "utf8");
 
-function readTemplate(name) {
-  return fs.readFileSync(path.join(ASSETS, name), "utf8");
+// Extension ID derived from the manifest `key` (first 16 bytes of SHA-256 of the SPKI DER, a-p).
+const EXPECTED_EXTENSION_ID = "lfbahamapdlbimlffmhiomfdemnjhjkc";
+
+const BEARER = "bearer-0123456789abcdef";
+const SOCKET = "/run/user/1000/passless/agent/sign/sock";
+const BUILD = "0.9.0-test";
+const PLACEHOLDERS = ["__PASSLESS_BEARER__", "__PASSLESS_SOCKET_PATH__", "__PASSLESS_BUILD_VERSION__"];
+
+// Single-pass replacement with JSON string literals, as the daemon does.
+function renderWorker(values) {
+  const map = {
+    __PASSLESS_BEARER__: JSON.stringify(values.bearer),
+    __PASSLESS_SOCKET_PATH__: JSON.stringify(values.socket),
+    __PASSLESS_BUILD_VERSION__: JSON.stringify(values.build)
+  };
+  return WORKER_SRC.replace(/__PASSLESS_(?:BEARER|SOCKET_PATH|BUILD_VERSION)__/g, (m) => map[m]);
 }
 
-function renderMain(channel) {
-  return readTemplate("main.js").replace(/__PASSLESS_CHANNEL__/g, channel);
-}
+// ---- test runner ---------------------------------------------------------------------------------
 
-function renderBroker(channel) {
-  return readTemplate("broker.js").replace(/__PASSLESS_CHANNEL__/g, channel);
-}
-
-function renderWorker(socketPath, bearer) {
-  const bearerLiteral = JSON.stringify(bearer);
-  const socketPathLiteral = JSON.stringify(socketPath);
-  return readTemplate("worker.js")
-    .replace(/__PASSLESS_SOCKET_PATH__/g, socketPathLiteral)
-    .replace(/__PASSLESS_BEARER__/g, bearerLiteral);
-}
-
-function b64url(buf) {
-  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-  return bytes.toString("base64url");
-}
-
-let passed = 0;
-let failed = 0;
-const failures = [];
-const pendingTests = [];
-
+const tests = [];
 function test(name, fn) {
-  pendingTests.push({ name, fn });
+  tests.push({ name, fn });
 }
 
-async function runAllTests() {
-  for (const t of pendingTests) {
+function flush() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function clone(v) {
+  return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+}
+
+// ---- fake timers ---------------------------------------------------------------------------------
+
+function makeClock() {
+  let now = 0;
+  let seq = 1;
+  const timers = new Map();
+  const clock = {
+    setTimeout(fn, ms) {
+      const id = seq++;
+      timers.set(id, { fn, at: now + Math.max(0, Number(ms) || 0), every: null });
+      return id;
+    },
+    setInterval(fn, ms) {
+      const id = seq++;
+      const every = Math.max(1, Number(ms) || 0);
+      timers.set(id, { fn, at: now + every, every });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+    clearInterval(id) {
+      timers.delete(id);
+    },
+    now() {
+      return now;
+    },
+    async advance(ms) {
+      const end = now + ms;
+      for (;;) {
+        let nextId = null;
+        let next = null;
+        for (const [id, t] of timers) {
+          if (t.at <= end && (next === null || t.at < next.at || (t.at === next.at && id < nextId))) {
+            next = t;
+            nextId = id;
+          }
+        }
+        if (next === null) break;
+        now = next.at;
+        if (next.every !== null) next.at += next.every;
+        else timers.delete(nextId);
+        next.fn();
+        await flush();
+      }
+      now = end;
+      await flush();
+    }
+  };
+  return clock;
+}
+
+// ---- mock chrome ---------------------------------------------------------------------------------
+
+function makeEvent() {
+  const listeners = [];
+  return {
+    addListener(fn) {
+      listeners.push(fn);
+    },
+    removeListener(fn) {
+      const i = listeners.indexOf(fn);
+      if (i !== -1) listeners.splice(i, 1);
+    },
+    hasListener(fn) {
+      return listeners.includes(fn);
+    },
+    fire(...args) {
+      for (const fn of listeners.slice()) fn(...args);
+    },
+    count() {
+      return listeners.length;
+    }
+  };
+}
+
+// opts:
+//   attach: "ok" | "error:<msg>" | "lastError:<msg>" | "throw" | "manual"
+//   incognito: boolean
+//   storage: Map shared across worker restarts
+//   deferStorageGet: hold storage.session.get callbacks until env.releaseGets()
+//   connectPlan: array of "ok" | "fail" | "throw", consumed one per connectNative call
+function makeEnv(opts = {}) {
+  const env = {
+    clock: makeClock(),
+    storage: opts.storage || new Map(),
+    ports: [],
+    completes: [],
+    uvpaa: [],
+    attachCalls: 0,
+    reloadCalls: 0,
+    connectNames: [],
+    connectPlan: (opts.connectPlan || []).slice(),
+    pendingAttach: null,
+    pendingGets: [],
+    nonce: opts.nonce || null
+  };
+
+  const chrome = {};
+  function withLastError(message, fn) {
+    chrome.runtime.lastError = message == null ? undefined : { message };
+    try {
+      fn();
+    } finally {
+      chrome.runtime.lastError = undefined;
+    }
+  }
+  function later(fn) {
+    queueMicrotask(fn);
+  }
+
+  function makePort(name) {
+    const port = {
+      name,
+      posted: [],
+      closed: false,
+      disconnectCalls: 0,
+      onMessage: makeEvent(),
+      onDisconnect: makeEvent(),
+      postMessage(m) {
+        if (port.closed) throw new Error("Attempting to use a disconnected port object");
+        port.posted.push(clone(m));
+      },
+      disconnect() {
+        port.disconnectCalls++;
+        port.closed = true;
+      },
+      // Chrome hands the extension the JSON the host wrote, parsed.
+      deliver(m) {
+        if (!port.closed) port.onMessage.fire(clone(m));
+      },
+      deliverRaw(m) {
+        if (!port.closed) port.onMessage.fire(m);
+      },
+      drop(message) {
+        if (port.closed) return;
+        port.closed = true;
+        withLastError(message || "Native host has exited.", () => port.onDisconnect.fire(port));
+      },
+      frames(type) {
+        return type ? port.posted.filter((f) => f && f.type === type) : port.posted.slice();
+      }
+    };
+    return port;
+  }
+
+  function completer(kind) {
+    return function (arg, cb) {
+      env.completes.push({ kind, arg: clone(arg), raw: arg });
+      later(() => withLastError(opts.completeLastError || null, () => cb && cb()));
+    };
+  }
+
+  chrome.runtime = {
+    id: EXPECTED_EXTENSION_ID,
+    lastError: undefined,
+    onMessage: makeEvent(),
+    onMessageExternal: makeEvent(),
+    onConnect: makeEvent(),
+    onConnectExternal: makeEvent(),
+    reload() {
+      env.reloadCalls++;
+    },
+    connectNative(name) {
+      env.connectNames.push(name);
+      const plan = env.connectPlan.shift() || "ok";
+      if (plan === "throw") throw new Error("connectNative failed");
+      const port = makePort(name);
+      env.ports.push(port);
+      if (plan === "fail") later(() => port.drop("Specified native messaging host not found."));
+      return port;
+    }
+  };
+
+  chrome.webAuthenticationProxy = {
+    onCreateRequest: makeEvent(),
+    onGetRequest: makeEvent(),
+    onRequestCanceled: makeEvent(),
+    onIsUvpaaRequest: makeEvent(),
+    onRemoteSessionStateChange: makeEvent(),
+    attach(cb) {
+      env.attachCalls++;
+      const mode = opts.attach || "ok";
+      if (mode === "throw") throw new Error("attach exploded");
+      if (mode === "manual") {
+        env.pendingAttach = (result, lastError) => withLastError(lastError || null, () => cb(result));
+        return;
+      }
+      later(() => {
+        if (mode === "ok") withLastError(null, () => cb());
+        else if (mode.startsWith("error:")) withLastError(null, () => cb(mode.slice("error:".length)));
+        else if (mode.startsWith("lastError:")) withLastError(mode.slice("lastError:".length), () => cb());
+      });
+    },
+    detach(cb) {
+      later(() => cb && cb());
+    },
+    completeCreateRequest: completer("create"),
+    completeGetRequest: completer("get"),
+    completeIsUvpaaRequest(arg, cb) {
+      env.uvpaa.push(clone(arg));
+      later(() => withLastError(null, () => cb && cb()));
+    }
+  };
+
+  chrome.extension = {
+    isAllowedIncognitoAccess(cb) {
+      const allowed = opts.incognito === undefined ? true : opts.incognito;
+      later(() => withLastError(null, () => cb(allowed)));
+    }
+  };
+
+  chrome.storage = {
+    session: {
+      get(keys, cb) {
+        const snapshot = {};
+        for (const [k, v] of env.storage) snapshot[k] = clone(v);
+        const respond = () => withLastError(null, () => cb(snapshot));
+        if (opts.deferStorageGet) env.pendingGets.push(respond);
+        else later(respond);
+      },
+      set(items, cb) {
+        for (const k of Object.keys(items)) env.storage.set(k, clone(items[k]));
+        later(() => withLastError(null, () => cb && cb()));
+      },
+      remove(keys, cb) {
+        for (const k of [].concat(keys)) env.storage.delete(k);
+        later(() => withLastError(null, () => cb && cb()));
+      }
+    }
+  };
+
+  env.chrome = chrome;
+  env.proxy = chrome.webAuthenticationProxy;
+  env.releaseGets = () => {
+    const gets = env.pendingGets.splice(0);
+    gets.forEach((g) => g());
+  };
+  env.port = () => env.ports[env.ports.length - 1];
+  env.create = (requestId, details) =>
+    env.proxy.onCreateRequest.fire({ requestId, requestDetailsJson: typeof details === "string" ? details : JSON.stringify(details) });
+  env.get = (requestId, details) =>
+    env.proxy.onGetRequest.fire({ requestId, requestDetailsJson: typeof details === "string" ? details : JSON.stringify(details) });
+  env.completesFor = (requestId) => env.completes.filter((c) => c.arg.requestId === requestId);
+  env.pendingKeys = () => [...env.storage.keys()].filter((k) => k.startsWith("pending:"));
+  return env;
+}
+
+function startWorker(env, values = { bearer: BEARER, socket: SOCKET, build: BUILD }) {
+  // A fixed instance nonce lets a test seed entries that belong to the current instance.
+  const webcrypto = env.nonce
+    ? { randomUUID: () => env.nonce, getRandomValues: (a) => crypto.webcrypto.getRandomValues(a) }
+    : crypto.webcrypto;
+  const sandbox = {
+    chrome: env.chrome,
+    setTimeout: env.clock.setTimeout,
+    setInterval: env.clock.setInterval,
+    clearTimeout: env.clock.clearTimeout,
+    clearInterval: env.clock.clearInterval,
+    crypto: webcrypto,
+    console
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(renderWorker(values), sandbox, { filename: "worker.js" });
+  return sandbox;
+}
+
+async function boot(opts = {}, values) {
+  const env = makeEnv(opts);
+  startWorker(env, values);
+  await flush();
+  return env;
+}
+
+// ---- request details fixtures --------------------------------------------------------------------
+
+const RP_ORIGIN = "https://rp.example";
+
+function override(origin = RP_ORIGIN, same = true) {
+  return { remoteDesktopClientOverride: { origin, sameOriginWithAncestors: same } };
+}
+
+function getDetails(extra = {}) {
+  return Object.assign(
+    {
+      allowCredentials: [],
+      challenge: "Y2hhbGxlbmdlLWNoYWxsZW5nZQ",
+      extensions: override(),
+      rpId: "rp.example",
+      timeout: 180000,
+      userVerification: "preferred"
+    },
+    extra
+  );
+}
+
+function createDetails(extra = {}) {
+  return Object.assign(
+    {
+      attestation: "none",
+      authenticatorSelection: { residentKey: "required", userVerification: "preferred" },
+      challenge: "Y3JlYXRlLWNoYWxsZW5nZQ",
+      excludeCredentials: [],
+      extensions: override(),
+      pubKeyCredParams: [{ alg: -7, type: "public-key" }],
+      rp: { id: "rp.example", name: "rp" },
+      timeout: 180000,
+      user: { displayName: "Alice", id: "dXNlcg", name: "alice" }
+    },
+    extra
+  );
+}
+
+function assertNotAllowed(env, requestId, kind) {
+  const c = env.completesFor(requestId);
+  assert.strictEqual(c.length, 1, `exactly one completion for ${requestId}, got ${c.length}`);
+  if (kind) assert.strictEqual(c[0].kind, kind);
+  assert.ok(c[0].arg.error, "completion carries an error");
+  assert.strictEqual(c[0].arg.error.name, "NotAllowedError");
+  assert.strictEqual(typeof c[0].arg.error.message, "string");
+  assert.strictEqual(c[0].arg.responseJson, undefined);
+}
+
+function requestFrames(env) {
+  return env.ports.flatMap((p) => p.frames("request"));
+}
+
+// ---- hello and lifecycle -------------------------------------------------------------------------
+
+test("hello is the first frame and carries bearer, attached, incognito_allowed, build_version, socket", async () => {
+  const env = await boot();
+  assert.deepStrictEqual(env.connectNames, ["rs.passless.sign_proxy"]);
+  const port = env.port();
+  assert.ok(port.posted.length >= 1);
+  assert.deepStrictEqual(port.posted[0], {
+    type: "hello",
+    v: 2,
+    build_version: BUILD,
+    bearer: BEARER,
+    attached: true,
+    incognito_allowed: true,
+    socket: SOCKET
+  });
+  assert.strictEqual(port.frames("hello").length, 1);
+});
+
+test("hello reports incognito_allowed=false from isAllowedIncognitoAccess", async () => {
+  const env = await boot({ incognito: false });
+  const hello = env.port().posted[0];
+  assert.strictEqual(hello.type, "hello");
+  assert.strictEqual(hello.incognito_allowed, false);
+  assert.strictEqual(hello.attached, true);
+});
+
+test("attach() is called on every worker start", async () => {
+  const storage = new Map();
+  const env1 = await boot({ storage });
+  assert.strictEqual(env1.attachCalls, 1);
+  const env2 = await boot({ storage });
+  assert.strictEqual(env2.attachCalls, 1);
+  assert.strictEqual(env2.port().posted[0].attached, true);
+});
+
+test("an 'already attached' attach error counts as attached; another extension does not", async () => {
+  const a = await boot({ attach: "lastError:This extension is already attached" });
+  assert.strictEqual(a.port().posted[0].attached, true);
+  const b = await boot({ attach: "error:Another extension is already attached" });
+  assert.strictEqual(b.port().posted[0].attached, false);
+  const c = await boot({ attach: "error:Some failure" });
+  assert.strictEqual(c.port().posted[0].attached, false);
+  const d = await boot({ attach: "throw" });
+  assert.strictEqual(d.port().posted[0].attached, false);
+});
+
+test("hello waits for the attach result; a later attach change re-sends hello", async () => {
+  const env = await boot({ attach: "manual" });
+  const port = env.port();
+  assert.strictEqual(port.posted.length, 0, "no frame before the attach state is known");
+  await env.clock.advance(2000);
+  assert.strictEqual(port.posted.length, 1);
+  assert.strictEqual(port.posted[0].type, "hello");
+  assert.strictEqual(port.posted[0].attached, false);
+  env.pendingAttach(undefined);
+  await flush();
+  const hellos = port.frames("hello");
+  assert.strictEqual(hellos.length, 2);
+  assert.strictEqual(hellos[1].attached, true);
+  assert.strictEqual(hellos[1].bearer, BEARER);
+  // An unchanged state does not re-send.
+  env.pendingAttach(undefined);
+  await flush();
+  assert.strictEqual(port.frames("hello").length, 2);
+});
+
+test("requests arriving before the hello are queued behind it", async () => {
+  const env = await boot({ attach: "manual" });
+  env.get(10, getDetails());
+  await flush();
+  const port = env.port();
+  assert.strictEqual(port.posted.length, 0);
+  env.pendingAttach(undefined);
+  await flush();
+  assert.deepStrictEqual(port.posted.map((f) => f.type), ["hello", "request"]);
+  assert.strictEqual(port.posted[0].attached, true);
+});
+
+test("a request cancelled before the hello is dropped, not sent", async () => {
+  const env = await boot({ attach: "manual" });
+  env.get(10, getDetails());
+  env.proxy.onRequestCanceled.fire(10);
+  env.pendingAttach(undefined);
+  await flush();
+  assert.deepStrictEqual(env.port().posted.map((f) => f.type), ["hello"]);
+  assert.strictEqual(env.completes.length, 0);
+});
+
+test("the template has each placeholder once and renders a special-character bearer", async () => {
+  for (const p of PLACEHOLDERS) {
+    assert.strictEqual(WORKER_SRC.split(p).length - 1, 1, `${p} appears exactly once`);
+  }
+  const bearer = "tok\"en\\with\nspecialé </script>'`${x}";
+  const socket = "/tmp/so ck\"et";
+  const build = "1.2.3+\"x\"";
+  const src = renderWorker({ bearer, socket, build });
+  assert.doesNotThrow(() => new vm.Script(src));
+  const env = makeEnv();
+  startWorker(env, { bearer, socket, build });
+  await flush();
+  const hello = env.port().posted[0];
+  assert.strictEqual(hello.bearer, bearer);
+  assert.strictEqual(hello.socket, socket);
+  assert.strictEqual(hello.build_version, build);
+});
+
+// ---- request framing -----------------------------------------------------------------------------
+
+test("request frame: verbatim body, origin and cross_origin from the override, timeout_ms", async () => {
+  const env = await boot();
+  // Odd spacing and key order: the body must be the exact event string.
+  const body =
+    '{ "rpId":"rp.example",  "challenge":"Y2g","timeout":180000,\n' +
+    '"extensions":{"remoteDesktopClientOverride":{"sameOriginWithAncestors":true,"origin":"https://rp.example:8443"}},' +
+    '"allowCredentials":[] , "userVerification":"required"}';
+  env.get(-1381853939, body);
+  await flush();
+  const frames = env.port().frames("request");
+  assert.strictEqual(frames.length, 1);
+  assert.deepStrictEqual(frames[0], {
+    type: "request",
+    id: 1,
+    op: "get",
+    timeout_ms: 180000,
+    origin: "https://rp.example:8443",
+    cross_origin: false,
+    body
+  });
+  assert.strictEqual(frames[0].bearer, undefined);
+});
+
+test("request frame: create op, cross_origin from sameOriginWithAncestors=false, null timeout", async () => {
+  const env = await boot();
+  const details = createDetails({ extensions: override("https://frame.example", false) });
+  delete details.timeout;
+  env.create(7, details);
+  await flush();
+  const f = env.port().frames("request")[0];
+  assert.strictEqual(f.op, "create");
+  assert.strictEqual(f.origin, "https://frame.example");
+  assert.strictEqual(f.cross_origin, true);
+  assert.strictEqual(f.timeout_ms, null);
+  assert.strictEqual(f.body, JSON.stringify(details));
+});
+
+test("origin comes only from the override, never from rp.id, rpId or a top-level origin", async () => {
+  const env = await boot();
+  env.get(1, getDetails({ rpId: "evil.example", origin: "https://evil.example", topOrigin: "https://evil.example" }));
+  env.create(2, createDetails({ rp: { id: "evil.example", name: "evil" }, origin: "https://evil.example" }));
+  await flush();
+  const frames = env.port().frames("request");
+  assert.strictEqual(frames.length, 2);
+  for (const f of frames) assert.strictEqual(f.origin, RP_ORIGIN);
+});
+
+test("a missing or malformed override is rejected without contacting the daemon", async () => {
+  const env = await boot();
+  const bad = [
+    getDetails({ extensions: undefined, origin: RP_ORIGIN }),
+    getDetails({ extensions: {} }),
+    getDetails({ extensions: { remoteDesktopClientOverride: null } }),
+    getDetails({ extensions: { remoteDesktopClientOverride: "https://rp.example" } }),
+    getDetails({ extensions: { remoteDesktopClientOverride: { origin: 42, sameOriginWithAncestors: true } } }),
+    getDetails({ extensions: { remoteDesktopClientOverride: { origin: "", sameOriginWithAncestors: true } } }),
+    getDetails({ extensions: { remoteDesktopClientOverride: { origin: RP_ORIGIN } } }),
+    getDetails({ extensions: { remoteDesktopClientOverride: { origin: RP_ORIGIN, sameOriginWithAncestors: "true" } } }),
+    getDetails({ extensions: [] })
+  ];
+  bad.forEach((d, i) => env.get(100 + i, d));
+  env.get(200, "{not json");
+  env.get(201, "null");
+  env.create(202, createDetails({ extensions: undefined }));
+  env.proxy.onGetRequest.fire({ requestId: 203, requestDetailsJson: { extensions: override() } });
+  await flush();
+  assert.strictEqual(requestFrames(env).length, 0, "no request frame sent");
+  bad.forEach((_, i) => assertNotAllowed(env, 100 + i, "get"));
+  assertNotAllowed(env, 200, "get");
+  assertNotAllowed(env, 201, "get");
+  assertNotAllowed(env, 202, "create");
+  assertNotAllowed(env, 203, "get");
+  assert.deepStrictEqual(env.pendingKeys(), []);
+});
+
+test("conditional-mediation get is rejected without a daemon frame", async () => {
+  const env = await boot();
+  env.get(5, getDetails({ mediation: "conditional" }));
+  await flush();
+  assert.strictEqual(requestFrames(env).length, 0);
+  assertNotAllowed(env, 5, "get");
+});
+
+test("an oversize request is refused locally instead of breaking the port", async () => {
+  const env = await boot();
+  env.get(6, getDetails({ challenge: "A".repeat(1048576) }));
+  await flush();
+  assert.strictEqual(requestFrames(env).length, 0);
+  assertNotAllowed(env, 6, "get");
+  assert.strictEqual(env.port().closed, false);
+});
+
+test("a duplicate event for an in-flight requestId is not sent twice", async () => {
+  const env = await boot();
+  env.get(9, getDetails());
+  env.get(9, getDetails());
+  await flush();
+  assert.strictEqual(requestFrames(env).length, 1);
+  assert.strictEqual(env.completes.length, 0);
+});
+
+test("wire ids are a monotonic counter starting at 1", async () => {
+  const env = await boot();
+  env.get(50, getDetails());
+  env.create(51, createDetails());
+  env.get(52, getDetails());
+  await flush();
+  assert.deepStrictEqual(requestFrames(env).map((f) => f.id), [1, 2, 3]);
+});
+
+// ---- results -------------------------------------------------------------------------------------
+
+test("multiplexing: two concurrent requests completed out of order with the right responseJson", async () => {
+  const env = await boot();
+  env.get(111, getDetails());
+  env.create(222, createDetails());
+  await flush();
+  const [f1, f2] = requestFrames(env);
+  const port = env.port();
+  port.deliver({ type: "result", id: f2.id, ok: true, body: '{"id":"create-222"}' });
+  await flush();
+  port.deliver({ type: "result", id: f1.id, ok: true, body: '{"id":"get-111"}' });
+  await flush();
+  assert.strictEqual(env.completes.length, 2);
+  assert.deepStrictEqual(env.completes[0].arg, { requestId: 222, responseJson: '{"id":"create-222"}' });
+  assert.strictEqual(env.completes[0].kind, "create");
+  assert.deepStrictEqual(env.completes[1].arg, { requestId: 111, responseJson: '{"id":"get-111"}' });
+  assert.strictEqual(env.completes[1].kind, "get");
+});
+
+test("responseJson is passed verbatim (byte-identical string)", async () => {
+  const env = await boot();
+  env.get(1, getDetails());
+  await flush();
+  const body =
+    '{"type":"public-key",  "id":"AAEC","rawId":"AAEC","authenticatorAttachment":"cross-platform",\n' +
+    '"clientExtensionResults":{},"response":{"clientDataJSON":"eyJ0eXBlIjoid2ViYXV0aG4uZ2V0In0",' +
+    '"authenticatorData":"YWJj","signature":"c2ln","userHandle":null},"z":"é \\u0000","a":1.50}';
+  env.port().deliver({ type: "result", id: 1, ok: true, body });
+  await flush();
+  const c = env.completesFor(1);
+  assert.strictEqual(c.length, 1);
+  assert.strictEqual(typeof c[0].raw.responseJson, "string");
+  assert.strictEqual(c[0].raw.responseJson, body);
+  assert.ok(Buffer.from(c[0].raw.responseJson, "utf8").equals(Buffer.from(body, "utf8")));
+  assert.strictEqual(c[0].raw.error, undefined);
+});
+
+test("error mapping: allowed dom names pass through, anything else becomes NotAllowedError", async () => {
+  const env = await boot();
+  const cases = [
+    { dom: "NotAllowedError", want: "NotAllowedError" },
+    { dom: "NotSupportedError", want: "NotSupportedError" },
+    { dom: "InvalidStateError", want: "InvalidStateError" },
+    { dom: "SecurityError", want: "SecurityError" },
+    { dom: "AbortError", want: "AbortError" },
+    { dom: "WhateverError", want: "NotAllowedError" },
+    { dom: "TypeError", want: "NotAllowedError" },
+    { dom: undefined, want: "NotAllowedError" },
+    { dom: 7, want: "NotAllowedError" }
+  ];
+  cases.forEach((_, i) => env.create(1000 + i, createDetails()));
+  await flush();
+  const frames = requestFrames(env);
+  cases.forEach((c, i) => env.port().deliver({ type: "result", id: frames[i].id, ok: false, error: { code: "x", dom: c.dom } }));
+  await flush();
+  cases.forEach((c, i) => {
+    const done = env.completesFor(1000 + i);
+    assert.strictEqual(done.length, 1);
+    assert.strictEqual(done[0].kind, "create");
+    assert.strictEqual(done[0].arg.error.name, c.want, `dom ${c.dom}`);
+    assert.strictEqual(typeof done[0].arg.error.message, "string");
+    assert.strictEqual(done[0].arg.responseJson, undefined);
+  });
+  assert.deepStrictEqual(env.pendingKeys(), []);
+});
+
+test("a malformed result for a known id fails it with NotAllowedError", async () => {
+  const env = await boot();
+  const malformed = [
+    { ok: "yes", body: "{}" },
+    { ok: true },
+    { ok: true, body: { id: "x" } },
+    { ok: false },
+    { ok: false, error: "busy" }
+  ];
+  malformed.forEach((_, i) => env.get(300 + i, getDetails()));
+  await flush();
+  const frames = requestFrames(env);
+  malformed.forEach((m, i) => env.port().deliver(Object.assign({ type: "result", id: frames[i].id }, m)));
+  await flush();
+  malformed.forEach((_, i) => assertNotAllowed(env, 300 + i, "get"));
+});
+
+test("unknown or malformed daemon frames are ignored", async () => {
+  const env = await boot();
+  env.get(1, getDetails());
+  await flush();
+  const port = env.port();
+  for (const raw of [null, 42, "result", [], { id: 1 }, { type: 5 }, { type: "bogus", id: 1 }, { type: "result" },
+    { type: "result", id: "1", ok: true, body: "{}" }, { type: "result", id: 99, ok: true, body: "{}" },
+    { type: "keepalive" }, { type: "hello", v: 2, build_version: "x" }]) {
+    port.deliverRaw(raw);
+  }
+  await flush();
+  assert.strictEqual(env.completes.length, 0, "nothing completed");
+  assert.strictEqual(port.closed, false);
+  port.deliver({ type: "result", id: 1, ok: true, body: "{\"ok\":1}" });
+  await flush();
+  assert.deepStrictEqual(env.completesFor(1).map((c) => c.arg.responseJson), ["{\"ok\":1}"]);
+});
+
+test("a second result for the same id is ignored", async () => {
+  const env = await boot();
+  env.get(1, getDetails());
+  await flush();
+  env.port().deliver({ type: "result", id: 1, ok: true, body: "{\"a\":1}" });
+  env.port().deliver({ type: "result", id: 1, ok: false, error: { code: "x", dom: "SecurityError" } });
+  await flush();
+  assert.strictEqual(env.completes.length, 1);
+});
+
+// ---- abort and UVPAA -----------------------------------------------------------------------------
+
+test("onRequestCanceled sends abort for the mapped wire id and the late result is ignored", async () => {
+  const env = await boot();
+  env.get(40, getDetails());
+  env.create(41, createDetails());
+  await flush();
+  const [, f41] = requestFrames(env);
+  env.proxy.onRequestCanceled.fire(41);
+  await flush();
+  const aborts = env.port().frames("abort");
+  assert.deepStrictEqual(aborts, [{ type: "abort", id: f41.id }]);
+  assert.ok(!env.pendingKeys().includes("pending:41"));
+  assert.ok(env.pendingKeys().includes("pending:40"));
+  env.port().deliver({ type: "result", id: f41.id, ok: false, error: { code: "aborted", dom: "AbortError" } });
+  await flush();
+  assert.strictEqual(env.completes.length, 0, "no completion after cancel");
+  env.proxy.onRequestCanceled.fire(41);
+  env.proxy.onRequestCanceled.fire(12345);
+  await flush();
+  assert.strictEqual(env.port().frames("abort").length, 1, "unknown requestIds send nothing");
+});
+
+test("onIsUvpaaRequest is always answered with isUvpaa=false", async () => {
+  const env = await boot();
+  env.proxy.onIsUvpaaRequest.fire({ requestId: 77 });
+  env.proxy.onIsUvpaaRequest.fire({ requestId: -3 });
+  await flush();
+  assert.deepStrictEqual(env.uvpaa, [{ requestId: 77, isUvpaa: false }, { requestId: -3, isUvpaa: false }]);
+  assert.deepStrictEqual(env.port().posted.map((f) => f.type), ["hello"]);
+});
+
+// ---- keepalive -----------------------------------------------------------------------------------
+
+test("keepalive is sent every 20 s while the port is open", async () => {
+  const env = await boot();
+  const port = env.port();
+  await env.clock.advance(19999);
+  assert.strictEqual(port.frames("keepalive").length, 0);
+  await env.clock.advance(1);
+  assert.strictEqual(port.frames("keepalive").length, 1);
+  await env.clock.advance(20000);
+  assert.strictEqual(port.frames("keepalive").length, 2);
+  await env.clock.advance(60000);
+  assert.strictEqual(port.frames("keepalive").length, 5);
+  assert.deepStrictEqual(port.frames("keepalive")[0], { type: "keepalive" });
+  port.drop();
+  await flush();
+  await env.clock.advance(19000);
+  assert.strictEqual(port.frames("keepalive").length, 5, "no keepalive on a dropped port");
+});
+
+// ---- disconnect and reconnect --------------------------------------------------------------------
+
+test("disconnect fails in-flight requests, then reconnects with backoff and says hello again", async () => {
+  const env = await boot();
+  env.get(1, getDetails());
+  env.create(2, createDetails());
+  await flush();
+  assert.strictEqual(env.pendingKeys().length, 2);
+  const first = env.port();
+  first.drop("Native host has exited.");
+  await flush();
+  assertNotAllowed(env, 1, "get");
+  assertNotAllowed(env, 2, "create");
+  assert.deepStrictEqual(env.pendingKeys(), []);
+  assert.strictEqual(env.ports.length, 1, "no immediate reconnect");
+  await env.clock.advance(249);
+  assert.strictEqual(env.ports.length, 1);
+  await env.clock.advance(1);
+  assert.strictEqual(env.ports.length, 2);
+  const second = env.port();
+  assert.strictEqual(second.posted[0].type, "hello");
+  assert.strictEqual(second.posted[0].bearer, BEARER);
+  // A late result from the dead port cannot complete anything twice.
+  first.onMessage.fire({ type: "result", id: 1, ok: true, body: "{}" });
+  await flush();
+  assert.strictEqual(env.completes.length, 2);
+});
+
+test("backoff doubles to a 10 s cap and resets after a hello ack", async () => {
+  const env = await boot();
+  const delays = [];
+  for (let i = 0; i < 8; i++) {
+    env.port().drop();
+    await flush();
+    const before = env.ports.length;
+    const start = env.clock.now();
+    let waited = 0;
+    while (env.ports.length === before && waited < 20000) {
+      await env.clock.advance(50);
+      waited += 50;
+    }
+    assert.strictEqual(env.ports.length, before + 1, "reconnected");
+    delays.push(env.clock.now() - start);
+  }
+  assert.deepStrictEqual(delays, [250, 500, 1000, 2000, 4000, 8000, 10000, 10000]);
+  env.port().deliver({ type: "hello", v: 2, build_version: "daemon" });
+  await flush();
+  env.port().drop();
+  await flush();
+  const before = env.ports.length;
+  await env.clock.advance(249);
+  assert.strictEqual(env.ports.length, before);
+  await env.clock.advance(1);
+  assert.strictEqual(env.ports.length, before + 1, "backoff reset to 250 ms");
+});
+
+test("a request while disconnected connects immediately and is sent after the hello", async () => {
+  const env = await boot();
+  env.port().drop();
+  await flush();
+  assert.strictEqual(env.ports.length, 1);
+  env.get(8, getDetails());
+  await flush();
+  assert.strictEqual(env.ports.length, 2, "immediate connect attempt");
+  const port = env.port();
+  assert.deepStrictEqual(port.posted.map((f) => f.type), ["hello", "request"]);
+  assert.strictEqual(port.posted[1].id, 1);
+  // The pending backoff timer was replaced by this connection: no extra port appears.
+  await env.clock.advance(1000);
+  assert.strictEqual(env.ports.length, 2);
+  port.deliver({ type: "result", id: 1, ok: true, body: "{\"x\":1}" });
+  await flush();
+  assert.strictEqual(env.completesFor(8)[0].arg.responseJson, "{\"x\":1}");
+});
+
+test("a request whose connect fails gets NotAllowedError, never a native fallback", async () => {
+  const env = await boot({ connectPlan: ["ok", "fail", "throw"] });
+  env.port().drop();
+  await flush();
+  env.get(20, getDetails());
+  await flush();
+  assertNotAllowed(env, 20, "get");
+  // connectNative throwing (the next attempt) fails the request synchronously.
+  env.get(21, getDetails());
+  await flush();
+  assertNotAllowed(env, 21, "get");
+  assert.deepStrictEqual(env.pendingKeys(), []);
+  assert.strictEqual(env.completes.length, 2);
+});
+
+test("a daemon error frame is fatal for the port: disconnect, fail in-flight, backoff", async () => {
+  const env = await boot();
+  env.get(1, getDetails());
+  await flush();
+  const port = env.port();
+  port.deliver({ type: "error", code: "superseded" });
+  await flush();
+  assert.strictEqual(port.disconnectCalls, 1, "worker disconnected the port");
+  assertNotAllowed(env, 1, "get");
+  assert.strictEqual(env.ports.length, 1);
+  await env.clock.advance(250);
+  assert.strictEqual(env.ports.length, 2);
+  assert.strictEqual(env.port().posted[0].type, "hello");
+});
+
+test("a postMessage failure is treated as a disconnect", async () => {
+  const env = await boot();
+  const port = env.port();
+  port.closed = true; // the port died without onDisconnect yet
+  env.get(3, getDetails());
+  await flush();
+  assertNotAllowed(env, 3, "get");
+  await env.clock.advance(250);
+  assert.strictEqual(env.ports.length, 2);
+});
+
+// ---- storage.session (V-M4) ----------------------------------------------------------------------
+
+test("in-flight ids are recorded in storage.session and removed on completion", async () => {
+  const env = await boot();
+  env.create(-5, createDetails());
+  await flush();
+  const entry = env.storage.get("pending:-5");
+  assert.ok(entry, "recorded");
+  assert.strictEqual(entry.op, "create");
+  assert.strictEqual(typeof entry.instance, "string");
+  assert.ok(entry.instance.length >= 16);
+  env.port().deliver({ type: "result", id: 1, ok: true, body: "{}" });
+  await flush();
+  assert.deepStrictEqual(env.pendingKeys(), []);
+});
+
+test("restart fails another instance's leftovers but not the current instance's entries", async () => {
+  const storage = new Map([
+    ["pending:111", { op: "create", instance: "old-instance" }],
+    ["pending:222", { op: "get", instance: "old-instance" }],
+    ["pending:333", { op: "get", instance: "old-instance" }],
+    ["pending:444", { op: "weird" }],
+    ["pending:666", { op: "get", instance: "current-instance-nonce" }],
+    ["unrelated", { keep: true }]
+  ]);
+  const env = await boot({ storage, deferStorageGet: true, nonce: "current-instance-nonce" });
+  // The request that woke the worker is recorded before the cleanup read completes, and 333 is
+  // re-delivered live by the browser to this instance.
+  env.get(555, getDetails());
+  env.get(333, getDetails());
+  await flush();
+  const current = env.storage.get("pending:555").instance;
+  assert.notStrictEqual(current, "old-instance");
+  env.releaseGets();
+  await flush();
+  assertNotAllowed(env, 111, "create");
+  assertNotAllowed(env, 222, "get");
+  assertNotAllowed(env, 444, "get");
+  assert.strictEqual(env.completesFor(555).length, 0, "current instance entry not failed");
+  assert.strictEqual(env.completesFor(333).length, 0, "live request not failed");
+  assert.strictEqual(env.completesFor(666).length, 0, "current instance entry (not live) not failed");
+  assert.deepStrictEqual(env.pendingKeys().sort(), ["pending:333", "pending:555", "pending:666"]);
+  assert.strictEqual(env.storage.get("pending:333").instance, current);
+  assert.ok(env.storage.has("unrelated"));
+  // The live requests still complete normally.
+  const frames = env.port().frames("request");
+  env.port().deliver({ type: "result", id: frames[0].id, ok: true, body: "{\"r\":555}" });
+  await flush();
+  assert.strictEqual(env.completesFor(555)[0].arg.responseJson, "{\"r\":555}");
+});
+
+test("a worker restart leaves the dead instance's in-flight request failed on the next start", async () => {
+  const storage = new Map();
+  const env1 = await boot({ storage });
+  env1.get(900, getDetails());
+  await flush();
+  assert.ok(storage.has("pending:900"));
+  // Worker dies; the browser starts a new instance with the same session storage.
+  const env2 = await boot({ storage });
+  await flush();
+  assertNotAllowed(env2, 900, "get");
+  assert.ok(!storage.has("pending:900"));
+});
+
+// ---- forbidden surfaces --------------------------------------------------------------------------
+
+test("no runtime.reload, onMessage or onMessageExternal (source and spies)", async () => {
+  assert.ok(!/\.reload\s*\(/.test(WORKER_SRC), "no reload()");
+  assert.ok(!/onMessageExternal/.test(WORKER_SRC), "no onMessageExternal");
+  assert.ok(!/runtime\s*\.\s*onMessage/.test(WORKER_SRC), "no runtime.onMessage");
+  assert.ok(!/onConnect(External)?\b/.test(WORKER_SRC), "no onConnect listeners");
+  assert.ok(!/sendNativeMessage|sendMessage|externally_connectable/.test(WORKER_SRC));
+  assert.ok(!/main\.js|broker\.js|importScripts/.test(WORKER_SRC), "no MAIN-world path");
+  assert.ok(!/fetch\s*\(|XMLHttpRequest|WebSocket/.test(WORKER_SRC), "no network transport");
+
+  const env = await boot();
+  env.get(1, getDetails());
+  env.create(2, createDetails());
+  env.proxy.onIsUvpaaRequest.fire({ requestId: 3 });
+  await flush();
+  env.port().deliver({ type: "result", id: 1, ok: true, body: "{}" });
+  env.port().deliver({ type: "error", code: "bad_frame" });
+  await flush();
+  await env.clock.advance(60000);
+  const rt = env.chrome.runtime;
+  assert.strictEqual(env.reloadCalls, 0);
+  assert.strictEqual(rt.onMessage.count(), 0);
+  assert.strictEqual(rt.onMessageExternal.count(), 0);
+  assert.strictEqual(rt.onConnect.count(), 0);
+  assert.strictEqual(rt.onConnectExternal.count(), 0);
+  // All four proxy listeners registered synchronously during the first run.
+  for (const ev of ["onCreateRequest", "onGetRequest", "onRequestCanceled", "onIsUvpaaRequest"]) {
+    assert.strictEqual(env.proxy[ev].count(), 1, ev);
+  }
+});
+
+test("proxy listeners are registered synchronously at top level", () => {
+  const env = makeEnv();
+  startWorker(env); // no await: listeners must exist before any callback runs
+  for (const ev of ["onCreateRequest", "onGetRequest", "onRequestCanceled", "onIsUvpaaRequest"]) {
+    assert.strictEqual(env.proxy[ev].count(), 1, ev);
+  }
+  assert.strictEqual(env.attachCalls, 1);
+  assert.strictEqual(env.ports.length, 1, "port opened at start");
+});
+
+test("the bearer appears only in hello frames", async () => {
+  const env = await boot();
+  env.get(1, getDetails());
+  env.create(2, createDetails());
+  await flush();
+  env.proxy.onRequestCanceled.fire(2);
+  await env.clock.advance(20000);
+  for (const f of env.port().posted) {
+    if (f.type === "hello") continue;
+    assert.ok(!JSON.stringify(f).includes(BEARER), `bearer leaked in ${f.type}`);
+  }
+});
+
+// ---- manifest ------------------------------------------------------------------------------------
+
+test("manifest: worker-only proxy extension with exactly the required permissions", () => {
+  const m = JSON.parse(MANIFEST_SRC);
+  assert.strictEqual(m.manifest_version, 3);
+  assert.deepStrictEqual([...m.permissions].sort(), ["nativeMessaging", "storage", "webAuthenticationProxy"]);
+  assert.strictEqual(m.permissions.length, 3);
+  for (const k of ["host_permissions", "optional_permissions", "optional_host_permissions", "content_scripts",
+    "web_accessible_resources", "externally_connectable", "background_page", "action", "side_panel",
+    "devtools_page", "options_page", "options_ui", "chrome_url_overrides"]) {
+    assert.strictEqual(m[k], undefined, `${k} must be absent`);
+  }
+  assert.deepStrictEqual(m.background, { service_worker: "worker.js" });
+  assert.strictEqual(m.incognito, "spanning");
+  assert.ok(Number(m.minimum_chrome_version) >= 116, "proxy API needs a recent Chrome");
+  assert.ok(!/main\.js|broker\.js/.test(MANIFEST_SRC));
+});
+
+test("manifest: key is an RSA-2048 public SPKI giving the expected extension ID", () => {
+  const m = JSON.parse(MANIFEST_SRC);
+  assert.strictEqual(typeof m.key, "string");
+  const der = Buffer.from(m.key, "base64");
+  assert.strictEqual(der.toString("base64"), m.key, "canonical base64");
+  const pub = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
+  assert.strictEqual(pub.type, "public");
+  assert.strictEqual(pub.asymmetricKeyType, "rsa");
+  assert.strictEqual(pub.asymmetricKeyDetails.modulusLength, 2048);
+  const id = crypto
+    .createHash("sha256")
+    .update(der)
+    .digest("hex")
+    .slice(0, 32)
+    .replace(/[0-9a-f]/g, (c) => String.fromCharCode(97 + parseInt(c, 16)));
+  assert.strictEqual(id, EXPECTED_EXTENSION_ID);
+});
+
+// ---- main ----------------------------------------------------------------------------------------
+
+(async () => {
+  let passed = 0;
+  const failures = [];
+  for (const t of tests) {
     try {
       await t.fn();
       passed++;
+      console.log(`ok   ${t.name}`);
     } catch (e) {
-      failed++;
-      failures.push({ name: t.name, error: e.message || String(e) });
+      failures.push(t.name);
+      console.log(`FAIL ${t.name}\n     ${(e && e.stack) || e}`);
     }
   }
-}
-
-function flushPromises() {
-  return new Promise(function(resolve) { setTimeout(resolve, 10); });
-}
-
-function makeChallenge(len) {
-  return new Uint8Array(len || 32);
-}
-
-function makeCredentialId(len) {
-  return new Uint8Array(len || 32);
-}
-
-function runMainTest(channel, setupFn) {
-  const sandbox = {
-    _originalCalled: false,
-    _originalCreateCalled: false,
-    _originalOptions: null,
-    _postMessageCalls: [],
-    _setTimeoutCalls: [],
-    _clearTimeoutCalls: [],
-    _timerId: 0,
-  };
-
-  const cryptoObj = {
-    getRandomValues: function(arr) {
-      for (let i = 0; i < arr.length; i++) arr[i] = (i * 7 + 13) & 0xff;
-      return arr;
-    },
-  };
-
-  // Like the browser: the methods live on CredentialsContainer.prototype, not on the instance.
-  const credentialsProto = {
-    get: function(options) {
-      sandbox._originalCalled = true;
-      sandbox._originalOptions = options;
-      return Promise.resolve({ id: "original-credential" });
-    },
-    create: function(options) {
-      sandbox._originalCreateCalled = true;
-      sandbox._originalOptions = options;
-      return Promise.resolve({ id: "original-created-credential" });
-    },
-  };
-  const credentials = Object.create(credentialsProto);
-  sandbox._credentialsProto = credentialsProto;
-
-  const navigatorObj = { credentials: credentials };
-
-  const windowListeners = {};
-  const windowObj = {
-    addEventListener: function(type, fn) {
-      windowListeners[type] = fn;
-    },
-    postMessage: function(data, origin) {
-      sandbox._postMessageCalls.push({ data, origin });
-    },
-  };
-
-  sandbox.window = windowObj;
-  sandbox.navigator = navigatorObj;
-  sandbox.crypto = cryptoObj;
-  sandbox.location = { hostname: "example.com", origin: "https://example.com" };
-  sandbox.setTimeout = function(fn, ms) {
-    const id = ++sandbox._timerId;
-    sandbox._setTimeoutCalls.push({ id, fn, ms });
-    return id;
-  };
-  sandbox.clearTimeout = function(id) {
-    sandbox._clearTimeoutCalls.push(id);
-  };
-  sandbox.DOMException = class DOMException extends Error {
-    constructor(msg, name) {
-      super(msg);
-      this.name = name || "DOMException";
-    }
-  };
-  sandbox.ArrayBuffer = ArrayBuffer;
-  sandbox.Uint8Array = Uint8Array;
-  sandbox.Buffer = Buffer;
-  sandbox.btoa = function(s) { return Buffer.from(s, "binary").toString("base64"); };
-  sandbox.atob = function(s) { return Buffer.from(s, "base64").toString("binary"); };
-  sandbox.Map = Map;
-  sandbox.Promise = Promise;
-  sandbox.TypeError = TypeError;
-  sandbox.Array = Array;
-  sandbox.Object = Object;
-  sandbox.String = String;
-  sandbox.Boolean = Boolean;
-  sandbox.Number = Number;
-  sandbox.JSON = JSON;
-  sandbox.Math = Math;
-  sandbox.parseInt = parseInt;
-  sandbox.parseFloat = parseFloat;
-  sandbox.undefined = undefined;
-  sandbox.NaN = NaN;
-  sandbox.Infinity = Infinity;
-
-  const ctx = vm.createContext(sandbox);
-  const code = renderMain(channel);
-  vm.runInContext(code, ctx);
-
-  if (setupFn) setupFn(sandbox, windowListeners, credentials);
-
-  return sandbox;
-}
-
-function runBrokerCode(sandbox, channel) {
-  const ctx = vm.createContext(sandbox);
-  const code = renderBroker(channel);
-  vm.runInContext(code, ctx);
-}
-
-function runBrokerTest(channel, setupFn) {
-  const sandbox = {
-    _chromeSendResponse: null,
-    _chromeLastError: null,
-  };
-
-  const chromeObj = {
-    runtime: {
-      sendMessage: function(msg, cb) {
-        sandbox._chromeSendMessage = msg;
-        if (sandbox._chromeSendResponse) {
-          cb(sandbox._chromeSendResponse);
-        }
-      },
-      get lastError() {
-        return sandbox._chromeLastError;
-      },
-    },
-  };
-
-  const windowListeners = {};
-  const windowObj = {
-    addEventListener: function(type, fn) {
-      windowListeners[type] = fn;
-    },
-    postMessage: function(data, origin) {
-      sandbox._postMessageCalls = sandbox._postMessageCalls || [];
-      sandbox._postMessageCalls.push({ data, origin });
-    },
-  };
-
-  const documentElement = {
-    _attributes: new Set(),
-    hasAttribute: function(name) { return this._attributes.has(name); },
-    setAttribute: function(name) { this._attributes.add(name); },
-  };
-  sandbox._windowListeners = windowListeners;
-  sandbox.window = windowObj;
-  sandbox.document = { documentElement: documentElement };
-  sandbox.chrome = chromeObj;
-  sandbox.location = { origin: "https://example.com" };
-  sandbox.Array = Array;
-  sandbox.Set = Set;
-  sandbox.Object = Object;
-  sandbox.String = String;
-  sandbox.Boolean = Boolean;
-  sandbox.Number = Number;
-  sandbox.JSON = JSON;
-  sandbox.TypeError = TypeError;
-
-  runBrokerCode(sandbox, channel);
-
-  if (setupFn) setupFn(sandbox, windowListeners);
-
-  return sandbox;
-}
-
-function runWorkerTest(socketPath, bearer, setupFn) {
-  const sandbox = {
-    _listeners: [],
-    _sendResponses: [],
-    _nativeMessageCalls: [],
-  };
-
-  const chromeObj = {
-    runtime: {
-      id: "test-extension-id",
-      lastError: null,
-      onMessage: {
-        addListener: function(fn) {
-          sandbox._listeners.push(fn);
-        },
-      },
-      sendNativeMessage: function(host, message, callback) {
-        sandbox._nativeMessageCalls.push({ host, message, callback });
-        if (sandbox._nativeMessageResponse) {
-          callback(sandbox._nativeMessageResponse);
-        }
-      },
-    },
-  };
-
-  sandbox.chrome = chromeObj;
-  sandbox.URL = URL;
-  sandbox.Array = Array;
-  sandbox.Object = Object;
-  sandbox.String = String;
-  sandbox.Boolean = Boolean;
-  sandbox.Number = Number;
-  sandbox.JSON = JSON;
-  sandbox.TypeError = TypeError;
-  sandbox.Error = Error;
-  sandbox.Promise = Promise;
-
-  const ctx = vm.createContext(sandbox);
-  const code = renderWorker(socketPath || "/tmp/test/sock", bearer);
-  vm.runInContext(code, ctx);
-
-  if (setupFn) setupFn(sandbox);
-
-  return sandbox;
-}
-
-function simulateMessage(listener, eventData, eventSource, eventOrigin) {
-  listener({
-    data: eventData,
-    source: eventSource,
-    origin: eventOrigin || "https://example.com",
-  });
-}
-
-// ======================== MAIN.JS BEHAVIORAL TESTS ========================
-
-test("main: intercepts publicKey get and posts to broker", async function() {
-  const ch = "testchannel1";
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function() {});
-  });
-
-  assert.strictEqual(sandbox._originalCalled, false);
-  assert.strictEqual(sandbox._postMessageCalls.length, 1);
-  const posted = sandbox._postMessageCalls[0];
-  assert.strictEqual(posted.data.source, "passless-agent-main");
-  assert.strictEqual(posted.data.channel, ch);
-  assert.strictEqual(posted.data.request.rp_id, "example.com");
-  assert.strictEqual(posted.data.request.user_verification, false);
+  console.log(`\n${passed} passed, ${failures.length} failed`);
+  process.exitCode = failures.length === 0 ? 0 : 1;
+})().catch((e) => {
+  console.error(e);
+  process.exitCode = 1;
 });
-
-test("main: passes through non-publicKey options to original get", async function() {
-  const ch = "testchannel2";
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    creds.get({ password: "test" });
-  });
-  assert.strictEqual(sandbox._originalCalled, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: base64url encoding produces correct output", async function() {
-  const ch = "testchannel3";
-  const challengeBytes = new Uint8Array([0xff, 0xfe, 0xfd, 0x00, 0x01, 0x02]);
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: challengeBytes,
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function() {});
-  });
-
-  const expected = b64url(challengeBytes);
-  const posted = sandbox._postMessageCalls[0];
-  assert.strictEqual(posted.data.request.challenge_b64u, expected);
-  assert.ok(!posted.data.request.challenge_b64u.includes("+"));
-  assert.ok(!posted.data.request.challenge_b64u.includes("/"));
-  assert.ok(!posted.data.request.challenge_b64u.includes("="));
-});
-
-test("main: rejects allowCredentials exceeding MAX_ALLOW_CREDENTIALS", async function() {
-  const ch = "testchannel4";
-  const tooMany = [];
-  for (let i = 0; i < 65; i++) {
-    tooMany.push({ type: "public-key", id: makeCredentialId(16) });
-  }
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        allowCredentials: tooMany,
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) {
-      rejected = true;
-      assert.strictEqual(e.name, "NotAllowedError");
-    });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: rejects malformed allowCredentials entries", async function() {
-  const ch = "testchannel5";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        allowCredentials: [{ type: "public-key", id: null }],
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: rejects empty challenge", async function() {
-  const ch = "testchannel6";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: new Uint8Array(0),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: rejects challenge exceeding MAX_CHALLENGE_BYTES", async function() {
-  const ch = "testchannel7";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(1025),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: rejects empty rpId", async function() {
-  const ch = "testchannel8";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._postMessageCalls.length, 1, "empty rpId defaults to hostname");
-  assert.strictEqual(sandbox._postMessageCalls[0].data.request.rp_id, "example.com");
-});
-
-test("main: rejects non-public-key credential type", async function() {
-  const ch = "testchannel9";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        allowCredentials: [{ type: "password", id: makeCredentialId(16) }],
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: rejects credential id exceeding MAX_CREDENTIAL_ID_BYTES", async function() {
-  const ch = "testchannel10";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        allowCredentials: [{ type: "public-key", id: makeCredentialId(257) }],
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: rejects invalid userVerification value", async function() {
-  const ch = "testchannel11";
-
-  let rejected = false;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "mandatory",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: accepts all valid userVerification values", async function() {
-  for (const uv of ["required", "preferred", "discouraged"]) {
-    const ch = "testchannel12_" + uv;
-    const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-      const p = creds.get({
-        publicKey: {
-          challenge: makeChallenge(32),
-          rpId: "example.com",
-          userVerification: uv,
-        },
-      });
-      p.catch(function() {});
-    });
-    assert.strictEqual(sandbox._postMessageCalls.length, 1, "should post for uv=" + uv);
-    assert.strictEqual(sandbox._postMessageCalls[0].data.request.user_verification, uv === "required");
-  }
-});
-
-test("main: constructs Gitea-compatible credential from daemon response", async function() {
-  const ch = "testchannel13";
-  let resolvedCredential = null;
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.then(function(cred) { resolvedCredential = cred; }).catch(function() {});
-
-    const requestId = sandbox._postMessageCalls[0].data.id;
-    const messageHandler = listeners["message"];
-    assert.ok(messageHandler, "message listener should be registered");
-
-    const daemonResponse = {
-      credential_id_b64u: b64url(new Uint8Array([1, 2, 3])),
-      authenticator_data_b64u: b64url(new Uint8Array([4, 5, 6])),
-      signature_b64u: b64url(new Uint8Array([7, 8, 9])),
-      client_data_json_b64u: b64url(new Uint8Array([10, 11, 12])),
-      user_handle_b64u: b64url(new Uint8Array([13, 14, 15])),
-    };
-
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        channel: ch,
-        id: requestId,
-        ok: true,
-        response: daemonResponse,
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  await flushPromises();
-  assert.ok(resolvedCredential, "credential should be resolved");
-  assert.strictEqual(resolvedCredential.type, "public-key");
-  assert.strictEqual(resolvedCredential.id, b64url(new Uint8Array([1, 2, 3])));
-  assert.ok(resolvedCredential.rawId instanceof ArrayBuffer, "rawId should be ArrayBuffer");
-  assert.ok(resolvedCredential.response.authenticatorData instanceof ArrayBuffer);
-  assert.ok(resolvedCredential.response.clientDataJSON instanceof ArrayBuffer);
-  assert.ok(resolvedCredential.response.signature instanceof ArrayBuffer);
-  assert.ok(resolvedCredential.response.userHandle instanceof ArrayBuffer);
-  assert.deepStrictEqual(Object.keys(resolvedCredential.getClientExtensionResults()), []);
-});
-
-test("main: malformed daemon response becomes NotAllowedError", async function() {
-  const ch = "testchannel14";
-  let rejectedError = null;
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejectedError = e; });
-
-    const requestId = sandbox._postMessageCalls[0].data.id;
-    const messageHandler = listeners["message"];
-
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        channel: ch,
-        id: requestId,
-        ok: true,
-        response: { bad: "data" },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  await flushPromises();
-  assert.ok(rejectedError, "should reject");
-  assert.strictEqual(rejectedError.name, "NotAllowedError");
-});
-
-test("main: broker ok=false becomes NotAllowedError", async function() {
-  const ch = "testchannel15";
-  let rejectedError = null;
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejectedError = e; });
-
-    const requestId = sandbox._postMessageCalls[0].data.id;
-    const messageHandler = listeners["message"];
-
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        channel: ch,
-        id: requestId,
-        ok: false,
-        response: null,
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  await flushPromises();
-  assert.ok(rejectedError);
-  assert.strictEqual(rejectedError.name, "NotAllowedError");
-});
-
-test("main: ignores messages from wrong source", async function() {
-  const ch = "testchannel16";
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function() {});
-
-    const requestId = sandbox._postMessageCalls[0].data.id;
-    const messageHandler = listeners["message"];
-
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        channel: ch,
-        id: requestId,
-        ok: true,
-        response: {
-          credential_id_b64u: b64url(new Uint8Array([1])),
-          authenticator_data_b64u: b64url(new Uint8Array([2])),
-          signature_b64u: b64url(new Uint8Array([3])),
-          client_data_json_b64u: b64url(new Uint8Array([4])),
-        },
-      },
-      {},
-      "https://example.com"
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._clearTimeoutCalls.length, 0);
-});
-
-test("main: ignores messages with wrong channel", async function() {
-  const ch = "testchannel17";
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function() {});
-
-    const requestId = sandbox._postMessageCalls[0].data.id;
-    const messageHandler = listeners["message"];
-
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        channel: "wrong-channel",
-        id: requestId,
-        ok: true,
-        response: {
-          credential_id_b64u: b64url(new Uint8Array([1])),
-          authenticator_data_b64u: b64url(new Uint8Array([2])),
-          signature_b64u: b64url(new Uint8Array([3])),
-          client_data_json_b64u: b64url(new Uint8Array([4])),
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._clearTimeoutCalls.length, 0);
-});
-
-test("main: fresh object construction for each credential response", async function() {
-  const credentials = [];
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const ch = "testchannel18_" + attempt;
-    const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-      let resolved = null;
-      const p = creds.get({
-        publicKey: {
-          challenge: makeChallenge(32),
-          rpId: "example.com",
-          userVerification: "preferred",
-        },
-      });
-      p.then(function(c) { resolved = c; }).catch(function() {});
-
-      const requestId = sandbox._postMessageCalls[0].data.id;
-      const messageHandler = listeners["message"];
-
-      simulateMessage(
-        messageHandler,
-        {
-          source: "passless-agent-broker",
-        request_id: "request-1",
-          channel: ch,
-          id: requestId,
-          ok: true,
-          response: {
-            credential_id_b64u: b64url(new Uint8Array([1, 2, 3])),
-            authenticator_data_b64u: b64url(new Uint8Array([4, 5, 6])),
-            signature_b64u: b64url(new Uint8Array([7, 8, 9])),
-            client_data_json_b64u: b64url(new Uint8Array([10, 11, 12])),
-          },
-        },
-        sandbox.window,
-        "https://example.com"
-      );
-
-      credentials.push({ sandbox, getResolved: function() { return resolved; } });
-    });
-  }
-
-  await flushPromises();
-  assert.ok(credentials[0].getResolved() !== credentials[1].getResolved(), "each credential should be a fresh object");
-  assert.ok(credentials[0].getResolved().response !== credentials[1].getResolved().response, "response objects should be distinct");
-});
-
-test("main: timeout cleanup fires NotAllowedError", async function() {
-  const ch = "testchannel19";
-  let rejectedError = null;
-  let timerFn = null;
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejectedError = e; });
-
-    assert.strictEqual(sandbox._setTimeoutCalls.length, 1);
-    timerFn = sandbox._setTimeoutCalls[0].fn;
-    assert.strictEqual(sandbox._setTimeoutCalls[0].ms, 30000);
-  });
-
-  assert.ok(timerFn);
-  timerFn();
-  await flushPromises();
-  assert.ok(rejectedError, "timeout should cause rejection");
-  assert.strictEqual(rejectedError.name, "NotAllowedError");
-});
-
-test("main: allowCredentials with empty id rejected", async function() {
-  const ch = "testchannel20";
-  let rejected = false;
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        allowCredentials: [{ type: "public-key", id: new Uint8Array(0) }],
-        userVerification: "preferred",
-      },
-    });
-    p.catch(function(e) { rejected = true; assert.strictEqual(e.name, "NotAllowedError"); });
-  });
-
-  await flushPromises();
-  assert.strictEqual(rejected, true);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: valid allowCredentials are serialized correctly", async function() {
-  const ch = "testchannel21";
-  const credId = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        allowCredentials: [{ type: "public-key", id: credId }],
-        userVerification: "required",
-      },
-    });
-    p.catch(function() {});
-  });
-
-  const posted = sandbox._postMessageCalls[0];
-  assert.strictEqual(posted.data.request.allow_credentials.length, 1);
-  assert.strictEqual(posted.data.request.allow_credentials[0], b64url(credId));
-  assert.strictEqual(posted.data.request.user_verification, true);
-});
-
-test("main: defaults userVerification to preferred when omitted", async function() {
-  const ch = "testchannel22";
-
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-      },
-    });
-    p.catch(function() {});
-  });
-
-  const posted = sandbox._postMessageCalls[0];
-  assert.strictEqual(posted.data.request.user_verification, false);
-});
-
-// ======================== BROKER.JS BEHAVIORAL TESTS ========================
-
-test("broker: forwards valid request to chrome.runtime.sendMessage", async function() {
-  const ch = "broker-ch1";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    sandbox._chromeSendResponse = { ok: true, response: { data: "test" } };
-
-    const messageHandler = listeners["message"];
-    assert.ok(messageHandler);
-
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: b64url(makeChallenge(32)),
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.ok(sandbox._chromeSendMessage);
-  assert.strictEqual(sandbox._chromeSendMessage.source, "passless-agent-broker");
-  assert.strictEqual(sandbox._chromeSendMessage.request.rp_id, "example.com");
-});
-
-test("broker: ignores duplicate injection for the same channel", async function() {
-  const ch = "broker-duplicate";
-  let sendCount = 0;
-  const sandbox = runBrokerTest(ch, function(sandbox) {
-    sandbox.chrome.runtime.sendMessage = function(message, callback) {
-      sendCount++;
-      callback({ ok: true, response: { data: "test" } });
-    };
-  });
-
-  runBrokerCode(sandbox, ch);
-
-  simulateMessage(
-    sandbox._windowListeners.message,
-    {
-      source: "passless-agent-main",
-      channel: ch,
-      id: "req-1",
-      request: {
-        rp_id: "example.com",
-        challenge_b64u: b64url(makeChallenge(32)),
-        allow_credentials: [],
-        user_verification: false,
-      },
-    },
-    sandbox.window,
-    "https://example.com"
-  );
-
-  assert.strictEqual(sendCount, 1);
-});
-test("broker: rejects message from wrong source", async function() {
-  const ch = "broker-ch2";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      {},
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects message with wrong channel", async function() {
-  const ch = "broker-ch3";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: "wrong-channel",
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects message from wrong origin", async function() {
-  const ch = "broker-ch4";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://evil.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects request with invalid rp_id", async function() {
-  const ch = "broker-ch5";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects request with too many allow_credentials", async function() {
-  const ch = "broker-ch6";
-  const creds = [];
-  for (let i = 0; i < 65; i++) {
-    creds.push("abc");
-  }
-
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: creds,
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects request with invalid user_verification", async function() {
-  const ch = "broker-ch7";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: "mandatory",
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: relays failure response back to main", async function() {
-  const ch = "broker-ch8";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    sandbox._chromeSendResponse = { ok: false };
-
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: b64url(makeChallenge(32)),
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.ok(sandbox._postMessageCalls);
-  const relayed = sandbox._postMessageCalls[0];
-  assert.strictEqual(relayed.data.ok, false);
-  assert.strictEqual(relayed.data.source, "passless-agent-broker");
-  assert.strictEqual(relayed.data.channel, ch);
-  assert.strictEqual(relayed.data.id, "req-1");
-});
-
-test("broker: rejects oversized message JSON", async function() {
-  const ch = "broker-ch9";
-  const bigCreds = [];
-  for (let i = 0; i < 64; i++) {
-    bigCreds.push("x".repeat(512));
-  }
-
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "x".repeat(2048),
-          allow_credentials: bigCreds,
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects message with empty id", async function() {
-  const ch = "broker-ch10";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-test("broker: rejects credential id that is not a string", async function() {
-  const ch = "broker-ch11";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [42],
-          user_verification: false,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-// ======================== WORKER.JS BEHAVIORAL TESTS ========================
-
-test("worker: validates sender.url must be valid URL", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    assert.ok(listener);
-
-    let response = null;
-    const sender = { url: "not-a-url" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.ok(response);
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: validates sender.url must be https:", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    const listener = sandbox._listeners[0];
-
-    let response = null;
-    const sender = { url: "http://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: validates sender.id against chrome.runtime.id", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    const listener = sandbox._listeners[0];
-
-    let response = null;
-    const sender = { url: "https://example.com/page", id: "wrong-extension-id" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: accepts matching sender.id", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    sandbox._nativeMessageResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({ sign_assertion_result: { credential_id_b64u: "abc" } }); },
-    };
-
-    const listener = sandbox._listeners[0];
-    const sender = { url: "https://example.com/page", id: "test-extension-id" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
-});
-
-test("worker: coalesces duplicate request IDs", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken");
-  const listener = sandbox._listeners[0];
-  const sender = { url: "https://example.com/page", id: "test-extension-id" };
-  const message = {
-    source: "passless-agent-broker",
-    request_id: "duplicate-request",
-    request: {
-      rp_id: "example.com",
-      challenge_b64u: "aaa",
-      allow_credentials: [],
-      user_verification: false,
-    },
-  };
-  const responses = [];
-
-  assert.strictEqual(listener(message, sender, function(response) { responses.push(response); }), true);
-  assert.strictEqual(listener(message, sender, function(response) { responses.push(response); }), true);
-  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
-
-  sandbox._nativeMessageCalls[0].callback({
-    body: JSON.stringify({ sign_assertion_result: { credential_id_b64u: "abc" } }),
-  });
-
-  assert.strictEqual(responses.length, 2);
-  assert.deepStrictEqual(responses[0], responses[1]);
-});
-test("worker: derives origin and cross_origin from sender.url", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    sandbox._nativeMessageResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({}); },
-    };
-
-    const listener = sandbox._listeners[0];
-    const sender = {
-      url: "https://sub.example.com/page",
-      tab: { url: "https://sub.example.com/top" },
-      frameId: 0,
-    };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
-  const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
-  assert.strictEqual(body.origin, "https://sub.example.com");
-  assert.strictEqual(body.top_origin, "https://sub.example.com");
-  assert.strictEqual(body.cross_origin, false);
-});
-
-test("worker: computes cross_origin=true for a cross-origin subframe", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    sandbox._nativeMessageResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({}); },
-    };
-
-    const listener = sandbox._listeners[0];
-    const sender = {
-      url: "https://evil.com/page",
-      tab: { url: "https://example.com/top" },
-      frameId: 7,
-    };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
-  assert.strictEqual(body.origin, "https://evil.com");
-  assert.strictEqual(body.top_origin, "https://example.com");
-  assert.strictEqual(body.cross_origin, true);
-});
-
-test("worker: constructs fresh request object (not passthrough)", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    sandbox._nativeMessageResponse = {
-      ok: true,
-      json: function() { return Promise.resolve({}); },
-    };
-
-    const listener = sandbox._listeners[0];
-    const originalRequest = {
-      rp_id: "example.com",
-      challenge_b64u: "aaa",
-      allow_credentials: [],
-      user_verification: false,
-      extra_field: "should_not_appear",
-    };
-    const sender = { url: "https://example.com/page" };
-    listener(
-      { source: "passless-agent-broker",
-        request_id: "request-1", request: originalRequest },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
-  assert.strictEqual(body.extra_field, undefined);
-  assert.ok(body.origin);
-  assert.ok(typeof body.cross_origin === "boolean");
-});
-
-test("worker: sends bearer token in native message", async function() {
-  const bearerToken = "my-secret-bearer-token";
-  const sandbox = runWorkerTest("/tmp/test/sock", bearerToken, function(sandbox) {
-    sandbox._nativeMessageResponse = { body: "{}" };
-
-    const listener = sandbox._listeners[0];
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
-  assert.strictEqual(sandbox._nativeMessageCalls[0].message.bearer, bearerToken);
-});
-
-test("worker: bearer token with special characters is safely injected", async function() {
-  const bearerToken = 'tok"en\\with\nspecial\u00e9';
-  const sandbox = runWorkerTest("/tmp/test/sock", bearerToken, function(sandbox) {
-    sandbox._nativeMessageResponse = { body: "{}" };
-
-    const listener = sandbox._listeners[0];
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
-  assert.strictEqual(sandbox._nativeMessageCalls[0].message.bearer, bearerToken);
-});
-
-test("worker: sends correct socket path in native message", async function() {
-  const sandbox = runWorkerTest("/var/run/passless/sign/sock", "tok", function(sandbox) {
-    sandbox._nativeMessageResponse = { body: "{}" };
-
-    const listener = sandbox._listeners[0];
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() {}
-    );
-  });
-
-  await flushPromises();
-  assert.strictEqual(sandbox._nativeMessageCalls[0].message.socket_path, "/var/run/passless/sign/sock");
-  assert.strictEqual(sandbox._nativeMessageCalls[0].message.path, "/sign");
-});
-
-test("worker: rejects rp_id exceeding MAX_RP_ID_LEN", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "x".repeat(254),
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: rejects challenge_b64u exceeding MAX_CHALLENGE_B64U_LEN", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "x".repeat(2049),
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: rejects allow_credentials exceeding MAX_ALLOW_CREDENTIALS", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const creds = [];
-    for (let i = 0; i < 65; i++) {
-      creds.push("abc");
-    }
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: creds,
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: rejects invalid user_verification", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: "mandatory",
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: accepts all valid user_verification values", async function() {
-  for (const uv of ["required", "preferred", "discouraged"]) {
-    const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-      sandbox._nativeMessageResponse = {
-        ok: true,
-        json: function() { return Promise.resolve({}); },
-      };
-
-      const listener = sandbox._listeners[0];
-      const sender = { url: "https://example.com/page" };
-      listener(
-        {
-          source: "passless-agent-broker",
-        request_id: "request-1",
-          request: {
-            rp_id: "example.com",
-            challenge_b64u: "aaa",
-            allow_credentials: [],
-            user_verification: uv === "required",
-          },
-        },
-        sender,
-        function() {}
-      );
-    });
-
-    await flushPromises();
-    assert.strictEqual(sandbox._nativeMessageCalls.length, 1, "should send native message for uv=" + uv);
-    const body = JSON.parse(sandbox._nativeMessageCalls[0].message.body);
-    assert.strictEqual(body.user_verification, uv === "required");
-  }
-});
-
-test("worker: malformed daemon response results in ok:false", async function() {
-  let asyncResponse = null;
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    sandbox._nativeMessageResponse = {
-      error: "invalid_daemon_response",
-    };
-
-    const listener = sandbox._listeners[0];
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { asyncResponse = r; }
-    );
-  });
-
-  await flushPromises();
-  assert.ok(asyncResponse, "should have sent a response");
-  assert.strictEqual(asyncResponse.ok, false);
-});
-
-test("worker: native messaging error results in ok:false", async function() {
-  let asyncResponse = null;
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    sandbox.chrome.runtime.sendNativeMessage = function(host, message, callback) {
-      sandbox.chrome.runtime.lastError = { message: "host not found" };
-      callback(null);
-      sandbox.chrome.runtime.lastError = null;
-    };
-
-    const listener = sandbox._listeners[0];
-    const sender = { url: "https://example.com/page" };
-    const result = listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { asyncResponse = r; }
-    );
-
-    assert.strictEqual(result, true);
-  });
-
-  await flushPromises();
-  assert.ok(asyncResponse, "should have sent async response");
-  assert.strictEqual(asyncResponse.ok, false);
-});
-
-test("worker: rejects request body exceeding MAX_REQUEST_BYTES", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const bigCreds = [];
-    for (let i = 0; i < 64; i++) {
-      bigCreds.push("x".repeat(512));
-    }
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "x".repeat(2048),
-          allow_credentials: bigCreds,
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: rejects message from wrong source", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let called = false;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "wrong-source",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: false,
-        },
-      },
-      sender,
-      function() { called = true; }
-    );
-
-    assert.strictEqual(called, false);
-  });
-});
-
-test("worker: rejects message without request", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let called = false;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      { source: "passless-agent-broker" },
-      sender,
-      function() { called = true; }
-    );
-
-    assert.strictEqual(called, false);
-  });
-});
-
-test("worker: rejects credential id exceeding MAX_CREDENTIAL_ID_B64U_LEN", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: ["x".repeat(513)],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-test("worker: rejects credential id that is not a string", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "tok", function(sandbox) {
-    const listener = sandbox._listeners[0];
-    let response = null;
-    const sender = { url: "https://example.com/page" };
-    listener(
-      {
-        source: "passless-agent-broker",
-        request_id: "request-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [42],
-          user_verification: false,
-        },
-      },
-      sender,
-      function(r) { response = r; }
-    );
-
-    assert.strictEqual(response.ok, false);
-  });
-});
-
-// ======================== BEARER ESCAPING TESTS ========================
-
-test("bearer: generated worker JS parses with special-character token", async function() {
-  const token = 'tok"with\\special\nchars\u00e9';
-  const rendered = renderWorker("/tmp/test/sock", token);
-  const sandbox = { chrome: { runtime: { id: "x", onMessage: { addListener: function() {} } } } };
-  const ctx = vm.createContext(sandbox);
-  vm.runInContext(rendered, ctx);
-});
-
-test("bearer: token does not appear literally in main.js or broker.js", async function() {
-  const token = "super-secret-bearer-xyz";
-  const mainRendered = renderMain("somechannel");
-  const brokerRendered = renderBroker("somechannel");
-  assert.ok(!mainRendered.includes(token), "main.js should not contain bearer token");
-  assert.ok(!brokerRendered.includes(token), "broker.js should not contain bearer token");
-});
-
-// ======================== USER VERIFICATION BOUNDS ========================
-
-test("uv: main defaults empty string userVerification to preferred", async function() {
-  const ch = "uv-test-1";
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const p = creds.get({
-      publicKey: {
-        challenge: makeChallenge(32),
-        rpId: "example.com",
-        userVerification: "",
-      },
-    });
-    p.catch(function() {});
-  });
-  await flushPromises();
-  assert.strictEqual(sandbox._postMessageCalls.length, 1);
-  assert.strictEqual(sandbox._postMessageCalls[0].data.request.user_verification, false);
-});
-
-test("uv: broker rejects numeric user_verification", async function() {
-  const ch = "uv-test-2";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    const messageHandler = listeners["message"];
-    simulateMessage(
-      messageHandler,
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: {
-          rp_id: "example.com",
-          challenge_b64u: "aaa",
-          allow_credentials: [],
-          user_verification: 42,
-        },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-  assert.strictEqual(sandbox._chromeSendMessage, undefined);
-});
-
-// ---- P2: no native fallback, fail closed (ADR 0014 §7, invariant 25) ----
-
-function publicKeyGetOptions() {
-  return {
-    publicKey: {
-      challenge: makeChallenge(32),
-      rpId: "example.com",
-      userVerification: "preferred",
-    },
-  };
-}
-
-function publicKeyCreateOptions() {
-  return {
-    publicKey: {
-      challenge: makeChallenge(32),
-      rp: { id: "example.com", name: "Example" },
-      user: { id: new Uint8Array([1, 2, 3, 4]), name: "alice", displayName: "Alice" },
-      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-      userVerification: "preferred",
-    },
-  };
-}
-
-const DAEMON_FAILURES = [
-  { ok: false, error: "transport_error" },
-  { ok: false, error: "broker_unavailable" },
-  { ok: false, error: "invalid_daemon_response" },
-  { ok: false, error: "forbidden" },
-  { ok: false, error: "human_interaction_required", fallback: true },
-  { ok: false, response: null, fallback: true },
-];
-
-for (const kind of ["get", "create"]) {
-  DAEMON_FAILURES.forEach(function(failure, index) {
-    test("main: " + kind + " never calls the original after daemon failure #" + index, async function() {
-      const ch = "nofallback-" + kind + "-" + index;
-      let rejectedError = null;
-      let resolved = false;
-
-      const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-        const p = kind === "get" ? creds.get(publicKeyGetOptions()) : creds.create(publicKeyCreateOptions());
-        p.then(function() { resolved = true; }, function(e) { rejectedError = e; });
-
-        simulateMessage(
-          listeners["message"],
-          Object.assign({
-            source: "passless-agent-broker",
-            channel: ch,
-            id: sandbox._postMessageCalls[0].data.id,
-            type: kind,
-          }, failure),
-          sandbox.window,
-          "https://example.com"
-        );
-      });
-
-      await flushPromises();
-      assert.strictEqual(resolved, false);
-      assert.ok(rejectedError, "must reject");
-      assert.strictEqual(rejectedError.name, "NotAllowedError");
-      assert.strictEqual(sandbox._originalCalled, false, "original get must not be called");
-      assert.strictEqual(sandbox._originalCreateCalled, false, "original create must not be called");
-    });
-  });
-
-  test("main: " + kind + " never calls the original after a timeout", async function() {
-    const ch = "nofallback-timeout-" + kind;
-    let rejectedError = null;
-    let timerFn = null;
-    const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-      const p = kind === "get" ? creds.get(publicKeyGetOptions()) : creds.create(publicKeyCreateOptions());
-      p.catch(function(e) { rejectedError = e; });
-      timerFn = sandbox._setTimeoutCalls[0].fn;
-    });
-    timerFn();
-    await flushPromises();
-    assert.ok(rejectedError);
-    assert.strictEqual(rejectedError.name, "NotAllowedError");
-    assert.strictEqual(sandbox._originalCalled, false);
-    assert.strictEqual(sandbox._originalCreateCalled, false);
-  });
-
-  test("main: " + kind + " in a frame without proven delegation is rejected, not native", async function() {
-    const ch = "nofallback-frame-" + kind;
-    let rejectedError = null;
-    const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-      sandbox.window.top = {};
-      sandbox.window.self = sandbox.window;
-      sandbox.document = {};
-      const p = kind === "get" ? creds.get(publicKeyGetOptions()) : creds.create(publicKeyCreateOptions());
-      p.catch(function(e) { rejectedError = e; });
-    });
-    await flushPromises();
-    assert.ok(rejectedError);
-    assert.strictEqual(rejectedError.name, "NotAllowedError");
-    assert.strictEqual(sandbox._originalCalled, false);
-    assert.strictEqual(sandbox._originalCreateCalled, false);
-    assert.strictEqual(sandbox._postMessageCalls.length, 0);
-  });
-}
-
-test("main: conditional mediation is rejected, not native", async function() {
-  const ch = "nofallback-conditional";
-  let rejectedError = null;
-  const sandbox = runMainTest(ch, function(sandbox, listeners, creds) {
-    const options = publicKeyGetOptions();
-    options.mediation = "conditional";
-    creds.get(options).catch(function(e) { rejectedError = e; });
-  });
-  await flushPromises();
-  assert.ok(rejectedError);
-  assert.strictEqual(rejectedError.name, "NotAllowedError");
-  assert.strictEqual(sandbox._originalCalled, false);
-  assert.strictEqual(sandbox._postMessageCalls.length, 0);
-});
-
-test("main: non-WebAuthn create passes through (not an authenticator path)", async function() {
-  const sandbox = runMainTest("passthrough-create", function(sandbox, listeners, creds) {
-    creds.create({ password: { id: "x" } });
-  });
-  assert.strictEqual(sandbox._originalCreateCalled, true);
-});
-
-test("broker: never forwards a fallback flag and forwards ancestor origins", async function() {
-  const ch = "p2-broker-1";
-  const sandbox = runBrokerTest(ch, function(sandbox, listeners) {
-    sandbox.location.ancestorOrigins = ["https://top.example"];
-    sandbox._chromeSendResponse = { ok: false, error: "human_interaction_required", fallback: true };
-    simulateMessage(
-      listeners["message"],
-      {
-        source: "passless-agent-main",
-        channel: ch,
-        id: "req-1",
-        request: { rp_id: "example.com", challenge_b64u: "aaa", allow_credentials: [], user_verification: false },
-      },
-      sandbox.window,
-      "https://example.com"
-    );
-  });
-  assert.deepStrictEqual(Array.from(sandbox._chromeSendMessage.ancestor_origins), ["https://top.example"]);
-  const reply = sandbox._postMessageCalls[0].data;
-  assert.strictEqual(reply.ok, false);
-  assert.ok(!("fallback" in reply), "fallback must not be relayed");
-});
-
-test("worker: daemon human_interaction_required is a plain failure without fallback", async function() {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    sandbox._nativeMessageResponse = { error: "human_interaction_required" };
-  });
-  let response = null;
-  sandbox._listeners[0](
-    {
-      source: "passless-agent-broker",
-      request_id: "p2-fallback-1",
-      request: { rp_id: "example.com", challenge_b64u: "aaa", allow_credentials: [], user_verification: false },
-    },
-    { url: "https://example.com/page", tab: { url: "https://example.com/top" }, frameId: 0 },
-    function(r) { response = r; }
-  );
-  await flushPromises();
-  assert.ok(response);
-  assert.strictEqual(response.ok, false);
-  assert.ok(!("fallback" in response));
-});
-
-function workerCrossOrigin(sender, ancestorOrigins) {
-  const sandbox = runWorkerTest("/tmp/test/sock", "testtoken", function(sandbox) {
-    sandbox._nativeMessageResponse = { body: "{}" };
-  });
-  sandbox._listeners[0](
-    {
-      source: "passless-agent-broker",
-      request_id: "p2-cross-" + Math.random(),
-      ancestor_origins: ancestorOrigins,
-      request: { rp_id: "example.com", challenge_b64u: "aaa", allow_credentials: [], user_verification: false },
-    },
-    sender,
-    function() {}
-  );
-  assert.strictEqual(sandbox._nativeMessageCalls.length, 1);
-  return JSON.parse(sandbox._nativeMessageCalls[0].message.body);
-}
-
-test("worker: same-origin subframe with matching ancestors is not cross-origin", async function() {
-  const body = workerCrossOrigin(
-    { url: "https://example.com/frame", tab: { url: "https://example.com/top" }, frameId: 3 },
-    ["https://example.com"]
-  );
-  assert.strictEqual(body.cross_origin, false);
-});
-
-test("worker: an intermediate cross-origin ancestor makes a same-origin leaf cross-origin", async function() {
-  const body = workerCrossOrigin(
-    { url: "https://example.com/frame", tab: { url: "https://example.com/top" }, frameId: 3 },
-    ["https://other.example", "https://example.com"]
-  );
-  assert.strictEqual(body.cross_origin, true);
-});
-
-test("worker: unknown ancestors or top origin in a subframe fail closed", async function() {
-  assert.strictEqual(
-    workerCrossOrigin({ url: "https://example.com/f", tab: { url: "https://example.com/t" }, frameId: 3 }, null).cross_origin,
-    true
-  );
-  assert.strictEqual(
-    workerCrossOrigin({ url: "https://example.com/f", frameId: 3 }, ["https://example.com"]).cross_origin,
-    true
-  );
-  assert.strictEqual(
-    workerCrossOrigin({ url: "https://example.com/f" }, ["https://example.com"]).cross_origin,
-    true
-  );
-});
-
-test("worker: top-level frame is never cross-origin", async function() {
-  const body = workerCrossOrigin(
-    { url: "https://example.com/page", tab: { url: "https://example.com/page" }, frameId: 0 },
-    []
-  );
-  assert.strictEqual(body.cross_origin, false);
-});
-
-// ---- Interim MAIN-world hardening (H1, H2, L1) ----
-
-test("main: CredentialsContainer.prototype.get/create are overridden too", async function() {
-  let getError = null;
-  let createError = null;
-  const sandbox = runMainTest("proto-1", function(sandbox, listeners, creds) {
-    const proto = sandbox._credentialsProto;
-    proto.get.call(creds, publicKeyGetOptions()).catch(function(e) { getError = e; });
-    proto.create.call(creds, publicKeyCreateOptions()).catch(function(e) { createError = e; });
-  });
-  assert.strictEqual(sandbox._originalCalled, false, "prototype get must not reach native");
-  assert.strictEqual(sandbox._originalCreateCalled, false, "prototype create must not reach native");
-  assert.strictEqual(sandbox._postMessageCalls.length, 2, "both went to the broker");
-});
-
-test("main: overrides cannot be deleted or reassigned", async function() {
-  const sandbox = runMainTest("lock-1", function(sandbox, listeners, creds) {
-    const proto = sandbox._credentialsProto;
-    for (const target of [creds, proto]) {
-      for (const name of ["get", "create"]) {
-        const installed = target[name];
-        assert.strictEqual(Reflect.deleteProperty(target, name), false, "delete " + name);
-        assert.throws(function() { target[name] = function() { return "page"; }; }, TypeError);
-        assert.throws(function() {
-          Object.defineProperty(target, name, { value: function() {} });
-        }, TypeError);
-        assert.strictEqual(target[name], installed);
-      }
-    }
-    // After the failed delete, the call still goes through the override.
-    assert.throws(function() { delete creds.get; }, TypeError); // strict mode
-    creds.get(publicKeyGetOptions()).catch(function() {});
-  });
-  assert.strictEqual(sandbox._originalCalled, false);
-  assert.strictEqual(sandbox._postMessageCalls.length, 1);
-});
-
-test("main: publicKey getter that returns undefined first never reaches native with a publicKey", async function() {
-  let reads = 0;
-  const sandbox = runMainTest("getter-1", function(sandbox, listeners, creds) {
-    const real = publicKeyGetOptions().publicKey;
-    const options = {};
-    Object.defineProperty(options, "publicKey", {
-      enumerable: true,
-      get: function() { reads++; return reads === 1 ? undefined : real; },
-    });
-    creds.get(options).catch(function() {});
-  });
-  assert.strictEqual(reads, 1, "publicKey must be read exactly once");
-  assert.strictEqual(sandbox._originalCalled, true, "the page said there is no publicKey: non-WebAuthn passthrough");
-  assert.ok(!("publicKey" in sandbox._originalOptions), "native must get a copy without publicKey");
-});
-
-test("main: Proxy that hides publicKey from `in` never hands it to native", async function() {
-  const real = publicKeyGetOptions().publicKey;
-  const sandbox = runMainTest("getter-2", function(sandbox, listeners, creds) {
-    const options = new Proxy({ mediation: "optional" }, {
-      has: function(t, k) { return k === "publicKey" ? false : k in t; },
-      get: function(t, k) { return k === "publicKey" ? real : t[k]; },
-    });
-    creds.get(options).catch(function() {});
-  });
-  assert.strictEqual(sandbox._originalCalled, true);
-  assert.ok(!("publicKey" in sandbox._originalOptions));
-  assert.strictEqual(sandbox._originalOptions.mediation, "optional");
-});
-
-test("main: publicKey and signal are read once and the page object never reaches native", async function() {
-  let pkReads = 0;
-  let signalReads = 0;
-  const sandbox = runMainTest("getter-3", function(sandbox, listeners, creds) {
-    const options = {};
-    Object.defineProperty(options, "publicKey", {
-      enumerable: true,
-      get: function() { pkReads++; return publicKeyGetOptions().publicKey; },
-    });
-    Object.defineProperty(options, "signal", {
-      enumerable: true,
-      get: function() { signalReads++; return undefined; },
-    });
-    creds.get(options).catch(function() {});
-  });
-  assert.strictEqual(pkReads, 1);
-  assert.strictEqual(signalReads, 1);
-  assert.strictEqual(sandbox._originalCalled, false);
-  assert.strictEqual(sandbox._postMessageCalls.length, 1);
-});
-
-test("main: publicKey present as null or garbage is refused, never native", async function() {
-  const errors = [];
-  const sandbox = runMainTest("garbage-1", function(sandbox, listeners, creds) {
-    creds.get({ publicKey: null }).catch(function(e) { errors.push(e); });
-    creds.get({ publicKey: 5 }).catch(function(e) { errors.push(e); });
-  });
-  await flushPromises();
-  assert.strictEqual(sandbox._originalCalled, false);
-  assert.strictEqual(errors.length, 2);
-});
-
-test("main: postMessage failure (opaque origin) rejects NotAllowedError and clears the timer", async function() {
-  let rejected = null;
-  const sandbox = runMainTest("opaque-1", function(sandbox, listeners, creds) {
-    sandbox.window.postMessage = function() { throw new Error("SyntaxError: target origin 'null'"); };
-    creds.get(publicKeyGetOptions()).catch(function(e) { rejected = e; });
-  });
-  await flushPromises();
-  assert.ok(rejected, "must reject");
-  assert.strictEqual(rejected.name, "NotAllowedError");
-  assert.strictEqual(sandbox._setTimeoutCalls.length, 1);
-  assert.deepStrictEqual(sandbox._clearTimeoutCalls, [sandbox._setTimeoutCalls[0].id], "timer cleared immediately");
-  assert.strictEqual(sandbox._originalCalled, false);
-});
-
-test("manifest: injects into about:blank, srcdoc, blob and localhost frames", async function() {
-  const manifest = JSON.parse(readTemplate("manifest.json"));
-  assert.ok(parseInt(manifest.minimum_chrome_version, 10) >= 119);
-  for (const entry of manifest.content_scripts) {
-    assert.strictEqual(entry.all_frames, true);
-    assert.strictEqual(entry.match_about_blank, true);
-    assert.strictEqual(entry.match_origin_as_fallback, true);
-    assert.strictEqual(entry.run_at, "document_start");
-    assert.ok(entry.matches.indexOf("https://*/*") !== -1);
-    assert.ok(entry.matches.indexOf("http://localhost/*") !== -1);
-    assert.ok(entry.matches.indexOf("http://127.0.0.1/*") !== -1);
-  }
-  assert.ok(manifest.host_permissions.indexOf("http://localhost/*") !== -1);
-});
-
-// ======================== REPORT ========================
-
-(async function() {
-  await runAllTests();
-  console.log("\n=== Agent Extension Behavioral Tests ===");
-  console.log("Passed: " + passed);
-  console.log("Failed: " + failed);
-  if (failures.length > 0) {
-    console.log("\nFailures:");
-    for (const f of failures) {
-      console.log("  FAIL: " + f.name);
-      console.log("    " + f.error);
-    }
-  }
-  process.exit(failed > 0 ? 1 : 0);
-})();

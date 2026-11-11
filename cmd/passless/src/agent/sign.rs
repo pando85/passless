@@ -1,28 +1,22 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use log::{debug, warn};
+use log::warn;
 use sha2::{Digest, Sha256};
 
-use passless_core::agent::AgentRequestLimits;
 use passless_core::agent::config::{ANY_RP_ID, CredentialSelection, LOCALHOST_RP_ID};
 use passless_core::agent::protocol::{
     ErrorCode, IntentAction, PrincipalResponse, ProtocolError, RecommendedAction,
-    RegisterCredentialRequest, SignAssertionRequest, SignAssertionResponse,
+    SignAssertionRequest, SignAssertionResponse,
 };
 use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
-use super::capacity::{BusyScope, ConnectionSlots, RequestLimiter, decrement, try_increment};
 use super::lock_order::{self, LockLevel, Tracked};
 use super::policy_engine::PolicyRuntime;
 use super::register::{RegisterContext, RegisterHandler};
@@ -253,7 +247,7 @@ fn normalize_rp_id(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max_len = if a.len() > b.len() { a.len() } else { b.len() };
     let mut diff: usize = a.len() ^ b.len();
     for i in 0..max_len {
@@ -311,9 +305,10 @@ pub struct RevokedRegistration {
 
 impl RevokedRegistration {
     /// Audit a refused registration (bounded per bearer, see `MAX_AUDITED_REFUSALS_PER_BEARER`).
-    pub fn refuse(&self, body: &[u8]) {
+    /// `rp_id` is the untrusted RP ID of the refused request, if it named one.
+    pub fn refuse(&self, rp_id: Option<&str>) {
         if self.refusals.fetch_add(1, Ordering::AcqRel) < MAX_AUDITED_REFUSALS_PER_BEARER {
-            self.handler.refuse_revoked_bearer(&self.context, body);
+            self.handler.refuse_revoked_bearer(&self.context, rp_id);
         }
     }
 }
@@ -347,16 +342,38 @@ impl RevokedRegistrations {
 }
 
 /// A bearer looked up for a request: the sign or the registration context behind it.
-enum BearerEntry {
+#[derive(Clone)]
+pub enum BearerEntry {
     Sign(LeaseEntry),
     Register(RegistrationLeaseEntry),
 }
 
 impl BearerEntry {
-    fn session(&self) -> &Arc<AgentSession> {
+    pub fn session(&self) -> &Arc<AgentSession> {
         match self {
             Self::Sign(entry) => &entry.context.session,
             Self::Register(entry) => &entry.context.session,
+        }
+    }
+
+    pub fn profile_id(&self) -> &ProfileId {
+        match self {
+            Self::Sign(entry) => &entry.context.profile_id,
+            Self::Register(entry) => &entry.context.profile_id,
+        }
+    }
+
+    pub fn audit_gate(&self) -> &Arc<AuditGate> {
+        match self {
+            Self::Sign(entry) => &entry.handler.audit_gate,
+            Self::Register(entry) => &entry.handler.audit_gate,
+        }
+    }
+
+    pub fn policy_runtime(&self) -> &Arc<PolicyRuntime> {
+        match self {
+            Self::Sign(entry) => &entry.handler.policy_runtime,
+            Self::Register(entry) => &entry.handler.policy_runtime,
         }
     }
 }
@@ -448,6 +465,34 @@ impl SignContextRegistry {
             }
         }
         found.filter(|entry| entry.lease_id.is_some()).cloned()
+    }
+
+    /// A bearer the transport may accept at `hello` (ADR 0014 section 11, plan D6.1): a sign or a
+    /// registration bearer, bound to its lease or not yet bound (the browser's worker says hello
+    /// while the browser is still launching). Requests still require the binding, and re-validate
+    /// the bearer from scratch ([`Self::lookup_bound`], [`Self::lookup_registration`]).
+    pub fn lookup_for_hello(&self, token: &str) -> Option<BearerEntry> {
+        let sign = {
+            let map = self.lock_entries();
+            let mut found = None;
+            for (k, v) in map.iter() {
+                if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                    found = Some(v.clone());
+                }
+            }
+            found
+        };
+        if let Some(entry) = sign {
+            return Some(BearerEntry::Sign(entry));
+        }
+        let map = self.lock_registration_entries();
+        let mut found = None;
+        for (k, v) in map.iter() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                found = Some(v.clone());
+            }
+        }
+        found.map(BearerEntry::Register)
     }
 
     /// A registration bearer that was revoked; used only to refuse and audit a late registration.
@@ -633,131 +678,6 @@ impl Default for SignContextRegistry {
     }
 }
 
-pub struct SignHttpServer {
-    listener: Option<UnixListener>,
-    socket_path: PathBuf,
-    shutdown: Arc<AtomicBool>,
-}
-
-const MAX_HTTP_BODY_SIZE: usize = 16_384;
-const MAX_HTTP_HEADER_SIZE: usize = 8192;
-/// How long the accept loop waits for the request of a connection it answers `busy` inline.
-const INLINE_BUSY_READ_TIMEOUT: Duration = Duration::from_millis(50);
-
-impl SignHttpServer {
-    pub fn bind(socket_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self, String> {
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create socket directory: {}", e))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("set socket dir permissions: {}", e))?;
-        }
-        let _ = std::fs::remove_file(&socket_path);
-        let listener =
-            UnixListener::bind(&socket_path).map_err(|e| format!("bind failed: {}", e))?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set socket permissions: {}", e))?;
-        Ok(Self {
-            listener: Some(listener),
-            socket_path,
-            shutdown,
-        })
-    }
-
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-    }
-
-    /// Serve with the default request caps.
-    pub fn serve(self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
-        self.serve_with_limiter(registry, RequestLimiter::new(AgentRequestLimits::default()))
-    }
-
-    /// Serve until shutdown. Every connection gets an answer (plan R11): within
-    /// [`RequestLimiter::max_connections`] a handler thread reads the request and either serves it
-    /// or answers `busy` when a request cap is reached; beyond that the accept loop answers `busy`
-    /// itself.
-    pub fn serve_with_limiter(
-        mut self,
-        registry: Arc<SignContextRegistry>,
-        limiter: Arc<RequestLimiter>,
-    ) -> thread::JoinHandle<()> {
-        let shutdown = self.shutdown.clone();
-        let listener = self.listener.take().expect("listener already taken");
-        let socket_path = self.socket_path.clone();
-        thread::spawn(move || {
-            listener.set_nonblocking(true).expect("set_nonblocking");
-            let open_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let admitted = try_increment(&open_connections, limiter.max_connections());
-                        if !admitted {
-                            limiter.note_overflow(BusyScope::Connections);
-                            answer_busy_inline(stream);
-                            continue;
-                        }
-                        let registry = registry.clone();
-                        let limiter = limiter.clone();
-                        let count = open_connections.clone();
-                        // One set of connection slots per accepted connection (TODO(P6): one
-                        // connection carries one request until the multiplexed transport).
-                        let connection = ConnectionSlots::new();
-                        let spawned = thread::Builder::new()
-                            .name("agent-sign-conn".to_string())
-                            .spawn(move || {
-                                if let Err(e) =
-                                    handle_http_connection(stream, &registry, &limiter, &connection)
-                                {
-                                    debug!("sign http connection error: {}", e);
-                                }
-                                decrement(&count);
-                            });
-                        if let Err(e) = spawned {
-                            decrement(&open_connections);
-                            warn!("sign http: failed to spawn a connection thread: {}", e);
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        warn!("sign http accept error: {}", e);
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            }
-            let _ = std::fs::remove_file(&socket_path);
-        })
-    }
-}
-
-impl Drop for SignHttpServer {
-    fn drop(&mut self) {
-        if self.listener.is_some() {
-            let _ = std::fs::remove_file(&self.socket_path);
-        }
-    }
-}
-
-/// Answer a connection over the connection cap without a handler thread: read what the client
-/// already sent (briefly), then reply `busy` and close. Never a silent drop (plan R11).
-fn answer_busy_inline(mut stream: UnixStream) {
-    let _ = stream.set_read_timeout(Some(INLINE_BUSY_READ_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(INLINE_BUSY_READ_TIMEOUT));
-    let mut buf = [0u8; MAX_HTTP_HEADER_SIZE + MAX_HTTP_BODY_SIZE];
-    let _ = stream.read(&mut buf);
-    send_ceremony_error(&mut stream, ErrorCode::Busy);
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-}
-
 /// The WebAuthn DOMException name the page receives for a daemon error (ADR 0014 sections
 /// 10.2-10.3 and 11). The extension passes it to `complete*Request` and never invents one.
 pub fn dom_exception_name(code: ErrorCode) -> &'static str {
@@ -765,310 +685,11 @@ pub fn dom_exception_name(code: ErrorCode) -> &'static str {
         ErrorCode::NotSupported => "NotSupportedError",
         ErrorCode::InvalidState => "InvalidStateError",
         ErrorCode::OriginInvalid => "SecurityError",
+        ErrorCode::Aborted => "AbortError",
         // Policy denials, revocation, replay, budget, `busy`, timeouts and internal failures all
         // look the same to the page (ADR 0014 section 7).
         _ => "NotAllowedError",
     }
-}
-
-/// HTTP status and wire error code of a ceremony error.
-fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
-    match code {
-        ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-        ErrorCode::MalformedMessage => ("400 Bad Request", "invalid_json"),
-        ErrorCode::NotSupported => ("400 Bad Request", "not_supported"),
-        ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-        ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-        ErrorCode::OriginInvalid => ("403 Forbidden", "origin_invalid"),
-        ErrorCode::NotFound => ("404 Not Found", "not_found"),
-        ErrorCode::Conflict => ("409 Conflict", "conflict"),
-        ErrorCode::InvalidState => ("409 Conflict", "invalid_state"),
-        ErrorCode::Replayed => ("409 Conflict", "replayed_operation"),
-        ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
-        ErrorCode::BudgetExhausted => ("429 Too Many Requests", "operation_budget_exhausted"),
-        ErrorCode::Busy => ("503 Service Unavailable", "busy"),
-        ErrorCode::Timeout => ("504 Gateway Timeout", "operation_timeout"),
-        _ => ("500 Internal Server Error", "internal_error"),
-    }
-}
-
-fn error_body(code: ErrorCode) -> (&'static str, Vec<u8>) {
-    let (status, wire) = error_status_code(code);
-    let body = format!(
-        "{{\"error\":\"{}\",\"dom\":\"{}\"}}",
-        wire,
-        dom_exception_name(code)
-    );
-    (status, body.into_bytes())
-}
-
-fn send_http_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
-    let content_length = body.map(|b| b.len()).unwrap_or(0);
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        status, content_length
-    );
-    let _ = stream.write_all(header.as_bytes());
-    if let Some(body) = body {
-        let _ = stream.write_all(body);
-    }
-}
-
-/// A transport-level error that is not a ceremony outcome (routing, authentication, framing).
-fn send_http_error(stream: &mut UnixStream, status: &str, code: &str) {
-    let body = format!("{{\"error\":\"{}\",\"dom\":\"NotAllowedError\"}}", code);
-    send_http_response(stream, status, Some(body.as_bytes()));
-}
-
-fn send_ceremony_error(stream: &mut UnixStream, code: ErrorCode) {
-    let (status, body) = error_body(code);
-    send_http_response(stream, status, Some(&body));
-}
-
-/// Whether the client of `stream` has gone away (EOF or error), without blocking or consuming data.
-/// A joined duplicate whose client left detaches (V-L1).
-fn peer_hung_up(stream: &UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut byte = [0u8; 1];
-    // SAFETY: `recv` reads at most one byte into a valid local buffer from a socket this thread
-    // owns; MSG_PEEK leaves it queued and MSG_DONTWAIT never blocks.
-    let n = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            byte.as_mut_ptr().cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if n == 0 {
-        return true;
-    }
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        return !matches!(
-            err.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        );
-    }
-    false
-}
-
-fn handle_http_connection(
-    mut stream: UnixStream,
-    registry: &SignContextRegistry,
-    limiter: &Arc<RequestLimiter>,
-    connection: &Arc<ConnectionSlots>,
-) -> Result<(), String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let mut buf = [0u8; MAX_HTTP_HEADER_SIZE + MAX_HTTP_BODY_SIZE];
-    let mut total = 0;
-    loop {
-        let n = stream
-            .read(&mut buf[total..])
-            .map_err(|e| format!("read: {}", e))?;
-        if n == 0 {
-            return Err("connection closed before headers complete".into());
-        }
-        total += n;
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if total >= MAX_HTTP_HEADER_SIZE {
-            send_http_error(&mut stream, "413 Payload Too Large", "request_too_large");
-            return Ok(());
-        }
-    }
-    let header_end = buf[..total]
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("no header terminator")?;
-    let header_str = std::str::from_utf8(&buf[..header_end]).map_err(|_| "invalid utf-8")?;
-    let mut lines = header_str.split("\r\n");
-    let request_line = lines.next().ok_or("no request line")?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or("no method")?;
-    let path = parts.next().ok_or("no path")?;
-    if method != "POST" || (path != "/sign" && path != "/register") {
-        send_http_error(&mut stream, "404 Not Found", "not_found");
-        return Ok(());
-    }
-    let mut auth_header = None;
-    let mut content_type_header = None;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("authorization:") {
-            auth_header = Some(
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
-        } else if lower.starts_with("content-type:") {
-            content_type_header = Some(
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
-    let Some(auth) = auth_header else {
-        send_http_error(&mut stream, "401 Unauthorized", "missing_authorization");
-        return Ok(());
-    };
-    let Some(token) = auth.strip_prefix("Bearer ") else {
-        send_http_error(
-            &mut stream,
-            "401 Unauthorized",
-            "invalid_authorization_scheme",
-        );
-        return Ok(());
-    };
-
-    // Authenticate the bearer (ADR 0014 section 9, step 1). Session validity (revocation epoch,
-    // TTL) is checked by the handler, which audits it.
-    let is_register = path == "/register";
-    let entry = if is_register {
-        match registry.lookup_registration(token) {
-            Some(entry) => BearerEntry::Register(entry),
-            None => {
-                // A bearer revoked with its browser lease is refused exactly like an unknown one,
-                // but the attempt is audited.
-                if let Some(revoked) = registry.lookup_revoked_registration(token)
-                    && let Some(body) =
-                        read_request_body(&mut stream, header_str, &buf, header_end, total)?
-                {
-                    revoked.refuse(&body);
-                }
-                send_http_error(&mut stream, "401 Unauthorized", "invalid_bearer");
-                return Ok(());
-            }
-        }
-    } else {
-        match registry.lookup_bound(token) {
-            Some(entry) => BearerEntry::Sign(entry),
-            None => {
-                send_http_error(&mut stream, "401 Unauthorized", "invalid_bearer");
-                return Ok(());
-            }
-        }
-    };
-    if let Some(ct) = content_type_header
-        && !ct.to_ascii_lowercase().starts_with("application/json")
-    {
-        send_http_error(
-            &mut stream,
-            "415 Unsupported Media Type",
-            "unsupported_content_type",
-        );
-        return Ok(());
-    }
-    let Some(body) = read_request_body(&mut stream, header_str, &buf, header_end, total)? else {
-        return Ok(());
-    };
-
-    // Capacity (plan R11): over any cap the request is answered `busy`, never dropped.
-    let _permit = match limiter.try_acquire(connection, entry.session()) {
-        Ok(permit) => permit,
-        Err(scope) => {
-            limiter.note_overflow(scope);
-            send_ceremony_error(&mut stream, ErrorCode::Busy);
-            return Ok(());
-        }
-    };
-
-    let probe = stream.try_clone().map_err(|e| format!("clone: {}", e))?;
-    let cancelled = move || peer_hung_up(&probe);
-    let now = Instant::now();
-    let (status, response) = match entry {
-        BearerEntry::Sign(entry) => match serde_json::from_slice::<SignAssertionRequest>(&body) {
-            Err(_) => error_body(ErrorCode::MalformedMessage),
-            Ok(req) => {
-                let deadline = ceremony_deadline(req.timeout_ms, now);
-                match entry
-                    .handler
-                    .sign_with(&entry.context, &req, deadline, &cancelled)
-                {
-                    Ok(resp) => (
-                        "200 OK",
-                        serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?,
-                    ),
-                    Err(e) => error_body(e.code),
-                }
-            }
-        },
-        BearerEntry::Register(entry) => {
-            match serde_json::from_slice::<RegisterCredentialRequest>(&body) {
-                Err(_) => error_body(ErrorCode::MalformedMessage),
-                Ok(req) => {
-                    let deadline = ceremony_deadline(req.timeout_ms, now);
-                    match entry
-                        .handler
-                        .register_with(&entry.context, &req, deadline, &cancelled)
-                    {
-                        Ok(resp) => (
-                            "200 OK",
-                            serde_json::to_vec(&resp)
-                                .map_err(|e| format!("json serialize: {}", e))?,
-                        ),
-                        Err(e) => error_body(e.code),
-                    }
-                }
-            }
-        }
-    };
-    send_http_response(&mut stream, status, Some(&response));
-    Ok(())
-}
-
-/// Read the request body that follows the headers. Replies 413 and returns `None` when it is too
-/// large.
-fn read_request_body(
-    stream: &mut UnixStream,
-    header_str: &str,
-    buf: &[u8],
-    header_end: usize,
-    total: usize,
-) -> Result<Option<Vec<u8>>, String> {
-    let body_start = header_end + 4;
-    let content_length: usize = header_str
-        .lines()
-        .find_map(|l| {
-            let lower = l.to_ascii_lowercase();
-            lower
-                .strip_prefix("content-length:")
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0);
-    if content_length > MAX_HTTP_BODY_SIZE {
-        send_http_error(stream, "413 Payload Too Large", "body_too_large");
-        return Ok(None);
-    }
-    let mut body = Vec::new();
-    body.extend_from_slice(&buf[body_start..total]);
-    let remaining = content_length.saturating_sub(total - body_start);
-    if remaining > 0 {
-        if remaining > MAX_HTTP_BODY_SIZE {
-            send_http_error(stream, "413 Payload Too Large", "body_too_large");
-            return Ok(None);
-        }
-        let mut extra = vec![0u8; remaining];
-        stream
-            .read_exact(&mut extra)
-            .map_err(|e| format!("read body: {}", e))?;
-        body.extend_from_slice(&extra);
-    }
-    if body.len() > MAX_HTTP_BODY_SIZE {
-        send_http_error(stream, "413 Payload Too Large", "body_too_large");
-        return Ok(None);
-    }
-    Ok(Some(body))
 }
 
 /// The assertion inside a replayed or joined outcome. The replay key includes the action, so an
@@ -1172,9 +793,10 @@ pub struct SignHandler {
 }
 
 /// Client extensions an authentication request may name. `appid` is honored by never matching a
-/// U2F AppID credential (its output is `false`); `remoteDesktopClientOverride` is browser metadata,
-/// not an RP extension (ADR 0014 section 10.2).
-const SUPPORTED_GET_EXTENSIONS: &[&str] = &["appid", "remoteDesktopClientOverride"];
+/// U2F AppID credential (its output is `false`). `remoteDesktopClientOverride` is browser metadata,
+/// not an RP extension (ADR 0014 section 10.2): the transport strips it while it parses the
+/// request, so it never reaches this list.
+const SUPPORTED_GET_EXTENSIONS: &[&str] = &["appid"];
 /// Most extension identifiers a request may name, and their longest accepted length.
 pub(crate) const MAX_EXTENSIONS: usize = 32;
 pub(crate) const MAX_EXTENSION_ID_LEN: usize = 64;
@@ -1265,7 +887,7 @@ pub(crate) fn claim_rejection_error(
 pub(crate) fn join_failure(result: JoinResult) -> ProtocolError {
     match result {
         JoinResult::Detached => ProtocolError::new(
-            ErrorCode::Timeout,
+            ErrorCode::Aborted,
             "request aborted while waiting for an identical request",
             RecommendedAction::Abort,
         ),
@@ -1274,6 +896,55 @@ pub(crate) fn join_failure(result: JoinResult) -> ProtocolError {
             "ceremony deadline passed while waiting for an identical request",
             RecommendedAction::Abort,
         ),
+    }
+}
+
+/// The browser cancelled the request before key use (ADR 0014 section 11: `onRequestCanceled`).
+pub(crate) fn aborted_error() -> (PolicyDenyReason, ProtocolError) {
+    (
+        PolicyDenyReason::Aborted,
+        ProtocolError::new(
+            ErrorCode::Aborted,
+            "the request was cancelled before key use",
+            RecommendedAction::Abort,
+        ),
+    )
+}
+
+/// What a ceremony's audit records carry about its request (ADR 0014 section 12): the RP ID and
+/// the origin context. On the proxy path the browser never supplies a top origin, so it is
+/// recorded as null.
+#[derive(Clone, Copy)]
+pub(crate) struct AuditTarget<'a> {
+    pub rp_id: &'a str,
+    pub origin: Option<&'a str>,
+    pub top_origin: Option<&'a str>,
+    pub cross_origin: Option<bool>,
+}
+
+impl<'a> AuditTarget<'a> {
+    pub fn of_request(
+        rp_id: &'a str,
+        origin: &'a str,
+        top_origin: Option<&'a str>,
+        cross_origin: bool,
+    ) -> Self {
+        Self {
+            rp_id,
+            origin: Some(origin),
+            top_origin,
+            cross_origin: Some(cross_origin),
+        }
+    }
+
+    /// A record about an RP only (a refused request whose origin is not known).
+    pub fn rp_only(rp_id: &'a str) -> Self {
+        Self {
+            rp_id,
+            origin: None,
+            top_origin: None,
+            cross_origin: None,
+        }
     }
 }
 
@@ -1290,13 +961,19 @@ pub(crate) fn decode_challenge(challenge_b64u: &str) -> Result<Vec<u8>, Protocol
 }
 
 impl SignHandler {
-    fn record_policy_deny(&self, ctx: &SignContext, rp_id: &str, reason: PolicyDenyReason) {
+    fn record_policy_deny(
+        &self,
+        ctx: &SignContext,
+        target: &AuditTarget,
+        reason: PolicyDenyReason,
+    ) {
         let deny_event = PolicyDenyBuilder::new(
             ctx.profile_id.clone(),
             AuditAction::Authenticate,
-            rp_id,
+            target.rp_id,
             reason,
         )
+        .origin_context(target.origin, target.top_origin, target.cross_origin)
         .build();
         let _ = self.audit_gate.record(deny_event);
     }
@@ -1304,10 +981,10 @@ impl SignHandler {
     fn deny(
         &self,
         ctx: &SignContext,
-        rp_id: &str,
+        target: &AuditTarget,
         (reason, error): (PolicyDenyReason, ProtocolError),
     ) -> ProtocolError {
-        self.record_policy_deny(ctx, rp_id, reason);
+        self.record_policy_deny(ctx, target, reason);
         error
     }
 
@@ -1322,11 +999,11 @@ impl SignHandler {
     }
 
     /// The bearer session is usable and bound to this context's profile.
-    fn check_session(&self, ctx: &SignContext, rp_id: &str) -> Result<(), ProtocolError> {
+    fn check_session(&self, ctx: &SignContext, target: &AuditTarget) -> Result<(), ProtocolError> {
         if ctx.session.profile_id() != &ctx.profile_id {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::SessionMismatch,
                     ProtocolError::new(
@@ -1339,22 +1016,23 @@ impl SignHandler {
         }
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, rp_id, session_invalid_error(invalid)))
+            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))
     }
 
     /// The session grant is active, was issued to this session's principal, and covers `rp_id`.
     fn check_grant(
         &self,
         ctx: &SignContext,
-        rp_id: &str,
+        target: &AuditTarget,
     ) -> Result<super::policy_engine::GrantSignSnapshot, ProtocolError> {
+        let rp_id = target.rp_id;
         let grant = self
             .policy_runtime
             .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
             .ok_or_else(|| {
                 self.deny(
                     ctx,
-                    rp_id,
+                    target,
                     (
                         PolicyDenyReason::GrantNotFound,
                         ProtocolError::new(
@@ -1368,7 +1046,7 @@ impl SignHandler {
         if grant.is_revoked {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::GrantRevoked,
                     ProtocolError::new(
@@ -1382,7 +1060,7 @@ impl SignHandler {
         if grant.state != super::grant::GrantState::Active {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::GrantExpired,
                     ProtocolError::new(
@@ -1399,7 +1077,7 @@ impl SignHandler {
         {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::PrincipalMismatch,
                     ProtocolError::new(
@@ -1416,7 +1094,7 @@ impl SignHandler {
         }) {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::RpIdNotMatch,
                     ProtocolError::new(
@@ -1452,9 +1130,16 @@ impl SignHandler {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<PrincipalResponse, ProtocolError> {
         let normalized_rp = normalize_rp_id(&req.rp_id);
+        let target = AuditTarget::of_request(
+            &normalized_rp,
+            &req.origin,
+            req.top_origin.as_deref(),
+            req.cross_origin,
+        );
+        let target = &target;
 
         // 1. Bearer session.
-        self.check_session(ctx, &normalized_rp)?;
+        self.check_session(ctx, target)?;
 
         // 2. Origin and RP validation.
         if !verify_origin_context(
@@ -1478,7 +1163,7 @@ impl SignHandler {
             };
             return Err(self.deny(
                 ctx,
-                &normalized_rp,
+                target,
                 (
                     reason,
                     ProtocolError::new(code, message, RecommendedAction::FixRequest),
@@ -1487,7 +1172,7 @@ impl SignHandler {
         }
 
         // 3. Session grant and principal binding.
-        let grant = self.check_grant(ctx, &normalized_rp)?;
+        let grant = self.check_grant(ctx, target)?;
 
         // 4. Resolve against the live policy and granted rules on every request, never against a
         //    copy of the profile configuration frozen into the session (plan R16).
@@ -1500,7 +1185,7 @@ impl SignHandler {
             RuleAction::Deny => {
                 return Err(self.deny(
                     ctx,
-                    &normalized_rp,
+                    target,
                     (
                         PolicyDenyReason::ActionNotAllowed,
                         ProtocolError::new(
@@ -1525,7 +1210,7 @@ impl SignHandler {
             RuleAction::Request => {
                 return Err(self.deny(
                     ctx,
-                    &normalized_rp,
+                    target,
                     (
                         PolicyDenyReason::EscalationUnavailable,
                         ProtocolError::new(
@@ -1543,7 +1228,7 @@ impl SignHandler {
         if !extensions_supported(&req.extensions, SUPPORTED_GET_EXTENSIONS)? {
             return Err(self.deny(
                 ctx,
-                &normalized_rp,
+                target,
                 (
                     PolicyDenyReason::UnsupportedOption,
                     ProtocolError::new(
@@ -1555,6 +1240,11 @@ impl SignHandler {
             ));
         }
         let challenge = decode_challenge(&req.challenge_b64u)?;
+
+        // The browser already cancelled the request: stop before the replay key is consumed.
+        if cancelled() {
+            return Err(self.deny(ctx, target, aborted_error()));
+        }
 
         // 6. Replay key, then budget (R1, R4). The budget limit is the live `max_operations`.
         let key = ReplayKey::derive(
@@ -1577,12 +1267,11 @@ impl SignHandler {
             Claim::Fresh(guard) => {
                 let mut key_used = false;
                 let outcome =
-                    self.sign_fresh(ctx, req, &normalized_rp, &grant, &matched, &mut key_used);
+                    self.sign_fresh(ctx, req, target, &grant, &matched, cancelled, &mut key_used);
                 // The operation lock is released: activate the browser lease now (review H1).
                 // The assertion is released only if activation succeeds.
-                let outcome = outcome.and_then(|response| {
-                    self.activate_lease(ctx, &normalized_rp).map(|()| response)
-                });
+                let outcome = outcome
+                    .and_then(|response| self.activate_lease(ctx, target).map(|()| response));
                 let ceremony = outcome
                     .clone()
                     .map(|response| CeremonyResult::Assertion(Box::new(response)));
@@ -1596,17 +1285,19 @@ impl SignHandler {
             }
             Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled) {
                 JoinResult::Completed(outcome) => {
-                    self.serve_duplicate(ctx, &normalized_rp, audit)?;
+                    self.serve_duplicate(ctx, target, audit)?;
                     assertion_outcome(outcome)
                 }
+                // The browser cancelled the duplicate while it waited: audited like any abort.
+                JoinResult::Detached => Err(self.deny(ctx, target, aborted_error())),
                 other => Err(join_failure(other)),
             },
             Claim::Completed(outcome, audit) => {
-                self.serve_duplicate(ctx, &normalized_rp, audit)?;
+                self.serve_duplicate(ctx, target, audit)?;
                 assertion_outcome(outcome)
             }
             Claim::Rejected(rejection) => {
-                Err(self.deny(ctx, &normalized_rp, claim_rejection_error(rejection)))
+                Err(self.deny(ctx, target, claim_rejection_error(rejection)))
             }
         }
     }
@@ -1617,20 +1308,20 @@ impl SignHandler {
     fn serve_duplicate(
         &self,
         ctx: &SignContext,
-        rp_id: &str,
+        target: &AuditTarget,
         audit: bool,
     ) -> Result<(), ProtocolError> {
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, rp_id, session_invalid_error(invalid)))?;
+            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
         if audit {
-            self.record_policy_deny(ctx, rp_id, PolicyDenyReason::ReplayServed);
+            self.record_policy_deny(ctx, target, PolicyDenyReason::ReplayServed);
         }
         Ok(())
     }
 
     /// Activate the browser lease after key use, with no backend lock held (review H1).
-    fn activate_lease(&self, ctx: &SignContext, rp_id: &str) -> Result<(), ProtocolError> {
+    fn activate_lease(&self, ctx: &SignContext, target: &AuditTarget) -> Result<(), ProtocolError> {
         let Some(activation) = &ctx.lease_activation else {
             return Ok(());
         };
@@ -1638,7 +1329,7 @@ impl SignHandler {
             warn!("agent sign: {}", e);
             self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::LeaseActivationFailed,
                     ProtocolError::new(
@@ -1654,15 +1345,18 @@ impl SignHandler {
     /// Steps 7-10 for a fresh replay key. The backend operation lock is held only here: never
     /// across a join, an escalation wait, the browser manager or a policy guard (LOCKING.md).
     /// `key_used` is set right before the key provider signs.
+    #[allow(clippy::too_many_arguments)]
     fn sign_fresh(
         &self,
         ctx: &SignContext,
         req: &SignAssertionRequest,
-        normalized_rp: &str,
+        target: &AuditTarget,
         grant: &super::policy_engine::GrantSignSnapshot,
         matched: &passless_core::agent::MatchedRule,
+        cancelled: &dyn Fn() -> bool,
         key_used: &mut bool,
     ) -> Result<PrincipalResponse, ProtocolError> {
+        let normalized_rp = target.rp_id;
         // `allow` is the only agent evidence: UP and UV come from the validated agent session,
         // never from a rule field or the RP's `userVerification` request (ADR 0014 section 7).
         let up = true;
@@ -1705,11 +1399,7 @@ impl SignHandler {
         let candidates =
             Self::narrow_candidates(candidates, &req.allow_credentials, &matched.selection);
         if candidates.is_empty() && !req.allow_credentials.is_empty() {
-            self.record_policy_deny(
-                ctx,
-                normalized_rp,
-                PolicyDenyReason::AllowCredentialsMismatch,
-            );
+            self.record_policy_deny(ctx, target, PolicyDenyReason::AllowCredentialsMismatch);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "allowCredentials does not contain a permitted credential",
@@ -1719,7 +1409,7 @@ impl SignHandler {
 
         let cred_id =
             Self::select_credential(candidates, &matched.selection).inspect_err(|_| {
-                self.record_policy_deny(ctx, normalized_rp, PolicyDenyReason::CredentialNotMatch);
+                self.record_policy_deny(ctx, target, PolicyDenyReason::CredentialNotMatch);
             })?;
 
         // 8. Durable audit reservation before key use (invariant 16).
@@ -1729,6 +1419,7 @@ impl SignHandler {
             normalized_rp,
         )
         .evidence_sources("allow", "agent", "agent")
+        .origin_context(target.origin, target.top_origin, target.cross_origin)
         .build();
         self.audit_gate.record(allow_event).map_err(|_| {
             ProtocolError::new(
@@ -1746,7 +1437,7 @@ impl SignHandler {
             )
         })?;
         if cred.extensions.cred_protect == Some(3) && !uv {
-            self.record_policy_deny(ctx, normalized_rp, PolicyDenyReason::UvRequired);
+            self.record_policy_deny(ctx, target, PolicyDenyReason::UvRequired);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "credential protection policy requires user verification",
@@ -1763,7 +1454,7 @@ impl SignHandler {
         super::session::test_hooks::before_key_use();
         let _session_gate = ctx.session.key_use_guard();
         let _epoch_gate = self.policy_runtime.key_use_guard();
-        self.recheck_before_key_use(ctx, normalized_rp)?;
+        self.recheck_before_key_use(ctx, target, cancelled)?;
 
         // 10. Key use: persist the counter, release storage, then sign. The browser lease is
         //     activated by the caller after the operation lock is released (review H1).
@@ -1795,11 +1486,7 @@ impl SignHandler {
                 cred_random: updated_cred.extensions.cred_random.as_ref(),
             };
             storage.write(cred_ref).map_err(|_| {
-                self.record_policy_deny(
-                    ctx,
-                    normalized_rp,
-                    PolicyDenyReason::CounterPersistenceFailure,
-                );
+                self.record_policy_deny(ctx, target, PolicyDenyReason::CounterPersistenceFailure);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "failed to write updated credential",
@@ -1847,18 +1534,29 @@ impl SignHandler {
     }
 
     /// Invariant 13: re-check the revocation epoch and the session, re-resolve the rule against
-    /// the live policy and grants, and re-check the grant, immediately before key use.
-    fn recheck_before_key_use(&self, ctx: &SignContext, rp_id: &str) -> Result<(), ProtocolError> {
+    /// the live policy and grants, and re-check the grant, immediately before key use. A request
+    /// the browser cancelled meanwhile stops here too; this is the terminal record of its
+    /// reservation.
+    fn recheck_before_key_use(
+        &self,
+        ctx: &SignContext,
+        target: &AuditTarget,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ProtocolError> {
+        let rp_id = target.rp_id;
+        if cancelled() {
+            return Err(self.deny(ctx, target, aborted_error()));
+        }
         ctx.session
             .validity(self.policy_runtime.revocation_epoch(), Instant::now())
-            .map_err(|invalid| self.deny(ctx, rp_id, session_invalid_error(invalid)))?;
+            .map_err(|invalid| self.deny(ctx, target, session_invalid_error(invalid)))?;
         let matched =
             self.policy_runtime
                 .resolve(&ctx.profile_id, &IntentAction::Authenticate, rp_id);
         if matched.action != RuleAction::Allow {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::PolicyRevoked,
                     ProtocolError::new(
@@ -1876,7 +1574,7 @@ impl SignHandler {
         if !grant_active {
             return Err(self.deny(
                 ctx,
-                rp_id,
+                target,
                 (
                     PolicyDenyReason::GrantRevoked,
                     ProtocolError::new(
@@ -1976,8 +1674,14 @@ impl SignHandler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::thread;
+
+    use passless_core::agent::protocol::RegisterCredentialRequest;
 
     /// A bearer session for `profile_id`, bound like a session issued with an all-zero principal
     /// digest at revocation epoch 1 (a fresh `PolicyRuntime`).
@@ -2370,20 +2074,6 @@ mod tests {
     }
 
     #[test]
-    fn test_http_server_binds_unix_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        assert!(server.socket_path().exists());
-        let meta = std::fs::metadata(server.socket_path()).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        drop(server);
-        shutdown.store(true, Ordering::Release);
-    }
-
-    #[test]
     fn test_generate_bearer_token_entropy() {
         let token = generate_bearer_token().unwrap();
         let decoded = b64u_decode(&token).unwrap();
@@ -2655,269 +2345,6 @@ mod tests {
     }
 
     #[test]
-    fn test_http_valid_bound_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry.bind_lease(&token, "lease-rt".to_string()).unwrap();
-        let handle = server.serve(registry);
-        let body = serde_json::to_vec(&SignAssertionRequest {
-            extensions: Vec::new(),
-            timeout_ms: None,
-            origin: "https://example.com".to_string(),
-            top_origin: None,
-            rp_id: "example.com".to_string(),
-            challenge_b64u: "dGVzdA".to_string(),
-            allow_credentials: vec![],
-            user_verification: false,
-            cross_origin: false,
-        })
-        .unwrap();
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(&body).unwrap();
-        let mut resp_buf = vec![0u8; 8192];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("200 OK"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_unknown_bearer_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer unknown_token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_unbound_bearer_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_revoked_bearer_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry
-            .bind_lease(&token, "lease-rev".to_string())
-            .unwrap();
-        registry.revoke(&token);
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_missing_bearer() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_wrong_method() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry.bind_lease(&token, "lease-m".to_string()).unwrap();
-        let handle = server.serve(registry);
-        let request = format!(
-            "GET /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
-            token
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("404"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_wrong_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry.bind_lease(&token, "lease-p".to_string()).unwrap();
-        let handle = server.serve(registry);
-        let request = format!(
-            "POST /other HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
-            token
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("404"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_listener_loopback_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        assert!(server.socket_path().starts_with(dir.path()));
-        shutdown.store(true, Ordering::Release);
-    }
-
-    #[test]
-    fn test_shutdown_join() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path, shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
     fn test_p256_sign_verify_through_provider() {
         let provider = soft_fido2::SoftwareCredentialKeyProvider;
         let generated = provider.generate(-7).unwrap();
@@ -2926,171 +2353,7 @@ mod tests {
         assert!(!signature.is_empty());
     }
 
-    #[test]
-    fn test_http_options_returns_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let request = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("404"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_post_error_no_cors_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        assert!(!resp_str.contains("Access-Control"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_success_no_cors_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry
-            .bind_lease(&token, "lease-cors".to_string())
-            .unwrap();
-        let handle = server.serve(registry);
-        let body = serde_json::to_vec(&SignAssertionRequest {
-            extensions: Vec::new(),
-            timeout_ms: None,
-            origin: "https://example.com".to_string(),
-            top_origin: None,
-            rp_id: "example.com".to_string(),
-            challenge_b64u: "dGVzdA".to_string(),
-            allow_credentials: vec![],
-            user_verification: false,
-            cross_origin: false,
-        })
-        .unwrap();
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(&body).unwrap();
-        let mut resp_buf = vec![0u8; 8192];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("200 OK"));
-        assert!(!resp_str.contains("Access-Control"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_unbound_bearer_same_401_as_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let mut total = 0;
-        loop {
-            let n = stream.read(&mut resp_buf[total..]).unwrap();
-            if n == 0 {
-                break;
-            }
-            total += n;
-            if resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                let header_end = resp_buf[..total]
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .unwrap();
-                let header_str = std::str::from_utf8(&resp_buf[..header_end]).unwrap();
-                if let Some(cl) = header_str.lines().find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                }) {
-                    let body_start = header_end + 4;
-                    let body_len = total.saturating_sub(body_start);
-                    if body_len >= cl {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-        let resp_str = std::str::from_utf8(&resp_buf[..total]).unwrap();
-        assert!(resp_str.contains("401"));
-        assert!(resp_str.contains("invalid_bearer"));
-        assert!(!resp_str.contains("unbound_bearer"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    pub(super) mod sign_handler_tests {
+    pub(crate) mod sign_handler_tests {
         use super::*;
         use crate::agent::audit::AuditGate;
         use crate::agent::browser;
@@ -4426,19 +3689,21 @@ mod tests {
             );
         }
 
-        // `request` acts as `deny` until P7: HTTP 403, an audited deny, no allow record, and no
+        // `request` acts as `deny` until P7: `forbidden`, an audited deny, no allow record, and no
         // human or native path (the handler has no prompt dependency).
         #[test]
-        fn request_rule_is_denied_with_403_and_audited_without_human_path() {
+        fn request_rule_is_denied_as_forbidden_and_audited_without_human_path() {
             let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
             let handler = f.make_handler();
             let ctx = f.make_ctx();
             let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
             assert_ne!(err.code, ErrorCode::InteractionRequired);
-            let (status, code) = error_status_code(err.code);
-            assert_eq!(status, "403 Forbidden");
-            assert_eq!(code, "forbidden");
+            assert_eq!(
+                crate::agent::transport::wire_error_code(err.code),
+                "forbidden"
+            );
+            assert_eq!(dom_exception_name(err.code), "NotAllowedError");
 
             let events = read_audit_events(&f.audit_dir);
             let policy_events = find_policy_events(&events);
@@ -4980,7 +4245,7 @@ mod tests {
             req.cross_origin = true;
             let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
             assert_eq!(err.code, ErrorCode::Forbidden);
-            assert_eq!(error_status_code(err.code).0, "403 Forbidden");
+            assert_eq!(dom_exception_name(err.code), "NotAllowedError");
 
             let events = read_audit_events(&f.audit_dir);
             let policy_events = find_policy_events(&events);
@@ -5287,14 +4552,24 @@ mod tests {
                     handler.sign(&ctx, &req)
                 });
                 reached_rx.recv().unwrap();
-                // The duplicate's client is gone: it detaches at once.
+                // The duplicate's client goes away while it waits: it detaches at once. (The
+                // first poll is the check before the replay key, which it passes.)
+                let polls = std::sync::atomic::AtomicUsize::new(0);
                 let detached = handler.sign_with(
+                    &ctx,
+                    &req,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| polls.fetch_add(1, Ordering::AcqRel) > 0,
+                );
+                assert_eq!(detached.unwrap_err().code, ErrorCode::Aborted);
+                // A duplicate already cancelled when it arrives stops before the replay key.
+                let cancelled = handler.sign_with(
                     &ctx,
                     &req,
                     Instant::now() + Duration::from_secs(30),
                     &|| true,
                 );
-                assert_eq!(detached.unwrap_err().code, ErrorCode::Timeout);
+                assert_eq!(cancelled.unwrap_err().code, ErrorCode::Aborted);
                 // A duplicate whose deadline passes detaches too.
                 let late = handler.sign_with(&ctx, &req, Instant::now(), &|| false);
                 assert_eq!(late.unwrap_err().code, ErrorCode::Timeout);
@@ -5362,6 +4637,7 @@ mod tests {
                 extensions: vec![],
                 attestation: None,
                 timeout_ms: None,
+                authenticator_attachment: None,
             };
             assert_eq!(
                 f.register_handler()
@@ -5460,11 +4736,15 @@ mod tests {
             );
             assert_eq!(f.reasons(), vec!["unsupported_option".to_string()]);
             assert_eq!(ctx.session.operations_used(), 0);
-            // Browser metadata and `appid` are not unsupported RP extensions.
-            req.extensions = vec![
-                "remoteDesktopClientOverride".to_string(),
-                "appid".to_string(),
-            ];
+            // The browser's `remoteDesktopClientOverride` is stripped by the transport's parse; named
+            // as an RP extension it is not supported.
+            req.extensions = vec!["remoteDesktopClientOverride".to_string()];
+            assert_eq!(
+                handler.sign(&ctx, &req).unwrap_err().code,
+                ErrorCode::NotSupported
+            );
+            // `appid` is supported.
+            req.extensions = vec!["appid".to_string()];
             handler.sign(&ctx, &req).expect("supported extensions");
             assert_eq!(
                 dom_exception_name(ErrorCode::NotSupported),
@@ -5738,653 +5018,12 @@ mod tests {
             assert_eq!(f.reasons().last().unwrap(), "challenge_reused");
             assert_eq!(f.key_provider.sign_calls(), 1);
         }
-
-        // --- P5: capacity (plan R11): explicit `busy`, never a silent drop ---
-
-        struct CapacityRig {
-            f: AuditTestFixture,
-            sock: std::path::PathBuf,
-            token: String,
-            shutdown: Arc<AtomicBool>,
-            server: Option<thread::JoinHandle<()>>,
-            _dir: tempfile::TempDir,
-        }
-
-        impl CapacityRig {
-            fn new(limits: AgentRequestLimits) -> Self {
-                let f = AuditTestFixture::default_allow();
-                let dir = tempfile::tempdir().unwrap();
-                let sock = dir.path().join("sock");
-                let shutdown = Arc::new(AtomicBool::new(false));
-                let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
-                let registry = Arc::new(SignContextRegistry::new());
-                let token = generate_bearer_token().unwrap();
-                registry
-                    .register_pending(token.clone(), f.make_ctx(), Arc::new(f.make_handler()))
-                    .unwrap();
-                registry
-                    .bind_lease(&token, "lease-cap".to_string())
-                    .unwrap();
-                let server = server.serve_with_limiter(registry, RequestLimiter::new(limits));
-                Self {
-                    f,
-                    sock,
-                    token,
-                    shutdown,
-                    server: Some(server),
-                    _dir: dir,
-                }
-            }
-
-            fn request(&self, challenge: &[u8]) -> Vec<u8> {
-                let body = serde_json::to_vec(&self.f.req_with_challenge(challenge)).unwrap();
-                let mut request = format!(
-                    "POST /sign HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                    self.token,
-                    body.len()
-                )
-                .into_bytes();
-                request.extend_from_slice(&body);
-                request
-            }
-
-            /// Send one request on its own connection and read the whole response.
-            fn send(sock: &Path, request: &[u8]) -> String {
-                let mut stream = UnixStream::connect(sock).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(20)))
-                    .unwrap();
-                stream.write_all(request).unwrap();
-                let mut response = Vec::new();
-                let _ = stream.read_to_end(&mut response);
-                String::from_utf8_lossy(&response).to_string()
-            }
-        }
-
-        impl Drop for CapacityRig {
-            fn drop(&mut self) {
-                self.shutdown.store(true, Ordering::Release);
-                if let Some(server) = self.server.take() {
-                    let _ = server.join();
-                }
-            }
-        }
-
-        fn is_busy(response: &str) -> bool {
-            response.starts_with("HTTP/1.1 503")
-                && response.contains("\"error\":\"busy\"")
-                && response.contains("\"dom\":\"NotAllowedError\"")
-        }
-
-        #[test]
-        fn requests_over_the_caps_get_an_explicit_busy_and_none_is_dropped() {
-            let rig = CapacityRig::new(AgentRequestLimits {
-                max_concurrent_requests: 2,
-                max_requests_per_profile: 2,
-                max_requests_per_connection: 1,
-                max_requests_per_session: 2,
-            });
-            const CLIENTS: usize = 12;
-            // Hold the backend operation lock: admitted requests park on it, holding their slot.
-            let op = rig.f.operation_lock.lock().unwrap();
-            let (tx, rx) = std::sync::mpsc::channel();
-            let clients: Vec<_> = (0..CLIENTS)
-                .map(|i| {
-                    let request = rig.request(&[b'c', i as u8]);
-                    let sock = rig.sock.clone();
-                    let tx = tx.clone();
-                    thread::spawn(move || tx.send(CapacityRig::send(&sock, &request)).unwrap())
-                })
-                .collect();
-            let mut responses = Vec::new();
-            for _ in 0..CLIENTS - 2 {
-                responses.push(
-                    rx.recv_timeout(Duration::from_secs(15))
-                        .expect("busy reply"),
-                );
-            }
-            assert!(
-                responses.iter().all(|r| is_busy(r)),
-                "every request over the cap is answered busy: {:?}",
-                responses
-            );
-            assert_eq!(rig.f.key_provider.sign_calls(), 0);
-            drop(op);
-            for _ in 0..2 {
-                responses.push(rx.recv_timeout(Duration::from_secs(15)).expect("served"));
-            }
-            for client in clients {
-                client.join().unwrap();
-            }
-            assert_eq!(responses.len(), CLIENTS, "no request was dropped");
-            assert_eq!(
-                responses
-                    .iter()
-                    .filter(|r| r.starts_with("HTTP/1.1 200"))
-                    .count(),
-                2
-            );
-            assert_eq!(rig.f.key_provider.sign_calls(), 2);
-        }
-
-        #[test]
-        fn connections_over_the_connection_cap_are_answered_busy_by_the_accept_loop() {
-            let rig = CapacityRig::new(AgentRequestLimits {
-                max_concurrent_requests: 1,
-                max_requests_per_profile: 1,
-                max_requests_per_connection: 1,
-                max_requests_per_session: 1,
-            });
-            let max_connections = 1 + super::super::super::capacity::BUSY_CONNECTION_HEADROOM;
-            // Idle connections occupy every handler thread (each waits for its request).
-            let idle: Vec<UnixStream> = (0..max_connections)
-                .map(|_| UnixStream::connect(&rig.sock).unwrap())
-                .collect();
-            thread::sleep(Duration::from_millis(300));
-            let response = CapacityRig::send(&rig.sock, &rig.request(b"over"));
-            assert!(is_busy(&response), "{response}");
-            drop(idle);
-            assert_eq!(rig.f.key_provider.sign_calls(), 0);
-        }
-
-        #[test]
-        fn twenty_concurrent_ceremonies_within_the_caps_all_complete() {
-            let rig = CapacityRig::new(AgentRequestLimits {
-                max_concurrent_requests: 32,
-                max_requests_per_profile: 32,
-                max_requests_per_connection: 8,
-                max_requests_per_session: 32,
-            });
-            let responses: Vec<String> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..20u8)
-                    .map(|i| {
-                        let request = rig.request(&[b'p', i]);
-                        let sock = rig.sock.clone();
-                        scope.spawn(move || CapacityRig::send(&sock, &request))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            assert!(
-                responses.iter().all(|r| r.starts_with("HTTP/1.1 200")),
-                "{:?}",
-                responses
-            );
-            assert_eq!(rig.f.key_provider.sign_calls(), 20);
-        }
-
-        #[test]
-        fn duplicate_http_requests_are_coalesced_into_one_signature() {
-            let rig = CapacityRig::new(AgentRequestLimits::default());
-            let op = rig.f.operation_lock.lock().unwrap();
-            let request = rig.request(b"same");
-            let responses: Vec<String> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..4)
-                    .map(|_| {
-                        let sock = rig.sock.clone();
-                        let request = request.clone();
-                        scope.spawn(move || CapacityRig::send(&sock, &request))
-                    })
-                    .collect();
-                thread::sleep(Duration::from_millis(300));
-                drop(op);
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            let bodies: Vec<&str> = responses
-                .iter()
-                .map(|r| r.split("\r\n\r\n").nth(1).unwrap_or(""))
-                .collect();
-            assert!(responses.iter().all(|r| r.starts_with("HTTP/1.1 200")));
-            assert!(bodies.windows(2).all(|w| w[0] == w[1]), "identical results");
-            assert_eq!(rig.f.key_provider.sign_calls(), 1);
-        }
     }
 
-    mod integration_tests {
-        use super::sign_handler_tests::TestFixture;
-        use super::*;
-
-        use std::io::{Read, Write};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        fn http_request(sock_path: &Path, request: &str, body: &[u8]) -> String {
-            let mut stream = UnixStream::connect(sock_path).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
-            stream.write_all(body).unwrap();
-            let mut resp_buf = vec![0u8; 32768];
-            let mut total = 0;
-            loop {
-                match stream.read(&mut resp_buf[total..]) {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(_) => break,
-                }
-            }
-            String::from_utf8_lossy(&resp_buf[..total]).to_string()
-        }
-
-        fn http_body(resp: &str) -> &str {
-            resp.split("\r\n\r\n").nth(1).unwrap_or("")
-        }
-
-        fn setup_bound(
-            constant_counter: bool,
-        ) -> (
-            Arc<AtomicBool>,
-            tempfile::TempDir,
-            std::path::PathBuf,
-            Arc<SignContextRegistry>,
-            String,
-            TestFixture,
-            thread::JoinHandle<()>,
-        ) {
-            let dir = tempfile::tempdir().unwrap();
-            let sock_path = dir.path().join("sock");
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-            let registry = Arc::new(SignContextRegistry::new());
-            let token = generate_bearer_token().unwrap();
-            let f = TestFixture::new(constant_counter);
-            let handler = Arc::new(f.make_handler());
-            let ctx = f.make_ctx();
-            registry
-                .register_pending(token.clone(), ctx, handler)
-                .unwrap();
-            registry
-                .bind_lease(&token, "lease-integ".to_string())
-                .unwrap();
-            let handle = server.serve(registry.clone());
-            (shutdown, dir, sock_path, registry, token, f, handle)
-        }
-
-        fn sign_request_body(
-            origin: &str,
-            rp_id: &str,
-            challenge: &str,
-            allow_credentials: Vec<String>,
-            cross_origin: bool,
-        ) -> Vec<u8> {
-            serde_json::to_vec(&SignAssertionRequest {
-                extensions: Vec::new(),
-                timeout_ms: None,
-                origin: origin.to_string(),
-                top_origin: None,
-                rp_id: rp_id.to_string(),
-                challenge_b64u: challenge.to_string(),
-                allow_credentials,
-                user_verification: false,
-                cross_origin,
-            })
-            .unwrap()
-        }
-
-        fn format_sign_request(token: &str, body: &[u8]) -> String {
-            format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
-            )
-        }
-
-        fn extract_counter(auth_data_b64u: &str) -> u32 {
-            let auth_data = b64u_decode(auth_data_b64u).unwrap();
-            assert!(auth_data.len() >= 37);
-            u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]])
-        }
-
-        #[test]
-        fn http_sign_full_response_structure() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("200 OK"));
-            let body_str = http_body(&resp);
-            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
-            let inner = parsed.get("sign_assertion_result").unwrap();
-            assert!(inner.get("credential_id_b64u").is_some());
-            assert!(inner.get("authenticator_data_b64u").is_some());
-            assert!(inner.get("signature_b64u").is_some());
-            assert!(inner.get("user_handle_b64u").is_some());
-            assert!(inner.get("client_data_json_b64u").is_some());
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_auth_preflight_then_sign() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let sign_resp = http_request(&sock_path, &req, &body);
-            assert!(sign_resp.contains("200 OK"));
-            assert!(!sign_resp.contains("Access-Control"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_policy_deny_returns_403() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_grant_ttl_enforced() {
-            let (shutdown, _dir, sock_path, _registry, token, f, handle) = setup_bound(true);
-            f.clock.advance(Duration::from_secs(301));
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_credential_ref_enforced() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("200 OK"));
-            let body_str = http_body(&resp);
-            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
-            let inner = parsed.get("sign_assertion_result").unwrap();
-            let cred_id = inner.get("credential_id_b64u").unwrap().as_str().unwrap();
-            let expected = b64u_encode(&[1u8; 32]);
-            assert_eq!(cred_id, expected);
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_counter_increment_monotonic() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
-            let body1 = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req1 = format_sign_request(&token, &body1);
-            let resp1 = http_request(&sock_path, &req1, &body1);
-            assert!(resp1.contains("200 OK"));
-            let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
-            let inner1 = parsed1.get("sign_assertion_result").unwrap();
-            let auth1 = inner1
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            let counter1 = extract_counter(auth1);
-            let body2 = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "Y2hhbA",
-                vec![],
-                false,
-            );
-            let req2 = format_sign_request(&token, &body2);
-            let resp2 = http_request(&sock_path, &req2, &body2);
-            assert!(resp2.contains("200 OK"));
-            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
-            let inner2 = parsed2.get("sign_assertion_result").unwrap();
-            let auth2 = inner2
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            let counter2 = extract_counter(auth2);
-            assert_eq!(counter1, 1);
-            assert_eq!(counter2, 2);
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_content_type_validation() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = b"{}";
-            let req = format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
-            );
-            let resp = http_request(&sock_path, &req, body);
-            assert!(resp.contains("415"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("unsupported_content_type"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_origin_mismatch_denied() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body =
-                sign_request_body("https://evil.com", "example.com", "dGVzdA", vec![], false);
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("origin_invalid"));
-            assert!(body_str.contains("\"dom\":\"SecurityError\""));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_wrong_rp_id_denied() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_unauthorized_credential_denied() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let wrong_cred = b64u_encode(b"wrong_credential_id_bytes_1234567");
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![wrong_cred],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_duplicate_request_within_ttl_returns_cached_assertion() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp1 = http_request(&sock_path, &req, &body);
-            assert!(resp1.contains("200 OK"));
-            let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
-            let auth1 = parsed1
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string();
-            assert_eq!(extract_counter(&auth1), 1);
-
-            // An identical request within the completed-outcome TTL returns the
-            // same cached assertion instead of being re-signed. The counter is not
-            // incremented again, so no new signature is produced (idempotent).
-            let resp2 = http_request(&sock_path, &req, &body);
-            assert!(resp2.contains("200 OK"));
-            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
-            let auth2 = parsed2
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            assert_eq!(auth2, auth1);
-            assert_eq!(extract_counter(auth2), 1);
-
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_invalid_json_body() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = b"{invalid json!!";
-            let req = format_sign_request(&token, body);
-            let resp = http_request(&sock_path, &req, body);
-            assert!(resp.contains("400"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("invalid_json"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_body_too_large() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let req = format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n",
-                token
-            );
-            let resp = http_request(&sock_path, &req, b"");
-            assert!(resp.contains("413"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("body_too_large"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_bearer_not_prefix_match() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let prefix = &token[..10];
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(prefix, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("401"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("invalid_bearer"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_wrong_auth_scheme() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
-            );
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("401"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("invalid_authorization_scheme"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_cross_origin_theft_attempt() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://attacker.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                true,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-    }
-
-    /// Registration bearers are bound to the browser lease and revoked with it (ADR 0014 section 9).
     mod registration_lease_tests {
         use super::*;
         use crate::agent::audit::test_support::read_audit_events;
+        use crate::agent::transport::tests::{TestServer, create_body};
         use passless_core::agent::protocol::RegisterCredentialRequest;
         use soft_fido2::SoftwareCredentialKeyProvider;
 
@@ -6477,6 +5116,7 @@ mod tests {
                     extensions: Vec::new(),
                     attestation: None,
                     timeout_ms: None,
+                    authenticator_attachment: None,
                     origin: "https://example.com".to_string(),
                     top_origin: None,
                     rp_id: "example.com".to_string(),
@@ -6499,23 +5139,6 @@ mod tests {
                     .filter(|e| e["kind"] == "policy.deny")
                     .collect()
             }
-        }
-
-        fn post_register(sock: &Path, token: &str, body: &[u8]) -> String {
-            let request = format!(
-                "POST /register HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
-            );
-            let mut stream = UnixStream::connect(sock).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
-            stream.write_all(body).unwrap();
-            let mut resp = vec![0u8; 16384];
-            let n = stream.read(&mut resp).unwrap();
-            String::from_utf8_lossy(&resp[..n]).into_owned()
         }
 
         #[test]
@@ -6582,24 +5205,23 @@ mod tests {
         #[test]
         fn registration_after_lease_revocation_is_refused_and_audited() {
             let rig = Rig::new();
-            let dir = tempfile::tempdir().unwrap();
-            let sock = dir.path().join("sock");
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
-            let handle = server.serve(rig.registry.clone());
+            let server = TestServer::start(rig.registry.clone());
             let token = rig.bearer(Some("lease-1"));
+            let mut client = server.connect();
+            client.hello(&token);
 
             // While the lease is alive, registration works.
-            let ok = post_register(&sock, &token, &rig.registration_body("Y2hhbGxlbmdlMQ"));
-            assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+            client.request(1, "create", &create_body(b"challenge1"));
+            let ok = client.result();
+            assert_eq!(ok["ok"], true, "{ok:?}");
             assert_eq!(rig.credential_count(), 1);
             assert!(rig.policy_denies().is_empty());
 
             // The browser exits / the lease is revoked: the old bearer no longer registers.
             rig.registry.revoke_by_lease("lease-1");
-            let refused = post_register(&sock, &token, &rig.registration_body("Y2hhbGxlbmdlMg"));
-            assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
-            assert!(refused.contains("invalid_bearer"), "{refused}");
+            client.request(2, "create", &create_body(b"challenge2"));
+            let refused = client.result();
+            assert_eq!(refused["error"]["code"], "unauthorized", "{refused:?}");
             assert_eq!(rig.credential_count(), 1, "no credential may be created");
 
             let denies = rig.policy_denies();
@@ -6608,9 +5230,6 @@ mod tests {
             assert_eq!(denies[0]["reason"], "bearer_revoked");
             assert_eq!(denies[0]["profile_id"], "test-profile");
             assert_eq!(denies[0]["rp_id"], "example.com");
-
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
         }
 
         #[test]
@@ -6636,43 +5255,36 @@ mod tests {
         #[test]
         fn unknown_registration_bearer_is_refused_without_audit() {
             let rig = Rig::new();
-            let dir = tempfile::tempdir().unwrap();
-            let sock = dir.path().join("sock");
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
-            let handle = server.serve(rig.registry.clone());
-
+            let server = TestServer::start(rig.registry.clone());
             let token = generate_bearer_token().unwrap();
-            let refused = post_register(&sock, &token, &rig.registration_body("Y2hhbGxlbmdl"));
-            assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+            let mut client = server.connect();
+            let refused = client.hello_with(&token, true);
+            assert_eq!(refused["code"], "unauthorized", "{refused:?}");
+            assert!(client.closed());
             assert!(rig.policy_denies().is_empty());
-
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
         }
 
         #[test]
         fn refusals_of_a_revoked_bearer_are_audited_at_most_a_bounded_number_of_times() {
             let rig = Rig::new();
-            let dir = tempfile::tempdir().unwrap();
-            let sock = dir.path().join("sock");
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
-            let handle = server.serve(rig.registry.clone());
+            let server = TestServer::start(rig.registry.clone());
             let token = rig.bearer(Some("lease-flood"));
+            let mut client = server.connect();
+            client.hello(&token);
             rig.registry.revoke_by_lease("lease-flood");
 
             let attempts = MAX_AUDITED_REFUSALS_PER_BEARER + 4;
             for i in 0..attempts {
-                let body = rig.registration_body(&format!("challenge{i}"));
-                let refused = post_register(&sock, &token, &body);
-                assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+                client.request(
+                    i as u32 + 1,
+                    "create",
+                    &create_body(format!("challenge{i}").as_bytes()),
+                );
+                let refused = client.result();
+                assert_eq!(refused["error"]["code"], "unauthorized", "{refused:?}");
             }
             assert_eq!(rig.policy_denies().len(), MAX_AUDITED_REFUSALS_PER_BEARER);
             assert_eq!(rig.credential_count(), 0);
-
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
         }
 
         #[test]

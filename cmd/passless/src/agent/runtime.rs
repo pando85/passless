@@ -37,12 +37,14 @@ use super::launcher::{
     verify_process_ancestry,
 };
 use super::policy_engine::PolicyRuntime;
-use super::sign::{SignContextRegistry, SignHttpServer};
+use super::sign::SignContextRegistry;
 use super::storage_factory::{create_storage_bundle_with_options, key_provider_for_config};
+use super::transport::{ReadinessRegistry, SignTransportServer, TransportOptions};
 use passless_core::agent::config::CdpExposeMode;
 
 use crate::storage::CredentialStorage;
 mod browser_ensure;
+mod interception;
 
 const MAX_WORKERS: usize = 16;
 const MAX_COMPLETED_SESSIONS: usize = 256;
@@ -569,6 +571,10 @@ pub struct AgentRuntime {
     sign_server_handle: Mutex<Option<JoinHandle<()>>>,
     #[allow(dead_code)]
     sign_socket_path: std::path::PathBuf,
+    /// The sign socket of each browser UID other than the daemon's, or why it is unavailable.
+    sign_uid_sockets: HashMap<u32, Result<PathBuf, String>>,
+    /// Interception readiness per bearer, reported by the extension worker's hello (plan D6.1).
+    sign_readiness: Arc<ReadinessRegistry>,
 }
 
 impl AgentRuntime {
@@ -987,17 +993,40 @@ impl AgentRuntime {
             })
             .ok_or_else(|| RuntimeError::Config("cannot resolve runtime directory".into()))?;
         let sign_socket_path = sign_socket_base.join("agent").join("sign").join("sock");
-        let sign_server =
-            SignHttpServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone()).map_err(
-                |e| RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e)),
-            )?;
-        info!(
-            "Sign HTTP server listening on {}",
-            sign_socket_path.display()
-        );
-        let sign_server_handle = sign_server.serve_with_limiter(
+        let mut sign_server =
+            SignTransportServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone())
+                .map_err(|e| {
+                    RuntimeError::Service(format!("failed to bind the sign transport: {}", e))
+                })?;
+        info!("Sign transport listening on {}", sign_socket_path.display());
+        // A browser that runs as another user reaches the daemon through its own socket, in a
+        // directory only that user (and root) can enter. Failures do not stop the daemon: the
+        // profiles of that browser user refuse to launch with the reason (and doctor reports it).
+        let mut sign_uid_sockets: HashMap<u32, Result<PathBuf, String>> = HashMap::new();
+        for (_, browser_user) in &resolved_browser_users {
+            let Some(browser_user) = browser_user else {
+                continue;
+            };
+            if browser_user.uid == daemon_uid || sign_uid_sockets.contains_key(&browser_user.uid) {
+                continue;
+            }
+            let bound = sign_server.add_uid_socket(browser_user.uid, browser_user.gid);
+            match &bound {
+                Ok(path) => info!(
+                    "Sign transport listening on {} for browser uid {}",
+                    path.display(),
+                    browser_user.uid
+                ),
+                Err(e) => warn!("no sign socket for browser uid {}: {}", browser_user.uid, e),
+            }
+            sign_uid_sockets.insert(browser_user.uid, bound);
+        }
+        let sign_readiness = Arc::new(ReadinessRegistry::new());
+        let sign_server_handle = sign_server.serve(
             sign_registry.clone(),
             super::capacity::RequestLimiter::new(agent_config.limits),
+            sign_readiness.clone(),
+            TransportOptions::from_env(),
         );
 
         let mut profiles = BTreeMap::new();
@@ -1118,6 +1147,8 @@ impl AgentRuntime {
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
             sign_socket_path,
+            sign_uid_sockets,
+            sign_readiness,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -1237,6 +1268,7 @@ impl AgentRuntime {
                         }
                     }
                 }
+                self.report_interception_transitions(&mut browser_mgr);
                 let expired_leases = browser_mgr.check_expired();
                 for lease_id in &expired_leases {
                     self.revoke_sign_context_for_lease(lease_id);
@@ -2429,12 +2461,23 @@ impl AgentRuntime {
                     } else {
                         None
                     };
+                let (interception, incognito_allowed) =
+                    self.lease_interception_report(&browser_mgr, &lease_id);
+                // Like the bootstrap, status does not hand out the endpoint of a lease whose
+                // interception is not attached (plan D6 layer 1).
+                // A lease without an interception record withholds it too (fail closed).
+                let cdp_endpoint = cdp_endpoint.filter(|_| {
+                    interception.as_deref()
+                        == Some(super::browser::InterceptionState::Attached.as_str())
+                });
                 return Ok(PrincipalResponse::BrowserStatus(
                     passless_core::agent::BrowserStatusResponse {
                         running: !snapshot.state.is_terminal(),
                         status: format!("{}", snapshot.state),
                         cdp_endpoint,
                         shared_browser_context,
+                        interception,
+                        incognito_allowed,
                     },
                 ));
             }
@@ -2446,6 +2489,8 @@ impl AgentRuntime {
                 status: "no_browser".into(),
                 cdp_endpoint: None,
                 shared_browser_context: None,
+                interception: None,
+                incognito_allowed: None,
             },
         ))
     }
@@ -2761,6 +2806,30 @@ impl AgentRuntime {
                 require_uv,
             },
         );
+        // The installed relay against the daemon's build (plan V-L5).
+        report.checks.push(super::doctor::relay_version_check(
+            &super::doctor::ProductionRelayProbe,
+            &super::transport::build_version(),
+        ));
+        // The browser user's relay needs a sign socket it can reach (finding: a browser of another
+        // UID used to time out at launch with no explanation).
+        let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
+        report.checks.push(match self.sign_socket_for(browser_uid) {
+            Ok(path) => passless_core::agent::DoctorCheck {
+                name: "sign_socket".into(),
+                passed: true,
+                message: format!(
+                    "browser uid {} reaches the daemon at {}",
+                    browser_uid,
+                    path.display()
+                ),
+            },
+            Err(e) => passless_core::agent::DoctorCheck {
+                name: "sign_socket".into(),
+                passed: false,
+                message: e.message,
+            },
+        });
         // Deprecated config vocabulary is accepted with a warning for one minor release (plan R8):
         // a warning never makes the profile unhealthy, so the check passes and carries the text.
         for warning in profile.profile_config.deprecation_warnings(profile_id) {
@@ -3141,28 +3210,18 @@ impl AgentRuntime {
         Ok(AdminResponse::CredentialRevoked)
     }
 
+    /// Delete a credential from an isolated profile's store. Every credential there was created
+    /// by the agent path (including an orphan of an unfocused-tab registration, ADR 0014 section
+    /// 11), so the operator can delete any of them; the human store (same-user profiles) is never
+    /// touched.
     fn handle_admin_delete_credential(
         &self,
         credential_ref: &passless_core::agent::CredentialRef,
     ) -> Result<AdminResponse, ProtocolError> {
-        let mut _found_isolated = false;
-
         for profile in self.profiles.values() {
             if profile.mode != AgentMode::Isolated {
                 continue;
             }
-
-            let is_in_profile = profile
-                .profile_config
-                .credential_refs
-                .as_ref()
-                .is_some_and(|refs| refs.iter().any(|r| r == credential_ref));
-
-            if !is_in_profile {
-                continue;
-            }
-
-            _found_isolated = true;
 
             let _op = super::lock_order::lock(
                 &profile.operation_lock,
@@ -3174,57 +3233,41 @@ impl AgentRuntime {
                 super::lock_order::LockLevel::Storage,
             );
 
-            let first_result = storage.read_first(crate::storage::CredentialFilter::None);
-            let mut cred = match first_result {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::Internal,
-                        format!("storage enumeration failed: {}", e),
-                        RecommendedAction::Retry,
-                    ));
-                }
+            let found = find_credential_by_ref(&mut **storage, credential_ref).map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "failed to read the credential store of profile '{}': {}",
+                        profile.profile_id, e
+                    ),
+                    RecommendedAction::Retry,
+                )
+            })?;
+            let Some(cred) = found else {
+                continue;
             };
+            storage.delete(&cred.id).map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to delete credential: {}", e),
+                    RecommendedAction::Retry,
+                )
+            })?;
 
-            loop {
-                let actual_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
-                if actual_ref == *credential_ref {
-                    storage.delete(credential_ref.as_bytes()).map_err(|e| {
-                        ProtocolError::new(
-                            ErrorCode::Internal,
-                            format!("failed to delete credential: {}", e),
-                            RecommendedAction::Retry,
-                        )
-                    })?;
+            let delete_event = super::audit_events::AdminCredentialDeleteBuilder::new(
+                profile.profile_id.clone(),
+                credential_ref.clone(),
+                &cred.rp.id,
+            )
+            .build();
+            let _ = self.audit_gate.record(delete_event);
 
-                    let delete_event = super::audit_events::AdminCredentialDeleteBuilder::new(
-                        credential_ref.clone(),
-                        &cred.rp.id,
-                    )
-                    .build();
-                    let _ = self.audit_gate.record(delete_event);
-
-                    return Ok(AdminResponse::Deleted);
-                }
-
-                match storage.read_next() {
-                    Ok(next) => cred = next,
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if !_found_isolated {
-            return Err(ProtocolError::new(
-                ErrorCode::NotFound,
-                "credential not found in any isolated profile",
-                RecommendedAction::FixRequest,
-            ));
+            return Ok(AdminResponse::Deleted);
         }
 
         Err(ProtocolError::new(
             ErrorCode::NotFound,
-            "credential not found",
+            "credential not found in any isolated profile",
             RecommendedAction::FixRequest,
         ))
     }
@@ -3791,6 +3834,10 @@ impl AgentRuntime {
             let cdp_endpoint = browser_manager
                 .lease_cdp_endpoint(&existing_snapshot.id)
                 .flatten();
+            // An admin launch reports the existing lease's interception as it is; only the
+            // principal bootstrap withholds a degraded lease's endpoint.
+            let (interception, incognito_allowed) =
+                self.lease_interception_report(&browser_manager, &existing_snapshot.id);
 
             return Ok(AdminResponse::BrowserLaunched(
                 passless_core::agent::protocol::BrowserLaunchedResponse {
@@ -3799,9 +3846,15 @@ impl AgentRuntime {
                     pid: existing_snapshot.pid,
                     start_url: existing_snapshot.start_url,
                     cdp_endpoint,
+                    interception,
+                    incognito_allowed,
                 },
             ));
         }
+
+        // The browser's relay must be able to reach a sign socket of its own UID; refuse up front
+        // rather than time out waiting for an attach that cannot happen.
+        let sign_socket = self.sign_socket_for(browser_uid)?;
 
         // Generate bearer token for this browser session
         let bearer_token = super::sign::generate_bearer_token().map_err(|e| {
@@ -3817,6 +3870,7 @@ impl AgentRuntime {
         // An admin-launched browser has no principal process: its session is bound to the
         // all-zero principal digest, like its session grant.
         let session = self.new_bearer_session(profile_id, [0u8; 32], profile_config);
+        session.bind_browser_uid(browser_uid);
         let register_ctx =
             super::register::RegisterContext::new(profile_id.clone(), session.clone());
 
@@ -3841,7 +3895,7 @@ impl AgentRuntime {
             })?;
 
         let metadata = super::browser::AgentEndpointMetadata {
-            socket_path: self.sign_socket_path.to_string_lossy().into_owned(),
+            socket_path: sign_socket.to_string_lossy().into_owned(),
             bearer_token: bearer_token.clone(),
         };
 
@@ -3878,6 +3932,32 @@ impl AgentRuntime {
                 RecommendedAction::Abort,
             ));
         }
+
+        // Ready means intercepted (plan D6 layer 1): the launch reports success only once the
+        // lease's worker said hello with `attached = true`. The registration bearer was registered
+        // before the spawn, so the transport accepts that hello even if it arrives before the
+        // binding above. Otherwise the launch fails closed like any other launch failure.
+        let readiness = match browser_manager.await_interception(
+            &lease_id,
+            &self.sign_readiness,
+            super::browser::INTERCEPTION_ATTACH_TIMEOUT,
+        ) {
+            Ok(readiness) => readiness,
+            Err(e) => {
+                warn!("browser launch for profile={} failed: {}", profile_id, e);
+                self.sign_registry.revoke_registration(&bearer_token);
+                self.sign_registry.revoke_by_lease(lease_id.as_ref());
+                let _ = browser_manager.revoke(&lease_id);
+                let _ = browser_manager.terminate(&lease_id);
+                let _ = browser_manager.cleanup(&lease_id);
+                browser_manager.remove(&lease_id);
+                return Err(ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to launch browser: {}", e),
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        };
 
         let snapshot = browser_manager.snapshot(&lease_id).ok_or_else(|| {
             ProtocolError::new(
@@ -4001,6 +4081,19 @@ impl AgentRuntime {
             );
         }
 
+        // An admin-launched browser is active from the start (no principal assertion activates
+        // it): without this the lease stays authentication-pending and is expired at the login
+        // deadline, killing the browser mid-session.
+        if let Err(e) = browser_manager.activate_after_assertion(&lease_id, config.ttl) {
+            warn!(
+                "browser lease {} for profile={} could not be activated: {}",
+                lease_id, profile_id, e
+            );
+        }
+
+        // The start URL is opened only now that interception is attached and the bearer's
+        // contexts are registered (defect B2).
+        self.open_deferred_start_url(&mut browser_manager, &lease_id);
         let cdp_endpoint = browser_manager.lease_cdp_endpoint(&lease_id).flatten();
 
         Ok(AdminResponse::BrowserLaunched(
@@ -4010,6 +4103,8 @@ impl AgentRuntime {
                 pid,
                 start_url: config.start_url,
                 cdp_endpoint,
+                interception: Some(super::browser::InterceptionState::Attached.to_string()),
+                incognito_allowed: Some(readiness.incognito_allowed),
             },
         ))
     }
@@ -4371,9 +4466,94 @@ impl PrincipalHandler for AgentRuntime {
     }
 }
 
+/// The credential of `storage` whose reference is `credential_ref`. `DoesNotExist` ends the
+/// iteration (an empty store has no first credential); any other storage error is returned, never
+/// mistaken for "not found".
+fn find_credential_by_ref(
+    storage: &mut dyn CredentialStorage,
+    credential_ref: &passless_core::agent::CredentialRef,
+) -> std::result::Result<Option<soft_fido2::Credential>, soft_fido2::Error> {
+    let mut next = storage.read_first(crate::storage::CredentialFilter::None);
+    loop {
+        match next {
+            Ok(cred) => {
+                if passless_core::agent::CredentialRef::with_default_domain(&cred.id)
+                    == *credential_ref
+                {
+                    return Ok(Some(cred));
+                }
+            }
+            Err(soft_fido2::Error::DoesNotExist) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        next = storage.read_next();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- admin credential delete: storage errors are not "not found" ---
+
+    /// A store whose every call fails: with `DoesNotExist` when `empty`, else with `Other`.
+    struct FailingStorage {
+        empty: bool,
+    }
+
+    impl FailingStorage {
+        fn error(&self) -> soft_fido2::Error {
+            if self.empty {
+                soft_fido2::Error::DoesNotExist
+            } else {
+                soft_fido2::Error::Other
+            }
+        }
+    }
+
+    impl CredentialStorage for FailingStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(self.error())
+        }
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(self.error())
+        }
+        fn read(&mut self, _id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(self.error())
+        }
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            Err(self.error())
+        }
+        fn delete(&mut self, _id: &[u8]) -> soft_fido2::Result<()> {
+            Err(self.error())
+        }
+        fn count_credentials(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn credential_lookup_reports_an_empty_store_as_not_found() {
+        let reference = passless_core::agent::CredentialRef::with_default_domain(b"abc");
+        let mut empty = FailingStorage { empty: true };
+        assert!(matches!(
+            find_credential_by_ref(&mut empty, &reference),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn credential_lookup_surfaces_a_storage_error() {
+        let reference = passless_core::agent::CredentialRef::with_default_domain(b"abc");
+        let mut broken = FailingStorage { empty: false };
+        assert!(matches!(
+            find_credential_by_ref(&mut broken, &reference),
+            Err(soft_fido2::Error::Other)
+        ));
+    }
 
     // --- P5: reload re-reads and validates the configuration file (ADR 0014 section 6.4) ---
 

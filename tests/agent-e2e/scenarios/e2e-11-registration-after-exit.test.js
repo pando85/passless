@@ -1,13 +1,20 @@
 'use strict';
 const { scenario, assert } = require('../lib/scenario');
-const { policyEvents, extensionEndpoint, postToDaemon, registerRequest, waitFor, assertNoNotification } = require('../lib/helpers');
+const { policyEvents, extensionEndpoint, FramedClient, registerRequest, waitFor, assertNoNotification, TRANSPORT_LOG, logMatches } = require('../lib/helpers');
+const { stopExtensionWorker } = require('../lib/browser');
 
 // Catalogue: registration after browser exit using the old bearer is refused (ADR 0014 §9: browser exit and lease
 // revocation revoke both sign and registration bearers; the refusal is audited).
 //
-// The bearer is the one the managed browser's extension holds. While the browser lives it registers (positive control,
-// so the later refusal can only be the revocation); after the browser is killed, the daemon revokes the lease and the
-// same bearer must be refused: HTTP 401, no credential created, one audited `policy.deny(reason=bearer_revoked)`.
+// The bearer is the one the managed browser's extension holds, used over the daemon's wire protocol (hello, then
+// request frames). The extension's worker is stopped first so that this client is the bearer's only connection (the
+// daemon keeps one per bearer). While the browser lives the bearer registers (positive control, so the later
+// refusals can only be the revocation). After the browser is killed and the daemon has revoked the lease:
+//   - a `create` on the connection that is still open is answered `unauthorized` (the bearer is re-validated per
+//     request; the connection is not dropped) and audited `policy.deny(reason=bearer_revoked, rp_id=rp-a.test)`;
+//   - a new connection's `hello` with the old bearer is refused `unauthorized` and closed, and audited
+//     `policy.deny(reason=bearer_revoked)` with an unknown RP ID (a hello names none).
+// No credential is created after the exit.
 //
 // The profile also carries a legacy `[device]` table: it must be warned about and ignored (R6, B6).
 scenario({ id: 'E2E-11', title: 'registration after browser exit with the old bearer is refused', ci: true }, async ctx => {
@@ -22,27 +29,47 @@ scenario({ id: 'E2E-11', title: 'registration after browser exit with the old be
 
   const b = await stack.open('iso', `${rp.origin}/sw`);
   const endpoint = await extensionEndpoint(b);
+  await stopExtensionWorker(b.browser);
+  await waitFor('the daemon to see the worker connection close', () => logMatches(stack.daemon.log(), TRANSPORT_LOG.closed).length >= 1);
 
-  // Positive control: the live bearer registers.
-  const live = await postToDaemon(endpoint, '/register', registerRequest(rp, { username: 'dora' }));
-  assert.equal(live.status, 200, `a live bearer must register: ${live.status} ${live.body}`);
-  assert.equal(stack.daemon.profileStore('iso').length, 1, 'the credential lands in the isolated profile store');
+  const client = await FramedClient.connect(endpoint.socketPath);
+  try {
+    const ack = await client.hello(endpoint);
+    assert.equal(ack.type, 'hello', `the live bearer must be accepted: ${JSON.stringify(ack)}`);
 
-  // The browser exits; wait until the daemon has noticed and revoked the lease.
-  stack.env.killTree(b.lease.pid);
-  await waitFor('the daemon to record the browser exit', async () =>
-    (await stack.daemon.audit()).some(e => (e.event || e).kind === 'browser_lease.crash'));
+    // Positive control: the live bearer registers.
+    const live = await client.request(1, 'create', registerRequest(rp, { username: 'dora' }));
+    assert.equal(live.ok, true, `a live bearer must register: ${JSON.stringify(live)}`);
+    assert.equal(stack.daemon.profileStore('iso').length, 1, 'the credential lands in the isolated profile store');
 
-  const late = await postToDaemon(endpoint, '/register', registerRequest(rp, { username: 'eve' }));
-  assert.equal(late.status, 401, `the old bearer must be refused: ${late.status} ${late.body}`);
+    // The browser exits; wait until the daemon has noticed and revoked the lease.
+    stack.env.killTree(b.lease.pid);
+    await waitFor('the daemon to record the browser exit', async () =>
+      (await stack.daemon.audit()).some(e => (e.event || e).kind === 'browser_lease.crash'));
+
+    // The still-open connection: the request is refused, the connection stays.
+    const late = await client.request(2, 'create', registerRequest(rp, { username: 'eve' }));
+    assert.equal(late.type, 'result', `the refusal must be a result on the open connection: ${JSON.stringify(late)}`);
+    assert.equal(late.ok, false, `the old bearer must be refused: ${JSON.stringify(late)}`);
+    assert.equal(late.error.code, 'unauthorized', JSON.stringify(late));
+    assert.equal(late.error.dom, 'NotAllowedError', JSON.stringify(late));
+  } finally { client.close(); }
+
+  // A new connection with the old bearer is refused at hello.
+  const again = await FramedClient.connect(endpoint.socketPath);
+  try {
+    const refused = await again.hello(endpoint);
+    assert.deepEqual(refused, { type: 'error', code: 'unauthorized' }, 'a hello with the revoked bearer');
+    assert.equal((await again.next(() => false, 5000)).type, 'eof', 'the daemon closes the connection after refusing the hello');
+  } finally { again.close(); }
+
   assert.equal(stack.daemon.profileStore('iso').length, 1, 'no credential may be created after the exit');
   assert.deepEqual(stack.daemon.humanStore(), humanBefore, 'the human store must be untouched');
 
   const audit = await stack.daemon.audit();
-  const refused = policyEvents(audit, 'policy.deny').filter(e => e.profile_id === 'iso' && e.action === 'register');
-  assert.equal(refused.length, 1, `expected one audited registration refusal, audit: ${JSON.stringify(audit.map(e => (e.event || e).kind))}`);
-  assert.equal(refused[0].reason, 'bearer_revoked');
-  assert.equal(refused[0].rp_id, 'rp-a.test');
+  const refusals = policyEvents(audit, 'policy.deny').filter(e => e.profile_id === 'iso' && e.action === 'register');
+  assert.deepEqual(refusals.map(e => [e.reason, e.rp_id]), [['bearer_revoked', 'rp-a.test'], ['bearer_revoked', 'unknown']],
+    `expected the request and the hello refusals, audit: ${JSON.stringify(audit.map(e => (e.event || e).kind))}`);
   assert.equal(policyEvents(audit, 'policy.allow').filter(e => e.action === 'register').length, 1, 'only the live registration was allowed');
   assertNoNotification(stack);
 });

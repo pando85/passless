@@ -63,10 +63,14 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 | 68 T | `PolicyRuntime::reload_lock` | `policy_engine.rs` | Serializes reloads. It is held across the epoch gate and the policy locks of rank 70. |
 | 69 T | `PolicyRuntime::key_use_gate` (`RwLock`) | `policy_engine.rs` | Rule 6. Read by a ceremony after its session gate; write by `bump_revocation_epoch` (under `reload_lock` on a reload). |
 | 70 T | `PolicyRuntime`: `current` (`RwLock`), `intents`, `grants`, `pending`, `pending_requests` | `policy_engine.rs` | Leaves (rule 2). `grants` may call the audit gate. |
+| 72 T | `ReadinessRegistry::entries` and its condvar | `transport/readiness.rs` | A leaf. The hello path records into it and the launch path reads or waits on it (`status`, `wait_attached`), possibly holding `lifecycle_lock` (10) and `browser_manager` (30). Waiters park on its condvar holding nothing else. The hello path never takes the lifecycle lock or the browser manager. |
+| 74 T | Sign transport: `Shared::connections` and each `Connection::in_flight` | `transport/mod.rs` | Leaves; they never nest with each other. Short map sections only: a connection to supersede is cloned out before it is closed. |
+| 76 T | A transport connection's write mutex (`Connection::writer`) | `transport/mod.rs` | A leaf. Held across one frame write, bounded by the 5 s write timeout. `closed` is set under it, so no frame follows a close. |
 | 80 | P7 escalation service mutex (reserved) | — | A leaf. It must never be taken with the operation lock, a policy guard or a session guard held. Waiters use its condvar holding nothing else. |
 | 90 | `AuditGate`: `append_lock`, then `sequence`, `last_hash`, `writer`, `current_segment(_name)`, `segment_index`, `anchor`, `anchor_inode`, `segment_file_ino` | `audit.rs` | Terminal leaf (rule 5). |
 | — | TPM `Context` mutex | `storage/tpm/portable/provider.rs` | A leaf inside the TPM key provider. It is released before the provider returns. |
 | — | `runtime_loop`, `sign_server_handle`, `WorkerTracker.handles`, `completed_sessions` | `runtime.rs` | Join-handle and bookkeeping locks. They never nest with the locks above. A `join()` under them only joins threads that do not take them. |
+| — | Relay (`sign-proxy`): `Relay::output`, `Relay::in_flight` | `bin/sign-proxy.rs` | A separate process. The two never nest: an id is retired or drained under `in_flight`, which is released before a frame is written under `output`. |
 
 ## Ceremony paths
 
@@ -88,6 +92,17 @@ checks (for example `sign_path_follows_the_lock_order`, and the `lock_order` uni
 **Register** follows the same path without the lease activation; its gates are held until the
 credential is written.
 
+**Sign transport** (`transport/mod.rs`). The connection's reader thread authenticates `hello`
+through the registry maps (50) and the session and policy reads of the bearer, one at a time;
+records the hello in the readiness registry (72); then, if it superseded another connection, takes
+the connection table (74) to find it and that connection's write mutex (76) to close it. Each
+`request` re-validates the bearer through the registry (50), is admitted by the request limiter
+(55), and is tracked in the in-flight table (74); its ceremony then runs on its own thread with no
+transport lock held, following the sign or register path above. The result is written under the
+write mutex (76) alone. A close sets `closed` under the write mutex, releases it, and only then
+takes the in-flight table (74) to cancel every request. The keepalive writer takes only the write
+mutex.
+
 **Browser launch** (`handle_ensure_browser`) takes these locks in this order:
 
 1. the `managed_sessions` slot (5);
@@ -96,6 +111,15 @@ credential is written.
 4. while `browser_manager` is held, briefly: bookkeeping (35), `agent_config` (45), storage (40)
    and then registry (50), and policy `grants` (70). Each of these is acquired and released
    separately.
+5. while `browser_manager` is held, the wait for the extension worker's attached `hello`
+   (`await_interception`, or `await_reattach` for an existing lease): it parks on the readiness
+   condvar (72) holding nothing else of rank above 30, and the transport's hello path that wakes
+   it takes only the registry maps (50) and the readiness registry (72).
+
+The admin `browser launch` (`handle_launch_browser`) takes `browser_manager` (30) without the
+lifecycle lock and then follows steps 4 and 5. The runtime loop reads the readiness registry (72)
+under `browser_manager` to find degraded leases (`poll_interception`), then records their audit
+events (90).
 
 **Reload** (`handle_reload_policy`) takes these locks in this order:
 
@@ -123,7 +147,9 @@ credential is written.
 ## Known bounded waits (not deadlocks)
 
 - `browser_manager` is held across a browser launch (up to the CDP discovery timeout of about
-  30 s) and across `terminate` (up to about 8 s). The first sign of a lease waits for it to
+  30 s, then up to `INTERCEPTION_ATTACH_TIMEOUT`, 30 s, for the worker to attach), across the
+  bootstrap's wait for a reconnecting worker (at most the 10 s degraded grace period) and across
+  `terminate` (up to about 8 s). The first sign of a lease waits for it to
   activate the lease, holding no backend lock, so the human CTAP path is not delayed.
 - A revocation waits for a key use that already passed its re-check (rule 6): one signature or
   one credential write.

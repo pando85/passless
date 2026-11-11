@@ -1,7 +1,10 @@
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use passless_core::agent::protocol::{DoctorCheck, EndpointDiagnosticState};
 use passless_core::agent::{AgentMode, ProfileId};
@@ -365,6 +368,127 @@ pub fn run_startup_diagnostics(
     }
 
     StartupDiagnosticResult { checks, fatal }
+}
+
+/// What running the installed `sign-proxy --version` gave (plan V-L5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayVersionProbe {
+    /// The relay ran and printed this version.
+    Found { path: PathBuf, version: String },
+    /// No relay where the launcher looks for it.
+    Missing { path: Option<PathBuf> },
+    /// The relay exists but `--version` failed.
+    Failed { path: PathBuf, error: String },
+}
+
+/// Runs the installed relay's `--version`, from where the browser launcher finds it.
+pub trait RelayProbe: Send + Sync {
+    fn probe_relay_version(&self) -> RelayVersionProbe;
+}
+
+/// How long `sign-proxy --version` may take.
+const RELAY_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most bytes of `--version` output kept.
+const RELAY_VERSION_MAX_LEN: usize = 128;
+
+pub struct ProductionRelayProbe;
+
+impl RelayProbe for ProductionRelayProbe {
+    fn probe_relay_version(&self) -> RelayVersionProbe {
+        let Some(path) = super::browser::installed_sign_proxy_path() else {
+            return RelayVersionProbe::Missing { path: None };
+        };
+        if !path.is_file() {
+            return RelayVersionProbe::Missing { path: Some(path) };
+        }
+        match run_relay_version(&path) {
+            Ok(version) => RelayVersionProbe::Found { path, version },
+            Err(error) => RelayVersionProbe::Failed { path, error },
+        }
+    }
+}
+
+fn run_relay_version(path: &Path) -> Result<String, String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run it: {e}"))?;
+    let deadline = Instant::now() + RELAY_VERSION_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("--version did not finish".to_string());
+            }
+            Err(e) => return Err(format!("waiting for it failed: {e}")),
+        }
+    };
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let _ = stdout
+            .take(RELAY_VERSION_MAX_LEN as u64)
+            .read_to_end(&mut output);
+    }
+    if !status.success() {
+        return Err(format!("--version exited with {status}"));
+    }
+    let version = String::from_utf8_lossy(&output).trim().to_string();
+    if version.is_empty() {
+        return Err("--version printed nothing".to_string());
+    }
+    Ok(version)
+}
+
+/// The `relay_version` doctor check: the installed relay's build version against the daemon's.
+/// A missing or broken relay fails (a launch fails without it); a different version passes with
+/// a warning, like the version skew a hello reports (plan V-L5).
+pub fn relay_version_check(probe: &dyn RelayProbe, daemon_version: &str) -> DoctorCheck {
+    let (passed, message) = match probe.probe_relay_version() {
+        RelayVersionProbe::Found { path, version } if version == daemon_version => (
+            true,
+            format!(
+                "sign-proxy {} matches the daemon ({})",
+                path.display(),
+                daemon_version
+            ),
+        ),
+        RelayVersionProbe::Found { path, version } => (
+            true,
+            format!(
+                "warning: sign-proxy {} is version {} but the daemon is {}; reinstall passless \
+                 so both come from the same build",
+                path.display(),
+                version,
+                daemon_version
+            ),
+        ),
+        RelayVersionProbe::Missing { path } => (
+            false,
+            format!(
+                "sign-proxy is missing{}; managed browsers cannot launch without it. Reinstall \
+                 passless so that sign-proxy is next to the passless executable",
+                path.map(|p| format!(" at {}", p.display()))
+                    .unwrap_or_default()
+            ),
+        ),
+        RelayVersionProbe::Failed { path, error } => (
+            false,
+            format!("sign-proxy {} is not usable: {}", path.display(), error),
+        ),
+    };
+    DoctorCheck {
+        name: "relay_version".into(),
+        passed,
+        message,
+    }
 }
 
 pub struct BrowserRuntimeRootInfo {
@@ -925,5 +1049,96 @@ mod tests {
         assert_eq!(stat_before.st_ino, stat_after.st_ino);
 
         unsafe { libc::close(dup_fd) };
+    }
+
+    struct MockRelayProbe(RelayVersionProbe);
+
+    impl RelayProbe for MockRelayProbe {
+        fn probe_relay_version(&self) -> RelayVersionProbe {
+            self.0.clone()
+        }
+    }
+
+    const DAEMON_VERSION: &str = "0.21.0+abc1234";
+
+    #[test]
+    fn test_relay_version_check_matching_version_passes() {
+        let check = relay_version_check(
+            &MockRelayProbe(RelayVersionProbe::Found {
+                path: PathBuf::from("/usr/bin/sign-proxy"),
+                version: DAEMON_VERSION.to_string(),
+            }),
+            DAEMON_VERSION,
+        );
+        assert_eq!(check.name, "relay_version");
+        assert!(check.passed);
+        assert!(check.message.contains("matches"), "{}", check.message);
+    }
+
+    #[test]
+    fn test_relay_version_check_mismatch_is_a_warning() {
+        let check = relay_version_check(
+            &MockRelayProbe(RelayVersionProbe::Found {
+                path: PathBuf::from("/usr/bin/sign-proxy"),
+                version: "0.20.0+def5678".to_string(),
+            }),
+            DAEMON_VERSION,
+        );
+        assert!(check.passed, "skew is not fatal (plan V-L5)");
+        assert!(check.message.starts_with("warning:"), "{}", check.message);
+        assert!(
+            check.message.contains("0.20.0+def5678"),
+            "{}",
+            check.message
+        );
+        assert!(check.message.contains(DAEMON_VERSION), "{}", check.message);
+    }
+
+    #[test]
+    fn test_relay_version_check_missing_or_broken_relay_fails() {
+        for probe in [
+            RelayVersionProbe::Missing {
+                path: Some(PathBuf::from("/usr/bin/sign-proxy")),
+            },
+            RelayVersionProbe::Missing { path: None },
+            RelayVersionProbe::Failed {
+                path: PathBuf::from("/usr/bin/sign-proxy"),
+                error: "--version exited with exit status: 1".to_string(),
+            },
+        ] {
+            let check = relay_version_check(&MockRelayProbe(probe.clone()), DAEMON_VERSION);
+            assert!(!check.passed, "{probe:?}");
+            assert!(check.message.contains("sign-proxy"), "{}", check.message);
+        }
+    }
+
+    #[test]
+    fn test_run_relay_version_reads_the_printed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // A script just written can be briefly busy when another test thread forks meanwhile.
+        let run = |path: &Path| {
+            for _ in 0..20 {
+                match run_relay_version(path) {
+                    Err(e) if e.contains("Text file busy") => {
+                        std::thread::sleep(std::time::Duration::from_millis(50))
+                    }
+                    other => return other,
+                }
+            }
+            run_relay_version(path)
+        };
+        let good = script(
+            "sign-proxy",
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 1.2.3+abc\n",
+        );
+        assert_eq!(run(&good).unwrap(), "1.2.3+abc");
+        let failing = script("failing-sign-proxy", "#!/bin/sh\nexit 3\n");
+        assert!(run(&failing).is_err());
     }
 }

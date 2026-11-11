@@ -584,6 +584,19 @@ Replace the `sign.rs` replay tests (2091-2258). E2E-14 and E2E-15.
 - Fix B2 (see Defects found by the P1 baseline) with a regression test.
 - Un-XFAIL E2E-02 (closes B3 against a real RP).
 
+P6 notes:
+
+- Removed `passless agent-admin install-native-messaging` and the cleanup that deleted
+  `rs.passless.sign_proxy.json` from the user's own browser configuration
+  (`~/.config/{chromium,google-chrome,google-chrome-beta}/NativeMessagingHosts`). The launcher writes
+  the native host manifest only into the lease's profile; the command wrote one into the personal
+  browser configuration, admitting the extension ID that the committed manifest `key` makes
+  reproducible.
+- A browser that runs as another user gets its own sign socket, `<sign dir>/<uid>/sock`, which
+  needs a root daemon; a non-root daemon refuses such a launch up front and `doctor` reports it.
+  The `hello` checks the peer's `SO_PEERCRED` UID against the lease's browser UID. A real
+  cross-UID run needs root and is left to P12 (manual).
+
 **P7.** Unit tests:
 
 - join and coalesce;
@@ -615,6 +628,9 @@ list. The schema version is bumped. E2E-32.
 - Add the manifest `key`; implement the incognito seed and its `isAllowedIncognitoAccess`
   verification (D4); confirm `chrome-headless-shell` detection (D4).
 - Re-check preference MAC behaviour for each supported browser version (D4).
+- In port mode, withholding the CDP endpoint of a degraded lease is advisory until the containment
+  lands: the browser's `DevToolsActivePort` in the profile stays readable by a same-UID agent.
+  Hide it from the agent, or document the residual risk.
 - Fix B1 and B7 (see Defects found by the P1 baseline) with a regression test.
 - Profile-scoped shared browser: a second principal's bearer must not depend on the first
   principal's grant; on first-principal exit, rebind or close (P5 review L5).
@@ -813,7 +829,7 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 | P3 | ✅ | — | UHID route and minted grants removed; registration bearers lease-bound; B3 (COSE_Key) and B6 fixed. E2E-11 pass; E2E-02 XFAIL until P6 (extension `/register` response shape only) |
 | P4 | ✅ | — | `RuleAction`/`PolicyAction`, legacy mapping with warnings (doctor shows them; unmappable legacy values are reported by `validate`, so a disabled `[agents]` section never breaks the human config load), validation (wildcard, `register = request`, `localhost` exact only, at most 32 RP rules without a `*` rule), `resolve_rules`/`MatchedRule`/`GrantSource` hook, ceremonies resolve per request through `PolicyRuntime::resolve` against the compiled in-memory generation (not a copy in the session context), numeric generation (serialized reloads), digest v4, pinning before `allowCredentials`, B4 fixed, launch-URL check by most specific rule. E2E-12, 13 added; E2E-03 uses an all-deny profile. Not yet real: config changes do not reach the runtime (reload re-recompiles the in-memory config; P5 re-reads the file) and there is no re-resolve before key use (P5/invariant 13). Also frozen: `max_operations` in the sign/register contexts (P5); audit `rule` identity (E2E-12/audit-rule XFAIL until P8) |
 | P5 | ✅ | — | Bearer sessions with length-prefixed replay key (join, 120 s outcome cache, never sign twice); budget only for key use; revocation/grant epochs with key-use gates; reload re-reads config; per-global/profile/session caps with explicit busy; LOCKING.md with debug lock-order checks; two deadlocks fixed; B5 fixed. E2E-14, 15 pass |
-| P6 | ⏳ | — | |
+| P6 | ✅ | — | Proxy-only worker, framed relay and daemon transport, attach-gated launch (B2 fixed). E2E-02 (B3 closed against SimpleWebAuthn) and E2E-06 un-XFAILed; E2E-16 to 22, 45, 51 added: full matrix (3 browsers x headed/headless) 28 PASS, 4 XFAIL per variant (E2E-20/escalation, 21 until P7; E2E-45/cdp-context until P10; E2E-12/audit-rule until P8). Fixed along the way: admin-launched leases were never activated (browser killed at the 300 s login deadline) and `agent-admin credential delete` could not delete an isolated-store credential (orphan cleanup, E2E-51). Worker death mid-request leaves the page pending until the next worker start fails it |
 | P7 | ⏳ | — | |
 | P8 | ⏳ | — | |
 | P9 | ⏳ | — | |

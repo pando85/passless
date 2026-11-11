@@ -14,7 +14,7 @@ scenario({ id: 'E2E-03', title: 'deny rule: NotAllowedError, no prompt, no key u
   const storeBefore = storeFingerprint(stack.daemon);
   const assertionsBefore = rp.authentications.length;
 
-  const b = await stack.open('agent', `${rp.origin}/sw`);
+  const b = await stack.open('agent', `${rp.origin}/sw`, { startUrl: false }); // a denied RP is no admissible start URL
   assertInterceptionActive(b);
   const res = await authenticate(b.page, { username: 'alice' });
 

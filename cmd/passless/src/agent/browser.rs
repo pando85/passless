@@ -21,8 +21,6 @@ use passless_core::agent::{
 };
 
 use rand::Rng;
-use rsa::PrivateKey;
-use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json;
 
@@ -30,6 +28,7 @@ use super::launcher::{
     DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NPROC, HardenedChildSetup,
     close_range_preserving,
 };
+use super::transport::{BearerReadiness, ReadinessRegistry};
 
 const RUNTIME_DIR_MODE: u32 = 0o700;
 const EXTENSION_DIR_MODE: u32 = 0o755;
@@ -52,81 +51,22 @@ pub const CDP_MAX_RESPONSE_TOTAL_BYTES: usize = 64 * 1024;
 pub const CDP_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CDP_MIN_TIMEOUT: Duration = Duration::from_millis(100);
 const CDP_READ_BUF_SIZE: usize = 16 * 1024;
-const EXTENSION_KEY_FILENAME: &str = "extension_key.pem";
-
-fn extension_key_path() -> Result<PathBuf, LaunchError> {
-    dirs::config_dir()
-        .map(|d| d.join("passless").join(EXTENSION_KEY_FILENAME))
-        .ok_or_else(|| {
-            LaunchError::ExtensionSetupFailed("cannot determine config directory".into())
-        })
-}
-
-fn generate_extension_key() -> Result<PrivateKey, LaunchError> {
-    let mut rng = getrandom::SysRng;
-    PrivateKey::new(&mut rng, 2048)
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("generate RSA key: {}", e)))
-}
-
-fn load_or_create_extension_key() -> Result<PrivateKey, LaunchError> {
-    let key_path = extension_key_path()?;
-
-    if key_path.exists() {
-        let pem_data = fs::read_to_string(&key_path)
-            .map_err(|e| LaunchError::ExtensionSetupFailed(format!("read extension key: {}", e)))?;
-        PrivateKey::from_pkcs8_pem(&pem_data)
-            .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse extension key: {}", e)))
-    } else {
-        let key = generate_extension_key()?;
-        let pem_data = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).map_err(|e| {
-            LaunchError::ExtensionSetupFailed(format!("encode extension key: {}", e))
-        })?;
-
-        if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                LaunchError::ExtensionSetupFailed(format!("create config directory: {}", e))
-            })?;
-        }
-
-        fs::write(&key_path, pem_data.as_bytes()).map_err(|e| {
-            LaunchError::ExtensionSetupFailed(format!("write extension key: {}", e))
-        })?;
-
-        Ok(key)
-    }
-}
-
-fn compute_extension_id_from_key(key: &PrivateKey) -> Result<String, LaunchError> {
-    use sha2::Digest;
-
-    let pub_key = key.to_public_key();
-    let pub_key_der = pub_key
-        .to_public_key_der()
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("encode public key: {}", e)))?;
-
-    let hash = sha2::Sha256::digest(pub_key_der.as_bytes());
-    let ext_id: String = hash
-        .iter()
-        .take(16)
-        .flat_map(|b| {
-            let high = (b >> 4) & 0x0F;
-            let low = b & 0x0F;
-            [(b'a' + high) as char, (b'a' + low) as char]
-        })
-        .collect();
-
-    Ok(ext_id)
-}
-
-fn get_public_key_base64(key: &PrivateKey) -> Result<String, LaunchError> {
-    let pub_key = key.to_public_key();
-    let pub_key_der = pub_key
-        .to_public_key_der()
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("encode public key: {}", e)))?;
-
-    use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.encode(pub_key_der.as_bytes()))
-}
+/// The interception extension's manifest. It carries the committed public `key` that fixes the
+/// extension ID ([`AGENT_EXTENSION_ID`]); it is written verbatim, never edited.
+const EXTENSION_MANIFEST_TEMPLATE: &str =
+    include_str!("../../assets/agent-extension/manifest.json");
+/// The interception extension's service worker; its placeholders are filled in per lease.
+const EXTENSION_WORKER_TEMPLATE: &str = include_str!("../../assets/agent-extension/worker.js");
+/// The placeholder prefix of `worker.js`; none may survive rendering.
+const EXTENSION_PLACEHOLDER_PREFIX: &str = "__PASSLESS_";
+/// The extension ID that the committed manifest `key` gives (checked by a unit test). The native
+/// messaging host admits only this origin.
+pub const AGENT_EXTENSION_ID: &str = "lfbahamapdlbimlffmhiomfdemnjhjkc";
+/// Request id of the daemon's own `Target.createTarget` that opens a deferred start URL in pipe
+/// mode. The launch sends it before any principal can reach the pipe.
+const START_URL_CDP_ID: u64 = 2_000_000_001;
+/// The page an intercepted browser starts on, before its start URL is opened.
+const BLANK_START_URL: &str = "about:blank";
 
 fn process_epoch() -> &'static Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -534,6 +474,8 @@ pub enum LaunchError {
     EndpointFileWriteFailed(String, String),
     ExtensionSetupFailed(String),
     InvalidCdpEndpoint(String),
+    /// The extension worker did not report the WebAuthn proxy attached in time (plan D6 layer 1).
+    InterceptionNotAttached(String),
 }
 
 impl fmt::Display for LaunchError {
@@ -574,6 +516,15 @@ impl fmt::Display for LaunchError {
             LaunchError::InvalidCdpEndpoint(msg) => {
                 write!(f, "invalid CDP endpoint: {}", msg)
             }
+            LaunchError::InterceptionNotAttached(msg) => write!(
+                f,
+                "the passless agent extension did not attach the WebAuthn proxy ({}); the \
+                 browser was stopped so that no WebAuthn request reaches the human \
+                 authenticator. Check that the browser supports chrome.webAuthenticationProxy \
+                 (Chromium 116 or later), that sign-proxy is installed next to passless, and \
+                 the daemon log for sign transport errors",
+                msg
+            ),
         }
     }
 }
@@ -662,6 +613,188 @@ pub struct BrowserLease {
     pub child_reaped: bool,
     pub cdp_endpoint: Option<String>,
     pub start_url: Option<String>,
+    /// The start URL of an intercepted lease, held back until its extension worker attached the
+    /// WebAuthn proxy (defect B2); `open_deferred_start_url` takes it.
+    deferred_start_url: Option<String>,
+    /// The interception state of a lease launched with the agent extension.
+    interception: Option<LeaseInterception>,
+}
+
+/// What the manager tracks about a lease's WebAuthn interception (plan D6 layer 1). The readiness
+/// itself lives in the sign transport's `ReadinessRegistry`, keyed by the bearer.
+struct LeaseInterception {
+    /// The bearer templated into the lease's `worker.js`; the worker says hello with it.
+    bearer: String,
+    /// The launch saw the worker attach (`await_interception` succeeded).
+    confirmed: bool,
+    /// The lease was reported (logged and audited) as degraded and has not re-attached since.
+    degraded_reported: bool,
+    /// Owner of the lease's `cdp-endpoint` file (port mode), written while attached.
+    endpoint_file_owner: (u32, u32),
+}
+
+impl fmt::Debug for LeaseInterception {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LeaseInterception")
+            .field("bearer", &"<redacted>")
+            .field("confirmed", &self.confirmed)
+            .field("degraded_reported", &self.degraded_reported)
+            .finish()
+    }
+}
+
+/// How long a launch waits for the extension worker to report the WebAuthn proxy attached before
+/// it fails closed (plan D6 layer 1). Headed Chrome for Testing under Xvfb can take a while.
+pub const INTERCEPTION_ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a launched lease may stay unattached (worker reconnecting) before it is degraded.
+pub const INTERCEPTION_DEGRADED_GRACE: Duration = Duration::from_secs(10);
+
+/// Whether a lease's WebAuthn requests are intercepted (plan D6 layer 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterceptionState {
+    /// The worker is connected and reports the WebAuthn proxy attached.
+    Attached,
+    /// Not attached, but for less than the grace period (the worker is reconnecting), or the
+    /// launch has not seen the worker attach yet.
+    Pending,
+    /// Not attached for longer than the grace period. The endpoint is not handed out.
+    Degraded,
+}
+
+impl InterceptionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Pending => "pending",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    /// The state of a lease whose launch saw its worker attach, from the bearer's last reported
+    /// readiness. A missing record is degraded (fail closed).
+    pub fn of_confirmed(
+        readiness: Option<&BearerReadiness>,
+        now: Instant,
+        grace: Duration,
+    ) -> Self {
+        let Some(readiness) = readiness else {
+            return Self::Degraded;
+        };
+        if readiness.connected && readiness.attached {
+            return Self::Attached;
+        }
+        match readiness.detached_since {
+            Some(since) if now.saturating_duration_since(since) < grace => Self::Pending,
+            _ => Self::Degraded,
+        }
+    }
+}
+
+impl fmt::Display for InterceptionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An interception state change that the runtime logs and audits once (see
+/// `BrowserProcessManager::poll_interception`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterceptionTransition {
+    pub lease_id: BrowserLeaseId,
+    pub profile_id: ProfileId,
+    pub degraded: bool,
+}
+
+/// Opens a lease's deferred start URL once its interception is ready. Injectable for tests.
+pub trait StartUrlOpener: Send + Sync {
+    fn open(
+        &self,
+        manager: &mut BrowserProcessManager,
+        lease_id: &BrowserLeaseId,
+        url: &str,
+    ) -> Result<(), String>;
+}
+
+/// Opens the URL in a new tab over CDP: `Target.createTarget` on the daemon's pipe in pipe mode,
+/// `PUT /json/new` on the loopback DevTools port in port mode.
+pub struct CdpStartUrlOpener;
+
+impl StartUrlOpener for CdpStartUrlOpener {
+    fn open(
+        &self,
+        manager: &mut BrowserProcessManager,
+        lease_id: &BrowserLeaseId,
+        url: &str,
+    ) -> Result<(), String> {
+        match manager.lease_has_cdp_pipes(lease_id) {
+            None => Err("lease not found".to_string()),
+            Some(true) => {
+                let request = serde_json::json!({
+                    "id": START_URL_CDP_ID,
+                    "method": "Target.createTarget",
+                    "params": {"url": url},
+                })
+                .to_string();
+                let result = manager
+                    .cdp_round_trip(lease_id, &request, START_URL_OPEN_TIMEOUT)
+                    .map_err(|e| e.to_string())?;
+                let id = serde_json::Number::from(START_URL_CDP_ID);
+                let reply = result
+                    .messages
+                    .iter()
+                    .find(|m| cdp_message_has_id(m, &id))
+                    .ok_or("no reply to Target.createTarget")?;
+                match serde_json::from_str::<serde_json::Value>(reply) {
+                    Ok(v) if v.get("error").is_none() => Ok(()),
+                    _ => Err(format!("Target.createTarget failed: {reply}")),
+                }
+            }
+            Some(false) => {
+                let endpoint = manager
+                    .lease_cdp_endpoint(lease_id)
+                    .flatten()
+                    .ok_or("the lease has no CDP endpoint")?;
+                open_url_over_devtools_http(&endpoint, url)
+            }
+        }
+    }
+}
+
+/// How long opening a deferred start URL may take.
+const START_URL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `PUT http://127.0.0.1:<port>/json/new?<url>` on the DevTools HTTP endpoint of a port-mode
+/// browser, whose port is taken from its (already loopback-validated) WebSocket URL.
+fn open_url_over_devtools_http(ws_endpoint: &str, url: &str) -> Result<(), String> {
+    validate_loopback_ws_url(ws_endpoint).map_err(|e| e.to_string())?;
+    let port = url::Url::parse(ws_endpoint)
+        .ok()
+        .and_then(|u| u.port())
+        .ok_or("the CDP endpoint has no port")?;
+    let encoded: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, START_URL_OPEN_TIMEOUT)
+        .map_err(|e| format!("connect to the DevTools port: {e}"))?;
+    let _ = stream.set_read_timeout(Some(START_URL_OPEN_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(START_URL_OPEN_TIMEOUT));
+    let request = format!(
+        "PUT /json/new?{encoded} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("write to the DevTools port: {e}"))?;
+    let mut status = [0u8; 12];
+    stream
+        .read_exact(&mut status)
+        .map_err(|e| format!("read the DevTools reply: {e}"))?;
+    if status.starts_with(b"HTTP/1.1 200") || status.starts_with(b"HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(format!(
+            "DevTools /json/new answered {}",
+            String::from_utf8_lossy(&status)
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +818,10 @@ pub struct BrowserProcessManager {
     sigterm_timeout: Duration,
     sigkill_timeout: Duration,
     spawner: Arc<dyn ChildSpawner>,
+    start_url_opener: Arc<dyn StartUrlOpener>,
+    /// Where the `sign-proxy` relay is; `None` means next to the running executable
+    /// (`installed_sign_proxy_path`). Tests point it elsewhere.
+    sign_proxy_path: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -697,6 +834,8 @@ impl BrowserProcessManager {
             sigterm_timeout: DEFAULT_SIGTERM_TIMEOUT,
             sigkill_timeout: DEFAULT_SIGKILL_TIMEOUT,
             spawner: Arc::new(FakeSpawner),
+            start_url_opener: Arc::new(CdpStartUrlOpener),
+            sign_proxy_path: Some(tests::test_sign_proxy_path()),
         }
     }
 
@@ -708,6 +847,8 @@ impl BrowserProcessManager {
             sigterm_timeout: DEFAULT_SIGTERM_TIMEOUT,
             sigkill_timeout: DEFAULT_SIGKILL_TIMEOUT,
             spawner,
+            start_url_opener: Arc::new(CdpStartUrlOpener),
+            sign_proxy_path: Some(tests::test_sign_proxy_path()),
         }
     }
 
@@ -723,6 +864,8 @@ impl BrowserProcessManager {
             sigterm_timeout,
             sigkill_timeout,
             spawner: Arc::new(FakeSpawner),
+            start_url_opener: Arc::new(CdpStartUrlOpener),
+            sign_proxy_path: Some(tests::test_sign_proxy_path()),
         }
     }
 
@@ -733,6 +876,8 @@ impl BrowserProcessManager {
             sigterm_timeout: DEFAULT_SIGTERM_TIMEOUT,
             sigkill_timeout: DEFAULT_SIGKILL_TIMEOUT,
             spawner: Arc::new(ProductionSpawner),
+            start_url_opener: Arc::new(CdpStartUrlOpener),
+            sign_proxy_path: None,
         }
     }
 
@@ -816,27 +961,27 @@ impl BrowserProcessManager {
             // Verified before anything is spawned: a missing or unreadable extension is a launch
             // error, never a browser without interception.
             verify_extension_dir(&ext_dir)?;
-            if let Ok(current_exe) = std::env::current_exe() {
-                let sign_proxy = current_exe
-                    .parent()
-                    .map(|p| p.join("sign-proxy"))
-                    .unwrap_or_else(|| PathBuf::from("sign-proxy"));
-                if sign_proxy.exists() {
-                    if let Err(e) = install_native_messaging_manifest(
-                        &ext_dir,
-                        &config.executable,
-                        &sign_proxy,
-                        Some(&profile_dir),
-                    ) {
-                        log::warn!("failed to install native messaging manifest: {}", e);
-                    }
-                } else {
-                    log::warn!(
-                        "sign-proxy not found at {}, native messaging disabled",
-                        sign_proxy.display()
-                    );
-                }
+            // Without the relay the worker cannot reach the daemon, so nothing is intercepted: a
+            // missing relay is a launch error too.
+            let sign_proxy = self
+                .sign_proxy_path
+                .clone()
+                .or_else(installed_sign_proxy_path)
+                .ok_or_else(|| {
+                    LaunchError::ExtensionSetupFailed(
+                        "cannot locate the sign-proxy relay (the executable path is unknown)"
+                            .into(),
+                    )
+                })?;
+            if !sign_proxy.is_file() {
+                return Err(LaunchError::ExtensionSetupFailed(format!(
+                    "the sign-proxy relay is missing at {}; refusing to launch the managed \
+                     browser without WebAuthn interception. Reinstall passless so that \
+                     sign-proxy is installed next to the passless executable",
+                    sign_proxy.display()
+                )));
             }
+            install_native_messaging_manifest(&ext_dir, &sign_proxy, &profile_dir)?;
         }
 
         let profile_fp = fingerprint_path(&profile_dir).map_err(|e| {
@@ -847,6 +992,19 @@ impl BrowserProcessManager {
             validate_start_url(url, &config.start_url_rules)
                 .map_err(|_| LaunchError::InvalidStartUrl(url.clone()))?;
         }
+
+        // An intercepted browser starts on a blank page; its start URL is opened only once its
+        // worker reported the WebAuthn proxy attached (`open_deferred_start_url`, defect B2):
+        // a page loaded earlier could reach the native authenticator.
+        let deferred_config;
+        let (config, deferred_start_url) = if agent_endpoint.is_some() {
+            let mut spawn_config = config.clone();
+            let deferred = spawn_config.start_url.replace(BLANK_START_URL.to_string());
+            deferred_config = spawn_config;
+            (&deferred_config, deferred)
+        } else {
+            (config, None)
+        };
 
         let is_port_mode = config.cdp_expose == CdpExposeMode::Port;
 
@@ -864,12 +1022,16 @@ impl BrowserProcessManager {
                     return Err(err);
                 }
             };
-            if let Err(err) = write_cdp_endpoint(
-                &runtime_dir,
-                &discovered,
-                config.target_uid,
-                config.target_gid,
-            ) {
+            // An intercepted lease's `cdp-endpoint` file is written only once its worker attached
+            // (`await_interception`) and removed while it is degraded; see `sync_cdp_endpoint_file`.
+            if agent_endpoint.is_none()
+                && let Err(err) = write_cdp_endpoint(
+                    &runtime_dir,
+                    &discovered,
+                    config.target_uid,
+                    config.target_gid,
+                )
+            {
                 terminate_failed_browser_spawn(&mut child);
                 return Err(err);
             }
@@ -942,7 +1104,18 @@ impl BrowserProcessManager {
             cdp_read_buf: Vec::with_capacity(CDP_READ_BUF_SIZE),
             child_reaped: false,
             cdp_endpoint: cdp_endpoint_url,
-            start_url: config.start_url.clone(),
+            start_url: if agent_endpoint.is_some() {
+                deferred_start_url.clone()
+            } else {
+                config.start_url.clone()
+            },
+            deferred_start_url,
+            interception: agent_endpoint.map(|metadata| LeaseInterception {
+                bearer: metadata.bearer_token.clone(),
+                confirmed: false,
+                degraded_reported: false,
+                endpoint_file_owner: (config.target_uid, config.target_gid),
+            }),
         };
 
         if let Some(mut consumed) = consumed_pipes {
@@ -1126,8 +1299,6 @@ impl BrowserProcessManager {
     }
 
     pub fn cleanup(&mut self, lease_id: &BrowserLeaseId) -> Result<CleanupSafety, TransitionError> {
-        remove_native_messaging_manifest_from_all();
-
         let entry = self.leases.get(lease_id).ok_or(TransitionError::NotFound)?;
 
         let manifest = &entry.manifest;
@@ -1226,6 +1397,171 @@ impl BrowserProcessManager {
 
     pub fn lease_has_cdp_pipes(&self, lease_id: &BrowserLeaseId) -> Option<bool> {
         self.leases.get(lease_id).map(|l| l.cdp.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_start_url_opener(&mut self, opener: Arc<dyn StartUrlOpener>) {
+        self.start_url_opener = opener;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sign_proxy_path(&mut self, path: PathBuf) {
+        self.sign_proxy_path = Some(path);
+    }
+
+    /// Blocks until the extension worker of `lease_id` said hello with `attached = true`, or
+    /// `timeout` passed (plan D6 layer 1). A launch reports success only after this returns `Ok`;
+    /// it marks the lease's interception confirmed.
+    ///
+    /// It holds the browser manager (the caller's guard) but takes only the readiness leaf lock,
+    /// which the transport's hello path also takes alone (LOCKING.md).
+    pub fn await_interception(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        readiness: &ReadinessRegistry,
+        timeout: Duration,
+    ) -> Result<BearerReadiness, LaunchError> {
+        let state = self
+            .wait_for_attach(lease_id, readiness, timeout)
+            .map_err(LaunchError::InterceptionNotAttached)?;
+        if let Some(lease) = self.leases.get_mut(lease_id)
+            && let Some(interception) = lease.interception.as_mut()
+        {
+            interception.confirmed = true;
+            sync_cdp_endpoint_file(lease, true)?;
+        }
+        Ok(state)
+    }
+
+    /// Waits up to `timeout` for a confirmed lease whose worker is reconnecting to re-attach.
+    pub fn await_reattach(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        readiness: &ReadinessRegistry,
+        timeout: Duration,
+    ) -> Result<BearerReadiness, String> {
+        self.wait_for_attach(lease_id, readiness, timeout)
+    }
+
+    /// Waits in short slices so a browser that exits during the wait ends it at once.
+    fn wait_for_attach(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+        readiness: &ReadinessRegistry,
+        timeout: Duration,
+    ) -> Result<BearerReadiness, String> {
+        const SLICE: Duration = Duration::from_millis(250);
+        let bearer = self
+            .leases
+            .get(lease_id)
+            .and_then(|lease| lease.interception.as_ref())
+            .map(|interception| interception.bearer.clone())
+            .ok_or("the lease was launched without the extension")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let slice = deadline
+                .saturating_duration_since(Instant::now())
+                .min(SLICE);
+            if let Some(state) = readiness.wait_attached(&bearer, slice) {
+                return Ok(state);
+            }
+            if let Some(child) = self
+                .leases
+                .get_mut(lease_id)
+                .and_then(|lease| lease.child.as_mut())
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                return Err(format!("the browser exited first ({status})"));
+            }
+            if Instant::now() >= deadline {
+                let why = match readiness.status(&bearer) {
+                    None => "the extension worker never connected to the daemon",
+                    Some(state) if !state.connected => "the extension worker's connection closed",
+                    Some(_) => "the extension worker reported attached = false",
+                };
+                return Err(format!("{why} within {:.1} s", timeout.as_secs_f32()));
+            }
+        }
+    }
+
+    /// Opens the start URL that the launch held back until interception was ready (defect B2).
+    /// Refused unless `await_interception` succeeded; does nothing if there is none, or if it was
+    /// already opened. Returns the URL it opened.
+    pub fn open_deferred_start_url(
+        &mut self,
+        lease_id: &BrowserLeaseId,
+    ) -> Result<Option<String>, String> {
+        let lease = self.leases.get_mut(lease_id).ok_or("lease not found")?;
+        if !lease.interception.as_ref().is_some_and(|i| i.confirmed) {
+            return Err("interception is not confirmed for this lease".to_string());
+        }
+        let Some(url) = lease.deferred_start_url.take() else {
+            return Ok(None);
+        };
+        let opener = self.start_url_opener.clone();
+        opener.open(self, lease_id, &url)?;
+        Ok(Some(url))
+    }
+
+    /// The interception state of `lease_id` (`None` for a lease without the extension). A lease
+    /// whose launch has not seen the worker attach yet is `Pending`.
+    pub fn interception_state(
+        &self,
+        lease_id: &BrowserLeaseId,
+        readiness: &ReadinessRegistry,
+        grace: Duration,
+    ) -> Option<(InterceptionState, Option<BearerReadiness>)> {
+        let interception = self.leases.get(lease_id)?.interception.as_ref()?;
+        let status = readiness.status(&interception.bearer);
+        let state = if interception.confirmed {
+            InterceptionState::of_confirmed(status.as_ref(), Instant::now(), grace)
+        } else {
+            InterceptionState::Pending
+        };
+        Some((state, status))
+    }
+
+    /// Re-evaluates the interception of every confirmed, live lease and returns the leases whose
+    /// degraded state changed since the last call: each episode is reported once when it starts
+    /// and once when the worker re-attaches. The runtime loop calls it and logs and audits them.
+    pub fn poll_interception(
+        &mut self,
+        readiness: &ReadinessRegistry,
+        grace: Duration,
+    ) -> Vec<InterceptionTransition> {
+        let now = Instant::now();
+        let mut transitions = Vec::new();
+        for lease in self.leases.values_mut() {
+            if lease.state.is_terminal() {
+                continue;
+            }
+            let Some(interception) = lease.interception.as_mut() else {
+                continue;
+            };
+            if !interception.confirmed {
+                continue;
+            }
+            let status = readiness.status(&interception.bearer);
+            let state = InterceptionState::of_confirmed(status.as_ref(), now, grace);
+            let degraded = match state {
+                InterceptionState::Degraded => true,
+                InterceptionState::Attached => false,
+                // Within the grace period nothing changes yet.
+                InterceptionState::Pending => continue,
+            };
+            if degraded != interception.degraded_reported {
+                interception.degraded_reported = degraded;
+                if let Err(e) = sync_cdp_endpoint_file(lease, !degraded) {
+                    log::warn!("browser lease {}: {}", lease.id, e);
+                }
+                transitions.push(InterceptionTransition {
+                    lease_id: lease.id.clone(),
+                    profile_id: lease.profile_id.clone(),
+                    degraded,
+                });
+            }
+        }
+        transitions
     }
 
     pub fn snapshot(&self, lease_id: &BrowserLeaseId) -> Option<LeaseSnapshot> {
@@ -1811,17 +2147,18 @@ fn create_cdp_pipes() -> io::Result<CdpPipes> {
     })
 }
 
-fn render_channel_script(template: &str, channel: &str) -> String {
-    template.replace("__PASSLESS_CHANNEL__", channel)
-}
-
-fn render_worker_script(template: &str, channel: &str, metadata: &AgentEndpointMetadata) -> String {
-    let bearer_literal = serde_json::to_string(&metadata.bearer_token).unwrap();
-    let socket_path_literal = serde_json::to_string(&metadata.socket_path).unwrap();
+/// Renders `worker.js` for one lease: each placeholder becomes a JSON string literal. The worker
+/// throws before it registers any listener if a placeholder survives, so `verify_extension_dir`
+/// rejects such a file before launch.
+fn render_worker_script(template: &str, metadata: &AgentEndpointMetadata) -> String {
+    let literal = |value: &str| serde_json::to_string(value).expect("a string serializes");
     template
-        .replace("__PASSLESS_CHANNEL__", channel)
-        .replace("__PASSLESS_SOCKET_PATH__", &socket_path_literal)
-        .replace("__PASSLESS_BEARER__", &bearer_literal)
+        .replace("__PASSLESS_BEARER__", &literal(&metadata.bearer_token))
+        .replace("__PASSLESS_SOCKET_PATH__", &literal(&metadata.socket_path))
+        .replace(
+            "__PASSLESS_BUILD_VERSION__",
+            &literal(&super::transport::build_version()),
+        )
 }
 
 fn write_extension_file(
@@ -1854,6 +2191,9 @@ fn write_extension_file(
     Ok(())
 }
 
+/// Writes the lease's interception extension: `manifest.json` verbatim from the assets (its
+/// committed `key` fixes the extension ID) and `worker.js` with the lease's bearer, sign socket
+/// and build version. The worker file holds the bearer, so it is readable by the browser user only.
 fn generate_agent_extension(
     runtime_dir: &Path,
     metadata: &AgentEndpointMetadata,
@@ -1864,47 +2204,10 @@ fn generate_agent_extension(
     create_lease_dir(&ext_dir, EXTENSION_DIR_MODE, target_uid, target_gid)
         .map_err(|e| LaunchError::ExtensionSetupFailed(format!("extension dir: {}", e)))?;
 
-    let channel_bytes: [u8; 32] = rand::thread_rng().r#gen();
-    let channel: String = channel_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-
-    let key = load_or_create_extension_key()?;
-    let pub_key_base64 = get_public_key_base64(&key)?;
-
-    let base_manifest: serde_json::Value = serde_json::from_str(include_str!(
-        "../../assets/agent-extension/manifest.json"
-    ))
-    .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse base manifest: {}", e)))?;
-    let mut manifest = base_manifest.as_object().cloned().unwrap_or_default();
-    manifest.insert("key".to_string(), serde_json::Value::String(pub_key_base64));
-    let manifest_json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("serialize manifest: {}", e)))?;
-
     write_extension_file(
         &ext_dir,
         "manifest.json",
-        &manifest_json,
-        0o644,
-        target_uid,
-        target_gid,
-    )?;
-    write_extension_file(
-        &ext_dir,
-        "main.js",
-        &render_channel_script(
-            include_str!("../../assets/agent-extension/main.js"),
-            &channel,
-        ),
-        0o644,
-        target_uid,
-        target_gid,
-    )?;
-    write_extension_file(
-        &ext_dir,
-        "broker.js",
-        &render_channel_script(
-            include_str!("../../assets/agent-extension/broker.js"),
-            &channel,
-        ),
+        EXTENSION_MANIFEST_TEMPLATE,
         0o644,
         target_uid,
         target_gid,
@@ -1912,11 +2215,7 @@ fn generate_agent_extension(
     write_extension_file(
         &ext_dir,
         "worker.js",
-        &render_worker_script(
-            include_str!("../../assets/agent-extension/worker.js"),
-            &channel,
-            metadata,
-        ),
+        &render_worker_script(EXTENSION_WORKER_TEMPLATE, metadata),
         0o600,
         target_uid,
         target_gid,
@@ -1945,37 +2244,59 @@ fn simulate_missing_extension() -> bool {
 
 pub const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
 
-pub fn compute_extension_id(_ext_dir: &Path) -> String {
-    load_or_create_extension_key()
-        .and_then(|key| compute_extension_id_from_key(&key))
-        .unwrap_or_else(|e| {
-            log::error!("failed to compute stable extension ID: {}", e);
-            String::new()
-        })
+/// The Chromium extension ID of an unpacked extension whose manifest carries `key`: the SHA-256 of
+/// the key's SubjectPublicKeyInfo DER, first 16 bytes, each nibble mapped to `a`..`p`.
+pub fn compute_extension_id(manifest_json: &str) -> Result<String, LaunchError> {
+    use base64::Engine;
+    use sha2::Digest;
+
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("parse manifest: {}", e)))?;
+    let key = manifest
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| LaunchError::ExtensionSetupFailed("manifest has no key".into()))?;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .map_err(|e| LaunchError::ExtensionSetupFailed(format!("decode manifest key: {}", e)))?;
+    let hash = sha2::Sha256::digest(&der);
+    Ok(hash
+        .iter()
+        .take(16)
+        .flat_map(|b| [(b'a' + (b >> 4)) as char, (b'a' + (b & 0x0F)) as char])
+        .collect())
 }
 
-fn native_messaging_hosts_dir(browser_exec: &Path) -> Option<PathBuf> {
-    let exec_name = browser_exec
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    let config_dir = if exec_name.contains("google-chrome") || exec_name == "chrome" {
-        dirs::config_dir().map(|d| d.join("google-chrome"))
-    } else if exec_name.contains("chromium") {
-        dirs::config_dir().map(|d| d.join("chromium"))
-    } else {
-        dirs::config_dir().map(|d| d.join("chromium"))
-    };
-    config_dir.map(|d| d.join("NativeMessagingHosts"))
+/// The ID of the extension in `ext_dir`, from its `manifest.json`.
+pub fn extension_id_of_dir(ext_dir: &Path) -> Result<String, LaunchError> {
+    let manifest = fs::read_to_string(ext_dir.join("manifest.json")).map_err(|e| {
+        LaunchError::ExtensionSetupFailed(format!(
+            "read {}: {}",
+            ext_dir.join("manifest.json").display(),
+            e
+        ))
+    })?;
+    compute_extension_id(&manifest)
 }
 
-pub fn install_native_messaging_manifest(
+/// Where the launcher expects the `sign-proxy` relay: next to the running executable. `None` if
+/// the executable's path is unknown.
+pub(crate) fn installed_sign_proxy_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("sign-proxy")))
+}
+
+/// Writes the native messaging host manifest into the lease's profile (`--user-data-dir`), never
+/// into the user's own browser configuration: it admits only the committed extension ID and runs
+/// `sign_proxy_path`.
+fn install_native_messaging_manifest(
     ext_dir: &Path,
-    browser_exec: &Path,
     sign_proxy_path: &Path,
-    profile_dir: Option<&Path>,
+    profile_dir: &Path,
 ) -> Result<PathBuf, LaunchError> {
-    let ext_id = compute_extension_id(ext_dir);
+    let ext_id = extension_id_of_dir(ext_dir)?;
     let manifest = serde_json::json!({
         "name": NATIVE_MESSAGING_HOST_NAME,
         "description": "Passless agent sign proxy",
@@ -1983,18 +2304,7 @@ pub fn install_native_messaging_manifest(
         "type": "stdio",
         "allowed_origins": [format!("chrome-extension://{}/", ext_id)]
     });
-
-    let hosts_dir = if let Some(profile_dir) = profile_dir {
-        profile_dir.join("NativeMessagingHosts")
-    } else {
-        native_messaging_hosts_dir(browser_exec).ok_or_else(|| {
-            LaunchError::ExtensionSetupFailed(
-                "cannot determine native messaging hosts directory".into(),
-            )
-        })?
-    };
-
-    write_native_messaging_manifest(&hosts_dir, &manifest)
+    write_native_messaging_manifest(&profile_dir.join("NativeMessagingHosts"), &manifest)
 }
 
 fn write_native_messaging_manifest(
@@ -2024,24 +2334,19 @@ fn write_native_messaging_manifest(
     Ok(manifest_path)
 }
 
-fn remove_native_messaging_manifest_from_all() {
-    if let Some(config_dir) = dirs::config_dir() {
-        for browser_dir in &["chromium", "google-chrome", "google-chrome-beta"] {
-            let hosts_dir = config_dir.join(browser_dir).join("NativeMessagingHosts");
-            let manifest_path = hosts_dir.join(format!("{}.json", NATIVE_MESSAGING_HOST_NAME));
-            let _ = fs::remove_file(&manifest_path);
-        }
-    }
-}
+/// The service worker file the extension consists of, besides `manifest.json`.
+const EXTENSION_WORKER: &str = "worker.js";
 
-/// Scripts the generated extension always consists of; each must exist and be non-empty.
-const EXTENSION_SCRIPTS: [&str; 3] = ["worker.js", "main.js", "broker.js"];
-
-/// Checks that the agent extension can be loaded and still intercepts WebAuthn: the directory exists,
-/// the three scripts exist and are non-empty, and `manifest.json` is readable valid JSON that
-/// declares what the generator emits (`nativeMessaging`, the service worker, `main.js` as a MAIN-world
-/// `document_start` script in all frames, and `broker.js`). A failure is a launch error with an
-/// actionable message; the caller must not start any browser (plan D6 layer 2).
+/// Checks that the agent extension can be loaded and still intercepts WebAuthn (plan D6 layer 2):
+///
+/// - the directory exists;
+/// - `manifest.json` is a JSON object with the `webAuthenticationProxy` and `nativeMessaging`
+///   permissions, `worker.js` as its service worker, a non-empty `key` (it fixes the extension ID
+///   the native messaging host admits) and no content scripts;
+/// - `worker.js` is non-empty and has no unreplaced `__PASSLESS_` placeholder (the worker throws
+///   before registering its listeners if one is left, and requests would go native).
+///
+/// A failure is a launch error with an actionable message; the caller must not start any browser.
 pub(crate) fn verify_extension_dir(ext_dir: &Path) -> Result<(), LaunchError> {
     let fail = |why: String| {
         LaunchError::ExtensionSetupFailed(format!(
@@ -2080,81 +2385,73 @@ pub(crate) fn verify_extension_dir(ext_dir: &Path) -> Result<(), LaunchError> {
         }
     };
 
-    let mut scripts: Vec<&str> = EXTENSION_SCRIPTS.to_vec();
-    if let Some(worker) = manifest
-        .pointer("/background/service_worker")
-        .and_then(|v| v.as_str())
-    {
-        scripts.push(worker);
-    }
-    for script in scripts {
-        let path = ext_dir.join(script);
-        match fs::metadata(&path) {
-            Ok(m) if m.is_file() && m.len() > 0 => {}
-            Ok(_) => {
-                return Err(fail(format!(
-                    "extension script {} is empty or not a regular file",
-                    path.display()
-                )));
-            }
-            Err(e) => {
-                return Err(fail(format!(
-                    "extension script {} is missing or unreadable: {e}",
-                    path.display()
-                )));
-            }
-        }
-    }
-
     let has_permission = |name: &str| {
         manifest
             .get("permissions")
             .and_then(|v| v.as_array())
             .is_some_and(|p| p.iter().any(|v| v.as_str() == Some(name)))
     };
-    if !has_permission("nativeMessaging") {
-        return Err(fail(
-            "extension manifest lacks the nativeMessaging permission".to_string(),
-        ));
+    for permission in ["webAuthenticationProxy", "nativeMessaging"] {
+        if !has_permission(permission) {
+            return Err(fail(format!(
+                "extension manifest lacks the {permission} permission"
+            )));
+        }
     }
     if manifest
         .pointer("/background/service_worker")
         .and_then(|v| v.as_str())
-        != Some("worker.js")
+        != Some(EXTENSION_WORKER)
+    {
+        return Err(fail(format!(
+            "extension manifest does not declare {EXTENSION_WORKER} as its service worker"
+        )));
+    }
+    if !manifest
+        .get("key")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.is_empty())
     {
         return Err(fail(
-            "extension manifest does not declare worker.js as its service worker".to_string(),
-        ));
-    }
-
-    let content_scripts = manifest
-        .get("content_scripts")
-        .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let entry_for = |script: &str| {
-        content_scripts.iter().find(|entry| {
-            entry
-                .get("js")
-                .and_then(|v| v.as_array())
-                .is_some_and(|js| js.iter().any(|v| v.as_str() == Some(script)))
-        })
-    };
-    let main = entry_for("main.js")
-        .ok_or_else(|| fail("extension manifest does not inject main.js".to_string()))?;
-    let main_ok = main.get("world").and_then(|v| v.as_str()) == Some("MAIN")
-        && main.get("all_frames").and_then(|v| v.as_bool()) == Some(true)
-        && main.get("run_at").and_then(|v| v.as_str()) == Some("document_start");
-    if !main_ok {
-        return Err(fail(
-            "extension manifest must inject main.js in the MAIN world, in all frames, at document_start"
+            "extension manifest has no key, so its extension ID is not the one the native \
+             messaging host admits"
                 .to_string(),
         ));
     }
-    if entry_for("broker.js").is_none() {
+    if manifest.get("content_scripts").is_some() {
         return Err(fail(
-            "extension manifest does not inject broker.js".to_string(),
+            "extension manifest declares content scripts; the interception extension is \
+             worker-only"
+                .to_string(),
         ));
+    }
+
+    let worker_path = ext_dir.join(EXTENSION_WORKER);
+    let worker = match fs::metadata(&worker_path) {
+        Ok(m) if m.is_file() && m.len() > 0 => fs::read_to_string(&worker_path).map_err(|e| {
+            fail(format!(
+                "extension script {} is not readable: {e}",
+                worker_path.display()
+            ))
+        })?,
+        Ok(_) => {
+            return Err(fail(format!(
+                "extension script {} is empty or not a regular file",
+                worker_path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(fail(format!(
+                "extension script {} is missing or unreadable: {e}",
+                worker_path.display()
+            )));
+        }
+    };
+    if worker.contains(EXTENSION_PLACEHOLDER_PREFIX) {
+        return Err(fail(format!(
+            "extension script {} has an unreplaced {EXTENSION_PLACEHOLDER_PREFIX} placeholder",
+            worker_path.display()
+        )));
     }
     Ok(())
 }
@@ -2652,6 +2949,29 @@ fn extract_web_socket_debugger_url(http_response: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+/// Keeps an intercepted port-mode lease's `cdp-endpoint` file in step with its interception: it
+/// exists only while the worker is attached (finding: it used to be written before the attach and
+/// left behind on degrade). Pipe-mode leases have no such file.
+fn sync_cdp_endpoint_file(lease: &BrowserLease, attached: bool) -> Result<(), LaunchError> {
+    let (Some(endpoint), Some(interception)) = (&lease.cdp_endpoint, &lease.interception) else {
+        return Ok(());
+    };
+    let runtime_dir = &lease.manifest.runtime_dir;
+    if attached {
+        let (uid, gid) = interception.endpoint_file_owner;
+        write_cdp_endpoint(runtime_dir, endpoint, uid, gid)
+    } else {
+        match fs::remove_file(runtime_dir.join("cdp-endpoint")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(LaunchError::EndpointFileWriteFailed(
+                runtime_dir.join("cdp-endpoint").display().to_string(),
+                e.to_string(),
+            )),
+        }
+    }
+}
+
 fn write_cdp_endpoint(
     runtime_dir: &Path,
     url: &str,
@@ -3101,6 +3421,11 @@ mod tests {
     thread_local! {
         /// Makes `generate_agent_extension` drop the extension directory (see `simulate_missing_extension`).
         pub(super) static OMIT_EXTENSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The relay path test managers use: any existing file will do, nothing runs it.
+    pub(super) fn test_sign_proxy_path() -> PathBuf {
+        PathBuf::from("/bin/true")
     }
 
     const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -6500,50 +6825,42 @@ mod tests {
     }
 
     #[test]
-    fn test_render_channel_script_replaces_channel() {
-        let template = r#"(function(ch){})("__PASSLESS_CHANNEL__");"#;
-        let result = render_channel_script(template, "abc123");
-        assert!(result.contains("abc123"));
-        assert!(!result.contains("__PASSLESS_CHANNEL__"));
-    }
-
-    #[test]
     fn test_render_worker_script_replaces_all_placeholders() {
-        let template = r#"(function(s,b){})("__PASSLESS_CHANNEL__",__PASSLESS_SOCKET_PATH__,__PASSLESS_BEARER__);"#;
+        let template = r#"(function(b,s,v){})(__PASSLESS_BEARER__, __PASSLESS_SOCKET_PATH__, __PASSLESS_BUILD_VERSION__);"#;
         let metadata = AgentEndpointMetadata {
             socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "secrettoken".to_string(),
         };
-        let result = render_worker_script(template, "chan123", &metadata);
-        assert!(result.contains("chan123"));
-        assert!(result.contains("/tmp/test/sock"));
-        assert!(result.contains("secrettoken"));
-        assert!(!result.contains("__PASSLESS_CHANNEL__"));
-        assert!(!result.contains("__PASSLESS_SOCKET_PATH__"));
-        assert!(!result.contains("__PASSLESS_BEARER__"));
+        let result = render_worker_script(template, &metadata);
+        assert_eq!(
+            result,
+            format!(
+                r#"(function(b,s,v){{}})("secrettoken", "/tmp/test/sock", {});"#,
+                serde_json::to_string(&super::super::transport::build_version()).unwrap()
+            )
+        );
     }
 
     #[test]
-    fn test_render_channel_script_does_not_expose_port_or_bearer() {
-        let rendered = render_channel_script(
-            include_str!("../../assets/agent-extension/main.js"),
-            "testchannel",
+    fn test_worker_template_has_exactly_the_three_placeholders() {
+        let found: Vec<&str> = EXTENSION_WORKER_TEMPLATE
+            .match_indices(EXTENSION_PLACEHOLDER_PREFIX)
+            .map(|(at, _)| {
+                let rest = &EXTENSION_WORKER_TEMPLATE[at..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "__PASSLESS_BEARER__",
+                "__PASSLESS_SOCKET_PATH__",
+                "__PASSLESS_BUILD_VERSION__"
+            ]
         );
-        assert!(!rendered.contains("__PASSLESS_SOCKET_PATH__"));
-        assert!(!rendered.contains("__PASSLESS_BEARER__"));
-        assert!(rendered.contains("testchannel"));
-        assert!(!rendered.contains("__PASSLESS_CHANNEL__"));
-    }
-
-    #[test]
-    fn test_render_channel_script_broker_no_port_or_bearer() {
-        let rendered = render_channel_script(
-            include_str!("../../assets/agent-extension/broker.js"),
-            "testchannel",
-        );
-        assert!(!rendered.contains("__PASSLESS_SOCKET_PATH__"));
-        assert!(!rendered.contains("__PASSLESS_BEARER__"));
-        assert!(rendered.contains("testchannel"));
     }
 
     #[test]
@@ -6552,15 +6869,11 @@ mod tests {
             socket_path: "/tmp/test/sock".to_string(),
             bearer_token: "beartoken99".to_string(),
         };
-        let rendered = render_worker_script(
-            include_str!("../../assets/agent-extension/worker.js"),
-            "wchan",
-            &metadata,
-        );
-        assert!(rendered.contains("/tmp/test/sock"));
-        assert!(rendered.contains("beartoken99"));
-        assert!(!rendered.contains("__PASSLESS_SOCKET_PATH__"));
-        assert!(!rendered.contains("__PASSLESS_BEARER__"));
+        let rendered = render_worker_script(EXTENSION_WORKER_TEMPLATE, &metadata);
+        assert!(rendered.contains("\"/tmp/test/sock\""));
+        assert!(rendered.contains("\"beartoken99\""));
+        assert!(rendered.contains(&super::super::transport::build_version()));
+        assert!(!rendered.contains(EXTENSION_PLACEHOLDER_PREFIX));
     }
 
     #[test]
@@ -6578,12 +6891,65 @@ mod tests {
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
         assert!(ext_dir.is_dir());
-        assert!(ext_dir.join("manifest.json").exists());
-        assert!(ext_dir.join("main.js").exists());
-        assert!(ext_dir.join("broker.js").exists());
-        assert!(ext_dir.join("worker.js").exists());
-        assert!(!ext_dir.join("config.js").exists());
-        assert!(!ext_dir.join("content.js").exists());
+        let mut files: Vec<String> = fs::read_dir(&ext_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["manifest.json", "worker.js"]);
+        // The manifest is the committed one, byte for byte: its key is never replaced.
+        assert_eq!(
+            fs::read_to_string(ext_dir.join("manifest.json")).unwrap(),
+            EXTENSION_MANIFEST_TEMPLATE
+        );
+        assert_eq!(extension_id_of_dir(&ext_dir).unwrap(), AGENT_EXTENSION_ID);
+    }
+
+    #[test]
+    fn test_committed_manifest_key_gives_the_fixed_extension_id() {
+        assert_eq!(
+            compute_extension_id(EXTENSION_MANIFEST_TEMPLATE).unwrap(),
+            "lfbahamapdlbimlffmhiomfdemnjhjkc"
+        );
+        assert_eq!(AGENT_EXTENSION_ID, "lfbahamapdlbimlffmhiomfdemnjhjkc");
+    }
+
+    #[test]
+    fn test_compute_extension_id_requires_a_key() {
+        assert!(compute_extension_id(r#"{"name":"x"}"#).is_err());
+        assert!(compute_extension_id(r#"{"key":""}"#).is_err());
+        assert!(compute_extension_id(r#"{"key":"not base64!"}"#).is_err());
+        assert!(compute_extension_id("not json").is_err());
+    }
+
+    #[test]
+    fn test_native_messaging_manifest_admits_only_the_fixed_extension_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = setup_runtime_root(dir.path());
+        let lease_dir = root.join("lease-nm");
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "tok".to_string(),
+        };
+        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
+        let profile_dir = lease_dir.join("profile");
+        let path = install_native_messaging_manifest(
+            &ext_dir,
+            Path::new("/opt/passless/sign-proxy"),
+            &profile_dir,
+        )
+        .unwrap();
+        assert!(path.starts_with(&profile_dir), "stays inside the profile");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(manifest["name"], NATIVE_MESSAGING_HOST_NAME);
+        assert_eq!(manifest["path"], "/opt/passless/sign-proxy");
+        assert_eq!(
+            manifest["allowed_origins"],
+            serde_json::json!([format!("chrome-extension://{AGENT_EXTENSION_ID}/")])
+        );
     }
 
     #[test]
@@ -6627,7 +6993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_main_js_permissions_are_0644() {
+    fn test_manifest_json_permissions_are_0644() {
         let dir = tempfile::tempdir().unwrap();
         let root = setup_runtime_root(dir.path());
         let lease_dir = root.join("lease-mperm");
@@ -6640,18 +7006,6 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
-        let main_mode = fs::symlink_metadata(ext_dir.join("main.js"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(main_mode, 0o644);
-        let broker_mode = fs::symlink_metadata(ext_dir.join("broker.js"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(broker_mode, 0o644);
         let manifest_mode = fs::symlink_metadata(ext_dir.join("manifest.json"))
             .unwrap()
             .permissions()
@@ -6674,46 +7028,11 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
-        for name in &["main.js", "broker.js", "worker.js"] {
-            let content = fs::read_to_string(ext_dir.join(name)).unwrap();
-            assert!(
-                !content.contains("__PASSLESS_CHANNEL__"),
-                "{} has unresolved channel placeholder",
-                name
-            );
-            assert!(
-                !content.contains("__PASSLESS_PORT__"),
-                "{} has unresolved port placeholder",
-                name
-            );
-            assert!(
-                !content.contains("__PASSLESS_BEARER__"),
-                "{} has unresolved bearer placeholder",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_main_js_has_no_port_or_bearer_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = setup_runtime_root(dir.path());
-        let lease_dir = root.join("lease-nosec");
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-        create_lease_dir(&lease_dir, RUNTIME_DIR_MODE, uid, gid).unwrap();
-
-        let metadata = AgentEndpointMetadata {
-            socket_path: "/tmp/test/sock".to_string(),
-            bearer_token: "supersecretbearer".to_string(),
-        };
-        let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
-        let main_content = fs::read_to_string(ext_dir.join("main.js")).unwrap();
-        assert!(!main_content.contains("55555"));
-        assert!(!main_content.contains("supersecretbearer"));
-        let broker_content = fs::read_to_string(ext_dir.join("broker.js")).unwrap();
-        assert!(!broker_content.contains("55555"));
-        assert!(!broker_content.contains("supersecretbearer"));
+        let content = fs::read_to_string(ext_dir.join("worker.js")).unwrap();
+        assert!(
+            !content.contains(EXTENSION_PLACEHOLDER_PREFIX),
+            "worker.js has an unresolved placeholder"
+        );
     }
 
     #[test]
@@ -6755,36 +7074,6 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_has_main_world_content_script() {
-        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
-        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
-        let scripts = parsed["content_scripts"].as_array().unwrap();
-        let main_script = scripts
-            .iter()
-            .find(|s| s["world"] == "MAIN")
-            .expect("MAIN world content script required");
-        assert_eq!(main_script["run_at"], "document_start");
-        assert_eq!(main_script["all_frames"], true);
-        let js = main_script["js"].as_array().unwrap();
-        assert!(js.iter().any(|j| j == "main.js"));
-    }
-
-    #[test]
-    fn test_manifest_has_isolated_world_broker() {
-        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
-        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
-        let scripts = parsed["content_scripts"].as_array().unwrap();
-        let isolated_script = scripts
-            .iter()
-            .find(|s| s["world"] == "ISOLATED")
-            .expect("ISOLATED world content script required");
-        assert_eq!(isolated_script["run_at"], "document_start");
-        assert_eq!(isolated_script["all_frames"], true);
-        let js = isolated_script["js"].as_array().unwrap();
-        assert!(js.iter().any(|j| j == "broker.js"));
-    }
-
-    #[test]
     fn test_manifest_has_service_worker() {
         let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
         let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
@@ -6792,45 +7081,22 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_has_host_permissions() {
-        let manifest_str = include_str!("../../assets/agent-extension/manifest.json");
-        let parsed: serde_json::Value = serde_json::from_str(manifest_str).unwrap();
-        let host_permissions = parsed
-            .get("host_permissions")
-            .expect("host_permissions must be present for content scripts");
-        let arr = host_permissions
+    fn test_manifest_is_a_worker_only_webauthn_proxy() {
+        let parsed: serde_json::Value = serde_json::from_str(EXTENSION_MANIFEST_TEMPLATE).unwrap();
+        let permissions: Vec<&str> = parsed["permissions"]
             .as_array()
-            .expect("host_permissions must be an array");
-        assert!(
-            arr.iter().any(|v| v.as_str() == Some("https://*/*")),
-            "host_permissions must include https://*/*"
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            permissions,
+            ["webAuthenticationProxy", "nativeMessaging", "storage"]
         );
-    }
-
-    #[test]
-    fn test_main_js_template_syntax_valid() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let path = format!("{}/assets/agent-extension/main.js", manifest_dir);
-        let status = std::process::Command::new("node")
-            .arg("--check")
-            .arg(&path)
-            .status();
-        if let Ok(s) = status {
-            assert!(s.success(), "main.js has syntax errors");
-        }
-    }
-
-    #[test]
-    fn test_broker_js_template_syntax_valid() {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let path = format!("{}/assets/agent-extension/broker.js", manifest_dir);
-        let status = std::process::Command::new("node")
-            .arg("--check")
-            .arg(&path)
-            .status();
-        if let Ok(s) = status {
-            assert!(s.success(), "broker.js has syntax errors");
-        }
+        assert!(parsed.get("content_scripts").is_none());
+        assert!(parsed.get("host_permissions").is_none());
+        assert_eq!(parsed["incognito"], "spanning");
+        assert!(!parsed["key"].as_str().unwrap().is_empty());
     }
 
     #[test]
@@ -6860,15 +7126,12 @@ mod tests {
             bearer_token: "tok".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
-        for name in &["main.js", "broker.js", "worker.js"] {
-            let path = ext_dir.join(name);
-            let status = std::process::Command::new("node")
-                .arg("--check")
-                .arg(&path)
-                .status();
-            if let Ok(s) = status {
-                assert!(s.success(), "generated {} has syntax errors", name);
-            }
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(ext_dir.join("worker.js"))
+            .status();
+        if let Ok(s) = status {
+            assert!(s.success(), "generated worker.js has syntax errors");
         }
     }
 
@@ -6937,8 +7200,6 @@ mod tests {
         let ext_dir = runtime_dir.join(AGENT_EXTENSION_DIR);
         assert!(ext_dir.is_dir());
         assert!(ext_dir.join("manifest.json").exists());
-        assert!(ext_dir.join("main.js").exists());
-        assert!(ext_dir.join("broker.js").exists());
         assert!(ext_dir.join("worker.js").exists());
 
         let worker_content = fs::read_to_string(ext_dir.join("worker.js")).unwrap();
@@ -7068,7 +7329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generated_worker_bearer_not_in_main_or_broker() {
+    fn test_generated_bearer_is_only_in_the_worker() {
         let dir = tempfile::tempdir().unwrap();
         let root = setup_runtime_root(dir.path());
         let lease_dir = root.join("lease-bearer-iso");
@@ -7081,10 +7342,10 @@ mod tests {
             bearer_token: "supersecretbearertoken".to_string(),
         };
         let ext_dir = generate_agent_extension(&lease_dir, &metadata, uid, gid).unwrap();
-        let main_content = fs::read_to_string(ext_dir.join("main.js")).unwrap();
-        let broker_content = fs::read_to_string(ext_dir.join("broker.js")).unwrap();
-        assert!(!main_content.contains("supersecretbearertoken"));
-        assert!(!broker_content.contains("supersecretbearertoken"));
+        let manifest = fs::read_to_string(ext_dir.join("manifest.json")).unwrap();
+        assert!(!manifest.contains("supersecretbearertoken"));
+        let worker = fs::read_to_string(ext_dir.join("worker.js")).unwrap();
+        assert!(worker.contains("supersecretbearertoken"));
     }
 
     #[test]
@@ -7233,17 +7494,19 @@ mod tests {
     }
 
     /// Writes an extension directory that has what the generator emits: the real manifest template
-    /// and non-empty scripts.
+    /// and a rendered worker.
     fn write_valid_extension(ext_dir: &Path) {
         fs::create_dir_all(ext_dir).unwrap();
+        fs::write(ext_dir.join("manifest.json"), EXTENSION_MANIFEST_TEMPLATE).unwrap();
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "tok".to_string(),
+        };
         fs::write(
-            ext_dir.join("manifest.json"),
-            include_str!("../../assets/agent-extension/manifest.json"),
+            ext_dir.join(EXTENSION_WORKER),
+            render_worker_script(EXTENSION_WORKER_TEMPLATE, &metadata),
         )
         .unwrap();
-        for script in EXTENSION_SCRIPTS {
-            fs::write(ext_dir.join(script), "// script\n").unwrap();
-        }
     }
 
     fn manifest_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
@@ -7299,23 +7562,42 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_extension_dir_requires_non_empty_scripts() {
-        for script in EXTENSION_SCRIPTS {
-            let dir = tempfile::tempdir().unwrap();
-            let ext = dir.path().join("ext");
-            write_valid_extension(&ext);
+    fn test_verify_extension_dir_requires_a_non_empty_rendered_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = dir.path().join("ext");
+        write_valid_extension(&ext);
+        let worker = ext.join(EXTENSION_WORKER);
 
-            fs::remove_file(ext.join(script)).unwrap();
-            let err = verify_extension_dir(&ext).unwrap_err().to_string();
-            assert!(err.contains(script), "missing {script}: {err}");
+        fs::remove_file(&worker).unwrap();
+        let err = verify_extension_dir(&ext).unwrap_err().to_string();
+        assert!(err.contains("worker.js"), "missing worker: {err}");
 
-            fs::write(ext.join(script), "").unwrap();
-            let err = verify_extension_dir(&ext).unwrap_err().to_string();
-            assert!(err.contains(script), "empty {script}: {err}");
+        fs::write(&worker, "").unwrap();
+        let err = verify_extension_dir(&ext).unwrap_err().to_string();
+        assert!(err.contains("worker.js"), "empty worker: {err}");
 
-            fs::write(ext.join(script), "// ok").unwrap();
-            verify_extension_dir(&ext).unwrap();
+        // The unrendered template: every placeholder is still there.
+        fs::write(&worker, EXTENSION_WORKER_TEMPLATE).unwrap();
+        let err = verify_extension_dir(&ext).unwrap_err().to_string();
+        assert!(err.contains("placeholder"), "template worker: {err}");
+
+        // A single placeholder left behind is enough to refuse.
+        for placeholder in [
+            "__PASSLESS_BEARER__",
+            "__PASSLESS_SOCKET_PATH__",
+            "__PASSLESS_BUILD_VERSION__",
+        ] {
+            fs::write(&worker, format!("f(\"tok\", {placeholder});")).unwrap();
+            let err = verify_extension_dir(&ext).unwrap_err();
+            assert!(
+                matches!(err, LaunchError::ExtensionSetupFailed(_)),
+                "{placeholder}: {err}"
+            );
+            assert!(err.to_string().contains("refusing to launch"), "{err}");
         }
+
+        fs::write(&worker, "// ok").unwrap();
+        verify_extension_dir(&ext).unwrap();
     }
 
     #[test]
@@ -7323,64 +7605,51 @@ mod tests {
         type ManifestEdit = Box<dyn Fn(&mut serde_json::Value)>;
         let cases: Vec<(&str, ManifestEdit)> = vec![
             (
+                "webAuthenticationProxy permission",
+                Box::new(|m| m["permissions"] = serde_json::json!(["nativeMessaging", "storage"])),
+            ),
+            (
                 "nativeMessaging permission",
-                Box::new(|m| m["permissions"] = serde_json::json!([])),
+                Box::new(|m| {
+                    m["permissions"] = serde_json::json!(["webAuthenticationProxy", "storage"])
+                }),
+            ),
+            (
+                "no permissions",
+                Box::new(|m| {
+                    m.as_object_mut().unwrap().remove("permissions");
+                }),
             ),
             (
                 "service worker",
                 Box::new(|m| m["background"]["service_worker"] = serde_json::json!("other.js")),
             ),
             (
-                "no content scripts",
+                "no background",
+                Box::new(|m| {
+                    m.as_object_mut().unwrap().remove("background");
+                }),
+            ),
+            (
+                "missing key",
+                Box::new(|m| {
+                    m.as_object_mut().unwrap().remove("key");
+                }),
+            ),
+            ("empty key", Box::new(|m| m["key"] = serde_json::json!(""))),
+            (
+                "content scripts present",
+                Box::new(|m| {
+                    m["content_scripts"] = serde_json::json!([{
+                        "matches": ["https://*/*"],
+                        "js": ["main.js"],
+                        "world": "MAIN",
+                    }])
+                }),
+            ),
+            (
+                "empty content scripts",
                 Box::new(|m| m["content_scripts"] = serde_json::json!([])),
-            ),
-            (
-                "main.js world",
-                Box::new(|m| {
-                    for entry in m["content_scripts"].as_array_mut().unwrap() {
-                        if entry["js"][0] == "main.js" {
-                            entry["world"] = serde_json::json!("ISOLATED");
-                        }
-                    }
-                }),
-            ),
-            (
-                "main.js all_frames",
-                Box::new(|m| {
-                    for entry in m["content_scripts"].as_array_mut().unwrap() {
-                        if entry["js"][0] == "main.js" {
-                            entry["all_frames"] = serde_json::json!(false);
-                        }
-                    }
-                }),
-            ),
-            (
-                "main.js run_at",
-                Box::new(|m| {
-                    for entry in m["content_scripts"].as_array_mut().unwrap() {
-                        if entry["js"][0] == "main.js" {
-                            entry["run_at"] = serde_json::json!("document_idle");
-                        }
-                    }
-                }),
-            ),
-            (
-                "main.js missing",
-                Box::new(|m| {
-                    m["content_scripts"]
-                        .as_array_mut()
-                        .unwrap()
-                        .retain(|e| e["js"][0] != "main.js");
-                }),
-            ),
-            (
-                "broker.js missing",
-                Box::new(|m| {
-                    m["content_scripts"]
-                        .as_array_mut()
-                        .unwrap()
-                        .retain(|e| e["js"][0] != "broker.js");
-                }),
             ),
         ];
         for (name, edit) in cases {
@@ -7394,26 +7663,6 @@ mod tests {
                 "{name} must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn test_template_manifest_covers_blank_frames_and_localhost() {
-        let manifest: serde_json::Value =
-            serde_json::from_str(include_str!("../../assets/agent-extension/manifest.json"))
-                .unwrap();
-        for entry in manifest["content_scripts"].as_array().unwrap() {
-            assert_eq!(entry["match_about_blank"], true, "{entry}");
-            assert_eq!(entry["match_origin_as_fallback"], true, "{entry}");
-            let matches = entry["matches"].to_string();
-            assert!(matches.contains("http://localhost/*"), "{matches}");
-            assert!(matches.contains("http://127.0.0.1/*"), "{matches}");
-        }
-        let min: u32 = manifest["minimum_chrome_version"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(min >= 119, "match_origin_as_fallback needs Chromium 119");
     }
 
     struct CountingSpawner(Arc<std::sync::atomic::AtomicUsize>);
@@ -7650,5 +7899,552 @@ mod tests {
             exit.is_some(),
             "child should be killed by PDEATHSIG when spawning thread exits"
         );
+    }
+
+    // --- P6: interception readiness (plan D6 layer 1) and defect B2 -------------------------------
+
+    /// Records the argv the real command builder makes, then runs a long-lived stand-in browser in
+    /// its own process group.
+    struct ArgvRecordingSpawner(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl ChildSpawner for ArgvRecordingSpawner {
+        fn spawn_browser(
+            &self,
+            config: &BrowserConfig,
+            profile_dir: &Path,
+            _cdp: &CdpPipes,
+        ) -> Result<Child, LaunchError> {
+            let cmd = build_browser_command(config, profile_dir)?;
+            *self.0.lock().unwrap() = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let mut stand_in = Command::new("/bin/sleep");
+            stand_in.arg("60");
+            unsafe {
+                stand_in.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            stand_in
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| LaunchError::SpawnFailed(e.to_string()))
+        }
+    }
+
+    /// Records every start URL it is asked to open, with the readiness seen at that moment.
+    #[derive(Default)]
+    struct RecordingOpener {
+        opened: std::sync::Mutex<Vec<(String, bool)>>,
+        readiness: std::sync::Mutex<Option<(Arc<ReadinessRegistry>, String)>>,
+    }
+
+    impl StartUrlOpener for RecordingOpener {
+        fn open(
+            &self,
+            _manager: &mut BrowserProcessManager,
+            _lease_id: &BrowserLeaseId,
+            url: &str,
+        ) -> Result<(), String> {
+            let attached = self
+                .readiness
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|(registry, bearer)| registry.status(bearer))
+                .is_some_and(|s| s.connected && s.attached);
+            self.opened
+                .lock()
+                .unwrap()
+                .push((url.to_string(), attached));
+            Ok(())
+        }
+    }
+
+    const START_URL: &str = "https://example.com/login";
+    const BEARER: &str = "interception-test-bearer";
+
+    struct InterceptedLaunch {
+        _dir: tempfile::TempDir,
+        mgr: BrowserProcessManager,
+        lease_id: BrowserLeaseId,
+        argv: Vec<String>,
+        opener: Arc<RecordingOpener>,
+        readiness: Arc<ReadinessRegistry>,
+        runtime_root: PathBuf,
+    }
+
+    fn intercepted_launch() -> InterceptedLaunch {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mgr = BrowserProcessManager::with_spawner(
+            test_clock(),
+            Arc::new(ArgvRecordingSpawner(argv.clone())),
+        );
+        let readiness = Arc::new(ReadinessRegistry::new());
+        let opener = Arc::new(RecordingOpener::default());
+        *opener.readiness.lock().unwrap() = Some((readiness.clone(), BEARER.to_string()));
+        mgr.set_start_url_opener(opener.clone());
+        let mut config = test_config(dir.path());
+        config.executable = PathBuf::from("/usr/bin/chromium");
+        config.start_url = Some(START_URL.to_string());
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: BEARER.to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+        let argv = argv.lock().unwrap().clone();
+        InterceptedLaunch {
+            _dir: dir,
+            mgr,
+            lease_id,
+            argv,
+            opener,
+            readiness,
+            runtime_root: config.runtime_root,
+        }
+    }
+
+    impl Drop for InterceptedLaunch {
+        fn drop(&mut self) {
+            let _ = self.mgr.terminate(&self.lease_id);
+        }
+    }
+
+    /// B2 regression: the intercepted browser is spawned on a blank page, never on the start URL.
+    #[test]
+    fn test_b2_intercepted_launch_spawns_without_the_start_url() {
+        let mut launch = intercepted_launch();
+        assert!(!launch.argv.is_empty(), "the spawner saw the real argv");
+        assert!(
+            !launch.argv.iter().any(|a| a.contains("example.com")),
+            "the start URL must not be in the spawn argv: {:?}",
+            launch.argv
+        );
+        assert_eq!(
+            launch.argv.last().map(String::as_str),
+            Some(BLANK_START_URL)
+        );
+        assert!(
+            launch
+                .argv
+                .iter()
+                .any(|a| a.starts_with("--load-extension="))
+        );
+        // The lease still reports the URL it will open.
+        let snapshot = launch.mgr.snapshot(&launch.lease_id).unwrap();
+        assert_eq!(snapshot.start_url.as_deref(), Some(START_URL));
+        // Nothing opens it before the worker attached.
+        assert!(
+            launch
+                .mgr
+                .open_deferred_start_url(&launch.lease_id)
+                .is_err()
+        );
+        assert!(launch.opener.opened.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_launch_without_extension_keeps_the_start_url_in_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.start_url = Some(START_URL.to_string());
+        let cmd = build_browser_command_unverified(&config, dir.path()).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some(START_URL));
+    }
+
+    /// B2 regression: the start URL is opened only after the worker said hello with
+    /// `attached = true`, and only once.
+    #[test]
+    fn test_b2_start_url_opens_only_after_the_worker_attached() {
+        let mut launch = intercepted_launch();
+        let readiness = launch.readiness.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            // The worker connects before attach() resolved, then reports the attachment.
+            readiness.simulate_hello(BEARER, 1, false, false);
+            std::thread::sleep(Duration::from_millis(200));
+            readiness.simulate_hello(BEARER, 1, true, true);
+        });
+        let state = launch
+            .mgr
+            .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(10))
+            .unwrap();
+        worker.join().unwrap();
+        assert!(state.connected && state.attached);
+        assert!(state.incognito_allowed);
+        assert!(launch.opener.opened.lock().unwrap().is_empty());
+
+        let opened = launch.mgr.open_deferred_start_url(&launch.lease_id);
+        assert_eq!(opened, Ok(Some(START_URL.to_string())));
+        assert_eq!(
+            *launch.opener.opened.lock().unwrap(),
+            [(START_URL.to_string(), true)],
+            "opened once, with interception attached"
+        );
+        assert_eq!(
+            launch.mgr.open_deferred_start_url(&launch.lease_id),
+            Ok(None)
+        );
+        assert_eq!(launch.opener.opened.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_launch_fails_closed_when_the_worker_never_attaches() {
+        let mut launch = intercepted_launch();
+        // A worker that connects but whose attach() failed is not ready either.
+        launch.readiness.simulate_hello(BEARER, 1, false, true);
+        let started = Instant::now();
+        let err = launch
+            .mgr
+            .await_interception(
+                &launch.lease_id,
+                &launch.readiness,
+                Duration::from_millis(400),
+            )
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            matches!(err, LaunchError::InterceptionNotAttached(_)),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not attach the WebAuthn proxy"),
+            "actionable: {msg}"
+        );
+        assert!(msg.contains("attached = false"), "{msg}");
+        assert!(launch.opener.opened.lock().unwrap().is_empty());
+        assert!(
+            launch
+                .mgr
+                .open_deferred_start_url(&launch.lease_id)
+                .is_err()
+        );
+
+        // The runtime's failure path: the browser is stopped and its runtime dir (with the
+        // worker's bearer) removed.
+        let lease_id = launch.lease_id.clone();
+        let _ = launch.mgr.revoke(&lease_id);
+        launch.mgr.terminate(&lease_id).unwrap();
+        assert!(matches!(
+            launch.mgr.cleanup(&lease_id).unwrap(),
+            CleanupSafety::Clean
+        ));
+        launch.mgr.remove(&lease_id);
+        assert_no_lease_dirs(&launch.runtime_root);
+    }
+
+    #[test]
+    fn test_launch_fails_closed_when_the_worker_never_connects() {
+        let mut launch = intercepted_launch();
+        let err = launch
+            .mgr
+            .await_interception(
+                &launch.lease_id,
+                &launch.readiness,
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("never connected"), "{err}");
+    }
+
+    #[test]
+    fn test_await_interception_ends_when_the_browser_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BrowserProcessManager::with_spawner(test_clock(), Arc::new(TestSpawner));
+        let config = test_config(dir.path());
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: BEARER.to_string(),
+        };
+        let lease_id = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap();
+        let readiness = ReadinessRegistry::new();
+        let started = Instant::now();
+        let err = mgr
+            .await_interception(&lease_id, &readiness, Duration::from_secs(20))
+            .unwrap_err();
+        assert!(err.to_string().contains("exited"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_await_interception_refuses_a_lease_without_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BrowserProcessManager::new(test_clock());
+        let lease_id = mgr
+            .launch_pending(
+                &test_config(dir.path()),
+                test_endpoint_id(),
+                test_profile_id(),
+            )
+            .unwrap();
+        let readiness = ReadinessRegistry::new();
+        assert!(
+            mgr.await_interception(&lease_id, &readiness, Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(
+            mgr.interception_state(&lease_id, &readiness, INTERCEPTION_DEGRADED_GRACE)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_interception_degrades_after_the_grace_period_and_is_reported_once() {
+        let mut launch = intercepted_launch();
+        let grace = INTERCEPTION_DEGRADED_GRACE;
+        let state = |launch: &InterceptedLaunch| {
+            launch
+                .mgr
+                .interception_state(&launch.lease_id, &launch.readiness, grace)
+                .unwrap()
+                .0
+        };
+        // Before the launch saw the worker attach the lease is pending, and nothing is polled.
+        assert_eq!(state(&launch), InterceptionState::Pending);
+        launch.readiness.simulate_hello(BEARER, 1, true, false);
+        assert!(
+            launch
+                .mgr
+                .poll_interception(&launch.readiness, grace)
+                .is_empty()
+        );
+        launch
+            .mgr
+            .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(state(&launch), InterceptionState::Attached);
+
+        // The port drops: within the grace period the lease is pending, not degraded.
+        launch.readiness.simulate_disconnect(BEARER, 1);
+        assert_eq!(state(&launch), InterceptionState::Pending);
+        assert!(
+            launch
+                .mgr
+                .poll_interception(&launch.readiness, grace)
+                .is_empty()
+        );
+
+        // Past the grace period it is degraded, and the change is reported exactly once.
+        launch
+            .readiness
+            .backdate_detached(BEARER, grace + Duration::from_secs(1));
+        assert_eq!(state(&launch), InterceptionState::Degraded);
+        let transitions = launch.mgr.poll_interception(&launch.readiness, grace);
+        assert_eq!(
+            transitions,
+            [InterceptionTransition {
+                lease_id: launch.lease_id.clone(),
+                profile_id: test_profile_id(),
+                degraded: true,
+            }]
+        );
+        assert!(
+            launch
+                .mgr
+                .poll_interception(&launch.readiness, grace)
+                .is_empty()
+        );
+
+        // A reconnect that is not attached yet does not end the episode.
+        launch.readiness.simulate_hello(BEARER, 2, false, false);
+        assert!(
+            launch
+                .mgr
+                .poll_interception(&launch.readiness, grace)
+                .is_empty()
+        );
+
+        // The worker re-attaches: attached again, reported once.
+        launch.readiness.simulate_hello(BEARER, 2, true, false);
+        assert_eq!(state(&launch), InterceptionState::Attached);
+        let transitions = launch.mgr.poll_interception(&launch.readiness, grace);
+        assert_eq!(transitions.len(), 1);
+        assert!(!transitions[0].degraded);
+        assert!(
+            launch
+                .mgr
+                .poll_interception(&launch.readiness, grace)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_connected_but_detached_worker_also_degrades() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(10);
+        let readiness = |connected, attached, detached_for: Option<u64>| BearerReadiness {
+            connected,
+            attached,
+            incognito_allowed: false,
+            build_version: None,
+            relay_version: None,
+            last_disconnect: None,
+            detached_since: detached_for.map(|s| now - Duration::from_secs(s)),
+        };
+        let of =
+            |r: Option<BearerReadiness>| InterceptionState::of_confirmed(r.as_ref(), now, grace);
+        assert_eq!(
+            of(Some(readiness(true, true, None))),
+            InterceptionState::Attached
+        );
+        assert_eq!(
+            of(Some(readiness(true, false, Some(1)))),
+            InterceptionState::Pending
+        );
+        assert_eq!(
+            of(Some(readiness(true, false, Some(11)))),
+            InterceptionState::Degraded
+        );
+        assert_eq!(
+            of(Some(readiness(false, true, Some(1)))),
+            InterceptionState::Pending
+        );
+        assert_eq!(
+            of(Some(readiness(false, true, Some(11)))),
+            InterceptionState::Degraded
+        );
+        // Without a detach time or a record at all it fails closed.
+        assert_eq!(
+            of(Some(readiness(false, false, None))),
+            InterceptionState::Degraded
+        );
+        assert_eq!(of(None), InterceptionState::Degraded);
+    }
+
+    #[test]
+    fn test_missing_sign_proxy_is_a_launch_error_and_spawns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mgr = BrowserProcessManager::with_spawner(
+            test_clock(),
+            Arc::new(CountingSpawner(spawned.clone())),
+        );
+        mgr.set_sign_proxy_path(dir.path().join("no-such-sign-proxy"));
+        let config = test_config(dir.path());
+        let metadata = AgentEndpointMetadata {
+            socket_path: "/tmp/test/sock".to_string(),
+            bearer_token: "tok".to_string(),
+        };
+        let err = mgr
+            .launch_pending_with_agent_endpoint(
+                &config,
+                test_endpoint_id(),
+                test_profile_id(),
+                Some(&metadata),
+            )
+            .unwrap_err();
+        assert!(matches!(err, LaunchError::ExtensionSetupFailed(_)), "{err}");
+        assert!(err.to_string().contains("sign-proxy"), "{err}");
+        assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(mgr.leases.is_empty());
+        assert_no_lease_dirs(&config.runtime_root);
+    }
+
+    #[test]
+    fn test_devtools_http_open_refuses_a_non_loopback_endpoint() {
+        assert!(
+            open_url_over_devtools_http("ws://203.0.113.1:9222/devtools/browser/x", START_URL)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_devtools_http_open_sends_put_json_new_with_the_encoded_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        open_url_over_devtools_http(
+            &format!("ws://127.0.0.1:{port}/devtools/browser/abc"),
+            "https://example.com/login?next=/a&b=c",
+        )
+        .unwrap();
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with(
+                "PUT /json/new?https%3A%2F%2Fexample.com%2Flogin%3Fnext%3D%2Fa%26b%3Dc HTTP/1.1\r\n"
+            ),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn test_cdp_endpoint_file_exists_only_while_interception_is_attached() {
+        let mut launch = intercepted_launch();
+        let endpoint = "ws://127.0.0.1:9333/devtools/browser/abc";
+        // As a port-mode launch leaves it: the endpoint is known, no file is written yet.
+        launch
+            .mgr
+            .leases
+            .get_mut(&launch.lease_id)
+            .unwrap()
+            .cdp_endpoint = Some(endpoint.to_string());
+        let file = launch.mgr.leases[&launch.lease_id]
+            .manifest
+            .runtime_dir
+            .join("cdp-endpoint");
+        assert!(!file.exists(), "not before the worker attached");
+
+        launch.readiness.simulate_hello(BEARER, 1, true, false);
+        launch
+            .mgr
+            .await_interception(&launch.lease_id, &launch.readiness, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), endpoint);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let grace = INTERCEPTION_DEGRADED_GRACE;
+        launch.readiness.simulate_disconnect(BEARER, 1);
+        launch
+            .readiness
+            .backdate_detached(BEARER, grace + Duration::from_secs(1));
+        assert_eq!(
+            launch.mgr.poll_interception(&launch.readiness, grace).len(),
+            1
+        );
+        assert!(!file.exists(), "removed while degraded");
+
+        launch.readiness.simulate_hello(BEARER, 2, true, false);
+        assert_eq!(
+            launch.mgr.poll_interception(&launch.readiness, grace).len(),
+            1
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), endpoint);
     }
 }

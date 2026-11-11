@@ -44,6 +44,17 @@ Chrome for Testing are downloaded once into `target/agent-e2e-cache/` (never int
   `rp-a.test` / `rp-b.test` / `evil.test` via `--host-resolver-rules`; `lib/notify-double.js` (Rust tool in
   `tools/notify-double`); `lib/mcp-client.js` minimal MCP client; `lib/scenario.js` matrix, CI tags and xfail.
 - `scenarios/e2e-NN-*.test.js` follow the catalogue in `docs/plans/agent-delegation-implementation.md`.
+- `lib/helpers.js`: `extensionEndpoint` (bearer, socket and build version from the extension worker), `FramedClient`
+  (the daemon's wire protocol v2: `hello`, `request`, `abort`), proxy-shaped request bodies, and the daemon log patterns
+  of the sign transport (`TRANSPORT_LOG`) and of the human UHID device (`HUMAN_CTAP_LOG`).
+- `stack.open(profile, url)` launches through the product path with `url` as the start URL (opened by the daemon only
+  after the worker attached the WebAuthn proxy) and returns the start-URL tab, brought to the front; the browser's
+  own `about:blank` tab is `b.blankPages`. `{startUrl: false}` navigates the blank tab instead (RPs the rules do not
+  admit as a start URL). `lib/browser.js` `stopExtensionWorker` closes the worker target (`Target.closeTarget`).
+
+Debug-build daemon hooks (set through `daemonEnv`): `PASSLESS_E2E_HOLD_REQUEST_MS` holds each request before its
+ceremony (an abort or disconnect then lands before key use), `PASSLESS_E2E_HOLD_RESULT_MS` holds each successful
+result after key use.
 
 ## Expected failures
 

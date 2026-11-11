@@ -180,18 +180,48 @@ async function connect(cdpUrl) {
   return { browser, context };
 }
 
-/** Wait until an extension service worker (the Passless `worker.js`) is running in the browser. */
-async function waitForExtensionWorker(context, page, timeoutMs = 15000) {
-  const cdp = await context.newCDPSession(page);
+/** The Passless agent extension has a fixed ID (manifest `key`); its only script is the service worker. */
+const EXTENSION_ID = 'lfbahamapdlbimlffmhiomfdemnjhjkc';
+const EXTENSION_WORKER_URL = `chrome-extension://${EXTENSION_ID}/worker.js`;
+
+/** CDP target infos of the Passless extension's service worker (zero or one), via a browser-level session. */
+async function extensionWorkerTargets(browser) {
+  const cdp = await browser.newBrowserCDPSession();
   try {
-    const end = Date.now() + timeoutMs;
-    while (Date.now() < end) {
-      const { targetInfos } = await cdp.send('Target.getTargets');
-      if (targetInfos.some(t => t.type === 'service_worker' && /^chrome-extension:\/\/[a-p]{32}\/worker\.js$/.test(t.url))) return true;
-      await sleep(200);
-    }
-    return false;
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    return targetInfos.filter(t => t.type === 'service_worker' && t.url === EXTENSION_WORKER_URL);
   } finally { await cdp.detach().catch(() => {}); }
+}
+
+/** Wait until the Passless extension's service worker (`worker.js` of the fixed extension ID) is running. */
+async function waitForExtensionWorker(browser, timeoutMs = 15000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if ((await extensionWorkerTargets(browser)).length) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+/**
+ * Stop the extension's service worker the way Chromium stops an idle worker, with CDP `Target.closeTarget` on the
+ * worker target (plan V-L6; spike Q2). Its native port closes with it, so the relay exits and the daemon sees EOF.
+ * Resolves once the target is gone.
+ */
+async function stopExtensionWorker(browser, timeoutMs = 10000) {
+  const [worker] = await extensionWorkerTargets(browser);
+  if (!worker) throw new Error('no extension service worker to stop');
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    const { success } = await cdp.send('Target.closeTarget', { targetId: worker.targetId });
+    if (!success) throw new Error('Target.closeTarget on the extension worker failed');
+  } finally { await cdp.detach().catch(() => {}); }
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (!(await extensionWorkerTargets(browser)).some(t => t.targetId === worker.targetId)) return worker.targetId;
+    await sleep(100);
+  }
+  throw new Error('the extension service worker did not stop');
 }
 
 /**
@@ -223,4 +253,4 @@ function bwrapPath() {
   return null;
 }
 
-module.exports = { bwrapPath, discover, matrix, variantArgs, connect, launchPlain, classify, waitForExtensionWorker };
+module.exports = { bwrapPath, discover, matrix, variantArgs, connect, launchPlain, classify, waitForExtensionWorker, extensionWorkerTargets, stopExtensionWorker, EXTENSION_ID, EXTENSION_WORKER_URL };

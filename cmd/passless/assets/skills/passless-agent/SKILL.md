@@ -47,11 +47,11 @@ An `isolated` profile uses profile-owned credentials and does not grant access t
 
 ## Managed browser and WebAuthn
 
-Passless loads a daemon-managed MV3 extension into its browser. A MAIN-world adapter observes explicit WebAuthn `get()`/`create()` operations and sends bounded request data through the extension. The extension worker derives browser origin context from Chrome sender metadata and forwards the request to the loopback daemon using the session capability.
+Passless loads a daemon-managed MV3 extension into its browser. The extension has no content script: its service worker attaches Chrome's `webAuthenticationProxy`, so the browser hands it every WebAuthn `get()`/`create()` of the managed browser, with the browser-supplied origin. The worker forwards the request over a native-messaging port to the `sign-proxy` relay, which passes it to the daemon's Unix socket with the session bearer. The page receives a genuine `PublicKeyCredential`.
 
-The daemon remains the signer and enforces the current RP policy, origin relationship, credential scope, session state, operation budget, replay protection, and audit gate before credential use.
+The daemon remains the signer and enforces the current RP policy, origin relationship, credential scope, session state, operation budget, replay protection, and audit gate before credential use. A browser launch reports ready, and its CDP endpoint is handed out, only once the extension has attached the proxy; `browser-status` reports `interception: degraded` while it is not attached, and the endpoint is withheld then.
 
-Conditional mediation/passkey autofill remains native and must not be treated as implicit permission for autonomous same-user login.
+Conditional mediation (passkey autofill) is unavailable while the proxy is attached; use an explicit sign-in button.
 
 ## Browser control
 

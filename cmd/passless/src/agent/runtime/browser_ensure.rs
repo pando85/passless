@@ -9,7 +9,9 @@ use passless_core::agent::protocol::{
 use passless_core::agent::{BrowserLeaseId, BrowserScope, PrincipalSessionId, ProfileId};
 
 use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease};
-use crate::agent::browser::{BrowserConfig, LeaseState};
+use crate::agent::browser::{
+    BrowserConfig, INTERCEPTION_ATTACH_TIMEOUT, InterceptionState, LeaseState,
+};
 use crate::agent::intent::ProcessIdentityDigest;
 use crate::agent::sign::BrowserLeaseActivation;
 use crate::storage::CredentialFilter;
@@ -77,6 +79,9 @@ impl AgentRuntime {
                     )
                     && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
                 {
+                    // A degraded lease's endpoint is withheld until its worker re-attaches.
+                    let (interception, incognito_allowed) =
+                        self.require_attached_interception(&mut browser_manager, &lease_id)?;
                     {
                         let mut shared = profile.shared_browsers.lock().map_err(|_| {
                             ProtocolError::new(
@@ -107,7 +112,13 @@ impl AgentRuntime {
                                 session_id: session_id.clone(),
                             },
                         );
-                    return Ok(browser_ensured(snapshot.state.to_string(), endpoint, true));
+                    return Ok(browser_ensured(
+                        snapshot.state.to_string(),
+                        endpoint,
+                        true,
+                        interception,
+                        incognito_allowed,
+                    ));
                 }
 
                 self.sign_registry.revoke_by_lease(lease_id.as_ref());
@@ -150,7 +161,16 @@ impl AgentRuntime {
                 )
                 && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
             {
-                return Ok(browser_ensured(snapshot.state.to_string(), endpoint, false));
+                // A degraded lease's endpoint is withheld until its worker re-attaches.
+                let (interception, incognito_allowed) =
+                    self.require_attached_interception(&mut browser_manager, &lease_id)?;
+                return Ok(browser_ensured(
+                    snapshot.state.to_string(),
+                    endpoint,
+                    false,
+                    interception,
+                    incognito_allowed,
+                ));
             }
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
@@ -244,6 +264,10 @@ impl AgentRuntime {
             bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
         };
 
+        // The browser's relay must be able to reach a sign socket of its own UID; refuse up front
+        // rather than time out waiting for an attach that cannot happen.
+        let sign_socket = self.sign_socket_for(config.target_uid)?;
+
         let bearer_token = crate::agent::sign::generate_bearer_token().map_err(|e| {
             ProtocolError::new(
                 ErrorCode::Internal,
@@ -260,6 +284,7 @@ impl AgentRuntime {
         // (ADR 0014 section 9).
         let session =
             self.new_bearer_session(profile_id, *process_digest.as_bytes(), profile_config);
+        session.bind_browser_uid(config.target_uid);
         let registration_ctx =
             crate::agent::register::RegisterContext::new(profile_id.clone(), session.clone());
         let registration_handler = Arc::new(crate::agent::register::RegisterHandler {
@@ -285,7 +310,7 @@ impl AgentRuntime {
             })?;
 
         let metadata = crate::agent::browser::AgentEndpointMetadata {
-            socket_path: self.sign_socket_path.to_string_lossy().into_owned(),
+            socket_path: sign_socket.to_string_lossy().into_owned(),
             bearer_token: bearer_token.clone(),
         };
         let lease_id = match browser_manager.launch_pending_with_agent_endpoint(
@@ -353,6 +378,20 @@ impl AgentRuntime {
                     ErrorCode::Internal,
                     format!("failed to bind browser registration context: {e}"),
                     RecommendedAction::Abort,
+                )
+            })?;
+        // Ready means intercepted (plan D6 layer 1): no endpoint is handed out before the lease's
+        // worker said hello with `attached = true`. The registration bearer was registered before
+        // the spawn, so the transport accepts that hello even before the binding above. On a
+        // timeout the caller stops the browser and revokes the bearer.
+        let readiness = browser_manager
+            .await_interception(lease_id, &self.sign_readiness, INTERCEPTION_ATTACH_TIMEOUT)
+            .map_err(|e| {
+                log::warn!("browser launch for profile={profile_id} failed: {e}");
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to launch browser: {e}"),
+                    RecommendedAction::FixRequest,
                 )
             })?;
         let mut credential_refs = Vec::new();
@@ -536,19 +575,33 @@ impl AgentRuntime {
                 );
         }
 
+        // The start URL is opened only now that interception is attached and the bearer's
+        // contexts are registered (defect B2).
+        self.open_deferred_start_url(browser_manager, lease_id);
+
         Ok(browser_ensured(
             LeaseState::AuthenticationPending.to_string(),
             endpoint,
             profile_config.browser_scope == BrowserScope::Profile,
+            InterceptionState::Attached,
+            readiness.incognito_allowed,
         ))
     }
 }
 
-fn browser_ensured(status: String, endpoint: String, shared: bool) -> PrincipalResponse {
+fn browser_ensured(
+    status: String,
+    endpoint: String,
+    shared: bool,
+    interception: InterceptionState,
+    incognito_allowed: bool,
+) -> PrincipalResponse {
     PrincipalResponse::BrowserEnsured(BrowserStatusResponse {
         running: true,
         status,
         cdp_endpoint: Some(endpoint),
         shared_browser_context: if shared { Some(true) } else { None },
+        interception: Some(interception.to_string()),
+        incognito_allowed: Some(incognito_allowed),
     })
 }

@@ -36,6 +36,7 @@ function tomlValue(v) {
  * `*` rules (same-user only) get the profile listed in `acknowledge_global_same_user` automatically.
  * @param {string[]} [o.browserArgs]  extra browser flags (variant + TLS), put after the executable
  * @param {string} o.browserExe
+ * @param {object} [o.limits]  `[agents.limits]` keys
  */
 function renderConfig(env, o) {
   const user = os.userInfo().username;
@@ -90,6 +91,11 @@ function renderConfig(env, o) {
   lines.push('[agents]', 'enabled = true', `audit_path = ${q(env.dirs.audit)}`);
   if (globalAck.length) lines.push(`acknowledge_global_same_user = ${tomlValue(globalAck)}`);
   if (sameUserRegisterAck.length) lines.push(`acknowledge_same_user_registration = ${tomlValue(sameUserRegisterAck)}`);
+  // Request caps (plan R11), e.g. {max_requests_per_connection: 8}; omitted keys keep the daemon defaults.
+  if (o.limits) {
+    lines.push('', '[agents.limits]');
+    for (const [k, v] of Object.entries(o.limits)) lines.push(`${k} = ${tomlValue(v)}`);
+  }
   lines.push('', profileBlocks.join('\n\n'), '');
   return lines.join('\n');
 }

@@ -151,6 +151,10 @@ pub enum AuditPayload {
     BrowserLeaseCleanup(BrowserLeaseCleanupMeta),
     #[serde(rename = "browser_lease.quarantine")]
     BrowserLeaseQuarantine(BrowserLeaseQuarantineMeta),
+    /// A launched lease's WebAuthn interception became degraded (its extension worker stayed
+    /// detached past the grace period) or re-attached (plan D6 layer 1). One record per change.
+    #[serde(rename = "browser_lease.interception")]
+    BrowserLeaseInterception(BrowserLeaseInterceptionMeta),
 
     #[serde(rename = "browser_control.request")]
     BrowserControlRequest(BrowserControlRequestMeta),
@@ -191,6 +195,15 @@ pub enum AuditPayload {
     /// section 9). The `reason` is always `replay_served`.
     #[serde(rename = "policy.replay_served")]
     PolicyReplayServed(PolicyDenyMeta),
+
+    /// A sign-transport connection said hello with a build or relay version that differs from the
+    /// daemon's (plan V-L5). Not fatal; recorded once per connection.
+    #[serde(rename = "transport.version_skew")]
+    TransportVersionSkew(TransportVersionSkewMeta),
+    /// A sign-transport hello with a valid bearer came from a peer whose UID is not the lease's
+    /// browser UID (`SO_PEERCRED`); it was refused.
+    #[serde(rename = "transport.peer_refused")]
+    TransportPeerRefused(TransportPeerRefusedMeta),
 
     #[serde(rename = "ceremony.start")]
     CeremonyStart(CeremonyStartMeta),
@@ -274,6 +287,7 @@ impl AuditPayload {
             Self::BrowserLeaseCrash(_) => "browser_lease.crash",
             Self::BrowserLeaseCleanup(_) => "browser_lease.cleanup",
             Self::BrowserLeaseQuarantine(_) => "browser_lease.quarantine",
+            Self::BrowserLeaseInterception(_) => "browser_lease.interception",
             Self::BrowserControlRequest(_) => "browser_control.request",
             Self::IntentCreate(_) => "intent.create",
             Self::IntentApprove(_) => "intent.approve",
@@ -291,6 +305,8 @@ impl AuditPayload {
             Self::PolicyAllow(_) => "policy.allow",
             Self::PolicyDeny(_) => "policy.deny",
             Self::PolicyReplayServed(_) => "policy.replay_served",
+            Self::TransportVersionSkew(_) => "transport.version_skew",
+            Self::TransportPeerRefused(_) => "transport.peer_refused",
             Self::CeremonyStart(_) => "ceremony.start",
             Self::CeremonySuccess(_) => "ceremony.success",
             Self::CeremonyFailure(_) => "ceremony.failure",
@@ -563,6 +579,21 @@ pub struct BrowserLeaseCleanupMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserLeaseInterceptionMeta {
+    lease_id: BrowserLeaseId,
+    profile_id: ProfileId,
+    state: InterceptionAuditState,
+}
+
+/// The interception state a `browser_lease.interception` record reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptionAuditState {
+    Degraded,
+    Attached,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserLeaseQuarantineMeta {
     lease_id: BrowserLeaseId,
     reason: QuarantineReason,
@@ -668,6 +699,8 @@ pub struct PolicyAllowMeta {
     authorization: String,
     user_presence: String,
     user_verification: String,
+    #[serde(flatten)]
+    origin: OriginContextMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -676,6 +709,47 @@ pub struct PolicyDenyMeta {
     action: AuditAction,
     rp_id: String,
     reason: PolicyDenyReason,
+    #[serde(flatten)]
+    origin: OriginContextMeta,
+}
+
+/// The origin context of a ceremony record (ADR 0014 section 12). `top_origin` is always written,
+/// and is null on the proxy path, where the browser never supplies it (section 11).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OriginContextMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(default)]
+    top_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_origin: Option<bool>,
+}
+
+impl OriginContextMeta {
+    fn new(origin: Option<&str>, top_origin: Option<&str>, cross_origin: Option<bool>) -> Self {
+        Self {
+            origin: origin.map(str::to_string),
+            top_origin: top_origin.map(str::to_string),
+            cross_origin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportPeerRefusedMeta {
+    profile_id: ProfileId,
+    expected_uid: u32,
+    peer_uid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportVersionSkewMeta {
+    profile_id: ProfileId,
+    daemon_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +801,9 @@ pub enum PolicyDenyReason {
     ReplayServed,
     /// The assertion was made but the browser lease could not be activated; it was withheld.
     LeaseActivationFailed,
+    /// The browser cancelled the request (`onRequestCanceled`, or its connection closed) before
+    /// key use. Nothing was signed or created.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -887,6 +964,7 @@ pub struct AdminCredentialRevokeMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminCredentialDeleteMeta {
+    profile_id: ProfileId,
     credential: CredentialRef,
     rp_id: String,
 }
@@ -1326,6 +1404,36 @@ impl BrowserLeaseQuarantineBuilder {
     }
 }
 
+pub struct BrowserLeaseInterceptionBuilder {
+    lease_id: BrowserLeaseId,
+    profile_id: ProfileId,
+    state: InterceptionAuditState,
+}
+
+impl BrowserLeaseInterceptionBuilder {
+    pub fn new(
+        lease_id: BrowserLeaseId,
+        profile_id: ProfileId,
+        state: InterceptionAuditState,
+    ) -> Self {
+        Self {
+            lease_id,
+            profile_id,
+            state,
+        }
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::BrowserLeaseInterception(
+            BrowserLeaseInterceptionMeta {
+                lease_id: self.lease_id,
+                profile_id: self.profile_id,
+                state: self.state,
+            },
+        ))
+    }
+}
+
 pub struct BrowserControlRequestBuilder {
     profile_id: ProfileId,
     lease_id: BrowserLeaseId,
@@ -1609,6 +1717,7 @@ pub struct PolicyAllowBuilder {
     authorization: String,
     user_presence: String,
     user_verification: String,
+    origin: OriginContextMeta,
 }
 
 impl PolicyAllowBuilder {
@@ -1620,7 +1729,19 @@ impl PolicyAllowBuilder {
             authorization: "confirm".to_string(),
             user_presence: "human".to_string(),
             user_verification: "none".to_string(),
+            origin: OriginContextMeta::default(),
         }
+    }
+
+    /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
+    pub fn origin_context(
+        mut self,
+        origin: Option<&str>,
+        top_origin: Option<&str>,
+        cross_origin: Option<bool>,
+    ) -> Self {
+        self.origin = OriginContextMeta::new(origin, top_origin, cross_origin);
+        self
     }
 
     pub fn evidence_sources(
@@ -1643,6 +1764,7 @@ impl PolicyAllowBuilder {
             authorization: self.authorization,
             user_presence: self.user_presence,
             user_verification: self.user_verification,
+            origin: self.origin,
         }))
     }
 }
@@ -1652,6 +1774,7 @@ pub struct PolicyDenyBuilder {
     action: AuditAction,
     rp_id: String,
     reason: PolicyDenyReason,
+    origin: OriginContextMeta,
 }
 
 impl PolicyDenyBuilder {
@@ -1666,7 +1789,19 @@ impl PolicyDenyBuilder {
             action,
             rp_id: rp_id.to_string(),
             reason,
+            origin: OriginContextMeta::default(),
         }
+    }
+
+    /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
+    pub fn origin_context(
+        mut self,
+        origin: Option<&str>,
+        top_origin: Option<&str>,
+        cross_origin: Option<bool>,
+    ) -> Self {
+        self.origin = OriginContextMeta::new(origin, top_origin, cross_origin);
+        self
     }
 
     pub fn build(self) -> AuditEvent {
@@ -1675,12 +1810,83 @@ impl PolicyDenyBuilder {
             action: self.action,
             rp_id: self.rp_id,
             reason: self.reason,
+            origin: self.origin,
         };
         if meta.reason == PolicyDenyReason::ReplayServed {
             AuditEvent::new(AuditPayload::PolicyReplayServed(meta))
         } else {
             AuditEvent::new(AuditPayload::PolicyDeny(meta))
         }
+    }
+}
+
+/// A sign-transport hello refused because its peer UID is not the lease's browser UID.
+pub struct TransportPeerRefusedBuilder {
+    profile_id: ProfileId,
+    expected_uid: u32,
+    peer_uid: Option<u32>,
+}
+
+impl TransportPeerRefusedBuilder {
+    pub fn new(profile_id: ProfileId, expected_uid: u32) -> Self {
+        Self {
+            profile_id,
+            expected_uid,
+            peer_uid: None,
+        }
+    }
+
+    /// The peer's UID, if the kernel reported one.
+    pub fn peer_uid(mut self, peer_uid: Option<u32>) -> Self {
+        self.peer_uid = peer_uid;
+        self
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::TransportPeerRefused(
+            TransportPeerRefusedMeta {
+                profile_id: self.profile_id,
+                expected_uid: self.expected_uid,
+                peer_uid: self.peer_uid,
+            },
+        ))
+    }
+}
+
+/// A sign-transport hello whose build or relay version differs from the daemon's (plan V-L5).
+pub struct TransportVersionSkewBuilder {
+    profile_id: ProfileId,
+    daemon_version: String,
+    build_version: Option<String>,
+    relay_version: Option<String>,
+}
+
+impl TransportVersionSkewBuilder {
+    pub fn new(profile_id: ProfileId, daemon_version: &str) -> Self {
+        Self {
+            profile_id,
+            daemon_version: daemon_version.to_string(),
+            build_version: None,
+            relay_version: None,
+        }
+    }
+
+    /// The versions the hello reported (bounded and stripped of control characters by the caller).
+    pub fn reported(mut self, build_version: Option<&str>, relay_version: Option<&str>) -> Self {
+        self.build_version = build_version.map(str::to_string);
+        self.relay_version = relay_version.map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::TransportVersionSkew(
+            TransportVersionSkewMeta {
+                profile_id: self.profile_id,
+                daemon_version: self.daemon_version,
+                build_version: self.build_version,
+                relay_version: self.relay_version,
+            },
+        ))
     }
 }
 
@@ -2225,13 +2431,15 @@ impl AdminCredentialRevokeBuilder {
 }
 
 pub struct AdminCredentialDeleteBuilder {
+    profile_id: ProfileId,
     credential: CredentialRef,
     rp_id: String,
 }
 
 impl AdminCredentialDeleteBuilder {
-    pub fn new(credential: CredentialRef, rp_id: &str) -> Self {
+    pub fn new(profile_id: ProfileId, credential: CredentialRef, rp_id: &str) -> Self {
         Self {
+            profile_id,
             credential,
             rp_id: rp_id.to_string(),
         }
@@ -2240,6 +2448,7 @@ impl AdminCredentialDeleteBuilder {
     pub fn build(self) -> AuditEvent {
         AuditEvent::new(AuditPayload::AdminCredentialDelete(
             AdminCredentialDeleteMeta {
+                profile_id: self.profile_id,
                 credential: self.credential,
                 rp_id: self.rp_id,
             },
@@ -2384,6 +2593,12 @@ mod tests {
             BrowserLeaseCleanupBuilder::new(lid.clone()).build(),
             BrowserLeaseQuarantineBuilder::new(lid.clone(), QuarantineReason::SymlinkEscape)
                 .build(),
+            BrowserLeaseInterceptionBuilder::new(
+                lid.clone(),
+                pid.clone(),
+                InterceptionAuditState::Degraded,
+            )
+            .build(),
             IntentCreateBuilder::new(iid.clone(), pid.clone(), AuditAction::Register).build(),
             IntentApproveBuilder::new(iid.clone()).build(),
             IntentDenyBuilder::new(iid.clone()).build(),
@@ -2412,6 +2627,12 @@ mod tests {
                 PolicyDenyReason::ReplayServed,
             )
             .build(),
+            TransportVersionSkewBuilder::new(pid.clone(), "0.21.0+abc")
+                .reported(Some("0.20.0+def"), None)
+                .build(),
+            TransportPeerRefusedBuilder::new(pid.clone(), 1001)
+                .peer_uid(Some(1000))
+                .build(),
             CeremonyStartBuilder::new(
                 &cer_id,
                 Some(gid.clone()),
@@ -2628,12 +2849,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 51);
+        assert_eq!(events.len(), 54);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 51, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 54, "duplicate kind names detected");
     }
 
     #[test]
@@ -2790,6 +3011,7 @@ mod tests {
             "browser_lease.crash",
             "browser_lease.cleanup",
             "browser_lease.quarantine",
+            "browser_lease.interception",
             "intent.create",
             "intent.approve",
             "intent.deny",
@@ -2806,6 +3028,8 @@ mod tests {
             "policy.allow",
             "policy.deny",
             "policy.replay_served",
+            "transport.version_skew",
+            "transport.peer_refused",
             "ceremony.start",
             "ceremony.success",
             "ceremony.failure",

@@ -17,8 +17,8 @@ use passless_core::agent::{AgentRequestLimits, ProfileId};
 use super::lock_order::{self, LockLevel};
 use super::session::AgentSession;
 
-/// Connections accepted beyond the global request cap. They still get a handler thread, which
-/// reads the request and answers `busy`, so a client over the cap gets a well-formed reply.
+/// Connections accepted beyond the global request cap. Each connection has a reader thread; a
+/// connection beyond this headroom is answered `error{busy}` and closed by the accept loop.
 pub const BUSY_CONNECTION_HEADROOM: usize = 16;
 /// Minimum interval between two overflow log lines.
 pub const OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -50,10 +50,8 @@ impl BusyScope {
     }
 }
 
-/// Concurrent requests carried by one connection. Created once per accepted connection.
-///
-/// TODO(P6): the HTTP transport carries one request per connection, so this cap only bites once
-/// the multiplexed `connectNative` connection (plan D2) carries several requests at a time.
+/// Concurrent requests carried by one sign-transport connection (the multiplexed `connectNative`
+/// connection of plan D2). Created once per accepted connection.
 #[derive(Debug, Default)]
 pub struct ConnectionSlots {
     active: AtomicUsize,
@@ -132,7 +130,7 @@ impl RequestLimiter {
         &self.limits
     }
 
-    /// Open connections the accept loop serves with a handler thread.
+    /// Open connections the accept loop serves with a reader thread.
     pub fn max_connections(&self) -> usize {
         usize::from(self.limits.max_concurrent_requests) + BUSY_CONNECTION_HEADROOM
     }

@@ -283,6 +283,10 @@ pub struct AgentSession {
     binding: SessionBinding,
     expires_at: Instant,
     grant_id: OnceLock<GrantId>,
+    /// The UID the lease's browser (and so its `sign-proxy` relay) runs as. The sign transport
+    /// admits a hello for this session only from a peer with this UID (`SO_PEERCRED`); unset means
+    /// the daemon's own UID.
+    browser_uid: OnceLock<u32>,
     revoked: AtomicBool,
     state: Mutex<SessionState>,
     active_requests: AtomicUsize,
@@ -309,6 +313,7 @@ impl AgentSession {
             binding,
             expires_at,
             grant_id: OnceLock::new(),
+            browser_uid: OnceLock::new(),
             revoked: AtomicBool::new(false),
             state: Mutex::new(SessionState::default()),
             active_requests: AtomicUsize::new(0),
@@ -326,6 +331,16 @@ impl AgentSession {
 
     pub fn revocation_epoch(&self) -> u64 {
         self.binding.revocation_epoch
+    }
+
+    /// Record the UID the lease's browser runs as (once; a later call changes nothing).
+    pub fn bind_browser_uid(&self, uid: u32) {
+        let _ = self.browser_uid.set(uid);
+    }
+
+    /// The UID the lease's browser runs as, if one was bound.
+    pub fn browser_uid(&self) -> Option<u32> {
+        self.browser_uid.get().copied()
     }
 
     /// Bind the session grant that backs authentication for this bearer. Registration checks it
