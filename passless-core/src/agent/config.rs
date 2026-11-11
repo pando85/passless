@@ -13,19 +13,6 @@ use crate::error::{Error, Result};
 const MAX_DURATION_SECS: u64 = 86_400 * 365;
 const MIN_DURATION_SECS: u64 = 1;
 
-const UHID_NAME_MAX: usize = 128;
-const UHID_PHYS_MAX: usize = 64;
-const UHID_UNIQ_MAX: usize = 64;
-
-const DEVICE_NAME_MAX: usize = UHID_NAME_MAX - 1;
-const DEVICE_PHYS_MAX: usize = UHID_PHYS_MAX - 1;
-const DEVICE_UNIQ_MAX: usize = UHID_UNIQ_MAX - 1;
-
-const HUMAN_DEVICE_NAME: &str = "virtual-fido";
-const HUMAN_DEVICE_PHYS: &str = "virtual-fido-001";
-const HUMAN_VENDOR_ID: u16 = 0x15d9;
-const HUMAN_PRODUCT_ID: u16 = 0x0a37;
-
 pub const ANY_RP_ID: &str = "*";
 
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
@@ -588,62 +575,14 @@ impl<'de> Deserialize<'de> for BoundedDuration {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigDoc)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceIdentity {
-    pub name: String,
-    pub phys: String,
-    pub uniq: String,
-    pub vendor_id: u16,
-    pub product_id: u16,
-}
-
-impl DeviceIdentity {
-    pub fn validate(&self, profile_id: &ProfileId) -> Result<()> {
-        validate_device_field(&self.name, "name", DEVICE_NAME_MAX, profile_id)?;
-        validate_device_field(&self.phys, "phys", DEVICE_PHYS_MAX, profile_id)?;
-        validate_device_field(&self.uniq, "uniq", DEVICE_UNIQ_MAX, profile_id)?;
-
-        if self.name == HUMAN_DEVICE_NAME
-            && self.phys == HUMAN_DEVICE_PHYS
-            && self.vendor_id == HUMAN_VENDOR_ID
-            && self.product_id == HUMAN_PRODUCT_ID
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': device identity collides with the human authenticator \
-                 (virtual-fido / 0x{:04x}:0x{:04x})",
-                profile_id, HUMAN_VENDOR_ID, HUMAN_PRODUCT_ID,
-            )));
-        }
-
-        Ok(())
-    }
-}
-
-fn validate_device_field(
-    value: &str,
-    field: &'static str,
-    max: usize,
-    profile_id: &ProfileId,
-) -> Result<()> {
-    if value.contains('\0') {
-        return Err(Error::Config(format!(
-            "agent profile '{}': device.{} must not contain NUL bytes",
-            profile_id, field,
-        )));
-    }
-    if value.len() > max {
-        return Err(Error::Config(format!(
-            "agent profile '{}': device.{} exceeds maximum length of {} bytes (got {}); \
-             limit reserves 1 byte for NUL terminator",
-            profile_id,
-            field,
-            max,
-            value.len(),
-        )));
-    }
-    Ok(())
-}
+/// Legacy per-profile UHID identity.
+///
+/// Agents have no UHID or hidraw device of their own (ADR 0014 section 5): the isolated route was
+/// removed, so a `[agents.profiles.<id>.device]` table is parsed only so that old configs keep
+/// loading. Its contents are ignored and a deprecation warning is logged by
+/// `AgentProfileConfig::validate`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceIdentity {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(deny_unknown_fields)]
@@ -686,8 +625,9 @@ pub struct AgentProfileConfig {
     #[serde(default)]
     pub rules: Vec<AgentRpRule>,
 
-    #[serde(default)]
-    pub device: DeviceIdentity,
+    /// Deprecated and ignored: agents no longer use a UHID device.
+    #[serde(default, skip_serializing)]
+    pub device: Option<DeviceIdentity>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
@@ -774,7 +714,23 @@ impl AgentProfileConfig {
         })
     }
 
+    /// Deprecation warnings for legacy keys that are still accepted but have no effect.
+    pub fn deprecation_warnings(&self, profile_id: &ProfileId) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.device.is_some() {
+            warnings.push(format!(
+                "agent profile '{}': the [device] table is deprecated and ignored: agents have no \
+                 UHID device (ADR 0014 section 5); remove it",
+                profile_id
+            ));
+        }
+        warnings
+    }
+
     pub fn validate(&self, profile_id: &ProfileId) -> Result<()> {
+        for warning in self.deprecation_warnings(profile_id) {
+            log::warn!("{}", warning);
+        }
         if self.principal_user.is_empty() {
             return Err(Error::Config(format!(
                 "agent profile '{}': principal_user must not be empty",
@@ -929,16 +885,6 @@ impl AgentProfileConfig {
                 }
             }
             AgentMode::Isolated => {
-                if self.device.name.is_empty()
-                    || self.device.phys.is_empty()
-                    || self.device.uniq.is_empty()
-                {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': isolated mode requires a complete device identity",
-                        profile_id
-                    )));
-                }
-                self.device.validate(profile_id)?;
                 if self.storage.is_none() {
                     return Err(Error::Config(format!(
                         "agent profile '{}': isolated mode requires storage backend configuration",
@@ -1113,27 +1059,6 @@ impl AgentConfig {
                         canonical_human.display(),
                     )));
                 }
-            }
-        }
-
-        let mut device_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (pid, profile) in &validated_profiles {
-            if profile.mode == AgentMode::SameUser {
-                continue;
-            }
-            let key = format!(
-                "{}:{}:{}:{}:{}",
-                profile.device.name,
-                profile.device.phys,
-                profile.device.uniq,
-                profile.device.vendor_id,
-                profile.device.product_id,
-            );
-            if !device_keys.insert(key) {
-                return Err(Error::Config(format!(
-                    "agent profile '{}': device identity collides with another profile",
-                    pid
-                )));
             }
         }
 
@@ -1572,7 +1497,6 @@ register = "deny"
     fn test_same_user_profile_rejects_storage() {
         let mut profile = make_isolated_profile();
         profile.mode = AgentMode::SameUser;
-        profile.device = DeviceIdentity::default();
         assert!(
             profile
                 .validate(&ProfileId::new("same-user").unwrap())
@@ -1613,13 +1537,7 @@ register = "deny"
             }),
             registration_allowed: true,
             rules: vec![],
-            device: DeviceIdentity {
-                name: "passless-agent-iso".to_string(),
-                phys: "iso-phys".to_string(),
-                uniq: "iso-uniq-001".to_string(),
-                vendor_id: 0x1234,
-                product_id: 0x5679,
-            },
+            device: None,
             start_url: None,
             browser_command: None,
             browser_user: None,
@@ -1627,6 +1545,69 @@ register = "deny"
             browser_cdp_expose: None,
             browser_cdp_port: None,
         }
+    }
+
+    // B6 regression: an isolated profile no longer needs (or can collide on) a `[device]` identity.
+    #[test]
+    fn test_isolated_profile_valid_without_device() {
+        let profile = make_isolated_profile();
+        assert!(profile.device.is_none());
+        let pid = ProfileId::new("test").unwrap();
+        profile.validate(&pid).unwrap();
+        assert!(profile.deprecation_warnings(&pid).is_empty());
+    }
+
+    #[test]
+    fn test_legacy_device_key_warns_and_is_ignored() {
+        let input = r#"
+mode = "isolated"
+principal_user = "agent"
+rp_ids = ["example.com"]
+
+[storage.local]
+path = "/tmp/legacy-device/credentials"
+pin_path = "/tmp/legacy-device/pin"
+
+[device]
+name = "legacy"
+phys = "legacy-phys"
+uniq = "legacy-uniq"
+vendor_id = 4660
+product_id = 22136
+"#;
+        let profile: AgentProfileConfig = toml::from_str(input).unwrap();
+        let pid = ProfileId::new("legacy").unwrap();
+        let warnings = profile.deprecation_warnings(&pid);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[device]") && warnings[0].contains("ignored"));
+        profile.validate(&pid).unwrap();
+        // The legacy identity is never written back out.
+        let rendered = toml::to_string(&profile).unwrap();
+        assert!(!rendered.contains("legacy-phys"), "{rendered}");
+    }
+
+    #[test]
+    fn test_identical_legacy_devices_do_not_collide_across_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        for name in ["a", "b"] {
+            let mut profile = make_isolated_profile();
+            profile.storage = Some(AgentStorageConfig::Local {
+                path: dir.path().join(name).join("creds"),
+                pin_path: dir.path().join(name).join("pin"),
+            });
+            // The same legacy identity on two profiles used to be a config error.
+            profile.device = Some(DeviceIdentity::default());
+            profiles.insert(name.to_string(), profile);
+        }
+        let config = AgentConfig {
+            enabled: true,
+            profiles,
+            audit_path: Some(dir.path().join("audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
+        };
+        config.validate(None).unwrap();
     }
 
     #[test]
@@ -1898,87 +1879,6 @@ verbose = false
     }
 
     #[test]
-    fn test_config_device_identity_collision() {
-        let mut profiles = BTreeMap::new();
-        let device = DeviceIdentity {
-            name: "same".to_string(),
-            phys: "same".to_string(),
-            uniq: "same".to_string(),
-            vendor_id: 1,
-            product_id: 2,
-        };
-        profiles.insert(
-            "a".to_string(),
-            AgentProfileConfig {
-                max_operations: 64,
-                max_concurrent_sessions: 1,
-                browser_scope: BrowserScope::Session,
-                credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
-                mode: AgentMode::Isolated,
-                principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
-                credential_refs: None,
-                max_grant_ttl: None,
-                max_session_ttl: None,
-                storage: Some(AgentStorageConfig::Local {
-                    path: PathBuf::from("/tmp/a/creds"),
-                    pin_path: PathBuf::from("/tmp/a/pin"),
-                }),
-                registration_allowed: false,
-                rules: vec![],
-                device: device.clone(),
-                start_url: None,
-                browser_command: None,
-                browser_user: None,
-                browser_runtime_root: None,
-                browser_cdp_expose: None,
-                browser_cdp_port: None,
-            },
-        );
-        profiles.insert(
-            "b".to_string(),
-            AgentProfileConfig {
-                max_operations: 64,
-                max_concurrent_sessions: 1,
-                browser_scope: BrowserScope::Session,
-                credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
-                mode: AgentMode::Isolated,
-                principal_user: "u2".to_string(),
-                rp_ids: vec!["b.com".to_string()],
-                require_uv: true,
-                credential_refs: None,
-                max_grant_ttl: None,
-                max_session_ttl: None,
-                storage: Some(AgentStorageConfig::Local {
-                    path: PathBuf::from("/tmp/b/creds"),
-                    pin_path: PathBuf::from("/tmp/b/pin"),
-                }),
-                registration_allowed: false,
-                rules: vec![],
-                device,
-                start_url: None,
-                browser_command: None,
-                browser_user: None,
-                browser_runtime_root: None,
-                browser_cdp_expose: None,
-                browser_cdp_port: None,
-            },
-        );
-        let config = AgentConfig {
-            enabled: true,
-            profiles,
-            audit_path: Some(PathBuf::from("/tmp/agent-audit")),
-            acknowledge_global_same_user: vec![],
-            acknowledge_same_user_registration: vec![],
-        };
-        let err = config.validate(None).unwrap_err();
-        assert!(err.to_string().contains("collides"));
-    }
-
-    #[test]
     fn test_config_overlapping_roots_rejected() {
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -2002,13 +1902,7 @@ verbose = false
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2056,13 +1950,7 @@ verbose = false
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2109,134 +1997,6 @@ product_id = 2
         use super::super::ids::CredentialRef;
         let _cred_ref = CredentialRef::with_default_domain(b"test-credential");
         assert_eq!(_cred_ref.as_bytes().len(), 32);
-    }
-
-    #[test]
-    fn test_device_identity_nul_in_name_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "te\0st".to_string();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_device_identity_nul_in_phys_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "ph\0ys".to_string();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_device_identity_nul_in_uniq_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "un\0iq".to_string();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_device_identity_name_too_long_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "a".repeat(DEVICE_NAME_MAX + 1);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_phys_too_long_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "a".repeat(DEVICE_PHYS_MAX + 1);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_uniq_too_long_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "a".repeat(DEVICE_UNIQ_MAX + 1);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_name_at_nul_boundary_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "a".repeat(UHID_NAME_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_phys_at_nul_boundary_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "a".repeat(UHID_PHYS_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_uniq_at_nul_boundary_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "a".repeat(UHID_UNIQ_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_name_at_max_accepted() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "a".repeat(DEVICE_NAME_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_device_identity_phys_at_max_accepted() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "a".repeat(DEVICE_PHYS_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_device_identity_uniq_at_max_accepted() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "a".repeat(DEVICE_UNIQ_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_device_identity_human_collision_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "virtual-fido".to_string();
-        profile.device.phys = "virtual-fido-001".to_string();
-        profile.device.vendor_id = 0x15d9;
-        profile.device.product_id = 0x0a37;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("human authenticator"));
-    }
-
-    #[test]
-    fn test_device_identity_partial_human_match_allowed() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "virtual-fido".to_string();
-        profile.device.phys = "virtual-fido-001".to_string();
-        profile.device.vendor_id = 0x1234;
-        profile.device.product_id = 0x5678;
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
     }
 
     #[test]
@@ -2288,13 +2048,7 @@ product_id = 2
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "overlap-test".to_string(),
-                    phys: "p".to_string(),
-                    uniq: "u".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2340,13 +2094,7 @@ product_id = 2
                     }),
                     registration_allowed: false,
                     rules: vec![],
-                    device: DeviceIdentity {
-                        name: format!("dev-{}", name),
-                        phys: format!("phys-{}", name),
-                        uniq: format!("uniq-{}", name),
-                        vendor_id: 1,
-                        product_id: 1,
-                    },
+                    device: None,
                     start_url: None,
                     browser_command: None,
                     browser_user: None,
@@ -2475,13 +2223,7 @@ backend_type = "local"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2539,13 +2281,7 @@ backend_type = "local"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2595,13 +2331,7 @@ backend_type = "local"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2965,13 +2695,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3001,13 +2725,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "b".to_string(),
-                    phys: "b".to_string(),
-                    uniq: "b".to_string(),
-                    vendor_id: 2,
-                    product_id: 2,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3084,13 +2802,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3120,13 +2832,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "b".to_string(),
-                    phys: "b".to_string(),
-                    uniq: "b".to_string(),
-                    vendor_id: 2,
-                    product_id: 2,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3172,13 +2878,7 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                 }),
                 registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,

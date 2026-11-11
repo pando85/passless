@@ -3,7 +3,6 @@ use std::fmt;
 
 use super::ids::{
     CredentialRef, EndpointId, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
-    RegistrationGrantId,
 };
 
 #[cfg(target_os = "linux")]
@@ -375,13 +374,6 @@ pub enum AdminRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
-    RequestRegistration {
-        profile_id: ProfileId,
-        rp_id: String,
-        max_session_ttl: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
     LaunchBrowser {
         profile_id: ProfileId,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -425,12 +417,7 @@ pub enum AdminResponse {
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
-    DelegationRequested {
-        request_id: PendingRequestId,
-    },
-    RegistrationGranted {
-        registration_grant_id: RegistrationGrantId,
-    },
+    DelegationRequested { request_id: PendingRequestId },
     ShutdownAccepted,
 }
 
@@ -1314,12 +1301,6 @@ impl Validate for AdminRequest {
             }
             Self::TerminatePrincipal { .. } => {}
             Self::RequestDelegation { rp_id, reason, .. } => {
-                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                if let Some(r) = reason {
-                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
-                }
-            }
-            Self::RequestRegistration { rp_id, reason, .. } => {
                 check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
                 if let Some(r) = reason {
                     check_str(r, "reason", MAX_REASON_LEN, &mut errors);

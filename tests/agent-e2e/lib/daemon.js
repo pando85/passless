@@ -34,7 +34,7 @@ function tomlValue(v) {
  * @param {object} env
  * @param {object} o
  * @param {Object<string,object>} o.profiles  name -> {mode, rules:[{rp, authenticate, register, credential_selection}],
- *        credential_selection, max_operations, extra:{...raw profile keys}}
+ *        credential_selection, max_operations, legacyDevice, extra:{...raw profile keys}}
  * @param {string[]} [o.browserArgs]  extra browser flags (variant + TLS), put after the executable
  * @param {string} o.browserExe
  */
@@ -58,9 +58,6 @@ function renderConfig(env, o) {
     // Linux delivers when the *thread* that spawned it exits, i.e. the short-lived IPC handler thread of
     // `agent-admin browser launch`. The browser would be SIGTERMed right after launch (baseline finding).
     b.push('browser_scope = "profile"', 'browser_cdp_expose = "port"', 'browser_cdp_port = 0');
-    // Every profile needs a unique device identity: same-user profiles with the default identity
-    // collide with each other ("device identity collides with another profile").
-    const rnd = crypto.randomBytes(4).toString('hex');
     if (mode === 'isolated') {
       const base = path.join(env.dirs.work, 'iso', name);
       fs.mkdirSync(path.join(base, 'credentials'), { recursive: true, mode: 0o700 });
@@ -68,8 +65,12 @@ function renderConfig(env, o) {
       b.push('');
       b.push(`[agents.profiles.${name}.storage.local]`, `path = ${q(path.join(base, 'credentials'))}`, `pin_path = ${q(path.join(base, 'pin'))}`);
     }
-    b.push('', `[agents.profiles.${name}.device]`, `name = ${q(`e2e-${name}-${rnd}`)}`, `phys = ${q(`e2e-${name}-${rnd}-phys`)}`,
-      `uniq = ${q(`e2e-${name}-${rnd}-uniq`)}`, 'vendor_id = 4660', 'product_id = 22136');
+    // No `[device]` table: agents have no UHID route (ADR 0014 section 5). `legacyDevice: true` writes the old
+    // table anyway to prove it is warned about and ignored (R6).
+    if (p.legacyDevice) {
+      b.push('', `[agents.profiles.${name}.device]`, `name = ${q(`legacy-${name}`)}`, `phys = ${q(`legacy-${name}-phys`)}`,
+        `uniq = ${q(`legacy-${name}-uniq`)}`, 'vendor_id = 4660', 'product_id = 22136');
+    }
     for (const r of p.rules || []) {
       const reg = RULE_ACTION[r.register || 'deny'];
       const auth = RULE_ACTION[r.authenticate || 'deny'];

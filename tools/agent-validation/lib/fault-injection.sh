@@ -19,12 +19,10 @@ AV_FAULT_RUST_CATEGORIES=(
     "audit-rotation;passless-rs;agent::audit::tests;test_audit_gate_rotation,test_cross_segment_reopen,test_empty_rotated_segment_restart"
     "intent-grant-races;passless-rs;agent::intent::tests;test_cancel_approve_race_cancel_wins,agent::policy_engine::tests::test_two_authorize_races_one_intent_one_succeeds,agent::policy_engine::tests::test_intent_replay_denied,agent::policy_engine::tests::test_concurrent_authorize_one_claim,agent::grant::tests::test_concurrent_claim_only_one_succeeds"
     "policy-reload;passless-rs;agent::policy_engine::tests;test_reload_invalidates_stores"
-    "endpoint-capacity;passless-rs;agent::endpoint_manager::tests;test_create_rejected_capacity_exceeded,test_endpoint_creation_failure_marks_endpoint_failed"
     "browser-cleanup-quarantine;passless-rs;agent::browser::tests;test_quarantine_path_format,test_quarantine_path_unique,test_pid_mismatch_cleanup_quarantines"
-    "protocol-malformed-cbor;passless-rs;agent::ceremony::tests;test_parse_make_credential_invalid_cbor,test_parse_response_malformed_cbor,test_fuzz_truncated_cbor,test_malformed_truncated_cbor,test_malformed_indefinite_length_not_supported"
     "protocol-ipc;passless-rs;agent::ipc::tests;test_malformed_message_rejected"
     "monotonic-clocks;passless-rs;agent::browser::tests;test_system_clock_monotonic,test_mock_clock_advance,test_mock_clock_set_offset,test_mock_clock_concurrent_advance"
-    "redaction;passless-rs;agent::audit_events::tests;test_no_secret_value_patterns,agent::intent::tests::test_claim_token_display_redacted,agent::intent::tests::test_claim_token_debug_redacted,agent::interaction::tests::test_debug_redacts_token_bytes,agent::launcher::tests::test_session_capability_debug_redacted,agent::launcher::tests::test_session_capability_display_redacted,agent::ceremony_observer::tests::test_observation_debug_has_no_secret_fields"
+    "redaction;passless-rs;agent::audit_events::tests;test_no_secret_value_patterns,agent::intent::tests::test_claim_token_display_redacted,agent::intent::tests::test_claim_token_debug_redacted,agent::launcher::tests::test_session_capability_debug_redacted,agent::launcher::tests::test_session_capability_display_redacted"
 )
 
 av_run_fault_rust_category() {

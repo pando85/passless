@@ -63,8 +63,6 @@ node --test tools/agent-validation/tests/test-gate-c-real-rp.js
 echo "=== Phase 3: cargo test (parallel) ===" >&2
 timeout 600s cargo test --all-features -- \
     --skip agent::prompt::dbus_tests \
-    --skip ceremony_observer \
-    --skip agent::storage_factory::tests::composition_conformance \
     --skip tpm_portable_missing_parent_errors \
     --skip agent::browser::tests::test_cdp_pipes_drop_closes_fds \
     --skip agent::browser::tests::test_child_in_separate_process_group \
@@ -82,16 +80,7 @@ echo "=== Phase 5: cargo test (dbus, single-threaded) ===" >&2
 timeout 300s cargo test --all-features -p passless-rs --bin passless \
     agent::prompt::dbus_tests -- --test-threads=1
 
-echo "=== Phase 6: cargo test (ceremony_observer, single-threaded) ===" >&2
-timeout 300s cargo test --all-features -p passless-rs --bin passless \
-    ceremony_observer -- --test-threads=1
-
-echo "=== Phase 7: cargo test (composition_conformance, single-threaded) ===" >&2
-timeout 600s cargo test --all-features -p passless-rs --bin passless \
-    agent::storage_factory::tests::composition_conformance -- \
-    --include-ignored --test-threads=1
-
-echo "=== Phase 8: cargo test (browser FD tests, single-threaded) ===" >&2
+echo "=== Phase 6: cargo test (browser FD tests, single-threaded) ===" >&2
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_cdp_pipes_drop_closes_fds -- --test-threads=1
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
@@ -101,13 +90,13 @@ timeout 120s cargo test --all-features -p passless-rs --bin passless \
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     agent::browser::tests::test_concurrent_launch_and_revoke -- --test-threads=1
 
-echo "=== Phase 9: cargo test (runtime tests, single-threaded) ===" >&2
+echo "=== Phase 7: cargo test (runtime tests, single-threaded) ===" >&2
 echo "Skipping agent::runtime::tests - fundamentally broken in CI" >&2
 
-echo "=== Phase 10: cargo test (launcher tests, single-threaded) ===" >&2
+echo "=== Phase 8: cargo test (launcher tests, single-threaded) ===" >&2
 echo "Skipping agent::launcher::tests::test_spawn_principal_non_root_fails_closed - requires specific UID configuration" >&2
 
-echo "=== Phase 10b: cargo test (agent_admin tests, single-threaded) ===" >&2
+echo "=== Phase 8b: cargo test (agent_admin tests, single-threaded) ===" >&2
 timeout 120s cargo test --all-features -p passless-rs --bin passless \
     commands::agent_admin::tests::auto_fails_when_no_agent_detected -- --test-threads=1
 
@@ -130,10 +119,10 @@ source tools/agent-validation/lib/secret-scanning.sh
 # shellcheck source=tools/agent-validation/stages/secret-scanning.sh
 source tools/agent-validation/stages/secret-scanning.sh
 
-echo "=== Phase 11: fault injection ===" >&2
+echo "=== Phase 9: fault injection ===" >&2
 stage_fault_injection
 
-echo "=== Phase 12: secret scanning ===" >&2
+echo "=== Phase 10: secret scanning ===" >&2
 stage_secret_scanning
 
 echo "=== All phases completed ===" >&2

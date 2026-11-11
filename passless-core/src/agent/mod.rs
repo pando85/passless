@@ -11,7 +11,7 @@ pub use config::{
 };
 pub use ids::{
     BrowserLeaseId, CredentialRef, EndpointId, GrantId, IdError, IntentId, PendingRequestId,
-    PolicyGenerationId, PrincipalSessionId, ProfileId, RegistrationGrantId,
+    PolicyGenerationId, PrincipalSessionId, ProfileId,
 };
 pub use policy::{Policy, PolicyDigest, PolicyError, PolicyParams};
 pub use protocol::{

@@ -147,20 +147,21 @@ test_fault_category_includes_intent_races() {
     fi
 }
 
-test_fault_category_includes_endpoint_capacity() {
-    log_test "fault categories include endpoint capacity tests"
+test_fault_categories_exclude_agent_endpoints() {
+    log_test "fault categories reference no removed agent UHID endpoint/ceremony modules"
     setup_env
     local found=false
     for spec in "${AV_FAULT_RUST_CATEGORIES[@]}"; do
-        if [[ "$spec" == *"endpoint"* ]] && [[ "$spec" == *"capacity"* ]]; then
+        if [[ "$spec" == *"endpoint_manager"* ]] || [[ "$spec" == *"agent::ceremony"* ]] \
+            || [[ "$spec" == *"ceremony_observer"* ]] || [[ "$spec" == *"agent::interaction"* ]]; then
             found=true
             break
         fi
     done
-    if [[ "$found" == "true" ]]; then
-        log_pass "endpoint capacity category present"
+    if [[ "$found" == "false" ]]; then
+        log_pass "no removed-module fault categories present"
     else
-        log_fail "endpoint capacity category missing"
+        log_fail "fault categories still reference removed agent modules"
     fi
 }
 
@@ -181,20 +182,20 @@ test_fault_category_includes_browser_cleanup() {
     fi
 }
 
-test_fault_category_includes_malformed_cbor() {
-    log_test "fault categories include malformed CBOR tests"
+test_fault_category_includes_malformed_ipc() {
+    log_test "fault categories include malformed IPC message tests"
     setup_env
     local found=false
     for spec in "${AV_FAULT_RUST_CATEGORIES[@]}"; do
-        if [[ "$spec" == *"malformed"* ]] || [[ "$spec" == *"cbor"* ]]; then
+        if [[ "$spec" == *"ipc"* ]] && [[ "$spec" == *"malformed"* ]]; then
             found=true
             break
         fi
     done
     if [[ "$found" == "true" ]]; then
-        log_pass "malformed CBOR category present"
+        log_pass "malformed IPC category present"
     else
-        log_fail "malformed CBOR category missing"
+        log_fail "malformed IPC category missing"
     fi
 }
 
@@ -309,9 +310,9 @@ main() {
     test_fault_category_names_unique
     test_fault_category_includes_audit_enospc
     test_fault_category_includes_intent_races
-    test_fault_category_includes_endpoint_capacity
+    test_fault_categories_exclude_agent_endpoints
     test_fault_category_includes_browser_cleanup
-    test_fault_category_includes_malformed_cbor
+    test_fault_category_includes_malformed_ipc
     test_fault_category_includes_monotonic_clocks
     test_fault_category_includes_circuit_breaker
     test_resource_ceiling_check_cleans_up

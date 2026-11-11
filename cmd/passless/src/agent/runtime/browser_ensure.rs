@@ -327,18 +327,18 @@ impl AgentRuntime {
             )
         })?;
 
-        let registration_ctx = crate::agent::register::RegisterContext {
-            profile_id: profile_id.clone(),
-            // Browser startup never implicitly creates enrollment authority.
-            registration_grants: std::collections::HashMap::new(),
-            profile_config: profile_config.clone(),
-        };
+        // Registration authority is policy only (`register = "allow"` on an exact RP rule); the
+        // bearer is bound to the browser lease in `finish_principal_browser_launch` and revoked
+        // with it.
+        let registration_ctx = crate::agent::register::RegisterContext::new(
+            profile_id.clone(),
+            profile_config.clone(),
+        );
         let registration_handler = Arc::new(crate::agent::register::RegisterHandler {
             credential_storage: profile.backend.credential_storage.clone(),
-            policy_runtime: self.policy_runtime.clone(),
             audit_gate: self.audit_gate.clone(),
             key_provider: profile.backend.key_provider.clone(),
-            security_config: profile.endpoint_spec.security_config.clone(),
+            security_config: profile.security_config.clone(),
             operation_lock: profile.backend.operation_lock.clone(),
         });
         self.sign_registry
@@ -414,6 +414,15 @@ impl AgentRuntime {
         browser_manager: &mut crate::agent::browser::BrowserProcessManager,
     ) -> Result<PrincipalResponse, ProtocolError> {
         let profile_config = &profile.profile_config;
+        self.sign_registry
+            .bind_registration_lease(bearer_token, lease_id.to_string())
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to bind browser registration context: {e}"),
+                    RecommendedAction::Abort,
+                )
+            })?;
         let mut credential_refs = Vec::new();
         if let Ok(mut storage) = profile.backend.credential_storage.lock()
             && let Ok(mut credential) = storage.read_first(CredentialFilter::None)
@@ -504,7 +513,7 @@ impl AgentRuntime {
                 credential_storage: profile.backend.credential_storage.clone(),
                 policy_runtime: self.policy_runtime.clone(),
                 audit_gate: self.audit_gate.clone(),
-                security_config: profile.endpoint_spec.security_config.clone(),
+                security_config: profile.security_config.clone(),
                 key_provider,
                 operation_lock: profile.backend.operation_lock.clone(),
             });

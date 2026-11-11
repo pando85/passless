@@ -1749,6 +1749,58 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Test helper: decode the frames of an audit directory into their JSON payloads.
+#[cfg(test)]
+pub(crate) mod test_support {
+    const FRAME_MAGIC: u32 = 0x41554449;
+    const HEADER_SIZE: usize = 88;
+
+    pub fn read_audit_events(audit_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(audit_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("audit-") && name.ends_with(".log")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let data = std::fs::read(entry.path()).unwrap();
+            if data.len() <= HEADER_SIZE {
+                continue;
+            }
+            let mut offset = HEADER_SIZE;
+            while offset + 12 <= data.len() {
+                let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                if magic != FRAME_MAGIC {
+                    break;
+                }
+                let frame_len =
+                    u64::from_le_bytes(data[offset + 4..offset + 12].try_into().unwrap()) as usize;
+                if offset + 12 + frame_len > data.len() {
+                    break;
+                }
+                let body = &data[offset + 12..offset + 12 + frame_len];
+                if body.len() < 28 {
+                    break;
+                }
+                let payload_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
+                if body.len() < 28 + payload_len + 64 {
+                    break;
+                }
+                let payload = &body[28..28 + payload_len];
+                events.push(serde_json::from_slice(payload).unwrap());
+                offset += 12 + frame_len;
+            }
+        }
+        events
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

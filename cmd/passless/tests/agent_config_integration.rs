@@ -6,18 +6,8 @@ use std::path::PathBuf;
 
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration, BrowserScope,
-    DeviceIdentity, validate_rp_id,
+    validate_rp_id,
 };
-
-fn minimal_device() -> DeviceIdentity {
-    DeviceIdentity {
-        name: "agent-test-dev".into(),
-        phys: "agent-test-phys".into(),
-        uniq: "agent-test-uniq".into(),
-        vendor_id: 0x9999,
-        product_id: 0x0001,
-    }
-}
 
 fn isolated_profile() -> AgentProfileConfig {
     AgentProfileConfig {
@@ -39,7 +29,7 @@ fn isolated_profile() -> AgentProfileConfig {
         }),
         registration_allowed: false,
         rules: vec![],
-        device: minimal_device(),
+        device: None,
         start_url: None,
         browser_command: None,
         browser_user: None,
@@ -123,42 +113,6 @@ fn isolated_mode_rejects_browser_runtime_root() {
 }
 
 #[test]
-fn device_collision_with_human_authenticator_rejected() {
-    let mut profile = isolated_profile();
-    profile.device = DeviceIdentity {
-        name: "virtual-fido".into(),
-        phys: "virtual-fido-001".into(),
-        uniq: "anything".into(),
-        vendor_id: 0x15d9,
-        product_id: 0x0a37,
-    };
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("collides with the human authenticator")
-    );
-}
-
-#[test]
-fn device_name_with_nul_byte_rejected() {
-    let mut profile = isolated_profile();
-    profile.device.name = "bad\0name".into();
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("NUL"));
-}
-
-#[test]
-fn device_name_too_long_rejected() {
-    let mut profile = isolated_profile();
-    profile.device.name = "x".repeat(200);
-    let pid = passless_core::agent::ProfileId::new("test").unwrap();
-    let err = profile.validate(&pid).unwrap_err();
-    assert!(err.to_string().contains("exceeds maximum length"));
-}
-
-#[test]
 fn invalid_rp_id_in_profile_rejected() {
     let mut profile = isolated_profile();
     profile.rp_ids = vec!["https://example.com".into()];
@@ -200,7 +154,6 @@ fn agent_config_detects_overlapping_storage_paths() {
         path: PathBuf::from("/tmp/agent-overlap/cred"),
         pin_path: PathBuf::from("/tmp/agent-overlap/pin"),
     });
-    p1.device.name = "dev1".into();
     profiles.insert("p1".to_string(), p1);
 
     let mut p2 = isolated_profile();
@@ -208,7 +161,6 @@ fn agent_config_detects_overlapping_storage_paths() {
         path: PathBuf::from("/tmp/agent-overlap/cred/sub"),
         pin_path: PathBuf::from("/tmp/agent-overlap/pin2"),
     });
-    p2.device.name = "dev2".into();
     profiles.insert("p2".to_string(), p2);
 
     let config = AgentConfig {
@@ -222,8 +174,10 @@ fn agent_config_detects_overlapping_storage_paths() {
     assert!(err.to_string().contains("overlap"));
 }
 
+// B6 regression: profiles no longer need a distinct `[device]` identity (agents have no UHID route),
+// and a legacy `[device]` key is accepted and ignored.
 #[test]
-fn agent_config_detects_device_identity_collision() {
+fn agent_config_accepts_profiles_sharing_a_legacy_device_identity() {
     let mut profiles = BTreeMap::new();
     let mut p1 = isolated_profile();
     p1.storage = Some(AgentStorageConfig::Local {
@@ -246,8 +200,16 @@ fn agent_config_detects_device_identity_collision() {
         acknowledge_global_same_user: vec![],
         acknowledge_same_user_registration: vec![],
     };
-    let err = config.validate(None).unwrap_err();
-    assert!(err.to_string().contains("device identity collides"));
+    config.validate(None).unwrap();
+}
+
+#[test]
+fn legacy_device_table_is_parsed_and_ignored() {
+    let mut profile = isolated_profile();
+    profile.device = Some(passless_core::agent::DeviceIdentity::default());
+    let pid = passless_core::agent::ProfileId::new("test").unwrap();
+    assert_eq!(profile.deprecation_warnings(&pid).len(), 1);
+    profile.validate(&pid).unwrap();
 }
 
 #[test]

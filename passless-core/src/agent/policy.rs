@@ -50,11 +50,6 @@ pub struct PolicyParams {
     pub max_grant_ttl: u64,
     pub max_session_ttl: u64,
     pub principal_user: String,
-    pub device_name: String,
-    pub device_phys: String,
-    pub device_uniq: String,
-    pub device_vendor_id: u16,
-    pub device_product_id: u16,
     pub start_url: Option<String>,
     pub browser_argv: Vec<String>,
     pub storage_backend: String,
@@ -78,11 +73,6 @@ pub struct Policy {
     pub max_grant_ttl: u64,
     pub max_session_ttl: u64,
     pub principal_user: String,
-    pub device_name: String,
-    pub device_phys: String,
-    pub device_uniq: String,
-    pub device_vendor_id: u16,
-    pub device_product_id: u16,
     pub start_url: String,
     pub browser_argv: Vec<String>,
     pub storage_backend: String,
@@ -123,11 +113,6 @@ impl Policy {
             max_grant_ttl: params.max_grant_ttl,
             max_session_ttl: params.max_session_ttl,
             principal_user: params.principal_user,
-            device_name: params.device_name,
-            device_phys: params.device_phys,
-            device_uniq: params.device_uniq,
-            device_vendor_id: params.device_vendor_id,
-            device_product_id: params.device_product_id,
             start_url: params.start_url.unwrap_or_default(),
             browser_argv: params.browser_argv,
             storage_backend: params.storage_backend,
@@ -159,11 +144,6 @@ impl Policy {
             max_grant_ttl,
             max_session_ttl: 0,
             principal_user: String::new(),
-            device_name: String::new(),
-            device_phys: String::new(),
-            device_uniq: String::new(),
-            device_vendor_id: 0,
-            device_product_id: 0,
             start_url: None,
             browser_argv: vec![],
             storage_backend: String::new(),
@@ -434,17 +414,6 @@ pub mod cbor {
                 "principal_user".to_string(),
                 encode_text(&policy.principal_user),
             ),
-            ("device_name".to_string(), encode_text(&policy.device_name)),
-            ("device_phys".to_string(), encode_text(&policy.device_phys)),
-            ("device_uniq".to_string(), encode_text(&policy.device_uniq)),
-            (
-                "device_vendor_id".to_string(),
-                encode_uint(policy.device_vendor_id as u64),
-            ),
-            (
-                "device_product_id".to_string(),
-                encode_uint(policy.device_product_id as u64),
-            ),
             ("start_url".to_string(), encode_text(&policy.start_url)),
             (
                 "browser_argv".to_string(),
@@ -545,11 +514,6 @@ pub mod cbor {
             "max_grant_ttl",
             "max_session_ttl",
             "principal_user",
-            "device_name",
-            "device_phys",
-            "device_uniq",
-            "device_vendor_id",
-            "device_product_id",
             "start_url",
             "browser_argv",
             "storage_backend",
@@ -799,8 +763,7 @@ mod tests {
         let policy = test_policy();
         let cbor = policy.to_deterministic_cbor();
         assert_eq!(cbor[0] & 0xe0, 0xa0);
-        assert_eq!(cbor[0] & 0x1f, 24);
-        assert_eq!(cbor[1], 24);
+        assert_eq!(cbor[0], 0xa0 | 19, "map of 19 entries");
     }
 
     #[test]
@@ -914,11 +877,6 @@ mod tests {
             max_grant_ttl: 60,
             max_session_ttl: 0,
             principal_user: String::new(),
-            device_name: String::new(),
-            device_phys: String::new(),
-            device_uniq: String::new(),
-            device_vendor_id: 0,
-            device_product_id: 0,
             start_url: None,
             browser_argv: vec![],
             storage_backend: String::new(),
@@ -940,11 +898,6 @@ mod tests {
             max_grant_ttl: 60,
             max_session_ttl: 0,
             principal_user: String::new(),
-            device_name: String::new(),
-            device_phys: String::new(),
-            device_uniq: String::new(),
-            device_vendor_id: 0,
-            device_product_id: 0,
             start_url: None,
             browser_argv: vec![],
             storage_backend: String::new(),
@@ -972,11 +925,6 @@ mod tests {
             max_grant_ttl: 60,
             max_session_ttl: 0,
             principal_user: String::new(),
-            device_name: String::new(),
-            device_phys: String::new(),
-            device_uniq: String::new(),
-            device_vendor_id: 0,
-            device_product_id: 0,
             start_url: None,
             browser_argv: vec![],
             storage_backend: String::new(),
@@ -998,11 +946,6 @@ mod tests {
             max_grant_ttl: 60,
             max_session_ttl: 0,
             principal_user: String::new(),
-            device_name: String::new(),
-            device_phys: String::new(),
-            device_uniq: String::new(),
-            device_vendor_id: 0,
-            device_product_id: 0,
             start_url: None,
             browser_argv: vec![],
             storage_backend: String::new(),
@@ -1109,8 +1052,7 @@ mod tests {
         let cbor_bytes = policy.to_deterministic_cbor();
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
-        assert_eq!(cbor_bytes[0] & 0x1f, 24);
-        assert_eq!(cbor_bytes[1], 24);
+        assert_eq!(cbor_bytes[0], 0xa0 | 19, "map of 19 entries");
         assert!(!cbor_bytes.is_empty());
         assert_ne!(cbor_bytes[0], 0xbf);
     }
@@ -1139,8 +1081,7 @@ mod tests {
         let cbor_bytes = policy.to_deterministic_cbor();
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
-        assert_eq!(cbor_bytes[0] & 0x1f, 24);
-        assert_eq!(cbor_bytes[1], 24);
+        assert_eq!(cbor_bytes[0], 0xa0 | 19, "map of 19 entries");
         assert!(!cbor_bytes.is_empty());
     }
 
@@ -1167,8 +1108,7 @@ mod tests {
         let cbor_bytes = policy.to_deterministic_cbor();
 
         assert_eq!(cbor_bytes[0] & 0xe0, 0xa0);
-        assert_eq!(cbor_bytes[0] & 0x1f, 24);
-        assert_eq!(cbor_bytes[1], 24);
+        assert_eq!(cbor_bytes[0], 0xa0 | 19, "map of 19 entries");
     }
 
     #[test]
@@ -1263,7 +1203,7 @@ mod tests {
     #[test]
     fn test_sorted_keys_complete() {
         let keys = cbor::sorted_keys_for_policy();
-        assert_eq!(keys.len(), 24);
+        assert_eq!(keys.len(), 19);
         assert!(keys.contains(&"version"));
         assert!(keys.contains(&"profile_id"));
         assert!(keys.contains(&"mode"));
@@ -1276,11 +1216,6 @@ mod tests {
         assert!(keys.contains(&"max_grant_ttl"));
         assert!(keys.contains(&"max_session_ttl"));
         assert!(keys.contains(&"principal_user"));
-        assert!(keys.contains(&"device_name"));
-        assert!(keys.contains(&"device_phys"));
-        assert!(keys.contains(&"device_uniq"));
-        assert!(keys.contains(&"device_vendor_id"));
-        assert!(keys.contains(&"device_product_id"));
         assert!(keys.contains(&"start_url"));
         assert!(keys.contains(&"browser_argv"));
         assert!(keys.contains(&"storage_backend"));
@@ -1309,9 +1244,6 @@ mod tests {
                 "start_url",
                 "profile_id",
                 "require_uv",
-                "device_name",
-                "device_phys",
-                "device_uniq",
                 "browser_argv",
                 "browser_user",
                 "storage_path",
@@ -1321,8 +1253,6 @@ mod tests {
                 "credential_refs",
                 "max_session_ttl",
                 "storage_backend",
-                "device_vendor_id",
-                "device_product_id",
                 "normalized_rp_ids",
                 "browser_runtime_root",
                 "registration_allowed",

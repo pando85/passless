@@ -21,11 +21,8 @@ AV_REDACTION_TEST_FILTERS=(
     "passless-rs|agent::audit_events::tests::test_no_secret_value_patterns"
     "passless-rs|agent::intent::tests::test_claim_token_display_redacted"
     "passless-rs|agent::intent::tests::test_claim_token_debug_redacted"
-    "passless-rs|agent::interaction::tests::test_debug_redacts_token_bytes"
     "passless-rs|agent::launcher::tests::test_session_capability_debug_redacted"
     "passless-rs|agent::launcher::tests::test_session_capability_display_redacted"
-    "passless-rs|agent::ceremony_observer::tests::test_observation_debug_has_no_secret_fields"
-    "passless-rs|agent::ceremony_observer::tests::response_extraction::test_observation_correlation_id_is_non_secret"
 )
 
 stage_secret_scanning() {

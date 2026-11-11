@@ -1,20 +1,20 @@
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::debug;
 use sha2::{Digest, Sha256};
 
+use passless_core::agent::config::ANY_RP_ID;
 use passless_core::agent::protocol::{
     ErrorCode, ProtocolError, RecommendedAction, RegisterCredentialRequest,
     RegisterCredentialResponse,
 };
-use passless_core::agent::{AgentProfileConfig, ProfileId, RegistrationGrantId};
+use passless_core::agent::{AgentProfileConfig, ProfileId};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
 use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
-use super::policy_engine::PolicyRuntime;
 use super::sign::{b64u_decode, b64u_encode, verify_origin_context};
 
 use crate::storage::CredentialStorage;
@@ -28,13 +28,39 @@ const PASSLESS_AAGUID: [u8; 16] = [
 #[derive(Clone)]
 pub struct RegisterContext {
     pub profile_id: ProfileId,
-    pub registration_grants: HashMap<String, RegistrationGrantId>,
     pub profile_config: AgentProfileConfig,
+    /// Set by the registry when the bearer is revoked (browser exit, lease revocation). An in-flight
+    /// request re-checks it before key use and before the credential is written (ADR 0014 section 9).
+    revoked: Arc<AtomicBool>,
+}
+
+impl RegisterContext {
+    pub fn new(profile_id: ProfileId, profile_config: AgentProfileConfig) -> Self {
+        Self {
+            profile_id,
+            profile_config,
+            revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A copy with its own revocation flag, so one bearer's revocation never reaches another's.
+    pub fn with_fresh_revocation(mut self) -> Self {
+        self.revoked = Arc::new(AtomicBool::new(false));
+        self
+    }
+
+    /// Mark the bearer this context belongs to as revoked.
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
+
+    fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
 }
 
 pub struct RegisterHandler {
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
-    pub policy_runtime: Arc<PolicyRuntime>,
     pub audit_gate: Arc<AuditGate>,
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
     pub security_config: SecurityConfig,
@@ -47,6 +73,28 @@ impl RegisterHandler {
             PolicyDenyBuilder::new(ctx.profile_id.clone(), AuditAction::Register, rp_id, reason)
                 .build();
         let _ = self.audit_gate.record(deny_event);
+    }
+
+    /// Refuse and audit a registration made with a bearer that was revoked (browser exit or lease
+    /// revocation). The request never reaches policy or key generation.
+    /// Audit a registration that lost its bearer mid-flight and build the 401 returned for it.
+    fn revoked_mid_flight(&self, ctx: &RegisterContext, rp_id: &str) -> ProtocolError {
+        self.record_policy_deny(ctx, rp_id, PolicyDenyReason::BearerRevoked);
+        ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "registration bearer was revoked",
+            RecommendedAction::Abort,
+        )
+    }
+
+    pub fn refuse_revoked_bearer(&self, ctx: &RegisterContext, body: &[u8]) {
+        // The body is untrusted: only a syntactically valid RP ID is recorded.
+        let rp_id = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("rp_id")?.as_str().map(normalize_rp_id))
+            .filter(|rp| passless_core::agent::config::validate_rp_id(rp).is_ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        self.record_policy_deny(ctx, &rp_id, PolicyDenyReason::BearerRevoked);
     }
 
     pub fn register(
@@ -86,63 +134,37 @@ impl RegisterHandler {
             )
         })?;
 
-        let grant_snapshot = self
-            .policy_runtime
-            .active_registration_grant(&ctx.profile_id, &normalized_rp)
-            .ok_or_else(|| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Register,
-                    &normalized_rp,
-                    PolicyDenyReason::GrantNotFound,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "registration grant not valid",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        if grant_snapshot.state != super::grant::GrantState::Active {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Register,
-                &normalized_rp,
-                PolicyDenyReason::GrantExpired,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "registration grant not active",
-                RecommendedAction::FixRequest,
-            ));
+        if ctx.is_revoked() {
+            return Err(self.revoked_mid_flight(ctx, &normalized_rp));
         }
 
-        let ceremony_policy = ctx
+        // Registration authority is policy only (ADR 0014 section 10.3): an exact RP rule with
+        // `register = "allow"`. There is no operator-minted enrollment grant. A wildcard rule never
+        // permits registration (section 6.3).
+        let rule = ctx
             .profile_config
             .rule_for_rp(&normalized_rp)
-            .map(|rule| rule.register)
             .ok_or_else(|| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Register,
-                    &normalized_rp,
-                    PolicyDenyReason::ActionNotAllowed,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
+                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
                 ProtocolError::new(
                     ErrorCode::Forbidden,
                     "RP policy does not allow registration",
                     RecommendedAction::FixRequest,
                 )
             })?;
+        if rule.rp_id.trim() == ANY_RP_ID {
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "a wildcard rule never permits registration",
+                RecommendedAction::FixRequest,
+            ));
+        }
+        let ceremony_policy = rule.register;
 
         match ceremony_policy.authorization {
             passless_core::agent::AgentAuthorization::Deny => {
+                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
                 return Err(ProtocolError::new(
                     ErrorCode::Forbidden,
                     "RP policy denies registration",
@@ -188,6 +210,7 @@ impl RegisterHandler {
         let uv = ceremony_policy.user_verification
             == passless_core::agent::UserVerificationSource::Agent;
         if (req.user_verification || self.security_config.always_uv) && !uv {
+            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "user verification is required but the configured evidence source is none",
@@ -231,6 +254,24 @@ impl RegisterHandler {
             }
         }
 
+        let algorithm = req
+            .pub_key_cred_params
+            .iter()
+            .copied()
+            .find(|algorithm| self.key_provider.supports_algorithm(*algorithm))
+            .ok_or_else(|| {
+                self.record_policy_deny(
+                    ctx,
+                    &normalized_rp,
+                    PolicyDenyReason::AlgorithmUnsupported,
+                );
+                ProtocolError::new(
+                    ErrorCode::BadRequest,
+                    "no requested public-key algorithm is supported by this backend",
+                    RecommendedAction::FixRequest,
+                )
+            })?;
+
         let allow_event = PolicyAllowBuilder::new(
             ctx.profile_id.clone(),
             AuditAction::Register,
@@ -250,28 +291,10 @@ impl RegisterHandler {
             )
         })?;
 
-        self.policy_runtime
-            .consume_registration_grant(&ctx.profile_id, &grant_snapshot.grant_id)
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "registration enrollment grant was already consumed",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
+        if ctx.is_revoked() {
+            return Err(self.revoked_mid_flight(ctx, &normalized_rp));
+        }
 
-        let algorithm = req
-            .pub_key_cred_params
-            .iter()
-            .copied()
-            .find(|algorithm| self.key_provider.supports_algorithm(*algorithm))
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::BadRequest,
-                    "no requested public-key algorithm is supported by this backend",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
         let generated = self.key_provider.generate(algorithm).map_err(|_| {
             ProtocolError::new(
                 ErrorCode::Internal,
@@ -282,10 +305,21 @@ impl RegisterHandler {
 
         let credential_id = generate_credential_id();
 
+        // `GeneratedCredentialKey::cose_public_key` is the provider's raw public key (SEC1 point or
+        // Ed25519 bytes), not a COSE_Key; encode it before it goes into the attested credential data.
+        let cose_key = cose_key_from_raw_public_key(algorithm, &generated.cose_public_key)
+            .map_err(|_| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    "key provider returned an unusable public key",
+                    RecommendedAction::Abort,
+                )
+            })?;
+
         let authenticator_data = build_authenticator_data_for_registration(
             &normalized_rp,
             &credential_id,
-            &generated.cose_public_key,
+            &cose_key,
             up,
             uv,
         );
@@ -345,6 +379,10 @@ impl RegisterHandler {
             backup_state: &credential.backup_state,
         };
 
+        if ctx.is_revoked() {
+            return Err(self.revoked_mid_flight(ctx, &normalized_rp));
+        }
+
         storage.write(cred_ref).map_err(|_| {
             ProtocolError::new(
                 ErrorCode::Internal,
@@ -377,6 +415,48 @@ fn generate_credential_id() -> Vec<u8> {
     let mut rng = std::fs::File::open("/dev/urandom").expect("open urandom");
     std::io::Read::read_exact(&mut rng, &mut id).expect("read urandom");
     id
+}
+
+/// Encode a provider public key as a COSE_Key (RFC 9052 section 7) in CTAP2 canonical form.
+///
+/// - ES256 (-7): `{1: 2, 3: -7, -1: 1, -2: x, -3: y}` from an uncompressed SEC1 point.
+/// - EdDSA (-8) and Ed25519 (-19): `{1: 1, 3: alg, -1: 6, -2: x}` from the 32-byte public key.
+///
+/// Map keys are sorted by their encoded bytes (1, 3, -1, -2, -3), which is the CTAP2 canonical order.
+fn cose_key_from_raw_public_key(algorithm: i32, raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use ciborium::Value;
+
+    let int = |n: i64| Value::Integer(n.into());
+    let entries = match algorithm {
+        -7 => {
+            if raw.len() != 65 || raw[0] != 0x04 {
+                return Err("expected an uncompressed P-256 point");
+            }
+            vec![
+                (int(1), int(2)),
+                (int(3), int(-7)),
+                (int(-1), int(1)),
+                (int(-2), Value::Bytes(raw[1..33].to_vec())),
+                (int(-3), Value::Bytes(raw[33..65].to_vec())),
+            ]
+        }
+        -8 | -19 => {
+            if raw.len() != 32 {
+                return Err("expected a 32-byte Ed25519 public key");
+            }
+            vec![
+                (int(1), int(1)),
+                (int(3), int(i64::from(algorithm))),
+                (int(-1), int(6)),
+                (int(-2), Value::Bytes(raw.to_vec())),
+            ]
+        }
+        _ => return Err("unsupported COSE algorithm"),
+    };
+
+    let mut out = Vec::with_capacity(80);
+    ciborium::into_writer(&Value::Map(entries), &mut out).map_err(|_| "CBOR encoding failed")?;
+    Ok(out)
 }
 
 fn build_authenticator_data_for_registration(
@@ -479,73 +559,16 @@ fn build_attestation_object(auth_data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    use crate::agent::audit::AuditGate;
-    use crate::agent::browser;
-    use crate::agent::intent;
-    use crate::agent::policy_engine::PolicyRuntime;
+    use crate::agent::audit::{AuditGate, test_support::read_audit_events};
     use crate::storage::CredentialStorage;
     use passless_core::agent::{
-        AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-        AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+        AgentAuthorization, AgentCeremonyPolicy, AgentMode, AgentProfileConfig, AgentRpRule,
+        BrowserScope, UserPresenceSource, UserVerificationSource,
     };
     use passless_core::config::SecurityConfig;
     use soft_fido2::{CredentialBackupState, RelyingParty, SoftwareCredentialKeyProvider, User};
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    pub struct MockClock {
-        inner: Mutex<MockClockInner>,
-    }
-    struct MockClockInner {
-        base: Instant,
-        offset: Duration,
-    }
-    impl MockClock {
-        pub fn new() -> Self {
-            Self {
-                inner: Mutex::new(MockClockInner {
-                    base: Instant::now(),
-                    offset: Duration::ZERO,
-                }),
-            }
-        }
-        #[allow(dead_code)]
-        pub fn advance(&self, d: Duration) {
-            self.inner.lock().unwrap().offset += d;
-        }
-    }
-    impl browser::Clock for MockClock {
-        fn now(&self) -> Instant {
-            let inner = self.inner.lock().unwrap();
-            inner.base + inner.offset
-        }
-        fn monotonic_secs(&self) -> u64 {
-            self.inner.lock().unwrap().offset.as_secs()
-        }
-    }
-
-    pub struct MockMonoClock {
-        inner: Mutex<MockClockInner>,
-    }
-    impl MockMonoClock {
-        pub fn new() -> Self {
-            Self {
-                inner: Mutex::new(MockClockInner {
-                    base: Instant::now(),
-                    offset: Duration::ZERO,
-                }),
-            }
-        }
-    }
-    impl intent::MonotonicClock for MockMonoClock {
-        fn now(&self) -> intent::MonotonicTime {
-            let inner = self.inner.lock().unwrap();
-            let elapsed = inner.offset;
-            intent::MonotonicTime::from_millis(elapsed.as_millis() as u64)
-        }
-    }
 
     pub struct WriteCountingStorage {
         creds: Mutex<Vec<soft_fido2::Credential>>,
@@ -662,13 +685,7 @@ mod tests {
                 },
                 authenticate: AgentCeremonyPolicy::deny(),
             }],
-            device: DeviceIdentity {
-                name: "test-device".to_string(),
-                phys: "test-phys".to_string(),
-                uniq: "test-uniq".to_string(),
-                vendor_id: 0x1234,
-                product_id: 0x5678,
-            },
+            device: None,
             start_url: None,
             browser_command: None,
             browser_user: None,
@@ -680,85 +697,24 @@ mod tests {
 
     struct RegisterTestFixture {
         profile_id: ProfileId,
-        registration_grants: HashMap<String, RegistrationGrantId>,
-        clock: Arc<MockClock>,
-        policy_runtime: Arc<PolicyRuntime>,
         storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
         key_provider: Arc<SoftwareCredentialKeyProvider>,
         audit_gate: Arc<AuditGate>,
+        audit_dir: std::path::PathBuf,
         operation_lock: Arc<Mutex<()>>,
         security_config: SecurityConfig,
         profile_config: AgentProfileConfig,
+        _tmp: tempfile::TempDir,
     }
 
     impl RegisterTestFixture {
         fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
-            let audit_path = tmp.path().to_path_buf();
-            drop(tmp);
-            std::fs::create_dir_all(&audit_path).unwrap();
-            std::fs::set_permissions(
-                &audit_path,
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )
-            .unwrap();
-            let audit_gate = Arc::new(AuditGate::open(&audit_path).unwrap());
-
-            let profile_id = ProfileId::new("test-register-profile").unwrap();
-
-            let storage = Arc::new(Mutex::new(
-                Box::new(WriteCountingStorage::new()) as Box<dyn CredentialStorage>
-            ));
-
-            let profile_config = make_registration_profile_config();
-
-            let mut profiles = BTreeMap::new();
-            profiles.insert("test-register-profile".to_string(), profile_config.clone());
-            let agent_config = AgentConfig {
-                enabled: true,
-                profiles,
-                audit_path: Some(audit_path),
-                acknowledge_global_same_user: vec![],
-                acknowledge_same_user_registration: vec![],
-            };
-
-            let clock = Arc::new(MockClock::new());
-            let mono_clock = Arc::new(MockMonoClock::new());
-
-            let policy_runtime = Arc::new(
-                PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None).unwrap(),
-            );
-
-            let mut registration_grants = HashMap::new();
-            registration_grants.insert(
-                "example.com".to_string(),
-                policy_runtime
-                    .request_registration_grant(profile_id.clone(), "example.com".to_string(), 300)
-                    .unwrap(),
-            );
-
-            let key_provider = Arc::new(SoftwareCredentialKeyProvider);
-            let operation_lock = Arc::new(Mutex::new(()));
-            let security_config = make_test_security_config();
-
-            Self {
-                profile_id,
-                registration_grants,
-                clock,
-                policy_runtime,
-                storage,
-                key_provider,
-                audit_gate,
-                operation_lock,
-                security_config,
-                profile_config,
-            }
+            make_fixture_with_config(make_registration_profile_config())
         }
 
         fn make_handler(&self) -> RegisterHandler {
             RegisterHandler {
                 credential_storage: self.storage.clone(),
-                policy_runtime: self.policy_runtime.clone(),
                 audit_gate: self.audit_gate.clone(),
                 key_provider: self.key_provider.clone(),
                 security_config: self.security_config.clone(),
@@ -767,11 +723,7 @@ mod tests {
         }
 
         fn make_ctx(&self) -> RegisterContext {
-            RegisterContext {
-                profile_id: self.profile_id.clone(),
-                registration_grants: self.registration_grants.clone(),
-                profile_config: self.profile_config.clone(),
-            }
+            RegisterContext::new(self.profile_id.clone(), self.profile_config.clone())
         }
 
         fn make_req(&self) -> RegisterCredentialRequest {
@@ -789,6 +741,17 @@ mod tests {
                 user_verification: false,
                 cross_origin: false,
             }
+        }
+
+        fn policy_events(&self) -> Vec<serde_json::Value> {
+            read_audit_events(&self.audit_dir)
+                .into_iter()
+                .filter(|e| {
+                    e.get("kind")
+                        .and_then(|k| k.as_str())
+                        .is_some_and(|k| k == "policy.allow" || k == "policy.deny")
+                })
+                .collect()
         }
     }
 
@@ -819,13 +782,7 @@ mod tests {
                     user_verification: UserVerificationSource::Agent,
                 },
             }],
-            device: DeviceIdentity {
-                name: "test-device".to_string(),
-                phys: "test-phys".to_string(),
-                uniq: "test-uniq".to_string(),
-                vendor_id: 0x1234,
-                product_id: 0x5678,
-            },
+            device: None,
             start_url: None,
             browser_command: None,
             browser_user: None,
@@ -837,62 +794,27 @@ mod tests {
 
     fn make_fixture_with_config(profile_config: AgentProfileConfig) -> RegisterTestFixture {
         let tmp = tempfile::tempdir().unwrap();
-        let audit_path = tmp.path().to_path_buf();
-        drop(tmp);
-        std::fs::create_dir_all(&audit_path).unwrap();
+        let audit_dir = tmp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
         std::fs::set_permissions(
-            &audit_path,
+            &audit_dir,
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let audit_gate = Arc::new(AuditGate::open(&audit_path).unwrap());
-
-        let profile_id = ProfileId::new("test-register-profile").unwrap();
-
-        let storage = Arc::new(Mutex::new(
-            Box::new(WriteCountingStorage::new()) as Box<dyn CredentialStorage>
-        ));
-
-        let mut profiles = BTreeMap::new();
-        profiles.insert("test-register-profile".to_string(), profile_config.clone());
-        let agent_config = AgentConfig {
-            enabled: true,
-            profiles,
-            audit_path: Some(audit_path),
-            acknowledge_global_same_user: vec![],
-            acknowledge_same_user_registration: vec![],
-        };
-
-        let clock = Arc::new(MockClock::new());
-        let mono_clock = Arc::new(MockMonoClock::new());
-
-        let policy_runtime = Arc::new(
-            PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None).unwrap(),
-        );
-
-        let mut registration_grants = HashMap::new();
-        registration_grants.insert(
-            "example.com".to_string(),
-            policy_runtime
-                .request_registration_grant(profile_id.clone(), "example.com".to_string(), 300)
-                .unwrap(),
-        );
-
-        let key_provider = Arc::new(SoftwareCredentialKeyProvider);
-        let operation_lock = Arc::new(Mutex::new(()));
-        let security_config = make_test_security_config();
+        let audit_gate = Arc::new(AuditGate::open(&audit_dir).unwrap());
 
         RegisterTestFixture {
-            profile_id,
-            registration_grants,
-            clock,
-            policy_runtime,
-            storage,
-            key_provider,
+            profile_id: ProfileId::new("test-register-profile").unwrap(),
+            storage: Arc::new(Mutex::new(
+                Box::new(WriteCountingStorage::new()) as Box<dyn CredentialStorage>
+            )),
+            key_provider: Arc::new(SoftwareCredentialKeyProvider),
             audit_gate,
-            operation_lock,
-            security_config,
+            audit_dir,
+            operation_lock: Arc::new(Mutex::new(())),
+            security_config: make_test_security_config(),
             profile_config,
+            _tmp: tmp,
         }
     }
 
@@ -1085,40 +1007,6 @@ mod tests {
     }
 
     #[test]
-    fn test_register_rejects_expired_grant() {
-        let f = RegisterTestFixture::new();
-        f.clock.advance(Duration::from_secs(301));
-        let handler = f.make_handler();
-        let ctx = f.make_ctx();
-        let req = f.make_req();
-
-        let result = handler.register(&ctx, &req);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Forbidden);
-    }
-
-    #[test]
-    fn test_register_rejects_invalid_grant_id() {
-        let f = RegisterTestFixture::new();
-        let handler = f.make_handler();
-        let grant = f
-            .policy_runtime
-            .active_registration_grant(&f.profile_id, "example.com")
-            .unwrap();
-        f.policy_runtime
-            .consume_registration_grant(&f.profile_id, &grant.grant_id)
-            .unwrap();
-        let ctx = f.make_ctx();
-        let req = f.make_req();
-
-        let result = handler.register(&ctx, &req);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Forbidden);
-    }
-
-    #[test]
     fn test_register_rejects_denied_policy() {
         let deny_config = make_deny_profile_config();
         let f = make_fixture_with_config(deny_config);
@@ -1148,6 +1036,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Forbidden);
         assert_ne!(err.code, ErrorCode::InteractionRequired);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![(
+                "example.com".to_string(),
+                "escalation_unavailable".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -1285,31 +1180,8 @@ mod tests {
     }
 
     #[test]
-    fn test_register_unauthorized_without_grant() {
-        let f = RegisterTestFixture::new();
-        let handler = f.make_handler();
-
-        let other_profile = ProfileId::new("other-profile").unwrap();
-        let ctx = RegisterContext {
-            profile_id: other_profile,
-            registration_grants: f.registration_grants.clone(),
-            profile_config: f.profile_config.clone(),
-        };
-        let req = f.make_req();
-
-        let result = handler.register(&ctx, &req);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, ErrorCode::Forbidden);
-    }
-
-    #[test]
     fn test_register_concurrent_requests_serialized() {
         let f = Arc::new(RegisterTestFixture::new());
-        for _ in 0..3 {
-            f.policy_runtime
-                .request_registration_grant(f.profile_id.clone(), "example.com".to_string(), 300)
-                .unwrap();
-        }
         let handler = Arc::new(f.make_handler());
         let mut handles = Vec::new();
 
@@ -1336,20 +1208,6 @@ mod tests {
     }
 
     #[test]
-    fn test_register_rp_id_mismatch_with_grant() {
-        let f = RegisterTestFixture::new();
-        let handler = f.make_handler();
-        let ctx = f.make_ctx();
-        let mut req = f.make_req();
-        req.rp_id = "other.com".to_string();
-        req.origin = "https://other.com".to_string();
-
-        let result = handler.register(&ctx, &req);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, ErrorCode::Forbidden);
-    }
-
-    #[test]
     fn test_register_exclude_list_nonexistent_credential_passes() {
         let f = RegisterTestFixture::new();
         let handler = f.make_handler();
@@ -1359,5 +1217,444 @@ mod tests {
 
         let result = handler.register(&ctx, &req);
         assert!(result.is_ok());
+    }
+
+    // --- B3: the attested credential data carries a real COSE_Key ---
+
+    /// Split registration `authenticatorData` into (credential id, COSE_Key bytes), checking that
+    /// nothing is left over after the COSE_Key (the "Leftover bytes" failure a real RP reports).
+    fn parse_attested_credential_data(auth_data: &[u8]) -> (Vec<u8>, ciborium::Value) {
+        assert!(
+            auth_data.len() > 55,
+            "too short for attested credential data"
+        );
+        assert_eq!(auth_data[32] & 0x40, 0x40, "AT flag must be set");
+        assert_eq!(&auth_data[37..53], &PASSLESS_AAGUID);
+        let id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
+        let id = auth_data[55..55 + id_len].to_vec();
+        let mut cose = &auth_data[55 + id_len..];
+        let key: ciborium::Value =
+            ciborium::from_reader(&mut cose).expect("COSE_Key is valid CBOR");
+        assert!(
+            cose.is_empty(),
+            "leftover bytes after the COSE_Key: {}",
+            cose.len()
+        );
+        (id, key)
+    }
+
+    fn cose_int(key: &ciborium::Value, label: i64) -> Option<i128> {
+        let ciborium::Value::Map(map) = key else {
+            panic!("COSE_Key must be a CBOR map");
+        };
+        map.iter().find_map(|(k, v)| match (k, v) {
+            (ciborium::Value::Integer(k), ciborium::Value::Integer(v))
+                if i128::from(*k) == i128::from(label) =>
+            {
+                Some(i128::from(*v))
+            }
+            _ => None,
+        })
+    }
+
+    fn cose_bytes(key: &ciborium::Value, label: i64) -> Option<Vec<u8>> {
+        let ciborium::Value::Map(map) = key else {
+            panic!("COSE_Key must be a CBOR map");
+        };
+        map.iter().find_map(|(k, v)| match (k, v) {
+            (ciborium::Value::Integer(k), ciborium::Value::Bytes(v))
+                if i128::from(*k) == i128::from(label) =>
+            {
+                Some(v.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_cose_key_es256_exact_encoding() {
+        let mut raw = vec![0x04];
+        raw.extend_from_slice(&[0x11; 32]);
+        raw.extend_from_slice(&[0x22; 32]);
+
+        let cose = cose_key_from_raw_public_key(-7, &raw).unwrap();
+
+        // {1: 2, 3: -7, -1: 1, -2: h'11..', -3: h'22..'} in CTAP2 canonical key order.
+        assert_eq!(cose.len(), 77);
+        assert_eq!(
+            &cose[..10],
+            &[0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20]
+        );
+        assert_eq!(&cose[10..42], &[0x11; 32]);
+        assert_eq!(&cose[42..45], &[0x22, 0x58, 0x20]);
+        assert_eq!(&cose[45..], &[0x22; 32]);
+    }
+
+    #[test]
+    fn test_cose_key_eddsa_encoding() {
+        let cose = cose_key_from_raw_public_key(-19, &[0x33; 32]).unwrap();
+        let key: ciborium::Value = ciborium::from_reader(cose.as_slice()).unwrap();
+        assert_eq!(cose_int(&key, 1), Some(1));
+        assert_eq!(cose_int(&key, 3), Some(-19));
+        assert_eq!(cose_int(&key, -1), Some(6));
+        assert_eq!(cose_bytes(&key, -2), Some(vec![0x33; 32]));
+    }
+
+    #[test]
+    fn test_cose_key_rejects_malformed_public_keys() {
+        assert!(cose_key_from_raw_public_key(-7, &[0x04; 10]).is_err());
+        let mut compressed = vec![0x02];
+        compressed.extend_from_slice(&[0u8; 64]);
+        assert!(cose_key_from_raw_public_key(-7, &compressed).is_err());
+        assert!(cose_key_from_raw_public_key(-19, &[0u8; 31]).is_err());
+        assert!(cose_key_from_raw_public_key(-257, &[0u8; 65]).is_err());
+    }
+
+    #[test]
+    fn test_register_attested_credential_data_round_trips_and_verifies() {
+        let f = RegisterTestFixture::new();
+        let resp = f
+            .make_handler()
+            .register(&f.make_ctx(), &f.make_req())
+            .unwrap();
+
+        let auth_data = b64u_decode(&resp.authenticator_data_b64u).unwrap();
+        let (credential_id, key) = parse_attested_credential_data(&auth_data);
+        assert_eq!(b64u_encode(&credential_id), resp.credential_id_b64u);
+
+        // EC2 / ES256 / P-256 with 32-byte coordinates.
+        assert_eq!(cose_int(&key, 1), Some(2), "kty");
+        assert_eq!(cose_int(&key, 3), Some(-7), "alg");
+        assert_eq!(cose_int(&key, -1), Some(1), "crv");
+        let x = cose_bytes(&key, -2).expect("x");
+        let y = cose_bytes(&key, -3).expect("y");
+        assert_eq!((x.len(), y.len()), (32, 32));
+
+        // The decoded COSE key verifies a signature made with the stored credential key.
+        let stored = f.storage.lock().unwrap().read(&credential_id).unwrap();
+        let message = b"authenticatorData || clientDataHash";
+        let signature = f.key_provider.sign(&stored.key, -7, message).unwrap();
+        let mut sec1 = vec![0x04];
+        sec1.extend_from_slice(&x);
+        sec1.extend_from_slice(&y);
+        soft_fido2_crypto::ecdsa::verify(&sec1, message, &signature)
+            .expect("signature verifies with the public key decoded from authenticatorData");
+        assert!(soft_fido2_crypto::ecdsa::verify(&sec1, b"other message", &signature).is_err());
+    }
+
+    // --- registration authority is policy only (ADR 0014 section 10.3) ---
+
+    fn deny_reasons(f: &RegisterTestFixture) -> Vec<(String, String)> {
+        f.policy_events()
+            .iter()
+            .filter(|e| e["kind"] == "policy.deny")
+            .map(|e| {
+                (
+                    e["rp_id"].as_str().unwrap_or_default().to_string(),
+                    e["reason"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_register_allow_needs_no_enrollment_grant() {
+        let f = RegisterTestFixture::new();
+        f.make_handler()
+            .register(&f.make_ctx(), &f.make_req())
+            .expect("register = allow is sufficient");
+        let events = f.policy_events();
+        assert_eq!(events.last().unwrap()["kind"], "policy.allow");
+        assert_eq!(events.last().unwrap()["action"], "register");
+    }
+
+    #[test]
+    fn test_register_unlisted_rp_is_denied_and_audited() {
+        let f = RegisterTestFixture::new();
+        let mut req = f.make_req();
+        req.rp_id = "other.com".to_string();
+        req.origin = "https://other.com".to_string();
+
+        let err = f.make_handler().register(&f.make_ctx(), &req).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("other.com".to_string(), "action_not_allowed".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_register_deny_rule_is_audited() {
+        let f = make_fixture_with_config(make_deny_profile_config());
+        let err = f
+            .make_handler()
+            .register(&f.make_ctx(), &f.make_req())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("example.com".to_string(), "action_not_allowed".to_string())]
+        );
+    }
+
+    fn wildcard_register_config(register: AgentCeremonyPolicy) -> AgentProfileConfig {
+        let mut config = make_registration_profile_config();
+        config.rules = vec![AgentRpRule {
+            credential_selection: None,
+            rp_id: ANY_RP_ID.to_string(),
+            register,
+            authenticate: AgentCeremonyPolicy::deny(),
+        }];
+        config
+    }
+
+    #[test]
+    fn test_register_under_wildcard_is_always_denied() {
+        // `register = "deny"` is the only configuration the wildcard allows (section 6.3) ...
+        // ... but the handler also refuses a wildcard rule that says `allow`, so a policy bug
+        // elsewhere can never turn the wildcard into registration authority.
+        for register in [
+            AgentCeremonyPolicy::deny(),
+            AgentCeremonyPolicy {
+                authorization: AgentAuthorization::Allow,
+                user_presence: UserPresenceSource::Agent,
+                user_verification: UserVerificationSource::Agent,
+            },
+        ] {
+            let f = make_fixture_with_config(wildcard_register_config(register));
+            let err = f
+                .make_handler()
+                .register(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(
+                deny_reasons(&f),
+                vec![("example.com".to_string(), "action_not_allowed".to_string())]
+            );
+            let boxed = f.storage.lock().unwrap();
+            assert_eq!(boxed.count_credentials(), 0, "no credential may be written");
+        }
+    }
+
+    #[test]
+    fn test_exact_rule_wins_over_wildcard_for_registration() {
+        let mut config = wildcard_register_config(AgentCeremonyPolicy::deny());
+        config.rules.insert(
+            0,
+            AgentRpRule {
+                credential_selection: None,
+                rp_id: "example.com".to_string(),
+                register: AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Allow,
+                    user_presence: UserPresenceSource::Agent,
+                    user_verification: UserVerificationSource::Agent,
+                },
+                authenticate: AgentCeremonyPolicy::deny(),
+            },
+        );
+        let f = make_fixture_with_config(config);
+        f.make_handler()
+            .register(&f.make_ctx(), &f.make_req())
+            .expect("exact allow rule is used");
+    }
+
+    #[test]
+    fn test_refuse_revoked_bearer_records_bearer_revoked() {
+        let f = RegisterTestFixture::new();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "origin": "https://example.com",
+            "rp_id": "Example.com",
+            "challenge_b64u": "dGVzdA",
+            "user_id_b64u": "dXNlcg",
+            "user_name": "testuser",
+            "pub_key_cred_params": [-7],
+        }))
+        .unwrap();
+
+        f.make_handler().refuse_revoked_bearer(&f.make_ctx(), &body);
+        f.make_handler()
+            .refuse_revoked_bearer(&f.make_ctx(), b"not json");
+
+        assert_eq!(
+            deny_reasons(&f),
+            vec![
+                ("example.com".to_string(), "bearer_revoked".to_string()),
+                ("unknown".to_string(), "bearer_revoked".to_string()),
+            ]
+        );
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+    }
+
+    // --- revocation while a request is in flight (ADR 0014 section 9) ---
+
+    /// Counts `generate` calls and can revoke the bearer while the key is being generated, which is
+    /// the window between the registry lookup and the credential write.
+    struct InterferingKeyProvider {
+        inner: SoftwareCredentialKeyProvider,
+        generated: std::sync::atomic::AtomicUsize,
+        revoke_during_generate: Option<RegisterContext>,
+    }
+
+    impl soft_fido2::CredentialKeyProvider for InterferingKeyProvider {
+        fn provider_id(&self) -> soft_fido2::CredentialKeyProviderId {
+            self.inner.provider_id()
+        }
+        fn supports_algorithm(&self, algorithm: i32) -> bool {
+            self.inner.supports_algorithm(algorithm)
+        }
+        fn generate(
+            &self,
+            algorithm: i32,
+        ) -> Result<soft_fido2::GeneratedCredentialKey, soft_fido2::CredentialKeyError> {
+            self.generated.fetch_add(1, Ordering::AcqRel);
+            if let Some(ctx) = &self.revoke_during_generate {
+                ctx.revoke();
+            }
+            self.inner.generate(algorithm)
+        }
+        fn sign(
+            &self,
+            key: &soft_fido2::CredentialKey,
+            algorithm: i32,
+            data: &[u8],
+        ) -> Result<Vec<u8>, soft_fido2::CredentialKeyError> {
+            self.inner.sign(key, algorithm, data)
+        }
+    }
+
+    fn handler_with_provider(
+        f: &RegisterTestFixture,
+        provider: Arc<InterferingKeyProvider>,
+    ) -> RegisterHandler {
+        RegisterHandler {
+            key_provider: provider,
+            ..f.make_handler()
+        }
+    }
+
+    #[test]
+    fn test_revoked_before_key_use_generates_nothing() {
+        let f = RegisterTestFixture::new();
+        let ctx = f.make_ctx();
+        ctx.revoke();
+        let provider = Arc::new(InterferingKeyProvider {
+            inner: SoftwareCredentialKeyProvider,
+            generated: std::sync::atomic::AtomicUsize::new(0),
+            revoke_during_generate: None,
+        });
+
+        let err = handler_with_provider(&f, provider.clone())
+            .register(&ctx, &f.make_req())
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert_eq!(provider.generated.load(Ordering::Acquire), 0, "no key use");
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("example.com".to_string(), "bearer_revoked".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_revoked_between_claim_and_write_writes_no_credential() {
+        let f = RegisterTestFixture::new();
+        let ctx = f.make_ctx();
+        let provider = Arc::new(InterferingKeyProvider {
+            inner: SoftwareCredentialKeyProvider,
+            generated: std::sync::atomic::AtomicUsize::new(0),
+            revoke_during_generate: Some(ctx.clone()),
+        });
+
+        let err = handler_with_provider(&f, provider.clone())
+            .register(&ctx, &f.make_req())
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert_eq!(provider.generated.load(Ordering::Acquire), 1);
+        let boxed = f.storage.lock().unwrap();
+        assert_eq!(
+            boxed.count_credentials(),
+            0,
+            "the credential must not be written"
+        );
+        drop(boxed);
+        // Audited once, as a revocation.
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("example.com".to_string(), "bearer_revoked".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_unsupported_algorithm_is_a_deny_not_an_allow() {
+        let f = RegisterTestFixture::new();
+        let mut req = f.make_req();
+        req.pub_key_cred_params = vec![-257];
+
+        let err = f.make_handler().register(&f.make_ctx(), &req).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![(
+                "example.com".to_string(),
+                "algorithm_unsupported".to_string()
+            )]
+        );
+        assert!(
+            f.policy_events()
+                .iter()
+                .all(|e| e["kind"] != "policy.allow"),
+            "no allow without a credential"
+        );
+    }
+
+    #[test]
+    fn test_uv_required_without_agent_uv_source_is_audited() {
+        let mut config = make_registration_profile_config();
+        config.rules[0].register.user_verification = UserVerificationSource::None;
+        let f = make_fixture_with_config(config);
+        let mut req = f.make_req();
+        req.user_verification = true;
+
+        let err = f.make_handler().register(&f.make_ctx(), &req).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Forbidden);
+        assert_eq!(
+            deny_reasons(&f),
+            vec![("example.com".to_string(), "uv_required".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_cose_key_eddsa_byte_order_and_signature_verify() {
+        let provider = SoftwareCredentialKeyProvider;
+        let generated = provider.generate(-19).unwrap();
+        assert_eq!(generated.cose_public_key.len(), 32);
+
+        let cose = cose_key_from_raw_public_key(-19, &generated.cose_public_key).unwrap();
+
+        // {1: 1, 3: -19, -1: 6, -2: h'..'} in CTAP2 canonical key order.
+        assert_eq!(cose.len(), 1 + 2 + 2 + 2 + 35);
+        assert_eq!(
+            &cose[..9],
+            &[0xa4, 0x01, 0x01, 0x03, 0x32, 0x20, 0x06, 0x21, 0x58]
+        );
+        assert_eq!(cose[9], 0x20);
+
+        let mut rest = cose.as_slice();
+        let key: ciborium::Value = ciborium::from_reader(&mut rest).unwrap();
+        assert!(rest.is_empty(), "leftover bytes after the COSE_Key");
+        assert_eq!(cose_int(&key, 1), Some(1));
+        assert_eq!(cose_int(&key, 3), Some(-19));
+        assert_eq!(cose_int(&key, -1), Some(6));
+        let x = cose_bytes(&key, -2).expect("x");
+
+        let message = b"authenticatorData || clientDataHash";
+        let signature = provider.sign(&generated.key, -19, message).unwrap();
+        soft_fido2_crypto::eddsa::verify(&x, message, &signature)
+            .expect("signature verifies with the public key decoded from the COSE_Key");
+        assert!(soft_fido2_crypto::eddsa::verify(&x, b"other message", &signature).is_err());
     }
 }

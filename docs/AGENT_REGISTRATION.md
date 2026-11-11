@@ -72,7 +72,7 @@ authenticate = { authorization = "allow", user_presence = "none", user_verificat
 
 ### Step 2: Launch Browser with Extension
 
-The `browser launch` command automatically requests registration grants for all allowed RP IDs in the profile:
+The `browser launch` command gives the browser a bearer token bound to its lease. Registration is allowed only for exact-RP rules with `register = "allow"`; there is no separate enrollment grant:
 
 ```bash
 passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/register
@@ -80,8 +80,7 @@ passless agent-admin browser launch --profile ci-agent --url https://gitea.examp
 
 This command:
 - Generates a bearer token for the session
-- Requests registration grants for all allowed RP IDs
-- Registers registration and sign contexts with the daemon
+- Registers registration and sign contexts with the daemon, bound to the browser lease (they are revoked when the browser exits)
 - Launches Chromium with the agent extension loaded
 
 **Output:**
@@ -148,14 +147,13 @@ Registration grants are:
 2. Check that `register.authorization = "allow"` for the RP
 3. Verify the RP ID matches exactly (case-sensitive)
 
-### Grant Not Found
+### Bearer Revoked
 
-**Symptom:** Registration fails with "GrantNotFound" error
+**Symptom:** Registration is refused with `401 invalid_bearer` and the audit log shows `policy.deny` with reason `bearer_revoked`
 
 **Solution:**
-1. Ensure you requested a registration grant before navigating to the RP
-2. Check that the grant hasn't expired (TTL)
-3. Verify the grant ID is correct
+1. The browser that held the bearer has exited or its lease was revoked; launch a new browser
+2. Registration bearers are bound to the browser lease and are never reused
 
 ### Origin Mismatch
 

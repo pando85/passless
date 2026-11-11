@@ -8,13 +8,11 @@ use passless_core::agent::{AgentMode, ProfileId};
 
 use super::audit::AuditGate;
 use super::browser::{BrowserManifest, ProcessIdentity};
-use super::launcher::{ProbeResult, probe_uhid_access};
 
 use passless_core::agent::ProfileDiagnosticReport;
 
 pub trait StartupProbes: Send + Sync {
     fn probe_euid_is_root(&self) -> bool;
-    fn probe_uhid(&self) -> ProbeResult;
     fn probe_close_range_available(&self) -> bool;
     fn probe_audit_gate_healthy(&self, audit_path: &Path) -> Result<(), String>;
     fn probe_storage_root(&self, path: &Path, expected_uid: u32) -> Result<(), String>;
@@ -35,10 +33,6 @@ pub struct ProductionProbes;
 impl StartupProbes for ProductionProbes {
     fn probe_euid_is_root(&self) -> bool {
         unsafe { libc::geteuid() == 0 }
-    }
-
-    fn probe_uhid(&self) -> ProbeResult {
-        probe_uhid_access()
     }
 
     fn probe_close_range_available(&self) -> bool {
@@ -242,27 +236,9 @@ pub fn run_startup_diagnostics(
             message: if euid_ok {
                 "daemon euid is root".into()
             } else {
-                "daemon euid is not root; relying on group-based UHID access".into()
+                "daemon euid is not root; running without principal isolation".into()
             },
         });
-    }
-
-    if has_profiles {
-        let uhid = probes.probe_uhid();
-        let uhid_ok = matches!(uhid, ProbeResult::Allowed { .. });
-        checks.push(DoctorCheck {
-            name: "uhid_access".into(),
-            passed: uhid_ok,
-            message: match &uhid {
-                ProbeResult::Allowed { path } => format!("{} is accessible", path),
-                ProbeResult::Denied { path, errno } => {
-                    format!("{} is not accessible (errno {})", path, errno)
-                }
-            },
-        });
-        if !uhid_ok {
-            fatal.push("/dev/uhid not accessible".into());
-        }
     }
 
     if has_profiles {
@@ -386,19 +362,6 @@ pub fn run_startup_diagnostics(
                 }
             }
         }
-
-        checks.push(DoctorCheck {
-            name: format!("device_identity.{}", name),
-            passed: info.device_identity_unique,
-            message: if info.device_identity_unique {
-                "device identity is unique".into()
-            } else {
-                "device identity collides with another profile".into()
-            },
-        });
-        if !info.device_identity_unique {
-            fatal.push(format!("profile '{}': device identity collision", name));
-        }
     }
 
     StartupDiagnosticResult { checks, fatal }
@@ -419,7 +382,6 @@ pub struct ProfileStartupInfo {
     pub storage_roots: Vec<(String, PathBuf, u32)>,
     pub browser_runtime_root: Option<BrowserRuntimeRootInfo>,
     pub uid_checks: Vec<UidCheck>,
-    pub device_identity_unique: bool,
 }
 
 pub struct ProfileDiagnosticParams<'a> {
@@ -549,42 +511,6 @@ pub fn build_profile_diagnostic_report(
     }
 }
 
-pub fn compute_device_identity_uniqueness(
-    profiles: &[(String, DeviceIdentityKey)],
-) -> Vec<(String, bool)> {
-    let mut keys: Vec<String> = Vec::new();
-
-    for (_name, key) in profiles {
-        let composite = format!(
-            "{}:{}:{}:{}:{}",
-            key.name, key.phys, key.uniq, key.vendor_id, key.product_id
-        );
-        keys.push(composite);
-    }
-
-    let mut result = Vec::new();
-    for (i, (name, _)) in profiles.iter().enumerate() {
-        let key = &keys[i];
-        let unique = profiles.iter().enumerate().all(|(j, _)| {
-            if i == j {
-                return true;
-            }
-            keys[j] != *key
-        });
-        result.push((name.clone(), unique));
-    }
-
-    result
-}
-
-pub struct DeviceIdentityKey {
-    pub name: String,
-    pub phys: String,
-    pub uniq: String,
-    pub vendor_id: u16,
-    pub product_id: u16,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +518,6 @@ mod tests {
 
     pub struct MockProbes {
         pub euid_is_root: bool,
-        pub uhid_result: ProbeResult,
         pub close_range_ok: bool,
         pub audit_healthy: bool,
         pub storage_results: Mutex<Vec<Result<(), String>>>,
@@ -604,24 +529,6 @@ mod tests {
         pub fn all_healthy() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
-                close_range_ok: true,
-                audit_healthy: true,
-                storage_results: Mutex::new(Vec::new()),
-                browser_root_results: Mutex::new(Vec::new()),
-                stale_result: StaleManifestResult::None,
-            }
-        }
-
-        pub fn no_uhid() -> Self {
-            Self {
-                euid_is_root: true,
-                uhid_result: ProbeResult::Denied {
-                    path: "/dev/uhid".into(),
-                    errno: libc::EACCES,
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -633,9 +540,6 @@ mod tests {
         pub fn no_close_range() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: false,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -647,9 +551,6 @@ mod tests {
         pub fn not_root() -> Self {
             Self {
                 euid_is_root: false,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -661,9 +562,6 @@ mod tests {
         pub fn audit_broken() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: false,
                 storage_results: Mutex::new(Vec::new()),
@@ -675,9 +573,6 @@ mod tests {
         pub fn unsafe_perms() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(vec![Err(
@@ -691,9 +586,6 @@ mod tests {
         pub fn stale_verified_process() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -709,10 +601,6 @@ mod tests {
     impl StartupProbes for MockProbes {
         fn probe_euid_is_root(&self) -> bool {
             self.euid_is_root
-        }
-
-        fn probe_uhid(&self) -> ProbeResult {
-            self.uhid_result.clone()
         }
 
         fn probe_close_range_available(&self) -> bool {
@@ -766,7 +654,6 @@ mod tests {
                 passed: true,
                 message: "principal uid differs from daemon".into(),
             }],
-            device_identity_unique: true,
         }
     }
 
@@ -786,22 +673,15 @@ mod tests {
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(result.is_ok(), "fatal: {:?}", result.fatal);
         assert!(result.checks.iter().all(|c| c.passed));
-    }
-
-    #[test]
-    fn test_no_uhid_is_fatal() {
-        let probes = MockProbes::no_uhid();
-        let profiles = vec![("test".into(), make_profile_info())];
-        let result =
-            run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
-        assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("uhid")));
-        let uhid_check = result
-            .checks
-            .iter()
-            .find(|c| c.name == "uhid_access")
-            .unwrap();
-        assert!(!uhid_check.passed);
+        // Agents have no UHID route (ADR 0014 section 5): no UHID or device identity check remains.
+        assert!(
+            !result
+                .checks
+                .iter()
+                .any(|c| c.name == "uhid_access" || c.name.starts_with("device_identity")),
+            "{:?}",
+            result.checks
+        );
     }
 
     #[test]
@@ -815,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn test_not_root_nonfatal_when_uhid_accessible() {
+    fn test_not_root_nonfatal() {
         let probes = MockProbes::not_root();
         let profiles = vec![("test".into(), make_profile_info())];
         let result =
@@ -880,83 +760,6 @@ mod tests {
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(!result.is_ok());
         assert!(result.fatal.iter().any(|f| f.contains("audit")));
-    }
-
-    #[test]
-    fn test_device_identity_collision_detected() {
-        let probes = MockProbes::all_healthy();
-        let mut info = make_profile_info();
-        info.device_identity_unique = false;
-        let profiles = vec![("test".into(), info)];
-        let result =
-            run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
-        assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("collision")));
-    }
-
-    #[test]
-    fn test_compute_device_identity_uniqueness_all_unique() {
-        let profiles = vec![
-            (
-                "a".into(),
-                DeviceIdentityKey {
-                    name: "n1".into(),
-                    phys: "p1".into(),
-                    uniq: "u1".into(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
-            ),
-            (
-                "b".into(),
-                DeviceIdentityKey {
-                    name: "n2".into(),
-                    phys: "p2".into(),
-                    uniq: "u2".into(),
-                    vendor_id: 2,
-                    product_id: 2,
-                },
-            ),
-        ];
-        let result = compute_device_identity_uniqueness(&profiles);
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|(_, unique)| *unique));
-    }
-
-    #[test]
-    fn test_compute_device_identity_uniqueness_collision() {
-        let key = DeviceIdentityKey {
-            name: "same".into(),
-            phys: "same".into(),
-            uniq: "same".into(),
-            vendor_id: 1,
-            product_id: 2,
-        };
-        let profiles = vec![
-            (
-                "a".into(),
-                DeviceIdentityKey {
-                    name: key.name.clone(),
-                    phys: key.phys.clone(),
-                    uniq: key.uniq.clone(),
-                    vendor_id: key.vendor_id,
-                    product_id: key.product_id,
-                },
-            ),
-            (
-                "b".into(),
-                DeviceIdentityKey {
-                    name: key.name.clone(),
-                    phys: key.phys.clone(),
-                    uniq: key.uniq.clone(),
-                    vendor_id: key.vendor_id,
-                    product_id: key.product_id,
-                },
-            ),
-        ];
-        let result = compute_device_identity_uniqueness(&profiles);
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|(_, unique)| !*unique));
     }
 
     #[test]

@@ -471,14 +471,13 @@ This requires PIN authentication and restores UV retries to the configured maxim
 
 ## Agent Mode Permissions
 
-Agent mode extends Passless with multiple UHID endpoints, principal sessions, and browser leases.
+Agent mode extends Passless with principal sessions and browser leases. Agents have no UHID device of their own: they use the browser extension path only.
 It requires additional permissions and a different security model than the human authenticator.
 
 ### Daemon runs as root
 
 The agent daemon **must run as root** to:
 
-- Create UHID endpoints with deterministic device identity.
 - Enforce principal isolation (separate UIDs, namespaces, device policy).
 - Manage browser leases and ephemeral profiles.
 - Write audit events to owner-only paths.
@@ -501,19 +500,9 @@ sudo useradd -r -s /usr/sbin/nologin passless-browser-<profile>
 
 ### Device permissions
 
-Agent hidraw nodes require per-profile udev rules to grant access **only** to the configured browser user.
+Agent profiles use only the browser-extension path and have no UHID or hidraw device of their own, so no agent udev rule is needed.
 
-**Install the agent udev rule:**
-
-```bash
-sudo cp contrib/udev/70-passless-agent.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-**Important:** The example rule contains placeholders. Replace `ATTRS{phys}` and `OWNER`/`GROUP` with your profile's device identity and browser user. See `contrib/udev/70-passless-agent.rules` for instructions.
-
-**Do not** grant human users or principals access to `/dev/uhid`. The daemon accesses `/dev/uhid` as root.
+**Do not** grant principals or browser users access to `/dev/uhid`. Only the human authenticator uses it (group `fido`, see `contrib/udev/90-passless.rules`).
 
 ### Storage and audit paths
 

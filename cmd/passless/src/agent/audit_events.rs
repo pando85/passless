@@ -696,6 +696,10 @@ pub enum PolicyDenyReason {
     EscalationUnavailable,
     /// The request came from a frame whose origin differs from its ancestors; cross-origin fails closed.
     CrossOriginDenied,
+    /// The request used a bearer whose browser lease was revoked or whose browser exited.
+    BearerRevoked,
+    /// None of the requested public-key algorithms is supported by the selected backend.
+    AlgorithmUnsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

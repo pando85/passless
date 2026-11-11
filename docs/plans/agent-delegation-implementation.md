@@ -577,6 +577,7 @@ Replace the `sign.rs` replay tests (2091-2258). E2E-14 and E2E-15.
 - Rewrite `agent_extension_behavioral.js`.
 - E2E-16 to E2E-22.
 - Fix B2 (see Defects found by the P1 baseline) with a regression test.
+- Un-XFAIL E2E-02 (closes B3 against a real RP).
 
 **P7.** Unit tests:
 
@@ -591,6 +592,9 @@ Replace the `sign.rs` replay tests (2091-2258). E2E-14 and E2E-15.
   concurrently).
 
 E2E-23 to E2E-31.
+
+- Remove the principal intent protocol (`CreateIntent`/`ShowIntent`/`WaitIntent`/`CancelIntent`,
+  `intent.rs`) unless reused by escalation.
 
 **P8.** Every reservation has a terminal record. The field-presence test is driven by a §12 field
 list. The schema version is bumped. E2E-32.
@@ -615,6 +619,8 @@ list. The schema version is bumped. E2E-32.
   except migration notes.
 - The `docs/agents` quick start is followed verbatim by a subagent in the hermetic environment,
   and works.
+- Move agent-validation assets out of `tools/agent-uhid-feasibility`, then delete it and the
+  agent-only parts of `passless-uhid` if the human path does not need them.
 
 **P12.** See [Final gate](#final-gate).
 
@@ -797,7 +803,7 @@ session bus); the zbus `MessageStream` lifetime was not covered by P0a and stays
 | P0b | ✅ | — | ADR 0014 amended (R1–R4, R7, R9, R10, R12–R19, V-M3, V-H2, P0a outcomes; invariant 25; §19 rows); plan R, D1, D4, D6, P0a, E2E updated |
 | P1 | ✅ | — | Baseline: 24 PASS, 8 XFAIL (E2E-02, 06 until P6) on Chromium and PW Chromium headed/headless; CfT 12 PASS/4 XFAIL; defects B1–B7 recorded |
 | P2 | ✅ | — | Native fallback removed; cross-origin and `confirm` deny with audit; launch refuses invalid extension; interim MAIN-world hardening (prototype, single read, about:blank/srcdoc/blob frames). E2E-09, 10, 47 pass; E2E-02, 06 XFAIL until P6 |
-| P3 | ⏳ | — | |
+| P3 | ✅ | — | UHID route and minted grants removed; registration bearers lease-bound; B3 (COSE_Key) and B6 fixed. E2E-11 pass; E2E-02 XFAIL until P6 (extension `/register` response shape only) |
 | P4 | ⏳ | — | |
 | P5 | ⏳ | — | |
 | P6 | ⏳ | — | |

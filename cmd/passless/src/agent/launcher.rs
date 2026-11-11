@@ -1250,26 +1250,11 @@ pub fn spawn_principal(config: SpawnConfig) -> Result<PrincipalSession, Launcher
     })
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
     Allowed { path: String },
     Denied { path: String, errno: i32 },
-}
-
-pub fn probe_uhid_access() -> ProbeResult {
-    let path_str = "/dev/uhid";
-    let fd = unsafe { libc::open(c"/dev/uhid".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        let err = io::Error::last_os_error();
-        return ProbeResult::Denied {
-            path: path_str.to_string(),
-            errno: err.raw_os_error().unwrap_or(0),
-        };
-    }
-    unsafe { libc::close(fd) };
-    ProbeResult::Allowed {
-        path: path_str.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -2377,15 +2362,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_proc_no_new_privs(99999, dir.path()).unwrap_err();
         assert!(matches!(err, LauncherError::ProcRead { .. }));
-    }
-
-    #[test]
-    fn test_probe_uhid_access_deterministic() {
-        let result = probe_uhid_access();
-        match &result {
-            ProbeResult::Allowed { path } => assert_eq!(path, "/dev/uhid"),
-            ProbeResult::Denied { path, .. } => assert_eq!(path, "/dev/uhid"),
-        }
     }
 
     #[test]

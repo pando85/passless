@@ -18,7 +18,6 @@ The agent validation orchestrator provides a fail-closed framework to run compre
 - UHID kernel module
 - Chromium browser (for Tier 2)
 - Node.js 22+, Xvfb, dunst, and dunstctl (for Tier 2)
-- pass, GPG, and swtpm (for backend composition)
 - Disposable agent/human users, profiles, and credential stores (for Tier 3)
 
 ## Usage

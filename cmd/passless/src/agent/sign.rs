@@ -450,14 +450,69 @@ impl LeaseEntry {
 pub struct SignContextRegistry {
     entries: Mutex<HashMap<String, LeaseEntry>>,
     registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
+    revoked_registrations: Mutex<RevokedRegistrations>,
     request_budgets: Mutex<HashMap<String, RequestBudget>>,
 }
 
+/// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
+/// revoked with it (ADR 0014 section 9).
 #[derive(Clone)]
 pub struct RegistrationLeaseEntry {
     pub context: RegisterContext,
     pub handler: Arc<RegisterHandler>,
+    pub lease_id: Option<String>,
     request_budget: RequestBudget,
+}
+
+/// Most revoked registration bearers remembered so a late use can be refused and audited.
+const MAX_REVOKED_REGISTRATIONS: usize = 256;
+/// Refusals recorded per revoked bearer; later attempts are still refused but not audited again,
+/// so a browser holding an old bearer cannot flood the audit log.
+const MAX_AUDITED_REFUSALS_PER_BEARER: usize = 16;
+
+/// What is kept of a revoked registration bearer: enough to audit a late use, never to serve it.
+#[derive(Clone)]
+pub struct RevokedRegistration {
+    context: RegisterContext,
+    handler: Arc<RegisterHandler>,
+    refusals: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RevokedRegistration {
+    /// Audit a refused registration (bounded per bearer, see `MAX_AUDITED_REFUSALS_PER_BEARER`).
+    pub fn refuse(&self, body: &[u8]) {
+        if self.refusals.fetch_add(1, Ordering::AcqRel) < MAX_AUDITED_REFUSALS_PER_BEARER {
+            self.handler.refuse_revoked_bearer(&self.context, body);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RevokedRegistrations {
+    order: std::collections::VecDeque<String>,
+    entries: HashMap<String, RevokedRegistration>,
+}
+
+impl RevokedRegistrations {
+    fn remember(&mut self, token: String, entry: &RegistrationLeaseEntry) {
+        if self.entries.contains_key(&token) {
+            return;
+        }
+        while self.order.len() >= MAX_REVOKED_REGISTRATIONS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(token.clone());
+        self.entries.insert(
+            token,
+            RevokedRegistration {
+                context: entry.context.clone(),
+                handler: entry.handler.clone(),
+                refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+        );
+    }
 }
 
 impl RegistrationLeaseEntry {
@@ -481,6 +536,7 @@ impl SignContextRegistry {
         Self {
             entries: Mutex::new(HashMap::new()),
             registration_entries: Mutex::new(HashMap::new()),
+            revoked_registrations: Mutex::new(RevokedRegistrations::default()),
             request_budgets: Mutex::new(HashMap::new()),
         }
     }
@@ -514,6 +570,7 @@ impl SignContextRegistry {
         context: RegisterContext,
         handler: Arc<RegisterHandler>,
     ) -> Result<(), String> {
+        let context = context.with_fresh_revocation();
         let max_requests = usize::from(context.profile_config.max_operations);
         let request_budget = self.request_budget(&token, max_requests)?;
         let mut map = self
@@ -528,33 +585,73 @@ impl SignContextRegistry {
             RegistrationLeaseEntry {
                 context,
                 handler,
+                lease_id: None,
                 request_budget,
             },
         );
         Ok(())
     }
 
+    /// Bind a registration bearer to its browser lease. Until it is bound the bearer is unusable,
+    /// exactly like a sign bearer.
+    pub fn bind_registration_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
+        let mut map = self
+            .registration_entries
+            .lock()
+            .map_err(|_| "registry lock poisoned")?;
+        let entry = map.get_mut(token).ok_or("token not found")?;
+        if entry.lease_id.is_some() {
+            return Err("already bound".into());
+        }
+        entry.lease_id = Some(lease_id);
+        Ok(())
+    }
+
+    /// A live (bound, not revoked) registration bearer.
     pub fn lookup_registration(&self, token: &str) -> Option<RegistrationLeaseEntry> {
         let map = match self.registration_entries.lock() {
             Ok(m) => m,
             Err(_) => return None,
         };
+        let mut found = None;
         for (k, v) in map.iter() {
             if constant_time_eq(token.as_bytes(), k.as_bytes()) {
-                return Some(v.clone());
+                found = Some(v);
             }
         }
-        None
+        found.filter(|entry| entry.lease_id.is_some()).cloned()
+    }
+
+    /// A registration bearer that was revoked; used only to refuse and audit a late registration.
+    pub fn lookup_revoked_registration(&self, token: &str) -> Option<RevokedRegistration> {
+        let revoked = self.revoked_registrations.lock().ok()?;
+        let mut found = None;
+        for (k, v) in revoked.entries.iter() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                found = Some(v);
+            }
+        }
+        found.cloned()
     }
 
     pub fn revoke_registration(&self, token: &str) -> bool {
         let removed = self
             .registration_entries
             .lock()
-            .map(|mut map| map.remove(token).is_some())
-            .unwrap_or(false);
+            .ok()
+            .and_then(|mut map| map.remove(token));
+        let was_present = removed.is_some();
+        if let Some(entry) = &removed {
+            // Fail any request of this bearer that is already past authentication.
+            entry.context.revoke();
+        }
+        if let Some(entry) = removed
+            && let Ok(mut revoked) = self.revoked_registrations.lock()
+        {
+            revoked.remember(token.to_string(), &entry);
+        }
         self.cleanup_request_budget(token);
-        removed
+        was_present
     }
 
     pub fn register_pending(
@@ -652,13 +749,28 @@ impl SignContextRegistry {
             .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
             .map(|(k, _)| k.clone())
             .collect();
-        let count = keys.len();
+        let mut count = keys.len();
         for k in &keys {
             map.remove(k);
         }
         drop(map);
         for key in keys {
             self.cleanup_request_budget(&key);
+        }
+
+        // Registration bearers die with the lease too.
+        let registration_keys: Vec<String> = match self.registration_entries.lock() {
+            Ok(map) => map
+                .iter()
+                .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
+                .map(|(k, _)| k.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for key in registration_keys {
+            if self.revoke_registration(&key) {
+                count += 1;
+            }
         }
         count
     }
@@ -668,7 +780,13 @@ impl SignContextRegistry {
             map.clear();
         }
         if let Ok(mut map) = self.registration_entries.lock() {
+            for entry in map.values() {
+                entry.context.revoke();
+            }
             map.clear();
+        }
+        if let Ok(mut revoked) = self.revoked_registrations.lock() {
+            *revoked = RevokedRegistrations::default();
         }
         if let Ok(mut budgets) = self.request_budgets.lock() {
             budgets.clear();
@@ -925,6 +1043,14 @@ fn handle_http_connection(
                 let reg_entry = match registry.lookup_registration(token) {
                     Some(e) => e,
                     None => {
+                        // A bearer revoked with its browser lease is refused exactly like an
+                        // unknown one, but the attempt is audited.
+                        if let Some(revoked) = registry.lookup_revoked_registration(token)
+                            && let Some(body) =
+                                read_request_body(&mut stream, header_str, &buf, header_end, total)?
+                        {
+                            revoked.refuse(&body);
+                        }
                         send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
                         return Ok(());
                     }
@@ -939,38 +1065,11 @@ fn handle_http_connection(
                     );
                     return Ok(());
                 }
-                let body_start = header_end + 4;
-                let content_length: usize = header_str
-                    .lines()
-                    .find_map(|l| {
-                        let lower = l.to_ascii_lowercase();
-                        lower
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse().ok())
-                    })
-                    .unwrap_or(0);
-                if content_length > MAX_HTTP_BODY_SIZE {
-                    send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+                let Some(body) =
+                    read_request_body(&mut stream, header_str, &buf, header_end, total)?
+                else {
                     return Ok(());
-                }
-                let mut body = Vec::new();
-                body.extend_from_slice(&buf[body_start..total]);
-                let remaining = content_length.saturating_sub(total - body_start);
-                if remaining > 0 {
-                    if remaining > MAX_HTTP_BODY_SIZE {
-                        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-                        return Ok(());
-                    }
-                    let mut extra = vec![0u8; remaining];
-                    stream
-                        .read_exact(&mut extra)
-                        .map_err(|e| format!("read body: {}", e))?;
-                    body.extend_from_slice(&extra);
-                }
-                if body.len() > MAX_HTTP_BODY_SIZE {
-                    send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-                    return Ok(());
-                }
+                };
                 match reg_entry.claim_request(&body) {
                     RequestClaim::Claimed { digest } => {
                         let mut guard =
@@ -1046,38 +1145,9 @@ fn handle_http_connection(
         );
         return Ok(());
     }
-    let body_start = header_end + 4;
-    let content_length: usize = header_str
-        .lines()
-        .find_map(|l| {
-            let lower = l.to_ascii_lowercase();
-            lower
-                .strip_prefix("content-length:")
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0);
-    if content_length > MAX_HTTP_BODY_SIZE {
-        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
+    let Some(body) = read_request_body(&mut stream, header_str, &buf, header_end, total)? else {
         return Ok(());
-    }
-    let mut body = Vec::new();
-    body.extend_from_slice(&buf[body_start..total]);
-    let remaining = content_length.saturating_sub(total - body_start);
-    if remaining > 0 {
-        if remaining > MAX_HTTP_BODY_SIZE {
-            send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-            return Ok(());
-        }
-        let mut extra = vec![0u8; remaining];
-        stream
-            .read_exact(&mut extra)
-            .map_err(|e| format!("read body: {}", e))?;
-        body.extend_from_slice(&extra);
-    }
-    if body.len() > MAX_HTTP_BODY_SIZE {
-        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-        return Ok(());
-    }
+    };
     match entry.claim_request(&body) {
         RequestClaim::Claimed { digest } => {
             let mut guard = InFlightGuard::new(entry.request_budget.clone(), digest);
@@ -1125,6 +1195,50 @@ fn handle_http_connection(
         }
     }
     Ok(())
+}
+
+/// Read the request body that follows the headers. Replies 413 and returns `None` when it is too
+/// large.
+fn read_request_body(
+    stream: &mut UnixStream,
+    header_str: &str,
+    buf: &[u8],
+    header_end: usize,
+    total: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    let body_start = header_end + 4;
+    let content_length: usize = header_str
+        .lines()
+        .find_map(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower
+                .strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_SIZE {
+        send_sign_error(stream, "413 Payload Too Large", "body_too_large");
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(&buf[body_start..total]);
+    let remaining = content_length.saturating_sub(total - body_start);
+    if remaining > 0 {
+        if remaining > MAX_HTTP_BODY_SIZE {
+            send_sign_error(stream, "413 Payload Too Large", "body_too_large");
+            return Ok(None);
+        }
+        let mut extra = vec![0u8; remaining];
+        stream
+            .read_exact(&mut extra)
+            .map_err(|e| format!("read body: {}", e))?;
+        body.extend_from_slice(&extra);
+    }
+    if body.len() > MAX_HTTP_BODY_SIZE {
+        send_sign_error(stream, "413 Payload Too Large", "body_too_large");
+        return Ok(None);
+    }
+    Ok(Some(body))
 }
 
 fn handle_sign_body(
@@ -2867,7 +2981,7 @@ mod tests {
         use crate::storage::{CredentialFilter, CredentialStorage};
         use passless_core::agent::{
             AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+            AgentRpRule, BrowserScope, UserPresenceSource, UserVerificationSource,
         };
         use passless_core::config::SecurityConfig;
         use soft_fido2::{
@@ -3121,13 +3235,7 @@ mod tests {
                             user_verification: UserVerificationSource::Agent,
                         },
                     }],
-                    device: DeviceIdentity {
-                        name: "test-device".to_string(),
-                        phys: "test-phys".to_string(),
-                        uniq: "test-uniq".to_string(),
-                        vendor_id: 0x1234,
-                        product_id: 0x5678,
-                    },
+                    device: None,
                     start_url: None,
                     browser_command: None,
                     browser_user: None,
@@ -3566,7 +3674,7 @@ mod tests {
 
         use passless_core::agent::{
             AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+            AgentRpRule, BrowserScope, UserPresenceSource, UserVerificationSource,
         };
         use passless_core::config::SecurityConfig;
 
@@ -3715,13 +3823,7 @@ mod tests {
                     storage: None,
                     registration_allowed: false,
                     rules,
-                    device: DeviceIdentity {
-                        name: "test-device".to_string(),
-                        phys: "test-phys".to_string(),
-                        uniq: "test-uniq".to_string(),
-                        vendor_id: 0x1234,
-                        product_id: 0x5678,
-                    },
+                    device: None,
                     start_url: None,
                     browser_command: None,
                     browser_user: None,
@@ -4664,6 +4766,290 @@ mod tests {
             assert!(body_str.contains("forbidden"));
             shutdown.store(true, Ordering::Release);
             handle.join().unwrap();
+        }
+    }
+
+    /// Registration bearers are bound to the browser lease and revoked with it (ADR 0014 section 9).
+    mod registration_lease_tests {
+        use super::*;
+        use crate::agent::audit::test_support::read_audit_events;
+        use passless_core::agent::protocol::RegisterCredentialRequest;
+        use passless_core::agent::{AgentAuthorization, AgentCeremonyPolicy};
+        use passless_core::agent::{UserPresenceSource, UserVerificationSource};
+        use soft_fido2::SoftwareCredentialKeyProvider;
+
+        struct Rig {
+            registry: Arc<SignContextRegistry>,
+            handler: Arc<RegisterHandler>,
+            ctx: RegisterContext,
+            storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+            audit_dir: PathBuf,
+            _dirs: Vec<tempfile::TempDir>,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                let audit_tmp = tempfile::tempdir().unwrap();
+                let audit_dir = audit_tmp.path().join("audit");
+                std::fs::create_dir_all(&audit_dir).unwrap();
+                std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let store_tmp = tempfile::tempdir().unwrap();
+
+                let mut profile_config = sign_handler_tests::TestFixture::new(true)
+                    .make_ctx()
+                    .profile_config;
+                profile_config.rules[0].register = AgentCeremonyPolicy {
+                    authorization: AgentAuthorization::Allow,
+                    user_presence: UserPresenceSource::Agent,
+                    user_verification: UserVerificationSource::Agent,
+                };
+                let storage: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                    Arc::new(Mutex::new(Box::new(
+                        crate::storage::LocalStorageAdapter::new(store_tmp.path().into()).unwrap(),
+                    )));
+                let handler = Arc::new(RegisterHandler {
+                    credential_storage: storage.clone(),
+                    audit_gate: Arc::new(AuditGate::open(&audit_dir).unwrap()),
+                    key_provider: Arc::new(SoftwareCredentialKeyProvider),
+                    security_config: SecurityConfig::default(),
+                    operation_lock: Arc::new(Mutex::new(())),
+                });
+                let ctx =
+                    RegisterContext::new(ProfileId::new("test-profile").unwrap(), profile_config);
+                Self {
+                    registry: Arc::new(SignContextRegistry::new()),
+                    handler,
+                    ctx,
+                    storage,
+                    audit_dir,
+                    _dirs: vec![audit_tmp, store_tmp],
+                }
+            }
+
+            /// Register a bearer, optionally bound to `lease`.
+            fn bearer(&self, lease: Option<&str>) -> String {
+                let token = generate_bearer_token().unwrap();
+                self.registry
+                    .register_pending_registration(
+                        token.clone(),
+                        self.ctx.clone(),
+                        self.handler.clone(),
+                    )
+                    .unwrap();
+                if let Some(lease) = lease {
+                    self.registry
+                        .bind_registration_lease(&token, lease.to_string())
+                        .unwrap();
+                }
+                token
+            }
+
+            fn credential_count(&self) -> usize {
+                self.storage.lock().unwrap().count_credentials()
+            }
+
+            fn registration_body(&self, challenge: &str) -> Vec<u8> {
+                serde_json::to_vec(&RegisterCredentialRequest {
+                    origin: "https://example.com".to_string(),
+                    top_origin: None,
+                    rp_id: "example.com".to_string(),
+                    challenge_b64u: challenge.to_string(),
+                    user_id_b64u: "dXNlcg".to_string(),
+                    user_name: "testuser".to_string(),
+                    user_display_name: None,
+                    rp_name: None,
+                    exclude_credentials: vec![],
+                    pub_key_cred_params: vec![-7],
+                    user_verification: false,
+                    cross_origin: false,
+                })
+                .unwrap()
+            }
+
+            fn policy_denies(&self) -> Vec<serde_json::Value> {
+                read_audit_events(&self.audit_dir)
+                    .into_iter()
+                    .filter(|e| e["kind"] == "policy.deny")
+                    .collect()
+            }
+        }
+
+        fn post_register(sock: &Path, token: &str, body: &[u8]) -> String {
+            let request = format!(
+                "POST /register HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                token,
+                body.len()
+            );
+            let mut stream = UnixStream::connect(sock).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            let mut resp = vec![0u8; 16384];
+            let n = stream.read(&mut resp).unwrap();
+            String::from_utf8_lossy(&resp[..n]).into_owned()
+        }
+
+        #[test]
+        fn unbound_registration_bearer_is_unusable() {
+            let rig = Rig::new();
+            let token = rig.bearer(None);
+            assert!(rig.registry.lookup_registration(&token).is_none());
+            rig.registry
+                .bind_registration_lease(&token, "lease-1".into())
+                .unwrap();
+            assert!(rig.registry.lookup_registration(&token).is_some());
+            assert!(
+                rig.registry
+                    .bind_registration_lease(&token, "lease-2".into())
+                    .is_err(),
+                "a bearer binds to one lease only"
+            );
+        }
+
+        #[test]
+        fn revoke_by_lease_revokes_registration_bearers_only_for_that_lease() {
+            let rig = Rig::new();
+            let a = rig.bearer(Some("lease-a"));
+            let b = rig.bearer(Some("lease-b"));
+
+            assert_eq!(rig.registry.revoke_by_lease("lease-a"), 1);
+
+            assert!(rig.registry.lookup_registration(&a).is_none());
+            assert!(rig.registry.lookup_revoked_registration(&a).is_some());
+            assert!(rig.registry.lookup_registration(&b).is_some());
+            assert!(rig.registry.lookup_revoked_registration(&b).is_none());
+        }
+
+        #[test]
+        fn revoke_by_lease_covers_sign_and_registration_bearers_of_one_token() {
+            let rig = Rig::new();
+            let token = rig.bearer(Some("lease-x"));
+            let f = sign_handler_tests::TestFixture::new(true);
+            rig.registry
+                .register_pending(token.clone(), f.make_ctx(), Arc::new(f.make_handler()))
+                .unwrap();
+            rig.registry.bind_lease(&token, "lease-x".into()).unwrap();
+
+            assert_eq!(rig.registry.revoke_by_lease("lease-x"), 2);
+            assert!(rig.registry.lookup_bound(&token).is_none());
+            assert!(rig.registry.lookup_registration(&token).is_none());
+        }
+
+        #[test]
+        fn registration_after_lease_revocation_is_refused_and_audited() {
+            let rig = Rig::new();
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("sock");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
+            let handle = server.serve(rig.registry.clone());
+            let token = rig.bearer(Some("lease-1"));
+
+            // While the lease is alive, registration works.
+            let ok = post_register(&sock, &token, &rig.registration_body("Y2hhbGxlbmdlMQ"));
+            assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+            assert_eq!(rig.credential_count(), 1);
+            assert!(rig.policy_denies().is_empty());
+
+            // The browser exits / the lease is revoked: the old bearer no longer registers.
+            rig.registry.revoke_by_lease("lease-1");
+            let refused = post_register(&sock, &token, &rig.registration_body("Y2hhbGxlbmdlMg"));
+            assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+            assert!(refused.contains("invalid_bearer"), "{refused}");
+            assert_eq!(rig.credential_count(), 1, "no credential may be created");
+
+            let denies = rig.policy_denies();
+            assert_eq!(denies.len(), 1, "{denies:?}");
+            assert_eq!(denies[0]["action"], "register");
+            assert_eq!(denies[0]["reason"], "bearer_revoked");
+            assert_eq!(denies[0]["profile_id"], "test-profile");
+            assert_eq!(denies[0]["rp_id"], "example.com");
+
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn request_in_flight_when_the_lease_is_revoked_creates_no_credential() {
+            let rig = Rig::new();
+            let token = rig.bearer(Some("lease-inflight"));
+            // The request has passed authentication (the entry is in hand) ...
+            let entry = rig.registry.lookup_registration(&token).unwrap();
+            // ... when the browser exits.
+            rig.registry.revoke_by_lease("lease-inflight");
+
+            let req: RegisterCredentialRequest =
+                serde_json::from_slice(&rig.registration_body("Y2hhbGxlbmdl")).unwrap();
+            let err = entry.handler.register(&entry.context, &req).unwrap_err();
+
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(rig.credential_count(), 0);
+            let denies = rig.policy_denies();
+            assert_eq!(denies.len(), 1, "{denies:?}");
+            assert_eq!(denies[0]["reason"], "bearer_revoked");
+        }
+
+        #[test]
+        fn unknown_registration_bearer_is_refused_without_audit() {
+            let rig = Rig::new();
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("sock");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
+            let handle = server.serve(rig.registry.clone());
+
+            let token = generate_bearer_token().unwrap();
+            let refused = post_register(&sock, &token, &rig.registration_body("Y2hhbGxlbmdl"));
+            assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+            assert!(rig.policy_denies().is_empty());
+
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn refusals_of_a_revoked_bearer_are_audited_at_most_a_bounded_number_of_times() {
+            let rig = Rig::new();
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("sock");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let server = SignHttpServer::bind(sock.clone(), shutdown.clone()).unwrap();
+            let handle = server.serve(rig.registry.clone());
+            let token = rig.bearer(Some("lease-flood"));
+            rig.registry.revoke_by_lease("lease-flood");
+
+            let attempts = MAX_AUDITED_REFUSALS_PER_BEARER + 4;
+            for i in 0..attempts {
+                let body = rig.registration_body(&format!("challenge{i}"));
+                let refused = post_register(&sock, &token, &body);
+                assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+            }
+            assert_eq!(rig.policy_denies().len(), MAX_AUDITED_REFUSALS_PER_BEARER);
+            assert_eq!(rig.credential_count(), 0);
+
+            shutdown.store(true, Ordering::Release);
+            handle.join().unwrap();
+        }
+
+        #[test]
+        fn revoked_registration_memory_is_bounded() {
+            let rig = Rig::new();
+            let mut first = None;
+            for i in 0..(MAX_REVOKED_REGISTRATIONS + 8) {
+                let token = rig.bearer(Some(&format!("lease-{i}")));
+                rig.registry.revoke_registration(&token);
+                first.get_or_insert(token);
+            }
+            let remembered = rig.registry.revoked_registrations.lock().unwrap();
+            assert_eq!(remembered.entries.len(), MAX_REVOKED_REGISTRATIONS);
+            let first = first.unwrap();
+            assert!(!remembered.entries.contains_key(&first));
+            drop(remembered);
+            // The evicted bearer is gone from the live map as well, so it is still refused (as unknown).
+            assert!(rig.registry.lookup_registration(&first).is_none());
         }
     }
 }

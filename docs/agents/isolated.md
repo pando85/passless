@@ -54,13 +54,6 @@ authenticate = "autonomous"
 [agents.profiles.release-bot.storage.local]
 path = "/var/lib/passless-agent/release-bot/credentials"
 pin_path = "/var/lib/passless-agent/release-bot/pin"
-
-[agents.profiles.release-bot.device]
-name = "passless-agent-release"
-phys = "release-phys"
-uniq = "release-uniq"
-vendor_id = 4660
-product_id = 22137
 ```
 
 The expanded autonomous policy is:

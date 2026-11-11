@@ -39,14 +39,13 @@ Common current errors include:
 |---|---|---|
 | `same-user mode uses the human backend and must not specify storage` | Same-user profile has a profile-specific storage section | Remove the profile storage configuration; same-user reuses the already-open human backend |
 | `isolated mode requires storage backend configuration` | Isolated profile has no separate storage | Add an isolated local/pass/TPM storage backend |
-| `isolated mode requires a complete device identity` | Isolated UHID identity is incomplete | Configure `device.name`, `phys`, `uniq`, vendor ID, and product ID |
 | `explicit rules cannot be combined with legacy rp_ids...` | New rule syntax is mixed with migration syntax | Use explicit `[[agents.profiles.<name>.rules]]` entries only |
 | `wildcard RP scope '*' is only supported in same-user mode` | Global scope used by an isolated profile | Replace `*` with exact RP rules |
 | `wildcard RP scope '*' requires credential_refs to be omitted` | Global same-user scope is mixed with static credential references | Remove `credential_refs` or, preferably, replace `*` with exact RP rules and explicit credential scope |
 | `wildcard RP scope '*' must deny registration` | Global registration was enabled | Keep wildcard registration denied; registration requires exact RP policy |
 | invalid RP / public suffix / wildcard error | RP is a URL, IP, public suffix, partial wildcard, or otherwise invalid | Configure an exact WebAuthn RP ID such as `github.com`; `*` is the only global policy sentinel and only for same-user authentication |
-| device identity collision | Isolated device identity matches the human endpoint or another profile | Change the isolated device identity |
 | agent roots overlap | Audit, isolated storage, PIN, or human state paths overlap | Use independent roots |
+| `the [device] table is deprecated and ignored` (warning) | A legacy `[agents.profiles.<name>.device]` table is present | Remove it; agents have no UHID device |
 | `unknown field` | Invalid, removed, or misspelled configuration | Remove it and check [configuration.md](configuration.md) |
 | invalid mode `delegated-session` | The old experimental mode was removed | Migrate human-credential use to `same-user` and review its trust model; use `isolated` for a separate RP identity |
 

@@ -124,13 +124,6 @@ audit_path = "${TEST_DIR}/audit.log"
 mode = "isolated"
 principal_user = "$(whoami)"
 
-[agents.profiles.webauthn-test.device]
-name = "passless-agent-webauthn-test"
-phys = "webauthn-test-phys"
-uniq = "webauthn-test-uniq"
-vendor_id = 4660
-product_id = 22137
-
 [agents.profiles.webauthn-test.storage.local]
 path = "${TEST_DIR}/agent-credentials"
 pin_path = "${TEST_DIR}/agent-pin"
@@ -232,46 +225,7 @@ start_daemon() {
     log_info "Daemon is ready"
 }
 
-request_registration_grant() {
-    log_info "Requesting registration grant..."
-
-    local output
-    output=$("$BINARY" agent-admin delegation request-registration \
-        --profile webauthn-test \
-        --rp webauthn.io \
-        --session-ttl 300 \
-        --reason "E2E test registration" \
-        --output json 2>&1)
-
-    if [[ $? -ne 0 ]]; then
-        log_error "Failed to request registration grant"
-        log_error "Output: $output"
-        exit 1
-    fi
-
-    # Extract registration_grant_id from JSON response
-    # Response format: {"version":"1","status":"ok","data":{"registration_grant_id":"..."}}
-    local grant_id
-    grant_id=$(echo "$output" | jq -r '.data.registration_grant_id // empty')
-
-    if [[ -z "$grant_id" ]]; then
-        log_error "Failed to extract registration_grant_id from response"
-        log_error "Response: $output"
-        exit 1
-    fi
-
-    # Validate grant ID format (should be 64-char hex string)
-    if [[ ${#grant_id} -ne 64 ]] || ! [[ "$grant_id" =~ ^[0-9a-f]+$ ]]; then
-        log_error "Invalid registration grant ID format: $grant_id"
-        exit 1
-    fi
-
-    log_info "Registration grant ID: $grant_id"
-    echo "$grant_id"
-}
-
 test_register_endpoint() {
-    local grant_id="$1"
     local port
     port=$(cat "$HTTP_PORT_FILE")
 
@@ -447,12 +401,9 @@ main() {
     build_passless
     start_daemon
 
-    # Test registration flow
-    local grant_id
-    grant_id=$(request_registration_grant)
-
-    # Test endpoints
-    test_register_endpoint "$grant_id"
+    # Registration authority is the exact-RP `register = "allow"` rule in the config above; there is
+    # no enrollment grant to request (ADR 0014 section 10.3).
+    test_register_endpoint
     test_sign_endpoint
 
     # Verify storage
@@ -467,7 +418,6 @@ main() {
     log_info "Test Summary:"
     log_info "  - Daemon started successfully"
     log_info "  - HTTP server listening on port $(cat "$HTTP_PORT_FILE")"
-    log_info "  - Registration grant obtained: ${grant_id:0:16}..."
     log_info "  - /register endpoint accessible"
     log_info "  - /sign endpoint accessible"
     log_info "  - Admin IPC functional"

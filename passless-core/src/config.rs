@@ -1141,21 +1141,6 @@ pub enum AdminDelegationAction {
         #[arg(long)]
         confirm: bool,
     },
-    /// Create an exact-RP, short-lived, one-shot registration enrollment grant
-    RequestRegistration {
-        /// Profile identifier
-        #[arg(long, value_name = "PROFILE")]
-        profile: String,
-        /// Relying party ID
-        #[arg(long, value_name = "RP_ID")]
-        rp: String,
-        /// Enrollment grant TTL in seconds (clamped to profile TTL and 300 seconds)
-        #[arg(long, value_name = "SECONDS")]
-        session_ttl: u64,
-        /// Reason for the registration
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-    },
 }
 
 /// Admin session actions
@@ -1411,7 +1396,8 @@ pub enum AgentCommand {
 #[cfg(feature = "agent")]
 #[derive(Subcommand, Debug, Clone)]
 pub enum AgentIntentAction {
-    /// Create a new intent
+    /// Create a new intent (unavailable: the daemon refuses it; removed with the intent protocol in P7)
+    #[command(hide = true)]
     Create {
         /// Action type
         #[arg(value_enum)]

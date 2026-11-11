@@ -240,7 +240,7 @@ The exact required primitives depend on the active path, but supported Linux dep
 
 | Feature | Used for |
 |---|---|
-| UHID / hidraw | Human and isolated compatibility/native authenticator endpoints |
+| UHID / hidraw | The human authenticator only; agents have no device endpoint |
 | `pidfd`, `close_range`, `/proc` process identity | Principal/browser process lifecycle and FD hygiene |
 | `SOCK_SEQPACKET` | Local admin/principal IPC |
 | Unix ownership/mode checks | Runtime, storage, audit, and browser roots |

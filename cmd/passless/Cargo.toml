@@ -32,12 +32,11 @@ required-features = ["agent"]
 [features]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]
-agent = ["passless-core/agent", "passless-uhid"]
+agent = ["passless-core/agent"]
 agent-validation = ["agent"]
 
 [dependencies]
 passless-core.workspace = true
-passless-uhid = { workspace = true, optional = true }
 soft-fido2.workspace = true
 soft-fido2-transport.workspace = true
 soft-fido2-ctap.workspace = true
@@ -85,6 +84,7 @@ ciborium = "0.2"
 tempfile = "3.14"
 hex = "0.4"
 soft-fido2-ctap.workspace = true
+soft-fido2-crypto.workspace = true
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true

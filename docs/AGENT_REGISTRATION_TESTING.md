@@ -55,13 +55,6 @@ rp_id = "webauthn.io"
 register = { authorization = "allow", user_presence = "none", user_verification = "none" }
 authenticate = { authorization = "allow", user_presence = "none", user_verification = "none" }
 
-[agents.profiles.webauthn-test.device]
-name = "passless-agent-webauthn"
-phys = "webauthn-test-phys"
-uniq = "webauthn-test-uniq"
-vendor_id = 4660
-product_id = 22137
-
 [agents.profiles.webauthn-test.storage.local]
 path = "/tmp/passless-webauthn-test/agent-credentials"
 pin_path = "/tmp/passless-webauthn-test/agent-pin"
@@ -101,8 +94,7 @@ passless agent-admin browser launch --profile webauthn-test --url https://webaut
 
 This command:
 - Generates a bearer token for the session
-- Requests registration grants for all allowed RP IDs
-- Registers registration and sign contexts
+- Registers registration and sign contexts, bound to the browser lease
 - Launches Chromium with the agent extension loaded
 
 Expected output:
@@ -152,7 +144,8 @@ cargo test --features agent -- register::tests
 
 # Specific test categories
 cargo test --features agent -- register::tests::test_register_origin_verification
-cargo test --features agent -- register::tests::test_register_rejects_expired_grant
+cargo test --features agent -- register::tests::test_register_allow_needs_no_enrollment_grant
+cargo test --features agent -- register::tests::test_register_under_wildcard_is_always_denied
 cargo test --features agent -- register::tests::test_register_rejects_denied_policy
 cargo test --features agent -- register::tests::test_register_origin_spoofing_prevented
 cargo test --features agent -- register::tests::test_register_writes_credential
@@ -160,18 +153,11 @@ cargo test --features agent -- register::tests::test_register_success_response_f
 cargo test --features agent -- register::tests::test_register_concurrent_requests_serialized
 ```
 
-### Policy engine tests
+### Bearer lifecycle tests
 
 ```bash
-# Registration authorization tests
-cargo test --features agent -- policy_engine::tests::test_authorize_registration
-```
-
-### Grant system tests
-
-```bash
-# Registration grant lifecycle tests
-cargo test --features agent -- grant::tests::test_registration
+# Registration bearers are bound to the browser lease and revoked with it
+cargo test --features agent -- sign::tests::registration_lease_tests
 ```
 
 ### Full agent test suite
@@ -184,7 +170,7 @@ cargo test --features agent -- agent:: --nocapture
 
 - [ ] Daemon starts without errors
 - [ ] HTTP server binds to a port (check log for `Sign HTTP server listening`)
-- [ ] `browser launch` creates registration grants and contexts
+- [ ] `browser launch` creates lease-bound registration and sign contexts
 - [ ] `/register` endpoint accepts POST requests with bearer token
 - [ ] Credential is stored in the backend (check storage directory)
 - [ ] `clientDataJSON` contains `"type":"webauthn.create"`
@@ -213,22 +199,16 @@ Test that the daemon rejects requests with invalid origins:
 
 Verified by unit test: `test_register_origin_spoofing_prevented`
 
-### Grant expiry
+### Bearer revocation
 
 ```bash
-# Request a grant with 5-second TTL
-passless agent-admin delegation request-registration \
-  --profile webauthn-test \
-  --rp webauthn.io \
-  --session-ttl 5
-
-# Wait for expiry
-sleep 6
-
-# Attempt registration - should fail with "registration grant not active"
+# Register once with the live bearer, then exit the browser (or revoke its lease).
+# A registration with the old bearer is refused: 401 invalid_bearer, no credential,
+# and an audit record policy.deny with reason bearer_revoked.
 ```
 
-Verified by unit test: `test_register_rejects_expired_grant`
+Verified by the unit tests in `sign::tests::registration_lease_tests` and by the E2E scenario
+`tests/agent-e2e` E2E-11.
 
 ### Policy enforcement
 
@@ -286,7 +266,7 @@ rm -rf /run/user/$(id -u)/passless /run/user/$(id -u)/agent
 
 **Cause:** Request sent without a bearer token.
 
-The extension must include `Authorization: Bearer <token>` in the HTTP request. The token is bound to the registration grant during session setup.
+The extension must include `Authorization: Bearer <token>` in the HTTP request. The token is bound to the browser lease during session setup and is revoked with it.
 
 ### "policy_denied" / `ErrorCode::Forbidden`
 
@@ -301,13 +281,12 @@ register = { authorization = "allow", ... }
 
 Also check `registration_allowed = true` is set on the profile.
 
-### "grant_not_found" / "registration grant not active"
+### "invalid_bearer" after the browser exited
 
-**Cause:** The registration grant expired or was never created.
+**Cause:** Registration bearers are bound to the browser lease and are revoked when the browser exits or the lease is revoked. The refusal is audited as `bearer_revoked`.
 
-1. Request a new grant: `passless agent-admin delegation request-registration`
-2. Check the TTL is sufficient for your test
-3. Verify the grant ID in the request context matches
+1. Launch a new browser with `passless agent-admin browser launch`; it gets a new bearer
+2. Registration needs an exact-RP `register = "allow"` rule; there is no enrollment grant to request
 
 ### "credential matches exclude list"
 

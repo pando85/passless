@@ -163,7 +163,7 @@ Prefer explicit RP rules whenever possible. Treat an autonomous same-user `"*"` 
 
 ## Isolated mode
 
-Isolated mode uses profile-owned credentials. It requires a separate storage backend and a complete device identity. Storage/PIN roots must not overlap the human backend, another profile, or agent audit state.
+Isolated mode uses profile-owned credentials. It requires a separate storage backend. Storage/PIN roots must not overlap the human backend, another profile, or agent audit state.
 
 ```toml
 [agents.profiles.release]
@@ -176,13 +176,6 @@ credential_selection = "single"
 [agents.profiles.release.storage.local]
 path = "/var/lib/passless-agent/release/credentials"
 pin_path = "/var/lib/passless-agent/release/pin"
-
-[agents.profiles.release.device]
-name = "passless-release"
-phys = "release-phys"
-uniq = "release-uniq"
-vendor_id = 4660
-product_id = 22136
 
 [[agents.profiles.release.rules]]
 rp_id = "git.example.com"
@@ -232,18 +225,9 @@ be isolated between human credentials and agent credentials.
 
 ## Device identity
 
-Isolated profiles require a complete, unique UHID device identity:
-
-```toml
-[agents.profiles.<id>.device]
-name = "passless-agent-<profile>"
-phys = "<profile>-phys"
-uniq = "<profile>-uniq"
-vendor_id = 4660
-product_id = 22136
-```
-
-The values must not collide with the human endpoint or another profile, contain NUL bytes, or exceed kernel field limits.
+Agents have no UHID or hidraw device (they use the browser extension path only), so profiles need no
+`[device]` table. A legacy `[agents.profiles.<id>.device]` table is still parsed, logged as deprecated
+and ignored.
 
 ## CDP exposure
 
@@ -255,7 +239,7 @@ The daemon rejects conflicting Chromium remote-debugging flags supplied through 
 
 ## Registration
 
-Registration mutates identity state. In `same-user` mode, autonomous registration writes a new credential into the human backend. Keep registration denied after enrollment unless continuous automated creation is genuinely required. In isolated mode registration affects only the profile-owned namespace.
+Registration mutates identity state. It is allowed only by an exact-RP rule with `register = "allow"` (never by a wildcard), and its bearer is bound to the browser lease. In `same-user` mode, autonomous registration writes a new credential into the human backend. Keep registration denied after enrollment unless continuous automated creation is genuinely required. In isolated mode registration affects only the profile-owned namespace.
 
 ## Validation rules
 
@@ -263,7 +247,7 @@ Important fail-closed checks include:
 
 - `agents.enabled = true` requires `audit_path`.
 - `same-user` rejects profile storage.
-- `isolated` requires profile storage and a complete device identity.
+- `isolated` requires profile storage.
 - storage and audit roots must not overlap.
 - explicit `rules` cannot be mixed with the legacy `rp_ids`, `registration_allowed`, or `require_uv` fields.
 - wildcard scope requires explicit rules, is limited to `same-user`, requires dynamic credential discovery, and must deny wildcard registration.

@@ -5025,16 +5025,6 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_probe_uhid_deterministic_policy() {
-        use super::super::launcher::probe_uhid_access;
-        let result = probe_uhid_access();
-        match &result {
-            ProbeResult::Allowed { path } => assert_eq!(path, "/dev/uhid"),
-            ProbeResult::Denied { path, .. } => assert_eq!(path, "/dev/uhid"),
-        }
-    }
-
-    #[test]
     fn test_browser_probe_protected_node_deterministic_policy() {
         use super::super::launcher::probe_protected_node_access;
         let result = probe_protected_node_access(Path::new("/dev/uhid"));

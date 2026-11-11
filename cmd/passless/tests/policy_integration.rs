@@ -16,11 +16,6 @@ fn base_params() -> PolicyParams {
         max_grant_ttl: 3600,
         max_session_ttl: 7200,
         principal_user: "testuser".into(),
-        device_name: "agent-device".into(),
-        device_phys: "agent-phys".into(),
-        device_uniq: "agent-uniq".into(),
-        device_vendor_id: 0x9999,
-        device_product_id: 0x0001,
         start_url: None,
         browser_argv: vec![],
         storage_backend: "local".into(),
@@ -155,15 +150,6 @@ fn policy_digest_changes_when_actions_change() {
     let p1 = Policy::from_params(base_params()).unwrap();
     let mut params2 = base_params();
     params2.allowed_actions = vec!["register".into()];
-    let p2 = Policy::from_params(params2).unwrap();
-    assert_ne!(p1.digest(), p2.digest());
-}
-
-#[test]
-fn policy_digest_changes_when_device_changes() {
-    let p1 = Policy::from_params(base_params()).unwrap();
-    let mut params2 = base_params();
-    params2.device_vendor_id = 0x1234;
     let p2 = Policy::from_params(params2).unwrap();
     assert_ne!(p1.digest(), p2.digest());
 }

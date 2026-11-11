@@ -192,7 +192,6 @@ fn spawn_agent_runtime(
     human_key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
     agent_config: passless_core::agent::AgentConfig,
     security_config: passless_core::config::SecurityConfig,
-    pin_config: passless_core::config::PinConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let shutdown_for_runtime = shutdown.clone();
@@ -206,7 +205,6 @@ fn spawn_agent_runtime(
                 human_key_provider,
                 &agent_config,
                 security_config,
-                pin_config,
                 shutdown_for_runtime.clone(),
             ) {
                 Ok(runtime) => {
@@ -501,12 +499,6 @@ fn run() -> Result<()> {
             debug!("Daemon locks acquired");
 
             let shutdown = Arc::new(AtomicBool::new(false));
-            let mut endpoint_manager = agent::endpoint_manager::EndpointManager::new(
-                config.agents.profiles.len().max(1),
-                shutdown.clone(),
-                worker::WorkerConfig::default(),
-            );
-            debug!("Endpoint manager initialized");
 
             info!("Creating UHID device...");
 
@@ -583,14 +575,11 @@ fn run() -> Result<()> {
                         Arc::new(SoftwareCredentialKeyProvider),
                         config.agents.clone(),
                         security_config,
-                        pin_config,
                         shutdown.clone(),
                     );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                     join_agent_runtime(agent_runtime);
-                    endpoint_manager.cancel_all();
-                    let _ = endpoint_manager.shutdown_all(None);
                     result
                 }
                 BackendConfig::Pass {
@@ -633,14 +622,11 @@ fn run() -> Result<()> {
                         Arc::new(SoftwareCredentialKeyProvider),
                         config.agents.clone(),
                         security_config,
-                        pin_config,
                         shutdown.clone(),
                     );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                     join_agent_runtime(agent_runtime);
-                    endpoint_manager.cancel_all();
-                    let _ = endpoint_manager.shutdown_all(None);
                     result
                 }
                 #[cfg(feature = "tpm")]
@@ -681,15 +667,12 @@ fn run() -> Result<()> {
                             agent_key_provider,
                             config.agents.clone(),
                             security_config,
-                            pin_config,
                             shutdown.clone(),
                         );
 
                         let result =
                             run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                         join_agent_runtime(agent_runtime);
-                        endpoint_manager.cancel_all();
-                        let _ = endpoint_manager.shutdown_all(None);
                         result
                     } else {
                         let storage = TpmStorageAdapter::new_with_options(
@@ -716,15 +699,12 @@ fn run() -> Result<()> {
                             Arc::new(SoftwareCredentialKeyProvider),
                             config.agents.clone(),
                             security_config,
-                            pin_config,
                             shutdown.clone(),
                         );
 
                         let result =
                             run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                         join_agent_runtime(agent_runtime);
-                        endpoint_manager.cancel_all();
-                        let _ = endpoint_manager.shutdown_all(None);
                         result
                     }
                 }

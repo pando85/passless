@@ -2,6 +2,7 @@
 // Shared assertions and page helpers for scenarios.
 
 const assert = require('node:assert/strict');
+const http = require('node:http');
 
 /** Audit event bodies (the `event` objects), in order. */
 const auditEvents = audit => audit.map(e => e.event || e);
@@ -55,4 +56,58 @@ async function assertAgentAllowed(stack, { rpId, profile = 'agent', n = 1, actio
   return allows;
 }
 
-module.exports = { assertAgentAllowed, auditEvents, policyEvents, authenticate, storeFingerprint, assertVerifiedAssertion, assertInterceptionActive, assertNoNotification };
+
+/**
+ * The daemon endpoint the managed browser's extension was given: the sign socket and the lease-bound bearer.
+ * Read the way the extension itself holds them (its generated worker script), through the extension's own service
+ * worker, so no on-disk layout is assumed. Test-only: a page can never do this.
+ */
+async function extensionEndpoint(b) {
+  const worker = b.context.serviceWorkers().find(w => /^chrome-extension:\/\/[a-p]{32}\/worker\.js$/.test(w.url()));
+  assert.ok(worker, 'extension service worker not found');
+  const source = await worker.evaluate(async url => (await fetch(url)).text(), worker.url());
+  const m = source.match(/\}\)\(("(?:[^"\\]|\\.)*"),\s*("(?:[^"\\]|\\.)*")\);\s*$/);
+  assert.ok(m, 'could not read the endpoint arguments from the extension worker');
+  return { socketPath: JSON.parse(m[1]), bearer: JSON.parse(m[2]) };
+}
+
+/** POST JSON to the daemon's sign socket (`path` is `/register` or `/sign`) with a bearer; resolves {status, body}. */
+function postToDaemon({ socketPath, bearer }, path, payload) {
+  const data = Buffer.from(JSON.stringify(payload));
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      socketPath, path, method: 'POST',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json', 'content-length': data.length },
+    }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('daemon request timed out')));
+    req.end(data);
+  });
+}
+
+/** A minimal valid daemon `/register` request for `rp` (a test RP). Distinct `challenge` per attempt (replay key). */
+function registerRequest(rp, { username = 'dora', challenge } = {}) {
+  const b64u = b => Buffer.from(b).toString('base64url');
+  return {
+    origin: rp.origin, rp_id: rp.host, challenge_b64u: b64u(challenge || `challenge-${Date.now()}-${Math.random()}`),
+    user_id_b64u: b64u(username), user_name: username, user_display_name: username, rp_name: rp.host,
+    exclude_credentials: [], pub_key_cred_params: [-7], user_verification: false, cross_origin: false,
+  };
+}
+
+/** Poll until `predicate()` is truthy, or fail with `what`. */
+async function waitFor(what, predicate, { timeoutMs = 15000, intervalMs = 200 } = {}) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    const v = await predicate();
+    if (v) return v;
+    if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+}
+
+module.exports = { extensionEndpoint, postToDaemon, registerRequest, waitFor, assertAgentAllowed, auditEvents, policyEvents, authenticate, storeFingerprint, assertVerifiedAssertion, assertInterceptionActive, assertNoNotification };
