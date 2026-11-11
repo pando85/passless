@@ -32,7 +32,9 @@ async function waitForPage(context, url, timeoutMs = 15000) {
  * @param {object} o
  * @param {Object<string,{host?:string,requireUV?:boolean}>} o.rps    e.g. {a:{host:'rp-a.test'}} or {local:{host:'localhost'}}
  * @param {Object<string,object>} o.profiles   see daemon.renderConfig
- * @param {object|false} [o.notify]            {script:[...]} or false to skip the double
+ * @param {object|false} [o.notify]            {script:[...]} or false to skip the double (the private bus then has no
+ *                                             notification server: escalation is denied `escalation_unavailable`)
+ * @param {object} [o.agents]                  raw `[agents]` keys, e.g. {escalation_cooldown: 2}
  * @param {object} [o.daemonEnv]
  */
 async function createStack(label, variant, o) {
@@ -50,6 +52,7 @@ async function createStack(label, variant, o) {
     stack.startDaemon = profiles => startDaemon(env, {
       profiles,
       limits: o.limits,
+      agents: o.agents,
       browserExe: variant.browser.exe,
       browserArgs: [...variantArgs(variant), ...rpBrowserArgs(rpList)],
       env: o.daemonEnv,
@@ -74,6 +77,17 @@ async function createStack(label, variant, o) {
     fs.rmSync(path.join(env.dirs.run, 'agent'), { recursive: true, force: true });
     stack.daemon = await stack.startDaemon(profiles);
     return stack.daemon;
+  };
+
+  /**
+   * Replace the notification double: stop the current one (waits for it to release the bus name), start a new one with
+   * `opts` (`{script:[...]}`) and its own log. `stack.notify` is the new double; the old one is returned for its log.
+   */
+  stack.restartNotify = async (opts = {}) => {
+    const previous = stack.notify;
+    if (previous) await previous.stop();
+    stack.notify = await startNotifyDouble(env, opts);
+    return previous;
   };
 
   /** Launch the managed browser for `profile` via the product path and attach Playwright. */
@@ -154,7 +168,7 @@ async function closeStack(stack, failed) {
   for (const b of stack.browsers || []) { try { await b.browser.close(); } catch { /* gone */ } }
   stack.browsers = [];
   if (stack.daemon) { try { await stack.daemon.stop(); } catch { /* gone */ } }
-  if (stack.notify) stack.notify.stop();
+  if (stack.notify) { try { await stack.notify.stop(); } catch { /* gone */ } }
   for (const rp of Object.values(stack.rp || {})) { try { await rp.stop(); } catch { /* gone */ } }
 }
 

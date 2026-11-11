@@ -2,7 +2,9 @@
 // Shared assertions and page helpers for scenarios.
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const net = require('node:net');
+const path = require('node:path');
 
 const { EXTENSION_WORKER_URL } = require('./browser');
 
@@ -10,6 +12,42 @@ const { EXTENSION_WORKER_URL } = require('./browser');
 const auditEvents = audit => audit.map(e => e.event || e);
 
 const policyEvents = (audit, kind) => auditEvents(audit).filter(e => e.kind === kind);
+
+/** `escalation.<kind>` audit events (`requested`, `approved`, `denied`, `expired`, `revoked`); every one when `kind` is omitted. */
+const escalationEvents = (audit, kind) => auditEvents(audit).filter(e => (kind ? e.kind === `escalation.${kind}` : /^escalation\./.test(e.kind)));
+
+/** `granted_rule.<kind>` audit events (`add`, `revoke`). */
+const grantedRuleEvents = (audit, kind) => auditEvents(audit).filter(e => e.kind === `granted_rule.${kind}`);
+
+/** The `policy.deny` reasons of `profile` in audit order, optionally for one RP. */
+const denyReasons = (audit, { profile = 'agent', rpId, action } = {}) =>
+  policyEvents(audit, 'policy.deny').filter(e => e.profile_id === profile && (!rpId || e.rp_id === rpId) && (!action || e.action === action)).map(e => e.reason);
+
+/**
+ * The granted-rules store file of `profile` (default `agents.state_dir`: `$XDG_STATE_HOME/passless/agent` of the temp
+ * HOME) and its parse: `{path, exists, version, grants: [{rp_id, action, kind, ...}]}`. The file is simple TOML written by
+ * the daemon (`version = 1` and `[[grant]]` tables of string/number/boolean keys), so a minimal parser is enough.
+ */
+function grantsStore(stack, profile = 'agent') {
+  const file = path.join(stack.env.dirs.state, 'passless', 'agent', 'granted-rules', `${profile}.toml`);
+  if (!fs.existsSync(file)) return { path: file, exists: false, version: null, grants: [] };
+  const out = { path: file, exists: true, version: null, grants: [] };
+  let cur = null;
+  for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
+    const line = raw.replace(/^\s+|\s+$/g, '');
+    if (!line || line.startsWith('#')) continue;
+    if (line === '[[grant]]') { cur = {}; out.grants.push(cur); continue; }
+    const m = line.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
+    if (!m) continue;
+    let v = m[2];
+    if (/^".*"$/.test(v)) v = JSON.parse(v); else if (/^-?\d+$/.test(v)) v = Number(v); else if (v === 'true' || v === 'false') v = v === 'true';
+    if (cur) cur[m[1]] = v; else if (m[1] === 'version') out.version = v;
+  }
+  return out;
+}
+
+/** Notify events (the daemon's notification calls) of a notify-double: summary, body, actions, expire_timeout, id. */
+const notifyCalls = stack => stack.notify.notifications();
 
 /** Run window.e2e.authenticate in `page` (or a frame) after the helper script is ready. */
 async function authenticate(pageOrFrame, opts = {}) {
@@ -212,4 +250,4 @@ async function waitFor(what, predicate, { timeoutMs = 15000, intervalMs = 200 } 
   }
 }
 
-module.exports = { extensionEndpoint, FramedClient, registerRequest, signRequest, TRANSPORT_LOG, logMatches, HUMAN_CTAP_LOG, waitFor, assertAgentAllowed, auditEvents, policyEvents, authenticate, storeFingerprint, assertVerifiedAssertion, assertInterceptionActive, assertNoNotification };
+module.exports = { escalationEvents, grantedRuleEvents, denyReasons, grantsStore, notifyCalls, extensionEndpoint, FramedClient, registerRequest, signRequest, TRANSPORT_LOG, logMatches, HUMAN_CTAP_LOG, waitFor, assertAgentAllowed, auditEvents, policyEvents, authenticate, storeFingerprint, assertVerifiedAssertion, assertInterceptionActive, assertNoNotification };

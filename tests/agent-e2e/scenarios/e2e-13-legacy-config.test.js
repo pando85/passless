@@ -1,6 +1,6 @@
 'use strict';
 const { scenario, assert } = require('../lib/scenario');
-const { authenticate, policyEvents, assertVerifiedAssertion, assertInterceptionActive, assertNoNotification } = require('../lib/helpers');
+const { authenticate, policyEvents, assertVerifiedAssertion, assertInterceptionActive } = require('../lib/helpers');
 const { DaemonStartError } = require('../lib/daemon');
 
 // Catalogue: a legacy config warns and maps; `allow` with human (or none) evidence fails startup (ADR 0014 6.4,
@@ -20,13 +20,14 @@ scenario({ id: 'E2E-13', title: 'legacy config warns and maps; allow+human fails
         legacyRules: [
           // alias -> allow
           { rp: 'rp-a.test', authenticate: '"autonomous"', register: '"deny"' },
-          // evidence table confirm+human -> request (denied with escalation_unavailable before P7)
+          // evidence table confirm+human -> request (denied with escalation_unavailable: no notification server)
           { rp: 'rp-b.test', authenticate: EVIDENCE_CONFIRM, register: '"deny"' },
           // evidence table allow+agent+agent -> allow
           { rp: 'rp-c.test', authenticate: EVIDENCE_ALLOW_AGENT, register: '"supervised"' },
         ],
       },
     },
+    notify: false,
   });
   const rpA = stack.rp.a;
   const rpB = stack.rp.b;
@@ -54,9 +55,8 @@ scenario({ id: 'E2E-13', title: 'legacy config warns and maps; allow+human fails
   assertVerifiedAssertion(rpA, await authenticate(b.page, { username: 'alice' }), { username: 'alice' });
   await b.page.goto(`${rpB.origin}/sw`);
   const res = await authenticate(b.page, { username: 'bob' });
-  assert.equal(res.ok, false, `a legacy confirm table maps to request, which denies before P7: ${JSON.stringify(res)}`);
+  assert.equal(res.ok, false, `a legacy confirm table maps to request, which is denied without a notification server: ${JSON.stringify(res)}`);
   assert.equal(res.name, 'NotAllowedError');
-  assertNoNotification(stack);
   const audit = await stack.daemon.audit();
   assert.equal(policyEvents(audit, 'policy.allow').filter(e => e.rp_id === 'rp-a.test').length, 1);
   const denies = policyEvents(audit, 'policy.deny').filter(e => e.rp_id === 'rp-b.test');

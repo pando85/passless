@@ -17,11 +17,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
  */
 async function startNotifyDouble(env, opts = {}) {
   const bin = ensureBuilt().notifyDouble;
-  const logFile = path.join(env.dirs.logs, 'notify.jsonl');
-  const readyFile = path.join(env.dirs.logs, 'notify.ready');
+  // A restart (stack.restartNotify) is a new instance with its own log and ready file: `notify.jsonl`, then
+  // `notify-2.jsonl`, ...
+  env.notifyInstances = (env.notifyInstances || 0) + 1;
+  const suffix = env.notifyInstances === 1 ? '' : `-${env.notifyInstances}`;
+  const logFile = path.join(env.dirs.logs, `notify${suffix}.jsonl`);
+  const readyFile = path.join(env.dirs.logs, `notify${suffix}.ready`);
   const args = ['--log', logFile, '--ready-file', readyFile];
   for (const s of opts.script || ['ignore']) args.push('--script', s);
-  const stderrFile = path.join(env.dirs.logs, 'notify.stderr');
+  const stderrFile = path.join(env.dirs.logs, `notify${suffix}.stderr`);
   const err = fs.openSync(stderrFile, 'a');
   const child = env.spawnTracked(spawn, bin, args, { env: env.env, detached: true, stdio: ['ignore', 'ignore', err] });
   fs.closeSync(err);
@@ -51,7 +55,20 @@ async function startNotifyDouble(env, opts = {}) {
       while (Date.now() < end) { if (events().filter(e => e.event === 'Notify').length >= n) return true; await sleep(100); }
       return false;
     },
-    stop() { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ } },
+    /**
+     * SIGTERM the double and wait for it to exit (it releases `org.freedesktop.Notifications` on the way out), falling
+     * back to SIGKILL of its group. A new double started right after must not find the name still taken.
+     */
+    async stop(timeoutMs = 5000) {
+      if (exited) return;
+      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ }
+      const end = Date.now() + timeoutMs;
+      while (!exited && Date.now() < end) await sleep(50);
+      if (!exited) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ }
+        for (let i = 0; i < 40 && !exited; i++) await sleep(50);
+      }
+    },
   };
 }
 

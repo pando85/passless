@@ -37,6 +37,8 @@ function tomlValue(v) {
  * @param {string[]} [o.browserArgs]  extra browser flags (variant + TLS), put after the executable
  * @param {string} o.browserExe
  * @param {object} [o.limits]  `[agents.limits]` keys
+ * @param {object} [o.agents]  extra raw `[agents]` keys (`escalation_cooldown`, `escalation_timeout`, `state_dir`, ...)
+ * Per profile: `max_granted_rules`.
  */
 function renderConfig(env, o) {
   const user = os.userInfo().username;
@@ -51,6 +53,7 @@ function renderConfig(env, o) {
     b.push(`[agents.profiles.${name}]`);
     b.push(`mode = ${q(mode)}`, `principal_user = ${q(user)}`);
     b.push(`max_operations = ${p.max_operations || 16}`, `max_session_ttl = ${p.max_session_ttl || 300}`);
+    if (p.max_granted_rules !== undefined) b.push(`max_granted_rules = ${p.max_granted_rules}`);
     if (p.credential_selection) b.push(`credential_selection = ${q(p.credential_selection)}`);
     b.push(`browser_command = ${tomlValue([o.browserExe, ...(o.browserArgs || [])])}`);
     // Isolated profiles must not set browser_runtime_root; the daemon then uses $XDG_RUNTIME_DIR/passless/browser.
@@ -91,6 +94,9 @@ function renderConfig(env, o) {
   lines.push('[agents]', 'enabled = true', `audit_path = ${q(env.dirs.audit)}`);
   if (globalAck.length) lines.push(`acknowledge_global_same_user = ${tomlValue(globalAck)}`);
   if (sameUserRegisterAck.length) lines.push(`acknowledge_same_user_registration = ${tomlValue(sameUserRegisterAck)}`);
+  // Escalation keys (P7): `escalation_cooldown` (seconds; 1 is accepted by debug builds), `escalation_timeout` (seconds),
+  // `state_dir` (absolute; default `$XDG_STATE_HOME/passless/agent`, inside the temp root here).
+  for (const [k, v] of Object.entries(o.agents || {})) lines.push(`${k} = ${tomlValue(v)}`);
   // Request caps (plan R11), e.g. {max_requests_per_connection: 8}; omitted keys keep the daemon defaults.
   if (o.limits) {
     lines.push('', '[agents.limits]');
