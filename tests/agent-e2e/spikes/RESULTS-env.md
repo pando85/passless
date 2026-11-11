@@ -85,7 +85,9 @@ strace inside bwrap : zero /dev/hidraw openat calls
 - Chromium's own sandbox is still active inside bwrap, with no `--no-sandbox`: browser `NoNewPrivs=1`; renderers have a different
   user namespace and pid namespace than the browser, and renderer/utility processes show `Seccomp=2`. (The setuid chrome-sandbox is
   not used; the userns sandbox works nested inside bwrap's userns.)
-- Side effects: supplementary groups are dropped in bwrap (`groups=1000(agil),65534(nobody)`; `fido` is lost, which is fine), uid stays 1000.
+- Side effects: supplementary groups show as `groups=1000(agil),65534(nobody)` in bwrap, uid stays 1000. (Correction, P10a review: the
+  groups are not dropped; an unprivileged user namespace maps only the user's own GID and shows the others as the overflow GID 65534, but
+  they stay effective for permission checks.)
   `/sys/class/hidraw` remains visible but the device nodes do not exist, so opening fails or is never attempted.
 - Caveat: `--dev /dev` hides the host `/dev/shm`, so anything shared through `/dev/shm` with the host (for example a cargo target dir)
   is not visible inside. Add `--bind /dev/shm /dev/shm` only if required, which does not expose hidraw. Needs xvfb socket access

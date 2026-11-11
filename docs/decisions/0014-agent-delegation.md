@@ -353,9 +353,14 @@ on the filesystem and the UID:
   and Chrome for Testing are verified before they are supported under containment).
 - The private `/dev` is required, and the launcher refuses to start the browser without it, when
   the browser's UID could open any `/dev/hidraw*` (no `bwrap`, or no unprivileged user namespaces,
-  means refusal). The check is `faccessat(AT_EACCESS, R_OK | W_OK)` over every `/dev/hidraw*`, run
-  in the child that would exec the browser, after its credential drop, so it is evaluated as the
-  browser's UID and groups; whether `bwrap` works is probed as that user too. The browser is forked
+  means refusal). The check is `faccessat2(AT_EACCESS, R_OK | W_OK)` over every `/dev/hidraw*`
+  (ACLs count), run in the child that would exec the browser, after its credential drop, so it is
+  evaluated as the browser's UID and groups; the child lists `/dev` itself. It fails closed: an
+  unreadable `/dev`, a kernel without `faccessat2` or any error other than "cannot open" refuses the
+  launch. Whether `bwrap` works is probed as the browser's user too, and a `bwrap` whose binary or
+  any directory on its path another user could write is not used. Supplementary groups are not
+  dropped inside `bwrap`'s user namespace (they show as the overflow GID 65534 but stay effective),
+  which is why the private `/dev`, not the groups, keeps hidraw out. The browser is forked
   on a long-lived launcher thread: its parent-death signal, and `bwrap --die-with-parent`, follow
   the forking thread, so a browser forked on a request thread would die when the request returned.
 - In a distinct-UID deployment where the browser user cannot open any hidraw node, containment is
@@ -374,11 +379,19 @@ on the filesystem and the UID:
   loopback listener (socket tables and its own processes' descriptors) and read the WebSocket URL
   from DevTools' `/json/version`. Port mode already trusts the local environment (§4.3); the
   private `/dev` bounds what a request that bypasses the extension can reach.
+- The daemon's writes into a lease never follow a path the browser user controls (the runtime
+  root belongs to that user): the lease directory and the extension directory stay the daemon's,
+  every write goes through directory handles opened without following symlinks, files are created
+  exclusively (`O_EXCL | O_NOFOLLOW`) and rewritten by unlink and create, and only the profile is
+  handed to the browser user, after the daemon's writes into it and before the browser starts.
 
 `PASSLESS_INTERACTION_MODE=automatic` (PR #505) affects only the human CTAP path and never approves
 an escalation. Because it would let a request that reaches the native path be signed silently, the
 daemon refuses to start agents when it is set and any same-user profile has an `allow` or `request`
 rule, unless `agents.allow_automatic_human_path = true`. `passless doctor` flags the combination.
+Isolated and deny-only profiles do not trigger it: in a shared-UID deployment their managed browser
+still runs as the human's UID, and what keeps its native requests from the automatically approving
+human authenticator is the containment above, not this guard.
 
 For an `allow` decision the daemon sets UP=1 and UV=1 only after validating that:
 
@@ -758,6 +771,9 @@ notification bus: it uses the privilege-dropping child of §8.2, and `notify_use
 `principal_user` and `browser_user`. The containment of §7 is not required when the browser user
 cannot open any hidraw node, but is still applied when `bwrap` is available; `passless doctor`
 reports which case applies.
+A browser that runs as another user gets resource limits Chromium can live with (no
+address-space limit, 4096 processes for that user, 8192 descriptors, no core dumps); the
+principal's tighter defaults would stop Chromium from starting.
 
 - *Systemd baseline (enabled):* `ProtectHostname`, `ProtectClock`, `ProtectKernelLogs`,
   `LockPersonality`, `RestrictRealtime`, plus `ProtectKernelTunables`, `ProtectControlGroups`,
@@ -950,7 +966,7 @@ References are `file:line` at commit `130eaa5`.
 | Same-UID self-approval | Not documented | Planned (P11): documented residual risk; `notify_user` differs from every principal and browser user (§8.2, §13, §15) |
 | Supported browsers | **Done (P2):** a missing or unloadable extension is a launch error (`verify_extension_dir`; E2E-47, and E2E-47/unloadable since P10a). No browser detection yet. P10a verified Chromium 156, Playwright Chromium (Chrome for Testing 155) and Chrome for Testing 157, headed and `--headless=new`, under the private `/dev` (Chromium's own sandbox on, extension and proxy attach, incognito seed honoured) | Planned (P10b): Chromium and Chrome for Testing accepted; branded Chrome and `chrome-headless-shell` rejected; root-owned binaries only in distinct-UID deployments (§4.2) |
 | Incognito and CDP-created contexts | **Done (P10a).** The launcher seeds the fresh profile's `Default/Preferences` with `extensions.settings.<id>.incognito = true` for the manifest-key extension ID (`seed_incognito_access`, `browser.rs`); the worker reports `isAllowedIncognitoAccess()` in its hello; a worker that is attached but not allowed in incognito is not intercepting (`BearerReadiness::intercepting`, `transport/readiness.rs`), so the launch fails (`LaunchError::IncognitoNotAllowed`) and the bootstrap withholds the endpoint (E2E-45/cdp-context) | — |
-| Native-path containment | **Done (P10a)** for the launcher: the browser runs under `bwrap --dev-bind / / --dev /dev --die-with-parent` whenever `bwrap` works for the browser's user (`ContainmentPlan`, `containment.rs`; `/dev/shm` is bound through only when a path the browser needs lives there); otherwise the child refuses to exec when `faccessat(AT_EACCESS, R_OK \| W_OK)` finds an openable `/dev/hidraw*`, after the credential drop (`LaunchError::ContainmentRefused`); `containment::assess` reports the case. Port mode removes `DevToolsActivePort` after discovery. E2E-45, 46, 46/refused, 47 | Planned (P10b): `passless doctor --agents` reports the case (§7) |
+| Native-path containment | **Done (P10a)** for the launcher: the browser runs under `bwrap --dev-bind / / --dev /dev --die-with-parent` whenever `bwrap` works for the browser's user (`ContainmentPlan`, `containment.rs`; `/dev/shm` is bound through only when a path the browser needs lives there); otherwise the child refuses to exec when `faccessat2(AT_EACCESS, R_OK \| W_OK)` finds an openable `/dev/hidraw*`, or cannot tell, after the credential drop (`LaunchError::ContainmentRefused`; the child lists `/dev` with `getdents64`); `containment::assess` reports the case. Port mode removes `DevToolsActivePort` after discovery. Review fixes: daemon writes into lease and sign-socket directories go through pinned directory handles (`safe_fs.rs`; lease and extension directories stay the daemon's, only the profile is handed over), a distinct-UID browser gets Chromium-sized rlimits, and `bwrap` must live on a path no other user can write. E2E-45, 46, 46/refused, 47 | Planned (P10b): `passless doctor --agents` reports the case (§7) |
 | Automatic interaction mode with agents | **Done (P10a).** Agents refuse to start, and a reload is rejected, when `PASSLESS_INTERACTION_MODE=automatic` and a same-user profile has an `allow` or `request` rule, unless `agents.allow_automatic_human_path = true` (`AgentConfig::validate_human_path_interaction`); the human path stays up (E2E-44/startup-refusal) | Planned (P10b): `doctor` flags it (§7) |
 | Principal relationship | **Done (P9).** One `PrincipalRelationship` type (`deployment.rs`) derives `shared-uid` or `distinct-uid` from the principal UID against the daemon UID; audit records (`principal_relationship`, next to `mode`) and `passless doctor` (`deployment_axes` check per profile) use it. The shared-UID `isolated` warning is a passing `isolated_shared_uid` doctor check and a `warn` log line at daemon start. A shared-UID principal is no longer a fatal start-up check: only a root principal is (`principal_not_root`) | — |
 | User guides | Describe `confirm`, presets, `registration_allowed` | Planned (P11): rewrite when the code lands |

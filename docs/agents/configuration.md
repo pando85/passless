@@ -258,6 +258,10 @@ section 7). The daemon runs it under `bwrap` (bubblewrap) with a private `/dev` 
 user namespaces. Without it, a launch is refused when the browser's user can open any
 `/dev/hidraw*`: install bubblewrap, or set `browser_user` to a user that cannot open hidraw
 devices. Inside the private `/dev` the browser renders without the GPU (`/dev/dri` is hidden).
+A browser that runs as another user (`browser_user`, root daemon) gets no address-space limit,
+4096 processes for that user and 8192 descriptors. The runtime root belongs to the browser user;
+each lease directory inside it stays the daemon's, and only the browser profile is the browser
+user's.
 
 ## CDP exposure
 
