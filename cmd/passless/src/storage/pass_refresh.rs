@@ -173,11 +173,9 @@ impl CredentialStorage for PassStorageAdapter {
     }
 
     fn write(&mut self, cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
-        let implicit = self.sync.begin_implicit_operation();
+        // The guard ends the implicit operation on every exit, a panic included.
+        let implicit = self.sync.implicit_operation();
         if let Err(error) = self.prepare_for_access() {
-            if implicit {
-                self.sync.end_operation();
-            }
             return Err(soft_fido2::Error::from(error));
         }
 
@@ -186,19 +184,16 @@ impl CredentialStorage for PassStorageAdapter {
             self.sync.mark_dirty("Update Passless credential state.");
             self.record_current_generation();
         }
-        if implicit {
-            self.sync.end_operation();
+        if implicit.is_some() {
+            drop(implicit);
             self.record_current_generation();
         }
         result
     }
 
     fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
-        let implicit = self.sync.begin_implicit_operation();
+        let implicit = self.sync.implicit_operation();
         if let Err(error) = self.prepare_for_access() {
-            if implicit {
-                self.sync.end_operation();
-            }
             return Err(soft_fido2::Error::from(error));
         }
 
@@ -207,8 +202,8 @@ impl CredentialStorage for PassStorageAdapter {
             self.sync.mark_dirty("Update Passless credential state.");
             self.record_current_generation();
         }
-        if implicit {
-            self.sync.end_operation();
+        if implicit.is_some() {
+            drop(implicit);
             self.record_current_generation();
         }
         result

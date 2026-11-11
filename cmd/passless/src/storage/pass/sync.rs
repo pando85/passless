@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const PASS_GIT_SSH_AUTH_SOCK_ENV: &str = "PASSLESS_PASS_GIT_SSH_AUTH_SOCK";
 const SSH_AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
@@ -24,6 +24,19 @@ const PASS_GIT_SYNC_HELPER_BIN: &str = "passless-git-sync.exe";
 #[derive(Debug, Clone)]
 pub struct PassGitSync {
     state: Arc<Mutex<SyncState>>,
+}
+
+/// An implicit one-call operation (see [`PassGitSync::implicit_operation`]). Dropping it ends
+/// the operation, committing and pushing what the call marked dirty.
+#[derive(Debug)]
+pub struct ImplicitOperation {
+    sync: PassGitSync,
+}
+
+impl Drop for ImplicitOperation {
+    fn drop(&mut self) {
+        self.sync.end_operation();
+    }
 }
 
 #[derive(Debug)]
@@ -55,10 +68,7 @@ impl PassGitSync {
     /// Pull once during backend construction so the initial credential index
     /// and PIN state are loaded from the latest local/remote Git state.
     pub fn prepare_startup(&self) {
-        let Ok(state) = self.state.lock() else {
-            warn!("Failed to acquire pass Git sync lock during startup");
-            return;
-        };
+        let state = self.lock_state();
         if !state.enabled {
             return;
         }
@@ -70,10 +80,7 @@ impl PassGitSync {
     /// Begin a logical Passless operation. Network I/O is lazy and only occurs
     /// if this operation actually touches synchronized pass state.
     pub fn begin_operation(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            warn!("Failed to acquire pass Git sync lock while beginning operation");
-            return;
-        };
+        let mut state = self.lock_state();
         if !state.enabled {
             return;
         }
@@ -85,26 +92,38 @@ impl PassGitSync {
 
     /// Begin a one-storage-call transaction when code accesses pass storage
     /// outside the normal CTAP operation boundary (for example agent paths).
-    /// Returns true when the caller owns the implicit transaction and must end it.
-    pub fn begin_implicit_operation(&self) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            warn!("Failed to acquire pass Git sync lock for implicit operation");
-            return false;
-        };
+    /// Returns a guard when the caller owns the implicit transaction. The
+    /// transaction ends when the guard is dropped, including when the thread
+    /// unwinds, so a panic between the begin and the end cannot leave the depth
+    /// counter raised (which would stop Git sync for the process lifetime).
+    #[must_use = "the implicit operation ends when the guard is dropped"]
+    pub fn implicit_operation(&self) -> Option<ImplicitOperation> {
+        let mut state = self.lock_state();
         if !state.enabled || state.depth != 0 {
-            return false;
+            return None;
         }
         state.depth = 1;
         state.prepared = false;
-        true
+        drop(state);
+        Some(ImplicitOperation { sync: self.clone() })
+    }
+
+    /// Lock the coordinator's state, recovering a poisoned lock. The state is
+    /// plain data (a depth counter, flags and pending messages), and a panic
+    /// while it is held at worst leaves a stale `prepared` or `dirty` flag, a
+    /// retry that the next operation makes anyway. Ignoring a poisoned lock
+    /// instead would stop Git sync for the process lifetime.
+    fn lock_state(&self) -> MutexGuard<'_, SyncState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            warn!("pass Git sync lock was poisoned by a panicked thread; recovering");
+            self.state.clear_poison();
+            poisoned.into_inner()
+        })
     }
 
     /// Pull at most once for the active operation.
     pub fn prepare_if_needed(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            warn!("Failed to acquire pass Git sync lock while preparing operation");
-            return;
-        };
+        let mut state = self.lock_state();
         if !state.enabled || state.depth == 0 || state.prepared {
             return;
         }
@@ -118,10 +137,7 @@ impl PassGitSync {
 
     /// Mark a synchronized file change. Local-only state must never call this.
     pub fn mark_dirty(&self, message: impl Into<String>) {
-        let Ok(mut state) = self.state.lock() else {
-            warn!("Failed to acquire pass Git sync lock while marking dirty state");
-            return;
-        };
+        let mut state = self.lock_state();
         if !state.enabled {
             return;
         }
@@ -135,10 +151,7 @@ impl PassGitSync {
     /// Finish a logical operation. The outermost operation produces at most one
     /// Git commit (and optionally push), irrespective of how many writes occurred.
     pub fn end_operation(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            warn!("Failed to acquire pass Git sync lock while ending operation");
-            return;
-        };
+        let mut state = self.lock_state();
         if !state.enabled {
             return;
         }
@@ -186,13 +199,7 @@ impl PassGitSync {
     /// Add a machine-local path to the repository-local exclude file. This is
     /// intentionally not committed and therefore applies independently per clone.
     pub fn ensure_local_only_path(&self, path: &Path) {
-        let store_path = match self.state.lock() {
-            Ok(state) => state.store_path.clone(),
-            Err(_) => {
-                warn!("Failed to acquire pass Git sync lock while configuring local-only path");
-                return;
-            }
-        };
+        let store_path = self.lock_state().store_path.clone();
 
         let Ok(repo) = Repository::discover(&store_path) else {
             debug!("No Git repository found while configuring local-only pass state");
@@ -390,6 +397,63 @@ mod tests {
         assert_eq!(state.depth, 1);
         assert!(state.dirty);
         assert_eq!(state.messages, vec!["first"]);
+    }
+
+    #[test]
+    fn an_implicit_operation_ends_when_its_guard_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync = PassGitSync::new(temp.path().to_path_buf(), true, true);
+
+        let guard = sync
+            .implicit_operation()
+            .expect("owns the implicit operation");
+        assert_eq!(sync.state.lock().unwrap().depth, 1);
+        // Nested in an operation, a second implicit operation is not owned.
+        assert!(sync.implicit_operation().is_none());
+        drop(guard);
+        assert_eq!(sync.state.lock().unwrap().depth, 0);
+        assert!(sync.implicit_operation().is_some());
+    }
+
+    /// A panic between the begin and the end of an implicit operation must not leave the depth
+    /// raised: every later operation would nest inside it and none would ever finalize.
+    #[test]
+    fn a_panic_inside_an_implicit_operation_releases_the_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync = PassGitSync::new(temp.path().to_path_buf(), true, true);
+
+        let panicking = sync.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = panicking.implicit_operation().unwrap();
+            panic!("simulated panic in a storage write");
+        })
+        .join();
+        assert!(result.is_err());
+
+        assert_eq!(sync.state.lock().map_or(0, |state| state.depth), 0);
+        // The next implicit operation is owned again, so its commit is not blocked.
+        assert!(sync.implicit_operation().is_some());
+    }
+
+    /// A panic while the state lock is held poisons it. The coordinator recovers instead of
+    /// ignoring every later call.
+    #[test]
+    fn a_poisoned_state_lock_is_recovered() {
+        let temp = tempfile::tempdir().unwrap();
+        let sync = PassGitSync::new(temp.path().to_path_buf(), true, true);
+
+        let poisoner = sync.clone();
+        let _ = std::thread::spawn(move || {
+            let _state = poisoner.state.lock().unwrap();
+            panic!("simulated panic under the state lock");
+        })
+        .join();
+        assert!(sync.state.is_poisoned());
+
+        sync.begin_operation();
+        assert_eq!(sync.lock_state().depth, 1);
+        sync.end_operation();
+        assert_eq!(sync.lock_state().depth, 0);
     }
 
     #[test]
