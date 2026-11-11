@@ -2791,6 +2791,57 @@ mod tests {
     }
 
     #[test]
+    fn a_registration_that_fails_after_approval_persists_nothing() {
+        // The approval is given, then a reload revokes the operation between the reservation and
+        // key generation: no credential is created and no grant (registration or authenticate)
+        // reaches the store (ADR 0014 section 8.3, plan RG-05).
+        let f = make_fixture_with_config(register_request_config());
+        let ctx = f.make_ctx();
+        let handler = f.make_handler();
+        let req = f.make_req();
+        let runtime = f.policy_runtime.clone();
+        let profile_id = f.profile_id.clone();
+        let ceremony = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _hook = crate::agent::session::test_hooks::set_before_key_use(move || {
+                    let mut changed = register_request_config();
+                    changed.max_operations = 3;
+                    runtime
+                        .reload(&agent_config_for(&profile_id, changed))
+                        .unwrap();
+                });
+                handler.register(&ctx, &req)
+            })
+        };
+        f.prompter.approve(1);
+        let err = ceremony.join().unwrap().unwrap_err();
+        assert!(
+            matches!(err.code, ErrorCode::Unauthorized | ErrorCode::Forbidden),
+            "{err:?}"
+        );
+
+        assert_eq!(f.storage.lock().unwrap().count_credentials(), 0);
+        assert!(
+            f.store
+                .profile(&f.profile_id)
+                .is_none_or(|grants| grants.rules().is_empty()),
+            "no grant persisted after a failed registration"
+        );
+        assert!(
+            !escalation_kinds(&f).contains(&"granted_rule.add".to_string()),
+            "{:?}",
+            escalation_kinds(&f)
+        );
+        // `authenticate` is not upgraded either: it still escalates.
+        let auth =
+            f.policy_runtime
+                .resolve(&f.profile_id, &GrantAction::Authenticate, "example.com");
+        assert!(!auth.granted);
+        assert_eq!(auth.action, RuleAction::Request);
+    }
+
+    #[test]
     fn test_failed_registration_grant_write_keeps_the_credential() {
         use std::os::unix::fs::PermissionsExt;
 
