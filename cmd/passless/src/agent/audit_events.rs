@@ -648,6 +648,10 @@ pub enum RevokeReason {
     PrincipalExit,
     PolicyReload,
     DaemonShutdown,
+    /// A launch that failed after the lease was recorded (attach timeout, binding failure).
+    LaunchFailed,
+    /// A lease whose profile bookkeeping was stale, replaced by a new launch.
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

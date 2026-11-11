@@ -186,6 +186,26 @@ scenario({ id: 'E2E-32', title: 'audit content for allow, deny, escalation: ever
   }
 
   assert.equal(policyEvents(audit, 'policy.replay_served').length, 0, 'no duplicates in this scenario');
+
+  // --- Browser-lease records (ADR 0014 section 12): the launch is audited once, with the profile, before anything else
+  // of the lease; the browser's end is audited too (a crash here) and followed by its cleanup, one record each.
+  const leaseId = b.lease.lease_id;
+  assert.ok(leaseId, `the launch response names the lease: ${JSON.stringify(b.lease)}`);
+  const leaseRecords = (events, kind) => auditEvents(events).filter(e => e.kind === kind && e.lease_id === leaseId);
+  const launches = leaseRecords(audit, 'browser_lease.launch');
+  assert.equal(launches.length, 1, `one browser_lease.launch for the session's lease: ${kinds}`);
+  assert.equal(launches[0].profile_id, 'agent');
+  assert.equal(leaseRecords(audit, 'browser_lease.cleanup').length, 0, 'the lease is still live: no cleanup yet');
+  stack.env.killTree(b.lease.pid);
+  const ended = await waitFor('the lease teardown to be audited', async () => {
+    const events = await stack.daemon.audit();
+    return leaseRecords(events, 'browser_lease.cleanup').length ? events : null;
+  });
+  assert.equal(leaseRecords(ended, 'browser_lease.crash').length, 1, 'the browser exit is audited once');
+  assert.equal(leaseRecords(ended, 'browser_lease.cleanup').length, 1, 'the cleanup is audited once');
+  assert.equal(leaseRecords(ended, 'browser_lease.launch').length, 1, 'still exactly one launch record');
+  const order = auditEvents(ended).filter(e => e.lease_id === leaseId).map(e => e.kind);
+  assert.ok(order.indexOf('browser_lease.launch') < order.indexOf('browser_lease.crash') && order.indexOf('browser_lease.crash') < order.indexOf('browser_lease.cleanup'), `launch, crash, cleanup in order: ${order}`);
 });
 
 // Abort before key use: Chromium rejects the page's promise with AbortError, the worker sends `abort{id}` and the daemon cancels

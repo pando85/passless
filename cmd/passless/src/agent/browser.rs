@@ -1859,6 +1859,11 @@ impl BrowserProcessManager {
         self.leases.len()
     }
 
+    /// The ids of every lease the manager holds (live or not yet removed).
+    pub fn lease_ids(&self) -> Vec<BrowserLeaseId> {
+        self.leases.keys().cloned().collect()
+    }
+
     pub fn active_count(&self) -> usize {
         self.leases
             .values()

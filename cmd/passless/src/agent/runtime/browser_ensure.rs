@@ -9,6 +9,7 @@ use passless_core::agent::protocol::{
 use passless_core::agent::{BrowserLeaseId, BrowserScope, PrincipalSessionId, ProfileId};
 
 use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease};
+use crate::agent::audit_events::RevokeReason;
 use crate::agent::browser::{
     BrowserConfig, INTERCEPTION_ATTACH_TIMEOUT, InterceptionState, LeaseState,
 };
@@ -122,11 +123,7 @@ impl AgentRuntime {
                     ));
                 }
 
-                self.sign_registry.revoke_by_lease(lease_id.as_ref());
-                let _ = browser_manager.revoke(&lease_id);
-                let _ = browser_manager.terminate(&lease_id);
-                let _ = browser_manager.cleanup(&lease_id);
-                browser_manager.remove(&lease_id);
+                self.close_lease(&mut browser_manager, &lease_id, RevokeReason::Superseded);
                 profile
                     .shared_browsers
                     .lock()
@@ -176,11 +173,7 @@ impl AgentRuntime {
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
             // before allowing a replacement browser to be created.
-            self.sign_registry.revoke_by_lease(lease_id.as_ref());
-            let _ = browser_manager.revoke(&lease_id);
-            let _ = browser_manager.terminate(&lease_id);
-            let _ = browser_manager.cleanup(&lease_id);
-            browser_manager.remove(&lease_id);
+            self.close_lease(&mut browser_manager, &lease_id, RevokeReason::Superseded);
             profile
                 .active_browser
                 .lock()
@@ -305,6 +298,7 @@ impl AgentRuntime {
                 ));
             }
         };
+        self.audit_launch(&lease_id, profile_id, &config);
 
         let result = self.finish_principal_browser_launch(
             profile_id,
@@ -321,11 +315,7 @@ impl AgentRuntime {
         if result.is_err() {
             self.sign_registry.revoke(&bearer_token);
             self.sign_registry.revoke_registration(&bearer_token);
-            self.sign_registry.revoke_by_lease(lease_id.as_ref());
-            let _ = browser_manager.revoke(&lease_id);
-            let _ = browser_manager.terminate(&lease_id);
-            let _ = browser_manager.cleanup(&lease_id);
-            browser_manager.remove(&lease_id);
+            self.close_lease(&mut browser_manager, &lease_id, RevokeReason::LaunchFailed);
         }
         result
     }

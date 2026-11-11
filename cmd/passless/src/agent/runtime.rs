@@ -25,7 +25,7 @@ use passless_core::config::SecurityConfig;
 use super::audit::AuditGate;
 use super::audit_events::{
     BackendKind, DaemonStartBuilder, DaemonStopBuilder, FailReason, ProfileCreateBuilder,
-    ProfileFailBuilder, StopReason,
+    ProfileFailBuilder, RevokeReason, StopReason,
 };
 use super::backend::CredentialBackendHandle;
 use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
@@ -200,34 +200,44 @@ fn close_leases_by_id(
     sign_registry: &SignContextRegistry,
     browser_mgr: &mut BrowserProcessManager,
     lease_ids: &[String],
+    reason: RevokeReason,
 ) {
     for raw in lease_ids {
         if let Ok(lease_id) = raw.parse::<BrowserLeaseId>() {
-            close_lease_audited(audit_gate, sign_registry, browser_mgr, &lease_id);
+            close_lease_audited(audit_gate, sign_registry, browser_mgr, &lease_id, reason);
         }
     }
 }
 
-/// Revoke, terminate and clean up one lease and audit it: `browser.lease.revoke` (reason
-/// `policy_reload`, the reason a grant revocation shares with a reload), then the cleanup outcome.
-/// The audit gate is a terminal leaf, so it may be called under the browser manager.
+/// Revoke, terminate and clean up one lease and audit it (ADR 0014 section 12):
+/// `browser_lease.revoke` with `reason`, then `browser_lease.cleanup` (and `quarantine` when the
+/// cleanup found a problem). A lease that is already gone writes nothing, so each teardown is
+/// audited once however many paths race to it. The audit gate is a terminal leaf (LOCKING.md,
+/// rule 5), so it may be called under the browser manager.
 fn close_lease_audited(
     audit_gate: &AuditGate,
     sign_registry: &SignContextRegistry,
     browser_mgr: &mut BrowserProcessManager,
     lease_id: &BrowserLeaseId,
+    reason: RevokeReason,
 ) {
     sign_registry.revoke_by_lease(lease_id.as_str());
     if browser_mgr.revoke(lease_id).is_ok() {
         let _ = audit_gate.record(
-            super::audit_events::BrowserLeaseRevokeBuilder::new(
-                lease_id.clone(),
-                super::audit_events::RevokeReason::PolicyReload,
-            )
-            .build(),
+            super::audit_events::BrowserLeaseRevokeBuilder::new(lease_id.clone(), reason).build(),
         );
     }
     let _ = browser_mgr.terminate(lease_id);
+    finish_lease_audited(audit_gate, browser_mgr, lease_id);
+}
+
+/// Clean up the directory of a lease and forget it, auditing `browser_lease.cleanup` (and
+/// `quarantine`). A lease the manager no longer holds is only forgotten: nothing was cleaned.
+fn finish_lease_audited(
+    audit_gate: &AuditGate,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+) {
     let quarantine = match browser_mgr.cleanup(lease_id) {
         Ok(super::browser::CleanupSafety::Clean) => None,
         Ok(super::browser::CleanupSafety::Quarantined { .. }) => {
@@ -251,6 +261,51 @@ fn close_lease_audited(
         );
     }
     browser_mgr.remove(lease_id);
+}
+
+/// How a lease ended without anyone revoking it.
+enum LeaseEnd {
+    /// The browser exited on its own (`browser_lease.crash`, with the exit code, -1 for a signal).
+    Crashed { exit_code: Option<i32> },
+    /// The login or session deadline passed (`browser_lease.expire`).
+    Expired,
+}
+
+/// Audit the end of a lease the runtime loop found dead (`browser_lease.crash` or `expire`), then
+/// clean it up and audit that. The loop finds each dead lease once: `check_exits` marks the child
+/// reaped and `check_expired` moves the lease out of the live states.
+fn retire_dead_lease_audited(
+    audit_gate: &AuditGate,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+    end: LeaseEnd,
+) {
+    let event = match end {
+        LeaseEnd::Crashed { exit_code } => super::audit_events::BrowserLeaseCrashBuilder::new(
+            lease_id.clone(),
+            exit_code.unwrap_or(-1),
+        )
+        .build(),
+        LeaseEnd::Expired => {
+            super::audit_events::BrowserLeaseExpireBuilder::new(lease_id.clone()).build()
+        }
+    };
+    let _ = audit_gate.record(event);
+    finish_lease_audited(audit_gate, browser_mgr, lease_id);
+}
+
+/// Audit `browser_lease.launch` for a lease that was spawned and recorded.
+fn audit_lease_launch(
+    audit_gate: &AuditGate,
+    lease_id: &BrowserLeaseId,
+    profile_id: &ProfileId,
+    cdp_expose: passless_core::agent::config::CdpExposeMode,
+) {
+    let _ = audit_gate.record(
+        super::audit_events::BrowserLeaseLaunchBuilder::new(lease_id.clone(), profile_id.clone())
+            .with_cdp_expose(cdp_expose.to_string())
+            .build(),
+    );
 }
 
 /// Re-read and validate the configuration file, check it can replace `current` without a restart,
@@ -1365,142 +1420,27 @@ impl AgentRuntime {
                 let exit_infos = browser_mgr.check_exits();
                 for info in &exit_infos {
                     self.revoke_sign_context_for_lease(&info.lease_id);
-                    let _ = self.audit_gate.record(
-                        super::audit_events::BrowserLeaseCrashBuilder::new(
-                            info.lease_id.clone(),
-                            info.exit_code.unwrap_or(-1),
-                        )
-                        .build(),
+                    self.forget_lease_in_profiles(&info.lease_id);
+                    retire_dead_lease_audited(
+                        &self.audit_gate,
+                        &mut browser_mgr,
+                        &info.lease_id,
+                        LeaseEnd::Crashed {
+                            exit_code: info.exit_code,
+                        },
                     );
-                    for profile in self.profiles.values() {
-                        let mut cleared = false;
-                        {
-                            let mut active = profile.active_browser.lock().unwrap();
-                            let before = active.len();
-                            active.retain(|_, lease| lease.lease_id != info.lease_id);
-                            cleared |= active.len() != before;
-                        }
-                        {
-                            let mut shared = profile.shared_browsers.lock().unwrap();
-                            if let Some(lease) = shared.get(&profile.profile_id)
-                                && lease.lease_id == info.lease_id
-                            {
-                                shared.remove(&profile.profile_id);
-                                cleared = true;
-                            }
-                        }
-                        if cleared {
-                            let cleanup_result = browser_mgr.cleanup(&info.lease_id);
-                            let _ = self.audit_gate.record(
-                                super::audit_events::BrowserLeaseCleanupBuilder::new(
-                                    info.lease_id.clone(),
-                                )
-                                .build(),
-                            );
-                            match cleanup_result {
-                                Ok(super::browser::CleanupSafety::Clean) => {}
-                                Ok(super::browser::CleanupSafety::Quarantined {
-                                    ref reason,
-                                    ..
-                                }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            info.lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                    let _ = reason;
-                                }
-                                Ok(super::browser::CleanupSafety::Failed { .. }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            info.lease_id.clone(),
-                                            super::audit_events::QuarantineReason::ManifestTampered,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                                Err(_) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            info.lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                            }
-                            browser_mgr.remove(&info.lease_id);
-                        }
-                    }
                 }
                 self.report_interception_transitions(&mut browser_mgr);
                 let expired_leases = browser_mgr.check_expired();
                 for lease_id in &expired_leases {
                     self.revoke_sign_context_for_lease(lease_id);
-                    let _ = self.audit_gate.record(
-                        super::audit_events::BrowserLeaseExpireBuilder::new(lease_id.clone())
-                            .build(),
+                    self.forget_lease_in_profiles(lease_id);
+                    retire_dead_lease_audited(
+                        &self.audit_gate,
+                        &mut browser_mgr,
+                        lease_id,
+                        LeaseEnd::Expired,
                     );
-                    for profile in self.profiles.values() {
-                        let mut cleared = false;
-                        {
-                            let mut active = profile.active_browser.lock().unwrap();
-                            let before = active.len();
-                            active.retain(|_, lease| lease.lease_id != *lease_id);
-                            cleared |= active.len() != before;
-                        }
-                        {
-                            let mut shared = profile.shared_browsers.lock().unwrap();
-                            if let Some(lease) = shared.get(&profile.profile_id)
-                                && lease.lease_id == *lease_id
-                            {
-                                shared.remove(&profile.profile_id);
-                                cleared = true;
-                            }
-                        }
-                        if cleared {
-                            let cleanup_result = browser_mgr.cleanup(lease_id);
-                            let _ = self.audit_gate.record(
-                                super::audit_events::BrowserLeaseCleanupBuilder::new(
-                                    lease_id.clone(),
-                                )
-                                .build(),
-                            );
-                            match cleanup_result {
-                                Ok(super::browser::CleanupSafety::Clean) => {}
-                                Ok(super::browser::CleanupSafety::Quarantined { .. }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                                Ok(super::browser::CleanupSafety::Failed { .. }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            lease_id.clone(),
-                                            super::audit_events::QuarantineReason::ManifestTampered,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                                Err(_) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                            }
-                            browser_mgr.remove(lease_id);
-                        }
-                    }
                 }
             }
 
@@ -1680,29 +1620,25 @@ impl AgentRuntime {
                 if let Ok(mut active) = profile.active_browser.lock() {
                     active.retain(|_, other| other.lease_id != lease_id);
                 }
-                self.revoke_sign_context_for_lease(&lease_id);
                 let mut browser_mgr = super::lock_order::lock(
                     &self.browser_manager,
                     super::lock_order::LockLevel::BrowserManager,
                 );
-                let _ = browser_mgr.revoke(&lease_id);
-                let _ = browser_mgr.terminate(&lease_id);
-                let _ = browser_mgr.cleanup(&lease_id);
-                browser_mgr.remove(&lease_id);
+                self.close_lease(&mut browser_mgr, &lease_id, RevokeReason::PrincipalExit);
             }
             return;
         }
 
         if let Some(active) = active {
-            self.revoke_sign_context_for_lease(&active.lease_id);
             let mut browser_mgr = super::lock_order::lock(
                 &self.browser_manager,
                 super::lock_order::LockLevel::BrowserManager,
             );
-            let _ = browser_mgr.revoke(&active.lease_id);
-            let _ = browser_mgr.terminate(&active.lease_id);
-            let _ = browser_mgr.cleanup(&active.lease_id);
-            browser_mgr.remove(&active.lease_id);
+            self.close_lease(
+                &mut browser_mgr,
+                &active.lease_id,
+                RevokeReason::PrincipalExit,
+            );
         }
     }
 
@@ -1785,7 +1721,7 @@ impl AgentRuntime {
         let stale = self.sign_registry.revoke_stale_sessions(current_epoch);
         self.close_revoked_leases(&stale.lease_ids);
         for profile in self.profiles.values() {
-            self.cleanup_all_browsers_for_profile(profile);
+            self.cleanup_all_browsers_for_profile(profile, RevokeReason::PolicyReload);
         }
         stale.revoked
     }
@@ -1805,10 +1741,11 @@ impl AgentRuntime {
             &self.sign_registry,
             &mut browser_mgr,
             lease_ids,
+            RevokeReason::PolicyReload,
         );
     }
 
-    fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime) {
+    fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime, reason: RevokeReason) {
         let mut leases: Vec<BrowserLeaseId> = profile
             .active_browser
             .lock()
@@ -1835,11 +1772,7 @@ impl AgentRuntime {
             super::lock_order::LockLevel::BrowserManager,
         );
         for lease_id in leases {
-            self.revoke_sign_context_for_lease(&lease_id);
-            let _ = browser_mgr.revoke(&lease_id);
-            let _ = browser_mgr.terminate(&lease_id);
-            let _ = browser_mgr.cleanup(&lease_id);
-            browser_mgr.remove(&lease_id);
+            self.close_lease(&mut browser_mgr, &lease_id, reason);
         }
     }
 
@@ -1875,6 +1808,11 @@ impl AgentRuntime {
                 &self.browser_manager,
                 super::lock_order::LockLevel::BrowserManager,
             );
+            // Every lease still held (admin-launched ones live only here) is closed and audited
+            // before the stop record; `terminate_all` stays as the backstop.
+            for lease_id in browser_mgr.lease_ids() {
+                self.close_lease(&mut browser_mgr, &lease_id, RevokeReason::DaemonShutdown);
+            }
             browser_mgr.terminate_all();
         }
 
@@ -1884,6 +1822,49 @@ impl AgentRuntime {
         let _ = self.audit_gate.record(stop_event);
 
         info!("Agent runtime shutdown complete");
+    }
+
+    /// Drop `lease_id` from every profile's bookkeeping (a lease that ended on its own). Takes
+    /// only the short profile bookkeeping locks, which never nest with each other.
+    fn forget_lease_in_profiles(&self, lease_id: &BrowserLeaseId) {
+        for profile in self.profiles.values() {
+            if let Ok(mut active) = profile.active_browser.lock() {
+                active.retain(|_, lease| lease.lease_id != *lease_id);
+            }
+            if let Ok(mut shared) = profile.shared_browsers.lock()
+                && shared
+                    .get(&profile.profile_id)
+                    .is_some_and(|lease| lease.lease_id == *lease_id)
+            {
+                shared.remove(&profile.profile_id);
+            }
+        }
+    }
+
+    /// [`close_lease_audited`] with this runtime's audit gate and sign registry.
+    pub(super) fn close_lease(
+        &self,
+        browser_mgr: &mut BrowserProcessManager,
+        lease_id: &BrowserLeaseId,
+        reason: RevokeReason,
+    ) {
+        close_lease_audited(
+            &self.audit_gate,
+            &self.sign_registry,
+            browser_mgr,
+            lease_id,
+            reason,
+        );
+    }
+
+    /// [`audit_lease_launch`] with this runtime's audit gate.
+    pub(super) fn audit_launch(
+        &self,
+        lease_id: &BrowserLeaseId,
+        profile_id: &ProfileId,
+        config: &BrowserConfig,
+    ) {
+        audit_lease_launch(&self.audit_gate, lease_id, profile_id, config.cdp_expose);
     }
 
     fn revoke_sign_context_for_lease(&self, lease_id: &BrowserLeaseId) {
@@ -2959,7 +2940,7 @@ impl AgentRuntime {
 
         profile.enabled.store(false, Ordering::Release);
 
-        self.cleanup_all_browsers_for_profile(profile);
+        self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
 
         if let Some(session_slot) = self.managed_sessions.get(profile_id) {
             let mut sessions =
@@ -3393,7 +3374,7 @@ impl AgentRuntime {
         }
 
         for profile in self.profiles.values() {
-            self.cleanup_all_browsers_for_profile(profile);
+            self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
         }
 
         let revoke_event =
@@ -3657,7 +3638,7 @@ impl AgentRuntime {
             if profile.profile_id != details.profile_id {
                 continue;
             }
-            self.cleanup_all_browsers_for_profile(profile);
+            self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
         }
 
         Ok(AdminResponse::GrantRevoked)
@@ -3936,6 +3917,7 @@ impl AgentRuntime {
                 &self.sign_registry,
                 &mut browser_manager,
                 &stale.id,
+                RevokeReason::PolicyReload,
             );
         }
 
@@ -4025,6 +4007,7 @@ impl AgentRuntime {
                 ));
             }
         };
+        self.audit_launch(&lease_id, profile_id, &config);
 
         // The registration bearer lives and dies with the browser lease.
         if let Err(e) = self
@@ -4032,10 +4015,7 @@ impl AgentRuntime {
             .bind_registration_lease(&bearer_token, lease_id.to_string())
         {
             self.sign_registry.revoke_registration(&bearer_token);
-            let _ = browser_manager.revoke(&lease_id);
-            let _ = browser_manager.terminate(&lease_id);
-            let _ = browser_manager.cleanup(&lease_id);
-            browser_manager.remove(&lease_id);
+            self.close_lease(&mut browser_manager, &lease_id, RevokeReason::LaunchFailed);
             return Err(ProtocolError::new(
                 ErrorCode::Internal,
                 format!("failed to bind registration context to lease: {}", e),
@@ -4056,11 +4036,7 @@ impl AgentRuntime {
             Err(e) => {
                 warn!("browser launch for profile={} failed: {}", profile_id, e);
                 self.sign_registry.revoke_registration(&bearer_token);
-                self.sign_registry.revoke_by_lease(lease_id.as_ref());
-                let _ = browser_manager.revoke(&lease_id);
-                let _ = browser_manager.terminate(&lease_id);
-                let _ = browser_manager.cleanup(&lease_id);
-                browser_manager.remove(&lease_id);
+                self.close_lease(&mut browser_manager, &lease_id, RevokeReason::LaunchFailed);
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to launch browser: {}", e),
@@ -5280,6 +5256,19 @@ register = "deny"
         dir: &std::path::Path,
         profile: &ProfileId,
     ) -> (BrowserProcessManager, BrowserLeaseId) {
+        let (manager, lease_id, _clock) = launch_sleeping_lease_with_clock(dir, profile);
+        (manager, lease_id)
+    }
+
+    /// [`launch_sleeping_lease`] with the manager's mock clock, to move a lease past its deadline.
+    fn launch_sleeping_lease_with_clock(
+        dir: &std::path::Path,
+        profile: &ProfileId,
+    ) -> (
+        BrowserProcessManager,
+        BrowserLeaseId,
+        Arc<super::super::browser::MockClock>,
+    ) {
         use std::os::unix::fs::PermissionsExt;
 
         let root = dir.join("runtime-root");
@@ -5302,12 +5291,31 @@ register = "deny"
             cdp_port: 9222,
             bind_parent_death: true,
         };
+        let clock = Arc::new(super::super::browser::MockClock::new());
         let mut manager = BrowserProcessManager::with_spawner(
-            Arc::new(super::super::browser::MockClock::new()),
+            clock.clone(),
             Arc::new(super::super::browser::DirectExecSpawner),
         );
         let lease_id = manager.launch(&config, profile.clone()).unwrap();
-        (manager, lease_id)
+        (manager, lease_id, clock)
+    }
+
+    /// An audit gate over a fresh private directory.
+    fn lease_audit_gate(dir: &std::path::Path) -> (AuditGate, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let audit_dir = dir.join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (AuditGate::open(&audit_dir).unwrap(), audit_dir)
+    }
+
+    /// The audit records of `kind`, oldest first.
+    fn lease_records(audit_dir: &std::path::Path, kind: &str) -> Vec<serde_json::Value> {
+        super::super::audit::test_support::read_audit_events(audit_dir)
+            .into_iter()
+            .filter(|e| e["kind"].as_str() == Some(kind))
+            .collect()
     }
 
     fn process_alive(pid: u32) -> bool {
@@ -5369,7 +5377,13 @@ register = "deny"
         assert!(!registry.has_live_bearer_for_lease(lease_id.as_str()));
         assert!(manager.find_live_lease_for_profile(&profile).is_some());
 
-        close_leases_by_id(&audit_gate, &registry, &mut manager, &stale.lease_ids);
+        close_leases_by_id(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &stale.lease_ids,
+            RevokeReason::PolicyReload,
+        );
 
         assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
         assert!(manager.find_live_lease_for_profile(&profile).is_none());
@@ -5403,6 +5417,118 @@ register = "deny"
             &registry,
             &mut manager,
             &[lease_id.to_string(), "not-a-lease".to_string()],
+            RevokeReason::PolicyReload,
         );
+    }
+
+    #[test]
+    fn a_launched_lease_is_audited_once_with_its_profile_and_cdp_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let lease_id = BrowserLeaseId::new();
+
+        audit_lease_launch(&audit_gate, &lease_id, &profile, CdpExposeMode::Pipe);
+
+        let launches = lease_records(&audit_dir, "browser_lease.launch");
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        assert_eq!(launches[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(launches[0]["profile_id"].as_str(), Some("test-profile"));
+        assert_eq!(launches[0]["cdp_expose"].as_str(), Some("pipe"));
+    }
+
+    #[test]
+    fn closing_a_lease_audits_one_revoke_with_its_reason_and_one_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id) = launch_sleeping_lease(dir.path(), &profile);
+        let registry = SignContextRegistry::new();
+
+        close_lease_audited(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &lease_id,
+            RevokeReason::PrincipalExit,
+        );
+        // A second teardown path racing to the same lease writes nothing.
+        close_lease_audited(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &lease_id,
+            RevokeReason::PolicyReload,
+        );
+
+        let revokes = lease_records(&audit_dir, "browser_lease.revoke");
+        assert_eq!(revokes.len(), 1, "{revokes:?}");
+        assert_eq!(revokes[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(revokes[0]["reason"].as_str(), Some("principal_exit"));
+        let cleanups = lease_records(&audit_dir, "browser_lease.cleanup");
+        assert_eq!(cleanups.len(), 1, "{cleanups:?}");
+        assert_eq!(cleanups[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert!(manager.snapshot(&lease_id).is_none());
+    }
+
+    #[test]
+    fn a_crashed_lease_is_audited_once_with_its_exit_code_then_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id) = launch_sleeping_lease(dir.path(), &profile);
+        let pid = manager.snapshot(&lease_id).unwrap().pid;
+
+        // The browser dies on its own (a signal: no exit code).
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let started = Instant::now();
+        let exits = loop {
+            let exits = manager.check_exits();
+            if !exits.is_empty() {
+                break exits;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "exit not seen");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exits.len(), 1);
+        retire_dead_lease_audited(
+            &audit_gate,
+            &mut manager,
+            &exits[0].lease_id,
+            LeaseEnd::Crashed {
+                exit_code: exits[0].exit_code,
+            },
+        );
+
+        let crashes = lease_records(&audit_dir, "browser_lease.crash");
+        assert_eq!(crashes.len(), 1, "{crashes:?}");
+        assert_eq!(crashes[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(crashes[0]["exit_code"].as_i64(), Some(-1));
+        assert_eq!(lease_records(&audit_dir, "browser_lease.cleanup").len(), 1);
+        assert!(lease_records(&audit_dir, "browser_lease.revoke").is_empty());
+        assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
+        assert!(manager.check_exits().is_empty(), "a crash is seen once");
+    }
+
+    #[test]
+    fn an_expired_lease_is_audited_once_then_cleaned_up_even_when_only_the_manager_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id, clock) = launch_sleeping_lease_with_clock(dir.path(), &profile);
+
+        clock.advance(Duration::from_secs(301));
+        let expired = manager.check_expired();
+        assert_eq!(expired, vec![lease_id.clone()]);
+        for id in &expired {
+            retire_dead_lease_audited(&audit_gate, &mut manager, id, LeaseEnd::Expired);
+        }
+
+        let expires = lease_records(&audit_dir, "browser_lease.expire");
+        assert_eq!(expires.len(), 1, "{expires:?}");
+        assert_eq!(expires[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(lease_records(&audit_dir, "browser_lease.cleanup").len(), 1);
+        assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
+        assert!(manager.check_expired().is_empty(), "an expiry is seen once");
     }
 }
