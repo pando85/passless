@@ -797,7 +797,7 @@ pub(crate) fn probe_notification_server(address: &str) -> Result<String, String>
             )),
             Ok(ServerSupport::FallbackDialog) => Ok(format!(
                 "notification server {name} {version} has no `actions` capability; escalation \
-                 prompts use its fallback dialogs (Allow always / Deny buttons)"
+                 prompts use its fallback dialogs (Allow always or Register once, and Deny, as buttons)"
             )),
             Err(why) => Err(format!("{why} ({name} {version})")),
         }

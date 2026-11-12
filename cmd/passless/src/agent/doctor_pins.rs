@@ -367,7 +367,7 @@ fn isolated_extension(storage: &passless_core::agent::AgentStorageConfig) -> &'s
 }
 
 /// The offline `doctor --agents` checks: per profile, the pin, wildcard registration and advisory
-/// checks, each message prefixed with the profile. The stores are read through their path indexes
+/// checks, each named `<profile>: <check>`. The stores are read through their path indexes
 /// only. `grants` gives the stored granted rules of a profile.
 pub fn run(
     config: &AgentConfig,
@@ -393,7 +393,9 @@ pub fn run(
         };
         let stored = grants(name);
         for mut check in profile_checks(config, name, profile, stored.as_deref(), &view) {
-            check.message = format!("profile '{name}': {}", check.message);
+            // The profile goes into the name, as the browser checks do, so that a message that
+            // starts with `warning:` still prints as a warning.
+            check.name = format!("{name}: {}", check.name);
             checks.push(check);
         }
     }
@@ -826,7 +828,7 @@ principal_user = \"alice\"
     }
 
     #[test]
-    fn the_offline_run_prefixes_each_check_with_its_profile_and_reads_the_store() {
+    fn the_offline_run_names_each_check_after_its_profile_and_reads_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let rp_dir = dir.path().join("github.com");
         std::fs::create_dir_all(&rp_dir).unwrap();
@@ -850,18 +852,24 @@ principal_user = \"alice\"
         };
         let checks = run(&config, Some(&human), &|_| None);
         assert!(
-            checks
-                .iter()
-                .all(|c| c.message.starts_with("profile 'coding': ")),
+            checks.iter().all(|c| c.name.starts_with("coding: ")),
             "{checks:?}"
         );
-        let health = checks.iter().find(|c| c.name == "pin_health").unwrap();
+        let health = checks
+            .iter()
+            .find(|c| c.name == "coding: pin_health")
+            .unwrap();
         assert!(health.message.contains("not in the store"), "{health:?}");
-        assert!(checks.iter().any(|c| c.name == "pin_coverage"));
+        // A warning still prints as one.
+        assert_eq!(health.mark(), "warn");
+        assert!(checks.iter().any(|c| c.name == "coding: pin_coverage"));
 
         // Without a known store the pins are reported as not checked.
         let unknown = run(&config, None, &|_| None);
-        let health = unknown.iter().find(|c| c.name == "pin_health").unwrap();
+        let health = unknown
+            .iter()
+            .find(|c| c.name == "coding: pin_health")
+            .unwrap();
         assert!(health.message.contains("not checked"), "{health:?}");
     }
 }
