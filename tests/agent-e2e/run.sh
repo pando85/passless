@@ -108,7 +108,12 @@ CONF
     "XDG_STATE_HOME=$RUN_ROOT/state" "XDG_DATA_HOME=$RUN_ROOT/data" "XDG_DATA_DIRS=$RUN_ROOT/data" "XDG_CACHE_HOME=$RUN_ROOT/cache"
     "XDG_RUNTIME_DIR=$RUN_ROOT/run" "AGENT_E2E_REAL_BUS=${DBUS_SESSION_BUS_ADDRESS:-}" "${fwd[@]}")
 
-  inner=(env AGENT_E2E_PRIVATE_BUS=1 AGENT_E2E_INNER=1 timeout -k 20 "$limit" bash "$HERE/run.sh")
+  # The overall limit runs under a name of its own. A bare `timeout` is a process any `pkill -x timeout` (another shell,
+  # another agent session on this machine) matches: it forwards SIGTERM to the whole run's process group, and
+  # node:test then reports "Interrupted" and cancels every remaining scenario file (seen at E2E-20, 02:58:28).
+  mkdir -p "$RUN_ROOT/bin"
+  ln -s "$(command -v timeout)" "$RUN_ROOT/bin/agent-e2e-timeout"
+  inner=(env AGENT_E2E_PRIVATE_BUS=1 AGENT_E2E_INNER=1 "$RUN_ROOT/bin/agent-e2e-timeout" -k 20 "$limit" bash "$HERE/run.sh")
   if want_headed; then
     inner=(xvfb-run -a -s "-screen 0 1280x1024x24" "${inner[@]}")
   fi
