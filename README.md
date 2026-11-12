@@ -159,6 +159,9 @@ requires PIN verification for WebAuthn operations based on the configured enforc
 | Yes | `required` | `false` | PIN required |
 | Yes | `required` | `true` | PIN required |
 
+For OpenSSH `-sk` keys and `always_uv`, see
+[Client Compatibility](docs/CLIENT_COMPATIBILITY.md#openssh-security-keys--sk).
+
 ### Setting a PIN
 
 ```bash

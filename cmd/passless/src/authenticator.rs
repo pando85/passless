@@ -52,6 +52,134 @@ fn backup_state_for_export(
     Ok(CredentialBackupState::BackedUp)
 }
 
+const CTAP_GET_ASSERTION: u8 = 0x02;
+const CRED_PROTECT_UV_REQUIRED: u8 = 0x03;
+
+/// The parts of a GetAssertion request that decide whether it may be retried with built-in UV.
+struct GetAssertionUvView {
+    params: Vec<(ciborium::Value, ciborium::Value)>,
+    rp_id: String,
+    /// The credential IDs of the allowList.
+    allow_list: Vec<Vec<u8>>,
+}
+
+impl GetAssertionUvView {
+    /// Parse a GetAssertion request (parameters after the command byte) that soft-fido2 served
+    /// without any user verification: `up` true, `uv` not requested, no pinUvAuthParam, and an
+    /// allowList. Requests without an allowList are never retried (see
+    /// [`AuthenticatorService::protected_credential_uv`]).
+    ///
+    /// Only called after soft-fido2 accepted the request and answered CTAP2_ERR_NO_CREDENTIALS, so
+    /// its CTAP CBOR profile validation (duplicate keys, nesting depth, tags) has already passed.
+    /// The byte-exact round trip additionally guarantees the rewrite re-encodes this very request.
+    fn without_uv(params: &[u8]) -> Option<Self> {
+        use ciborium::Value;
+
+        let value: Value = ciborium::from_reader(params).ok()?;
+        let mut reencoded = Vec::with_capacity(params.len());
+        ciborium::into_writer(&value, &mut reencoded).ok()?;
+        if reencoded != params {
+            return None;
+        }
+        let Value::Map(params) = value else {
+            return None;
+        };
+
+        let field = |key: u8| {
+            params
+                .iter()
+                .find(|(k, _)| k.as_integer() == Some(key.into()))
+                .map(|(_, v)| v)
+        };
+        if field(6).is_some() {
+            return None;
+        }
+        if let Some(options) = field(5) {
+            for (key, value) in options.as_map()? {
+                match (key.as_text()?, value.as_bool()?) {
+                    ("up", false) | ("uv", true) | ("rk", _) => return None,
+                    _ => {}
+                }
+            }
+        }
+
+        let rp_id = field(1)?.as_text()?.to_string();
+        let allow_list = field(3)?
+            .as_array()?
+            .iter()
+            .map(|descriptor| {
+                descriptor
+                    .as_map()?
+                    .iter()
+                    .find(|(k, _)| k.as_text() == Some("id"))
+                    .and_then(|(_, id)| id.as_bytes().cloned())
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(Self {
+            params,
+            rp_id,
+            allow_list,
+        })
+    }
+
+    /// Re-encode the request with `"uv": true`, keeping CTAP canonical key order.
+    fn with_uv_requested(mut self) -> Option<Vec<u8>> {
+        use ciborium::Value;
+
+        // CTAP canonical (RFC 7049 section 3.9) order: shorter encoded keys first, then bytewise.
+        fn encoded(key: &Value) -> Option<(usize, Vec<u8>)> {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(key, &mut bytes).ok()?;
+            Some((bytes.len(), bytes))
+        }
+        fn insert_canonical(map: &mut Vec<(Value, Value)>, entry: (Value, Value)) -> Option<()> {
+            let key = encoded(&entry.0)?;
+            let mut position = map.len();
+            for (index, (existing, _)) in map.iter().enumerate() {
+                if encoded(existing)? > key {
+                    position = index;
+                    break;
+                }
+            }
+            map.insert(position, entry);
+            Some(())
+        }
+
+        let uv = (Value::Text("uv".to_string()), Value::Bool(true));
+        match self
+            .params
+            .iter_mut()
+            .find(|(k, _)| k.as_integer() == Some(5.into()))
+        {
+            Some((_, Value::Map(options))) => {
+                options.retain(|(key, _)| key.as_text() != Some("uv"));
+                insert_canonical(options, uv)?;
+            }
+            Some(_) => return None,
+            None => insert_canonical(
+                &mut self.params,
+                (Value::Integer(5.into()), Value::Map(vec![uv])),
+            )?,
+        }
+
+        let mut request = vec![CTAP_GET_ASSERTION];
+        ciborium::into_writer(&Value::Map(self.params), &mut request).ok()?;
+        Some(request)
+    }
+}
+
+/// What the human authenticator does after soft-fido2 answered CTAP2_ERR_NO_CREDENTIALS.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtectedCredentialUv {
+    /// Keep soft-fido2's response.
+    AsAnswered,
+    /// Retry with built-in UV (the verification prompt), as `alwaysUv` would.
+    BuiltIn(Vec<u8>),
+    /// A PIN is the only UV method: ask the platform for a pinUvAuthToken.
+    PinRequired,
+}
+
 /// Classification of UV retry count transitions for diagnostic logging
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UvRetryTransition {
@@ -183,8 +311,92 @@ impl<S: CredentialStorage, P: PinStorage> PasslessCallbacks<S, P> {
     }
 }
 
+/// Thread-local stand-in for the desktop prompts, so unit tests can drive full CTAP ceremonies
+/// on the human path without D-Bus and count the prompts the authenticator raised.
+#[cfg(test)]
+pub(crate) mod test_prompts {
+    use std::cell::Cell;
+
+    use soft_fido2::{UpResult, UvResult};
+
+    /// How the stand-in answers every prompt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Answer {
+        Accept,
+        Deny,
+        /// The prompt cannot be shown (for example no notification server).
+        Fail,
+    }
+
+    thread_local! {
+        static ANSWER: Cell<Option<Answer>> = const { Cell::new(None) };
+        static UP_PROMPTS: Cell<usize> = const { Cell::new(0) };
+        static UV_PROMPTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Answers every prompt on this thread while alive.
+    pub(crate) struct Prompts;
+
+    /// Accepts every prompt on this thread while alive.
+    pub(crate) struct AutoAccept;
+
+    impl AutoAccept {
+        pub(crate) fn install() -> Prompts {
+            Prompts::install(Answer::Accept)
+        }
+    }
+
+    impl Prompts {
+        pub(crate) fn install(answer: Answer) -> Self {
+            ANSWER.with(|current| current.set(Some(answer)));
+            UP_PROMPTS.with(|count| count.set(0));
+            UV_PROMPTS.with(|count| count.set(0));
+            Self
+        }
+
+        pub(crate) fn up_prompts(&self) -> usize {
+            UP_PROMPTS.with(Cell::get)
+        }
+
+        pub(crate) fn uv_prompts(&self) -> usize {
+            UV_PROMPTS.with(Cell::get)
+        }
+    }
+
+    impl Drop for Prompts {
+        fn drop(&mut self) {
+            ANSWER.with(|current| current.set(None));
+        }
+    }
+
+    pub(super) fn up_result() -> Option<soft_fido2::Result<UpResult>> {
+        let answer = ANSWER.with(Cell::get)?;
+        UP_PROMPTS.with(|count| count.set(count.get() + 1));
+        Some(match answer {
+            Answer::Accept => Ok(UpResult::Accepted),
+            Answer::Deny => Ok(UpResult::Denied),
+            Answer::Fail => Err(soft_fido2::Error::Other),
+        })
+    }
+
+    pub(super) fn uv_result() -> Option<soft_fido2::Result<UvResult>> {
+        let answer = ANSWER.with(Cell::get)?;
+        UV_PROMPTS.with(|count| count.set(count.get() + 1));
+        Some(match answer {
+            Answer::Accept => Ok(UvResult::AcceptedWithUp),
+            Answer::Deny => Ok(UvResult::Denied),
+            Answer::Fail => Err(soft_fido2::Error::Other),
+        })
+    }
+}
+
 impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCallbacks<S, P> {
     fn request_up(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UpResult> {
+        #[cfg(test)]
+        if let Some(result) = test_prompts::up_result() {
+            return result;
+        }
+
         // Check for E2E test mode (only available in debug builds)
         #[cfg(debug_assertions)]
         {
@@ -239,6 +451,11 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
     }
 
     fn request_uv(&self, info: &str, user: Option<&str>, rp: &str) -> Result<UvResult> {
+        #[cfg(test)]
+        if let Some(result) = test_prompts::uv_result() {
+            return result;
+        }
+
         #[cfg(debug_assertions)]
         {
             if std::env::var("PASSLESS_E2E_AUTO_ACCEPT_UV").is_ok() {
@@ -486,6 +703,8 @@ pub struct AuthenticatorService<
     pub storage: Arc<Mutex<S>>,
     /// Maximum UV retries (configured value)
     max_uv_retries: u8,
+    /// The configured `security.always_uv` (advertised as the `alwaysUv` option).
+    always_uv: bool,
     /// Runtime feature gate for credential export/import.
     credential_backup_enabled: bool,
     /// False for TPM and other non-exportable key providers.
@@ -619,6 +838,7 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             authenticator,
             storage,
             max_uv_retries: pin_config.max_uv_retries,
+            always_uv: security_config.always_uv,
             credential_backup_enabled: security_config.enable_credential_backup,
             credential_backup_supported: true,
             pending_backups: HashMap::new(),
@@ -751,6 +971,7 @@ impl<
             authenticator,
             storage,
             max_uv_retries: pin_config.max_uv_retries,
+            always_uv: security_config.always_uv,
             credential_backup_enabled: false,
             credential_backup_supported: false,
             pending_backups: HashMap::new(),
@@ -1103,6 +1324,111 @@ impl<
         }
     }
 
+    /// Decide what to do after soft-fido2 answered a GetAssertion with CTAP2_ERR_NO_CREDENTIALS.
+    ///
+    /// When MakeCredential performs UV and the client sent no credProtect extension, soft-fido2
+    /// stores credProtect level 3 (userVerificationRequired). `alwaysUv` makes every enrollment
+    /// do so, including a plain `ssh-keygen -t ed25519-sk` key, and release builds from v0.16.0
+    /// to v0.21.0 forced `alwaysUv` regardless of `security.always_uv`. Once
+    /// `always_uv = false` is honored, OpenSSH's `{"up": true}` assertion for such a key filters
+    /// it out and fails with CTAP2_ERR_NO_CREDENTIALS (issue #588).
+    ///
+    /// The retry only applies when all of these hold, so it never answers differently for an RP
+    /// the caller cannot already name a credential of:
+    /// - `always_uv = false`: with `alwaysUv`, soft-fido2 already performs UV (or asks for a PIN)
+    ///   before looking credentials up, and its answer stays untouched;
+    /// - the request asks for presence (`up` true), not `uv`, carries no pinUvAuthParam, and has
+    ///   an allowList, so the caller already holds the random credential IDs. OpenSSH always
+    ///   sends one; discoverable (no allowList) requests keep soft-fido2's answer, which is
+    ///   identical whether or not the RP has protected credentials;
+    /// - every allowList entry stored for this RP is at credProtect level 3 (entries that are not
+    ///   stored here cannot be served either: soft-fido2 already failed to unwrap them).
+    ///
+    /// Retrying with UV keeps credProtect enforced: the credential is only used after UV, as with
+    /// `alwaysUv`. With a PIN set, built-in UV is unavailable, so the platform is asked for a
+    /// pinUvAuthToken instead (OpenSSH then prompts for the PIN and retries).
+    fn protected_credential_uv(&self, params: &[u8]) -> ProtectedCredentialUv {
+        if self.always_uv {
+            return ProtectedCredentialUv::AsAnswered;
+        }
+        let Some(view) = GetAssertionUvView::without_uv(params) else {
+            return ProtectedCredentialUv::AsAnswered;
+        };
+
+        let cred_protects: Vec<u8> = {
+            let mut storage = lock_shared_storage(&self.storage);
+            view.allow_list
+                .iter()
+                .filter_map(|id| storage.read(id).ok())
+                .filter(|credential| credential.rp.id == view.rp_id)
+                .map(|credential| credential.extensions.cred_protect.unwrap_or(1))
+                .collect()
+        };
+        if cred_protects.is_empty()
+            || cred_protects
+                .iter()
+                .any(|cred_protect| *cred_protect != CRED_PROTECT_UV_REQUIRED)
+        {
+            return ProtectedCredentialUv::AsAnswered;
+        }
+
+        match self.authenticator.built_in_uv_state() {
+            Ok(BuiltInUvState::Configured) => {
+                info!(
+                    "GetAssertion for RP {}: the allowed credentials require user verification \
+                     (credProtect); retrying with built-in UV",
+                    view.rp_id
+                );
+                view.with_uv_requested().map_or(
+                    ProtectedCredentialUv::AsAnswered,
+                    ProtectedCredentialUv::BuiltIn,
+                )
+            }
+            Ok(BuiltInUvState::SupportedNotConfigured) => {
+                info!(
+                    "GetAssertion for RP {}: the allowed credentials require user verification \
+                     (credProtect); requesting a PIN/UV auth token",
+                    view.rp_id
+                );
+                ProtectedCredentialUv::PinRequired
+            }
+            _ => ProtectedCredentialUv::AsAnswered,
+        }
+    }
+
+    /// Serve a GetAssertion, retrying once with UV for credProtect-protected credentials.
+    ///
+    /// soft-fido2 always answers first, so its CTAP CBOR validation and every other error stays
+    /// authoritative; only a CTAP2_ERR_NO_CREDENTIALS answer can change. That first attempt has
+    /// no effect worth undoing: in soft-fido2-ctap 0.17.0 `get_assertion::handle`, a request with
+    /// `up` true, no `uv`, no pinUvAuthParam and `alwaysUv` off skips the alwaysUv (step 5) and
+    /// UV (step 7) blocks, then step 8 reads the allowed credentials and returns NO_CREDENTIALS
+    /// before the user-presence prompt (step 10), the sign counter update and signing (step 14).
+    /// It touches no UV retry counter and no PIN token; it only clears the GetNextAssertion state
+    /// (as any GetAssertion does, and the retry does again) and reads storage, whose cache holds
+    /// the same credentials the retry reads.
+    fn handle_get_assertion(
+        &mut self,
+        request: &[u8],
+        response_buffer: &mut Vec<u8>,
+    ) -> Result<usize> {
+        let answered = self.authenticator.handle(request, response_buffer)?;
+        if response_buffer.as_slice() != [StatusCode::NoCredentials as u8] {
+            return Ok(answered);
+        }
+
+        match self.protected_credential_uv(&request[1..]) {
+            ProtectedCredentialUv::AsAnswered => Ok(answered),
+            ProtectedCredentialUv::BuiltIn(with_uv) => {
+                self.authenticator.handle(&with_uv, response_buffer)
+            }
+            ProtectedCredentialUv::PinRequired => {
+                *response_buffer = vec![StatusCode::PuatRequired as u8];
+                Ok(response_buffer.len())
+            }
+        }
+    }
+
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         self.refresh_built_in_uv_state()?;
@@ -1189,7 +1515,11 @@ impl<
             return Ok(());
         }
 
-        let result = self.authenticator.handle(request, response_buffer);
+        let result = if request.first() == Some(&CTAP_GET_ASSERTION) {
+            self.handle_get_assertion(request, response_buffer)
+        } else {
+            self.authenticator.handle(request, response_buffer)
+        };
         if let Err(SoftFido2Error::CtapError(code)) = &result
             && *code == StatusCode::UvBlocked as u8
         {
@@ -2174,5 +2504,631 @@ mod tests {
 
         let reloaded = storage.read(&credential_id).expect("re-read credential");
         assert_eq!(reloaded.backup_state, CredentialBackupState::NotEligible);
+    }
+}
+
+/// Issue #588: credentials minted while `alwaysUv` was in effect (the default, and forced in
+/// v0.16.0 to v0.21.0 release builds regardless of `security.always_uv`) carry credProtect level 3
+/// without the client asking for it. An OpenSSH GetAssertion (`up` only, no `uv`, allowList with
+/// the key handle) must still sign with them after `always_uv = false`, without changing any other
+/// answer and without revealing which RPs hold protected credentials.
+#[cfg(test)]
+mod protected_credential_tests {
+    use super::test_prompts::{Answer, AutoAccept, Prompts};
+    use super::*;
+
+    use crate::storage::LocalStorageAdapter;
+
+    use soft_fido2_ctap::SecPinHash;
+
+    use ciborium::Value;
+    use sha2::{Digest, Sha256};
+
+    const SSH_RP_ID: &str = "ssh:";
+    const EMPTY_RP_ID: &str = "nothing.example";
+    const CLIENT_DATA_HASH: [u8; 32] = [0x5a; 32];
+    const UP_FLAG: u8 = 0x01;
+    const UV_FLAG: u8 = 0x04;
+
+    struct FixedPinStorage(PinState);
+
+    impl PinStorage for FixedPinStorage {
+        fn load_pin_state(&self) -> core::result::Result<PinState, StatusCode> {
+            Ok(self.0.clone())
+        }
+
+        fn save_pin_state(&self, _state: &PinState) -> core::result::Result<(), StatusCode> {
+            Ok(())
+        }
+
+        fn is_pin_configured(&self) -> core::result::Result<bool, StatusCode> {
+            Ok(self.0.pin_hash.is_some())
+        }
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Text(value.to_string())
+    }
+
+    fn int(value: i64) -> Value {
+        Value::Integer(value.into())
+    }
+
+    /// Encode a CTAP command; every map below is written in CTAP canonical key order.
+    fn command(code: u8, params: Vec<(Value, Value)>) -> Vec<u8> {
+        let mut request = vec![code];
+        ciborium::into_writer(&Value::Map(params), &mut request).expect("encode CTAP request");
+        request
+    }
+
+    /// OpenSSH `sk_enroll`. A plain `ssh-keygen -t {ed25519,ecdsa}-sk` sends no rk, no uv and no
+    /// credProtect extension; `-O resident` adds rk and credProtect 2.
+    fn enroll_request(alg: i64, cred_protect: Option<i64>) -> Vec<u8> {
+        let mut params = vec![
+            (int(1), Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+            (int(2), Value::Map(vec![(text("id"), text(SSH_RP_ID))])),
+            (
+                int(3),
+                Value::Map(vec![
+                    (text("id"), Value::Bytes(vec![0x42; 32])),
+                    (text("name"), text("openssh")),
+                ]),
+            ),
+            (
+                int(4),
+                Value::Array(vec![Value::Map(vec![
+                    (text("alg"), int(alg)),
+                    (text("type"), text("public-key")),
+                ])]),
+            ),
+        ];
+        if let Some(level) = cred_protect {
+            params.push((int(6), Value::Map(vec![(text("credProtect"), int(level))])));
+            params.push((int(7), Value::Map(vec![(text("rk"), Value::Bool(true))])));
+        }
+        command(0x01, params)
+    }
+
+    /// OpenSSH `sk_sign` for a key without verify-required: an allowList with the key handle and
+    /// `{"up": up}`, never `uv`.
+    fn sign_request(credential_ids: &[&[u8]], up: bool) -> Vec<u8> {
+        let allow_list = credential_ids
+            .iter()
+            .map(|id| {
+                Value::Map(vec![
+                    (text("id"), Value::Bytes(id.to_vec())),
+                    (text("type"), text("public-key")),
+                ])
+            })
+            .collect();
+        command(
+            0x02,
+            vec![
+                (int(1), text(SSH_RP_ID)),
+                (int(2), Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+                (int(3), Value::Array(allow_list)),
+                (int(5), Value::Map(vec![(text("up"), Value::Bool(up))])),
+            ],
+        )
+    }
+
+    fn ssh_sign_request(credential_id: &[u8], up: bool) -> Vec<u8> {
+        sign_request(&[credential_id], up)
+    }
+
+    /// A discoverable (no allowList) GetAssertion asking for presence only.
+    fn discoverable_request(rp_id: &str) -> Vec<u8> {
+        command(
+            0x02,
+            vec![
+                (int(1), text(rp_id)),
+                (int(2), Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+                (int(5), Value::Map(vec![(text("up"), Value::Bool(true))])),
+            ],
+        )
+    }
+
+    fn map_get<'a>(map: &'a Value, key: &Value) -> Option<&'a Value> {
+        map.as_map()?
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+    }
+
+    fn bytes_at(map: &Value, key: Value) -> Vec<u8> {
+        map_get(map, &key)
+            .and_then(Value::as_bytes)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing byte string {key:?}"))
+    }
+
+    fn decode_success(response: &[u8]) -> Value {
+        assert_eq!(
+            response.first(),
+            Some(&0x00),
+            "CTAP status 0x{:02x}",
+            response.first().copied().unwrap_or(0xff)
+        );
+        ciborium::from_reader(&response[1..]).expect("decode CTAP response")
+    }
+
+    fn respond<P: PinStorage + 'static>(
+        service: &mut AuthenticatorService<LocalStorageAdapter, P>,
+        request: &[u8],
+    ) -> Vec<u8> {
+        let mut response = Vec::new();
+        service
+            .handle(request, &mut response)
+            .expect("handle CTAP request");
+        response
+    }
+
+    /// soft-fido2's own answer, without the human service's protected-credential retry.
+    fn soft_fido2_answer<P: PinStorage + 'static>(
+        service: &mut AuthenticatorService<LocalStorageAdapter, P>,
+        request: &[u8],
+    ) -> Vec<u8> {
+        let mut response = Vec::new();
+        service
+            .authenticator
+            .handle(request, &mut response)
+            .expect("handle CTAP request");
+        response
+    }
+
+    struct Enrolled {
+        credential_id: Vec<u8>,
+        cose_key: Value,
+    }
+
+    fn enroll<P: PinStorage + 'static>(
+        service: &mut AuthenticatorService<LocalStorageAdapter, P>,
+        alg: i64,
+        cred_protect: Option<i64>,
+    ) -> Enrolled {
+        let attestation = decode_success(&respond(service, &enroll_request(alg, cred_protect)));
+        let auth_data = bytes_at(&attestation, int(2));
+        // rpIdHash (32) || flags (1) || signCount (4) || aaguid (16) || idLen (2) || id || key
+        let id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
+        let credential_id = auth_data[55..55 + id_len].to_vec();
+        let cose_key = ciborium::from_reader(&auth_data[55 + id_len..]).expect("COSE key");
+        Enrolled {
+            credential_id,
+            cose_key,
+        }
+    }
+
+    fn verify_signature(cose_key: &Value, signed: &[u8], signature: &[u8]) {
+        let alg = map_get(cose_key, &int(3))
+            .and_then(Value::as_integer)
+            .map(i64::try_from)
+            .and_then(core::result::Result::ok)
+            .expect("COSE alg");
+        let x = bytes_at(cose_key, int(-2));
+        match alg {
+            -8 => soft_fido2_crypto::eddsa::verify(&x, signed, signature)
+                .expect("Ed25519 assertion signature verifies"),
+            -7 => {
+                let mut sec1 = vec![0x04];
+                sec1.extend_from_slice(&x);
+                sec1.extend_from_slice(&bytes_at(cose_key, int(-3)));
+                soft_fido2_crypto::ecdsa::verify(&sec1, signed, signature)
+                    .expect("ES256 assertion signature verifies")
+            }
+            other => panic!("unexpected COSE alg {other}"),
+        }
+    }
+
+    /// Assert a successful assertion with exactly the given UP/UV flags; return its credential ID.
+    fn assert_signed(response: &[u8], cose_key: Option<&Value>, flags: u8) -> Vec<u8> {
+        let assertion = decode_success(response);
+        let auth_data = bytes_at(&assertion, int(2));
+        assert_eq!(auth_data[..32], Sha256::digest(SSH_RP_ID.as_bytes())[..]);
+        assert_eq!(auth_data[32] & (UP_FLAG | UV_FLAG), flags);
+        if let Some(cose_key) = cose_key {
+            let signed = [auth_data.as_slice(), CLIENT_DATA_HASH.as_slice()].concat();
+            verify_signature(cose_key, &signed, &bytes_at(&assertion, int(3)));
+        }
+        let credential = map_get(&assertion, &int(1)).expect("credential descriptor");
+        bytes_at(credential, text("id"))
+    }
+
+    fn security_config(always_uv: bool) -> SecurityConfig {
+        SecurityConfig {
+            always_uv,
+            ..Default::default()
+        }
+    }
+
+    fn service_without_pin(
+        storage: &Arc<Mutex<LocalStorageAdapter>>,
+        always_uv: bool,
+    ) -> AuthenticatorService<LocalStorageAdapter, ()> {
+        AuthenticatorService::<_, (), _>::with_shared_storage(
+            storage.clone(),
+            None,
+            security_config(always_uv),
+            PinConfig::default(),
+        )
+        .expect("create human authenticator service")
+    }
+
+    fn service_with_pin(
+        storage: &Arc<Mutex<LocalStorageAdapter>>,
+        always_uv: bool,
+    ) -> AuthenticatorService<LocalStorageAdapter, FixedPinStorage> {
+        let mut pin_state = PinState::new();
+        pin_state.pin_hash = Some(SecPinHash::new([0x42; 32]));
+        AuthenticatorService::with_shared_storage(
+            storage.clone(),
+            Some(Arc::new(Mutex::new(FixedPinStorage(pin_state)))),
+            security_config(always_uv),
+            PinConfig::default(),
+        )
+        .expect("create human authenticator service")
+    }
+
+    fn local_storage(dir: &tempfile::TempDir) -> Arc<Mutex<LocalStorageAdapter>> {
+        let path = dir.path().join("credentials");
+        std::fs::create_dir_all(&path).expect("create credential directory");
+        Arc::new(Mutex::new(
+            LocalStorageAdapter::new(path).expect("create credential storage"),
+        ))
+    }
+
+    fn stored(storage: &Arc<Mutex<LocalStorageAdapter>>, id: &[u8]) -> Credential {
+        lock_shared_storage(storage)
+            .read(id)
+            .expect("read stored credential")
+    }
+
+    /// Enroll the way v0.21.0 release builds did: user verification forced on MakeCredential.
+    fn enroll_with_forced_uv(storage: &Arc<Mutex<LocalStorageAdapter>>, alg: i64) -> Enrolled {
+        let prompts = AutoAccept::install();
+        let enrolled = enroll(&mut service_without_pin(storage, true), alg, None);
+        assert_eq!(prompts.uv_prompts(), 1, "enrollment performed built-in UV");
+        assert_eq!(
+            stored(storage, &enrolled.credential_id)
+                .extensions
+                .cred_protect,
+            Some(3),
+            "soft-fido2 defaults credProtect to userVerificationRequired after UV"
+        );
+        enrolled
+    }
+
+    /// Enroll with `always_uv = false` and no UV: credProtect level 1.
+    fn enroll_unprotected(storage: &Arc<Mutex<LocalStorageAdapter>>, alg: i64) -> Enrolled {
+        let prompts = AutoAccept::install();
+        let enrolled = enroll(&mut service_without_pin(storage, false), alg, None);
+        assert_eq!(prompts.uv_prompts(), 0);
+        assert_eq!(
+            stored(storage, &enrolled.credential_id)
+                .extensions
+                .cred_protect,
+            Some(1)
+        );
+        enrolled
+    }
+
+    #[test]
+    fn ssh_sign_with_protected_credential_after_always_uv_is_disabled() {
+        for alg in [-8, -7] {
+            let dir = tempfile::tempdir().expect("create temp directory");
+            let storage = local_storage(&dir);
+            let enrolled = enroll_with_forced_uv(&storage, alg);
+
+            // The daemon restarts with the user's `always_uv = false`.
+            let mut service = service_without_pin(&storage, false);
+            let prompts = AutoAccept::install();
+            let response = respond(
+                &mut service,
+                &ssh_sign_request(&enrolled.credential_id, true),
+            );
+            // The protected credential is used only after built-in UV.
+            assert_signed(&response, Some(&enrolled.cose_key), UP_FLAG | UV_FLAG);
+            assert_eq!(
+                prompts.uv_prompts(),
+                1,
+                "alg {alg}: one verification prompt"
+            );
+            assert_eq!(
+                prompts.up_prompts(),
+                0,
+                "alg {alg}: UV prompt also proves presence"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_or_failed_uv_fails_closed() {
+        for (answer, status) in [
+            (Answer::Deny, StatusCode::OperationDenied),
+            (Answer::Fail, StatusCode::Other),
+        ] {
+            let dir = tempfile::tempdir().expect("create temp directory");
+            let storage = local_storage(&dir);
+            let enrolled = enroll_with_forced_uv(&storage, -8);
+            let before = stored(&storage, &enrolled.credential_id).sign_count;
+
+            let mut service = service_without_pin(&storage, false);
+            let prompts = Prompts::install(answer);
+            let response = respond(
+                &mut service,
+                &ssh_sign_request(&enrolled.credential_id, true),
+            );
+            assert_eq!(response, vec![status as u8], "{answer:?}");
+            assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 1));
+            assert_eq!(stored(&storage, &enrolled.credential_id).sign_count, before);
+        }
+    }
+
+    #[test]
+    fn mixed_allow_list_stays_on_presence_only_path() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let protected = enroll_with_forced_uv(&storage, -7);
+        let plain = enroll_unprotected(&storage, -7);
+
+        let mut service = service_without_pin(&storage, false);
+        for ids in [
+            [
+                protected.credential_id.as_slice(),
+                plain.credential_id.as_slice(),
+            ],
+            [
+                plain.credential_id.as_slice(),
+                protected.credential_id.as_slice(),
+            ],
+        ] {
+            let prompts = AutoAccept::install();
+            let response = respond(&mut service, &sign_request(&ids, true));
+            let used = assert_signed(&response, Some(&plain.cose_key), UP_FLAG);
+            assert_eq!(used, plain.credential_id);
+            assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (1, 0));
+        }
+    }
+
+    #[test]
+    fn unprotected_credential_still_signs_with_presence_only() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let enrolled = enroll_unprotected(&storage, -8);
+
+        let mut service = service_without_pin(&storage, false);
+        let prompts = AutoAccept::install();
+        let response = respond(
+            &mut service,
+            &ssh_sign_request(&enrolled.credential_id, true),
+        );
+        assert_signed(&response, Some(&enrolled.cose_key), UP_FLAG);
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (1, 0));
+    }
+
+    #[test]
+    fn level_two_credential_keeps_soft_fido2_behaviour() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        // `ssh-keygen -O resident`: rk and credProtect 2 (userVerificationOptionalWithCredentialIDList).
+        let prompts = AutoAccept::install();
+        let enrolled = enroll(&mut service_without_pin(&storage, false), -8, Some(2));
+        drop(prompts);
+        assert_eq!(
+            stored(&storage, &enrolled.credential_id)
+                .extensions
+                .cred_protect,
+            Some(2)
+        );
+
+        let mut service = service_without_pin(&storage, false);
+        // With an allowList the credential is usable with presence only.
+        let prompts = AutoAccept::install();
+        let response = respond(
+            &mut service,
+            &ssh_sign_request(&enrolled.credential_id, true),
+        );
+        assert_signed(&response, Some(&enrolled.cose_key), UP_FLAG);
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (1, 0));
+
+        // Without an allowList it stays hidden, with no prompt and no retry.
+        let prompts = AutoAccept::install();
+        let request = discoverable_request(SSH_RP_ID);
+        assert_eq!(
+            respond(&mut service, &request),
+            vec![StatusCode::NoCredentials as u8]
+        );
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 0));
+    }
+
+    #[test]
+    fn silent_probe_of_protected_credential_does_not_prompt() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let enrolled = enroll_with_forced_uv(&storage, -8);
+
+        let mut service = service_without_pin(&storage, false);
+        let prompts = AutoAccept::install();
+        let response = respond(
+            &mut service,
+            &ssh_sign_request(&enrolled.credential_id, false),
+        );
+        assert_eq!(response, vec![StatusCode::NoCredentials as u8]);
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 0));
+    }
+
+    #[test]
+    fn protected_credential_with_pin_set_asks_the_client_for_the_pin() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let enrolled = enroll_with_forced_uv(&storage, -8);
+
+        let mut service = service_with_pin(&storage, false);
+        let prompts = AutoAccept::install();
+        // libfido2 maps 0x36 to FIDO_ERR_PIN_REQUIRED; OpenSSH then prompts for the PIN and
+        // retries with a pinUvAuthToken instead of failing with "invalid format".
+        assert_eq!(
+            respond(
+                &mut service,
+                &ssh_sign_request(&enrolled.credential_id, true)
+            ),
+            vec![StatusCode::PuatRequired as u8]
+        );
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 0));
+    }
+
+    #[test]
+    fn always_uv_keeps_soft_fido2_answer() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let enrolled = enroll_with_forced_uv(&storage, -8);
+        let request = ssh_sign_request(&enrolled.credential_id, true);
+
+        // PIN set and `always_uv = true`: soft-fido2's alwaysUv step answers before any lookup.
+        let mut service = service_with_pin(&storage, true);
+        let prompts = AutoAccept::install();
+        let expected = soft_fido2_answer(&mut service, &request);
+        assert_eq!(expected, vec![StatusCode::OperationDenied as u8]);
+        assert_eq!(respond(&mut service, &request), expected);
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 0));
+
+        // No PIN and `always_uv = true`: soft-fido2 itself performs built-in UV, once.
+        let mut service = service_without_pin(&storage, true);
+        let prompts = AutoAccept::install();
+        let response = respond(&mut service, &request);
+        assert_signed(&response, Some(&enrolled.cose_key), UP_FLAG | UV_FLAG);
+        assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 1));
+    }
+
+    /// No silent oracle: a discoverable request gets the same answer, and no prompt, whether or
+    /// not the RP holds protected credentials.
+    #[test]
+    fn discoverable_requests_do_not_reveal_protected_credentials() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        enroll_with_forced_uv(&storage, -7);
+
+        fn answers<P: PinStorage + 'static>(
+            service: &mut AuthenticatorService<LocalStorageAdapter, P>,
+            case: &str,
+        ) {
+            let prompts = AutoAccept::install();
+            let answers: Vec<_> = [SSH_RP_ID, EMPTY_RP_ID]
+                .iter()
+                .map(|rp_id| {
+                    let request = discoverable_request(rp_id);
+                    let response = respond(service, &request);
+                    assert_eq!(
+                        response,
+                        soft_fido2_answer(service, &request),
+                        "{case}: {rp_id}"
+                    );
+                    response
+                })
+                .collect();
+            assert_eq!(answers[0], answers[1], "{case}: protected vs empty RP");
+            assert_ne!(answers[0].first(), Some(&0x00), "{case}");
+            assert_eq!(
+                (prompts.up_prompts(), prompts.uv_prompts()),
+                (0, 0),
+                "{case}"
+            );
+        }
+
+        answers(
+            &mut service_with_pin(&storage, false),
+            "PIN, always_uv=false",
+        );
+        answers(&mut service_with_pin(&storage, true), "PIN, always_uv=true");
+        answers(
+            &mut service_without_pin(&storage, false),
+            "no PIN, always_uv=false",
+        );
+    }
+
+    #[test]
+    fn malformed_requests_keep_soft_fido2_answer() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let storage = local_storage(&dir);
+        let enrolled = enroll_with_forced_uv(&storage, -7);
+
+        // Duplicate top-level key 1, which soft-fido2's CTAP CBOR profile rejects.
+        let mut duplicate_key = ssh_sign_request(&enrolled.credential_id, true);
+        assert_eq!(duplicate_key[1], 0xa4);
+        duplicate_key[1] = 0xa5;
+        duplicate_key.extend_from_slice(&[0x01, 0x63, b'a', b'b', b'c']);
+        // A trailing item after the request map.
+        let mut trailing = ssh_sign_request(&enrolled.credential_id, true);
+        trailing.push(0x00);
+
+        for request in [duplicate_key, trailing] {
+            let mut with_pin = service_with_pin(&storage, false);
+            let mut without_pin = service_without_pin(&storage, false);
+            let prompts = AutoAccept::install();
+            let expected = soft_fido2_answer(&mut with_pin, &request);
+            assert_ne!(expected, vec![StatusCode::NoCredentials as u8]);
+            assert_eq!(respond(&mut with_pin, &request), expected);
+            assert_eq!(respond(&mut without_pin, &request), expected);
+            assert_eq!((prompts.up_prompts(), prompts.uv_prompts()), (0, 0));
+        }
+    }
+
+    #[test]
+    fn uv_upgrade_keeps_ctap_canonical_encoding() {
+        let id = vec![0x11; 16];
+        let request = ssh_sign_request(&id, true);
+        let view = GetAssertionUvView::without_uv(&request[1..]).expect("view");
+        assert_eq!(view.allow_list, vec![id.clone()]);
+        let upgraded = view.with_uv_requested().expect("upgrade");
+        let value: Value = ciborium::from_reader(&upgraded[1..]).expect("decode");
+        let options = map_get(&value, &int(5))
+            .and_then(Value::as_map)
+            .expect("options");
+        let keys: Vec<_> = options.iter().filter_map(|(k, _)| k.as_text()).collect();
+        assert_eq!(keys, ["up", "uv"]);
+
+        // Without an options map, key 5 goes before any negative key (encoded 0x20 and up).
+        let allow_list = Value::Array(vec![Value::Map(vec![
+            (text("id"), Value::Bytes(id.clone())),
+            (text("type"), text("public-key")),
+        ])]);
+        let request = command(
+            0x02,
+            vec![
+                (int(1), text(SSH_RP_ID)),
+                (int(2), Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+                (int(3), allow_list),
+                (int(-1), Value::Bool(true)),
+            ],
+        );
+        let view = GetAssertionUvView::without_uv(&request[1..]).expect("view");
+        let upgraded = view.with_uv_requested().expect("upgrade");
+        let value: Value = ciborium::from_reader(&upgraded[1..]).expect("decode");
+        let keys: Vec<i128> = value
+            .as_map()
+            .expect("map")
+            .iter()
+            .filter_map(|(k, _)| k.as_integer().map(i128::from))
+            .collect();
+        assert_eq!(keys, [1, 2, 3, 5, -1]);
+
+        // Requests that already involve UV, probe silently, or lack an allowList are not views.
+        let pin_auth = command(
+            0x02,
+            vec![
+                (int(1), text(SSH_RP_ID)),
+                (int(2), Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+                (int(6), Value::Bytes(vec![0; 32])),
+                (int(7), int(2)),
+            ],
+        );
+        assert!(GetAssertionUvView::without_uv(&pin_auth[1..]).is_none());
+        assert!(GetAssertionUvView::without_uv(&ssh_sign_request(&id, false)[1..]).is_none());
+        assert!(GetAssertionUvView::without_uv(&discoverable_request(SSH_RP_ID)[1..]).is_none());
+
+        // A non-canonical encoding (rpId key as a two-byte integer) is never re-encoded.
+        let mut non_canonical = request[1..].to_vec();
+        assert_eq!(non_canonical[1], 0x01);
+        non_canonical.splice(1..2, [0x18, 0x01]);
+        assert!(GetAssertionUvView::without_uv(&non_canonical).is_none());
     }
 }
