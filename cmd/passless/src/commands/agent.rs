@@ -234,8 +234,12 @@ fn dispatch_capabilities(output: OutputFormat, profile: &str) -> Result<()> {
                 println!("policy_generation: {}", authority.policy_generation);
                 println!("credential_selection: {}", authority.credentials.selection);
                 println!(
-                    "dynamic_credential_scope: {}",
-                    authority.credentials.dynamic_per_rp
+                    "credential_scope_exact_rules: {}",
+                    authority.credentials.exact_rules
+                );
+                println!(
+                    "credential_scope_wildcard: {}",
+                    authority.credentials.wildcard.as_deref().unwrap_or("none")
                 );
                 println!(
                     "max_session_ttl_secs: {}",

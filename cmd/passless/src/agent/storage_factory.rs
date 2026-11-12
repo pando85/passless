@@ -630,6 +630,8 @@ mod tests {
         use passless_core::agent::AgentMode;
 
         let profile = AgentProfileConfig {
+            max_wildcard_registrations: None,
+            wildcard_registration_prompts_per_day: None,
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
@@ -671,6 +673,8 @@ mod tests {
         use passless_core::agent::AgentMode;
 
         let profile = AgentProfileConfig {
+            max_wildcard_registrations: None,
+            wildcard_registration_prompts_per_day: None,
             max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,

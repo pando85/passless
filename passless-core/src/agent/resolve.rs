@@ -1,6 +1,6 @@
-//! Rule resolution (ADR 0014 sections 6.2, 6.3 and 10.1).
+//! Rule resolution (ADR 0014 sections 6.2, 6.3 and 10.1, and its amendment section 4).
 //!
-//! The effective action for `(profile, rp_id, action)` is, in this order:
+//! The effective `authenticate` action for `(profile, rp_id)` is, in this order:
 //!
 //! 1. an exact rule with `deny` gives `deny`;
 //! 2. an exact rule with `allow` gives `allow`;
@@ -9,10 +9,21 @@
 //! 4. a wildcard rule with `allow` gives `allow`;
 //! 5. otherwise `deny`.
 //!
+//! The effective `register` action is, in this order:
+//!
+//! 1. an exact rule with `deny` gives `deny`;
+//! 2. an exact rule with `allow` gives `allow`;
+//! 3. an exact rule with `request` gives `request`;
+//! 4. a wildcard rule with `request` gives `request` (rule `*`); a wildcard `allow` (invalid
+//!    configuration) gives `deny`, as defence in depth;
+//! 5. otherwise `deny`.
+//!
 //! A rule is a single object per RP, so "exact decides, otherwise the wildcard decides" is the same
-//! ordering. The granted-rules store can only upgrade a `request` that still exists in the
-//! configuration: a grant whose rule was removed or set to `deny` is inert (never consulted).
-//! The wildcard never governs registration or `localhost`, and always selects with `single`.
+//! ordering: an RP with an exact rule never falls through to the wildcard. The granted-rules store
+//! can only upgrade an `authenticate` `request` that still exists in the configuration: a grant
+//! whose rule was removed or set to `deny` is inert (never consulted). Registration is never
+//! upgraded by a grant (one approval, one registration). The wildcard never governs `localhost`,
+//! and always selects with `single`.
 
 use super::config::{
     ANY_RP_ID, AgentRpRule, CredentialSelection, LOCALHOST_RP_ID, PolicyAction, RuleAction,
@@ -145,11 +156,16 @@ pub fn resolve_rules(
     let exact = rules
         .iter()
         .find(|rule| !rule.is_wildcard() && rule.rp_id.trim().eq_ignore_ascii_case(&normalized));
-    // The wildcard governs only same-user authentication, and never `localhost` (ADR 0014 6.1/6.3).
-    let wildcard = if action == PolicyAction::Authenticate && normalized != "localhost" {
-        rules.iter().find(|rule| rule.is_wildcard())
-    } else {
+    // The wildcard never governs `localhost` (ADR 0014 6.1/6.3). For registration it is consulted
+    // only when it says `request` (amendment section 4): a wildcard `allow` is invalid
+    // configuration and a wildcard `deny` is the default deny, so both resolve as no rule.
+    let wildcard = if normalized == LOCALHOST_RP_ID {
         None
+    } else {
+        rules.iter().find(|rule| {
+            rule.is_wildcard()
+                && (action == PolicyAction::Authenticate || rule.register == RuleAction::Request)
+        })
     };
 
     let (identity, rule) = match (exact, wildcard) {
@@ -550,10 +566,11 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_never_governs_register() {
-        // Validation forbids `register != deny` on the wildcard, but `resolve_rules` does not apply
-        // validation: a rule that slipped through must still never govern registration.
-        for register in [RuleAction::Allow, RuleAction::Request] {
+    fn wildcard_allow_never_governs_register() {
+        // Validation forbids `register = "allow"` on the wildcard, but `resolve_rules` does not
+        // apply validation: a rule that slipped through must still never permit registration
+        // (amendment section 4, step 4). A wildcard `deny` is the default deny.
+        for register in [RuleAction::Allow, RuleAction::Deny] {
             let rules = [rule("*", RuleAction::Allow, register)];
             let (matched, calls) = resolve_counting(
                 &rules,
@@ -576,6 +593,67 @@ mod tests {
         let matched = resolve_counting(&rules, PolicyAction::Register, "example.com", &[]).0;
         assert_eq!(matched.action, RuleAction::Request);
         assert_eq!(matched.rule, RuleIdentity::Exact("example.com".into()));
+    }
+
+    #[test]
+    fn wildcard_request_governs_register_at_unlisted_rps_only() {
+        let rules = [
+            rule("*", RuleAction::Request, RuleAction::Request),
+            rule("denied.example", RuleAction::Allow, RuleAction::Deny),
+            rule("allowed.example", RuleAction::Allow, RuleAction::Allow),
+            rule("asked.example", RuleAction::Allow, RuleAction::Request),
+        ];
+        let register = |rp: &str| resolve_counting(&rules, PolicyAction::Register, rp, &[rp]);
+
+        // Steps 1 to 3: the exact rule decides and the wildcard is never reached.
+        for (rp, expected) in [
+            ("denied.example", RuleAction::Deny),
+            ("allowed.example", RuleAction::Allow),
+            ("asked.example", RuleAction::Request),
+        ] {
+            let (matched, calls) = register(rp);
+            assert_eq!(matched.action, expected, "{rp}");
+            assert_eq!(matched.rule, RuleIdentity::Exact(rp.into()), "{rp}");
+            assert_eq!(calls, 0, "registration is never upgraded by a grant");
+        }
+
+        // Step 4: an unlisted RP resolves to the wildcard `request`, with `single` selection, and
+        // a grant for that RP (an earlier wildcard registration) never upgrades it.
+        let (matched, calls) = register("unlisted.example");
+        assert_eq!(matched.action, RuleAction::Request);
+        assert_eq!(matched.configured, RuleAction::Request);
+        assert_eq!(matched.rule, RuleIdentity::Wildcard);
+        assert_eq!(matched.audit_rule(), Some("*"));
+        assert_eq!(matched.selection, CredentialSelection::Single);
+        assert!(!matched.granted);
+        assert_eq!(calls, 0);
+
+        // A subdomain of an exact rule's RP is another RP: it goes through the wildcard.
+        assert_eq!(
+            register("sub.denied.example").0.rule,
+            RuleIdentity::Wildcard
+        );
+    }
+
+    #[test]
+    fn wildcard_never_governs_localhost_for_either_action() {
+        let rules = [rule("*", RuleAction::Request, RuleAction::Request)];
+        for action in [PolicyAction::Authenticate, PolicyAction::Register] {
+            for rp_id in ["localhost", "LOCALHOST", " localhost "] {
+                let (matched, calls) = resolve_counting(&rules, action, rp_id, &["localhost"]);
+                assert_eq!(matched.action, RuleAction::Deny, "{action:?} {rp_id:?}");
+                assert_eq!(matched.rule, RuleIdentity::None, "{action:?} {rp_id:?}");
+                assert_eq!(calls, 0);
+            }
+        }
+        // An exact `localhost` rule is the only way to register there.
+        let rules = [
+            rule("*", RuleAction::Request, RuleAction::Request),
+            rule("localhost", RuleAction::Allow, RuleAction::Request),
+        ];
+        let matched = resolve_counting(&rules, PolicyAction::Register, "localhost", &[]).0;
+        assert_eq!(matched.rule, RuleIdentity::Exact("localhost".into()));
+        assert_eq!(matched.action, RuleAction::Request);
     }
 
     #[test]

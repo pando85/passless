@@ -22,9 +22,13 @@ use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 ///   records carry `origin` and `rule`; `rule` is the matched rule everywhere (`exact` or `*`, as in
 ///   the granted-rules store), with `grant_source` on operation records; session grant records
 ///   carry `principal`, the RP scope and the TTL.
+/// - 4 (ADR 0014 amendment section 8, Phase 1): every operation record carries
+///   `credential_scope` (`pinned`, `discovered`, `registration_pinned`, or null before the
+///   candidate set was chosen), and `policy.deny` gains the reasons `wildcard_registration_cap`,
+///   `wildcard_registration_rate` and `wildcard_registration_cooldown`.
 ///
 /// Readers accept every version: fields added in a later version default when absent.
-pub const AUDIT_SCHEMA_VERSION: u32 = 3;
+pub const AUDIT_SCHEMA_VERSION: u32 = 4;
 
 /// ADR 0014 section 12: the fields every operation record carries. This is the single canonical
 /// list: `OperationRecord` serializes exactly these keys, and the field-presence tests check
@@ -49,6 +53,7 @@ const SECTION_12_OPERATION_FIELDS: &[&str] = &[
     "decision",
     "evidence_source",
     "credential_ref",
+    "credential_scope",
     "selection_rule",
     "backend",
     "key_provider",
@@ -1058,6 +1063,9 @@ impl OperationResult {
             | R::AllowCredentialsMismatch
             | R::EscalationUnavailable
             | R::EscalationCooldown
+            | R::WildcardRegistrationCap
+            | R::WildcardRegistrationRate
+            | R::WildcardRegistrationCooldown
             | R::GrantCapReached
             | R::GrantsUnavailable
             | R::EscalationDenied
@@ -1116,6 +1124,10 @@ pub struct OperationRecord {
     evidence_source: Option<String>,
     #[serde(default)]
     credential_ref: Option<CredentialRef>,
+    /// Where the candidate credentials came from (schema version 4); null before the candidate
+    /// set was chosen, and for registrations.
+    #[serde(default)]
+    credential_scope: Option<CredentialScope>,
     #[serde(default)]
     selection_rule: Option<String>,
     /// The storage backend the operation used (`local`, `pass` or `tpm`): the human backend's
@@ -1154,6 +1166,7 @@ impl OperationRecord {
             decision: None,
             evidence_source: None,
             credential_ref: None,
+            credential_scope: None,
             selection_rule: None,
             backend: None,
             key_provider: None,
@@ -1229,6 +1242,11 @@ impl OperationRecord {
         self
     }
 
+    pub fn credential_scope(mut self, scope: Option<CredentialScope>) -> Self {
+        self.credential_scope = scope;
+        self
+    }
+
     pub fn counters(mut self, before: Option<u32>, after: Option<u32>) -> Self {
         self.counter_before = before;
         self.counter_after = after;
@@ -1247,6 +1265,19 @@ impl OperationRecord {
         self.failure_class = failure;
         self
     }
+}
+
+/// Where an authentication's candidate credentials came from (ADR 0014 amendment section 2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialScope {
+    /// An exact rule with profile `credential_refs`: the pins plus registration-granted
+    /// credentials.
+    Pinned,
+    /// Every credential of the RP.
+    Discovered,
+    /// A `*` match at an RP where the agent registered: only those credentials.
+    RegistrationPinned,
 }
 
 /// The origin context of a ceremony record (ADR 0014 section 12). Every key is always written:
@@ -1389,6 +1420,16 @@ pub enum PolicyDenyReason {
     /// A duplicate's own ceremony deadline passed while it waited for the identical request that
     /// is still in flight (ADR 0014 section 9). Nothing was signed or created for the duplicate.
     JoinTimeout,
+    /// A registration through the `*` rule was refused without a prompt: the profile holds
+    /// `max_wildcard_registrations` wildcard registration grants (ADR 0014 amendment 2.2 item 4).
+    WildcardRegistrationCap,
+    /// A registration through the `*` rule was refused without a prompt: the profile showed
+    /// `wildcard_registration_prompts_per_day` such prompts in the last 24 hours (item 5).
+    WildcardRegistrationRate,
+    /// A registration through the `*` rule was refused without a prompt: a wildcard registration
+    /// escalation of the profile was denied, timed out or withdrawn too often recently, which
+    /// starts a profile-wide cooldown of `agents.escalation_cooldown` (item 6).
+    WildcardRegistrationCooldown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3608,8 +3649,8 @@ mod tests {
     #[test]
     fn test_schema_version_is_bumped_for_the_section_12_records() {
         assert_eq!(
-            AUDIT_SCHEMA_VERSION, 3,
-            "operation records changed shape in P8: the version must stay above 2"
+            AUDIT_SCHEMA_VERSION, 4,
+            "operation records gained `credential_scope` (ADR 0014 amendment section 8)"
         );
     }
 

@@ -366,10 +366,14 @@ impl AgentRuntime {
         );
         if let Ok(mut credential) = storage.read_first(CredentialFilter::None) {
             loop {
-                let rp_allowed = config
-                    .rp_ids
-                    .iter()
-                    .any(|rp| rp.eq_ignore_ascii_case(&credential.rp.id));
+                // A `*` scope covers every RP but `localhost` (ADR 0014 section 6.1).
+                let rp_allowed = config.rp_ids.iter().any(|rp| {
+                    rp.eq_ignore_ascii_case(&credential.rp.id)
+                        || (rp == passless_core::agent::config::ANY_RP_ID
+                            && !credential.rp.id.eq_ignore_ascii_case(
+                                passless_core::agent::config::LOCALHOST_RP_ID,
+                            ))
+                });
                 let credential_ref =
                     passless_core::agent::CredentialRef::with_default_domain(&credential.id);
                 let credential_allowed = profile_config
@@ -388,7 +392,16 @@ impl AgentRuntime {
         drop(storage);
 
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
+        // With a `*` rule the pins constrain exact-rule matches only and the sign path reads them
+        // from the live policy, so the grant is created even when no pinned credential is in the
+        // store; its credential list is for audit and `sessions show` only (ADR 0014 amendment
+        // 2.1). Without `*`, as before: pins with no stored credential create no grant.
+        let wildcard_scope = config
+            .rp_ids
+            .iter()
+            .any(|rp| rp == passless_core::agent::config::ANY_RP_ID);
+        let empty_credentials_allowed = dynamic_credential_scope || wildcard_scope;
+        if !config.rp_ids.is_empty() && (empty_credentials_allowed || !credential_refs.is_empty()) {
             let params = crate::agent::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id: session_id.clone(),
@@ -408,7 +421,7 @@ impl AgentRuntime {
             // The session grant is bounded by `max_session_ttl`, not `max_grant_ttl` (defect B5).
             let request_id = self
                 .policy_runtime
-                .admin_request_session_grant(params, dynamic_credential_scope)
+                .admin_request_session_grant(params, empty_credentials_allowed)
                 .map_err(|e| {
                     ProtocolError::new(
                         ErrorCode::Internal,

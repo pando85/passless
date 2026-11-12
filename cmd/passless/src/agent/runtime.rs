@@ -150,6 +150,7 @@ fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> Protocol
         GrantStoreError::InvalidRpId(_) => ErrorCode::BadRequest,
         GrantStoreError::Unavailable(_)
         | GrantStoreError::CapReached(_)
+        | GrantStoreError::WildcardCapReached(_)
         | GrantStoreError::Revoked => ErrorCode::Conflict,
         GrantStoreError::Io(_) => ErrorCode::Internal,
     };
@@ -2025,7 +2026,17 @@ impl AgentRuntime {
                 })
                 .collect(),
             credentials: AuthorityCredentialScope {
-                dynamic_per_rp: profile_config.credential_refs.is_none(),
+                // Profile pins constrain exact-rule matches only; `*` matches discover (ADR 0014
+                // amendment 2.1).
+                exact_rules: if profile_config.credential_refs.is_some() {
+                    passless_core::agent::protocol::AUTHORITY_SCOPE_PINNED
+                } else {
+                    passless_core::agent::protocol::AUTHORITY_SCOPE_DISCOVERED
+                }
+                .to_string(),
+                wildcard: rules.iter().any(|rule| rule.is_wildcard()).then(|| {
+                    passless_core::agent::protocol::AUTHORITY_SCOPE_DISCOVERED.to_string()
+                }),
                 configured_reference_count: profile_config
                     .credential_refs
                     .as_ref()
@@ -4221,10 +4232,14 @@ impl AgentRuntime {
         );
         if let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None) {
             loop {
-                let rp_allowed = config
-                    .rp_ids
-                    .iter()
-                    .any(|rp| rp.eq_ignore_ascii_case(&cred.rp.id));
+                // A `*` scope covers every RP but `localhost` (ADR 0014 section 6.1).
+                let rp_allowed = config.rp_ids.iter().any(|rp| {
+                    rp.eq_ignore_ascii_case(&cred.rp.id)
+                        || (rp == passless_core::agent::config::ANY_RP_ID
+                            && !cred.rp.id.eq_ignore_ascii_case(
+                                passless_core::agent::config::LOCALHOST_RP_ID,
+                            ))
+                });
                 let credential_ref =
                     passless_core::agent::CredentialRef::with_default_domain(&cred.id);
                 let credential_allowed = profile_config
@@ -4243,7 +4258,16 @@ impl AgentRuntime {
 
         drop(storage);
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
+        // With a `*` rule the pins constrain exact-rule matches only and the sign path reads them
+        // from the live policy, so the grant is created even when no pinned credential is in the
+        // store; its credential list is for audit and `sessions show` only (ADR 0014 amendment
+        // 2.1). Without `*`, as before: pins with no stored credential create no grant.
+        let wildcard_scope = config
+            .rp_ids
+            .iter()
+            .any(|rp| rp == passless_core::agent::config::ANY_RP_ID);
+        let empty_credentials_allowed = dynamic_credential_scope || wildcard_scope;
+        if !config.rp_ids.is_empty() && (empty_credentials_allowed || !credential_refs.is_empty()) {
             let session_id = passless_core::agent::PrincipalSessionId::new();
             let grant_params = super::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
@@ -4263,7 +4287,7 @@ impl AgentRuntime {
             };
             let grant_request = self
                 .policy_runtime
-                .admin_request_session_grant(grant_params, dynamic_credential_scope);
+                .admin_request_session_grant(grant_params, empty_credentials_allowed);
             match grant_request {
                 Ok(request_id) => {
                     match self

@@ -104,6 +104,22 @@ fn log_events(path: &PathBuf) -> Vec<Json> {
 
 #[test]
 fn reexecuted_binary_runs_the_prompt_child_with_only_the_bus_address() {
+    run_reexecuted_prompt(
+        "Passless: agent sign-in request",
+        ("allow_always", "Allow always"),
+    );
+}
+
+#[test]
+fn reexecuted_binary_shows_a_registration_prompt_with_register_once() {
+    // Protocol version 2 (ADR 0014 amendment section 5.4).
+    run_reexecuted_prompt(
+        "Passless: CREATE A NEW PASSKEY? (not a sign-in)",
+        ("register_once", "Register once"),
+    );
+}
+
+fn run_reexecuted_prompt(summary: &str, (approve, label): (&str, &str)) {
     let bus = PrivateBus::start();
     let log = bus.dir.path().join("notify.jsonl");
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -140,10 +156,10 @@ fn reexecuted_binary_runs_the_prompt_child_with_only_the_bus_address() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let request = json!({
-        "v": 1,
-        "summary": "Passless: agent sign-in request",
+        "v": 2,
+        "summary": summary,
         "body": "Site: example.com (any page under this site)",
-        "actions": [["allow_always", "Allow always"], ["deny", "Deny"]],
+        "actions": [[approve, label], ["deny", "Deny"]],
         "min_review_delay_ms": 1000,
     });
     writeln!(stdin, "{request}").unwrap();
@@ -182,8 +198,19 @@ fn reexecuted_binary_runs_the_prompt_child_with_only_the_bus_address() {
 
     let events = log_events(&log);
     let notify = events.iter().find(|e| e["event"] == "Notify").unwrap();
-    assert_eq!(notify["summary"], "Passless: agent sign-in request");
+    assert_eq!(notify["summary"], summary);
     assert_eq!(notify["expire_timeout"], 0);
+    let actions: Vec<&str> = notify["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert_eq!([actions[1], actions[3]], [label, "Deny"]);
+    let nonce = actions[0]
+        .strip_prefix(&format!("{approve}:"))
+        .expect("a nonced approving key");
+    assert_eq!(actions[2], format!("deny:{nonce}"));
     assert_eq!(notify["id"], shown["id"]);
     assert!(
         events

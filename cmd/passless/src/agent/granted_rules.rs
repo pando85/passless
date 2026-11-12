@@ -191,6 +191,9 @@ pub enum GrantStoreError {
     Unavailable(String),
     /// The profile holds `max_granted_rules` entries already.
     CapReached(usize),
+    /// The profile holds `max_wildcard_registrations` wildcard registration grants already
+    /// (ADR 0014 amendment section 2.2 item 4).
+    WildcardCapReached(usize),
     InvalidRpId(String),
     /// No matching granted rule.
     NotFound,
@@ -209,6 +212,11 @@ impl fmt::Display for GrantStoreError {
             Self::CapReached(max) => {
                 write!(f, "the profile already holds max_granted_rules ({})", max)
             }
+            Self::WildcardCapReached(max) => write!(
+                f,
+                "the profile already holds max_wildcard_registrations ({}) wildcard registration grants",
+                max
+            ),
             Self::InvalidRpId(e) => write!(f, "invalid RP ID: {}", e),
             Self::NotFound => write!(f, "no matching granted rule"),
             Self::Io(e) => write!(f, "granted-rules store write failed: {}", e),
@@ -419,9 +427,24 @@ impl GrantedRulesStore {
         &self,
         policy: &PolicyRuntime,
         profile: &ProfileId,
+        rule: GrantedRule,
+        max_rules: usize,
+        token: Option<RevokeToken>,
+    ) -> Result<AddOutcome, GrantStoreError> {
+        self.add_with_wildcard_cap(policy, profile, rule, max_rules, token, None)
+    }
+
+    /// [`Self::add_unless_revoked`], also refused with [`GrantStoreError::WildcardCapReached`]
+    /// when `wildcard_cap` is given and the profile already holds that many wildcard registration
+    /// grants ([`wildcard_registration_count`]), checked under the same writer as the write.
+    pub fn add_with_wildcard_cap(
+        &self,
+        policy: &PolicyRuntime,
+        profile: &ProfileId,
         mut rule: GrantedRule,
         max_rules: usize,
         token: Option<RevokeToken>,
+        wildcard_cap: Option<usize>,
     ) -> Result<AddOutcome, GrantStoreError> {
         let normalized =
             validate_rp_id(&rule.rp_id).map_err(|e| GrantStoreError::InvalidRpId(e.to_string()))?;
@@ -442,6 +465,11 @@ impl GrantedRulesStore {
             }
             if rules.len() >= max_rules {
                 return Err(GrantStoreError::CapReached(max_rules));
+            }
+            if let Some(cap) = wildcard_cap
+                && wildcard_registration_count(&rules) >= cap
+            {
+                return Err(GrantStoreError::WildcardCapReached(cap));
             }
             rules.push(rule);
             self.persist_and_swap(profile, rules)?;
@@ -630,6 +658,18 @@ impl GrantSource for GrantedRulesStore {
             .filter_map(|rule| rule.credential_ref.clone())
             .collect()
     }
+}
+
+/// How many of `rules` are wildcard registration grants: `kind = "registration"` with
+/// `rule = "*"`. This is what `max_wildcard_registrations` caps (ADR 0014 amendment section 2.2
+/// item 4); revoking such a grant frees a slot.
+pub fn wildcard_registration_count(rules: &[GrantedRule]) -> usize {
+    rules
+        .iter()
+        .filter(|rule| {
+            rule.kind == GrantKind::Registration && rule.rule == PermittingRule::Wildcard
+        })
+        .count()
 }
 
 fn store_path(dir: &Path, profile: &ProfileId) -> PathBuf {
