@@ -1400,7 +1400,7 @@ impl<
     ///
     /// soft-fido2 always answers first, so its CTAP CBOR validation and every other error stays
     /// authoritative; only a CTAP2_ERR_NO_CREDENTIALS answer can change. That first attempt has
-    /// no effect worth undoing: in soft-fido2-ctap 0.17.0 `get_assertion::handle`, a request with
+    /// no effect worth undoing: in soft-fido2-ctap's `get_assertion::handle`, a request with
     /// `up` true, no `uv`, no pinUvAuthParam and `alwaysUv` off skips the alwaysUv (step 5) and
     /// UV (step 7) blocks, then step 8 reads the allowed credentials and returns NO_CREDENTIALS
     /// before the user-presence prompt (step 10), the sign counter update and signing (step 14).
