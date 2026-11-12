@@ -19,7 +19,7 @@ repository = "https://github.com/pando85/passless"
 passless-core = { path = "./passless-core", version = "0.24.1" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.24.1" }
 
-soft-fido2 = "0.17.0"
+soft-fido2 = "0.18.0"
 soft-fido2-ctap = "0.17.0"
 soft-fido2-crypto = "0.17.0"
 soft-fido2-transport = "0.17.0"
