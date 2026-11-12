@@ -127,7 +127,7 @@ function installExitHandlers() {
 }
 
 const ENV_PASSTHROUGH = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS',
-  PRIVATE_BUS_MARKER, 'AGENT_E2E_REAL_BUS', 'CARGO_TARGET_DIR'];
+  PRIVATE_BUS_MARKER, 'AGENT_E2E_REAL_BUS', 'CARGO_TARGET_DIR', 'AGENT_E2E_NPX_MODULES'];
 
 /**
  * Create a hermetic environment. Returns an object with the temp `root`, the child env (`env`),

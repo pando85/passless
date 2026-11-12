@@ -267,8 +267,12 @@ async function startDaemon(env, o) {
       const dir = path.join(env.dirs.work, 'iso', profile, 'credentials');
       return walkFiles(dir).filter(f => f.endsWith('.bin')).map(f => path.relative(dir, f));
     },
-    async stop() {
-      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ }
+    /**
+     * Stop the daemon. SIGTERM (the default, what `systemctl stop` sends) ends it at once; SIGINT runs its graceful
+     * shutdown (leases closed and audited, `daemon.stop` recorded).
+     */
+    async stop(signal = 'SIGTERM') {
+      try { process.kill(-child.pid, signal); } catch { /* gone */ }
       for (let i = 0; i < 60 && !exited; i++) await sleep(100);
       env.killTree(child.pid);
     },

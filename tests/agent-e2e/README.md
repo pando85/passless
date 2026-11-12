@@ -129,7 +129,10 @@ check after the launch (profile key `cdpPort` sets the fixed port).
 E2E-34/35 (Playwright MCP, `--isolated`), 36 (chrome-devtools-mcp), 37 (`connectOverCDP(PASSLESS_CDP_URL)`) and 41 (refused
 browsers) run the real `passless agent mcp ...` / `agent browser` against the scenario's daemon (`lib/adapters.js`). `npx` is
 `bin/npx`, a stand-in that runs the copies `package.json` pins (`@playwright/mcp`, `chrome-devtools-mcp`), so no scenario needs
-the network. `agent browser` only works inside a principal session, so E2E-37 starts an agent as the product does
+the network. `AGENT_E2E_NPX_MODULES=<abs node_modules>` makes it run the copies installed there instead (another
+`@playwright/mcp` version: `npm install --prefix <dir> @playwright/mcp@<version>`). E2E-57 stops and restarts the scenario's
+daemon under a running `agent mcp playwright` (SIGTERM, then SIGINT for the graceful shutdown) and signs in again over the
+same MCP stdio session; `daemon.stop(signal)` takes the signal. `agent browser` only works inside a principal session, so E2E-37 starts an agent as the product does
 (`passless agent run -- /bin/bash <script>`). E2E-41 writes no `browser_command` (`noBrowserCommand`) and sets `agents.browser_path`
 to stand-ins for branded Chrome and `chrome-headless-shell` (and to the real ones when installed).
 

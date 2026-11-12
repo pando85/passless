@@ -16,8 +16,9 @@ const PIPE_RULES = [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }
 // only); in pipe mode run `passless agent browser` and drive the browser with `passless agent browser-control`".
 // - `agent mcp chrome-devtools` ensures the browser up front, so the adapter itself exits with the error on stderr;
 // - `agent mcp playwright` is lazy: the MCP server starts, and its first browser tool call fails because the bootstrap's
-//   discovery request is answered `503 {"class": "refused"}` (the bootstrap never repeats the daemon's text to the page-side
-//   client; the wrapper prints it on its stderr, which the MCP client keeps as the server's log).
+//   discovery points Playwright at its error endpoint, which answers `503` with the class (`refused`) and a fixed hint (the
+//   bootstrap never repeats the daemon's text to the page-side client; the wrapper prints it on its stderr, which the MCP
+//   client keeps as the server's log).
 // Then a positive control: the same profile is served by `agent browser` and browser-control, so the refusal is about the
 // endpoint, not the profile.
 // `pinsExpose: 'pipe'`: this scenario writes its own pipe-mode profile, whatever attach mode the run's axis selects.
@@ -57,11 +58,12 @@ scenario({
     assert.equal(nav.isError, true, `browser_navigate must fail: ${JSON.stringify(nav).slice(0, 400)}`);
     refusal = (nav.content || []).map(c => c.text || '').join('\n');
   } catch (e) { refusal = String(e.message || e); }
-  // Playwright reports only the bootstrap's `503` ("does not look like a DevTools server"): the bootstrap answers a refused launch
-  // with a class and a fixed hint, never the daemon's text. The full documented text goes to the wrapper's stderr, so the tool
-  // error alone does not say WHY but the MCP server's stderr does; the control below (a port-mode profile of the same daemon
-  // and adapter navigates fine) shows the refusal is specific to the pipe-mode profile.
+  // The tool error carries the bootstrap's `503` with the class and a fixed hint, never the daemon's text. The full documented
+  // text goes to the wrapper's stderr, so the tool error says that it was refused and the MCP server's stderr says why; the
+  // control below (a port-mode profile of the same daemon and adapter navigates fine) shows the refusal is specific to the
+  // pipe-mode profile.
   assert.match(refusal, /503/, `the discovery request was answered 503: ${refusal.slice(0, 400)}`);
+  assert.match(refusal, /managed browser unavailable \(refused\)/, `the tool error names the class: ${refusal.slice(0, 600)}`);
   const stderrOf = () => playwright.client.stderr;
   await waitFor('the wrapper to print the refusal on stderr', () => (documented.test(stderrOf()) ? true : null), { timeoutMs: 15000, intervalMs: 100 })
     .catch(() => {});
