@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.23.0](https://github.com/pando85/passless/tree/v0.23.0) - 2026-11-12
+
+### Added
+
+- Transparent Playwright MCP integration with agent mcp install and CDP ownership check (#582) ([821b41d](https://github.com/pando85/passless/commit/821b41d82d75a1d0710a6c40203366d9178296b8))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.251 (#574) ([6565cd4](https://github.com/pando85/passless/commit/6565cd4f44feb10847f6a4fdbb7ff16612d3e096))
+- deps: Update Rust crate psl to v2.1.252 (#581) ([c3572ff](https://github.com/pando85/passless/commit/c3572ff1c8ed45f26d6e1700b04aeaf95f19f8c3))
+
 ## [v0.22.0](https://github.com/pando85/passless/tree/v0.22.0) - 2026-11-12
 
 ### Added
