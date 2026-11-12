@@ -1098,6 +1098,25 @@ mod tests {
         );
     }
 
+    /// Waits until nothing listens on `port` any more, and returns the last holder seen.
+    ///
+    /// Dropping a `TcpListener` does not free the port while a forked child still has a copy of the
+    /// descriptor: the unit tests share one process with tests that spawn children, and a child
+    /// forked just before the drop keeps the socket listening until its `exec` closes it
+    /// (`CLOEXEC`). That is a window of a few milliseconds, longer on a loaded runner. A forked
+    /// child may also show up as the holder instead of this process, or vanish between the table
+    /// read and the descriptor scan, so only the free state is asserted against, after this wait.
+    fn wait_until_free(port: u16) -> Option<crate::agent::cdp_owner::PortHolder> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let holder = crate::agent::cdp_owner::port_holder(port);
+            if holder.is_none() || std::time::Instant::now() >= deadline {
+                return holder;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// A fixed CDP port held by another process is a warning that names the holder and the fix;
     /// a free one, or one held by a managed browser, is fine.
     #[test]
@@ -1111,35 +1130,25 @@ mod tests {
             warn.passed && warn.message.starts_with("warning:"),
             "{warn:?}"
         );
+        // The holder is this process, or a child forked while the listener was open, or only its
+        // UID when the descriptor table could not be read: never nobody.
+        assert!(
+            warn.message.contains(&holder.description)
+                && (holder.description.contains("pid ")
+                    || holder.description.starts_with("a process of uid ")),
+            "{warn:?}"
+        );
         assert!(
             warn.message
-                .contains(&format!("pid {}", std::process::id())),
+                .contains(&format!("browser_cdp_port {port} on 127.0.0.1")),
             "{warn:?}"
         );
         assert!(warn.message.contains("Remove browser_cdp_port"), "{warn:?}");
         let ours = cdp_port_check("coding", port, Some(&holder), true);
         assert!(!ours.message.starts_with("warning:"), "{ours:?}");
         drop(held);
-        // Another test may bind the freed ephemeral port at once: retry with fresh ports.
-        let freed = std::iter::once(port)
-            .chain((0..20).map(|_| {
-                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                probe.local_addr().unwrap().port()
-            }))
-            .find_map(|p| {
-                let free = cdp_port_check(
-                    "coding",
-                    p,
-                    crate::agent::cdp_owner::port_holder(p).as_ref(),
-                    false,
-                );
-                if free.passed && free.message.contains("is free") {
-                    Some(free)
-                } else {
-                    None
-                }
-            });
-        assert!(freed.is_some(), "a released port is reported free");
+        let free = cdp_port_check("coding", port, wait_until_free(port).as_ref(), false);
+        assert!(free.passed && free.message.contains("is free"), "{free:?}");
     }
 
     /// A fixed port gets one informational line; it passes (so it cannot make the status
@@ -1203,22 +1212,13 @@ mod tests {
 
         // A free port: the plain check plus the hint, no warning.
         drop(held);
-        // Another test may bind the freed ephemeral port at once: retry with fresh ports.
-        let free = std::iter::once(port)
-            .chain((0..20).map(|_| {
-                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                probe.local_addr().unwrap().port()
-            }))
-            .find_map(|p| {
-                let checks = fixed_port_checks("coding", &profile_with(Some(p)));
-                if checks.iter().all(|c| !c.message.starts_with("warning:")) {
-                    Some(checks)
-                } else {
-                    None
-                }
-            })
-            .expect("a released port is reported free");
+        assert!(wait_until_free(port).is_none(), "port {port} stayed held");
+        let free = fixed_port_checks("coding", &profile_with(Some(port)));
         assert_eq!(hinted(&free), 1, "{free:?}");
+        assert!(
+            free.iter().all(|c| !c.message.starts_with("warning:")),
+            "{free:?}"
+        );
         assert!(healthy(&free), "{free:?}");
     }
 
