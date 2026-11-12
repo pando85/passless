@@ -339,7 +339,7 @@ handle.wait_for_action(|action| {
 });
 ```
 
-The notification server is queried for capabilities (`prompt.rs:479-499`), and servers that only support default actions (notify-osd, mako, quickshell) are rejected. Only servers reporting `FullActions` capability are accepted.
+The notification server is queried for capabilities (`prompt.rs:479-499`), and servers that only support default actions (mako, quickshell) are rejected. notify-osd 1.0 is accepted because its fallback dialog delivers the distinct action keys; every prompt uses per-prompt nonced action keys (`allow_always:<nonce>`, `deny:<nonce>`), so its shared notification id 0 cannot misattribute an action (see ADR 0014 §8.2 and `docs/NOTIFICATIONS.md`). Other servers are accepted only if they report the `FullActions` capability.
 
 **The D-Bus notification protocol:**
 
