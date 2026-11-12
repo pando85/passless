@@ -429,6 +429,7 @@ fn test_client_cli_help() {
     assert!(subcommands.contains(&"list"));
     assert!(subcommands.contains(&"delete"));
     assert!(subcommands.contains(&"pin"));
+    assert!(subcommands.contains(&"set-cred-protect"));
 
     println!("✓ All client subcommands are registered:");
     for cmd in &subcommands {
@@ -1299,4 +1300,175 @@ fn test_pin_info_shows_correct_state() {
     // This is expected behavior - the UV enforcement is handled in passless callbacks
 
     println!("\n✅ Authenticator info shows correct PIN state!\n");
+}
+
+/// Run `passless client -D 0 ...` against the test authenticator.
+///
+/// The session bus is pointed at a path that does not exist, so no notification can reach the
+/// developer's real notification server, and `HOME` is a throwaway directory.
+fn run_client_cli(home: &std::path::Path, args: &[&str]) -> (String, String, bool) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_passless"))
+        .args(["client", "-D", "0"])
+        .args(args)
+        .env("HOME", home)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/nonexistent/passless-e2e-test-bus",
+        )
+        .env_remove("PASSLESS_CONFIG")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run passless client");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+/// `(credential_id, credProtect)` of every credential of `rp_id`, through `client list`.
+fn cli_levels(home: &std::path::Path, rp_id: &str) -> Vec<(String, Option<u64>)> {
+    let (stdout, stderr, ok) = run_client_cli(home, &["-o", "json", "list", "-d", rp_id]);
+    assert!(ok, "client list failed: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("list JSON");
+    json["relying_parties"][0]["credentials"]
+        .as_array()
+        .expect("credentials")
+        .iter()
+        .map(|c| {
+            (
+                c["credential_id"].as_str().expect("id").to_string(),
+                c["cred_protect"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore]
+fn test_client_set_cred_protect() {
+    println!("\n═══════════════════════════════════════");
+    println!("  TEST: Client set-cred-protect");
+    println!("═══════════════════════════════════════\n");
+
+    // `-D 0` selects the first FIDO device. Make sure the only one is the authenticator started
+    // below: refuse to run next to any other (for example the developer's real daemon).
+    let existing = TransportList::enumerate().map(|l| l.len()).unwrap_or(0);
+    assert_eq!(
+        existing, 0,
+        "refusing to run: another FIDO authenticator is present; this test must only ever \
+         talk to the instance it starts itself"
+    );
+
+    let mut harness = AuthenticatorHarness::with_local().expect("Failed to create harness");
+    harness.set_device_ids(0x5c0d, 0x0045);
+    harness.start().expect("Failed to start authenticator");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(
+        TransportList::enumerate().expect("enumerate").len(),
+        1,
+        "exactly the test authenticator must be present"
+    );
+
+    let home = tempfile::tempdir().expect("temp HOME");
+
+    let mut transport = connect_to_authenticator().expect("Failed to connect");
+    register_credential_with_rp(&mut transport, &[1, 1], "key-a", "ssh:").expect("register a");
+    register_credential_with_rp(&mut transport, &[2, 2], "key-b", "ssh:").expect("register b");
+    register_credential_with_rp(&mut transport, &[3, 3], "carol", "example.com")
+        .expect("register other RP");
+    transport.close();
+
+    let other_before = cli_levels(home.path(), "example.com");
+    assert_eq!(other_before.len(), 1);
+
+    // Lower every credential of the RP (this is the first command to a daemon that
+    // auto-accepts built-in user verification, so it needs no PIN).
+    let (stdout, stderr, ok) = run_client_cli(
+        home.path(),
+        &[
+            "-o",
+            "json",
+            "set-cred-protect",
+            "--rp",
+            "ssh:",
+            "--level",
+            "2",
+            "--yes",
+        ],
+    );
+    assert!(ok, "set-cred-protect failed: {stderr}\n{stdout}");
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("result JSON");
+    assert_eq!(result["rp_id"], "ssh:");
+    assert_eq!(result["credentials"].as_array().expect("array").len(), 2);
+    assert!(
+        cli_levels(home.path(), "ssh:")
+            .iter()
+            .all(|(_, level)| *level == Some(2))
+    );
+
+    // Lower again by credential ID: the response reports the previous level per credential.
+    let (target_id, _) = cli_levels(home.path(), "ssh:").remove(0);
+    let (stdout, stderr, ok) = run_client_cli(
+        home.path(),
+        &[
+            "-o",
+            "json",
+            "set-cred-protect",
+            "--id",
+            &target_id,
+            "--level",
+            "1",
+        ],
+    );
+    assert!(ok, "set-cred-protect --id failed: {stderr}\n{stdout}");
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("result JSON");
+    assert_eq!(result["credentials"][0]["previous_level"], 2);
+    assert_eq!(result["credentials"][0]["level"], 1);
+    assert_eq!(result["credentials"][0]["changed"], true);
+    let levels = cli_levels(home.path(), "ssh:");
+    assert!(
+        levels
+            .iter()
+            .any(|(id, level)| *id == target_id && *level == Some(1))
+    );
+    assert!(
+        levels
+            .iter()
+            .any(|(id, level)| *id != target_id && *level == Some(2))
+    );
+
+    // Raising works too.
+    let (stdout, stderr, ok) = run_client_cli(
+        home.path(),
+        &[
+            "-o",
+            "json",
+            "set-cred-protect",
+            "--rp",
+            "ssh:",
+            "--level",
+            "3",
+            "--yes",
+        ],
+    );
+    assert!(ok, "raising failed: {stderr}\n{stdout}");
+    assert!(
+        cli_levels(home.path(), "ssh:")
+            .iter()
+            .all(|(_, level)| *level == Some(3))
+    );
+
+    // The other RP was never touched.
+    assert_eq!(cli_levels(home.path(), "example.com"), other_before);
+
+    // An unknown credential fails and changes nothing.
+    let (_, stderr, ok) = run_client_cli(
+        home.path(),
+        &["set-cred-protect", "--id", &"ee".repeat(32), "--level", "1"],
+    );
+    assert!(!ok, "unknown credential must fail");
+    assert!(stderr.contains("not found"), "{stderr}");
+
+    println!("\n✅ set-cred-protect works end to end!\n");
 }
