@@ -24,7 +24,7 @@ scenario x variant table, and exits non-zero on any `FAIL` or `XPASS`.
 | `AGENT_E2E_EXPOSE` | the attach-mode axis (CDP exposure): `port`, `pipe` or `all`. Default `port` for ci (unchanged), `all` for full. See "Attach modes" |
 | `AGENT_E2E_FILTER` | scenario ids (`E2E-01,6`); overrides the CI selection. Also accepted as `run.sh` arguments |
 | `AGENT_E2E_ALLOW_SKIP=1` | a SKIP (missing browser, optional tool) no longer fails the run. Without it any SKIP, zero scenarios, or an unmatched filter id exits 1 |
-| `AGENT_E2E_TIMEOUT` | overall limit in seconds (default 900 ci, 14400 full) |
+| `AGENT_E2E_TIMEOUT` | overall limit in whole seconds (default 900 ci, 14400 full); exit 124 when it fires, whole run group stopped (TERM, then KILL after 20 s) |
 | `AGENT_E2E_OFFLINE=1` | never download browsers (a missing browser is a SKIP, i.e. a failure unless allowed) |
 | `AGENT_E2E_KEEP=1` | keep the temp root; `AGENT_E2E_DEBUG=1` extra logging |
 | `AGENT_E2E_PASSLESS_BIN`, `AGENT_E2E_NOTIFY_DOUBLE_BIN`, `AGENT_E2E_NO_BUILD=1` | use prebuilt binaries |
