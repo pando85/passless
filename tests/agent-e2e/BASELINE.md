@@ -1,5 +1,17 @@
 # E2E baseline
 
+## P12 (final gate), 2026-11-12
+
+Branch `feat/agent-delegation-adr-0014` at `602db70`. Debug build, `--features agent`.
+
+- Command: `make test-agent-e2e-full` (`AGENT_E2E_MATRIX=full`, chromium, pw-chromium and cft, headed and headless): 392 PASS
+  (65 on each of the 6 variants and the 2 smoke checks), 0 FAIL, 0 XFAIL, 0 XPASS, 0 SKIP, 6,980 s. `make test-agent-e2e`
+  (CI subset): PASS=46, nothing else.
+- E2E-52 and the optional-tool and browser scenarios E2E-36 to E2E-39, E2E-41 and E2E-42 pass on every variant; E2E-38 (browser-use 1.0.2) and E2E-39 (agent-browser 0.42.0) ran from the
+  harness cache (`target/agent-e2e-cache`) rather than SKIP-OPT.
+- The run exited 2 only because the hermeticity guard saw a write to `~/.cache/ms-playwright/b/` at 01:33:20 by an unrelated,
+  concurrently running Playwright MCP session outside the repo. No scenario failed.
+
 ## P7 (escalation), 2026-11-11
 
 Branch `feat/agent-delegation-adr-0014` at `ccf6c0c` (daemon escalation from `69b5700`, `262fb04`, `dd7da60`, `63153b8`; harness

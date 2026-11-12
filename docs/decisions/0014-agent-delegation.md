@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-11-10
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Implemented in P2 to P11; the two accepted residuals (unfocused-tab registration; the evaluated systemd directives) are marked as such in [Implementation status](#19-implementation-status), and the final verification gate (P12) is pending
+- **Implementation status:** Implemented on branch `feat/agent-delegation-adr-0014` (P2 to P12); the final verification gate (P12) passed at commit 602db70 on 2026-11-12. The two accepted residuals (unfocused-tab registration; the evaluated systemd directives) remain marked as such in [Implementation status](#19-implementation-status)
 - **Amended:** 2026-11-11, with maintainer-resolved decisions and the results of the browser and
   environment spikes (see [History](#20-history))
 
