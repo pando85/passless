@@ -6,6 +6,8 @@ use passless_core::{AppConfig, Args, Error, OutputFormat, Result};
 
 use crate::agent::doctor_agents;
 
+use super::config_check;
+
 /// Run the checks and print them. Exits 1 when a check fails, after printing.
 pub fn dispatch(args: &mut Args, agents: bool, output: OutputFormat) -> Result<()> {
     if !agents {
@@ -14,7 +16,8 @@ pub fn dispatch(args: &mut Args, agents: bool, output: OutputFormat) -> Result<(
         ));
     }
     let config = AppConfig::load(args)?;
-    let checks = doctor_agents::run(&config.agents);
+    let mut checks = doctor_agents::config_checks(config_check::check(&config));
+    checks.extend(doctor_agents::run(&config.agents));
     let report = DoctorResponse {
         healthy: checks.iter().all(|check| check.passed),
         checks,
@@ -39,13 +42,7 @@ pub fn dispatch(args: &mut Args, agents: bool, output: OutputFormat) -> Result<(
                 }
             );
             for check in &report.checks {
-                let mark = if !check.passed {
-                    "FAIL"
-                } else if check.message.starts_with("warning:") {
-                    "warn"
-                } else {
-                    "ok"
-                };
+                let mark = check.mark();
                 println!("  [{mark}] {}: {}", check.name, check.message);
             }
         }

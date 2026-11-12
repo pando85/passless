@@ -130,6 +130,28 @@ impl SocketProbe for FsSockets {
     }
 }
 
+/// The session bus address every unit test of this crate sees instead of the inherited one: no
+/// socket exists there, so nothing a test starts can reach a real session bus (and an empty
+/// address, which would fall back to `/run/user/<euid>/bus`, never happens).
+#[cfg(test)]
+pub(crate) const TEST_SESSION_BUS_ADDRESS: &str =
+    "unix:path=/nonexistent/passless-test-session-bus";
+
+/// The session bus address this process inherited, which the daemon's prompt child and
+/// `doctor --agents` use (ADR 0014 section 8.2). In unit tests it is always
+/// [`TEST_SESSION_BUS_ADDRESS`], never the developer's real session bus: a test that needs a bus
+/// starts a private one and passes its address explicitly.
+pub(crate) fn inherited_session_bus_address() -> Option<String> {
+    #[cfg(test)]
+    {
+        Some(TEST_SESSION_BUS_ADDRESS.to_string())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()
+    }
+}
+
 /// `/run/user/<uid>/bus`.
 pub fn user_bus_path(uid: u32) -> PathBuf {
     PathBuf::from(format!("/run/user/{}/bus", uid))
@@ -268,7 +290,7 @@ impl ProcessSpawner {
     pub fn new(notify_user: Option<String>) -> Self {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        let own_bus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        let own_bus_address = inherited_session_bus_address();
         Self::with_planner(
             PathBuf::from("/proc/self/exe"),
             vec![HIDDEN_ARG.to_string()],
@@ -868,6 +890,27 @@ mod tests {
         );
     }
 
+    /// The guard behind every test that builds a real `ProcessSpawner` or runs the doctor: the
+    /// inherited `DBUS_SESSION_BUS_ADDRESS` (the developer's real session bus) is never used.
+    #[test]
+    fn unit_tests_never_see_the_inherited_session_bus() {
+        assert_eq!(
+            inherited_session_bus_address().as_deref(),
+            Some(TEST_SESSION_BUS_ADDRESS)
+        );
+        let spawner = ProcessSpawner::new(None);
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            let plan = (spawner.planner)().unwrap();
+            assert_eq!(plan.bus_address, TEST_SESSION_BUS_ADDRESS);
+        }
+        assert!(
+            !std::path::Path::new("/nonexistent").exists(),
+            "the guard address must stay unreachable"
+        );
+    }
+
     #[test]
     fn user_daemon_keeps_its_user_and_bus() {
         let none = sockets(&[]);
@@ -1004,7 +1047,9 @@ mod dbus_tests {
 
     use futures_lite::StreamExt;
     use notify_double::server::{Config, NotificationDouble};
-    use notify_double::{LogWriter, OBJECT_PATH, Script, WELL_KNOWN_NAME};
+    use notify_double::{
+        Emulation, LogWriter, NOTIFY_OSD_CAPABILITIES, OBJECT_PATH, Script, WELL_KNOWN_NAME,
+    };
     use serde_json::Value as Json;
 
     use crate::agent::escalation::EscalationId;
@@ -1103,6 +1148,22 @@ mod dbus_tests {
 
     impl Double {
         fn start(bus: &PrivateBus, script: &str, capabilities: &[&str]) -> Self {
+            Self::start_as(bus, script, capabilities, Emulation::Spec)
+        }
+
+        /// notify-osd 1.0 as observed: no `actions` capability, a fallback dialog with id 0 for
+        /// every prompt, `ActionInvoked(0, key)` then `NotificationClosed(0, 3)` on a click, and
+        /// `CloseNotification` closes nothing.
+        fn start_notify_osd(bus: &PrivateBus, script: &str) -> Self {
+            Self::start_as(bus, script, NOTIFY_OSD_CAPABILITIES, Emulation::NotifyOsd)
+        }
+
+        fn start_as(
+            bus: &PrivateBus,
+            script: &str,
+            capabilities: &[&str],
+            emulation: Emulation,
+        ) -> Self {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -1116,6 +1177,7 @@ mod dbus_tests {
                 script: Script::parse_list(script).unwrap(),
                 capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
                 server_name: "notify-double".to_string(),
+                emulation,
             };
             let conn = runtime.block_on(async {
                 zbus::connection::Builder::address(bus.address.as_str())
@@ -1169,6 +1231,49 @@ mod dbus_tests {
                     let _ = conn.close().await;
                 });
             }
+        }
+
+        /// The action keys of the `n`th `Notify` (zero-based), waiting for it: `(allow, deny)`.
+        fn keys(&self, n: usize) -> (String, String) {
+            let start = Instant::now();
+            loop {
+                let notes: Vec<Json> = self
+                    .events()
+                    .into_iter()
+                    .filter(|e| e["event"] == "Notify")
+                    .collect();
+                if let Some(note) = notes.get(n) {
+                    let actions = note["actions"].as_array().unwrap();
+                    assert_eq!(actions.len(), 4, "{actions:?}");
+                    return (
+                        actions[0].as_str().unwrap().to_string(),
+                        actions[2].as_str().unwrap().to_string(),
+                    );
+                }
+                assert!(start.elapsed() < EVENT_WAIT, "no Notify #{n}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Emit a signal from the server's own connection, as the owner of the well-known name
+        /// (a click on a dialog the script does not drive, such as a stale one).
+        fn emit<B>(&self, member: &str, body: B)
+        where
+            B: serde::Serialize + zbus::zvariant::DynamicType,
+        {
+            let conn = self.conn.as_ref().expect("serving").clone();
+            self.runtime.block_on(async {
+                conn.emit_signal(
+                    None::<zbus::names::BusName<'_>>,
+                    OBJECT_PATH,
+                    WELL_KNOWN_NAME,
+                    member,
+                    &body,
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
         }
 
         /// Emit a signal from another connection on the bus (a spoofing peer).
@@ -1238,10 +1343,19 @@ mod dbus_tests {
                 .expect("no event from the prompt child")
         }
 
+        /// The next event, if one arrives within `wait`.
+        fn next_within(&self, wait: Duration) -> Option<ChildEvent> {
+            self.events.recv_timeout(wait).ok()
+        }
+
         fn shown(&self) -> u32 {
+            self.shown_by("notify-double")
+        }
+
+        fn shown_by(&self, expected: &str) -> u32 {
             match self.next() {
                 ChildEvent::Shown { id, server } => {
-                    assert_eq!(server, "notify-double");
+                    assert_eq!(server, expected);
                     id
                 }
                 other => panic!("expected shown, got {other:?}"),
@@ -1334,6 +1448,9 @@ mod dbus_tests {
         let double = Double::start(&bus, "deny:1500", &["actions", "body"]);
         let mut child = ChildHarness::start(&bus, 0);
         let id = child.shown();
+        // Even this prompt's exact key is ignored from a sender that is not the server.
+        let (allow, _) = double.keys(0);
+        double.spoof(&bus, "ActionInvoked", (id, allow.as_str()));
         double.spoof(&bus, "ActionInvoked", (id, ACTION_ALLOW_ALWAYS));
         double.spoof(&bus, "NotificationClosed", (id, 2u32));
         // The first event is the real server's deny, not the spoofed approval or close.
@@ -1447,6 +1564,120 @@ mod dbus_tests {
         assert_eq!(child.exit_code(), 0);
     }
 
+    fn decision(action: &str) -> ChildEvent {
+        ChildEvent::Decision {
+            action: action.to_string(),
+        }
+    }
+
+    #[test]
+    fn notify_osd_dialog_approves_and_denies_with_id_0() {
+        let bus = PrivateBus::start();
+        // Each click emits ActionInvoked(0, key) and then NotificationClosed(0, 3).
+        let double = Double::start_notify_osd(&bus, "approve:300,deny:300");
+        let mut child = ChildHarness::start(&bus, 100);
+        assert_eq!(child.shown_by("notify-osd"), 0);
+        assert_eq!(child.next(), decision(ACTION_ALLOW_ALWAYS));
+        assert_eq!(child.exit_code(), 0);
+
+        let mut child = ChildHarness::start(&bus, 100);
+        assert_eq!(child.shown_by("notify-osd"), 0);
+        assert_eq!(child.next(), decision(ACTION_DENY));
+        assert_eq!(child.exit_code(), 0);
+
+        let start = Instant::now();
+        loop {
+            let closes: Vec<Json> = double
+                .events()
+                .into_iter()
+                .filter(|e| e["event"] == "NotificationClosed")
+                .collect();
+            if closes.len() == 2 {
+                assert!(closes.iter().all(|c| c["id"] == 0 && c["reason"] == 3));
+                break;
+            }
+            assert!(start.elapsed() < EVENT_WAIT, "{:?}", double.kinds());
+            thread::sleep(Duration::from_millis(20));
+        }
+        let notes: Vec<Json> = double
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "Notify")
+            .collect();
+        assert!(notes.iter().all(|n| n["id"] == 0));
+        assert!(
+            !double.kinds().contains(&"CloseNotification".to_string()),
+            "the shared id 0 is never closed"
+        );
+    }
+
+    #[test]
+    fn notify_osd_concurrent_prompts_sharing_id_0_are_told_apart_by_key() {
+        let bus = PrivateBus::start();
+        let double = Double::start_notify_osd(&bus, "ignore");
+        let mut a = ChildHarness::start(&bus, 0);
+        assert_eq!(a.shown_by("notify-osd"), 0);
+        let mut b = ChildHarness::start(&bus, 0);
+        assert_eq!(b.shown_by("notify-osd"), 0);
+        let (a_allow, a_deny) = double.keys(0);
+        let (b_allow, b_deny) = double.keys(1);
+        assert_ne!(a_allow, b_allow);
+        assert_ne!(a_deny, b_deny);
+
+        // A's dialog is approved and closes with reason 3. B, under the same id 0, sees both
+        // signals from the real server and stays pending.
+        double.emit("ActionInvoked", (0u32, a_allow.as_str()));
+        double.emit("NotificationClosed", (0u32, 3u32));
+        assert_eq!(a.next(), decision(ACTION_ALLOW_ALWAYS));
+        assert_eq!(a.exit_code(), 0);
+        assert_eq!(b.next_within(Duration::from_millis(500)), None);
+
+        // A's keys are spent: clicking them again resolves nothing.
+        double.emit("ActionInvoked", (0u32, a_deny.as_str()));
+        assert_eq!(b.next_within(Duration::from_millis(300)), None);
+
+        double.emit("ActionInvoked", (0u32, b_deny.as_str()));
+        double.emit("NotificationClosed", (0u32, 3u32));
+        assert_eq!(b.next(), decision(ACTION_DENY));
+        assert_eq!(b.exit_code(), 0);
+    }
+
+    #[test]
+    fn notify_osd_child_ignores_a_spoofed_sender() {
+        let bus = PrivateBus::start();
+        let double = Double::start_notify_osd(&bus, "deny:1500");
+        let mut child = ChildHarness::start(&bus, 0);
+        assert_eq!(child.shown_by("notify-osd"), 0);
+        let (allow, _) = double.keys(0);
+        double.spoof(&bus, "ActionInvoked", (0u32, allow.as_str()));
+        double.spoof(&bus, "NotificationClosed", (0u32, 3u32));
+        assert_eq!(child.next(), decision(ACTION_DENY));
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    #[test]
+    fn doctor_classifies_notify_osd_as_ok_and_other_servers_without_actions_as_failed() {
+        use crate::agent::doctor_agents::probe_notification_server;
+
+        let bus = PrivateBus::start();
+        let _double = Double::start_notify_osd(&bus, "ignore");
+        let ok = probe_notification_server(&bus.address).unwrap();
+        assert!(
+            ok.contains("notify-osd 1.0") && ok.contains("fallback dialogs"),
+            "{ok}"
+        );
+
+        let bus = PrivateBus::start();
+        let _double = Double::start(&bus, "ignore", NOTIFY_OSD_CAPABILITIES);
+        let err = probe_notification_server(&bus.address).unwrap_err();
+        assert!(err.contains("does not support actions"), "{err}");
+
+        let bus = PrivateBus::start();
+        let _double = Double::start(&bus, "ignore", &["actions", "body"]);
+        let ok = probe_notification_server(&bus.address).unwrap();
+        assert!(ok.contains("supports actions"), "{ok}");
+    }
+
     /// Records the driver's reports.
     #[derive(Default)]
     struct RecordingSink {
@@ -1460,6 +1691,10 @@ mod dbus_tests {
     }
 
     impl RecordingSink {
+        fn now(&self) -> Vec<PromptEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
         fn wait_for(&self, count: usize) -> Vec<PromptEvent> {
             let start = Instant::now();
             loop {
@@ -1512,8 +1747,12 @@ mod dbus_tests {
     }
 
     fn ticket(seq: u64) -> PromptTicket {
+        ticket_in("work", seq)
+    }
+
+    fn ticket_in(profile: &str, seq: u64) -> PromptTicket {
         PromptTicket {
-            profile: ProfileId::new("work").unwrap(),
+            profile: ProfileId::new(profile).unwrap(),
             escalation_id: EscalationId::for_tests(&format!("esc-{seq}")),
             seq,
         }
@@ -1533,9 +1772,13 @@ mod dbus_tests {
     }
 
     fn show(prompter: &NotificationPrompter, seq: u64) -> Arc<RecordingSink> {
+        show_ticket(prompter, ticket(seq))
+    }
+
+    fn show_ticket(prompter: &NotificationPrompter, ticket: PromptTicket) -> Arc<RecordingSink> {
         let sink = Arc::new(RecordingSink::default());
         let weak: Weak<dyn PromptSink> = Arc::downgrade(&sink) as Weak<dyn PromptSink>;
-        prompter.show(ticket(seq), fields(), weak);
+        prompter.show(ticket, fields(), weak);
         sink
     }
 
@@ -1555,10 +1798,20 @@ mod dbus_tests {
         assert!(body.contains("Site: xn--bcher-kva.example (any page under this site)"));
         assert!(body.contains("Origin: https://xn--bcher-kva.example"));
         assert!(body.contains("saved permanently"));
-        assert_eq!(
-            notify["actions"],
-            serde_json::json!(["allow_always", "Allow always", "deny", "Deny"])
-        );
+        // Exactly two actions with the fixed labels; the keys carry this prompt's nonce, which
+        // the labels never show.
+        let actions: Vec<&str> = notify["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(actions.len(), 4, "{actions:?}");
+        assert_eq!([actions[1], actions[3]], ["Allow always", "Deny"]);
+        let nonce = actions[0].strip_prefix("allow_always:").unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(actions[2], format!("deny:{nonce}"));
         assert_eq!(notify["expire_timeout"], 0);
         assert_eq!(notify["hints"]["urgency"], 2);
         assert_eq!(notify["app_name"], "Passless");
@@ -1619,6 +1872,112 @@ mod dbus_tests {
         assert_eq!(
             sink.wait_for(1),
             [PromptEvent::Failed("no_server".to_string())]
+        );
+    }
+
+    #[test]
+    fn notify_osd_driver_maps_dialog_clicks_and_the_close_after_them() {
+        let bus = PrivateBus::start();
+        // Approve after the delay, then deny; each click is followed by NotificationClosed(0, 3),
+        // which must not turn the decision into a dismissal.
+        let _double = Double::start_notify_osd(&bus, "approve:700,deny:50");
+        let prompter = prompter(&bus, Duration::from_millis(500));
+        let sink = show(&prompter, 1);
+        assert_eq!(
+            sink.wait_for(2),
+            [PromptEvent::Shown, PromptEvent::Approved]
+        );
+        let sink = show(&prompter, 2);
+        assert_eq!(
+            sink.wait_for(2),
+            [
+                PromptEvent::Shown,
+                PromptEvent::Denied(EscalationDenyCause::User)
+            ]
+        );
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(sink.now().len(), 2, "nothing after the decision");
+    }
+
+    #[test]
+    fn notify_osd_driver_keeps_concurrent_profiles_apart() {
+        let bus = PrivateBus::start();
+        let double = Double::start_notify_osd(&bus, "ignore");
+        let prompter = prompter(&bus, Duration::from_millis(200));
+        let work = show_ticket(&prompter, ticket_in("work", 1));
+        assert_eq!(work.wait_for(1), [PromptEvent::Shown]);
+        let home = show_ticket(&prompter, ticket_in("home", 2));
+        assert_eq!(home.wait_for(1), [PromptEvent::Shown]);
+        let (work_allow, _) = double.keys(0);
+        let (_, home_deny) = double.keys(1);
+        thread::sleep(Duration::from_millis(300));
+
+        double.emit("ActionInvoked", (0u32, work_allow.as_str()));
+        double.emit("NotificationClosed", (0u32, 3u32));
+        assert_eq!(
+            work.wait_for(2),
+            [PromptEvent::Shown, PromptEvent::Approved]
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(home.now(), [PromptEvent::Shown], "home is still pending");
+
+        double.emit("ActionInvoked", (0u32, home_deny.as_str()));
+        double.emit("NotificationClosed", (0u32, 3u32));
+        assert_eq!(
+            home.wait_for(2),
+            [
+                PromptEvent::Shown,
+                PromptEvent::Denied(EscalationDenyCause::User)
+            ]
+        );
+        assert_eq!(work.now().len(), 2);
+    }
+
+    /// The daemon withdraws a prompt on timeout, abort, or a cooldown-setting deny; notify-osd
+    /// cannot close the dialog, so it stays visible. A later click on it grants nothing, also
+    /// while a newer prompt waits under the same id 0.
+    #[test]
+    fn notify_osd_a_stale_dialog_after_withdrawal_grants_nothing() {
+        let bus = PrivateBus::start();
+        let double = Double::start_notify_osd(&bus, "ignore");
+        // No review delay: an attributed approval would be accepted at once.
+        let prompter = prompter(&bus, Duration::ZERO);
+        let first = show(&prompter, 1);
+        assert_eq!(first.wait_for(1), [PromptEvent::Shown]);
+        let (stale_allow, _) = double.keys(0);
+        prompter.withdraw(&ticket(1));
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !double.kinds().contains(&"CloseNotification".to_string()),
+            "the shared id 0 is not closed"
+        );
+
+        // A click on the stale dialog with no prompt waiting.
+        double.emit("ActionInvoked", (0u32, stale_allow.as_str()));
+        double.emit("NotificationClosed", (0u32, 3u32));
+
+        let second = show(&prompter, 2);
+        assert_eq!(second.wait_for(1), [PromptEvent::Shown]);
+        let (_, deny) = double.keys(1);
+        // The stale dialog (and a bare legacy key) clicked while the newer prompt waits.
+        double.emit("ActionInvoked", (0u32, stale_allow.as_str()));
+        double.emit("ActionInvoked", (0u32, ACTION_ALLOW_ALWAYS));
+        double.emit("NotificationClosed", (0u32, 3u32));
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            first.now(),
+            [PromptEvent::Shown],
+            "a withdrawal reports nothing"
+        );
+        assert_eq!(second.now(), [PromptEvent::Shown], "the newer prompt waits");
+
+        double.emit("ActionInvoked", (0u32, deny.as_str()));
+        assert_eq!(
+            second.wait_for(2),
+            [
+                PromptEvent::Shown,
+                PromptEvent::Denied(EscalationDenyCause::User)
+            ]
         );
     }
 

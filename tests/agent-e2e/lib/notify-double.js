@@ -12,7 +12,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 /**
  * @param {object} env  from createEnv()
  * @param {{script?: string[]}} opts  script steps, e.g. ['approve'], ['deny:200'], ['ignore'] (see
- *   tools/notify-double: approve (invokes allow_always)|deny|ignore|close|invoke=<key>, each with an
+ *   tools/notify-double: approve (invokes the prompt's allow_always:<nonce> key)|deny|ignore|close|invoke=<key>, each with an
  *   optional :<delay_ms>)
  */
 async function startNotifyDouble(env, opts = {}) {

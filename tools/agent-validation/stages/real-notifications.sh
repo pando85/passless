@@ -148,6 +148,14 @@ DUNST_EOF
 set -euo pipefail
 export DISPLAY="${display_num}"
 
+# This driver must run on the private bus dbus-run-session created. Refuse the bus this stage was
+# started with (the developer's real session bus, or a stand-in that is not a private bus): the
+# probe would otherwise show real "Allow always" prompts there.
+if [[ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" || "\${DBUS_SESSION_BUS_ADDRESS}" == '${DBUS_SESSION_BUS_ADDRESS:-__none__}' ]]; then
+    echo '{"decision":"error","error_kind":"bus_unavailable","latency_class":"fast"}' > "${probe_output}"
+    exit 0
+fi
+
 dunst -config "${dunst_config}" &
 dunst_pid=\$!
 

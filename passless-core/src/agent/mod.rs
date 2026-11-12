@@ -26,8 +26,8 @@ pub use protocol::{
     PrincipalRequestFrame, PrincipalResponse, PrincipalResponseFrame, ProfileDiagnosticReport,
     ProfileGrantedRules, ProfileInfo, ProfileList, ProfileStatusResponse, ProfileSummary,
     ProtocolError, ProtocolVersion, RecommendedAction, RegisterCredentialRequest,
-    RegisterCredentialResponse, RequestFrame, ResponseFrame, Role, SeqpacketCodec, SessionInfo,
-    SessionList, Validate, ValidationErrors,
+    RegisterCredentialResponse, RequestFrame, ResponseFrame, Role, SeqpacketCodec,
+    SessionEndReason, SessionEndResponse, SessionInfo, SessionList, Validate, ValidationErrors,
 };
 pub use resolve::{
     GrantSource, MatchedRule, NoGrantedRules, RuleIdentity, resolve_rules, rule_for_host,

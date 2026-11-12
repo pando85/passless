@@ -8,15 +8,7 @@ mod agent_admin_cli {
     use tempfile::tempdir;
 
     fn passless_bin() -> PathBuf {
-        let mut path = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        path.push("passless");
-        path
+        PathBuf::from(env!("CARGO_BIN_EXE_passless"))
     }
 
     fn run_install(home: &Path, project: &Path, args: &[&str]) -> (String, String, i32) {

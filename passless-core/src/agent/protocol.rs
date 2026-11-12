@@ -408,6 +408,46 @@ pub enum AdminRequest {
         profile_id: ProfileId,
     },
     Shutdown,
+    /// Whether a principal session is still running and, once it ended, why (the daemon keeps
+    /// the reason for a while). Unlike `WaitPrincipal` it never consumes the record. A daemon
+    /// that predates it refuses the request as malformed, which a caller reads as "reason
+    /// unknown".
+    SessionEnd {
+        session_id: PrincipalSessionId,
+    },
+}
+
+/// Why a principal session ended, as the daemon that ended it recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEndReason {
+    /// Its `max_session_ttl` ran out.
+    Expired,
+    /// `RevokeSession` (`agent-admin principals revoke`).
+    Revoked,
+    /// `TerminatePrincipal`.
+    Terminated,
+    /// Its profile was disabled.
+    ProfileDisabled,
+    /// The session's process exited by itself.
+    Exited,
+    /// The client that launched it is gone.
+    ClientGone,
+    /// The daemon shut down.
+    DaemonShutdown,
+    /// A reason this build does not know (sent by a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to `AdminRequest::SessionEnd`: `running`, or the reason it ended. A session the
+/// daemon does not know (never launched, or its record expired) is a `NotFound` error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEndResponse {
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SessionEndReason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -448,6 +488,7 @@ pub enum AdminResponse {
     GrantedRuleList(GrantedRuleList),
     GrantedRulesRevoked { revoked: u32 },
     ShutdownAccepted,
+    SessionEnd(SessionEndResponse),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -873,6 +914,21 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
+impl DoctorCheck {
+    /// How a report prints the check: `FAIL`, `warn` or `ok`. A warning is a passing check whose
+    /// message starts with `warning:` (the JSON schema has no severity: `passed` stays what the
+    /// health of the report is computed from).
+    pub fn mark(&self) -> &'static str {
+        if !self.passed {
+            "FAIL"
+        } else if self.message.starts_with("warning:") {
+            "warn"
+        } else {
+            "ok"
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileDiagnosticReport {
@@ -889,10 +945,8 @@ pub struct ProfileDiagnosticReport {
 
 impl ProfileDiagnosticReport {
     pub fn is_healthy(&self) -> bool {
-        self.enabled
-            && self.audit_gate_healthy
-            && self.pin_storage_available
-            && self.checks.iter().all(|c| c.passed)
+        // The `pin_storage` check says whether the missing PIN storage matters for the mode.
+        self.enabled && self.audit_gate_healthy && self.checks.iter().all(|c| c.passed)
     }
 }
 
@@ -1261,6 +1315,7 @@ impl Validate for AdminRequest {
             | Self::ListSessions { .. }
             | Self::ShowSession { .. }
             | Self::RevokeSession { .. }
+            | Self::SessionEnd { .. }
             | Self::ListProfiles
             | Self::EnableProfile { .. }
             | Self::DisableProfile { .. }
@@ -1759,6 +1814,32 @@ mod tests {
     {
         let bytes = serde_json::to_vec(val).unwrap();
         serde_json::from_slice::<T>(&bytes).unwrap()
+    }
+
+    /// `SessionEnd` round-trips; a reason this build does not know reads as `Unknown`, and an
+    /// absent reason is allowed.
+    #[test]
+    fn session_end_round_trips_and_tolerates_new_reasons() {
+        let request = AdminRequest::SessionEnd {
+            session_id: PrincipalSessionId::new(),
+        };
+        assert_eq!(json_roundtrip(&request), request);
+        assert!(request.validate().is_ok());
+        let response = AdminResponse::SessionEnd(SessionEndResponse {
+            running: false,
+            reason: Some(SessionEndReason::Expired),
+        });
+        assert_eq!(json_roundtrip(&response), response);
+        assert_eq!(
+            serde_json::to_string(&SessionEndReason::ProfileDisabled).unwrap(),
+            "\"profile_disabled\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionEndReason>("\"some_future_reason\"").unwrap(),
+            SessionEndReason::Unknown
+        );
+        let running: SessionEndResponse = serde_json::from_str(r#"{"running":true}"#).unwrap();
+        assert_eq!(running.reason, None);
     }
 
     #[test]

@@ -4,12 +4,14 @@
 // package.json pins in node_modules, so `passless agent mcp ...` (which runs real npx in production) needs no network.
 // The argv it received is appended to $AGENT_E2E_NPX_LOG (bearer values redacted) so scenarios can assert the exact
 // command the adapter built. Unknown packages fail with 127 rather than reaching the registry.
+// AGENT_E2E_NPX_MODULES (an absolute node_modules directory) runs the copies installed there instead, e.g. another
+// @playwright/mcp version: `npm install --prefix /tmp/pw @playwright/mcp@0.0.83` and AGENT_E2E_NPX_MODULES=/tmp/pw/node_modules.
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const modules = path.join(__dirname, '..', 'node_modules');
+const modules = path.isAbsolute(process.env.AGENT_E2E_NPX_MODULES || '') ? process.env.AGENT_E2E_NPX_MODULES : path.join(__dirname, '..', 'node_modules');
 const argv = process.argv.slice(2);
 if (process.env.AGENT_E2E_NPX_LOG) {
   const redacted = argv.map(a => a.replace(/(Bearer )\S+/, '$1<redacted>'));

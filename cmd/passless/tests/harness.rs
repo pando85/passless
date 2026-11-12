@@ -491,6 +491,12 @@ impl AuthenticatorHarness {
             )
             .env("PASSLESS_E2E_AUTO_ACCEPT_UV", "1")
             .env("PASSLESS_E2E_AUTO_ACCEPT_STORAGE", "1")
+            // Never inherit the developer's session bus: an escalation or notification from a test
+            // daemon must not reach their real notification server.
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/passless-e2e-test-bus",
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

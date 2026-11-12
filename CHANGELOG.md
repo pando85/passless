@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.23.0](https://github.com/pando85/passless/tree/v0.23.0) - 2026-11-12
+
+### Added
+
+- Transparent Playwright MCP integration with agent mcp install and CDP ownership check (#582) ([821b41d](https://github.com/pando85/passless/commit/821b41d82d75a1d0710a6c40203366d9178296b8))
+
+### Build
+
+- deps: Update Rust crate psl to v2.1.251 (#574) ([6565cd4](https://github.com/pando85/passless/commit/6565cd4f44feb10847f6a4fdbb7ff16612d3e096))
+- deps: Update Rust crate psl to v2.1.252 (#581) ([c3572ff](https://github.com/pando85/passless/commit/c3572ff1c8ed45f26d6e1700b04aeaf95f19f8c3))
+
+## [v0.22.0](https://github.com/pando85/passless/tree/v0.22.0) - 2026-11-12
+
+### Added
+
+- Add agent delegation with a policy-gated managed browser (ADR 0014) (#579) ([c8e7a0f](https://github.com/pando85/passless/commit/c8e7a0f120582576ae5a496a7f6131d89c86accd))
+
+### Fixed
+
+- security: Prevent unauthenticated UV retry reset when PIN is set (#558) ([d6e52ae](https://github.com/pando85/passless/commit/d6e52aea574289dae0517ccbf421e7df5763d76b))
+- Update rsa to 0.10 and remove deprecated pem feature (#568) ([2ad88c8](https://github.com/pando85/passless/commit/2ad88c89bd0ff8e161fb63442a38b88efa88418d))
+
+### Documentation
+
+- Clarify first-run setup for Arch and source installs (#561) ([c5b0496](https://github.com/pando85/passless/commit/c5b0496a5c246a16d0ccb9224d30d91d8fbdb8b3))
+
+### Build
+
+- deps: Update dependency node to v26 (#550) ([0eacb1d](https://github.com/pando85/passless/commit/0eacb1db929c980814d8fa5488c027de1f85eb0b))
+- deps: Update Rust crate zbus to v6.2.0 (#551) ([067f87d](https://github.com/pando85/passless/commit/067f87d182e2cd47e26fd992f4ee737577b015df))
+- deps: Update Rust crate log to v0.4.35 (#552) ([c7c3c57](https://github.com/pando85/passless/commit/c7c3c57de9ea76e8a1c493d73d55c16b86637cb9))
+- deps: Update Rust crate signal-hook to v0.4.6 (#553) ([69c5def](https://github.com/pando85/passless/commit/69c5def29b6df5754675d889ad1e716bea5ae3a6))
+- deps: Update Rust crate zbus to v6.2.1 (#554) ([4ffa986](https://github.com/pando85/passless/commit/4ffa9860f41b546f88c3a5c7101ae3cce77d2d0f))
+- deps: Update Rust crate psl to v2.1.246 (#555) ([6cb099b](https://github.com/pando85/passless/commit/6cb099b3ba2349894e7391a5ed0636470b9a2e2e))
+- deps: Update Rust crate aes to v0.9.4 (#556) ([9412842](https://github.com/pando85/passless/commit/941284296a1d7161a326ba71754ba8713d9609ba))
+- deps: Update Rust crate toml to v1.2.0 (#559) ([4dd2cb3](https://github.com/pando85/passless/commit/4dd2cb3a7c2ca8060113a4f7546af4bd7a7721db))
+- deps: Update Rust crate psl to v2.1.247 (#562) ([e1512bb](https://github.com/pando85/passless/commit/e1512bbd74594c644dd67ea0af4ea5520fcab073))
+- deps: Update Rust crate psl to v2.1.248 (#563) ([6073793](https://github.com/pando85/passless/commit/60737932ba059dad3d10a91dbb63994cb9338dca))
+- deps: Update Rust crate toml to v1.2.1 (#564) ([7a8b198](https://github.com/pando85/passless/commit/7a8b198efc7a86b36f3cf35d4aa9340c9e6b0633))
+- deps: Update dependency @simplewebauthn/server to v14.1.0 (#565) ([e5fdbf0](https://github.com/pando85/passless/commit/e5fdbf0fe9f31b41691377d14c0d5832ee931af4))
+- deps: Update Rust crate notify-rust to v4.19.0 (#566) ([5c2d5b1](https://github.com/pando85/passless/commit/5c2d5b189fd4844ea8c794c27d39369fe62ae2b9))
+- deps: Update Rust crate psl to v2.1.249 (#569) ([c0a4496](https://github.com/pando85/passless/commit/c0a449663e530def2d1618d84d842a6c7a6753f3))
+- deps: Update Rust crate syn to v3.0.10 (#570) ([277309d](https://github.com/pando85/passless/commit/277309d6df27971fcfe255116594b93db8d7ebb3))
+- deps: Update Rust crate psl to v2.1.250 (#572) ([130eaa5](https://github.com/pando85/passless/commit/130eaa5047cc15099945c7618261a8b56fabaed8))
+- deps: Update Rust crate rpassword to v7.5.5 (#573) ([04406c1](https://github.com/pando85/passless/commit/04406c1360657b3aa641e2a0e832cd234b3fe63a))
+
 ## [v0.21.0](https://github.com/pando85/passless/tree/v0.21.0) - 2026-10-25
 
 ### Added

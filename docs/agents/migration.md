@@ -5,6 +5,10 @@
 > spellings below are accepted for one release with a warning and then removed (the warning says
 > "removed in the release after next").
 
+Validate before restarting the service: `passless config check` loads the file as the daemon does and
+prints every deprecation warning below, or the error that would stop the daemon, with no daemon
+running (see [Configuration](configuration.md#validate-before-restarting-the-service)).
+
 ## Rule actions
 
 Rules used to carry three values: an authorization (`deny`, `confirm`, `allow`) and the source of user
@@ -46,5 +50,24 @@ entries (`rp_id`, `authenticate`, `register`), and delete `human_verification_pr
   is a hidden alias of `agent mcp playwright`.
 - Conditional mediation no longer "stays native". It is unavailable in the managed browser, and
   cross-origin frames are denied.
+
+## From a plain Playwright MCP
+
+Before agent mode, an MCP client started its own browser (`npx @playwright/mcp`, `pnpm dlx
+@playwright/mcp@<pin>`, `chrome-devtools-mcp`). That still works, but its passkey prompts reach your
+human authenticator, not an agent profile's rules. Rewrite the entries to the wrapper:
+
+```bash
+passless agent mcp install --client claude-code --user --profile coding        # dry run
+passless agent mcp install --client claude-code --user --profile coding --yes  # write
+```
+
+Use `--client opencode --user` for `~/.config/opencode/opencode.json`, and `--project <DIR>` only for a
+repository that is yours alone (it writes your `passless` path and profile into a committed file).
+`--user` also rewrites the entries `claude mcp add` keeps per project (local scope). The entry keeps its
+name, other keys and package spec; compatible flags (`--isolated`, `--viewport-size`, ...) pass through, and flags
+that choose or attach a browser (`--browser`, `--headless`, `--user-data-dir`, ...) are dropped with a
+note. The profile needs `browser_cdp_expose = "port"`. Details: [Browser
+tools](browser-tools.md#switching-from-a-plain-playwright-mcp).
 
 The design record is [ADR 0014](../decisions/0014-agent-delegation.md#6-policy).

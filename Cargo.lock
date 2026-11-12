@@ -1869,15 +1869,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hermit-abi"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62b467343b94ba476dcb2500d242dadbb39557df889310ac77c5d99100aaac33"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3402,7 +3393,7 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "passless-config-doc"
-version = "0.21.0"
+version = "0.23.0"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -3412,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "passless-core"
-version = "0.21.0"
+version = "0.23.0"
 dependencies = [
  "clap",
  "clap-serde-derive",
@@ -3436,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "passless-rs"
-version = "0.21.0"
+version = "0.23.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5849,12 +5840,6 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"

@@ -45,3 +45,19 @@ For unattended or narrowly scoped automation, RP-native mechanisms are usually b
 OpenID Connect, OAuth token exchange (RFC 8693), sender-constrained tokens (DPoP, RFC 9449, or mutual
 TLS), application installations such as GitHub Apps, service accounts and workload identity. They
 express actor, audience, scope, lifetime and revocation independently of a browser session.
+
+## Glossary
+
+- **RP ID**: the relying party's identifier in WebAuthn, usually the site's domain (`github.com`). Rules
+  match it exactly; it is not the URL in the address bar.
+- **CDP**: the Chrome DevTools Protocol, how a tool (Playwright, chrome-devtools-mcp) controls a
+  browser. `browser_cdp_expose = "port"` opens a loopback endpoint for it; the default `pipe` has none.
+- **Principal session**: the daemon's record of one agent client and its limits (`max_session_ttl`,
+  `max_operations`). Each MCP client process that runs `passless agent mcp ...` has one.
+- **Lease**: the managed browser a session holds. It closes when its session ends (with
+  `browser_scope = "profile"`, when the session that owns it ends).
+- **Escalation**: a `request` rule asking you, through a desktop notification, to allow one RP.
+  Approving it stores a **granted rule**: a permanent `allow` for that exact RP until you revoke it.
+- **UHID / hidraw**: how Passless appears as a USB security key. UHID is the kernel interface the daemon
+  uses to create the virtual device; hidraw is the device node clients and browsers open to talk to it.
+  Agents get neither: they reach the daemon through the managed browser.

@@ -2135,6 +2135,15 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn session_and_operation_defaults_match_the_documentation() {
+        // docs/agents/configuration.md states these defaults.
+        let profile = parse_profile("").unwrap();
+        assert_eq!(profile.max_concurrent_sessions, 64);
+        assert_eq!(profile.max_operations, 64);
+        assert_eq!(profile.max_granted_rules, 64);
+    }
+
     fn agent_config(
         profile: AgentProfileConfig,
         acknowledge_global: bool,

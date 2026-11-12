@@ -905,6 +905,8 @@ impl std::fmt::Debug for ManagedPrincipalSession {
 pub struct CompletedSession {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    /// Why the session ended (`AdminRequest::SessionEnd`).
+    pub reason: passless_core::agent::SessionEndReason,
     pub completed_at: Instant,
 }
 
@@ -2872,26 +2874,17 @@ impl AgentRuntime {
             if let Some(profile) = self.profiles.get(profile_id) {
                 self.cleanup_browser_for_session(profile, &managed.session_id);
             }
+            // Recorded before the process is stopped, so its end always has a reason.
+            self.record_session_end(
+                &managed.session_id,
+                None,
+                passless_core::agent::SessionEndReason::Terminated,
+            );
             let exit_status = managed.session.terminate(TERMINATE_TIMEOUT);
-            let (exit_code, signal) = match exit_status {
-                Some(status) => {
-                    if let Some(code) = status.code() {
-                        (Some(code), None)
-                    } else {
-                        (None, status.signal())
-                    }
-                }
-                None => (None, None),
-            };
-            let mut completed_map = self.completed_sessions.lock().unwrap();
-            Self::prune_completed_before_insert(&mut completed_map);
-            completed_map.insert(
-                managed.session_id.to_string(),
-                CompletedSession {
-                    exit_code,
-                    signal,
-                    completed_at: Instant::now(),
-                },
+            self.record_session_end(
+                &managed.session_id,
+                exit_status,
+                passless_core::agent::SessionEndReason::Terminated,
             );
         }
 
@@ -2930,15 +2923,10 @@ impl AgentRuntime {
                             if let Some(profile) = self.profiles.get(profile_id) {
                                 self.cleanup_browser_for_session(profile, session_id);
                             }
-                            let mut completed_map = self.completed_sessions.lock().unwrap();
-                            Self::prune_completed_before_insert(&mut completed_map);
-                            completed_map.insert(
-                                managed.session_id.to_string(),
-                                CompletedSession {
-                                    exit_code,
-                                    signal,
-                                    completed_at: Instant::now(),
-                                },
+                            self.record_session_end(
+                                &managed.session_id,
+                                Some(status),
+                                passless_core::agent::SessionEndReason::Exited,
                             );
                             return Ok(AdminResponse::PrincipalWait(PrincipalWaitResponse {
                                 running: false,
@@ -3019,30 +3007,30 @@ impl AgentRuntime {
     }
 
     fn reap_expired_sessions(&self) {
+        use passless_core::agent::SessionEndReason;
+
         let now = Instant::now();
-        let mut to_reap: Vec<(
-            ProfileId,
-            PrincipalSessionId,
-            Option<std::process::ExitStatus>,
-        )> = Vec::new();
+        // The sessions stay alive (their processes unkilled) until their end is recorded, so a
+        // client that sees the process go can always ask why (`SessionEnd`).
+        let mut to_reap: Vec<(ProfileId, ManagedPrincipalSession, SessionEndReason)> = Vec::new();
 
         for (profile_id, session_slot) in &self.managed_sessions {
             let mut sessions =
                 super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             let mut index = 0;
             while index < sessions.len() {
-                let should_reap = if now >= sessions[index].deadline {
+                let reason = if now >= sessions[index].deadline {
                     debug!(
                         "Session {} for profile {} expired, reaping",
                         sessions[index].session_id, profile_id
                     );
-                    true
+                    Some(SessionEndReason::Expired)
                 } else if !Self::is_pid_alive(sessions[index].client_pid) {
                     debug!(
                         "Session {} for profile {} orphaned (client pid {} dead), reaping",
                         sessions[index].session_id, profile_id, sessions[index].client_pid
                     );
-                    true
+                    Some(SessionEndReason::ClientGone)
                 } else {
                     match sessions[index].session.child.try_wait() {
                         Ok(Some(_)) => {
@@ -3050,50 +3038,95 @@ impl AgentRuntime {
                                 "Session {} for profile {} exited, reaping",
                                 sessions[index].session_id, profile_id
                             );
-                            true
+                            Some(SessionEndReason::Exited)
                         }
-                        Ok(None) => false,
-                        Err(_) => true,
+                        Ok(None) => None,
+                        Err(_) => Some(SessionEndReason::Exited),
                     }
                 };
 
-                if should_reap {
-                    let mut taken = sessions.remove(index);
-                    let exit_status = taken.session.child.try_wait().ok().flatten();
-                    to_reap.push((profile_id.clone(), taken.session_id.clone(), exit_status));
+                if let Some(reason) = reason {
+                    to_reap.push((profile_id.clone(), sessions.remove(index), reason));
                 } else {
                     index += 1;
                 }
             }
         }
 
-        for (profile_id, session_id, exit_status) in to_reap {
-            let (exit_code, signal) = match exit_status {
-                Some(status) => {
-                    if let Some(code) = status.code() {
-                        (Some(code), None)
-                    } else {
-                        (None, status.signal())
-                    }
-                }
-                None => (None, None),
-            };
-            {
-                let mut completed_map = self.completed_sessions.lock().unwrap();
-                Self::prune_completed_before_insert(&mut completed_map);
-                completed_map.insert(
-                    session_id.to_string(),
-                    CompletedSession {
-                        exit_code,
-                        signal,
-                        completed_at: Instant::now(),
-                    },
-                );
-            }
+        for (profile_id, mut taken, reason) in to_reap {
+            let exit_status = taken.session.child.try_wait().ok().flatten();
+            let session_id = taken.session_id.clone();
+            self.record_session_end(&session_id, exit_status, reason);
+            // Now the process may go (dropping the session kills it).
+            drop(taken);
 
             if let Some(profile) = self.profiles.get(&profile_id) {
                 self.cleanup_browser_for_session(profile, &session_id);
             }
+        }
+    }
+
+    /// Remember how `session_id` ended (exit status and reason) for `WaitPrincipal` and
+    /// `SessionEnd`. Takes only the completed-sessions lock.
+    fn record_session_end(
+        &self,
+        session_id: &PrincipalSessionId,
+        exit_status: Option<std::process::ExitStatus>,
+        reason: passless_core::agent::SessionEndReason,
+    ) {
+        let (exit_code, signal) = match exit_status {
+            Some(status) => match status.code() {
+                Some(code) => (Some(code), None),
+                None => (None, status.signal()),
+            },
+            None => (None, None),
+        };
+        let mut completed_map = self.completed_sessions.lock().unwrap();
+        Self::prune_completed_before_insert(&mut completed_map);
+        completed_map.insert(
+            session_id.to_string(),
+            CompletedSession {
+                exit_code,
+                signal,
+                reason,
+                completed_at: Instant::now(),
+            },
+        );
+    }
+
+    /// `SessionEnd`: running, or the recorded reason it ended.
+    fn handle_session_end(
+        &self,
+        session_id: &PrincipalSessionId,
+    ) -> Result<AdminResponse, ProtocolError> {
+        for session_slot in self.managed_sessions.values() {
+            let sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
+            if sessions
+                .iter()
+                .any(|managed| managed.session_id == *session_id)
+            {
+                return Ok(AdminResponse::SessionEnd(
+                    passless_core::agent::SessionEndResponse {
+                        running: true,
+                        reason: None,
+                    },
+                ));
+            }
+        }
+        let completed_map = self.completed_sessions.lock().unwrap();
+        match completed_map.get(&session_id.to_string()) {
+            Some(completed) => Ok(AdminResponse::SessionEnd(
+                passless_core::agent::SessionEndResponse {
+                    running: false,
+                    reason: Some(completed.reason),
+                },
+            )),
+            None => Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("session '{}' not found", session_id),
+                RecommendedAction::FixRequest,
+            )),
         }
     }
 
@@ -3104,12 +3137,19 @@ impl AgentRuntime {
 
     fn shutdown_all_sessions(&self) {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions =
-                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
-            for managed in sessions.drain(..) {
+            let ending: Vec<ManagedPrincipalSession> =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession)
+                    .drain(..)
+                    .collect();
+            for managed in ending {
                 info!(
                     "Shutting down principal session {} for profile {}",
                     managed.session_id, profile_id
+                );
+                self.record_session_end(
+                    &managed.session_id,
+                    None,
+                    passless_core::agent::SessionEndReason::DaemonShutdown,
                 );
                 if let Some(profile) = self.profiles.get(profile_id) {
                     self.cleanup_browser_for_session(profile, &managed.session_id);
@@ -3672,14 +3712,22 @@ impl AgentRuntime {
         self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
 
         if let Some(session_slot) = self.managed_sessions.get(profile_id) {
-            let mut sessions =
-                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
-            for managed in sessions.drain(..) {
+            let ending: Vec<ManagedPrincipalSession> =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession)
+                    .drain(..)
+                    .collect();
+            for managed in ending {
                 info!(
                     "Disabling profile '{}' terminates session {} (pid {})",
                     profile_id,
                     managed.session_id,
                     managed.session.child.id()
+                );
+                // Recorded before the process is killed, so its end always has a reason.
+                self.record_session_end(
+                    &managed.session_id,
+                    None,
+                    passless_core::agent::SessionEndReason::ProfileDisabled,
                 );
                 drop(managed.session);
             }
@@ -4485,6 +4533,13 @@ impl AgentRuntime {
                 .build();
                 let _ = self.audit_gate.record(revoke_event);
 
+                // Recorded before the process is killed, so its end always has a reason.
+                self.record_session_end(
+                    session_id,
+                    None,
+                    passless_core::agent::SessionEndReason::Revoked,
+                );
+
                 if let Some(profile) = self.profiles.get(profile_id) {
                     self.cleanup_browser_for_session(profile, session_id);
                 }
@@ -5028,6 +5083,7 @@ impl AdminHandler for AgentRuntime {
                 start_url,
             } => self.handle_launch_browser(profile_id, start_url.as_deref()),
             AdminRequest::Shutdown => self.handle_shutdown(),
+            AdminRequest::SessionEnd { session_id } => self.handle_session_end(session_id),
         }
     }
 }

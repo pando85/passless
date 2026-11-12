@@ -358,10 +358,20 @@ fn run() -> Result<()> {
         return commands::doctor::dispatch(&mut args, agents, output);
     }
 
+    // `config check` loads the configuration itself, as the daemon does.
+    if let Some(Commands::Config {
+        action: ConfigAction::Check { config_path },
+    }) = &args.command
+    {
+        let config_path = config_path.clone();
+        return commands::config_check::dispatch(&mut args, config_path);
+    }
+
     // Handle subcommands first
     if let Some(command) = &args.command {
         return match command {
             Commands::Config { action } => match action {
+                ConfigAction::Check { .. } => unreachable!("handled above"),
                 ConfigAction::Print => {
                     // Generate default configuration with helpful comments
                     let mut default_args = Args::parse_from(["passless"]);

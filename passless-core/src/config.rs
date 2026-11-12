@@ -930,6 +930,14 @@ impl AppConfig {
         self.uv.clone()
     }
 
+    /// Everything the daemon checks of the configuration before it starts serving: [`Self::validate`]
+    /// and the backend's own validation (`main.rs` runs the same steps one by one, with its own
+    /// log messages). Used by `passless config check` and `passless doctor`.
+    pub fn check_startup(&self) -> crate::error::Result<()> {
+        self.validate()?;
+        self.backend()?.validate()
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> crate::error::Result<()> {
         self.pin.validate()?;
@@ -1213,6 +1221,18 @@ pub enum TpmAction {
 pub enum ConfigAction {
     /// Print the default configuration in TOML format
     Print,
+    /// Validate the configuration offline, as the daemon would at startup
+    ///
+    /// Loads the file like the daemon does (CLI flags and file merged, agent profiles parsed) and
+    /// runs the daemon's validation, including the agent profile rules and deprecation warnings.
+    /// Prints the warnings and exits non-zero on an error. It needs no running daemon, D-Bus or
+    /// UHID: run it before restarting the service.
+    Check {
+        /// Configuration file to check (default: `PASSLESS_CONFIG`, else
+        /// `~/.config/passless/config.toml`)
+        #[arg(short = 'c', long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
 }
 
 /// Agent administration actions
@@ -1715,6 +1735,20 @@ pub enum AgentCommand {
         #[arg(last = true, required = true)]
         command: Vec<std::path::PathBuf>,
     },
+    /// Internal: the principal-session side of `agent mcp playwright`
+    ///
+    /// Started by `agent mcp playwright` through the admin socket, never by hand. It holds the
+    /// principal session's capability descriptor and answers one request on its stdin, "ensure
+    /// the browser", with the CDP endpoint. It exits when its stdin closes.
+    #[command(hide = true)]
+    McpSessionBroker {
+        /// Profile of the principal session
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Start URL to open in the managed browser
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
     /// Launch a detached principal session
     Run {
         /// Profile to launch
@@ -1741,6 +1775,9 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Print a ready-to-paste MCP server entry for a client instead of running the server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
         /// Extra arguments for @playwright/mcp (after `--`)
         #[arg(last = true)]
         extra: Vec<String>,
@@ -1760,9 +1797,47 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Print a ready-to-paste MCP server entry for a client instead of running the server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
         /// Extra arguments for chrome-devtools-mcp (after `--`)
         #[arg(last = true)]
         extra: Vec<String>,
+    },
+    /// Rewrite plain Playwright MCP / chrome-devtools-mcp entries of a client to run through Passless
+    ///
+    /// Finds entries that start their own browser (`npx @playwright/mcp`, `pnpm dlx`, `bunx`,
+    /// `yarn dlx`, a `playwright-mcp` binary, `chrome-devtools-mcp`) in the client's MCP
+    /// configuration and rewrites each in place to `passless agent mcp playwright|chrome-devtools`,
+    /// so the agent keeps its tools and passkeys go through the managed browser and the profile's
+    /// rules. A file with no such entry gets a new `playwright` server that runs through Passless
+    /// (a file that does not exist is created; a different server named `playwright` is never
+    /// replaced). With `--user` on Claude Code, entries kept per project by `claude mcp add`
+    /// (local scope, in `projects.<path>.mcpServers`) are rewritten too. The default is a dry run
+    /// that prints a diff; `--yes` writes, after saving a backup.
+    /// The profile is the global `--profile`: required unless exactly one usable profile (with
+    /// `browser_cdp_expose = "port"`) is configured.
+    Install {
+        /// The MCP client whose configuration to change
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        client: McpInstallClient,
+        /// Change the client's user-level configuration (the default)
+        #[arg(long, conflicts_with = "project")]
+        user: bool,
+        /// Change the configuration of this project directory instead
+        #[arg(long, value_name = "DIR", conflicts_with = "user")]
+        project: Option<std::path::PathBuf>,
+        /// Write the change (after saving `<file>.passless-backup-<UTC timestamp>`); without it,
+        /// print the diff only
+        #[arg(long)]
+        yes: bool,
+        /// Also install or refresh the bundled `passless-agent` skill for the client
+        #[arg(long)]
+        skill: bool,
+        /// The `passless` the entries run (absolute path). Default: the first `passless` on
+        /// `PATH`, else this executable
+        #[arg(long, value_name = "ABS")]
+        passless_path: Option<std::path::PathBuf>,
     },
 }
 
@@ -1772,6 +1847,16 @@ pub enum McpAdapter {
 pub enum McpAdapterKind {
     Playwright,
     ChromeDevtools,
+}
+
+/// MCP clients `agent mcp install` can rewrite the configuration of.
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpInstallClient {
+    /// `opencode.json` (`mcp.servers.<name>`, or the legacy `mcp.<name>`)
+    Opencode,
+    /// `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`) and `.mcp.json`: `mcpServers.<name>`
+    ClaudeCode,
 }
 
 /// MCP clients `agent mcp --print-config` knows the configuration format of.
@@ -2270,6 +2355,44 @@ mod tests {
         assert!(
             Args::try_parse_from(["passless", "agent", "mcp", "--print-config", "emacs"]).is_err()
         );
+        // The same flag on the adapter subcommand, with `--profile` after it.
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "coding",
+            "--print-config",
+            "claude-code",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                profile: Some(ref profile),
+                action: AgentCommand::Mcp {
+                    print_config: None,
+                    adapter: Some(McpAdapter::Playwright {
+                        print_config: Some(McpConfigTarget::ClaudeCode),
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            }) if profile == "coding"
+        ));
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "mcp",
+                "chrome-devtools",
+                "--print-config",
+                "opencode",
+            ])
+            .is_ok()
+        );
         // The old name still parses (hidden alias, one release).
         assert!(
             Args::try_parse_from([
@@ -2284,6 +2407,93 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_mcp_install_parses() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["passless", "agent", "mcp", "install"];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+        };
+        // The client is required; everything else is optional and the default is a dry run.
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--client", "emacs"]).is_err());
+        let args = parse(&["--client", "opencode"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                profile: None,
+                action: AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::Install {
+                        client: McpInstallClient::Opencode,
+                        user: false,
+                        project: None,
+                        yes: false,
+                        skill: false,
+                        passless_path: None,
+                    }),
+                    ..
+                },
+                ..
+            })
+        ));
+        let args = parse(&[
+            "--client",
+            "claude-code",
+            "--project",
+            "/work/p",
+            "--profile",
+            "agent",
+            "--yes",
+            "--skill",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Commands::Agent {
+                profile,
+                action:
+                    AgentCommand::Mcp {
+                        adapter:
+                            Some(McpAdapter::Install {
+                                client,
+                                project,
+                                yes,
+                                skill,
+                                ..
+                            }),
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(profile.as_deref(), Some("agent"));
+                assert_eq!(client, McpInstallClient::ClaudeCode);
+                assert_eq!(project, Some(std::path::PathBuf::from("/work/p")));
+                assert!(yes && skill);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // `--user` and `--project` exclude each other.
+        assert!(parse(&["--client", "opencode", "--user", "--project", "/p"]).is_err());
+        assert!(parse(&["--client", "opencode", "--user"]).is_ok());
+        let args = parse(&[
+            "--client",
+            "opencode",
+            "--passless-path",
+            "/usr/bin/passless",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::Install { passless_path: Some(ref p), .. }),
+                    ..
+                },
+                ..
+            }) if p == std::path::Path::new("/usr/bin/passless")
+        ));
     }
 
     #[cfg(feature = "agent")]

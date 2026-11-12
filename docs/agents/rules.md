@@ -78,16 +78,38 @@ the agent out of the site. A store that is malformed or has the wrong owner or m
 for that profile and `passless doctor` reports it. A grant is inert, never consulted, when no rule
 reaches its RP, its rule is now `deny`, or its rule is now `allow`; `passless doctor --agents` and
 `agent-admin profile check` list those as orphaned (a warning), and `doctor --agents` also lists the
-stores of profiles that no longer exist. (`--confirm` is the real flag of the
-destructive admin commands; without it they refuse.)
+stores of profiles that no longer exist. The destructive admin commands (`revoke`, `clear`) refuse to
+run without `--confirm`.
 
 ## Registration
 
 `register = "allow"` is the autonomous setting: the agent may create a passkey at that exact RP with
-no prompt. It is never obtained through escalation and never by a wildcard. In `same-user` mode the
-new passkey is written into your own credential store, so the profile must also be listed in
+no prompt, and it is never granted by a wildcard or stored by an escalation (an approved escalation
+only ever permits the one registration that asked, see `register = "request"` above). In `same-user`
+mode the new passkey is written into your own credential store, so the profile must also be listed in
 `acknowledge_same_user_registration`. In `isolated` mode it lands in the profile's own store. Keep
 `register = "deny"` once enrollment is done.
+
+A same-user profile that may register at one site (`"request"` asks you first; `"allow"` does not):
+
+```toml
+[agents]
+enabled = true
+audit_path = "/home/alice/.local/state/passless/agent-audit"
+acknowledge_same_user_registration = ["coding"]
+
+[agents.profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+browser_cdp_expose = "port"
+
+[[agents.profiles.coding.rules]]
+rp_id = "github.com"
+authenticate = "allow"
+register = "request"
+```
+
+Without the acknowledgement the daemon refuses to start (`passless config check` shows the error).
 
 ## The wildcard rule
 

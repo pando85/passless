@@ -178,11 +178,24 @@ With `browser_scope = "session"` and `max_concurrent_sessions > 1`, `browser_cdp
 each session gets its own browser and two of them cannot bind one fixed port. With
 `browser_scope = "profile"` there is a single shared browser per profile, so a fixed port is
 allowed whatever `max_concurrent_sessions` is. `browser-control` is unavailable in port mode.
+*Amendment (CDP endpoint ownership):* the daemon hands out or stores a port-mode endpoint only after
+proving that every listener reachable at `127.0.0.1:<port>` is held by the launched browser's own
+process tree (`/proc/net/tcp{,6}` inode in its `/proc/<pid>/fd`; for an ephemeral port also the GUID
+of its `DevToolsActivePort`), and refuses a fixed `browser_cdp_port` that another process holds,
+before launch and again after it (`cdp_owner.rs`, E2E-56).
 
 Playwright MCP uses a Passless HTTP bootstrap on an ephemeral loopback port: `GET /json/version`
 authenticates an ephemeral bearer, runs the principal-scoped `EnsureBrowser` after full principal
 checks, and returns Chromium's real `webSocketDebuggerUrl`. It never relays WebSocket frames. The
 bearer gates lazy startup only; it does not protect Chromium's listener.
+*Amendment (MCP wrapper across daemon restarts):* outside a principal session, `agent mcp playwright`
+keeps the client's stdio, the Playwright MCP server and this bootstrap in the process the client
+started, and obtains its principal session through the admin socket exactly like `agent run`, as a
+broker that alone holds the capability and only answers "ensure the browser" (`direct_cdp`); a session
+lost with its daemon instance is launched again the same way on the next discovery, one the live
+daemon ended is not, and a profile whose sessions run as another Unix user keeps the server inside the
+session (`commands/mcp_session.rs`, E2E-57). A failed discovery points Playwright at
+`/passless/unavailable/<class>`, which answers `503` with the class and a fixed hint.
 
 In both modes the WebAuthn ceremony is mediated by the daemon; CDP exposure decides only who holds
 authenticated browser-session authority.
@@ -386,6 +399,12 @@ register = "deny"
 the profile value (§10.1). Policy is owned by the operator; a principal cannot add, broaden,
 reload or revoke it, and cannot choose an evidence source at request time.
 
+*Amendment (session TTL):* `max_session_ttl` bounds each principal session and its lease, not the
+launcher; the daemon records why a session ended (`AdminRequest::SessionEnd`: expired, revoked,
+terminated, profile disabled, exited), and `agent mcp playwright` renews only an expired session,
+through the admin socket like any launch (every check and the new daemon state applied, nothing of
+the old session reused, once per expiry), while every other or unknown reason is final.
+
 RP IDs are normalized exact DNS names: no scheme, port, path, trailing dot, IP address or public
 suffix. The only pattern is the constrained `*` (§6.3). The one exception to the public-suffix rule
 is `localhost`: `rp_id = "localhost"` and origins `http://localhost[:port]` are valid for exact
@@ -570,6 +589,11 @@ chose `allow`.
   a rule without a prompt edit the config.
 - The notification-server capability gate fails closed on servers without distinct actions.
   `min_review_delay_ms` is a timing heuristic, not authentication.
+  Amended (notify-osd): notify-osd 1.0 lacks the `actions` capability but was verified to deliver
+  distinct keys from a fallback dialog that always has id 0, so it is accepted, and every prompt's
+  action keys are `allow_always:<nonce>`/`deny:<nonce>` with a fresh 128-bit nonce (labels
+  unchanged): only the exact key from the verified sender decides, a shared-id close is ignored and
+  not sent, and a stale dialog left visible after withdrawal grants nothing.
 - `agents.notify_user` names the human whose session bus receives escalation prompts. The user
   unit uses its own bus. If no bus can be resolved, escalation is unavailable: the request is denied
   immediately and audited. Headless hosts use explicit `allow` rules.

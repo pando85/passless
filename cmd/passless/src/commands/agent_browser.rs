@@ -45,14 +45,15 @@ struct BrowserOutput<'a> {
 }
 
 /// `http://127.0.0.1:<port>` from the browser's `ws://127.0.0.1:<port>/devtools/browser/<id>`.
-/// `None` unless it is a loopback websocket URL.
+/// `None` unless it is a `ws://127.0.0.1` URL: the only endpoint the daemon hands out, once it
+/// verified that the listener is the managed browser's (an `[::1]` one never is).
 pub fn http_endpoint(ws_endpoint: &str) -> Option<String> {
     let url = url::Url::parse(ws_endpoint).ok()?;
     if url.scheme() != "ws" {
         return None;
     }
     let host = url.host_str()?;
-    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+    if host != "127.0.0.1" {
         return None;
     }
     Some(format!("http://{host}:{}", url.port()?))
@@ -421,11 +422,13 @@ fn npx_command(npx: &Path, package: &str, args: &[String]) -> Vec<PathBuf> {
     command
 }
 
-/// The MCP clients' server name, and the arguments `passless` is started with.
+/// The MCP clients' server name, and the arguments `passless` is started with. The name is the one
+/// the browser MCP servers' own documentation uses and `agent mcp install` writes, so the tools
+/// stay `mcp__playwright__*` (Claude Code) whichever way the entry got there.
 fn entry_parts(profile: &str, adapter: McpAdapterKind) -> (&'static str, Vec<String>) {
     let (name, adapter_name) = match adapter {
-        McpAdapterKind::Playwright => ("passless-playwright", "playwright"),
-        McpAdapterKind::ChromeDevtools => ("passless-chrome-devtools", "chrome-devtools"),
+        McpAdapterKind::Playwright => ("playwright", "playwright"),
+        McpAdapterKind::ChromeDevtools => ("chrome-devtools", "chrome-devtools"),
     };
     (
         name,
@@ -475,13 +478,29 @@ pub fn render_client_config(
 /// name `passless` (found through the client's `PATH`) when the path is unknown, no longer exists
 /// (a replaced binary reads as `... (deleted)`), is not valid UTF-8 or holds a quote that would
 /// break the shell one-liner printed next to it.
-fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
+pub(super) fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
     current_exe
         .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|path| path.to_str().map(str::to_owned))
         .filter(|path| Path::new(path).is_absolute() && !path.contains(['\'', '"']))
         .unwrap_or_else(|| "passless".to_string())
+}
+
+/// The entry `--print-config` prints needs a profile the adapters accept: they refuse pipe mode
+/// (there is no CDP endpoint to attach to), as `agent mcp install` does. A profile that cannot be
+/// found (no configuration on this machine) is only a warning: the entry may be for another host.
+fn print_config_profile_check(
+    config: Option<&passless_core::agent::AgentConfig>,
+    profile: &str,
+) -> Result<Option<String>> {
+    match super::agent_mcp_install::select_profile(config, Some(profile)) {
+        Ok(_) => Ok(None),
+        Err(why) if config.is_some_and(|config| config.profiles.contains_key(profile)) => {
+            Err(Error::Other(why))
+        }
+        Err(why) => Ok(Some(why)),
+    }
 }
 
 /// `passless agent mcp --print-config <client>`.
@@ -492,6 +511,11 @@ fn print_config(
 ) -> Result<()> {
     // The entry names its profile explicitly, so it keeps working when more are added later.
     let profile = &resolve_profile(profile)?;
+    if let Some(warning) =
+        print_config_profile_check(super::playwright_mcp::load_agent_config().as_ref(), profile)?
+    {
+        eprintln!("warning: {warning}");
+    }
     let command = mcp_entry_command(std::env::current_exe());
     let config = render_client_config(target, profile, adapter, &command);
     println!(
@@ -502,7 +526,12 @@ fn print_config(
         let (name, _) = entry_parts(profile, adapter);
         let entry = &config["mcpServers"][name];
         eprintln!(
-            "# or, without editing .mcp.json:\n# claude mcp add-json {name} --scope project '{entry}'"
+            "# or, without editing a file (every project of this Claude Code account):\n\
+             # claude mcp add-json {name} --scope user '{entry}'\n\
+             # for this project only, committed to .mcp.json (shared with everyone who clones it):\n\
+             # claude mcp add-json {name} --scope project '{entry}'\n\
+             # Remove the old entry first, or you will have two servers. A project or local entry named\n\
+             # `{name}` overrides a user-scope one: docs/agents/browser-tools.md"
         );
     }
     Ok(())
@@ -519,6 +548,38 @@ pub fn dispatch_mcp(
     if let Some(target) = print {
         return print_config(profile, target, server);
     }
+    // `agent mcp playwright --profile P --print-config <client>`: the adapter names the entry.
+    match adapter {
+        Some(McpAdapter::Playwright {
+            print_config: Some(target),
+            ..
+        }) => return print_config(profile, *target, McpAdapterKind::Playwright),
+        Some(McpAdapter::ChromeDevtools {
+            print_config: Some(target),
+            ..
+        }) => return print_config(profile, *target, McpAdapterKind::ChromeDevtools),
+        _ => {}
+    }
+    if let Some(McpAdapter::Install {
+        client,
+        project,
+        yes,
+        skill,
+        passless_path,
+        ..
+    }) = adapter
+    {
+        return super::agent_mcp_install::run(
+            profile,
+            &super::agent_mcp_install::InstallRequest {
+                client: *client,
+                project: project.as_deref(),
+                yes: *yes,
+                skill: *skill,
+                passless_path: passless_path.as_deref(),
+            },
+        );
+    }
     let Some(adapter) = adapter else {
         return Err(Error::Other(
             "choose an adapter (`agent mcp playwright` or `agent mcp chrome-devtools`) or pass \
@@ -533,19 +594,32 @@ pub fn dispatch_mcp(
             npx,
             url,
             extra,
+            ..
         } => (McpAdapterKind::Playwright, package, npx, url, extra),
         McpAdapter::ChromeDevtools {
             package,
             npx,
             url,
             extra,
+            ..
         } => (McpAdapterKind::ChromeDevtools, package, npx, url, extra),
+        McpAdapter::Install { .. } => unreachable!("handled above"),
     };
     let adapter_name = entry_parts(profile, kind).1[2].clone();
     if !in_principal_session(profile)? {
         // Resolve npx here: the principal session runs with the daemon's environment, whose PATH
         // need not have it.
         let npx = resolve_npx(npx.as_deref())?;
+        if kind == McpAdapterKind::Playwright {
+            // This process keeps the MCP stdio and runs the server; a principal session of its
+            // own (re-established after a daemon restart) answers the discovery requests.
+            let package = package.as_deref().unwrap_or(PLAYWRIGHT_PACKAGE);
+            let command = npx_command(&npx, package, extra);
+            if let Some(()) = super::mcp_session::run_playwright(profile, url.as_deref(), &command)?
+            {
+                return Ok(());
+            }
+        }
         let mut args = vec![
             "agent".to_string(),
             "mcp".to_string(),
@@ -667,6 +741,21 @@ pub(super) fn spawn_without_capability(command: &mut Command) {
     }
 }
 
+/// Tie the child's life to this process's, outside a principal session: there is no capability
+/// descriptor to close (descriptor 3 is whatever this process opened, possibly the pipe through
+/// which `spawn` learns that `exec` failed).
+pub(super) fn spawn_bound_to_wrapper(command: &mut Command) {
+    // SAFETY: the closure only calls async-signal-safe `prctl`.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +793,8 @@ mod tests {
             "wss://127.0.0.1:9222/devtools/browser/abc",
             "http://127.0.0.1:9222",
             "ws://127.0.0.1/devtools/browser/abc",
+            "ws://[::1]:9333/devtools/browser/abc",
+            "ws://localhost:9333/devtools/browser/abc",
             "not a url",
         ] {
             assert_eq!(http_endpoint(bad), None, "{bad}");
@@ -927,7 +1018,7 @@ mod tests {
             Playwright,
             "passless",
         );
-        let entry = &claude["mcpServers"]["passless-playwright"];
+        let entry = &claude["mcpServers"]["playwright"];
         assert_eq!(entry["type"], "stdio");
         assert_eq!(entry["command"], "passless");
         assert_eq!(entry["args"], serde_json::json!(args));
@@ -941,16 +1032,16 @@ mod tests {
         let vscode =
             render_client_config(McpConfigTarget::Vscode, "coding", Playwright, "passless");
         assert!(vscode.get("mcpServers").is_none());
-        assert_eq!(vscode["servers"]["passless-playwright"]["type"], "stdio");
+        assert_eq!(vscode["servers"]["playwright"]["type"], "stdio");
         assert_eq!(
-            vscode["servers"]["passless-playwright"]["args"],
+            vscode["servers"]["playwright"]["args"],
             serde_json::json!(args)
         );
 
         // opencode `opencode.json`: `mcp.servers.<name>` with a local command array.
         let opencode =
             render_client_config(McpConfigTarget::Opencode, "coding", Playwright, "passless");
-        let entry = &opencode["mcp"]["servers"]["passless-playwright"];
+        let entry = &opencode["mcp"]["servers"]["playwright"];
         assert_eq!(entry["type"], "local");
         assert_eq!(
             entry["command"],
@@ -972,12 +1063,46 @@ mod tests {
             "passless",
         );
         assert_eq!(
-            devtools["mcpServers"]["passless-chrome-devtools"]["args"][2],
+            devtools["mcpServers"]["chrome-devtools"]["args"][2],
             "chrome-devtools"
         );
     }
 
     /// The printed entry names this executable by its absolute, canonical path.
+    #[test]
+    fn print_config_refuses_a_pipe_mode_profile_and_only_warns_about_an_unknown_one() {
+        let config: passless_core::agent::AgentConfig = toml::from_str(
+            "enabled = true\n[profiles.port]\nmode = \"same-user\"\nprincipal_user = \"a\"\n\
+             browser_cdp_expose = \"port\"\n[profiles.pipe]\nmode = \"same-user\"\n\
+             principal_user = \"a\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            print_config_profile_check(Some(&config), "port").unwrap(),
+            None
+        );
+        let err = print_config_profile_check(Some(&config), "pipe")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("browser_cdp_expose = \"pipe\""), "{err}");
+        // Not configured here (or no configuration at all): the entry may be for another host.
+        assert!(
+            print_config_profile_check(Some(&config), "nope")
+                .unwrap()
+                .is_some()
+        );
+        assert!(print_config_profile_check(None, "port").unwrap().is_some());
+    }
+
+    #[test]
+    fn the_entries_are_named_like_install_names_them() {
+        assert_eq!(entry_parts("p", McpAdapterKind::Playwright).0, "playwright");
+        assert_eq!(
+            entry_parts("p", McpAdapterKind::ChromeDevtools).0,
+            "chrome-devtools"
+        );
+    }
+
     #[test]
     fn the_printed_entry_runs_the_absolute_path_of_this_executable() {
         use McpAdapterKind::Playwright;
@@ -994,14 +1119,11 @@ mod tests {
         assert_eq!(command, canonical);
         let claude =
             render_client_config(McpConfigTarget::ClaudeCode, "coding", Playwright, &command);
-        assert_eq!(
-            claude["mcpServers"]["passless-playwright"]["command"],
-            canonical
-        );
+        assert_eq!(claude["mcpServers"]["playwright"]["command"], canonical);
         let opencode =
             render_client_config(McpConfigTarget::Opencode, "coding", Playwright, &command);
         assert_eq!(
-            opencode["mcp"]["servers"]["passless-playwright"]["command"][0],
+            opencode["mcp"]["servers"]["playwright"]["command"][0],
             canonical
         );
 

@@ -6,7 +6,8 @@ const { requestProfile, start, settle, peek, abort, waitForEscalation, dbusSendS
 const ONE_RP = { rps: { a: { host: 'rp-a.test' } }, profiles: { agent: requestProfile(['rp-a.test'], { register: 'request' }) } };
 
 // The prompt child accepts `ActionInvoked` only from the notification server's unique name. Any other connection on the
-// session bus that emits the signal (here dbus-send, a separate connection) is ignored: the request stays pending.
+// session bus that emits the signal (here dbus-send, a separate connection) is ignored: the request stays pending, even
+// with the prompt's exact action key (read from the Notify call) and with the bare legacy key.
 scenario({ id: 'E2E-29', exposeModes: ['port', 'pipe'], title: 'a spoofed ActionInvoked from another bus connection is ignored: the request stays pending, no grant', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['ignore'] } });
   const rp = stack.rp.a;
@@ -16,11 +17,14 @@ scenario({ id: 'E2E-29', exposeModes: ['port', 'pipe'], title: 'a spoofed Action
 
   const key = await start(b.page, 'authenticate', { username: 'alice' });
   assert.ok(await stack.notify.waitForNotify(1), 'the notification was shown');
-  const id = stack.notify.notifications()[0].id;
-  const spoof = () => dbusSendSignal(stack, ['/org/freedesktop/Notifications', 'org.freedesktop.Notifications.ActionInvoked', `uint32:${id}`, 'string:allow_always']);
-  assert.equal(await spoof(), 0, 'dbus-send emitted the spoofed signal');
+  const { id, actions } = stack.notify.notifications()[0];
+  const allowKey = actions[0];
+  assert.match(allowKey, /^allow_always:[0-9a-f]{32}$/);
+  const spoof = key => dbusSendSignal(stack, ['/org/freedesktop/Notifications', 'org.freedesktop.Notifications.ActionInvoked', `uint32:${id}`, `string:${key}`]);
+  assert.equal(await spoof(allowKey), 0, 'dbus-send emitted the spoofed signal');
   await sleep(1500); // past the 1000 ms review delay, so a real approval would be accepted now
-  assert.equal(await spoof(), 0);
+  assert.equal(await spoof(allowKey), 0);
+  assert.equal(await spoof('allow_always'), 0);
   await sleep(2500);
 
   const state = await peek(b.page, key);

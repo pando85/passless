@@ -15,6 +15,11 @@ for forbidden_var in PASSLESS_E2E_AUTO_ACCEPT_UV PASSLESS_E2E_AUTO_ACCEPT_STORAG
     fi
 done
 
+# No test or stage below may use the session bus this script inherited: a prompt shown on the
+# developer's real notification server could be clicked ("Allow always"). Every part that needs a bus
+# starts a private one and sets the address itself.
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent/passless-validation-bus"
+
 for required_tool in dbus-daemon gpg jq node pass shellcheck swtpm; do
     if ! command -v "$required_tool" >/dev/null; then
         printf 'Missing deterministic validation dependency: %s\n' "$required_tool" >&2
@@ -40,6 +45,7 @@ shell_tests=(
     tools/agent-validation/test-orchestrator.sh
     tools/agent-validation/tests/test-tier2-stages.sh
     tools/agent-validation/tests/test-real-notifications.sh
+    tools/agent-validation/tests/test-session-bus-isolation.sh
     tools/agent-validation/tests/test-privilege-helper.sh
     tools/agent-validation/tests/test-principal-checks.sh
     tools/agent-validation/tests/test-device-matrix.sh
