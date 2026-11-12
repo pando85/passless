@@ -7727,7 +7727,14 @@ mod tests {
         cmd.arg("30");
         unsafe {
             cmd.pre_exec(move || {
-                if libc::dup2(fd, 3) < 0 {
+                // `dup2(3, 3)` is a no-op that leaves FD_CLOEXEC set, so a listener that is
+                // already fd 3 (a test run alone) would vanish at exec: clear the flag then.
+                let rc = if fd == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if rc < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
