@@ -656,9 +656,9 @@ fn install_plan(
     );
     if !request.yes {
         println!(
-            "Dry run: nothing was changed. Run again with --yes to {} (a backup is saved first).",
+            "Dry run: nothing was changed. Run again with --yes to {}.",
             if text.is_some() {
-                "write the file"
+                "write the file (a backup is saved first)"
             } else {
                 "create the file"
             }
