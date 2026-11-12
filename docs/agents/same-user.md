@@ -49,11 +49,20 @@ credential_selection = "credential:<credential-ref-hex>"
 `single` fails when more than one credential matches, which is the safest default when you have
 several accounts at a site.
 
+`credential_refs` pins the sites that have an exact rule. It can be set together with a `*` rule, and
+it never applies to a site that matches through `*` (those discover the site's credentials). A pin
+belongs to one site, so list a site with an exact rule to pin it. `agent-admin profile check` and
+`passless doctor --agents` print what the list covers and warn about inert or missing pins
+([Rules](rules.md#pins-and-the-wildcard)).
+
 ## Registration
 
 Registration writes the new passkey into your own store. It needs an exact-RP rule with
 `register = "allow"` (or `"request"`), and the profile listed in `acknowledge_same_user_registration`.
-Keep `register = "deny"` after enrollment. See [Rules](rules.md#registration).
+Keep `register = "deny"` after enrollment. A `*` rule can also have `register = "request"`, so that the
+agent can ask to create a passkey at a site you have not listed; that needs a further acknowledgement
+and is bounded by a cap, a daily limit and a cooldown. See [Rules](rules.md#registration) and
+[Registration at unlisted sites](rules.md#registration-at-unlisted-sites).
 
 ## Latency
 
@@ -72,7 +81,9 @@ not a security one; see the ADR's
 
 The agent runs as your Unix user, so it can drive your notification server and approve its own
 `request` prompts. A `request` rule in a same-user, same-Unix-user deployment is a convenience and an
-audit point, not a security boundary against a hostile agent. See
+audit point, not a security boundary against a hostile agent. That includes registration at unlisted
+sites (`register = "request"` on `*`): a convenience, not a security boundary, because the agent can
+approve its own prompt. Use a distinct-UID principal where it must be a boundary. See
 [Containment](containment.md#same-user-and-different-user).
 
 Operations, audit and recovery: [Operations](operations.md), [Audit](audit.md). Threat model:

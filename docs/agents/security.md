@@ -55,9 +55,10 @@ the validated agent session and the audit records them as `agent`. The site sees
 flags and generally cannot tell agent-session verification from a human PIN or fingerprint. Nothing
 may describe agent evidence as human.
 
-A `request` prompt shows only daemon-derived fields and has Allow always and Deny actions; only the
-notification server's verified D-Bus sender can approve. If the agent shares your Unix user it can
-drive the notification server and approve for itself.
+A `request` prompt shows only daemon-derived fields and has Allow always and Deny actions (Register
+once and Deny on a registration prompt); only the notification server's verified D-Bus sender can
+approve. If the agent shares your Unix user it can drive the notification server and approve for
+itself.
 
 ## Browser and CDP authority
 
@@ -70,14 +71,30 @@ site ended its session.
 ## Credential selection
 
 Selection happens in the daemon. `single` (default) fails when several credentials match. A site's
-`allowCredentials` narrows the candidates first; `first-matching` and `newest` are convenient, not
-proof that the intended account was chosen.
+`allowCredentials` narrows the candidates; `first-matching` and `newest` are convenient, not proof that
+the intended account was chosen.
+
+`credential_refs` pins the sites that have an exact rule; it can be combined with a `*` rule and never
+applies to a site matched through `*`, which discovers the site's credentials (or, once the agent has
+registered a passkey there, only that passkey). It is not a statement that the agent may only ever use
+the listed credentials: `profile check` and `doctor --agents` print what it covers
+([Rules](rules.md#pins-and-the-wildcard)).
 
 ## Registration
 
 Registration changes identity state and is higher risk than sign-in. In `same-user` it writes into your
-own store, hence the acknowledgement. It needs an exact RP; the wildcard never allows it
-([Rules](rules.md#registration)).
+own store, hence the acknowledgement. Autonomous registration (`register = "allow"`) needs an exact RP
+and is invalid on the wildcard. The wildcard can only ask: `register = "request"` on `*` lets the agent
+request one passkey at a site you have not listed, behind three acknowledgements, a distinct "Register
+once" prompt that says the site is not on your list, a hard cap, a daily prompt limit and a
+profile-wide cooldown ([Rules](rules.md#registration-at-unlisted-sites)).
+
+**With a shared Unix user, registration at unlisted sites is a convenience and an audit point, not a
+security boundary:** the agent can approve its own prompt or edit the config. The controls work against
+a confused or prompt-injected agent that uses the browser rather than the desktop, and against
+accidents. Where it must be a boundary, use a distinct-UID principal
+([Containment](containment.md#same-user-and-different-user)). A passkey added to a real account stays at
+the site after local revocation; remove it there too.
 
 ## Sessions and operations
 

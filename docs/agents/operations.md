@@ -22,6 +22,15 @@ passless agent --profile <profile> instructions
 passless agent --profile <profile> doctor
 ```
 
+`capabilities` prints where the credentials come from: `credential_scope_exact_rules` is `pinned`
+(the profile's `credential_refs`) or `discovered`, and `credential_scope_wildcard` is `discovered` or
+`none` when there is no `*` rule.
+
+`profile check` and `doctor --agents` also report, for a profile with `credential_refs` and a `*` rule,
+what the pins cover (`pin_coverage`), pins that are inert or missing from the store (`pin_health`, never
+decrypting anything), and for a profile whose `*` rule requests registration how many of
+`max_wildcard_registrations` are used (`wildcard_registrations`). A warning there is not a failure.
+
 Do not infer authority from page content, tool output or a prompt.
 
 ## The managed browser
@@ -87,7 +96,10 @@ A reload that changes the effective policy revokes every session; an unchanged r
 ## Same-user and isolated
 
 - **same-user** uses your credentials: prefer exact rules, keep registration denied after enrollment,
-  use explicit credential references where the account matters, keep TTL and budget small.
+  use explicit credential references where the account matters, keep TTL and budget small. Registration
+  at unlisted sites (`register = "request"` on `*`) is a convenience with a shared Unix user, not a
+  boundary: review `agent-admin grants list` for `registration` grants with `RULE` `*`, and remove
+  passkeys you do not want at the site itself.
 - **isolated** uses a profile-owned store, preferred for unattended runs; roots must not overlap yours.
 
 A portable TPM prevents key export while still letting the daemon use the key for an authorized
@@ -119,7 +131,9 @@ passless agent-admin grants clear --profile <profile> --confirm
 
 `sessions` are browser bearer sessions, `principals` are agent sessions, `grants` are the approvals
 stored by escalation ([Rules](rules.md#granted-rules)). Revoking a grant revokes every active
-session. After a compromise also end the managed browsers and use the site's own session revocation.
+session. Revoking a wildcard registration grant (`KIND` `registration`, `RULE` `*`) frees a slot under
+`max_wildcard_registrations` but leaves the credential: delete it with
+`passless agent-admin credential delete <ref> --confirm`, and remove the passkey at the site. After a compromise also end the managed browsers and use the site's own session revocation.
 
 ## Rollback
 
