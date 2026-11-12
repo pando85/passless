@@ -43,7 +43,7 @@ async function abortMidRequest(stack, b, beforeAbort = async () => {}) {
   return { res, conn, id, abortToSettleMs: Date.now() - t0, logBefore };
 }
 
-scenario({ id: 'E2E-17', title: 'AbortSignal before key use: AbortError, daemon cancels, no signature, audited aborted', ci: true }, async ctx => {
+scenario({ id: 'E2E-17', exposeModes: ['port', 'pipe'], title: 'AbortSignal before key use: AbortError, daemon cancels, no signature, audited aborted', ci: true }, async ctx => {
   const { stack, rp, b } = await setup(ctx, { PASSLESS_E2E_HOLD_REQUEST_MS: String(HOLD_MS) });
   const storeBefore = storeFingerprint(stack.daemon);
 
@@ -70,7 +70,7 @@ scenario({ id: 'E2E-17', title: 'AbortSignal before key use: AbortError, daemon 
   assertNoNotification(stack);
 });
 
-scenario({ id: 'E2E-17/after-key-use', title: 'AbortSignal after key use: the held result is discarded' }, async ctx => {
+scenario({ id: 'E2E-17/after-key-use', exposeModes: ['port', 'pipe'], title: 'AbortSignal after key use: the held result is discarded' }, async ctx => {
   const { stack, rp, b } = await setup(ctx, { PASSLESS_E2E_HOLD_RESULT_MS: String(HOLD_MS) });
   const storeBefore = storeFingerprint(stack.daemon);
 

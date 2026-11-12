@@ -21,6 +21,7 @@ scenario x variant table, and exits non-zero on any `FAIL` or `XPASS`.
 | `AGENT_E2E_MATRIX` | `ci` (default) or `full` |
 | `AGENT_E2E_BROWSERS` | comma list: `chromium` (distro), `pw-chromium`, `cft` (Chrome for Testing); negative controls `chrome`, `headless-shell`. Default `pw-chromium` (ci) or `chromium,pw-chromium,cft` (full) |
 | `AGENT_E2E_HEADLESS` | `new`, `headed` or `both` (default `new` for ci, `both` for full) |
+| `AGENT_E2E_EXPOSE` | the attach-mode axis (CDP exposure): `port`, `pipe` or `all`. Default `port` for ci (unchanged), `all` for full. See "Attach modes" |
 | `AGENT_E2E_FILTER` | scenario ids (`E2E-01,6`); overrides the CI selection. Also accepted as `run.sh` arguments |
 | `AGENT_E2E_ALLOW_SKIP=1` | a SKIP (missing browser, optional tool) no longer fails the run. Without it any SKIP, zero scenarios, or an unmatched filter id exits 1 |
 | `AGENT_E2E_TIMEOUT` | overall limit in seconds (default 900 ci, 14400 full) |
@@ -29,6 +30,32 @@ scenario x variant table, and exits non-zero on any `FAIL` or `XPASS`.
 | `AGENT_E2E_PASSLESS_BIN`, `AGENT_E2E_NOTIFY_DOUBLE_BIN`, `AGENT_E2E_NO_BUILD=1` | use prebuilt binaries |
 
 Failure artifacts (daemon log, audit, config, RP state) are kept in `target/agent-e2e-artifacts/`.
+
+## Attach modes (port and pipe)
+
+ADR 0014 section 4.3 makes `browser_cdp_expose = "pipe"` the default and the hardened mode: the browser has no CDP endpoint,
+every command goes through `passless agent browser-control` and the daemon's CDP filter, and the MCP adapters and other
+`direct_cdp` clients refuse the profile. The matrix therefore has a third axis next to browser and headless/headed.
+
+- A scenario declares the modes it supports: `exposeModes: ['port', 'pipe']` (default `['port']`). It runs once per
+  (browser, headless, supported mode). `AGENT_E2E_EXPOSE=port|pipe|all` picks the modes of a run; `pipe` runs only the scenarios
+  that support it. Variant names carry the mode whenever the run includes pipe (`[chromium/headless/pipe]`); a port-only run, such
+  as the CI subset, keeps its old names and its exact scenario set. `report.js` prints one table per mode.
+- `pinsExpose: 'pipe'` marks a scenario that writes its own pipe-mode profiles (E2E-52, 52/strict, 53, 54); it runs once per variant
+  whatever the axis says.
+- In pipe mode `stack.open(profile, url)` starts a principal session (`passless agent run`) that ensures the browser
+  (`agent browser --wait`) and serves `browser-control` requests from a FIFO, and returns the same `b` shape as the port path.
+  `b.page` is a `PipePage` (`lib/pipe-driver.js`): `evaluate`, `waitForFunction`, `goto`, `bringToFront`, `waitForLoadState`, built
+  from flat sessions on page targets and `Runtime.evaluate`; `b.context.newPage()` is `Target.createTarget`. Nothing else is used:
+  no CDP port, no Playwright connection. `b.pipe.control(method, params, sessionId)` is the raw call (E2E-52 uses the same).
+  A call has a 30 s cap, so `evaluate` starts the function in the page and polls it with short calls; two tabs can have ceremonies
+  in flight at once. The extension worker is hidden from the agent by design, so `assertInterceptionActive` judges the daemon's
+  `browser-status` (`interception: attached`, `incognito_allowed`, `cdp_exposure: pipe`) and every scenario still asserts the
+  agent-path audit records.
+- Pipe-enabled: E2E-01 to 05, 07, 09, 12 (+/audit-rule), 13, 14, 15, 16, 17 (+/after-key-use), 23 to 30, 32 (+/abort), 33, 43, 48, 49,
+  50, 51; pipe-only: E2E-52, 52/strict, 53 (adapters refused for a pipe-mode profile, with a port-mode control), 54 (grants revoke ends
+  the principal session and its browser). Every other scenario stays port-only with a comment saying why: the Playwright and
+  CDP-endpoint tools, and the ones that read or stop the extension worker (hidden in pipe mode), inherently need a port.
 
 ## Prerequisites
 

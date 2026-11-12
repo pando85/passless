@@ -11,7 +11,7 @@ const { DaemonStartError } = require('../lib/daemon');
 const EVIDENCE_CONFIRM = '{ authorization = "confirm", user_presence = "human", user_verification = "human" }';
 const EVIDENCE_ALLOW_AGENT = '{ authorization = "allow", user_presence = "agent", user_verification = "agent" }';
 
-scenario({ id: 'E2E-13', title: 'legacy config warns and maps; allow+human fails startup', ci: true }, async ctx => {
+scenario({ id: 'E2E-13', exposeModes: ['port', 'pipe'], title: 'legacy config warns and maps; allow+human fails startup', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } },
     profiles: {

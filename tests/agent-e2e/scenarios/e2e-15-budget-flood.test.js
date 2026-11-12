@@ -9,7 +9,7 @@ const FLOOD = 10;
 // is claimed only by a fresh replay key AFTER origin validation and policy resolution, so rejected requests (here an
 // unlisted RP) never consume budget. Once the budget is really used up the daemon answers `operation_budget_exhausted`
 // (the page sees NotAllowedError) and signs nothing.
-scenario({ id: 'E2E-15', title: 'Budget: evil.test floods denied requests', ci: true }, async ctx => {
+scenario({ id: 'E2E-15', exposeModes: ['port', 'pipe'], title: 'Budget: evil.test floods denied requests', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' }, evil: { host: 'evil.test' } },
     // Only rp-a.test is listed; evil.test resolves to no rule (default deny).

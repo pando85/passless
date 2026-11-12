@@ -84,6 +84,16 @@ function assertVerifiedAssertion(rp, result, { username } = {}) {
  * returns once the worker said hello with `attached = true`, plan D6 layer 1).
  */
 function assertInterceptionActive(b) {
+  if (b.pipe) {
+    // Pipe mode: the filter hides the extension worker from the agent by design, so it cannot be looked up through CDP.
+    // The daemon's own view of the lease stands in: the worker said hello attached, with incognito access, and the lease
+    // is a pipe-mode one. Every ceremony the scenario then runs is still audited as an agent-path decision.
+    assert.equal(b.lease && b.lease.cdp_exposure, 'pipe', `the lease is not a pipe-mode lease: ${JSON.stringify(b.lease)}`);
+    assert.equal(b.lease.running, true, JSON.stringify(b.lease));
+    assert.equal(b.lease.interception, 'attached', `the daemon does not report the lease as attached: ${JSON.stringify(b.lease)}`);
+    assert.equal(b.lease.incognito_allowed, true, JSON.stringify(b.lease));
+    return;
+  }
   assert.equal(b.extensionWorker, true, 'the Passless extension service worker is not running');
   assert.equal(b.lease && b.lease.interception, 'attached', `the daemon does not report the lease as attached: ${JSON.stringify(b.lease)}`);
 }

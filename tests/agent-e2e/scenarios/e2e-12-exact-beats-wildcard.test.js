@@ -17,7 +17,7 @@ const PROFILES = {
   },
 };
 
-scenario({ id: 'E2E-12', title: 'exact allow beats wildcard request', ci: true }, async ctx => {
+scenario({ id: 'E2E-12', exposeModes: ['port', 'pipe'], title: 'exact allow beats wildcard request', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } }, profiles: PROFILES, notify: NOTIFY });
   const rpA = stack.rp.a;
   const rpB = stack.rp.b;
@@ -53,7 +53,7 @@ scenario({ id: 'E2E-12', title: 'exact allow beats wildcard request', ci: true }
 
 // V-M6: the audit's matched `rule` (ADR 0014 section 12, P8) is asserted here for the wildcard path: a wildcard match is
 // audited `rule = "*"` with `grant_source = "config"`. It runs in the same stack shape as E2E-12.
-scenario({ id: 'E2E-12/audit-rule', title: 'wildcard match is audited rule="*"', ci: true }, async ctx => {
+scenario({ id: 'E2E-12/audit-rule', exposeModes: ['port', 'pipe'], title: 'wildcard match is audited rule="*"', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } }, profiles: PROFILES, notify: NOTIFY });
   const rpB = stack.rp.b;
   await stack.seedHuman(rpB, 'bob');

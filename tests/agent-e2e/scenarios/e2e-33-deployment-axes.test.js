@@ -22,7 +22,7 @@ const axesOf = report => ({
   warning: (report.checks || []).find(c => c.name === 'isolated_shared_uid'),
 });
 
-scenario({ id: 'E2E-33', title: 'deployment axes: doctor and audit report both; shared-UID isolated warns', ci: true }, async ctx => {
+scenario({ id: 'E2E-33', exposeModes: ['port', 'pipe'], title: 'deployment axes: doctor and audit report both; shared-UID isolated warns', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles: PROFILES, notify: false });
   const rpA = stack.rp.a;
   await stack.seedHuman(rpA, 'alice');

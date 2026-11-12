@@ -10,6 +10,7 @@ const profiles = { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authen
 // Catalogue E2E-34: Playwright MCP through `passless agent mcp playwright`: navigate, log in with a passkey. The adapter runs
 // `npx --yes @playwright/mcp --cdp-endpoint <bootstrap>` with `PLAYWRIGHT_MCP_CDP_HEADERS='Authorization: Bearer ...'` in its environment; the bootstrap starts the
 // managed browser lazily, on the first discovery request, which @playwright/mcp makes at its first browser tool call.
+// Port-only: Playwright MCP needs a CDP endpoint, which a pipe-mode profile refuses (ADR 0014 §4.3; the refusal is E2E-53).
 scenario({ id: 'E2E-34', title: 'Playwright MCP via `agent mcp playwright`: navigate and log in with a passkey', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
   const rp = stack.rp.a;
@@ -50,6 +51,7 @@ scenario({ id: 'E2E-34', title: 'Playwright MCP via `agent mcp playwright`: navi
 // Catalogue E2E-35: Playwright MCP with `--isolated`: the MCP server creates a browser context of its own
 // (Target.createBrowserContext), which is off the record to the extension; it is intercepted only because the launcher
 // seeded incognito access for it (plan D4).
+// Port-only: Playwright MCP needs a CDP endpoint, which a pipe-mode profile refuses (ADR 0014 §4.3; the refusal is E2E-53).
 scenario({ id: 'E2E-35', title: 'Playwright MCP with --isolated: the CDP-created context is intercepted', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
   const rp = stack.rp.a;
@@ -77,6 +79,7 @@ scenario({ id: 'E2E-35', title: 'Playwright MCP with --isolated: the CDP-created
 // P10b review L3: the default npx resolution, as a real MCP client configuration runs it: no `--npx`, `npx` found on the
 // client's PATH (here a symlink to the harness shim in a directory of its own), and that directory forwarded first into
 // the principal session's PATH, whose daemon environment need not have it (an nvm-installed node).
+// Port-only: Playwright MCP needs a CDP endpoint, which a pipe-mode profile refuses (ADR 0014 §4.3; the refusal is E2E-53).
 scenario({ id: 'E2E-34/default-npx', title: 'Playwright MCP without --npx: npx from PATH, its directory forwarded', ci: true }, async ctx => {
   const stack = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles });
   const rp = stack.rp.a;

@@ -10,7 +10,7 @@ const rps = Object.fromEntries('abcde'.split('').map(c => [c, { host: `rp-${c}.t
 // slots, so these are the limits that apply. Five RPs in one browser (one bearer session): the first four park, the fifth is
 // refused `escalation_waiter_cap` before any prompt, and a second profile (its own session, its own prompt queue and a plain
 // `allow` rule) is unaffected.
-scenario({ id: 'E2E-48', title: 'five RPs in one session: the fifth is denied escalation_waiter_cap while another profile still works', ci: true }, async ctx => {
+scenario({ id: 'E2E-48', exposeModes: ['port', 'pipe'], title: 'five RPs in one session: the fifth is denied escalation_waiter_cap while another profile still works', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps,
     profiles: {

@@ -145,12 +145,17 @@ function discover(id) {
  *   AGENT_E2E_BROWSERS  comma list of ids (default: pw-chromium for `ci`, chromium,pw-chromium,cft for `full`)
  *   AGENT_E2E_HEADLESS  `new`, `headed` or `both` (default: new for `ci`, both for `full`)
  *   AGENT_E2E_MATRIX    `ci` (default) or `full`
+ *   AGENT_E2E_EXPOSE    the CDP exposure ("attach mode") axis: `port`, `pipe` or `all` (default: port for `ci`, all for `full`)
+ * `expose` is the list of attach modes the run covers; lib/scenario.js crosses it with each scenario's `exposeModes`.
  */
 function matrix() {
   const m = process.env.AGENT_E2E_MATRIX || 'ci';
   const ids = (process.env.AGENT_E2E_BROWSERS || (m === 'full' ? 'chromium,pw-chromium,cft' : 'pw-chromium')).split(',').map(s => s.trim()).filter(Boolean);
   const hl = process.env.AGENT_E2E_HEADLESS || (m === 'full' ? 'both' : 'new');
   const modes = hl === 'both' ? ['new', 'headed'] : hl.split(',').map(s => s.trim());
+  const ex = process.env.AGENT_E2E_EXPOSE || (m === 'full' ? 'all' : 'port');
+  if (!['port', 'pipe', 'all'].includes(ex)) throw new Error(`AGENT_E2E_EXPOSE must be port, pipe or all (got ${ex})`);
+  const expose = ex === 'all' ? ['port', 'pipe'] : [ex];
   const out = [];
   for (const id of ids) for (const mode of modes) {
     const b = discover(id);
@@ -158,7 +163,7 @@ function matrix() {
     if (!skip && mode === 'headed' && !process.env.DISPLAY) skip = 'headed variant needs DISPLAY (run via run.sh, which uses xvfb-run)';
     out.push({ browser: b, mode, name: `${id}/${mode === 'new' ? 'headless' : 'headed'}`, skip });
   }
-  return { name: m, variants: out };
+  return { name: m, variants: out, expose };
 }
 
 /** Flags that belong to the variant (put after the executable in browser_command). */

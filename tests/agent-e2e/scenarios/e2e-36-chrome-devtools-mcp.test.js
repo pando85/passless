@@ -14,6 +14,7 @@ const selectedPageId = res => {
 // a browser context of its own, created over CDP). The adapter ensures the browser first and runs
 // `npx --yes chrome-devtools-mcp --browserUrl http://127.0.0.1:<port>`: puppeteer cannot send the bootstrap's bearer header, so
 // discovery cannot be lazy and authenticated here.
+// Port-only: chrome-devtools-mcp needs a CDP endpoint, which a pipe-mode profile refuses (ADR 0014 §4.3; the refusal is E2E-53).
 scenario({ id: 'E2E-36', title: 'chrome-devtools-mcp via `agent mcp chrome-devtools`, including isolatedContext', ci: false }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

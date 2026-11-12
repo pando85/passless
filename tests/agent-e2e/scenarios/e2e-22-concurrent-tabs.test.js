@@ -16,6 +16,7 @@ const TABS = 20;
 const CAP = 8;
 const HOLD_MS = 4000;
 
+// Port-only (not ported): 20 concurrent tabs; E2E-14, 25 and 48 cover concurrent tabs in pipe mode.
 scenario({ id: 'E2E-22', title: '20 concurrent ceremonies across tabs: no silent drops, caps answer busy', timeoutMs: 240000 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

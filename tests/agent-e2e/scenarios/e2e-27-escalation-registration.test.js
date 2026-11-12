@@ -9,7 +9,7 @@ const REGISTRATION = { rps: { a: { host: 'rp-a.test' } }, profiles: { iso: reque
 
 // ADR 0014 section 8.3: an approved registration persists `authenticate = allow` for the RP with `kind = registration` and
 // the new credential's reference, but not `register = allow`: the next registration prompts again.
-scenario({ id: 'E2E-27', title: 'registration escalation: one credential, a registration grant with credential_ref, the next registration prompts', ci: true }, async ctx => {
+scenario({ id: 'E2E-27', exposeModes: ['port', 'pipe'], title: 'registration escalation: one credential, a registration grant with credential_ref, the next registration prompts', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...REGISTRATION, notify: { script: ['approve:1500', 'deny:500'] } });
   const rp = stack.rp.a;
   const b = await stack.open('iso', `${rp.origin}/raw`);
@@ -48,7 +48,7 @@ scenario({ id: 'E2E-27', title: 'registration escalation: one credential, a regi
 // name and display name and the RP name, none of which may reach the notification. The actions are exactly allow_always
 // and deny, and the notification never expires on its own (`expire_timeout = 0`).
 const MARK = 'MARKER-9f3a7c';
-scenario({ id: 'E2E-28', title: 'the notification shows daemon-derived text only (no page markers), exactly two actions, no expiry', ci: true }, async ctx => {
+scenario({ id: 'E2E-28', exposeModes: ['port', 'pipe'], title: 'the notification shows daemon-derived text only (no page markers), exactly two actions, no expiry', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: requestProfile(['rp-a.test'], { register: 'request' }) },

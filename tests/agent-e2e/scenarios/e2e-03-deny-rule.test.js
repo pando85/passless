@@ -3,7 +3,7 @@ const { scenario, assert } = require('../lib/scenario');
 const { authenticate, policyEvents, storeFingerprint, assertInterceptionActive, assertNoNotification } = require('../lib/helpers');
 
 // Catalogue: `deny` rule: NotAllowedError; no prompt; no key use; audit deny.
-scenario({ id: 'E2E-03', title: 'deny rule: NotAllowedError, no prompt, no key use', ci: true }, async ctx => {
+scenario({ id: 'E2E-03', exposeModes: ['port', 'pipe'], title: 'deny rule: NotAllowedError, no prompt, no key use', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     // B4 (fixed in P4): a profile whose rules are ALL deny must start. rp-a is explicitly denied and nothing else is allowed.

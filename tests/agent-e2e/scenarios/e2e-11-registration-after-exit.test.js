@@ -18,6 +18,7 @@ const { stopExtensionWorker } = require('../lib/browser');
 // No credential is created after the exit.
 //
 // The profile also carries a legacy `[device]` table: it must be warned about and ignored (R6, B6).
+// Port-only: reads the extension's bearer and stops its worker over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-11', title: 'registration after browser exit with the old bearer is refused', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

@@ -9,6 +9,7 @@ const { startPrincipalShell } = require('../lib/adapters');
 // started by `agent run`) calls `agent browser --env --wait`, gets PASSLESS_CDP_URL and connects with connectOverCDP(); the
 // page it drives, in the default context and in a context it creates over CDP, is intercepted. The second `agent browser`
 // call (--json) prints the same endpoint: the browser is ensured, not restarted.
+// Port-only: connectOverCDP(PASSLESS_CDP_URL) needs a CDP endpoint, which pipe mode never prints (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-37', title: 'Playwright connectOverCDP(PASSLESS_CDP_URL) from `agent browser`', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

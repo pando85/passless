@@ -38,6 +38,7 @@ async function relaunchBrowser(stack, old, rp, what) {
   return fresh;
 }
 
+// Port-only: reads the extension's bearer and stops its worker over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52). Pipe-mode revocation is E2E-54.
 scenario({ id: 'E2E-31', title: 'grants CLI: list, revoke, clear; revocation kills sessions; a damaged store gives grants_unavailable and a doctor failure', ci: true, timeoutMs: 240000 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } },

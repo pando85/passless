@@ -9,6 +9,7 @@ const { stopExtensionWorker } = require('../lib/browser');
 // bearer, is signed for rp_id `localhost` / origin `http://localhost:<port>`. The worker is stopped first: the daemon
 // keeps one connection per bearer, so a live worker and this client would supersede each other.
 // Step 2 (page): the full path. The page's request wakes the stopped worker (plan D1), which reconnects and relays it.
+// Port-only: reads the extension's bearer and stops its worker over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-06', title: 'http://localhost RP works', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { local: { host: 'localhost' } },

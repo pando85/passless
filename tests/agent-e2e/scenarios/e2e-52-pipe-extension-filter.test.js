@@ -6,6 +6,7 @@ const { scenario, assert } = require('../lib/scenario');
 const { assertVerifiedAssertion, assertAgentAllowed, auditEvents, waitFor, HUMAN_CTAP_LOG } = require('../lib/helpers');
 const { startPrincipalShell, browserProcesses } = require('../lib/adapters');
 const { processesMentioning } = require('../lib/env');
+const { makeControl } = require('../lib/pipe-driver');
 
 // The fixed extension ID (the manifest `key`, `AGENT_EXTENSION_ID` in browser.rs).
 const EXTENSION_ID = 'lfbahamapdlbimlffmhiomfdemnjhjkc';
@@ -27,7 +28,7 @@ const EXTENSION_ID = 'lfbahamapdlbimlffmhiomfdemnjhjkc';
 //   on the agent path (a pipe-mode passkey login), without touching the human authenticator;
 // - the session's end tears the browser down, and the lease is audited (launch, with its CDP mode, then revoke/cleanup).
 scenario({
-  id: 'E2E-52', title: 'pipe mode: browser-control cannot reach the extension worker', ci: true,
+  id: 'E2E-52', title: 'pipe mode: browser-control cannot reach the extension worker', ci: true, pinsExpose: 'pipe',
 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
@@ -38,7 +39,6 @@ scenario({
   const logBefore = stack.daemon.log().length;
 
   const dir = fs.mkdtempSync(path.join(stack.env.dirs.work, 'pipe-agent-'));
-  const fifo = path.join(dir, 'requests');
   // `agent browser` ensures the session's browser and waits for interception; in pipe mode it prints how to drive it
   // (no endpoint), and `browser-status` reports the same lease.
   const agent = startPrincipalShell(stack, 'agent', [
@@ -56,21 +56,8 @@ scenario({
     'done',
   ].join('\n'));
 
-  let seq = 0;
-  /** One browser-control call from inside the principal session: {rc, messages, stderr}. */
-  const control = async (method, params, sessionId) => {
-    seq += 1;
-    const request = { id: seq, method, ...(params ? { params } : {}), ...(sessionId ? { sessionId } : {}) };
-    const file = path.join(dir, `req-${seq}.json`);
-    fs.writeFileSync(file, JSON.stringify(request), { mode: 0o600 });
-    fs.appendFileSync(fifo, `${file}\n`);
-    await waitFor(`browser-control ${method} to finish`, () => fs.existsSync(`${file}.rc`), { timeoutMs: 60000, intervalMs: 50 });
-    const rc = Number(fs.readFileSync(`${file}.rc`, 'utf8').trim());
-    const stdout = fs.readFileSync(`${file}.out`, 'utf8');
-    const stderr = fs.readFileSync(`${file}.err`, 'utf8');
-    const messages = rc === 0 ? JSON.parse(stdout).data.messages.map(m => JSON.parse(m)) : [];
-    return { rc, messages, stderr, response: messages.find(m => m.id === seq) };
-  };
+  /** One browser-control call from inside the principal session (lib/pipe-driver.js): {rc, messages, stderr, response}. */
+  const control = makeControl(dir);
   const assertDenied = async (label, method, params, sessionId) => {
     const r = await control(method, params, sessionId);
     assert.notEqual(r.rc, 0, `${label} was not refused: ${JSON.stringify(r.messages)}`);
@@ -202,7 +189,7 @@ scenario({
 // refused even for an ordinary page, and so are `about:` pages other than about:blank and about:srcdoc.
 // (Review H1 and M-a, cdp_filter.rs.)
 scenario({
-  id: 'E2E-52/strict', title: 'pipe mode: non-flat sessions, sendMessageToTarget and about: pages are refused', ci: true,
+  id: 'E2E-52/strict', title: 'pipe mode: non-flat sessions, sendMessageToTarget and about: pages are refused', ci: true, pinsExpose: 'pipe',
 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
@@ -210,7 +197,6 @@ scenario({
   });
   const rp = stack.rp.a;
   const dir = fs.mkdtempSync(path.join(stack.env.dirs.work, 'pipe-strict-'));
-  const fifo = path.join(dir, 'requests');
   const agent = startPrincipalShell(stack, 'agent', [
     `D=${JSON.stringify(dir)}`,
     'mkfifo "$D/requests"',
@@ -222,18 +208,7 @@ scenario({
     '  echo $? >"$req.rc.tmp" && mv "$req.rc.tmp" "$req.rc"',
     'done',
   ].join('\n'));
-  let seq = 0;
-  const control = async (method, params, sessionId) => {
-    seq += 1;
-    const request = { id: seq, method, ...(params ? { params } : {}), ...(sessionId ? { sessionId } : {}) };
-    const file = path.join(dir, `req-${seq}.json`);
-    fs.writeFileSync(file, JSON.stringify(request), { mode: 0o600 });
-    fs.appendFileSync(fifo, `${file}\n`);
-    await waitFor(`browser-control ${method} to finish`, () => fs.existsSync(`${file}.rc`), { timeoutMs: 60000, intervalMs: 50 });
-    const rc = Number(fs.readFileSync(`${file}.rc`, 'utf8').trim());
-    const messages = rc === 0 ? JSON.parse(fs.readFileSync(`${file}.out`, 'utf8')).data.messages.map(m => JSON.parse(m)) : [];
-    return { rc, messages, stderr: fs.readFileSync(`${file}.err`, 'utf8'), response: messages.find(m => m.id === seq) };
-  };
+  const control = makeControl(dir);
   const assertDenied = async (label, method, params, sessionId) => {
     const r = await control(method, params, sessionId);
     assert.notEqual(r.rc, 0, `${label} was not refused: ${JSON.stringify(r.messages)}`);

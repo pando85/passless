@@ -3,7 +3,7 @@ const { scenario, assert } = require('../lib/scenario');
 const { authenticate, policyEvents, storeFingerprint, assertInterceptionActive, assertNoNotification } = require('../lib/helpers');
 
 // Catalogue: unlisted RP, no wildcard: NotAllowedError, no prompt.
-scenario({ id: 'E2E-04', title: 'unlisted RP without wildcard: NotAllowedError, no prompt', ci: true }, async ctx => {
+scenario({ id: 'E2E-04', exposeModes: ['port', 'pipe'], title: 'unlisted RP without wildcard: NotAllowedError, no prompt', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } },
     // Only rp-a is listed. rp-b has a credential in the human store but no rule.

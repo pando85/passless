@@ -17,6 +17,7 @@ const { waitForPage } = require('../lib/stack');
 const HOLD_MS = 330000;
 const PAGE_TIMEOUT_MS = 600000;
 
+// Port-only: inspects and restarts the extension worker over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-20', title: 'long wait (> 5 min) completes: native-port keepalive beats the MV3 limit', timeoutMs: HOLD_MS + 180000 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
@@ -69,6 +70,7 @@ scenario({ id: 'E2E-20', title: 'long wait (> 5 min) completes: native-port keep
 // Playwright is disconnected during the wait (see above) and reattached afterwards to read the page.
 const APPROVE_AFTER_MS = 360000;
 
+// Port-only: inspects and restarts the extension worker over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-20/escalation', title: 'escalation approved after 6 min completes', timeoutMs: APPROVE_AFTER_MS + 240000 }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

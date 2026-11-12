@@ -3,7 +3,7 @@ const { scenario, assert } = require('../lib/scenario');
 const { assertVerifiedAssertion, assertInterceptionActive, assertAgentAllowed } = require('../lib/helpers');
 
 // Catalogue: raw navigator.credentials page with `allowCredentials`: the correct credential is selected.
-scenario({ id: 'E2E-05', title: 'raw navigator.credentials page with allowCredentials selects the right credential' }, async ctx => {
+scenario({ id: 'E2E-05', exposeModes: ['port', 'pipe'], title: 'raw navigator.credentials page with allowCredentials selects the right credential' }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },

@@ -6,6 +6,7 @@ const { authenticate, policyEvents, storeFingerprint, assertInterceptionActive, 
 // Both RPs are allowed, so the only reason for the denial is the frame's origin. The iframe is delegated WebAuthn
 // (`allow="publickey-credentials-get *"` in pages/embed.html), so Chromium hands it to the extension's WebAuthn proxy with
 // `sameOriginWithAncestors = false`; the daemon must deny and audit it (`cross_origin_denied`) and sign nothing.
+// Port-only (not ported): needs the Playwright frame API for a cross-origin iframe; lib/pipe-driver.js is page-level.
 scenario({ id: 'E2E-10', title: 'cross-origin iframe is denied and audited', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' }, b: { host: 'rp-b.test' } },

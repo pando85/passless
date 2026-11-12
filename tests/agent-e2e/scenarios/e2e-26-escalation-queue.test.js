@@ -16,7 +16,7 @@ const { requestProfile, start, settle, waitForEscalation } = require('../lib/esc
 // by the coordinator unit tests (`escalation.rs`: queue overflow, FIFO, dequeue); the caps that E2E can reach are in E2E-48.
 const HOSTS = ['rp-a.test', 'rp-b.test', 'rp-c.test', 'rp-d.test'];
 
-scenario({ id: 'E2E-26', title: 'queued escalations prompt one at a time in arrival order and all complete', timeoutMs: 240000 }, async ctx => {
+scenario({ id: 'E2E-26', exposeModes: ['port', 'pipe'], title: 'queued escalations prompt one at a time in arrival order and all complete', timeoutMs: 240000 }, async ctx => {
   const stack = await ctx.stack({
     rps: Object.fromEntries('abcd'.split('').map(c => [c, { host: `rp-${c}.test` }])),
     profiles: { agent: requestProfile(HOSTS) },

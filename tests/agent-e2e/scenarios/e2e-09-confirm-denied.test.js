@@ -10,7 +10,7 @@ const { authenticate, policyEvents, auditEvents, storeFingerprint, assertInterce
 // Evidence that nothing reached the human authenticator (a credential for alice exists in its store, so a leak would
 // succeed): the RP never sees an assertion, the human store (including its signature counters) is unchanged, and
 // the daemon log has no new CTAP request after the ceremony. There is no notification server at all.
-scenario({ id: 'E2E-09', title: 'request rule without a notification server is denied (escalation_unavailable): no human authenticator', ci: true }, async ctx => {
+scenario({ id: 'E2E-09', exposeModes: ['port', 'pipe'], title: 'request rule without a notification server is denied (escalation_unavailable): no human authenticator', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'request', register: 'deny' }] } },

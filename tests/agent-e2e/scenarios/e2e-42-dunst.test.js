@@ -30,6 +30,7 @@ async function startXvfb(stack) {
 // people actually run. dunst needs a display: the headed variants have Xvfb's, the others get an Xvfb of their own
 // (the scenario fails if there is none); without dunst it skips (SKIP-OPT). The prompt has two actions, so `dunstctl action` opens dunst's context menu; the harness answers it
 // through dunst's `dmenu` setting with a script that picks "Allow always", which is what a person would click.
+// Port-only (axis-independent): exercises the real notification server (dunst), not the attach mode.
 scenario({ id: 'E2E-42', title: 'real dunst: approval with `dunstctl action`', ci: false }, async ctx => {
   if (!which('dunst') || !which('dunstctl')) skipOptional('dunst/dunstctl are not installed');
 

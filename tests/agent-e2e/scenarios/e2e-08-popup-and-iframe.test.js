@@ -5,6 +5,7 @@ const { authenticate, assertVerifiedAssertion, assertInterceptionActive, assertA
 // Catalogue: popup and same-origin iframe both work. Interception is the browser-level WebAuthn proxy (plan D1), so
 // every frame and window of the profile is covered without content scripts; the ceremonies below are verified by the
 // RP and audited as agent allows, and the human UHID authenticator logs no CTAP traffic meanwhile.
+// Port-only (not ported): needs Playwright frame and popup APIs; lib/pipe-driver.js is page-level (ADR 0014 §4.3 allows it through browser-control).
 scenario({ id: 'E2E-08', title: 'popup and same-origin iframe' }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

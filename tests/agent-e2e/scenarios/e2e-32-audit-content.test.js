@@ -43,7 +43,7 @@ function assertCanonicalFields(record, fields) {
   assert.deepEqual(missing, [], `${record.kind} for ${record.rp_id} lacks section 12 field(s) ${missing.join(', ')}: ${JSON.stringify(record)}`);
 }
 
-scenario({ id: 'E2E-32', title: 'audit content for allow, deny, escalation: every section 12 field, one terminal record per reservation', ci: true, timeoutMs: 240000 }, async ctx => {
+scenario({ id: 'E2E-32', exposeModes: ['port', 'pipe'], title: 'audit content for allow, deny, escalation: every section 12 field, one terminal record per reservation', ci: true, timeoutMs: 240000 }, async ctx => {
   const stack = await ctx.stack({
     rps: Object.fromEntries('abcd'.split('').map(c => [c, { host: `rp-${c}.test` }])),
     profiles: PROFILES,
@@ -189,23 +189,30 @@ scenario({ id: 'E2E-32', title: 'audit content for allow, deny, escalation: ever
 
   // --- Browser-lease records (ADR 0014 section 12): the launch is audited once, with the profile, before anything else
   // of the lease; the browser's end is audited too (a crash here) and followed by its cleanup, one record each.
-  const leaseId = b.lease.lease_id;
-  assert.ok(leaseId, `the launch response names the lease: ${JSON.stringify(b.lease)}`);
+  // Port mode: the admin launch response names the lease and the browser's pid, and the harness kills the browser (a crash).
+  // Pipe mode: the lease belongs to the principal session; its id is in the launch record, and the browser ends with the
+  // session (the harness ends it: a revocation, then the cleanup).
+  const pipe = !!b.pipe;
+  const launchRecords = auditEvents(audit).filter(e => e.kind === 'browser_lease.launch' && e.profile_id === 'agent');
+  const leaseId = pipe ? (launchRecords[0] || {}).lease_id : b.lease.lease_id;
+  assert.ok(leaseId, `the lease is named: ${JSON.stringify(pipe ? launchRecords : b.lease)}`);
   const leaseRecords = (events, kind) => auditEvents(events).filter(e => e.kind === kind && e.lease_id === leaseId);
   const launches = leaseRecords(audit, 'browser_lease.launch');
   assert.equal(launches.length, 1, `one browser_lease.launch for the session's lease: ${kinds}`);
   assert.equal(launches[0].profile_id, 'agent');
+  if (pipe) assert.equal(launches[0].cdp_expose, 'pipe', JSON.stringify(launches[0]));
   assert.equal(leaseRecords(audit, 'browser_lease.cleanup').length, 0, 'the lease is still live: no cleanup yet');
-  stack.env.killTree(b.lease.pid);
+  if (pipe) await b.browser.close(); else stack.env.killTree(b.lease.pid);
   const ended = await waitFor('the lease teardown to be audited', async () => {
     const events = await stack.daemon.audit();
     return leaseRecords(events, 'browser_lease.cleanup').length ? events : null;
-  });
-  assert.equal(leaseRecords(ended, 'browser_lease.crash').length, 1, 'the browser exit is audited once');
+  }, { timeoutMs: 60000 });
+  const endKind = pipe ? 'browser_lease.revoke' : 'browser_lease.crash';
+  assert.equal(leaseRecords(ended, endKind).length, 1, `the browser's end is audited once (${endKind})`);
   assert.equal(leaseRecords(ended, 'browser_lease.cleanup').length, 1, 'the cleanup is audited once');
   assert.equal(leaseRecords(ended, 'browser_lease.launch').length, 1, 'still exactly one launch record');
   const order = auditEvents(ended).filter(e => e.lease_id === leaseId).map(e => e.kind);
-  assert.ok(order.indexOf('browser_lease.launch') < order.indexOf('browser_lease.crash') && order.indexOf('browser_lease.crash') < order.indexOf('browser_lease.cleanup'), `launch, crash, cleanup in order: ${order}`);
+  assert.ok(order.indexOf('browser_lease.launch') < order.indexOf(endKind) && order.indexOf(endKind) < order.indexOf('browser_lease.cleanup'), `launch, ${endKind}, cleanup in order: ${order}`);
 });
 
 // Abort before key use: Chromium rejects the page's promise with AbortError, the worker sends `abort{id}` and the daemon cancels
@@ -213,7 +220,7 @@ scenario({ id: 'E2E-32', title: 'audit content for allow, deny, escalation: ever
 // was reserved, so no terminal record is owed.
 const HOLD_MS = 6000;
 
-scenario({ id: 'E2E-32/abort', title: 'an aborted ceremony is audited with every section 12 field and no reservation', ci: true }, async ctx => {
+scenario({ id: 'E2E-32/abort', exposeModes: ['port', 'pipe'], title: 'an aborted ceremony is audited with every section 12 field and no reservation', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },

@@ -4,7 +4,7 @@ const { authenticate, policyEvents, assertVerifiedAssertion, assertInterceptionA
 
 // Catalogue: same-user `allow`, authenticate at rp-a (SimpleWebAuthn). RP verifies signature, UP=1, UV=1,
 // counter increments; audit shows `agent` evidence.
-scenario({ id: 'E2E-01', title: 'same-user allow: authenticate at rp-a (SimpleWebAuthn)', ci: true }, async ctx => {
+scenario({ id: 'E2E-01', title: 'same-user allow: authenticate at rp-a (SimpleWebAuthn)', ci: true, exposeModes: ['port', 'pipe'] }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },

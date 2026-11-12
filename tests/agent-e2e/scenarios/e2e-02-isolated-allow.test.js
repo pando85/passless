@@ -5,7 +5,7 @@ const { authenticate, policyEvents, assertVerifiedAssertion, assertInterceptionA
 // Catalogue: isolated `allow`: register then authenticate. The credential lands in the profile store, not in the human
 // store. Both ceremonies go through @simplewebauthn/browser and are verified by @simplewebauthn/server, so a bad
 // COSE_Key or attestation object (defect B3) or a response the page cannot consume fails here.
-scenario({ id: 'E2E-02', title: 'isolated allow: register then authenticate', ci: true }, async ctx => {
+scenario({ id: 'E2E-02', exposeModes: ['port', 'pipe'], title: 'isolated allow: register then authenticate', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { iso: { mode: 'isolated', rules: [{ rp: 'rp-a.test', register: 'allow', authenticate: 'allow' }] } },

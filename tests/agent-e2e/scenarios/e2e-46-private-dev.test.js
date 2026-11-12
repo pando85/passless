@@ -57,6 +57,7 @@ function accessible(node) {
   try { fs.accessSync(node, fs.constants.R_OK | fs.constants.W_OK); return true; } catch { return false; }
 }
 
+// Port-only: needs the admin-launched lease's pid and a live Playwright connection (a CDP port, ADR 0014 §4.3); containment does not depend on the attach mode.
 scenario({ id: 'E2E-46', title: 'the managed browser runs in a private /dev without hidraw or uhid', ci: true }, async ctx => {
   const stack = await ctx.stack(ONE_RP);
   const rp = stack.rp.a;
@@ -88,6 +89,7 @@ scenario({ id: 'E2E-46', title: 'the managed browser runs in a private /dev with
   assert.doesNotMatch(stack.daemon.log().slice(logBefore), HUMAN_CTAP_LOG, 'the human authenticator handled no request');
 });
 
+// Port-only: needs the admin-launched lease's pid and a live Playwright connection (a CDP port, ADR 0014 §4.3); containment does not depend on the attach mode.
 scenario({ id: 'E2E-46/refused', title: 'no bwrap and an openable hidraw node: the launch is refused', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, daemonEnv: { PASSLESS_E2E_DISABLE_BWRAP: '1' } });
   assert.ok(stack.daemon.hidraw && accessible(stack.daemon.hidraw),
@@ -106,6 +108,7 @@ scenario({ id: 'E2E-46/refused', title: 'no bwrap and an openable hidraw node: t
   assert.deepEqual(browsers, [], `a browser process exists: ${browsers.map(p => cmdline(p).slice(0, 2).join(' ')).join('; ')}`);
 });
 
+// Port-only: needs the admin-launched lease's pid and a live Playwright connection (a CDP port, ADR 0014 §4.3); containment does not depend on the attach mode.
 scenario({ id: 'E2E-46/session-scope', title: 'a session-scoped browser outlives its launch request (B1)', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, browserScope: 'session' });
   const rp = stack.rp.a;

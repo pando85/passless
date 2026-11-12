@@ -8,6 +8,7 @@ const { assertInterceptionActive, escalationEvents, grantedRuleEvents, denyReaso
 // as the timeout), so the audit says `escalation.expired` with `reason = timeout` and the page sees NotAllowedError.
 const PAGE_TIMEOUT_MS = 180000;
 
+// Port-only (budget): a 3 minute escalation timeout; the pipe path of the same escalation is E2E-23, 24 and 50 without the wait.
 scenario({
   id: 'E2E-21', title: 'page timeout 3 min without approval: fails at about 3 min, notification withdrawn, expired(timeout)',
   timeoutMs: 360000,

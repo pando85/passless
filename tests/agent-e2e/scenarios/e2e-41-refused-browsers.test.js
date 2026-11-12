@@ -33,6 +33,7 @@ const markerOf = file => `${file}.started`;
 // real ones: branded Chrome prints "Google Chrome 157...", while chrome-headless-shell prints "Google Chrome for Testing
 // ..." like the full Chrome for Testing, so it is recognised by its name); the real binaries are used too when present.
 // `passless doctor --agents` reports the same refusal. A supported browser named the same way launches (positive control).
+// Port-only (axis-independent): the refused browser is rejected at launch, before any CDP exposure exists (ADR 0014 §4.3 does not apply).
 scenario({ id: 'E2E-41', title: '`agents.browser_path` set to Google Chrome or chrome-headless-shell is refused', ci: true }, async ctx => {
   const probe = await ctx.stack({ rps: { a: { host: 'rp-a.test' } }, profiles, notify: false });
   const fakes = path.join(probe.env.dirs.work, 'fake-browsers');

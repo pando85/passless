@@ -8,7 +8,7 @@ const ONE_RP = { rps: { a: { host: 'rp-a.test' } }, profiles: { agent: requestPr
 
 // A parked escalation holds no lock of the human path (plan section 5: the human operation lock can be acquired while a
 // waiter is parked): while an agent request waits for approval, a human ceremony on the daemon's UHID authenticator completes.
-scenario({ id: 'E2E-43', title: 'a human ceremony completes while an escalation is pending' }, async ctx => {
+scenario({ id: 'E2E-43', exposeModes: ['port', 'pipe'], title: 'a human ceremony completes while an escalation is pending' }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['ignore'] } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -34,6 +34,7 @@ scenario({ id: 'E2E-43', title: 'a human ceremony completes while an escalation 
 // Escalation never reads it: the agent request still prompts, and with nobody approving it is never auto-approved.
 // The operator acknowledges the combination (`agents.allow_automatic_human_path`, R19); without it agents refuse to
 // start (E2E-44/startup-refusal).
+// Port-only (axis-independent): the automatic-interaction check does not depend on the attach mode.
 scenario({ id: 'E2E-44', title: 'automatic interaction mode never auto-approves an escalation' }, async ctx => {
   const stack = await ctx.stack({
     ...ONE_RP, notify: { script: ['deny:500'] }, agents: { allow_automatic_human_path: true },
@@ -61,6 +62,7 @@ scenario({ id: 'E2E-44', title: 'automatic interaction mode never auto-approves 
 
 // R19: a daemon whose human path is automatic refuses to run the agent subsystem while a same-user profile has an
 // `allow` or `request` rule, unless `agents.allow_automatic_human_path` says so. The human path stays up.
+// Port-only (axis-independent): the automatic-interaction check does not depend on the attach mode.
 scenario({
   id: 'E2E-44/startup-refusal', title: 'agents refuse to start in automatic interaction mode without agents.allow_automatic_human_path',
 }, async ctx => {

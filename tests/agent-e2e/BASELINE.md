@@ -1,5 +1,40 @@
 # E2E baseline
 
+## Pipe-mode attach axis (ADR 0014 section 4.3), 2026-11-12
+
+Branch `feat/agent-delegation-adr-0014`, on top of `794942d`. Debug build, `--features agent`, no Rust changes. The matrix gained a
+third axis, the CDP exposure ("attach mode", `AGENT_E2E_EXPOSE=port|pipe|all`; see `README.md`, "Attach modes"). Until now every
+scenario ran with `browser_cdp_expose = "port"`, except E2E-52 and 52/strict; pipe mode, the ADR's default, was never exercised end to
+end by the core flows. In pipe mode the harness drives each page through `passless agent browser-control` from a principal session
+(`lib/pipe-driver.js`), so every command passes the daemon's CDP filter and is audited per command; there is no CDP port and no
+Playwright connection.
+
+- Command: `AGENT_E2E_MATRIX=full AGENT_E2E_EXPOSE=pipe tests/agent-e2e/run.sh <ids>`, in two batches, chromium, pw-chromium and cft,
+  headed and headless:
+  - E2E-01 to 05, 09, 12 (+/audit-rule), 14, 15, 23, 24, 25, 27, 28, 32 (+/abort), 48, 52, 52/strict, 53, 54: 132 PASS (22 on each of
+    the 6 variants), 0 FAIL, 695 s.
+  - E2E-07, 13, 16, 17 (+/after-key-use), 26, 29, 30, 33, 43, 49, 50, 51: 78 PASS (13 on each variant), 0 FAIL, 426 s.
+  - Total: 210 PASS in pipe mode (35 on each variant), 0 FAIL, 0 SKIP, hermeticity guard clean.
+- `make test-agent-e2e` (CI subset, port only): unchanged, PASS=46 on pw-chromium headless, guard clean.
+- Per-variant pipe results (all PASS): `chromium/headed`, `chromium/headless`, `pw-chromium/headed`, `pw-chromium/headless`, `cft/headed`,
+  `cft/headless`: 35 PASS each.
+- Expected added full-matrix runtime: about 1,100 s of measured pipe time (the 12 E2E-52 runs were already in the 6,980 s), so a
+  full run of both modes is about 8,100 s; the 14,400 s limit is unchanged.
+- Pipe-only scenarios added: E2E-53 (the Playwright MCP and chrome-devtools adapters, which are `direct_cdp` clients, are refused for
+  a pipe-mode profile before any browser starts; a port-mode profile of the same daemon and a pipe session of the refused profile are
+  the controls) and E2E-54 (`grants revoke` ends the principal session and its browser, `browser-control` is refused afterwards, a new
+  session gets a fresh lease and the revoked RP prompts again).
+- Port-only scenarios keep a one-line comment with the reason: the Playwright, chrome-devtools, browser-use and agent-browser tools need
+  a CDP endpoint, and E2E-06, 11, 18, 19, 20, 31, 45 read or stop the extension worker, which the filter hides in pipe mode (E2E-52).
+  Not ported yet (driver is page-level): E2E-08, 10 (frames and popups), 22 (20 tabs), 21 (3 minute timeout).
+- Finding (not a safety issue; the refusal is enforced): `agent mcp playwright` against a pipe-mode profile fails its first tool call
+  with Playwright's `Unexpected status 503 when connecting to .../json/version/ ... does not look like a DevTools server`, and the
+  wrapper prints nothing. `cdp_bootstrap.rs` says the full refusal text goes to "the wrapper's stderr (and the daemon's log)", but
+  the `agent` client subcommands run before logging is initialised in `main.rs`, so `log::warn!` is dropped and the daemon never
+  sees the refusal. The documented text ("requires browser_cdp_expose = 'port' ...; in pipe mode run `passless agent browser`")
+  reaches the user only through `agent mcp chrome-devtools`, which exits with it on stderr. E2E-53 asserts the 503, the absence of
+  any browser or lease, and the port-mode control for Playwright MCP, and the documented text for chrome-devtools.
+
 ## P12 (final gate), 2026-11-12
 
 Branch `feat/agent-delegation-adr-0014` at `602db70`. Debug build, `--features agent`.

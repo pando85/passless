@@ -11,7 +11,7 @@ const untilNextSecondAfter = async t => { const target = (Math.floor(t / 1000) +
 // Catalogue: multi-account RP with `single` / `newest` / `credential:<ref>`: deterministic selection;
 // `single` errors on ambiguity. Authentication is discoverable (no username, no allowCredentials), so the
 // daemon's selection policy decides.
-scenario({ id: 'E2E-07', title: 'multi-account RP: single / newest / credential:<ref> selection' }, async ctx => {
+scenario({ id: 'E2E-07', exposeModes: ['port', 'pipe'], title: 'multi-account RP: single / newest / credential:<ref> selection' }, async ctx => {
   const rule = [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }];
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

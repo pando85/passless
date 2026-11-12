@@ -7,7 +7,7 @@ const { policyEvents, auditEvents, assertInterceptionActive } = require('../lib/
 // then rejects the page's create() with NotAllowedError because the tab does not have focus. The audit records the
 // registration and an orphan credential stays in the isolated profile store until the operator deletes it with
 // `passless agent-admin credential delete <ref> --confirm` (found with `agent-admin credential list`).
-scenario({ id: 'E2E-51', title: 'create() from an unfocused tab: NotAllowedError, audited registration, orphan removable' }, async ctx => {
+scenario({ id: 'E2E-51', exposeModes: ['port', 'pipe'], title: 'create() from an unfocused tab: NotAllowedError, audited registration, orphan removable' }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { iso: { mode: 'isolated', rules: [{ rp: 'rp-a.test', register: 'allow', authenticate: 'allow' }] } },

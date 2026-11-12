@@ -7,6 +7,7 @@ const { stopExtensionWorker, extensionWorkerTargets } = require('../lib/browser'
 // the way Chromium stops an idle worker). Its native port closes, so the relay exits and the daemon sees the connection
 // end. The next request wakes the worker (its proxy listeners are registered synchronously at top level and the
 // attachment is browser-side state, spike Q2): it says hello again on a new connection and the ceremony succeeds.
+// Port-only: stops the extension worker target over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-18', title: 'worker stopped between requests: the next request wakes it, reconnects and succeeds' }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

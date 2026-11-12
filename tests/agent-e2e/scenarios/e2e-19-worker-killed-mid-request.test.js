@@ -16,6 +16,7 @@ const { stopExtensionWorker, extensionWorkerTargets } = require('../lib/browser'
 const HOLD_MS = 8000;
 const WAIT_MS = 8000;
 
+// Port-only: stops/kills the extension worker target over CDP; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-19', title: 'worker killed during a pending request: NotAllowedError, daemon cancels, nothing orphaned' }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

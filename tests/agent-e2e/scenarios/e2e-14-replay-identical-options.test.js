@@ -6,7 +6,7 @@ const { parseAuthData } = require('../lib/rp-server');
 // Catalogue: replay, page resubmits identical options (Kanidm pattern). ADR 0014 section 9: per bearer session the
 // replay key is SHA-256(action | rp_id | origin | top_origin | challenge). An identical request never signs twice:
 // a duplicate in flight joins the first; after completion it gets the original result for 120 s.
-scenario({ id: 'E2E-14', title: 'Replay: page resubmits identical options (Kanidm pattern)', ci: true }, async ctx => {
+scenario({ id: 'E2E-14', exposeModes: ['port', 'pipe'], title: 'Replay: page resubmits identical options (Kanidm pattern)', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { agent: { mode: 'same-user', rules: [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }] } },

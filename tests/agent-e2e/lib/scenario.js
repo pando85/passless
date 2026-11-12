@@ -3,7 +3,12 @@
 //
 //   scenario({ id: 'E2E-01', title: '...', ci: true, xfailUntil: 'P4', xfailReason: '...' }, async ctx => { ... })
 //
-// - A scenario runs once per matrix variant (browser x headless/headed), see browser.matrix().
+// - A scenario runs once per matrix variant (browser x headless/headed), see browser.matrix(), and once per CDP
+//   exposure ("attach mode") it supports: `exposeModes: ['port', 'pipe']` (default `['port']`) crossed with the run's
+//   AGENT_E2E_EXPOSE (`port`, `pipe`, `all`; default port for ci, all for full). A scenario in pipe mode drives its
+//   pages through `passless agent browser-control` (lib/pipe-driver.js), never through a CDP port. The variant name
+//   carries the mode (`chromium/headless/pipe`) whenever the run includes pipe; a port-only run keeps the old names.
+//   `pinsExpose: 'pipe'`: the scenario writes its own pipe-mode profiles and runs once per variant whatever the axis says.
 // - `ci: true` marks the CI subset (catalogue "C"). AGENT_E2E_MATRIX=ci runs only those.
 //   AGENT_E2E_FILTER (comma list of ids or numbers, e.g. "E2E-01,6") overrides the CI selection.
 // - `xfailUntil: 'Pn'` + `xfailReason` + `xfailMatch` (a RegExp, required): a failure whose message matches is
@@ -52,10 +57,14 @@ function scenario(meta, body) {
     throw new Error(`${meta.id}: xfailUntil requires an xfailMatch RegExp describing the expected failure`);
   }
   if (!selected(meta)) return;
-  const { variants } = matrix();
-  for (const variant of variants) {
+  const { variants: matrixVariants, expose } = matrix();
+  const unknown = (meta.exposeModes || []).filter(m => !['port', 'pipe'].includes(m));
+  if (unknown.length) throw new Error(`${meta.id}: unknown exposeModes ${unknown.join(', ')}`);
+  const modes = meta.pinsExpose ? [meta.pinsExpose] : (meta.exposeModes || ['port']).filter(m => expose.includes(m));
+  const labelled = expose.includes('pipe');
+  for (const variant of matrixVariants.flatMap(v => modes.map(mode => ({ ...v, expose: mode, name: labelled ? `${v.name}/${mode}` : v.name })))) {
     const name = `${meta.id} ${meta.title} [${variant.name}]`;
-    const base = { id: meta.id, title: meta.title, variant: variant.name, ci: !!meta.ci };
+    const base = { id: meta.id, title: meta.title, variant: variant.name, expose: variant.expose, ci: !!meta.ci };
     if (variant.skip) {
       record({ ...base, status: 'SKIP', reason: variant.skip });
       test(name, { skip: variant.skip }, () => {});

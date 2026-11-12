@@ -6,6 +6,7 @@ const { processesMentioning } = require('../lib/env');
 // Catalogue: extension directory missing or unloadable: launch fails with an actionable error; no browser without
 // interception (plan D6 layer 2). The daemon (debug build) drops the generated extension directory when
 // PASSLESS_E2E_OMIT_AGENT_EXTENSION is set, which is what a missing or unreadable directory looks like to the launcher.
+// Port-only (axis-independent): a missing or unloadable extension fails the launch, before any CDP exposure exists.
 scenario({ id: 'E2E-47', title: 'missing extension directory is a launch error; no browser starts', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
@@ -34,6 +35,7 @@ scenario({ id: 'E2E-47', title: 'missing extension directory is a launch error; 
 // browser refuses to load would block headed Chromium on a modal dialog before it opens its debugging port). The
 // worker never says hello, so the launch fails closed at the attach timeout, the browser is stopped and no endpoint is
 // handed out.
+// Port-only (axis-independent): a missing or unloadable extension fails the launch, before any CDP exposure exists.
 scenario({ id: 'E2E-47/unloadable', title: 'an extension the browser cannot load is a launch error; the browser is stopped', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

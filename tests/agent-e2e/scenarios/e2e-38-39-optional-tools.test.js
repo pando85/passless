@@ -39,6 +39,7 @@ function findOnPath(name, extraDirs = []) {
   return null;
 }
 
+// Port-only: browser-use and agent-browser attach to a CDP endpoint, which pipe mode never prints (ADR 0014 §4.3).
 scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (local, optional)', ci: false }, async ctx => {
   const python = process.env.AGENT_E2E_BROWSER_USE_PYTHON || (fs.existsSync(CACHED_PYTHON) ? CACHED_PYTHON : findOnPath('python3'));
   if (!python) skipOptional('no python3');
@@ -83,6 +84,7 @@ scenario({ id: 'E2E-38', title: 'browser-use with cdp_url from `agent browser` (
   } finally { await agent.close(); }
 });
 
+// Port-only: browser-use and agent-browser attach to a CDP endpoint, which pipe mode never prints (ADR 0014 §4.3).
 scenario({ id: 'E2E-39', title: 'agent-browser --cdp with the endpoint from `agent browser` (local, optional)', ci: false }, async ctx => {
   const bin = process.env.AGENT_E2E_AGENT_BROWSER || findOnPath('agent-browser', [path.join(HARNESS_ROOT, 'node_modules', '.bin'), CACHED_BIN_DIR]);
   if (!bin) skipOptional('agent-browser is not installed (npm i -g agent-browser, or set AGENT_E2E_AGENT_BROWSER)');

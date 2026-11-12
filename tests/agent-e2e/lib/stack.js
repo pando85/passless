@@ -13,6 +13,7 @@ const { RpServer } = require('./rp-server');
 const { ensureTestTls, rpBrowserArgs } = require('./tls');
 const { variantArgs, connect, waitForExtensionWorker, launchPlain } = require('./browser');
 const { startAdapter } = require('./adapters');
+const { openPipe } = require('./pipe-driver');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -42,7 +43,7 @@ async function waitForPage(context, url, timeoutMs = 15000) {
  */
 async function createStack(label, variant, o) {
   const env = createEnv(label);
-  const stack = { env, variant, rp: {}, browsers: [], adapters: [], failed: false };
+  const stack = { env, variant, rp: {}, browsers: [], adapters: [], pipeAgents: [], failed: false };
   try {
     const tls = Object.values(o.rps || {}).some(r => r.host && r.host !== 'localhost') ? ensureTestTls() : null;
     for (const [key, spec] of Object.entries(o.rps || {})) {
@@ -54,6 +55,7 @@ async function createStack(label, variant, o) {
 
     stack.startDaemon = profiles => startDaemon(env, {
       profiles,
+      expose: variant.expose || 'port',
       limits: o.limits,
       agents: o.agents,
       browserScope: o.browserScope,
@@ -63,6 +65,7 @@ async function createStack(label, variant, o) {
       // The principal sessions the daemon starts inherit its environment: the npx shim logs here.
       env: { AGENT_E2E_NPX_LOG: path.join(env.dirs.logs, 'npx.jsonl'), ...(o.daemonEnv || {}) },
     });
+    stack.profiles = o.profiles;
     stack.daemon = await stack.startDaemon(o.profiles);
   } catch (e) {
     // The stack never reaches the caller, so keep the evidence and clean up here.
@@ -79,6 +82,9 @@ async function createStack(label, variant, o) {
   stack.restartDaemon = async profiles => {
     for (const b of stack.browsers) { try { await b.browser.close(); } catch { /* gone */ } }
     stack.browsers = [];
+    for (const a of stack.pipeAgents) { try { await a.close(); } catch { /* gone */ } }
+    stack.pipeAgents = [];
+    stack.profiles = profiles;
     await stack.daemon.stop();
     fs.rmSync(path.join(env.dirs.run, 'agent'), { recursive: true, force: true });
     stack.daemon = await stack.startDaemon(profiles);
@@ -106,8 +112,12 @@ async function createStack(label, variant, o) {
     return a;
   };
 
-  /** Launch the managed browser for `profile` via the product path and attach Playwright. */
+  /** The attach mode (CDP exposure) of `profile`: its own `cdpExpose`, else the run's. */
+  stack.exposeOf = profile => ((stack.profiles || {})[profile] || {}).cdpExpose || variant.expose || 'port';
+
+  /** Launch the managed browser for `profile` via the product path and attach Playwright (port mode only). */
   stack.launch = async (profile, startUrl) => {
+    if (stack.exposeOf(profile) === 'pipe') throw new Error(`stack.launch(${profile}): a pipe-mode profile has no CDP endpoint to attach Playwright to; use stack.open (browser-control)`);
     const lease = await stack.daemon.launchBrowser(profile, startUrl);
     const { browser, context } = await connect(lease.cdpUrl);
     const b = { lease, browser, context, cdpUrl: lease.cdpUrl, profile };
@@ -127,6 +137,12 @@ async function createStack(label, variant, o) {
    * profile's rules do not admit as a start URL (an unlisted or denied RP); interception is attached either way.
    */
   stack.open = async (profile, url, { startUrl = true } = {}) => {
+    // Pipe mode: a principal session ensures the browser and the page is driven through `browser-control` (lib/pipe-driver.js).
+    if (stack.exposeOf(profile) === 'pipe') {
+      const b = await openPipe(stack, profile, url, { startUrl });
+      stack.browsers.push(b);
+      return b;
+    }
     const b = await stack.launch(profile, startUrl ? url : undefined);
     b.extensionWorker = await waitForExtensionWorker(b.browser);
     if (startUrl) {
@@ -185,6 +201,8 @@ async function closeStack(stack, failed) {
   stack.adapters = [];
   for (const b of stack.browsers || []) { try { await b.browser.close(); } catch { /* gone */ } }
   stack.browsers = [];
+  for (const a of stack.pipeAgents || []) { try { await a.close(); } catch { /* gone */ } }
+  stack.pipeAgents = [];
   if (stack.daemon) { try { await stack.daemon.stop(); } catch { /* gone */ } }
   if (stack.notify) { try { await stack.notify.stop(); } catch { /* gone */ } }
   for (const rp of Object.values(stack.rp || {})) { try { await rp.stop(); } catch { /* gone */ } }

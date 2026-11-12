@@ -7,7 +7,7 @@ const { policyEvents, assertVerifiedAssertion, assertInterceptionActive, assertN
 // `instanceof PublicKeyCredential`, an AuthenticatorAttestationResponse / AuthenticatorAssertionResponse, and a working
 // `toJSON()`, whose output (not a page-built serialisation) the RP verifies. No MAIN-world shim exists: the
 // navigator.credentials methods are the browser's own and no Passless attribute or global is present.
-scenario({ id: 'E2E-16', title: 'native PublicKeyCredential for create and get; no MAIN-world shim', ci: true }, async ctx => {
+scenario({ id: 'E2E-16', exposeModes: ['port', 'pipe'], title: 'native PublicKeyCredential for create and get; no MAIN-world shim', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
     profiles: { iso: { mode: 'isolated', rules: [{ rp: 'rp-a.test', register: 'allow', authenticate: 'allow' }] } },

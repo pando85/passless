@@ -19,6 +19,7 @@ const { stopExtensionWorker, extensionWorkerTargets } = require('../lib/browser'
 // launcher seeds incognito access for the extension (plan D4) and the launch requires the worker to report it.
 // Not covered here: an unloaded extension (chrome.runtime.reload()); no product path unloads it (plan D1), and D6
 // layer 3 (no device access, E2E-46) is what contains it.
+// Port-only: lists worker targets and creates browser contexts over a CDP port; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-45', title: 'never native: before attach, conditional mediation, worker stopped', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },
@@ -111,6 +112,7 @@ async function evaluateInTarget(cdp, targetId, expression, timeoutMs = 20000) {
 // would go native (contained by the private /dev, E2E-46). The scenario still never issues a ceremony there unless the
 // proxy is proven attached: it first asks isConditionalMediationAvailable() (false only under the proxy, true
 // natively; spike Q6) and fails before any get() when it is true.
+// Port-only: lists worker targets and creates browser contexts over a CDP port; the extension worker is hidden from the agent in pipe mode by design (ADR 0014 §4.3, E2E-52).
 scenario({ id: 'E2E-45/cdp-context', title: 'never native: request from a CDP-created browser context', ci: true }, async ctx => {
   const stack = await ctx.stack({
     rps: { a: { host: 'rp-a.test' } },

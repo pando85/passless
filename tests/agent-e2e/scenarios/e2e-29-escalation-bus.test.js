@@ -7,7 +7,7 @@ const ONE_RP = { rps: { a: { host: 'rp-a.test' } }, profiles: { agent: requestPr
 
 // The prompt child accepts `ActionInvoked` only from the notification server's unique name. Any other connection on the
 // session bus that emits the signal (here dbus-send, a separate connection) is ignored: the request stays pending.
-scenario({ id: 'E2E-29', title: 'a spoofed ActionInvoked from another bus connection is ignored: the request stays pending, no grant', ci: true }, async ctx => {
+scenario({ id: 'E2E-29', exposeModes: ['port', 'pipe'], title: 'a spoofed ActionInvoked from another bus connection is ignored: the request stays pending, no grant', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['ignore'] } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -42,7 +42,7 @@ scenario({ id: 'E2E-29', title: 'a spoofed ActionInvoked from another bus connec
 
 // Without a notification server the prompt child finds nobody to ask: the escalation is denied at once, audited, and no
 // cooldown is set (a later request is again `escalation_unavailable`, not `escalation_cooldown`).
-scenario({ id: 'E2E-30', title: 'no notification server: immediate deny, escalation_unavailable, audited, no cooldown' }, async ctx => {
+scenario({ id: 'E2E-30', exposeModes: ['port', 'pipe'], title: 'no notification server: immediate deny, escalation_unavailable, audited, no cooldown' }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: false });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -69,7 +69,7 @@ scenario({ id: 'E2E-30', title: 'no notification server: immediate deny, escalat
 
 // The notification server vanishes while a request waits: the escalation expires `server_lost` and sets no cooldown, so the
 // next request prompts on a restarted server and completes.
-scenario({ id: 'E2E-49', title: 'notification server lost while waiting: expires server_lost, no cooldown, the next request prompts on the new server' }, async ctx => {
+scenario({ id: 'E2E-49', exposeModes: ['port', 'pipe'], title: 'notification server lost while waiting: expires server_lost, no cooldown, the next request prompts on the new server' }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['ignore'] } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');

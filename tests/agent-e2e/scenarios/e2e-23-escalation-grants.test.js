@@ -11,7 +11,7 @@ const { parseAuthData } = require('../lib/rp-server');
 
 const ONE_RP = { rps: { a: { host: 'rp-a.test' } }, profiles: { agent: requestProfile(['rp-a.test']) } };
 
-scenario({ id: 'E2E-23', title: 'approved escalation completes, persists a grant, and the next ceremony needs no prompt', ci: true }, async ctx => {
+scenario({ id: 'E2E-23', exposeModes: ['port', 'pipe'], title: 'approved escalation completes, persists a grant, and the next ceremony needs no prompt', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['approve:1500'] } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -40,7 +40,7 @@ scenario({ id: 'E2E-23', title: 'approved escalation completes, persists a grant
   assert.equal(policyEvents(audit, 'policy.allow').length, allowsBefore + 1, 'the second ceremony is an ordinary allow');
 });
 
-scenario({ id: 'E2E-24', title: 'denied escalation starts the cooldown: no prompt during it, a prompt after it', ci: true }, async ctx => {
+scenario({ id: 'E2E-24', exposeModes: ['port', 'pipe'], title: 'denied escalation starts the cooldown: no prompt during it, a prompt after it', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['deny:500', 'deny:500'] }, agents: { escalation_cooldown: 2 } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -72,7 +72,7 @@ scenario({ id: 'E2E-24', title: 'denied escalation starts the cooldown: no promp
   assert.equal(grantsStore(stack).grants.length, 0, 'a deny stores nothing');
 });
 
-scenario({ id: 'E2E-25', title: 'two tabs asking for the same RP share one prompt and both succeed', ci: true }, async ctx => {
+scenario({ id: 'E2E-25', exposeModes: ['port', 'pipe'], title: 'two tabs asking for the same RP share one prompt and both succeed', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['approve:3000'] } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');
@@ -102,7 +102,7 @@ scenario({ id: 'E2E-25', title: 'two tabs asking for the same RP share one promp
 
 // V-M2: a withdrawal (the last waiter leaves a pending escalation) is rate limited; the 3rd within 10 minutes starts the
 // cooldown. Three aborts after the notification was shown, then the fourth request is refused without a prompt.
-scenario({ id: 'E2E-50', title: 'three withdrawn escalations start the cooldown: the fourth request gets no prompt', ci: true }, async ctx => {
+scenario({ id: 'E2E-50', exposeModes: ['port', 'pipe'], title: 'three withdrawn escalations start the cooldown: the fourth request gets no prompt', ci: true }, async ctx => {
   const stack = await ctx.stack({ ...ONE_RP, notify: { script: ['ignore'] } });
   const rp = stack.rp.a;
   await stack.seedHuman(rp, 'alice');

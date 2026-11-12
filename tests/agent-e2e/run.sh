@@ -5,6 +5,7 @@
 #   AGENT_E2E_MATRIX=ci|full        ci (default): CI-tagged scenarios on one browser, headless. full: everything.
 #   AGENT_E2E_BROWSERS=a,b          chromium, pw-chromium, cft (negative controls: chrome, headless-shell)
 #   AGENT_E2E_HEADLESS=new|headed|both
+#   AGENT_E2E_EXPOSE=port|pipe|all  CDP exposure (attach mode) axis: ci default port, full default all (a scenario runs once per mode it supports)
 #   AGENT_E2E_FILTER=E2E-01,6       scenario ids (also accepted as arguments); overrides the CI selection
 #   AGENT_E2E_ALLOW_SKIP=1          a SKIP no longer fails the run (optional tools / missing browsers)
 #   AGENT_E2E_TIMEOUT=SECONDS       overall limit (default 900 for ci, 14400 for full)
