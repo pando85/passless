@@ -1584,7 +1584,7 @@ dependencies = [
  "shadow-rs",
  "signal-hook",
  "soft-fido2",
- "soft-fido2-crypto",
+ "soft-fido2-crypto 0.18.0",
  "soft-fido2-ctap",
  "soft-fido2-transport",
  "systemd-journal-logger",
@@ -2222,7 +2222,7 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto",
+ "soft-fido2-crypto 0.17.0",
  "soft-fido2-ctap",
  "soft-fido2-transport",
  "spin",
@@ -2234,6 +2234,25 @@ name = "soft-fido2-crypto"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff3bd853b5f76ba1477ccac1e4c367d7eb48ab939647cc96eca3ef1456e989bb"
+dependencies = [
+ "aes",
+ "cbc",
+ "ed25519-dalek",
+ "hkdf",
+ "hmac",
+ "p256",
+ "rand 0.10.3",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "soft-fido2-crypto"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a73976ad64a70797703e3135ffa1192a472b7c252d6ccb3b07aee335cbf1b3a"
 dependencies = [
  "aes",
  "cbc",
@@ -2261,7 +2280,7 @@ dependencies = [
  "serde_bytes",
  "sha2",
  "smallvec",
- "soft-fido2-crypto",
+ "soft-fido2-crypto 0.17.0",
  "subtle",
  "thiserror",
  "zeroize",
