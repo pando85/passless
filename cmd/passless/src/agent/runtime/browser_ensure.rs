@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,128 +6,63 @@ use passless_core::agent::protocol::{
     BrowserStatusResponse, ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{BrowserLeaseId, BrowserScope, PrincipalSessionId, ProfileId};
-use soft_fido2_ctap::key_provider::{
-    CredentialKey, CredentialKeyError, CredentialKeyProvider, CredentialKeyProviderId,
-    GeneratedCredentialKey,
-};
 
-use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease};
-use crate::agent::browser::{BrowserConfig, LeaseState};
-use crate::agent::intent::ProcessIdentityDigest;
+use super::{ActiveBrowserLease, AgentRuntime, ProfileRuntime, SharedBrowserLease, gates};
+use crate::agent::audit_events::RevokeReason;
+use crate::agent::browser::{
+    BrowserConfig, INTERCEPTION_ATTACH_TIMEOUT, InterceptionState, LeaseState,
+};
+use crate::agent::identity::ProcessIdentityDigest;
+use crate::agent::sign::BrowserLeaseActivation;
 use crate::storage::CredentialFilter;
 
 const BROWSER_TTL: Duration = Duration::from_secs(3600);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ACTIVE_TTL_SECS: u64 = 86_400;
 
-struct AssertionActivatingKeyProvider {
-    inner: Arc<dyn CredentialKeyProvider + Send + Sync>,
-    browser_manager: Arc<std::sync::Mutex<crate::agent::browser::BrowserProcessManager>>,
-    lease_id: BrowserLeaseId,
-    active_ttl: Duration,
-}
-
-impl CredentialKeyProvider for AssertionActivatingKeyProvider {
-    fn provider_id(&self) -> CredentialKeyProviderId {
-        self.inner.provider_id()
-    }
-
-    fn supports_algorithm(&self, algorithm: i32) -> bool {
-        self.inner.supports_algorithm(algorithm)
-    }
-
-    fn generate(
-        &self,
-        algorithm: i32,
-    ) -> core::result::Result<GeneratedCredentialKey, CredentialKeyError> {
-        self.inner.generate(algorithm)
-    }
-
-    fn sign(
-        &self,
-        key: &CredentialKey,
-        algorithm: i32,
-        message: &[u8],
-    ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
-        let signature = self.inner.sign(key, algorithm, message)?;
-
-        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
-            CredentialKeyError::TransientFailure("browser manager lock poisoned".to_string())
-        })?;
-        let state = browser_manager
-            .snapshot(&self.lease_id)
-            .ok_or_else(|| {
-                CredentialKeyError::TransientFailure("browser lease not found".to_string())
-            })?
-            .state;
-        match state {
-            LeaseState::AuthenticationPending => {
-                browser_manager
-                    .activate_after_assertion(&self.lease_id, self.active_ttl)
-                    .map_err(|e| {
-                        CredentialKeyError::TransientFailure(format!(
-                            "failed to activate browser lease after assertion: {e}"
-                        ))
-                    })?;
-            }
-            LeaseState::Active => {}
-            current => {
-                return Err(CredentialKeyError::TransientFailure(format!(
-                    "browser lease cannot activate after assertion from state {current}"
-                )));
-            }
-        }
-
-        Ok(signature)
-    }
-
-    fn delete(&self, key: &CredentialKey) -> core::result::Result<(), CredentialKeyError> {
-        self.inner.delete(key)
-    }
-}
-
 impl AgentRuntime {
-    /// Ensure that the verified principal owns a live trusted-port browser.
+    /// Ensure that the verified principal owns a live managed browser, in the profile's CDP mode.
+    ///
+    /// Port mode returns the loopback CDP endpoint. Pipe mode (the default) returns none: the
+    /// browser's CDP pipes stay with the daemon and the principal drives the browser through
+    /// `browser-control` (ADR 0014 section 4.3). Everything else is the same for both modes: the
+    /// principal checks of `handle_principal`, the interception gate (no result before the
+    /// worker attached and is allowed in incognito), the grants and bearers bound to the session,
+    /// the B1 lifetime and the lease audit records.
     ///
     /// For session-scoped profiles, each session gets its own browser lease.
     /// For profile-scoped profiles, sessions on the same profile share a single browser.
     /// The lifecycle lock makes concurrent Playwright discovery requests single-flight.
+    ///
+    /// `direct_cdp` is set by callers that can only use an endpoint; a pipe-mode profile refuses
+    /// them before anything is started.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_ensure_browser(
         &self,
         profile_id: &ProfileId,
         session_id: &PrincipalSessionId,
         process_digest: &ProcessIdentityDigest,
         start_url: Option<&str>,
+        headed: bool,
+        direct_cdp: bool,
         profile: &ProfileRuntime,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        if profile
-            .profile_config
-            .browser_cdp_expose
-            .unwrap_or_default()
-            != CdpExposeMode::Port
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "Playwright browser discovery requires browser_cdp_expose = 'port' (trusted agents only)",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // Rules, limits, the CDP mode and the session TTL come from the configuration in force,
+        // which a policy reload may have replaced since the daemon started (ADR 0014 section 6.4).
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
+        let mode = profile_config.browser_cdp_expose.unwrap_or_default();
+        gates::check_ensure_browser_mode(mode, direct_cdp)?;
 
-        let _lifecycle = profile.lifecycle_lock.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "profile lifecycle lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let _lifecycle = crate::agent::lock_order::lock(
+            &profile.lifecycle_lock,
+            crate::agent::lock_order::LockLevel::ProfileLifecycle,
+        );
 
-        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "browser manager lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut browser_manager = crate::agent::lock_order::lock(
+            &self.browser_manager,
+            crate::agent::lock_order::LockLevel::BrowserManager,
+        );
 
         if profile.profile_config.browser_scope == BrowserScope::Profile {
             let shared_lease_id = profile
@@ -150,8 +84,11 @@ impl AgentRuntime {
                         snapshot.state,
                         LeaseState::Active | LeaseState::AuthenticationPending
                     )
-                    && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
+                    && let Some(endpoint) = lease_cdp_access(&browser_manager, &lease_id, mode)
                 {
+                    // A degraded lease is withheld until its worker re-attaches.
+                    let (interception, incognito_allowed) =
+                        self.require_attached_interception(&mut browser_manager, &lease_id)?;
                     {
                         let mut shared = profile.shared_browsers.lock().map_err(|_| {
                             ProtocolError::new(
@@ -182,14 +119,17 @@ impl AgentRuntime {
                                 session_id: session_id.clone(),
                             },
                         );
-                    return Ok(browser_ensured(snapshot.state.to_string(), endpoint, true));
+                    return Ok(browser_ensured(
+                        snapshot.state.to_string(),
+                        endpoint,
+                        mode,
+                        true,
+                        interception,
+                        incognito_allowed,
+                    ));
                 }
 
-                self.sign_registry.revoke_by_lease(lease_id.as_ref());
-                let _ = browser_manager.revoke(&lease_id);
-                let _ = browser_manager.terminate(&lease_id);
-                let _ = browser_manager.cleanup(&lease_id);
-                browser_manager.remove(&lease_id);
+                self.close_lease(&mut browser_manager, &lease_id, RevokeReason::Superseded);
                 profile
                     .shared_browsers
                     .lock()
@@ -223,18 +163,24 @@ impl AgentRuntime {
                     snapshot.state,
                     LeaseState::Active | LeaseState::AuthenticationPending
                 )
-                && let Some(endpoint) = browser_manager.lease_cdp_endpoint(&lease_id).flatten()
+                && let Some(endpoint) = lease_cdp_access(&browser_manager, &lease_id, mode)
             {
-                return Ok(browser_ensured(snapshot.state.to_string(), endpoint, false));
+                // A degraded lease is withheld until its worker re-attaches.
+                let (interception, incognito_allowed) =
+                    self.require_attached_interception(&mut browser_manager, &lease_id)?;
+                return Ok(browser_ensured(
+                    snapshot.state.to_string(),
+                    endpoint,
+                    mode,
+                    false,
+                    interception,
+                    incognito_allowed,
+                ));
             }
 
             // The profile bookkeeping is stale. Revoke any sign token bound to the old lease
             // before allowing a replacement browser to be created.
-            self.sign_registry.revoke_by_lease(lease_id.as_ref());
-            let _ = browser_manager.revoke(&lease_id);
-            let _ = browser_manager.terminate(&lease_id);
-            let _ = browser_manager.cleanup(&lease_id);
-            browser_manager.remove(&lease_id);
+            self.close_lease(&mut browser_manager, &lease_id, RevokeReason::Superseded);
             profile
                 .active_browser
                 .lock()
@@ -251,73 +197,45 @@ impl AgentRuntime {
         // Other sessions (and admin-launched browsers) may have live leases for the same
         // authority profile. They are intentionally outside this principal's ownership namespace.
 
-        let endpoint_id = profile
-            .endpoint_id
-            .lock()
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "endpoint lock poisoned",
-                    RecommendedAction::Abort,
-                )
-            })?
-            .clone()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::NotFound,
-                    format!("profile '{}' has no active endpoint", profile_id),
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        let profile_config = &profile.profile_config;
-        let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::BadRequest,
-                format!("profile '{}' has no browser_command configured", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-        if browser_command.is_empty() {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "browser_command must contain an executable",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // The browser binary: the profile's `browser_command`, else `agents.browser_path`, else
+        // auto-detection. Branded Google Chrome and chrome-headless-shell are refused (R14), and a
+        // distinct-UID principal only gets a root-owned, principal-unwritable binary (V-H7).
+        let launch = self.resolve_browser_launch(profile, profile_config, headed)?;
 
         let runtime_root = profile_config
             .browser_runtime_root
             .clone()
-            .unwrap_or_else(|| {
-                dirs::runtime_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join("passless")
-                    .join("browser")
-            });
-        let rp_ids = if !profile_config.rp_ids.is_empty() {
-            profile_config.rp_ids.clone()
-        } else {
-            profile_config.allowed_rp_ids()
-        };
+            .unwrap_or_else(|| crate::agent::browser::default_runtime_root().1);
+        let rp_ids = profile_config.rule_rp_ids();
         let config = BrowserConfig {
-            executable: PathBuf::from(&browser_command[0]),
+            executable: launch.executable,
             start_url: start_url
                 .map(str::to_owned)
                 .or_else(|| profile_config.start_url.clone()),
-            extra_args: browser_command[1..].to_vec(),
+            extra_args: launch.extra_args,
             runtime_root,
             ttl: BROWSER_TTL,
             login_timeout: LOGIN_TIMEOUT,
             rp_ids,
+            start_url_rules: profile_config.rules.clone(),
             target_uid: profile.browser_uid.unwrap_or(profile.daemon_uid),
             target_gid: profile.browser_gid.unwrap_or(profile.daemon_gid),
             daemon_uid: profile.daemon_uid,
             daemon_gid: profile.daemon_gid,
-            cdp_expose: CdpExposeMode::Port,
-            cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
-            bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
+            cdp_expose: mode,
+            cdp_port: match mode {
+                CdpExposeMode::Port => profile_config.browser_cdp_port.unwrap_or(0),
+                CdpExposeMode::Pipe => 0,
+            },
+            // Every scope: the browser is forked on the long-lived launcher thread, so its
+            // parent-death signal fires only when the daemon dies (defect B1); revocation,
+            // expiry and session end terminate it explicitly.
+            bind_parent_death: true,
         };
+
+        // The browser's relay must be able to reach a sign socket of its own UID; refuse up front
+        // rather than time out waiting for an attach that cannot happen.
+        let sign_socket = self.sign_socket_for(config.target_uid)?;
 
         let bearer_token = crate::agent::sign::generate_bearer_token().map_err(|e| {
             ProtocolError::new(
@@ -327,19 +245,26 @@ impl AgentRuntime {
             )
         })?;
 
-        let registration_ctx = crate::agent::register::RegisterContext {
-            profile_id: profile_id.clone(),
-            // Browser startup never implicitly creates enrollment authority.
-            registration_grants: std::collections::HashMap::new(),
-            profile_config: profile_config.clone(),
-        };
+        // Registration authority is policy only (`register = "allow"` on an exact RP rule); the
+        // bearer is bound to the browser lease in `finish_principal_browser_launch` and revoked
+        // with it.
+        // One bearer session backs both the sign and the registration context of this bearer: it
+        // is bound to the principal digest, the revocation epoch now in force and the session TTL
+        // (ADR 0014 section 9).
+        let session =
+            self.new_bearer_session(profile_id, *process_digest.as_bytes(), profile_config);
+        session.bind_browser_uid(config.target_uid);
+        let registration_ctx =
+            crate::agent::register::RegisterContext::new(profile_id.clone(), session.clone());
         let registration_handler = Arc::new(crate::agent::register::RegisterHandler {
-            credential_storage: profile.backend.credential_storage.clone(),
             policy_runtime: self.policy_runtime.clone(),
+            credential_storage: profile.backend.credential_storage.clone(),
             audit_gate: self.audit_gate.clone(),
             key_provider: profile.backend.key_provider.clone(),
-            security_config: profile.endpoint_spec.security_config.clone(),
+            security_config: profile.security_config.clone(),
             operation_lock: profile.backend.operation_lock.clone(),
+            escalation: self.escalation.clone(),
+            audit_deployment: profile.audit_deployment(),
         });
         self.sign_registry
             .register_pending_registration(
@@ -356,12 +281,11 @@ impl AgentRuntime {
             })?;
 
         let metadata = crate::agent::browser::AgentEndpointMetadata {
-            socket_path: self.sign_socket_path.to_string_lossy().into_owned(),
+            socket_path: sign_socket.to_string_lossy().into_owned(),
             bearer_token: bearer_token.clone(),
         };
         let lease_id = match browser_manager.launch_pending_with_agent_endpoint(
             &config,
-            endpoint_id.clone(),
             profile_id.clone(),
             Some(&metadata),
         ) {
@@ -375,14 +299,15 @@ impl AgentRuntime {
                 ));
             }
         };
+        self.audit_launch(&lease_id, profile_id, &config);
 
         let result = self.finish_principal_browser_launch(
             profile_id,
             session_id,
             process_digest,
+            &session,
             profile,
             &config,
-            &endpoint_id,
             &bearer_token,
             &lease_id,
             &mut browser_manager,
@@ -391,11 +316,7 @@ impl AgentRuntime {
         if result.is_err() {
             self.sign_registry.revoke(&bearer_token);
             self.sign_registry.revoke_registration(&bearer_token);
-            self.sign_registry.revoke_by_lease(lease_id.as_ref());
-            let _ = browser_manager.revoke(&lease_id);
-            let _ = browser_manager.terminate(&lease_id);
-            let _ = browser_manager.cleanup(&lease_id);
-            browser_manager.remove(&lease_id);
+            self.close_lease(&mut browser_manager, &lease_id, RevokeReason::LaunchFailed);
         }
         result
     }
@@ -406,18 +327,44 @@ impl AgentRuntime {
         profile_id: &ProfileId,
         session_id: &PrincipalSessionId,
         process_digest: &ProcessIdentityDigest,
+        session: &Arc<crate::agent::session::AgentSession>,
         profile: &ProfileRuntime,
         config: &BrowserConfig,
-        endpoint_id: &passless_core::agent::EndpointId,
         bearer_token: &str,
         lease_id: &BrowserLeaseId,
         browser_manager: &mut crate::agent::browser::BrowserProcessManager,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let profile_config = &profile.profile_config;
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
+        self.sign_registry
+            .bind_registration_lease(bearer_token, lease_id.to_string())
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to bind browser registration context: {e}"),
+                    RecommendedAction::Abort,
+                )
+            })?;
+        // Ready means intercepted (plan D6 layer 1): no endpoint is handed out before the lease's
+        // worker said hello with `attached = true`. The registration bearer was registered before
+        // the spawn, so the transport accepts that hello even before the binding above. On a
+        // timeout the caller stops the browser and revokes the bearer.
+        let readiness = browser_manager
+            .await_interception(lease_id, &self.sign_readiness, INTERCEPTION_ATTACH_TIMEOUT)
+            .map_err(|e| {
+                log::warn!("browser launch for profile={profile_id} failed: {e}");
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to launch browser: {e}"),
+                    RecommendedAction::FixRequest,
+                )
+            })?;
         let mut credential_refs = Vec::new();
-        if let Ok(mut storage) = profile.backend.credential_storage.lock()
-            && let Ok(mut credential) = storage.read_first(CredentialFilter::None)
-        {
+        let mut storage = crate::agent::lock_order::lock(
+            &profile.backend.credential_storage,
+            crate::agent::lock_order::LockLevel::Storage,
+        );
+        if let Ok(mut credential) = storage.read_first(CredentialFilter::None) {
             loop {
                 let rp_allowed = config
                     .rp_ids
@@ -438,13 +385,13 @@ impl AgentRuntime {
                 }
             }
         }
+        drop(storage);
 
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if dynamic_credential_scope || !credential_refs.is_empty() {
+        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
             let params = crate::agent::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id: session_id.clone(),
-                endpoint_id: endpoint_id.clone(),
                 principal_digest: *process_digest.as_bytes(),
                 rp_ids: config.rp_ids.clone(),
                 credentials: if dynamic_credential_scope {
@@ -458,23 +405,23 @@ impl AgentRuntime {
                     .map(|ttl| ttl.as_secs())
                     .unwrap_or(300),
             };
-            let request_id = if dynamic_credential_scope {
-                self.policy_runtime.admin_request_dynamic_grant(params)
-            } else {
-                self.policy_runtime.admin_request_grant(params)
-            }
-            .map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to prepare browser authentication grant: {e}"),
-                    RecommendedAction::Abort,
-                )
-            })?;
+            // The session grant is bounded by `max_session_ttl`, not `max_grant_ttl` (defect B5).
+            let request_id = self
+                .policy_runtime
+                .admin_request_session_grant(params, dynamic_credential_scope)
+                .map_err(|e| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        format!("failed to prepare browser authentication grant: {e}"),
+                        RecommendedAction::Abort,
+                    )
+                })?;
             // This is an internal approval, not admin IPC. The request reached this point only
-            // after principal capability/peer/process verification and explicit trusted port mode.
+            // after principal capability/peer/process verification. Pipe mode mediates every CDP
+            // command (`browser-control`); port mode is the explicitly trusted mode.
             let grant_id = self
                 .policy_runtime
-                .admin_approve_grant(&request_id, &crate::agent::intent::admin_authority())
+                .admin_approve_grant(&request_id, &crate::agent::identity::admin_authority())
                 .map_err(|e| {
                     ProtocolError::new(
                         ErrorCode::Internal,
@@ -483,30 +430,35 @@ impl AgentRuntime {
                     )
                 })?;
 
-            let sign_ctx = crate::agent::sign::SignContext {
-                profile_id: profile_id.clone(),
-                active_grant_id: grant_id.clone(),
-                profile_config: profile_config.clone(),
-            };
+            let _ = session.bind_grant(grant_id.clone());
             let active_ttl = profile_config
                 .max_session_ttl
                 .as_ref()
                 .map(|ttl| ttl.as_secs())
                 .unwrap_or(300)
                 .clamp(1, MAX_ACTIVE_TTL_SECS);
-            let key_provider = Arc::new(AssertionActivatingKeyProvider {
-                inner: profile.backend.key_provider.clone(),
-                browser_manager: self.browser_manager.clone(),
-                lease_id: lease_id.clone(),
-                active_ttl: Duration::from_secs(active_ttl),
-            });
+            // The lease is activated after the first assertion, outside every backend lock
+            // (review H1): the browser manager is global and may be held by another launch.
+            let lease_activation = BrowserLeaseActivation::new(
+                self.browser_manager.clone(),
+                lease_id.clone(),
+                Duration::from_secs(active_ttl),
+            );
+            let sign_ctx = crate::agent::sign::SignContext {
+                profile_id: profile_id.clone(),
+                active_grant_id: grant_id.clone(),
+                session: session.clone(),
+                lease_activation: Some(lease_activation),
+            };
             let sign_handler = Arc::new(crate::agent::sign::SignHandler {
                 credential_storage: profile.backend.credential_storage.clone(),
                 policy_runtime: self.policy_runtime.clone(),
                 audit_gate: self.audit_gate.clone(),
-                security_config: profile.endpoint_spec.security_config.clone(),
-                key_provider,
+                security_config: profile.security_config.clone(),
+                key_provider: profile.backend.key_provider.clone(),
                 operation_lock: profile.backend.operation_lock.clone(),
+                escalation: self.escalation.clone(),
+                audit_deployment: profile.audit_deployment(),
             });
             if let Err(e) = self.sign_registry.register_pending(
                 bearer_token.to_string(),
@@ -515,7 +467,7 @@ impl AgentRuntime {
             ) {
                 let _ = self
                     .policy_runtime
-                    .admin_revoke_grant(&grant_id, &crate::agent::intent::admin_authority());
+                    .admin_revoke_grant(&grant_id, &crate::agent::identity::admin_authority());
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to register browser sign context: {e}"),
@@ -529,7 +481,7 @@ impl AgentRuntime {
                 self.sign_registry.revoke(bearer_token);
                 let _ = self
                     .policy_runtime
-                    .admin_revoke_grant(&grant_id, &crate::agent::intent::admin_authority());
+                    .admin_revoke_grant(&grant_id, &crate::agent::identity::admin_authority());
                 return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to bind browser sign context: {e}"),
@@ -538,16 +490,17 @@ impl AgentRuntime {
             }
         }
 
-        let endpoint = browser_manager
-            .lease_cdp_endpoint(lease_id)
-            .flatten()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    "port-mode browser did not expose a CDP endpoint",
-                    RecommendedAction::Abort,
-                )
-            })?;
+        let mode = config.cdp_expose;
+        let endpoint = lease_cdp_access(browser_manager, lease_id, mode).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                match mode {
+                    CdpExposeMode::Port => "port-mode browser did not expose a CDP endpoint",
+                    CdpExposeMode::Pipe => "pipe-mode browser did not open its CDP pipes",
+                },
+                RecommendedAction::Abort,
+            )
+        })?;
 
         profile
             .active_browser
@@ -584,25 +537,57 @@ impl AgentRuntime {
                     profile_id.clone(),
                     SharedBrowserLease {
                         lease_id: lease_id.clone(),
+                        owner_session: session_id.clone(),
                         ref_count: 1,
                         attached_sessions: attached,
                     },
                 );
         }
 
+        // The start URL is opened only now that interception is attached and the bearer's
+        // contexts are registered (defect B2).
+        self.open_deferred_start_url(browser_manager, lease_id);
+
         Ok(browser_ensured(
             LeaseState::AuthenticationPending.to_string(),
             endpoint,
+            mode,
             profile_config.browser_scope == BrowserScope::Profile,
+            InterceptionState::Attached,
+            readiness.incognito_allowed,
         ))
     }
 }
 
-fn browser_ensured(status: String, endpoint: String, shared: bool) -> PrincipalResponse {
+/// The lease's CDP channel in `mode` (see [`gates::cdp_access`]): `Some(Some(endpoint))` in port
+/// mode, `Some(None)` for a pipe-mode lease, `None` when it has none for that mode.
+pub(super) fn lease_cdp_access(
+    browser_manager: &crate::agent::browser::BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+    mode: CdpExposeMode,
+) -> Option<Option<String>> {
+    gates::cdp_access(
+        mode,
+        browser_manager.lease_cdp_endpoint(lease_id).flatten(),
+        browser_manager.lease_has_cdp_pipes(lease_id),
+    )
+}
+
+fn browser_ensured(
+    status: String,
+    endpoint: Option<String>,
+    mode: CdpExposeMode,
+    shared: bool,
+    interception: InterceptionState,
+    incognito_allowed: bool,
+) -> PrincipalResponse {
     PrincipalResponse::BrowserEnsured(BrowserStatusResponse {
         running: true,
         status,
-        cdp_endpoint: Some(endpoint),
+        cdp_endpoint: endpoint,
         shared_browser_context: if shared { Some(true) } else { None },
+        interception: Some(interception.to_string()),
+        incognito_allowed: Some(incognito_allowed),
+        cdp_exposure: Some(mode.to_string()),
     })
 }

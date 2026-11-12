@@ -1,6 +1,6 @@
 # Agent Validation Orchestrator
 
-This directory contains the fail-closed release-lab orchestrator specified in `docs/plans/agent-adr-validation-closure.md`.
+This directory contains the fail-closed release-lab orchestrator originally specified in the agent ADR validation closure plan (removed; see `docs/decisions/0014-agent-delegation.md`, History). The normative requirements are in that ADR.
 
 ## Overview
 
@@ -10,6 +10,13 @@ The agent validation orchestrator provides a fail-closed framework to run compre
 - **Tier 2**: Automated browser session tests (Chromium, notifications, ceremonies)
 - **Tier 3**: Privileged release lab tests (device permissions, principal isolation)
 
+## Layout
+
+- `run.sh`, `validate`, `lib/`, `stages/`, `tests/`: the orchestrator, its stages and their tests.
+- `controlled-rp/`: the standards-based WebAuthn relying party used by the browser stages.
+- `policy/`: the lab udev rule and its privileged setup, cleanup and dry-run validation scripts.
+- `scripts/`: the permission probes of the device-probes stage.
+
 ## Requirements
 
 - x86_64 Linux environment (for release mode)
@@ -18,7 +25,6 @@ The agent validation orchestrator provides a fail-closed framework to run compre
 - UHID kernel module
 - Chromium browser (for Tier 2)
 - Node.js 22+, Xvfb, dunst, and dunstctl (for Tier 2)
-- pass, GPG, and swtpm (for backend composition)
 - Disposable agent/human users, profiles, and credential stores (for Tier 3)
 
 ## Usage
@@ -100,5 +106,5 @@ All wired stages either run their asserted behavior or report `SKIP`. A required
 
 This orchestrator integrates with:
 - Existing fmt/clippy/test pipelines
-- Phase 0 tooling
+- The lab device policy (`policy/`) and permission probes (`scripts/`)
 - The broader agent validation plan

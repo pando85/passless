@@ -47,14 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-uhid-feasibility"
-version = "0.1.0"
-dependencies = [
- "libc",
- "passless-uhid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -198,7 +190,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
- "zeroize",
 ]
 
 [[package]]
@@ -465,7 +456,6 @@ dependencies = [
  "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
- "serdect",
  "subtle",
  "zeroize",
 ]
@@ -478,16 +468,6 @@ checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "getrandom 0.4.3",
  "hybrid-array",
- "rand_core 0.10.1",
-]
-
-[[package]]
-name = "crypto-primes"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
-dependencies = [
- "crypto-bigint",
  "rand_core 0.10.1",
 ]
 
@@ -609,7 +589,6 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "ctutils",
- "zeroize",
 ]
 
 [[package]]
@@ -1406,6 +1385,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify-double"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "notify-rust"
 version = "4.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1590,7 +1582,6 @@ dependencies = [
  "dirs 7.0.0",
  "env_logger",
  "futures-lite",
- "getrandom 0.4.3",
  "git2 0.21.0",
  "hex",
  "hkdf",
@@ -1598,15 +1589,14 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "notify-double",
  "notify-rust",
  "p256",
  "passless-config-doc",
  "passless-core",
- "passless-uhid",
  "prs-lib",
  "rand 0.8.8",
  "rpassword",
- "rsa",
  "serde",
  "serde_bytes",
  "serde_cbor",
@@ -1615,6 +1605,7 @@ dependencies = [
  "shadow-rs",
  "signal-hook",
  "soft-fido2",
+ "soft-fido2-crypto",
  "soft-fido2-ctap",
  "soft-fido2-transport",
  "systemd-journal-logger",
@@ -1622,16 +1613,9 @@ dependencies = [
  "tokio",
  "toml",
  "tss-esapi",
+ "url",
  "zbus",
  "zeroize",
-]
-
-[[package]]
-name = "passless-uhid"
-version = "0.21.0"
-dependencies = [
- "libc",
- "thiserror",
 ]
 
 [[package]]
@@ -1689,16 +1673,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pkcs1"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6250dd7321adbe93d12b750aee0ced159fd13e77f625edcdf1cb6f83cd99f650"
-dependencies = [
- "der",
- "spki",
-]
 
 [[package]]
 name = "pkcs8"
@@ -1980,27 +1954,6 @@ dependencies = [
  "libc",
  "rtoolbox",
  "windows-sys",
-]
-
-[[package]]
-name = "rsa"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23e77fd77e0dea28b3011fd62d15445b7de7959333b0276d930e03be0f755699"
-dependencies = [
- "const-oid",
- "crypto-bigint",
- "crypto-common",
- "crypto-primes",
- "digest",
- "hmac",
- "pkcs1",
- "pkcs8",
- "rand_core 0.10.1",
- "sha2",
- "signature",
- "spki",
- "zeroize",
 ]
 
 [[package]]

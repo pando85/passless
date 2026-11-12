@@ -1,7 +1,9 @@
 // Agent-only integration tests.
 #![cfg(feature = "agent")]
 
-use passless_core::agent::{CredentialRef, Policy, PolicyError, PolicyParams, ProfileId};
+use passless_core::agent::{
+    CredentialRef, CredentialSelection, Policy, PolicyError, PolicyParams, ProfileId,
+};
 
 fn base_params() -> PolicyParams {
     PolicyParams {
@@ -10,24 +12,28 @@ fn base_params() -> PolicyParams {
         normalized_rp_ids: vec!["example.com".into()],
         credential_refs: vec![],
         allowed_actions: vec!["authenticate".into()],
-        registration_allowed: false,
-        require_uv: true,
         max_concurrent_grants: 1,
         max_grant_ttl: 3600,
         max_session_ttl: 7200,
+        max_operations: 16,
+        max_concurrent_sessions: 1,
+        browser_scope: "default".into(),
         principal_user: "testuser".into(),
-        device_name: "agent-device".into(),
-        device_phys: "agent-phys".into(),
-        device_uniq: "agent-uniq".into(),
-        device_vendor_id: 0x9999,
-        device_product_id: 0x0001,
         start_url: None,
         browser_argv: vec![],
+        browser_cdp_expose: "none".into(),
+        browser_cdp_port: 0,
         storage_backend: "local".into(),
         storage_path: "/tmp/test".into(),
         browser_user: "browseruser".into(),
         browser_runtime_root: "/tmp/browser".into(),
+        credential_selection: CredentialSelection::default(),
+        acknowledged_global_same_user: false,
+        acknowledged_same_user_registration: false,
         rules: vec![],
+        max_granted_rules: 64,
+        escalation_timeout: 0,
+        escalation_cooldown: 600,
     }
 }
 
@@ -35,7 +41,7 @@ fn base_params() -> PolicyParams {
 fn policy_from_params_round_trip() {
     let params = base_params();
     let policy = Policy::from_params(params.clone()).unwrap();
-    assert_eq!(policy.version, 3);
+    assert_eq!(policy.version, 5);
     assert_eq!(policy.profile_id, "testprofile");
     assert_eq!(policy.mode, "isolated");
     assert_eq!(policy.normalized_rp_ids, vec!["example.com"]);
@@ -79,11 +85,14 @@ fn policy_sorts_and_deduplicates_credential_refs() {
 }
 
 #[test]
-fn policy_rejects_empty_actions() {
+fn policy_accepts_empty_actions_all_deny_profile() {
+    // Regression (defect B4): a profile whose rules are all `deny` has no allowed actions and must
+    // still produce a valid policy.
     let mut params = base_params();
     params.allowed_actions = vec![];
-    let err = Policy::from_params(params).unwrap_err();
-    assert!(matches!(err, PolicyError::EmptyActions));
+    let policy = Policy::from_params(params).unwrap();
+    assert!(policy.allowed_actions.is_empty());
+    policy.validate().unwrap();
 }
 
 #[test]
@@ -121,16 +130,16 @@ fn policy_rejects_excessive_concurrent_grants() {
 #[test]
 fn policy_new_constructor_validates() {
     let pid = ProfileId::new("test").unwrap();
-    let policy = Policy::new(&pid, vec!["authenticate".into()], 1, true, 3600).unwrap();
+    let policy = Policy::new(&pid, vec!["authenticate".into()], 1, 3600).unwrap();
     assert_eq!(policy.max_concurrent_grants, 1);
-    assert!(policy.require_uv);
+    assert_eq!(policy.max_grant_ttl, 3600);
 }
 
 #[test]
-fn policy_new_with_empty_actions_fails() {
+fn policy_new_with_empty_actions_is_valid() {
     let pid = ProfileId::new("test").unwrap();
-    let err = Policy::new(&pid, vec![], 1, true, 3600).unwrap_err();
-    assert!(matches!(err, PolicyError::EmptyActions));
+    let policy = Policy::new(&pid, vec![], 1, 3600).unwrap();
+    assert!(policy.allowed_actions.is_empty());
 }
 
 #[test]
@@ -155,15 +164,6 @@ fn policy_digest_changes_when_actions_change() {
     let p1 = Policy::from_params(base_params()).unwrap();
     let mut params2 = base_params();
     params2.allowed_actions = vec!["register".into()];
-    let p2 = Policy::from_params(params2).unwrap();
-    assert_ne!(p1.digest(), p2.digest());
-}
-
-#[test]
-fn policy_digest_changes_when_device_changes() {
-    let p1 = Policy::from_params(base_params()).unwrap();
-    let mut params2 = base_params();
-    params2.device_vendor_id = 0x1234;
     let p2 = Policy::from_params(params2).unwrap();
     assert_ne!(p1.digest(), p2.digest());
 }
@@ -221,11 +221,6 @@ fn policy_validate_rejects_wrong_version() {
 
 #[test]
 fn policy_error_display_messages() {
-    assert!(
-        PolicyError::EmptyActions
-            .to_string()
-            .contains("allowed_actions")
-    );
     assert!(PolicyError::InvalidTtl(0).to_string().contains("TTL"));
     assert!(
         PolicyError::InvalidMaxConcurrent(0)

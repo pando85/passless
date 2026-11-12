@@ -1,240 +1,149 @@
 # Agent troubleshooting
 
-> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+> **EXPERIMENTAL.** Agent mode is implemented but not yet validated for production use.
 
-Common issues and diagnostics for the current `same-user` and `isolated` modes.
+Start with `passless doctor --agents`: it checks the browser binary, containment, extension, native
+host, notification bus and state directory from the config file (no daemon needed for those), and,
+when agents are enabled, that the daemon's agent subsystem answers (`agent_subsystem`).
 
-## Agent support is disabled
-
-**Symptom:** `passless agent run` or `passless agent-admin` fails with "agent support is disabled" or similar.
-
-**Diagnosis:**
-
-```bash
-passless agent-admin profile list
-# Check that [agents].enabled = true in the configuration file.
-```
-
-**Fix:** Set `enabled = true` in `[agents]`, configure `audit_path`, and restart the daemon.
-
-## Profile not found
-
-**Symptom:** `passless agent run --profile <name>` fails with "profile not found".
-
-**Diagnosis:**
+## Agent support is disabled, or the profile is not found
 
 ```bash
 passless agent-admin profile list
 ```
 
-**Fix:** Ensure the profile exists under `[agents.profiles.<name>]`. If it was disabled at runtime, re-enable it with the administrator CLI.
+Check that `[agents].enabled = true`, `audit_path` is set, and the profile exists under
+`[agents.profiles.<name>]`. Restart the daemon after editing the config (`systemctl --user restart
+passless`) or reload a profile's policy with `passless agent-admin policy reload <profile>`.
 
-## Configuration validation errors
+`several agent profiles are configured`: pass `--profile <name>` to `passless agent browser` or
+`passless agent mcp ...`.
 
-**Symptom:** The daemon fails to start or `passless agent-admin profile check` reports errors.
+## The daemon runs but the agent subsystem does not
 
-Common current errors include:
+| Symptom | Cause and fix |
+|---|---|
+| Daemon log: `Agent subsystem failed to start: IPC error: failed to create runtime dir: ... File exists`, `agent-admin` says `no agent socket`, `doctor --agents` fails `agent_subsystem` | Older versions left `$XDG_RUNTIME_DIR/agent` behind after a SIGTERM or a crash, and the next start could not create it. Current versions remove their own directory at a clean shutdown and reclaim a leftover at start: a real directory owned by the daemon's user with mode 0700 whose sockets nobody answers is removed and recreated. Upgrade and restart. Where the start still fails with `cannot reclaim the stale runtime dir`, the log says why: it is a symlink or a file, another user owns it or its mode is not 0700 (so Passless will not remove it; check it and delete it yourself), or a live daemon answers on it (stop that one). With an older build, `systemctl --user stop passless; rm -rf "$XDG_RUNTIME_DIR/agent"; systemctl --user start passless`. |
+| `doctor --agents` fails `agent_subsystem` with `nothing answers on the admin socket` | The daemon is not running, or it started without agents (the `Agent subsystem failed to start` line in `journalctl --user -u passless` says why), or `agents.enabled` was set after the daemon started: restart it. |
 
-| Error / condition | Cause | Fix |
-|---|---|---|
-| `same-user mode uses the human backend and must not specify storage` | Same-user profile has a profile-specific storage section | Remove the profile storage configuration; same-user reuses the already-open human backend |
-| `isolated mode requires storage backend configuration` | Isolated profile has no separate storage | Add an isolated local/pass/TPM storage backend |
-| `isolated mode requires a complete device identity` | Isolated UHID identity is incomplete | Configure `device.name`, `phys`, `uniq`, vendor ID, and product ID |
-| `explicit rules cannot be combined with legacy rp_ids...` | New rule syntax is mixed with migration syntax | Use explicit `[[agents.profiles.<name>.rules]]` entries only |
-| `wildcard RP scope '*' is only supported in same-user mode` | Global scope used by an isolated profile | Replace `*` with exact RP rules |
-| `wildcard RP scope '*' requires credential_refs to be omitted` | Global same-user scope is mixed with static credential references | Remove `credential_refs` or, preferably, replace `*` with exact RP rules and explicit credential scope |
-| `wildcard RP scope '*' must deny registration` | Global registration was enabled | Keep wildcard registration denied; registration requires exact RP policy |
-| invalid RP / public suffix / wildcard error | RP is a URL, IP, public suffix, partial wildcard, or otherwise invalid | Configure an exact WebAuthn RP ID such as `github.com`; `*` is the only global policy sentinel and only for same-user authentication |
-| device identity collision | Isolated device identity matches the human endpoint or another profile | Change the isolated device identity |
-| agent roots overlap | Audit, isolated storage, PIN, or human state paths overlap | Use independent roots |
-| `unknown field` | Invalid, removed, or misspelled configuration | Remove it and check [configuration.md](configuration.md) |
-| invalid mode `delegated-session` | The old experimental mode was removed | Migrate human-credential use to `same-user` and review its trust model; use `isolated` for a separate RP identity |
+## Configuration errors
 
-**Diagnosis:**
+Run `passless agent-admin profile check <profile>`.
 
-```bash
-passless agent-admin profile check <profile>
-passless agent-admin policy check <profile>
-```
+| Error | Cause and fix |
+|---|---|
+| `same-user mode uses the human backend and must not specify storage` | Remove the profile's `storage`. |
+| `isolated mode requires storage backend configuration` | Add a local, pass or TPM storage section. |
+| `wildcard RP scope '*' is only supported in same-user mode` | Use exact rules in an isolated profile. |
+| `global same-user authentication requires explicit operator acknowledgement` | Add the profile to `agents.acknowledge_global_same_user`. |
+| `same-user registration ... requires explicit operator acknowledgement` | Add it to `agents.acknowledge_same_user_registration`, or set `register = "deny"`. |
+| `wildcard RP scope '*' must have register = "deny"` | A wildcard never permits or requests registration. |
+| `register = "request" with authenticate = "deny"` | Approving a registration stores `authenticate = allow`; use `allow` or `request` for `authenticate`. |
+| `agent roots ... overlap` | Give audit, state and storage separate directories. |
+| invalid RP ID | Use an exact domain such as `github.com`; no scheme, port, path, IP address or public suffix. |
+| `unknown field`, or a message about removed profile keys | Misspelled or removed field; see [Configuration](configuration.md) and [Migration](migration.md). |
 
-For same-user profiles, also review:
+## The browser does not start
 
-```bash
-passless agent run --profile <profile> -- sh -c \
-  'passless agent --profile <profile> capabilities'
-```
+- `... is branded Google Chrome` or `... is chrome-headless-shell`: neither can load the extension.
+  Remove `browser_command` and `agents.browser_path` so Passless detects a supported browser, or
+  install Playwright's Chromium (`npx playwright install chromium`), Chrome for Testing or your
+  distribution's `chromium`. See [Containment](containment.md#supported-browsers).
+- Containment refused the launch: the browser's user can open a hidraw device and `bwrap` does not work.
+  Install bubblewrap, and check that unprivileged user namespaces are enabled
+  (`passless doctor --agents` shows the case).
+- The MCP client says `Unexpected status 503 when connecting to http://127.0.0.1:<port>/json/version/`:
+  the browser could not be started. The response body names the class
+  (`{"error":"managed browser unavailable","class":"runtime_root_invalid",...}`; other classes are
+  `launch_failed`, `daemon_unreachable`, `refused` and `unavailable`) and the MCP server's stderr
+  (the client's MCP log) has the full text; the daemon's log has the launch error:
+  `journalctl --user -u passless`. A pipe-mode profile is refused this way (`class` `refused`); the
+  stderr line then reads `Playwright browser discovery requires browser_cdp_expose = 'port' ...`
+  (see below).
+  - `class` `runtime_root_invalid` (`failed to launch browser: invalid runtime root: ...`): the
+    browser runtime root, by default `$XDG_RUNTIME_DIR/passless/browser`, cannot be used. Current
+    versions create it (mode 0700, yours) when it is missing; an older build fails with `No such file
+    or directory`: `mkdir -p -m 700 "$XDG_RUNTIME_DIR/passless/browser"`. An existing root that is
+    a symlink, is not mode 0700 or has the wrong owner is refused, not repaired: fix or remove it.
+    For a configured `browser_runtime_root` Passless creates only the last component and only when
+    the parent exists and is not writable by others; create parents yourself. With a `browser_user`
+    that is not the daemon's user, create the root owned by that user with mode 0700 (the default
+    root is only created for the daemon's own user).
+  - `class` `daemon_unreachable`: the daemon is not running, or runs without agents (see above).
+  - `class` `launch_failed`: see `passless doctor --agents` and the daemon log.
+- The extension is not intercepting: the launch fails and no endpoint is printed. Check
+  `passless doctor --agents` for the extension and native host, and the daemon log.
+- `agent browser ... must run inside a principal session`: start your agent with
+  `passless agent run --profile <profile> -- <absolute command>`, or use `passless agent mcp ...`.
+- `Playwright browser discovery requires browser_cdp_expose = 'port'`: the adapter needs an endpoint,
+  which a pipe-mode profile does not have. Set `browser_cdp_expose = "port"` on the profile if direct
+  local control of the browser is acceptable ([Containment](containment.md#cdp-port-mode)), or run
+  `passless agent browser` and drive the browser with `passless agent browser-control`.
+- `browser-control` fails with `the managed browser's WebAuthn interception is degraded`: the extension
+  worker is not attached (or not allowed in incognito); retry after a moment, or see
+  `passless doctor --agents`. `no browser lease associated with this principal session`: run
+  `passless agent browser` first, in the same principal session.
+- A browser owned by another session: end it with `passless agent-admin principals revoke <id>
+  --confirm`.
+- Do not add `--remote-debugging-*` or `--load-extension` flags to `browser_command`: Passless owns
+  them.
 
-The capabilities view identifies human-identity and global-wildcard authority explicitly.
+## The page gets NotAllowedError, or the agent sees nothing happen
 
-## Same-user profile unexpectedly has broad authority
-
-**Symptom:** `capabilities` reports `acts_as_human: true`, or `wildcard_rp_scope: true`.
-
-**Diagnosis:** This is the intended meaning of `same-user`: it exercises the human credential/RP identity within the configured policy. `rp_id = "*"` expands authentication policy to any valid concrete RP for which the human backend contains a matching credential.
-
-**Fix:**
-
-- Prefer `isolated` when a separate RP account is acceptable.
-- Replace `*` with exact RP rules.
-- Add explicit credential references where practical.
-- Keep session TTL and operation budget small.
-- Keep same-user registration denied after enrollment.
-
-Remember that after successful authentication Passless does not restrict application actions inside the resulting RP browser session.
-
-## Browser fails to start
-
-**Symptom:** Managed browser launch fails.
-
-**Diagnosis:**
-
-```bash
-passless agent-admin profile check <profile>
-passless agent-admin browser launch --profile <profile>
-```
-
-Check the configured browser command and, for same-user profiles that use an explicit browser runtime/user boundary, verify the runtime root ownership and mode.
-
-**Fix:**
-
-- Ensure `browser_command` names an installed Chromium/Chrome-compatible browser where the managed extension path is used.
-- Do not inject conflicting `--remote-debugging-*` or extension flags; Passless owns those settings.
-- Ensure `browser_runtime_root`, when configured, is owned by the expected browser user and has the required restrictive permissions.
-- Run `profile check` to detect stale/unsafe runtime state.
-
-## Browser works, but WebAuthn stays native
-
-**Symptom:** A WebAuthn request opens the normal browser/security-key UI instead of completing through the agent path.
-
-This can be intentional.
-
-Passless deliberately leaves these cases native:
-
-- conditional mediation/passkey autofill (`mediation = "conditional"`);
-- a cross-origin frame when browser Permissions Policy delegation cannot be verified;
-- policy that requires human interaction;
-- unsupported/invalid browser request semantics.
-
-**Fix:** Do not bypass the native fallback with a virtual authenticator or private-key injection. Verify the RP flow, frame Permissions Policy, and current profile policy instead.
-
-## Human confirmation never appears or fails closed
-
-**Symptom:** A supervised operation returns an interaction/notification error.
-
-**Diagnosis:** The confirmation boundary requires a notification server that can provide distinct Approve and Deny actions. Unsupported or unqueryable notification-server behavior fails closed.
-
-**Fix:**
-
-- Test on the actual desktop environment.
-- Check daemon logs for `notification_unsupported`, `server_capability_rejected`, or render errors.
-- Do not work around the prompt by passing approval or PIN material through stdin, environment variables, chat, or page content.
-
-Agent/page-provided strings are sanitized and shown only as explicitly untrusted informational context; make the decision from the trusted RP/action fields.
-
-## Authentication stops after repeated ceremonies
-
-**Symptom:** The browser is still running but further WebAuthn operations return replay or operation-budget errors.
-
-**Diagnosis:** Each short-lived session has a bounded shared WebAuthn operation budget, and identical completed request bodies are rejected as replays.
-
-**Fix:** Treat `replayed_operation` as terminal for that operation. Treat `operation_budget_exhausted` as terminal for the session and launch a new bounded session if the operator still intends the task. Repeated retries are not a recovery strategy.
-
-## CDP client cannot connect
-
-**Symptom:** Playwright or another external browser automation client cannot attach.
-
-**Diagnosis:**
+`NotAllowedError` is deliberately generic. Look at the audit for the real reason:
 
 ```bash
-passless agent --profile <profile> browser-status
+passless agent-admin audit export --format json
 ```
 
-The plain status output includes `cdp_endpoint` when one is exposed. External attachment requires profile `browser_cdp_expose = "port"`; pipe mode is daemon-mediated.
+Common causes:
 
-**Fix:** Enable port mode only when full external control of the authenticated managed-browser session is intentional. Do not expose the loopback endpoint to untrusted local processes.
+- **No matching rule**, or `deny`: add an exact rule for the site's RP ID (check the RP ID, not just
+  the domain in the address bar).
+- **`request` waiting**: the page call stays pending until you answer the desktop notification, for up
+  to the page's timeout (3 minutes to 20 hours). The agent should wait, not retry.
+- **`request` denied or timed out**: a cooldown (10 minutes by default) denies further requests for
+  that RP without a prompt. Wait it out, or change the rule to `allow` and reload the policy.
+- **No notification**: `request` is denied at once when no notification server with action support is
+  running on the user's bus. `doctor --agents` warns. Run one (dunst, mako, a desktop shell) or use
+  `allow`.
+- **Conditional (autofill) request**: unavailable; the page needs an explicit sign-in button.
+- **Cross-origin iframe**: denied. Sign in on the top-level page.
+- **Extension not attached yet**: wait for `passless agent browser --wait` or the MCP tool's browser to
+  report ready.
+- **Registration from a background tab**: bring the page to the front; the daemon may have created
+  the credential anyway (see [Browser tools](browser-tools.md#limits)).
 
-## Principal cannot access admin commands
+## Authentication stops after some requests
 
-**Symptom:** `passless agent-admin` commands fail inside a principal session.
+`replayed_operation` and `operation_budget_exhausted` are terminal for that operation or session
+(identical repeats get the original result for 120 seconds, then are rejected). Start a new session if
+the task still needs it; retrying in a loop does not help. A policy reload that changes anything also
+revokes sessions.
 
-**Diagnosis:** This is expected. Principal sessions do not receive the administrator interface.
+## Approval does not appear, or a granted rule is missing
 
-**Fix:** Run administrator commands outside the principal session under the daemon administrator identity.
+See [Rules](rules.md). `passless agent-admin grants list --profile <profile>` shows what was approved;
+a store that is malformed or has the wrong owner or mode disables grants for that profile and is
+reported by `profile check`. A granted rule is inert if the config rule is `deny`, `allow` or gone;
+`profile check` and `doctor --agents` report those as orphaned grants.
 
-## Audit verification fails
+## A tool cannot connect to CDP
 
-**Symptom:** `passless agent-admin audit verify` reports a hash-chain discontinuity.
+The endpoint is printed only for an intercepted browser, by `passless agent browser --wait`. Port mode
+(`browser_cdp_expose = "port"`) is required; in pipe mode there is no endpoint (use `browser-control`). A tool that launches its own Chromium instead of
+attaching gets no passkeys. See [Browser tools](browser-tools.md).
 
-**Fix:**
+## Other
 
-1. Do not treat the audit trail as trustworthy until the cause is understood.
-2. Preserve the existing audit files.
-3. Investigate sequence gaps and hashes.
-4. Repair the audit storage before re-enabling agent work.
+- **Principal cannot run admin commands**: expected. Run `agent-admin` outside the principal session.
+- **Audit `verify` fails**: preserve the files, investigate the gap, and repair storage before more
+  agent use ([Operations](operations.md#recovery)).
+- **Daemon restart ended the sessions**: expected; start new ones.
+- **The site still shows a session after the browser closed**: expected. Use the site's own logout or
+  revocation.
+- **Credential selection is ambiguous**: `single` fails when several credentials match. Pin one with
+  `credential:<ref>` or pick `first-matching` or `newest` knowingly.
+- **Host features missing**: see the table in [Operations](operations.md#host-requirements).
 
-The local hash chain is not externally anchored; host root remains capable of rewriting local state.
-
-## Quarantined browser runtime
-
-**Symptom:** Browser cleanup did not complete and stale runtime state is detected.
-
-**Diagnosis:**
-
-```bash
-passless agent-admin profile check <profile>
-```
-
-**Fix:** Inspect the reported runtime path and process identity before removing quarantined state. Do not blindly reuse an unverified stale browser profile.
-
-## Daemon restart loses active sessions
-
-**Symptom:** Active agent sessions no longer work after daemon restart.
-
-**Diagnosis:** This is expected. Session capabilities, operation state, grants/intents, and browser bindings are intentionally short-lived daemon state.
-
-**Fix:** Re-run the profile pre-flight and launch a new principal/browser session. Do not replay old authorization material.
-
-## RP session outlives the local browser lease
-
-**Symptom:** The Passless lease/session ended, but the RP still considers its browser session authenticated.
-
-**Diagnosis:** This is expected. Local capability/lease expiry does not revoke server-side RP sessions.
-
-**Fix:** Use the RP's own session-revocation/logout controls after compromise or when explicit remote revocation is required.
-
-## Isolated credential not found
-
-**Symptom:** An isolated operation cannot resolve the requested credential reference.
-
-**Diagnosis:**
-
-```bash
-passless agent-admin credential list --profile <profile>
-```
-
-**Fix:** Verify the non-secret credential reference and RP. Isolated profiles cannot use the human credential namespace.
-
-## Same-user credential selection is ambiguous
-
-**Symptom:** Discoverable authentication fails when more than one eligible human credential exists.
-
-**Diagnosis:** The default `credential_selection = "single"` intentionally fails closed on ambiguity.
-
-**Fix:** Prefer explicit credential references for account-sensitive RPs. `first-matching` and `newest` are deterministic convenience policies, not proof that the intended human account was selected.
-
-## Kernel or distribution not supported
-
-**Symptom:** Agent mode fails with missing kernel/IPC/device features.
-
-**Diagnosis:** Review [operations.md](operations.md#kernel-requirements) and `profile check` output.
-
-**Fix:** Use a supported Linux environment providing the required UHID/hidraw, process-management, IPC, and isolation primitives for the configured mode/path.
-
-## Further help
-
-- [Agent overview](README.md)
-- [Security model](security.md)
-- [Configuration reference](configuration.md)
-- [Same-user mode](same-user.md)
-- [Isolated mode](isolated.md)
-- [Operations](operations.md)
+Related: [Overview](README.md), [Security](security.md), [Configuration](configuration.md).

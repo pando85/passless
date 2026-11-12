@@ -60,9 +60,9 @@ av_resolve_phase0_dir() {
     if [[ -z "$validation_dir" ]]; then
         validation_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     fi
-    local phase0_dir="${validation_dir}/../agent-uhid-feasibility"
-    if [[ -d "$phase0_dir" ]]; then
-        printf '%s' "$(cd "$phase0_dir" && pwd)"
+    # The lab policy (policy/) and probe scripts (scripts/) live in the validation directory itself.
+    if [[ -d "${validation_dir}/policy" ]]; then
+        printf '%s' "$(cd "$validation_dir" && pwd)"
         return 0
     fi
     return 1

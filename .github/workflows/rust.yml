@@ -74,6 +74,82 @@ jobs:
       - name: Run deterministic agent validation
         run: make test-agent-validation
 
+  agent-e2e:
+    name: Agent E2E (real browser)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt-get install -y bubblewrap dbus-daemon dbus-x11 libtss2-dev libudev-dev openssl xauth xvfb
+
+      - name: Enable UHID and hidraw access for the runner user
+        run: |
+          sudo modprobe uhid
+          printf '%s\n' \
+            'KERNEL=="uhid", MODE="0666"' \
+            'SUBSYSTEM=="hidraw", MODE="0666"' | sudo tee /etc/udev/rules.d/90-passless-e2e.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          sudo chmod 0666 /dev/uhid
+          test -r /dev/uhid -a -w /dev/uhid
+
+      - name: Allow unprivileged user namespaces (Chromium sandbox, bubblewrap)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Ubuntu 24.04+ (apparmor package) also ships a profile for /usr/bin/bwrap that stacks an
+          # `audit deny capability` profile onto everything running inside bwrap. The sysctl above does not
+          # lift that, and it breaks Chromium's own namespace sandbox nested in bwrap (the browser aborts with
+          # SIGABRT, exit 134). Unload it on this runner, and keep it off should apparmor reload its profiles.
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo mkdir -p /etc/apparmor.d/disable
+            sudo ln -sf /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/disable/bwrap-userns-restrict
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict || true
+          fi
+          echo "bwrap/userns AppArmor profiles still loaded:"
+          sudo aa-status 2>/dev/null | grep -iE 'bwrap|unprivileged_userns' || echo "  none"
+          unshare --user --map-root-user true && echo "unprivileged user namespaces: ok"
+          bwrap --dev-bind / / --dev /dev true && echo "bwrap: ok"
+
+      - name: Install stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup override set stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - name: Install harness dependencies and Playwright Chromium
+        working-directory: tests/agent-e2e
+        run: |
+          npm ci --no-audit --no-fund
+          # Playwright's Chromium goes into the harness cache only (never a shared cache).
+          PLAYWRIGHT_BROWSERS_PATH="$GITHUB_WORKSPACE/target/agent-e2e-cache/ms-playwright" \
+            node node_modules/playwright-core/cli.js install --with-deps chromium
+
+      - name: Run agent E2E (CI subset)
+        run: make test-agent-e2e
+
+      - name: Show AppArmor denials
+        if: failure()
+        run: |
+          sudo dmesg 2>/dev/null | grep -i 'apparmor=.*DENIED' | tail -n 40 || true
+          sudo aa-status 2>&1 | head -n 40 || true
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-e2e-artifacts
+          path: target/agent-e2e-artifacts
+
   agent-fuzz:
     name: Agent protocol fuzz smoke
     runs-on: ubuntu-26.04

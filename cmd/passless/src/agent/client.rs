@@ -3,7 +3,6 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use passless_core::agent::ProfileId;
 use passless_core::agent::protocol::{
@@ -21,8 +20,6 @@ const PRINCIPAL_ROOT_NAME: &str = "principal";
 const PROFILE_SOCKET_NAME: &str = "sock";
 const ENV_RUNTIME_DIR: &str = "PASSLESS_AGENT_RUNTIME_DIR";
 const BASE_DIR_MODE: u32 = 0o700;
-const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_WAIT_POLL: Duration = Duration::from_millis(100);
 const ADMIN_SOCK_MODE: u32 = 0o600;
 const PROFILE_SOCK_MODE: u32 = 0o660;
 
@@ -44,6 +41,11 @@ pub enum ClientError {
         detail: String,
     },
     NoControlFd,
+    /// The agent socket is not there, or nothing listens on it: the daemon is not running (or
+    /// runs without agents).
+    DaemonNotRunning {
+        socket: PathBuf,
+    },
     WrongSocketType {
         detail: String,
     },
@@ -70,6 +72,13 @@ impl fmt::Display for ClientError {
             Self::VersionMismatch(e) => write!(f, "version mismatch: {}", e),
             Self::UnsafePath { detail } => write!(f, "unsafe path: {}", detail),
             Self::NoControlFd => write!(f, "CONTROL_FD (fd 3) not available"),
+            Self::DaemonNotRunning { socket } => write!(
+                f,
+                "the passless daemon is not running, or runs without agents: no agent socket at {} \
+                 (start `passless` with `[agents] enabled = true`, then retry; XDG_RUNTIME_DIR and \
+                 PASSLESS_AGENT_RUNTIME_DIR must be the daemon's)",
+                socket.display()
+            ),
             Self::WrongSocketType { detail } => write!(f, "wrong socket type: {}", detail),
             Self::MissingCapability { detail } => write!(f, "missing capability: {}", detail),
             Self::Timeout => write!(f, "operation timed out"),
@@ -100,8 +109,14 @@ impl From<ProtocolError> for ClientError {
 }
 
 pub fn resolve_runtime_base() -> Result<PathBuf, ClientError> {
-    if let Ok(val) = std::env::var(ENV_RUNTIME_DIR) {
-        let p = PathBuf::from(&val);
+    resolve_runtime_base_with(std::env::var(ENV_RUNTIME_DIR).ok().as_deref())
+}
+
+/// Resolves the runtime base directory given the value of `ENV_RUNTIME_DIR`,
+/// so tests can exercise it without mutating the process environment.
+fn resolve_runtime_base_with(override_dir: Option<&str>) -> Result<PathBuf, ClientError> {
+    if let Some(val) = override_dir {
+        let p = PathBuf::from(val);
         if !p.is_absolute() {
             return Err(ClientError::UnsafePath {
                 detail: format!("{} must be an absolute path", ENV_RUNTIME_DIR),
@@ -176,8 +191,16 @@ fn validate_socket_parent_no_symlink(path: &Path) -> Result<(), ClientError> {
         detail: "socket path has no parent".to_string(),
     })?;
 
-    let meta = std::fs::symlink_metadata(parent).map_err(|e| ClientError::UnsafePath {
-        detail: format!("cannot stat parent {:?}: {}", parent, e),
+    let meta = std::fs::symlink_metadata(parent).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            ClientError::DaemonNotRunning {
+                socket: path.to_path_buf(),
+            }
+        } else {
+            ClientError::UnsafePath {
+                detail: format!("cannot stat parent {:?}: {}", parent, e),
+            }
+        }
     })?;
 
     if meta.file_type().is_symlink() {
@@ -192,8 +215,16 @@ fn validate_socket_parent_no_symlink(path: &Path) -> Result<(), ClientError> {
 fn validate_socket_path_safe(path: &Path, expected_mode: u32) -> Result<(), ClientError> {
     validate_socket_parent_no_symlink(path)?;
 
-    let meta = std::fs::symlink_metadata(path).map_err(|e| ClientError::UnsafePath {
-        detail: format!("cannot stat socket {:?}: {}", path, e),
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            ClientError::DaemonNotRunning {
+                socket: path.to_path_buf(),
+            }
+        } else {
+            ClientError::UnsafePath {
+                detail: format!("cannot stat socket {:?}: {}", path, e),
+            }
+        }
     })?;
 
     if meta.file_type().is_symlink() {
@@ -249,7 +280,17 @@ fn connect_seqpacket(path: &Path) -> Result<OwnedFd, ClientError> {
         )
     };
     if ret < 0 {
-        return Err(ClientError::Io(io::Error::last_os_error()));
+        let err = io::Error::last_os_error();
+        // A socket file nobody listens on is a daemon that exited.
+        if matches!(
+            err.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        ) {
+            return Err(ClientError::DaemonNotRunning {
+                socket: path.to_path_buf(),
+            });
+        }
+        return Err(ClientError::Io(err));
     }
 
     Ok(owned)
@@ -412,12 +453,9 @@ impl PrincipalClient {
             return Err(ClientError::NoControlFd);
         }
         if (stat.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
-            return Err(ClientError::WrongSocketType {
-                detail: format!(
-                    "CONTROL_FD is mode {:o}, expected SEQPACKET socket",
-                    stat.st_mode & libc::S_IFMT
-                ),
-            });
+            // Something else sits on descriptor 3 (an inherited file or pipe): this is not a
+            // principal session, so the caller wraps itself in one like any plain shell would.
+            return Err(ClientError::NoControlFd);
         }
 
         let sock_type = unsafe {
@@ -489,57 +527,6 @@ impl PrincipalClient {
     }
 }
 
-pub enum WaitTarget {
-    Intent,
-    Delegation,
-}
-
-pub fn wait_with_poll<F>(
-    target: WaitTarget,
-    request_id: &passless_core::agent::PendingRequestId,
-    timeout: Option<Duration>,
-    poll_interval: Option<Duration>,
-    mut poll_fn: F,
-) -> Result<(), ClientError>
-where
-    F: FnMut() -> Result<bool, ClientError>,
-{
-    let deadline = Instant::now()
-        .checked_add(timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT))
-        .ok_or(ClientError::Timeout)?;
-    let interval = poll_interval.unwrap_or(DEFAULT_WAIT_POLL);
-
-    let _ = target;
-    let _ = request_id;
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err(ClientError::Timeout);
-        }
-
-        if poll_fn()? {
-            return Ok(());
-        }
-
-        cancellation_safe_sleep(interval, deadline)?;
-    }
-}
-
-fn cancellation_safe_sleep(duration: Duration, deadline: Instant) -> Result<(), ClientError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or(Duration::ZERO);
-    let sleep_dur = duration.min(remaining);
-    if sleep_dur.is_zero() {
-        return Err(ClientError::Timeout);
-    }
-    std::thread::sleep(sleep_dur);
-    if Instant::now() >= deadline {
-        return Err(ClientError::Timeout);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub fn admin_socket_addr(base: &Path) -> PathBuf {
     admin_socket_path(base)
@@ -556,14 +543,13 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     use passless_core::agent::protocol::{CAPABILITY_PROOF_BYTES, PrincipalResponseFrame};
     use passless_core::agent::{DaemonStatus, ProfileId};
 
     use crate::agent::ipc::{AdminHandler, IpcServer, PrincipalHandler, ProfileAccess, RuntimeDir};
-
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EchoAdminHandler;
 
@@ -930,59 +916,45 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime_base_default() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
-        let base = resolve_runtime_base().unwrap();
+        let base = resolve_runtime_base_with(None).unwrap();
         assert!(base.is_absolute(), "base must be absolute: {:?}", base);
     }
 
     #[test]
     fn test_resolve_runtime_base_rejects_relative() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, "relative/path") };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some("relative/path"));
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
     fn test_resolve_runtime_base_accepts_valid_dir() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, dir.path().to_str().unwrap()) };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some(dir.path().to_str().unwrap()));
         assert!(result.is_ok());
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
     fn test_resolve_runtime_base_rejects_symlink() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, link.to_str().unwrap()) };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some(link.to_str().unwrap()));
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
     fn test_resolve_runtime_base_rejects_wrong_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        unsafe { std::env::set_var(ENV_RUNTIME_DIR, dir.path().to_str().unwrap()) };
-        let result = resolve_runtime_base();
+        let result = resolve_runtime_base_with(Some(dir.path().to_str().unwrap()));
         assert!(matches!(result, Err(ClientError::UnsafePath { .. })));
-        unsafe { std::env::remove_var(ENV_RUNTIME_DIR) };
     }
 
     #[test]
@@ -1086,48 +1058,24 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_with_poll_immediate_success() {
-        let req_id = passless_core::agent::PendingRequestId::new();
-        let result = wait_with_poll(
-            WaitTarget::Intent,
-            &req_id,
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_millis(10)),
-            || Ok(true),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_wait_with_poll_timeout() {
-        let req_id = passless_core::agent::PendingRequestId::new();
-        let result = wait_with_poll(
-            WaitTarget::Delegation,
-            &req_id,
-            Some(Duration::from_millis(50)),
-            Some(Duration::from_millis(10)),
-            || Ok(false),
-        );
-        assert!(matches!(result, Err(ClientError::Timeout)));
-    }
-
-    #[test]
-    fn test_wait_with_poll_eventual_success() {
-        let req_id = passless_core::agent::PendingRequestId::new();
-        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counter_clone = counter.clone();
-        let result = wait_with_poll(
-            WaitTarget::Intent,
-            &req_id,
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_millis(10)),
-            move || {
-                let n = counter_clone.fetch_add(1, Ordering::SeqCst);
-                Ok(n >= 2)
-            },
-        );
-        assert!(result.is_ok());
-        assert!(counter.load(Ordering::SeqCst) >= 3);
+    fn a_missing_socket_says_the_daemon_is_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        // The directory is not there at all (the daemon never ran), or is there without a socket.
+        for sock in [
+            dir.path().join("nope/admin.sock"),
+            dir.path().join("admin.sock"),
+        ] {
+            let err = validate_socket_path_safe(&sock, 0o600).unwrap_err();
+            assert!(matches!(err, ClientError::DaemonNotRunning { .. }), "{err}");
+            let text = err.to_string();
+            assert!(text.contains("daemon is not running"), "{text}");
+            assert!(!text.contains("unsafe path"), "{text}");
+        }
+        // A stale socket file nobody listens on.
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let err = connect_seqpacket(&stale).unwrap_err();
+        assert!(matches!(err, ClientError::DaemonNotRunning { .. }), "{err}");
     }
 
     #[test]

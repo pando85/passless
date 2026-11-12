@@ -1,10 +1,13 @@
 # Passless Agent Daemon
 #
-# The daemon MUST run as root to create UHID endpoints and enforce principal
-# isolation (separate UIDs, namespaces, device policy). Do not change User/Group.
+# The daemon MUST run as root to enforce principal isolation (separate UIDs,
+# namespaces) and to launch managed browsers under separate Unix identities via
+# setuid. Do not change User/Group.
 #
-# This unit does NOT grant /dev/uhid or human hidraw access to principals.
-# Per-profile hidraw group policy is handled by 70-passless-agent.rules.
+# Agents use only the browser-extension path. They get no UHID or hidraw device
+# of their own, so this unit installs no agent udev rule and grants no device
+# access to principals or browser users. The human authenticator's UHID device
+# is managed by passless.service and contrib/udev/90-passless.rules.
 #
 # Review hardening directives for your distribution before enabling.
 # Some directives may conflict with dynamic setuid/browser launch.
@@ -21,13 +24,18 @@ ExecStart=/usr/bin/passless --verbose
 Restart=on-failure
 RestartSec=5s
 
-# The daemon requires root for UHID endpoint creation and principal isolation.
+# The daemon requires root for principal isolation and setuid browser launch.
 # Do not add User= or Group= directives.
 
 # Filesystem
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/passless-agent /var/run/passless-agent /var/run/passless-browser
+# The default agents.state_dir (granted rules, audit) is systemd-managed. It is root:root 0700,
+# the same as contrib/tmpfiles/passless-agent.conf; StateDirectoryMode keeps systemd from
+# widening it to its 0755 default.
+StateDirectory=passless-agent
+StateDirectoryMode=0700
 PrivateTmp=true
 # Note: /var/run/passless-browser/<profile> directories are created per-profile
 # and owned by the configured browser_user. The daemon creates and cleans these
@@ -40,10 +48,11 @@ NoNewPrivileges=false
 
 # Namespaces / devices
 PrivateDevices=false
-# PrivateDevices cannot be enabled: Chromium enumerates dynamically created host
-# hidraw nodes after service startup, so static bind mounts are insufficient.
-# The daemon requires /dev/uhid; exact udev identity rules restrict each hidraw
-# node. Never grant /dev/uhid to principals or browser users.
+# Agents have no UHID/hidraw device of their own; no DeviceAllow= entries are
+# needed for them. The directive value is unchanged from earlier releases and is
+# kept because the root daemon launches managed browsers under other identities
+# and has not been profiled against a private /dev. Never grant host devices
+# (including /dev/uhid) to principals or browser users.
 #
 # RestrictAddressFamilies is intentionally deferred. The restriction is inherited
 # by managed Chromium, which requires AF_INET/AF_INET6 for RP access and may use

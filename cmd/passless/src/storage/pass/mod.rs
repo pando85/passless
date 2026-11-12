@@ -166,6 +166,9 @@ impl PassStorageAdapter {
             decryption_affinity: HashMap::new(),
         };
 
+        // A crash between GnuPG and the rename leaves a temporary file behind.
+        remove_stale_temp_files(&adapter.get_fido2_path());
+
         // Load indexes by scanning directory structure (no decryption!)
         adapter.indexes = load_credential_paths(&adapter.get_fido2_path(), "gpg")
             .map_err(|e| Error::Storage(format!("Failed to load credential paths: {}", e)))?;
@@ -549,33 +552,13 @@ impl PassStorageAdapter {
         let (gpg_id_path, content) = self.find_nearest_gpg_id(path)?;
         let recipients = gpg_id::parse_gpg_id_selectors(&content, &gpg_id_path)?;
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::Storage(format!("No parent directory for {}", path.display())))?;
-
-        let tmp_name = format!(
-            ".reencrypt.{}.{}",
-            std::process::id(),
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("credential.gpg")
-        );
-        let tmp_path = parent.join(&tmp_name);
-
+        // Writes a temporary file next to `path` and renames it over `path`.
         encrypt_with_gnupg_binary(
             Path::new("gpg"),
             &recipients,
             plaintext.unsecure_ref(),
-            &tmp_path,
+            path,
         )?;
-
-        std::fs::rename(&tmp_path, path).map_err(|e| {
-            Error::Storage(format!(
-                "Failed to replace {} with re-encrypted version: {}",
-                path.display(),
-                e
-            ))
-        })?;
 
         let relative_path = path
             .strip_prefix(&self.store_path)
@@ -592,7 +575,139 @@ impl PassStorageAdapter {
     }
 }
 
+/// Encrypt `plaintext` to `output_path` atomically.
+///
+/// GnuPG's `--output <target>` truncates the target in place, so a crash, a kill or a panic in
+/// the middle of it would leave a truncated credential. The ciphertext goes to a temporary file
+/// in the same directory instead; it is fsynced, renamed over the target and the directory is
+/// fsynced, so a reader (and a recovered lock after a panic, ADR 0014 section 14) sees either the
+/// previous file or the complete new one. The temporary file ends in `.new`, so neither the
+/// credential index nor the repository stamp (both look for `.gpg`) ever picks it up, and a
+/// failure removes it.
 fn encrypt_with_gnupg_binary(
+    binary: &Path,
+    recipients: &[String],
+    plaintext: &[u8],
+    output_path: &Path,
+) -> Result<()> {
+    let parent = output_path.parent().ok_or_else(|| {
+        Error::Storage(format!("No parent directory for {}", output_path.display()))
+    })?;
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Storage(format!("Invalid path {}", output_path.display())))?;
+    let tmp_path = parent.join(temp_file_name(std::process::id(), file_name));
+
+    let result = run_gnupg_encrypt(binary, recipients, plaintext, &tmp_path)
+        .and_then(|()| publish_encrypted_file(&tmp_path, output_path, parent));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// Gitignore pattern of the temporary files [`encrypt_with_gnupg_binary`] writes
+/// (`.tmp.<pid>.<credential>.gpg.new`). It goes into the repository's `info/exclude`, so the
+/// `git add .` of a Git-sync commit can never stage one that a crash left behind.
+pub(crate) const TEMP_FILE_EXCLUDE_PATTERN: &str = ".tmp.*.gpg.new";
+
+/// Temporary files younger than this are kept by the stale-file cleanup: another process may be
+/// in the middle of a write.
+const STALE_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn temp_file_name(pid: u32, file_name: &str) -> String {
+    format!(".tmp.{pid}.{file_name}.new")
+}
+
+/// Whether `name` is exactly a temporary file of [`encrypt_with_gnupg_binary`]:
+/// `.tmp.<digits>.<name>.gpg.new`.
+fn is_temp_file_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".tmp.") else {
+        return false;
+    };
+    let Some((pid, credential)) = rest.split_once('.') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && credential.len() > ".gpg.new".len()
+        && credential.ends_with(".gpg.new")
+}
+
+/// Remove temporary files a crash left in the credential subtree: regular files named exactly as
+/// [`temp_file_name`] makes them, directly inside an RP directory of `fido2_path`, at least
+/// [`STALE_TEMP_MIN_AGE`] old. Nothing else is touched. Returns how many were removed.
+fn remove_stale_temp_files(fido2_path: &Path) -> usize {
+    let mut removed = 0;
+    let Ok(rp_dirs) = std::fs::read_dir(fido2_path) else {
+        return 0;
+    };
+    for rp_dir in rp_dirs.flatten() {
+        if !rp_dir.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(rp_dir.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !is_temp_file_name(name) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= STALE_TEMP_MIN_AGE);
+            if old_enough && std::fs::remove_file(entry.path()).is_ok() {
+                warn!(
+                    "Removed a stale temporary credential file: {}",
+                    entry.path().display()
+                );
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Flush the encrypted temporary file, rename it over `target` and flush the directory entry.
+fn publish_encrypted_file(tmp_path: &Path, target: &Path, parent: &Path) -> Result<()> {
+    let storage_error = |action: &str, error: std::io::Error| {
+        Error::Storage(format!("Failed to {action} {}: {error}", target.display()))
+    };
+
+    let file = std::fs::File::open(tmp_path).map_err(|e| storage_error("open encrypted", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| storage_error("restrict permissions of", e))?;
+    }
+    file.sync_all()
+        .map_err(|e| storage_error("sync encrypted", e))?;
+    drop(file);
+
+    std::fs::rename(tmp_path, target).map_err(|e| storage_error("replace", e))?;
+
+    // Make the rename durable. A failure here leaves the new file in place, so it is only logged.
+    if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        warn!(
+            "Failed to sync directory {} after writing {}: {}",
+            parent.display(),
+            target.display(),
+            error
+        );
+    }
+    Ok(())
+}
+
+fn run_gnupg_encrypt(
     binary: &Path,
     recipients: &[String],
     plaintext: &[u8],
@@ -889,6 +1004,50 @@ mod tests {
         fs::write(dir.join(".gpg-id"), content).unwrap();
     }
 
+    /// Install an executable fake `gpg` shell script at `path`.
+    ///
+    /// Tests run on parallel threads of one process. While this thread holds the
+    /// script open for writing, another thread's `fork` can briefly inherit that
+    /// write descriptor, and `exec` of a file with a writer fails with ETXTBSY
+    /// ("Text file busy") until that child has exec'd. The script therefore
+    /// answers a probe argument immediately, and this helper only returns once a
+    /// probe run has been spawned successfully, so the code under test never
+    /// races the fork window.
+    #[cfg(unix)]
+    fn write_fake_gpg(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PROBE_ARG: &str = "--passless-test-probe";
+        const ETXTBSY: i32 = 26;
+
+        let body = body
+            .strip_prefix("#!/bin/sh\n")
+            .expect("fake gpg script must start with #!/bin/sh");
+        let script = format!("#!/bin/sh\n[ \"$1\" = '{PROBE_ARG}' ] && exit 0\n{body}");
+
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match Command::new(path).arg(PROBE_ARG).status() {
+                Ok(status) => {
+                    assert!(status.success(), "fake gpg probe failed: {status}");
+                    return;
+                }
+                Err(error)
+                    if error.raw_os_error() == Some(ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("failed to probe fake gpg: {error}"),
+            }
+        }
+    }
+
     fn create_adapter(store_root: &Path) -> PassStorageAdapter {
         PassStorageAdapter {
             store_path: store_root.to_path_buf(),
@@ -942,8 +1101,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gnupg_affinity_reuses_successful_key_for_same_recipient_policy() {
-        use std::os::unix::fs::PermissionsExt;
-
         const KEY2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -985,10 +1142,7 @@ exit 2
             log = log.display(),
             key = KEY2,
         );
-        fs::write(&fake_gpg, script).unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        write_fake_gpg(&fake_gpg, &script);
 
         let target = target_dir.join("aa.gpg");
         let mut adapter = create_adapter(root);
@@ -1021,8 +1175,6 @@ exit 2
     #[cfg(unix)]
     #[test]
     fn gnupg_affinity_is_invalidated_when_gpg_id_policy_changes() {
-        use std::os::unix::fs::PermissionsExt;
-
         const KEY2: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1048,10 +1200,7 @@ printf plaintext
             log = log.display(),
             key = KEY2,
         );
-        fs::write(&fake_gpg, script).unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        write_fake_gpg(&fake_gpg, &script);
 
         let target = target_dir.join("aa.gpg");
         let mut adapter = create_adapter(root);
@@ -1321,23 +1470,164 @@ printf plaintext
         assert_eq!(found_path, rp_dir.join(".gpg-id"));
     }
 
+    /// Shell lines of a fake `gpg` that writes its stdin to the `--output` file.
+    #[cfg(unix)]
+    const FAKE_GPG_WRITES_OUTPUT: &str = "out=\nprev=\nfor a in \"$@\"; do [ \"$prev\" = --output ] && out=\"$a\"; prev=\"$a\"; done\ncat > \"$out\"\n";
+
+    fn leftover_temporaries(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp."))
+            .collect()
+    }
+
+    fn age_file(path: &Path, age: std::time::Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn only_the_exact_temp_file_names_are_recognized() {
+        assert_eq!(temp_file_name(42, "ab12.gpg"), ".tmp.42.ab12.gpg.new");
+        assert!(is_temp_file_name(&temp_file_name(42, "ab12.gpg")));
+        assert!(is_temp_file_name(".tmp.1.x.gpg.new"));
+        for other in [
+            "ab12.gpg",
+            ".tmp.42.ab12.gpg",
+            ".tmp.abc.ab12.gpg.new",
+            ".tmp..ab12.gpg.new",
+            ".tmp.42..gpg.new",
+            "tmp.42.ab12.gpg.new",
+            ".reencrypt.42.ab12.gpg",
+            ".tmp.42.ab12.gpg.new.bak",
+        ] {
+            assert!(!is_temp_file_name(other), "{other}");
+        }
+    }
+
+    /// Initialisation removes stale temporary files of the exact naming, inside RP directories
+    /// only, and leaves everything else alone (fresh ones, other names, credentials, files outside
+    /// the credential subtree, symlinks).
+    #[cfg(unix)]
+    #[test]
+    fn stale_temp_files_are_removed_at_initialisation_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        let fido2 = store.join("fido2");
+        let rp = fido2.join("example.com");
+        fs::create_dir_all(&rp).unwrap();
+        fs::create_dir_all(store.join("other")).unwrap();
+
+        let stale = rp.join(".tmp.4242.aa.gpg.new");
+        let fresh = rp.join(".tmp.4243.bb.gpg.new");
+        let credential = rp.join("cc.gpg");
+        let lookalike = rp.join(".tmp.abc.dd.gpg.new");
+        let reencrypt_name = rp.join(".tmp.4242.ee.gpg");
+        let outside = store.join("other/.tmp.4242.ff.gpg.new");
+        let at_root = fido2.join(".tmp.4242.gg.gpg.new");
+        for path in [
+            &stale,
+            &fresh,
+            &credential,
+            &lookalike,
+            &reencrypt_name,
+            &outside,
+            &at_root,
+        ] {
+            fs::write(path, b"x").unwrap();
+        }
+        let old = std::time::Duration::from_secs(3600);
+        for path in [&stale, &lookalike, &reencrypt_name, &outside, &at_root] {
+            age_file(path, old);
+        }
+        let link = rp.join(".tmp.4244.hh.gpg.new");
+        std::os::unix::fs::symlink(&credential, &link).unwrap();
+
+        assert_eq!(remove_stale_temp_files(&fido2), 1);
+
+        assert!(!stale.exists());
+        for kept in [
+            &fresh,
+            &credential,
+            &lookalike,
+            &reencrypt_name,
+            &outside,
+            &at_root,
+        ] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+        assert!(link.symlink_metadata().is_ok(), "a symlink is left alone");
+    }
+
+    /// Review L3: GnuPG's `--output <target>` truncates in place. The ciphertext goes to a
+    /// temporary file that is renamed over the target, so the target holds the previous bytes
+    /// for as long as GnuPG runs and the complete new ones afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn gnupg_encrypt_replaces_the_target_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_gpg = dir.path().join("gpg");
+        let target = dir.path().join("credential.gpg");
+        let seen = dir.path().join("seen-by-gpg");
+        fs::write(&target, b"previous").unwrap();
+        let script = format!(
+            "#!/bin/sh\n{FAKE_GPG_WRITES_OUTPUT}cat '{}' > '{}'\nexit 0\n",
+            target.display(),
+            seen.display()
+        );
+        write_fake_gpg(&fake_gpg, &script);
+
+        encrypt_with_gnupg_binary(&fake_gpg, &["alice".to_string()], b"new", &target).unwrap();
+
+        assert_eq!(
+            fs::read(&seen).unwrap(),
+            b"previous",
+            "target untouched while gpg ran"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(leftover_temporaries(dir.path()).is_empty());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// A GnuPG that fails after writing part of its output must leave the previous credential
+    /// intact and no temporary file behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_gnupg_encrypt_keeps_the_previous_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_gpg = dir.path().join("gpg");
+        let target = dir.path().join("credential.gpg");
+        fs::write(&target, b"previous").unwrap();
+        let script = format!("#!/bin/sh\n{FAKE_GPG_WRITES_OUTPUT}echo 'gpg: failed' >&2\nexit 2\n");
+        write_fake_gpg(&fake_gpg, &script);
+
+        let error = encrypt_with_gnupg_binary(&fake_gpg, &["alice".to_string()], b"new", &target)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("GPG encryption failed"));
+        assert_eq!(fs::read(&target).unwrap(), b"previous");
+        assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn gnupg_encrypt_forwards_recipient_selectors_verbatim_and_in_order() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake_gpg = dir.path().join("gpg");
         let args_file = dir.path().join("args");
         let output = dir.path().join("credential.gpg");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat >/dev/null\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{FAKE_GPG_WRITES_OUTPUT}exit 0\n",
             args_file.display()
         );
-        fs::write(&fake_gpg, script).unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        write_fake_gpg(&fake_gpg, &script);
 
         let recipients = vec![
             "alice@example.com".to_string(),
@@ -1372,18 +1662,12 @@ printf plaintext
     #[cfg(unix)]
     #[test]
     fn gnupg_encrypt_propagates_recipient_rejection() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake_gpg = dir.path().join("gpg");
-        fs::write(
+        write_fake_gpg(
             &fake_gpg,
             "#!/bin/sh\ncat >/dev/null\necho 'gpg: error reading key: No public key' >&2\nexit 2\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&fake_gpg).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_gpg, permissions).unwrap();
+        );
 
         let recipients = vec!["definitely-not-a-real-recipient".to_string()];
         let error = encrypt_with_gnupg_binary(

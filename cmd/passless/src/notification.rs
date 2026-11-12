@@ -60,6 +60,18 @@ fn configured_interaction_mode() -> Result<InteractionMode, String> {
     }
 }
 
+/// Whether `PASSLESS_INTERACTION_MODE=automatic` makes the human path approve its prompts
+/// without user interaction. The agent subsystem refuses to start in that mode unless it is
+/// acknowledged (ADR 0014 section 7, R19). An invalid value is not automatic: the human path then
+/// fails every prompt instead of approving it.
+#[cfg(feature = "agent")]
+pub fn human_path_is_automatic() -> bool {
+    matches!(
+        configured_interaction_mode(),
+        Ok(InteractionMode::Automatic)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotificationActionMode {
     Explicit,
@@ -498,10 +510,5 @@ mod tests {
             "approve",
             NotificationActionMode::DunstDefault
         ));
-    }
-
-    #[test]
-    fn test_notification_action_mode_doesnt_panic() {
-        let _ = notification_action_mode(PromptKind::UserPresence);
     }
 }

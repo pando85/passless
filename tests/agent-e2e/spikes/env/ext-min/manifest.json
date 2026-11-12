@@ -1,0 +1,4 @@
+{"manifest_version":3,"name":"env-spike-min","version":"1.0.0",
+ "background":{"service_worker":"worker.js"},
+ "host_permissions":["http://localhost/*"],
+ "content_scripts":[{"matches":["http://localhost/*"],"js":["cs.js"],"run_at":"document_start"}]}

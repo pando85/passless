@@ -1,18 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use passless_core::agent::protocol::{
-    AuthorityRisk, DelegationState, IntentAction, IntentState, PrincipalCredentialSummary,
-};
+use passless_core::agent::protocol::{AuthorityRisk, PrincipalCredentialSummary};
 use passless_core::{
-    AgentCommand, AgentCredentialAction, AgentDelegationAction, AgentIntentAction,
-    AgentIntentActionType, CredentialRef, Error, OutputFormat, PendingRequestId, ProfileId, Result,
+    AgentCommand, AgentCredentialAction, CredentialRef, Error, OutputFormat, ProfileId, Result,
 };
 
 use serde::Serialize;
 
 use crate::agent::client::resolve_runtime_base;
-use crate::agent::client::{AdminClient, ClientError, PrincipalClient, WaitTarget, wait_with_poll};
+use crate::agent::client::{AdminClient, ClientError, PrincipalClient};
 
 use passless_core::agent::protocol::{AdminRequest, AdminResponse};
 
@@ -25,20 +21,6 @@ struct Envelope<T: Serialize> {
     data: T,
 }
 
-#[derive(Serialize)]
-struct ErrorEnvelope {
-    version: &'static str,
-    status: &'static str,
-    error: ErrorDetail,
-}
-
-#[derive(Serialize)]
-struct ErrorDetail {
-    code: String,
-    message: String,
-    recommended_action: String,
-}
-
 fn output_json<T: Serialize>(data: &T) -> Result<()> {
     let envelope = Envelope {
         version: ENVELOPE_VERSION,
@@ -46,23 +28,6 @@ fn output_json<T: Serialize>(data: &T) -> Result<()> {
         data,
     };
     println!(
-        "{}",
-        serde_json::to_string(&envelope).map_err(|e| Error::Other(e.to_string()))?
-    );
-    Ok(())
-}
-
-fn output_error(code: &str, message: &str, action: &str) -> Result<()> {
-    let envelope = ErrorEnvelope {
-        version: ENVELOPE_VERSION,
-        status: "error",
-        error: ErrorDetail {
-            code: code.to_string(),
-            message: message.to_string(),
-            recommended_action: action.to_string(),
-        },
-    };
-    eprintln!(
         "{}",
         serde_json::to_string(&envelope).map_err(|e| Error::Other(e.to_string()))?
     );
@@ -79,11 +44,6 @@ fn parse_profile_id(s: &str) -> Result<ProfileId> {
 
 fn parse_credential_ref(s: &str) -> Result<CredentialRef> {
     CredentialRef::from_hex(s).map_err(|e| Error::Other(e.to_string()))
-}
-
-fn parse_pending_request_id(s: &str) -> Result<PendingRequestId> {
-    s.parse::<PendingRequestId>()
-        .map_err(|e| Error::Other(e.to_string()))
 }
 
 fn connect_principal(profile: &str) -> Result<PrincipalClient> {
@@ -112,6 +72,33 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
             profile: run_profile,
             command,
         } => dispatch_run(output, run_profile, command),
+        AgentCommand::Browser {
+            json,
+            env,
+            wait,
+            headed,
+            url,
+        } => super::agent_browser::dispatch_browser(
+            profile,
+            &super::agent_browser::BrowserFlags {
+                json: *json,
+                env: *env,
+                wait: *wait,
+                headed: *headed,
+                url: url.clone(),
+            },
+        ),
+        AgentCommand::Mcp {
+            print_config,
+            server,
+            adapter,
+        } => super::agent_browser::dispatch_mcp(
+            profile,
+            output,
+            *print_config,
+            *server,
+            adapter.as_ref(),
+        ),
         _ => {
             let profile = profile.ok_or_else(|| {
                 Error::Other("--profile is required for principal commands".to_string())
@@ -120,17 +107,17 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
                 AgentCommand::Doctor => dispatch_doctor(output, profile),
                 AgentCommand::Capabilities => dispatch_capabilities(output, profile),
                 AgentCommand::Instructions => dispatch_instructions(output, profile),
-                AgentCommand::Intent { action } => dispatch_intent(output, profile, action),
-                AgentCommand::Delegation { action } => dispatch_delegation(output, profile, action),
                 AgentCommand::Credential { action } => dispatch_credential(output, profile, action),
                 AgentCommand::BrowserStatus => dispatch_browser_status(output, profile),
-                AgentCommand::EndpointStatus => dispatch_endpoint_status(output, profile),
                 AgentCommand::BrowserControl {
                     request,
                     request_file,
                     timeout_ms,
                 } => dispatch_browser_control(output, profile, request, request_file, *timeout_ms),
-                AgentCommand::PlaywrightMcp { .. } | AgentCommand::Run { .. } => unreachable!(),
+                AgentCommand::PlaywrightMcp { .. }
+                | AgentCommand::Run { .. }
+                | AgentCommand::Browser { .. }
+                | AgentCommand::Mcp { .. } => unreachable!(),
             }
         }
     }
@@ -313,352 +300,6 @@ fn dispatch_instructions(output: OutputFormat, profile: &str) -> Result<()> {
     }
 }
 
-fn dispatch_intent(output: OutputFormat, profile: &str, action: &AgentIntentAction) -> Result<()> {
-    match action {
-        AgentIntentAction::Create {
-            action: intent_type,
-            rp,
-            credential,
-            reason,
-        } => {
-            let mut client = connect_principal(profile)?;
-            let action = match intent_type {
-                AgentIntentActionType::Register => IntentAction::Register,
-                AgentIntentActionType::Authenticate => IntentAction::Authenticate,
-            };
-            let cred_ref = credential
-                .as_deref()
-                .map(parse_credential_ref)
-                .transpose()?;
-            let req = passless_core::agent::PrincipalRequest::CreateIntent {
-                profile_id: parse_profile_id(profile)?,
-                action,
-                rp_id: rp.clone(),
-                credential_ref: cred_ref,
-                reason: reason.clone(),
-                grant_ttl_secs: None,
-                session_ttl_secs: None,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::IntentCreated { request_id } => {
-                    #[derive(Serialize)]
-                    struct IntentCreated {
-                        request_id: String,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&IntentCreated {
-                            request_id: request_id.to_string(),
-                        }),
-                        OutputFormat::Plain => {
-                            println!("request_id: {}", request_id);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-        AgentIntentAction::Show { request_id } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::ShowIntent {
-                request_id: parse_pending_request_id(request_id)?,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::IntentStatus { request_id, state } => {
-                    #[derive(Serialize)]
-                    struct IntentStatusOut {
-                        request_id: String,
-                        state: String,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&IntentStatusOut {
-                            request_id: request_id.to_string(),
-                            state: state.to_string(),
-                        }),
-                        OutputFormat::Plain => {
-                            println!("request_id: {}", request_id);
-                            println!("state: {}", state);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-        AgentIntentAction::Wait {
-            request_id,
-            timeout,
-            poll_interval,
-        } => {
-            let mut client = connect_principal(profile)?;
-            let req_id = parse_pending_request_id(request_id)?;
-            let timeout_dur = timeout.map(Duration::from_secs);
-            let poll_dur = poll_interval.map(Duration::from_millis);
-
-            let result = wait_with_poll(
-                WaitTarget::Intent,
-                &req_id,
-                timeout_dur,
-                poll_dur,
-                || -> std::result::Result<bool, ClientError> {
-                    let show_req = passless_core::agent::PrincipalRequest::ShowIntent {
-                        request_id: req_id.clone(),
-                    };
-                    let resp = client.request(show_req)?;
-                    match resp {
-                        passless_core::agent::PrincipalResponse::IntentStatus { state, .. } => {
-                            Ok(is_terminal_intent(state))
-                        }
-                        _ => Ok(false),
-                    }
-                },
-            );
-
-            match result {
-                Ok(()) => {
-                    let show_req = passless_core::agent::PrincipalRequest::ShowIntent {
-                        request_id: req_id.clone(),
-                    };
-                    let resp = client.request(show_req).map_err(client_error_to_result)?;
-                    match resp {
-                        passless_core::agent::PrincipalResponse::IntentStatus {
-                            request_id,
-                            state,
-                        } => {
-                            #[derive(Serialize)]
-                            struct IntentWaitOut {
-                                request_id: String,
-                                state: String,
-                            }
-                            match output {
-                                OutputFormat::Json => output_json(&IntentWaitOut {
-                                    request_id: request_id.to_string(),
-                                    state: state.to_string(),
-                                }),
-                                OutputFormat::Plain => {
-                                    println!("request_id: {}", request_id);
-                                    println!("state: {}", state);
-                                    Ok(())
-                                }
-                            }
-                        }
-                        _ => Err(Error::Other("unexpected response".to_string())),
-                    }
-                }
-                Err(ClientError::Timeout) => {
-                    let _ = output_error("timeout", "wait timed out", "retry");
-                    Err(Error::Other("wait timed out".to_string()))
-                }
-                Err(e) => Err(client_error_to_result(e)),
-            }
-        }
-        AgentIntentAction::Cancel { request_id } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::CancelIntent {
-                request_id: parse_pending_request_id(request_id)?,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::IntentCancelled => {
-                    #[derive(Serialize)]
-                    struct CancelledOut {
-                        cancelled: bool,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&CancelledOut { cancelled: true }),
-                        OutputFormat::Plain => {
-                            println!("cancelled: true");
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-    }
-}
-
-fn is_terminal_intent(state: IntentState) -> bool {
-    matches!(
-        state,
-        IntentState::Approved | IntentState::Denied | IntentState::Cancelled | IntentState::Expired
-    )
-}
-
-fn is_terminal_delegation(state: DelegationState) -> bool {
-    matches!(
-        state,
-        DelegationState::Approved
-            | DelegationState::Denied
-            | DelegationState::Cancelled
-            | DelegationState::Expired
-            | DelegationState::Revoked
-    )
-}
-
-fn dispatch_delegation(
-    output: OutputFormat,
-    profile: &str,
-    action: &AgentDelegationAction,
-) -> Result<()> {
-    match action {
-        AgentDelegationAction::Request {
-            rp,
-            credential,
-            session_ttl,
-            reason,
-        } => {
-            let mut client = connect_admin()?;
-            let req = passless_core::agent::AdminRequest::RequestDelegation {
-                profile_id: parse_profile_id(profile)?,
-                rp_id: rp.clone(),
-                credential_ref: parse_credential_ref(credential)?,
-                max_session_ttl: *session_ttl,
-                reason: reason.clone(),
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::AdminResponse::DelegationRequested { request_id } => {
-                    #[derive(Serialize)]
-                    struct DelegationRequestedOut {
-                        request_id: String,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&DelegationRequestedOut {
-                            request_id: request_id.to_string(),
-                        }),
-                        OutputFormat::Plain => {
-                            println!("request_id: {}", request_id);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-        AgentDelegationAction::Show { request_id } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::ShowDelegation {
-                request_id: parse_pending_request_id(request_id)?,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::DelegationStatus { request_id, state } => {
-                    #[derive(Serialize)]
-                    struct DelegationStatusOut {
-                        request_id: String,
-                        state: String,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&DelegationStatusOut {
-                            request_id: request_id.to_string(),
-                            state: state.to_string(),
-                        }),
-                        OutputFormat::Plain => {
-                            println!("request_id: {}", request_id);
-                            println!("state: {}", state);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-        AgentDelegationAction::Wait {
-            request_id,
-            timeout,
-            poll_interval,
-        } => {
-            let mut client = connect_principal(profile)?;
-            let req_id = parse_pending_request_id(request_id)?;
-            let timeout_dur = timeout.map(Duration::from_secs);
-            let poll_dur = poll_interval.map(Duration::from_millis);
-
-            let result = wait_with_poll(
-                WaitTarget::Delegation,
-                &req_id,
-                timeout_dur,
-                poll_dur,
-                || -> std::result::Result<bool, ClientError> {
-                    let show_req = passless_core::agent::PrincipalRequest::ShowDelegation {
-                        request_id: req_id.clone(),
-                    };
-                    let resp = client.request(show_req)?;
-                    match resp {
-                        passless_core::agent::PrincipalResponse::DelegationStatus {
-                            state, ..
-                        } => Ok(is_terminal_delegation(state)),
-                        _ => Ok(false),
-                    }
-                },
-            );
-
-            match result {
-                Ok(()) => {
-                    let show_req = passless_core::agent::PrincipalRequest::ShowDelegation {
-                        request_id: req_id.clone(),
-                    };
-                    let resp = client.request(show_req).map_err(client_error_to_result)?;
-                    match resp {
-                        passless_core::agent::PrincipalResponse::DelegationStatus {
-                            request_id,
-                            state,
-                        } => {
-                            #[derive(Serialize)]
-                            struct DelegationWaitOut {
-                                request_id: String,
-                                state: String,
-                            }
-                            match output {
-                                OutputFormat::Json => output_json(&DelegationWaitOut {
-                                    request_id: request_id.to_string(),
-                                    state: state.to_string(),
-                                }),
-                                OutputFormat::Plain => {
-                                    println!("request_id: {}", request_id);
-                                    println!("state: {}", state);
-                                    Ok(())
-                                }
-                            }
-                        }
-                        _ => Err(Error::Other("unexpected response".to_string())),
-                    }
-                }
-                Err(ClientError::Timeout) => {
-                    let _ = output_error("timeout", "wait timed out", "retry");
-                    Err(Error::Other("wait timed out".to_string()))
-                }
-                Err(e) => Err(client_error_to_result(e)),
-            }
-        }
-        AgentDelegationAction::Cancel { request_id } => {
-            let mut client = connect_principal(profile)?;
-            let req = passless_core::agent::PrincipalRequest::CancelDelegation {
-                request_id: parse_pending_request_id(request_id)?,
-            };
-            let resp = client.request(req).map_err(client_error_to_result)?;
-            match resp {
-                passless_core::agent::PrincipalResponse::DelegationCancelled => {
-                    #[derive(Serialize)]
-                    struct CancelledOut {
-                        cancelled: bool,
-                    }
-                    match output {
-                        OutputFormat::Json => output_json(&CancelledOut { cancelled: true }),
-                        OutputFormat::Plain => {
-                            println!("cancelled: true");
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other("unexpected response".to_string())),
-            }
-        }
-    }
-}
-
 fn dispatch_credential(
     output: OutputFormat,
     profile: &str,
@@ -740,28 +381,12 @@ fn dispatch_browser_status(output: OutputFormat, profile: &str) -> Result<()> {
                 if let Some(endpoint) = &status.cdp_endpoint {
                     println!("cdp_endpoint: {}", endpoint);
                 }
-                Ok(())
-            }
-        },
-        _ => Err(Error::Other("unexpected response".to_string())),
-    }
-}
-
-fn dispatch_endpoint_status(output: OutputFormat, profile: &str) -> Result<()> {
-    let mut client = connect_principal(profile)?;
-    let resp = client
-        .request(passless_core::agent::PrincipalRequest::EndpointStatus)
-        .map_err(client_error_to_result)?;
-    match resp {
-        passless_core::agent::PrincipalResponse::EndpointStatus(status) => match output {
-            OutputFormat::Json => output_json(&status),
-            OutputFormat::Plain => {
-                println!("endpoint_id: {}", status.endpoint_id);
-                println!("status: {}", status.status);
-                println!(
-                    "connected: {}",
-                    if status.connected { "true" } else { "false" }
-                );
+                if let Some(interception) = &status.interception {
+                    println!("interception: {}", interception);
+                }
+                if let Some(incognito_allowed) = status.incognito_allowed {
+                    println!("incognito_allowed: {}", incognito_allowed);
+                }
                 Ok(())
             }
         },
@@ -879,6 +504,17 @@ fn read_cdp_request_file(path: &Path) -> Result<String> {
 }
 
 fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Result<()> {
+    run_in_principal_session(output, profile, command, false)
+}
+
+/// Start `command` in a new principal session of `profile` (or exec it directly when this
+/// process already is one) and wait for it. `quiet` suppresses the session notice on stderr.
+pub(super) fn run_in_principal_session(
+    output: OutputFormat,
+    profile: &str,
+    command: &[PathBuf],
+    quiet: bool,
+) -> Result<()> {
     let control_fd = crate::agent::launcher::CONTROL_FD;
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(control_fd, &mut stat) } == 0
@@ -908,7 +544,8 @@ fn dispatch_run(output: OutputFormat, profile: &str, command: &[PathBuf]) -> Res
         AdminResponse::PrincipalLaunched(launched) => {
             let session_id = launched.session_id.clone();
 
-            if output == OutputFormat::Json {
+            if quiet {
+            } else if output == OutputFormat::Json {
                 eprintln!(
                     "{}",
                     serde_json::to_string(&Envelope {
@@ -1014,16 +651,15 @@ mod tests {
 
     #[test]
     fn json_envelope_has_no_secrets() {
-        let caps = passless_core::agent::PrincipalCapabilities {
+        let instructions = passless_core::agent::PrincipalInstructions {
             profile_id: "test".into(),
             mode: "isolated".into(),
-            allowed_rp_ids: vec!["example.com".into()],
-            registration_allowed: true,
+            instructions: "Use WebAuthn API for authentication".into(),
         };
         let envelope = Envelope {
             version: ENVELOPE_VERSION,
             status: "ok",
-            data: &caps,
+            data: &instructions,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains(r#""version":"1"#));
@@ -1089,76 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn error_envelope_has_code_message_action() {
-        let err = ErrorEnvelope {
-            version: ENVELOPE_VERSION,
-            status: "error",
-            error: ErrorDetail {
-                code: "not_found".into(),
-                message: "credential not found".into(),
-                recommended_action: "fix_request".into(),
-            },
-        };
-        let json = serde_json::to_string(&err).unwrap();
-        assert!(json.contains(r#""code":"not_found"#));
-        assert!(json.contains(r#""message":"credential not found"#));
-        assert!(json.contains(r#""recommended_action":"fix_request"#));
-        assert!(!json.contains("data"));
-    }
-
-    #[test]
-    fn error_envelope_no_raw_internal_details() {
-        let err = ErrorEnvelope {
-            version: ENVELOPE_VERSION,
-            status: "error",
-            error: ErrorDetail {
-                code: "internal".into(),
-                message: "something went wrong".into(),
-                recommended_action: "retry".into(),
-            },
-        };
-        let json = serde_json::to_string(&err).unwrap();
-        assert!(!json.contains("stack_trace"));
-        assert!(!json.contains("backtrace"));
-        assert!(!json.contains("source_file"));
-    }
-
-    #[test]
-    fn capabilities_plain_output_no_debug() {
-        let caps = passless_core::agent::PrincipalCapabilities {
-            profile_id: "test".into(),
-            mode: "isolated".into(),
-            allowed_rp_ids: vec!["example.com".into()],
-            registration_allowed: true,
-        };
-        let plain = format!(
-            "profile: {}\nmode: {}\nregistration_allowed: {}\nallowed_rp_ids:\n  - {}",
-            caps.profile_id, caps.mode, caps.registration_allowed, caps.allowed_rp_ids[0]
-        );
-        assert!(!plain.contains("PrincipalCapabilities"));
-        assert!(!plain.contains("{"));
-    }
-
-    #[test]
-    fn terminal_intent_states() {
-        assert!(!is_terminal_intent(IntentState::Pending));
-        assert!(is_terminal_intent(IntentState::Approved));
-        assert!(is_terminal_intent(IntentState::Denied));
-        assert!(is_terminal_intent(IntentState::Cancelled));
-        assert!(is_terminal_intent(IntentState::Expired));
-    }
-
-    #[test]
-    fn terminal_delegation_states() {
-        assert!(!is_terminal_delegation(DelegationState::Pending));
-        assert!(is_terminal_delegation(DelegationState::Approved));
-        assert!(is_terminal_delegation(DelegationState::Denied));
-        assert!(is_terminal_delegation(DelegationState::Cancelled));
-        assert!(is_terminal_delegation(DelegationState::Expired));
-        assert!(is_terminal_delegation(DelegationState::Revoked));
-    }
-
-    #[test]
     fn admin_request_type_cannot_be_principal_request() {
         fn accepts_admin(_: AdminRequest) {}
         fn accepts_principal(_: passless_core::agent::PrincipalRequest) {}
@@ -1185,11 +751,6 @@ mod tests {
     #[test]
     fn credential_ref_parse_rejects_non_hex() {
         assert!(parse_credential_ref("zzzz").is_err());
-    }
-
-    #[test]
-    fn pending_request_id_parse_rejects_non_hex() {
-        assert!(parse_pending_request_id("not-hex").is_err());
     }
 
     #[test]

@@ -22,6 +22,46 @@ pub use tpm::TpmStorageAdapter;
 
 use soft_fido2::Result;
 
+use std::sync::{Mutex, MutexGuard};
+
+use log::warn;
+
+/// Lock the credential storage of the human authenticator, recovering a poisoned lock.
+///
+/// Same-user agent ceremonies share this mutex (ADR 0014 invariant 3), so a panic in one of them
+/// must not disable the human path for the rest of the daemon's life (invariant 23). Release
+/// builds abort on panic, so this matters for debug and test builds and for any future unwind
+/// build; agent code under this lock is kept panic-free as well.
+///
+/// Recovering is sound because the guarded adapter is never left half-updated in a way that
+/// matters:
+/// - Agent ceremonies touch the adapter only through `CredentialStorage` methods. A panic in agent
+///   code (selection, audit reservation, re-check) leaves it between two complete calls, a state
+///   the human path itself produces; an iteration cursor left mid-way is reset by the next
+///   `read_first`.
+/// - Inside an adapter method (code the human path runs too), a credential file is written
+///   atomically before the in-memory index is updated: `local` and `tpm` write a temporary file
+///   and rename it (`util::atomic_write_in_dir`), and `pass` has GnuPG encrypt to a temporary file
+///   in the same directory that is fsynced and renamed over the target
+///   (`pass::encrypt_with_gnupg_binary`; GnuPG's own `--output <target>` truncates in place and is
+///   not used on the target). The index is memory built from the files, never the other way round.
+///   A panic before the rename changes nothing; after it, at worst the index lacks the new
+///   credential until the next start. The `pass` and `tpm` backends also cache decrypted
+///   credentials (the `local` backend has no cache): a panic after the rename can leave a cached
+///   copy of the previous contents until `CREDENTIAL_CACHE_TTL` expires. None of these corrupts
+///   a credential or a key, or grants anything.
+/// - The `pass` Git-sync coordinator ends a one-call (implicit) operation from a drop guard, so a
+///   panic cannot leave its depth counter raised, and it recovers its own poisoned lock. A panic
+///   inside the human path's explicit operation bracket (`main.rs`, `handle_command`) is not
+///   unwound that way; it only matters for unwind builds, since release builds abort.
+pub fn lock_shared_storage<S: ?Sized>(storage: &Mutex<S>) -> MutexGuard<'_, S> {
+    storage.lock().unwrap_or_else(|poisoned| {
+        warn!("credential storage lock was poisoned by a panicked thread; recovering");
+        storage.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Filter criteria for reading credentials
 #[derive(Debug, Clone)]
 pub enum CredentialFilter {

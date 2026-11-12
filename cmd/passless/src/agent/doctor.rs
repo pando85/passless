@@ -1,20 +1,23 @@
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use passless_core::agent::protocol::{DoctorCheck, EndpointDiagnosticState};
-use passless_core::agent::{AgentMode, ProfileId};
+use passless_core::agent::protocol::DoctorCheck;
+use passless_core::agent::{AgentConfig, AgentMode, AgentProfileConfig, ProfileId, RuleAction};
 
 use super::audit::AuditGate;
 use super::browser::{BrowserManifest, ProcessIdentity};
-use super::launcher::{ProbeResult, probe_uhid_access};
+use super::deployment::DeploymentAxes;
+use super::granted_rules::ProfileGrants;
 
 use passless_core::agent::ProfileDiagnosticReport;
 
 pub trait StartupProbes: Send + Sync {
     fn probe_euid_is_root(&self) -> bool;
-    fn probe_uhid(&self) -> ProbeResult;
     fn probe_close_range_available(&self) -> bool;
     fn probe_audit_gate_healthy(&self, audit_path: &Path) -> Result<(), String>;
     fn probe_storage_root(&self, path: &Path, expected_uid: u32) -> Result<(), String>;
@@ -35,10 +38,6 @@ pub struct ProductionProbes;
 impl StartupProbes for ProductionProbes {
     fn probe_euid_is_root(&self) -> bool {
         unsafe { libc::geteuid() == 0 }
-    }
-
-    fn probe_uhid(&self) -> ProbeResult {
-        probe_uhid_access()
     }
 
     fn probe_close_range_available(&self) -> bool {
@@ -217,6 +216,9 @@ fn is_process_alive_verified(pid: u32, expected_identity: &ProcessIdentity) -> b
 pub struct StartupDiagnosticResult {
     pub checks: Vec<DoctorCheck>,
     pub fatal: Vec<String>,
+    /// Non-fatal findings the daemon logs at start, such as the shared-UID `isolated` warning of
+    /// ADR 0014 section 13.
+    pub warnings: Vec<String>,
 }
 
 impl StartupDiagnosticResult {
@@ -233,6 +235,7 @@ pub fn run_startup_diagnostics(
 ) -> StartupDiagnosticResult {
     let mut checks = Vec::new();
     let mut fatal = Vec::new();
+    let mut warnings = Vec::new();
 
     if has_profiles {
         let euid_ok = probes.probe_euid_is_root();
@@ -242,27 +245,9 @@ pub fn run_startup_diagnostics(
             message: if euid_ok {
                 "daemon euid is root".into()
             } else {
-                "daemon euid is not root; relying on group-based UHID access".into()
+                "daemon euid is not root; running without principal isolation".into()
             },
         });
-    }
-
-    if has_profiles {
-        let uhid = probes.probe_uhid();
-        let uhid_ok = matches!(uhid, ProbeResult::Allowed { .. });
-        checks.push(DoctorCheck {
-            name: "uhid_access".into(),
-            passed: uhid_ok,
-            message: match &uhid {
-                ProbeResult::Allowed { path } => format!("{} is accessible", path),
-                ProbeResult::Denied { path, errno } => {
-                    format!("{} is not accessible (errno {})", path, errno)
-                }
-            },
-        });
-        if !uhid_ok {
-            fatal.push("/dev/uhid not accessible".into());
-        }
     }
 
     if has_profiles {
@@ -302,6 +287,13 @@ pub fn run_startup_diagnostics(
     }
 
     for (name, info) in profile_configs {
+        // Both deployment axes (ADR 0014 section 13). No combination is fatal here: a principal
+        // that shares the daemon's UID is a supported deployment, and only `isolated` warns.
+        checks.extend(info.deployment.checks(Some(name)));
+        if let Some(warning) = info.deployment.isolated_shared_uid_warning() {
+            warnings.push(format!("profile '{name}': {warning}"));
+        }
+
         for (root_label, root_path, expected_uid) in &info.storage_roots {
             match probes.probe_storage_root(root_path, *expected_uid) {
                 Ok(()) => {
@@ -386,22 +378,134 @@ pub fn run_startup_diagnostics(
                 }
             }
         }
-
-        checks.push(DoctorCheck {
-            name: format!("device_identity.{}", name),
-            passed: info.device_identity_unique,
-            message: if info.device_identity_unique {
-                "device identity is unique".into()
-            } else {
-                "device identity collides with another profile".into()
-            },
-        });
-        if !info.device_identity_unique {
-            fatal.push(format!("profile '{}': device identity collision", name));
-        }
     }
 
-    StartupDiagnosticResult { checks, fatal }
+    StartupDiagnosticResult {
+        checks,
+        fatal,
+        warnings,
+    }
+}
+
+/// What running the installed `sign-proxy --version` gave (plan V-L5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayVersionProbe {
+    /// The relay ran and printed this version.
+    Found { path: PathBuf, version: String },
+    /// No relay where the launcher looks for it.
+    Missing { path: Option<PathBuf> },
+    /// The relay exists but `--version` failed.
+    Failed { path: PathBuf, error: String },
+}
+
+/// Runs the installed relay's `--version`, from where the browser launcher finds it.
+pub trait RelayProbe: Send + Sync {
+    fn probe_relay_version(&self) -> RelayVersionProbe;
+}
+
+/// How long `sign-proxy --version` may take.
+const RELAY_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most bytes of `--version` output kept.
+const RELAY_VERSION_MAX_LEN: usize = 128;
+
+pub struct ProductionRelayProbe;
+
+impl RelayProbe for ProductionRelayProbe {
+    fn probe_relay_version(&self) -> RelayVersionProbe {
+        let Some(path) = super::browser::installed_sign_proxy_path() else {
+            return RelayVersionProbe::Missing { path: None };
+        };
+        if !path.is_file() {
+            return RelayVersionProbe::Missing { path: Some(path) };
+        }
+        match run_relay_version(&path) {
+            Ok(version) => RelayVersionProbe::Found { path, version },
+            Err(error) => RelayVersionProbe::Failed { path, error },
+        }
+    }
+}
+
+fn run_relay_version(path: &Path) -> Result<String, String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run it: {e}"))?;
+    let deadline = Instant::now() + RELAY_VERSION_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("--version did not finish".to_string());
+            }
+            Err(e) => return Err(format!("waiting for it failed: {e}")),
+        }
+    };
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let _ = stdout
+            .take(RELAY_VERSION_MAX_LEN as u64)
+            .read_to_end(&mut output);
+    }
+    if !status.success() {
+        return Err(format!("--version exited with {status}"));
+    }
+    let version = String::from_utf8_lossy(&output).trim().to_string();
+    if version.is_empty() {
+        return Err("--version printed nothing".to_string());
+    }
+    Ok(version)
+}
+
+/// The `relay_version` doctor check: the installed relay's build version against the daemon's.
+/// A missing or broken relay fails (a launch fails without it); a different version passes with
+/// a warning, like the version skew a hello reports (plan V-L5).
+pub fn relay_version_check(probe: &dyn RelayProbe, daemon_version: &str) -> DoctorCheck {
+    let (passed, message) = match probe.probe_relay_version() {
+        RelayVersionProbe::Found { path, version } if version == daemon_version => (
+            true,
+            format!(
+                "sign-proxy {} matches the daemon ({})",
+                path.display(),
+                daemon_version
+            ),
+        ),
+        RelayVersionProbe::Found { path, version } => (
+            true,
+            format!(
+                "warning: sign-proxy {} is version {} but the daemon is {}; reinstall passless \
+                 so both come from the same build",
+                path.display(),
+                version,
+                daemon_version
+            ),
+        ),
+        RelayVersionProbe::Missing { path } => (
+            false,
+            format!(
+                "sign-proxy is missing{}; managed browsers cannot launch without it. Reinstall \
+                 passless so that sign-proxy is next to the passless executable",
+                path.map(|p| format!(" at {}", p.display()))
+                    .unwrap_or_default()
+            ),
+        ),
+        RelayVersionProbe::Failed { path, error } => (
+            false,
+            format!("sign-proxy {} is not usable: {}", path.display(), error),
+        ),
+    };
+    DoctorCheck {
+        name: "relay_version".into(),
+        passed,
+        message,
+    }
 }
 
 pub struct BrowserRuntimeRootInfo {
@@ -419,14 +523,13 @@ pub struct ProfileStartupInfo {
     pub storage_roots: Vec<(String, PathBuf, u32)>,
     pub browser_runtime_root: Option<BrowserRuntimeRootInfo>,
     pub uid_checks: Vec<UidCheck>,
-    pub device_identity_unique: bool,
+    pub deployment: DeploymentAxes,
 }
 
 pub struct ProfileDiagnosticParams<'a> {
     pub profile_id: &'a ProfileId,
     pub enabled: bool,
     pub mode: AgentMode,
-    pub endpoint_has_id: bool,
     pub browser_lease_state: Option<&'a str>,
     pub policy_generation: u64,
     pub audit_gate: &'a AuditGate,
@@ -442,7 +545,6 @@ pub fn build_profile_diagnostic_report(
         profile_id,
         enabled,
         mode,
-        endpoint_has_id,
         browser_lease_state,
         policy_generation,
         audit_gate,
@@ -450,23 +552,6 @@ pub fn build_profile_diagnostic_report(
         pin_set,
         require_uv,
     } = params;
-    let endpoint_state = match mode {
-        AgentMode::SameUser => {
-            if endpoint_has_id {
-                EndpointDiagnosticState::Ready
-            } else {
-                EndpointDiagnosticState::Unavailable
-            }
-        }
-        AgentMode::Isolated => {
-            if endpoint_has_id {
-                EndpointDiagnosticState::Ready
-            } else {
-                EndpointDiagnosticState::Unavailable
-            }
-        }
-    };
-
     let audit_ok = audit_gate.ping();
 
     let mut checks = Vec::new();
@@ -479,12 +564,6 @@ pub fn build_profile_diagnostic_report(
         } else {
             "profile is disabled".into()
         },
-    });
-
-    checks.push(DoctorCheck {
-        name: "endpoint".into(),
-        passed: !matches!(endpoint_state, EndpointDiagnosticState::Unavailable),
-        message: format!("endpoint state: {}", endpoint_state),
     });
 
     if let Some(lease_state) = browser_lease_state {
@@ -539,7 +618,6 @@ pub fn build_profile_diagnostic_report(
         profile_id: profile_id.to_string(),
         enabled,
         mode: mode_str,
-        endpoint_state,
         browser_lease_state: browser_lease_state.map(|s| s.to_string()),
         policy_generation,
         audit_gate_healthy: audit_ok,
@@ -549,40 +627,73 @@ pub fn build_profile_diagnostic_report(
     }
 }
 
-pub fn compute_device_identity_uniqueness(
-    profiles: &[(String, DeviceIdentityKey)],
-) -> Vec<(String, bool)> {
-    let mut keys: Vec<String> = Vec::new();
-
-    for (_name, key) in profiles {
-        let composite = format!(
-            "{}:{}:{}:{}:{}",
-            key.name, key.phys, key.uniq, key.vendor_id, key.product_id
-        );
-        keys.push(composite);
+/// The profile's granted-rules store (ADR 0014 section 8.4). A disabled store fails the check:
+/// escalation is denied with `grants_unavailable` and no grant is honored until it is fixed.
+pub fn granted_rules_check(view: Option<&ProfileGrants>, path: &Path) -> DoctorCheck {
+    match view {
+        Some(ProfileGrants::Enabled(rules)) => DoctorCheck {
+            name: "granted_rules".into(),
+            passed: true,
+            message: format!("{} granted rule(s) in {}", rules.len(), path.display()),
+        },
+        Some(ProfileGrants::Disabled(reason)) => DoctorCheck {
+            name: "granted_rules".into(),
+            passed: false,
+            message: format!(
+                "granted rules disabled (fail closed): {reason}; fix or remove the file and \
+                 restart the daemon"
+            ),
+        },
+        None => DoctorCheck {
+            name: "granted_rules".into(),
+            passed: false,
+            message: "no granted-rules store for this profile".into(),
+        },
     }
-
-    let mut result = Vec::new();
-    for (i, (name, _)) in profiles.iter().enumerate() {
-        let key = &keys[i];
-        let unique = profiles.iter().enumerate().all(|(j, _)| {
-            if i == j {
-                return true;
-            }
-            keys[j] != *key
-        });
-        result.push((name.clone(), unique));
-    }
-
-    result
 }
 
-pub struct DeviceIdentityKey {
-    pub name: String,
-    pub phys: String,
-    pub uniq: String,
-    pub vendor_id: u16,
-    pub product_id: u16,
+/// Whether the escalation configuration can reach a notification user (ADR 0014 section 8.2).
+///
+/// A root daemon without `agents.notify_user` cannot prompt: the check fails when the profile has
+/// a `request` rule (those requests are denied with `escalation_unavailable`) and only warns
+/// otherwise. A `notify_user` the daemon cannot use (unknown, or another user than a non-root
+/// daemon's own, or a principal or browser user of a root daemon) fails.
+pub fn escalation_check(
+    config: &AgentConfig,
+    profile: &AgentProfileConfig,
+    daemon_uid: u32,
+) -> DoctorCheck {
+    if let Err(e) =
+        config.validate_escalation(daemon_uid, &passless_core::agent::config::lookup_user_uid)
+    {
+        return DoctorCheck {
+            name: "escalation".into(),
+            passed: false,
+            message: e.to_string(),
+        };
+    }
+    let requests = profile.rules.iter().any(|rule| {
+        rule.authenticate == RuleAction::Request || rule.register == RuleAction::Request
+    });
+    match config.escalation_unavailable_reason(daemon_uid) {
+        Some(reason) => DoctorCheck {
+            name: "escalation".into(),
+            passed: !requests,
+            message: if requests {
+                reason
+            } else {
+                format!("warning: {reason}")
+            },
+        },
+        None => DoctorCheck {
+            name: "escalation".into(),
+            passed: true,
+            message: match &config.notify_user {
+                Some(user) => format!("escalation prompts go to '{user}'"),
+                None => "escalation prompts go to the daemon user's session bus".into(),
+            },
+        },
+    }
 }
 
 #[cfg(test)]
@@ -592,7 +703,6 @@ mod tests {
 
     pub struct MockProbes {
         pub euid_is_root: bool,
-        pub uhid_result: ProbeResult,
         pub close_range_ok: bool,
         pub audit_healthy: bool,
         pub storage_results: Mutex<Vec<Result<(), String>>>,
@@ -604,24 +714,6 @@ mod tests {
         pub fn all_healthy() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
-                close_range_ok: true,
-                audit_healthy: true,
-                storage_results: Mutex::new(Vec::new()),
-                browser_root_results: Mutex::new(Vec::new()),
-                stale_result: StaleManifestResult::None,
-            }
-        }
-
-        pub fn no_uhid() -> Self {
-            Self {
-                euid_is_root: true,
-                uhid_result: ProbeResult::Denied {
-                    path: "/dev/uhid".into(),
-                    errno: libc::EACCES,
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -633,9 +725,6 @@ mod tests {
         pub fn no_close_range() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: false,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -647,9 +736,6 @@ mod tests {
         pub fn not_root() -> Self {
             Self {
                 euid_is_root: false,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -661,9 +747,6 @@ mod tests {
         pub fn audit_broken() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: false,
                 storage_results: Mutex::new(Vec::new()),
@@ -675,9 +758,6 @@ mod tests {
         pub fn unsafe_perms() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(vec![Err(
@@ -691,9 +771,6 @@ mod tests {
         pub fn stale_verified_process() -> Self {
             Self {
                 euid_is_root: true,
-                uhid_result: ProbeResult::Allowed {
-                    path: "/dev/uhid".into(),
-                },
                 close_range_ok: true,
                 audit_healthy: true,
                 storage_results: Mutex::new(Vec::new()),
@@ -709,10 +786,6 @@ mod tests {
     impl StartupProbes for MockProbes {
         fn probe_euid_is_root(&self) -> bool {
             self.euid_is_root
-        }
-
-        fn probe_uhid(&self) -> ProbeResult {
-            self.uhid_result.clone()
         }
 
         fn probe_close_range_available(&self) -> bool {
@@ -756,17 +829,17 @@ mod tests {
 
     fn make_profile_info() -> ProfileStartupInfo {
         ProfileStartupInfo {
+            deployment: DeploymentAxes::new(AgentMode::Isolated, 1001, 1000),
             storage_roots: vec![("credential".into(), PathBuf::from("/tmp/creds"), 1000)],
             browser_runtime_root: Some(BrowserRuntimeRootInfo {
                 path: PathBuf::from("/tmp/browser"),
                 expected_uid: 1000,
             }),
             uid_checks: vec![UidCheck {
-                label: "principal_vs_daemon".into(),
+                label: "principal_not_root".into(),
                 passed: true,
-                message: "principal uid differs from daemon".into(),
+                message: "principal is not root".into(),
             }],
-            device_identity_unique: true,
         }
     }
 
@@ -786,22 +859,15 @@ mod tests {
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(result.is_ok(), "fatal: {:?}", result.fatal);
         assert!(result.checks.iter().all(|c| c.passed));
-    }
-
-    #[test]
-    fn test_no_uhid_is_fatal() {
-        let probes = MockProbes::no_uhid();
-        let profiles = vec![("test".into(), make_profile_info())];
-        let result =
-            run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
-        assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("uhid")));
-        let uhid_check = result
-            .checks
-            .iter()
-            .find(|c| c.name == "uhid_access")
-            .unwrap();
-        assert!(!uhid_check.passed);
+        // Agents have no UHID route (ADR 0014 section 5): no UHID or device identity check remains.
+        assert!(
+            !result
+                .checks
+                .iter()
+                .any(|c| c.name == "uhid_access" || c.name.starts_with("device_identity")),
+            "{:?}",
+            result.checks
+        );
     }
 
     #[test]
@@ -815,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn test_not_root_nonfatal_when_uhid_accessible() {
+    fn test_not_root_nonfatal() {
         let probes = MockProbes::not_root();
         let profiles = vec![("test".into(), make_profile_info())];
         let result =
@@ -836,20 +902,88 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ADR 0014 section 13: a principal that shares the daemon's UID is a supported deployment, so
+    // the relationship is reported as an axis and is never fatal by itself. (This test used to
+    // assert that a `principal_vs_daemon` uid check failing on "same as daemon" was fatal.) A
+    // principal that is root stays fatal through its own `principal_not_root` check.
     #[test]
-    fn test_same_uid_is_fatal() {
+    fn test_same_uid_is_reported_and_not_fatal() {
+        let probes = MockProbes::all_healthy();
+        for mode in [AgentMode::SameUser, AgentMode::Isolated] {
+            let mut info = make_profile_info();
+            info.deployment = DeploymentAxes::new(mode, 1000, 1000);
+            info.uid_checks.clear();
+            let profiles = vec![("test".into(), info)];
+            let result =
+                run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
+            assert!(result.is_ok(), "{mode}: fatal: {:?}", result.fatal);
+            let axes = result
+                .checks
+                .iter()
+                .find(|c| c.name == "deployment_axes.test")
+                .expect("axes check");
+            assert!(axes.passed);
+            assert!(axes.message.contains(&format!("mode: {mode}")));
+            assert!(axes.message.contains("principal_relationship: shared-uid"));
+            // Only `isolated` warns, in the checks and in the startup warnings.
+            let warned = result
+                .checks
+                .iter()
+                .any(|c| c.name == "isolated_shared_uid.test" && c.passed);
+            assert_eq!(warned, mode == AgentMode::Isolated, "{mode}");
+            assert_eq!(result.warnings.len(), usize::from(warned), "{mode}");
+        }
+    }
+
+    #[test]
+    fn test_distinct_uid_reports_the_axes_without_a_warning() {
+        let probes = MockProbes::all_healthy();
+        for mode in [AgentMode::SameUser, AgentMode::Isolated] {
+            let mut info = make_profile_info();
+            info.deployment = DeploymentAxes::new(mode, 1001, 1000);
+            let profiles = vec![("test".into(), info)];
+            let result =
+                run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
+            assert!(result.is_ok(), "{mode}: fatal: {:?}", result.fatal);
+            let axes = result
+                .checks
+                .iter()
+                .find(|c| c.name == "deployment_axes.test")
+                .expect("axes check");
+            assert!(
+                axes.message
+                    .contains("principal_relationship: distinct-uid")
+            );
+            assert!(result.warnings.is_empty(), "{mode}: {:?}", result.warnings);
+            assert!(
+                !result
+                    .checks
+                    .iter()
+                    .any(|c| c.name.starts_with("isolated_shared_uid"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_principal_root_is_still_fatal() {
         let probes = MockProbes::all_healthy();
         let mut info = make_profile_info();
+        info.deployment = DeploymentAxes::new(AgentMode::Isolated, 0, 0);
         info.uid_checks = vec![UidCheck {
-            label: "principal_vs_daemon".into(),
+            label: "principal_not_root".into(),
             passed: false,
-            message: "principal uid 0 same as daemon uid 0".into(),
+            message: "principal must not be root".into(),
         }];
         let profiles = vec![("test".into(), info)];
         let result =
             run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
         assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("same as daemon")));
+        assert!(
+            result
+                .fatal
+                .iter()
+                .any(|f| f.contains("principal must not be root"))
+        );
     }
 
     #[test]
@@ -883,83 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn test_device_identity_collision_detected() {
-        let probes = MockProbes::all_healthy();
-        let mut info = make_profile_info();
-        info.device_identity_unique = false;
-        let profiles = vec![("test".into(), info)];
-        let result =
-            run_startup_diagnostics(&probes, true, Some(Path::new("/tmp/audit")), &profiles);
-        assert!(!result.is_ok());
-        assert!(result.fatal.iter().any(|f| f.contains("collision")));
-    }
-
-    #[test]
-    fn test_compute_device_identity_uniqueness_all_unique() {
-        let profiles = vec![
-            (
-                "a".into(),
-                DeviceIdentityKey {
-                    name: "n1".into(),
-                    phys: "p1".into(),
-                    uniq: "u1".into(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
-            ),
-            (
-                "b".into(),
-                DeviceIdentityKey {
-                    name: "n2".into(),
-                    phys: "p2".into(),
-                    uniq: "u2".into(),
-                    vendor_id: 2,
-                    product_id: 2,
-                },
-            ),
-        ];
-        let result = compute_device_identity_uniqueness(&profiles);
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|(_, unique)| *unique));
-    }
-
-    #[test]
-    fn test_compute_device_identity_uniqueness_collision() {
-        let key = DeviceIdentityKey {
-            name: "same".into(),
-            phys: "same".into(),
-            uniq: "same".into(),
-            vendor_id: 1,
-            product_id: 2,
-        };
-        let profiles = vec![
-            (
-                "a".into(),
-                DeviceIdentityKey {
-                    name: key.name.clone(),
-                    phys: key.phys.clone(),
-                    uniq: key.uniq.clone(),
-                    vendor_id: key.vendor_id,
-                    product_id: key.product_id,
-                },
-            ),
-            (
-                "b".into(),
-                DeviceIdentityKey {
-                    name: key.name.clone(),
-                    phys: key.phys.clone(),
-                    uniq: key.uniq.clone(),
-                    vendor_id: key.vendor_id,
-                    product_id: key.product_id,
-                },
-            ),
-        ];
-        let result = compute_device_identity_uniqueness(&profiles);
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|(_, unique)| !*unique));
-    }
-
-    #[test]
     fn test_profile_diagnostic_report_isolated_ready() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -970,7 +1027,6 @@ mod tests {
             profile_id: &pid,
             enabled: true,
             mode: AgentMode::Isolated,
-            endpoint_has_id: true,
             browser_lease_state: None,
             policy_generation: 5,
             audit_gate: &audit,
@@ -980,7 +1036,6 @@ mod tests {
         });
 
         assert!(report.is_healthy());
-        assert_eq!(report.endpoint_state, EndpointDiagnosticState::Ready);
         assert!(report.audit_gate_healthy);
         assert_eq!(report.policy_generation, 5);
         assert!(report.pin_storage_available);
@@ -998,7 +1053,6 @@ mod tests {
             profile_id: &pid,
             enabled: false,
             mode: AgentMode::Isolated,
-            endpoint_has_id: false,
             browser_lease_state: None,
             policy_generation: 0,
             audit_gate: &audit,
@@ -1008,7 +1062,6 @@ mod tests {
         });
 
         assert!(!report.is_healthy());
-        assert_eq!(report.endpoint_state, EndpointDiagnosticState::Unavailable);
     }
 
     #[test]
@@ -1022,7 +1075,6 @@ mod tests {
             profile_id: &pid,
             enabled: true,
             mode: AgentMode::Isolated,
-            endpoint_has_id: true,
             browser_lease_state: None,
             policy_generation: 1,
             audit_gate: &audit,
@@ -1048,7 +1100,6 @@ mod tests {
             profile_id: &pid,
             enabled: true,
             mode: AgentMode::Isolated,
-            endpoint_has_id: true,
             browser_lease_state: None,
             policy_generation: 1,
             audit_gate: &audit,
@@ -1122,5 +1173,157 @@ mod tests {
         assert_eq!(stat_before.st_ino, stat_after.st_ino);
 
         unsafe { libc::close(dup_fd) };
+    }
+
+    struct MockRelayProbe(RelayVersionProbe);
+
+    impl RelayProbe for MockRelayProbe {
+        fn probe_relay_version(&self) -> RelayVersionProbe {
+            self.0.clone()
+        }
+    }
+
+    const DAEMON_VERSION: &str = "0.21.0+abc1234";
+
+    #[test]
+    fn test_relay_version_check_matching_version_passes() {
+        let check = relay_version_check(
+            &MockRelayProbe(RelayVersionProbe::Found {
+                path: PathBuf::from("/usr/bin/sign-proxy"),
+                version: DAEMON_VERSION.to_string(),
+            }),
+            DAEMON_VERSION,
+        );
+        assert_eq!(check.name, "relay_version");
+        assert!(check.passed);
+        assert!(check.message.contains("matches"), "{}", check.message);
+    }
+
+    #[test]
+    fn test_relay_version_check_mismatch_is_a_warning() {
+        let check = relay_version_check(
+            &MockRelayProbe(RelayVersionProbe::Found {
+                path: PathBuf::from("/usr/bin/sign-proxy"),
+                version: "0.20.0+def5678".to_string(),
+            }),
+            DAEMON_VERSION,
+        );
+        assert!(check.passed, "skew is not fatal (plan V-L5)");
+        assert!(check.message.starts_with("warning:"), "{}", check.message);
+        assert!(
+            check.message.contains("0.20.0+def5678"),
+            "{}",
+            check.message
+        );
+        assert!(check.message.contains(DAEMON_VERSION), "{}", check.message);
+    }
+
+    #[test]
+    fn test_relay_version_check_missing_or_broken_relay_fails() {
+        for probe in [
+            RelayVersionProbe::Missing {
+                path: Some(PathBuf::from("/usr/bin/sign-proxy")),
+            },
+            RelayVersionProbe::Missing { path: None },
+            RelayVersionProbe::Failed {
+                path: PathBuf::from("/usr/bin/sign-proxy"),
+                error: "--version exited with exit status: 1".to_string(),
+            },
+        ] {
+            let check = relay_version_check(&MockRelayProbe(probe.clone()), DAEMON_VERSION);
+            assert!(!check.passed, "{probe:?}");
+            assert!(check.message.contains("sign-proxy"), "{}", check.message);
+        }
+    }
+
+    #[test]
+    fn test_run_relay_version_reads_the_printed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // A script just written can be briefly busy when another test thread forks meanwhile.
+        let run = |path: &Path| {
+            for _ in 0..20 {
+                match run_relay_version(path) {
+                    Err(e) if e.contains("Text file busy") => {
+                        std::thread::sleep(std::time::Duration::from_millis(50))
+                    }
+                    other => return other,
+                }
+            }
+            run_relay_version(path)
+        };
+        let good = script(
+            "sign-proxy",
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 1.2.3+abc\n",
+        );
+        assert_eq!(run(&good).unwrap(), "1.2.3+abc");
+        let failing = script("failing-sign-proxy", "#!/bin/sh\nexit 3\n");
+        assert!(run(&failing).is_err());
+    }
+
+    fn escalation_config(notify_user: Option<&str>, request: bool) -> AgentConfig {
+        let action = if request { "request" } else { "allow" };
+        let mut config = AgentConfig::from_toml_str(
+            &format!(
+                "[agents]\nenabled = true\n\n[agents.profiles.p]\nmode = \"same-user\"\n\
+                 principal_user = \"root\"\n\n[[agents.profiles.p.rules]]\n\
+                 rp_id = \"example.com\"\nauthenticate = \"{action}\"\nregister = \"deny\"\n"
+            ),
+            "test",
+        )
+        .unwrap();
+        config.notify_user = notify_user.map(str::to_string);
+        config
+    }
+
+    #[test]
+    fn escalation_check_fails_for_a_root_daemon_without_notify_user() {
+        let config = escalation_config(None, true);
+        let check = escalation_check(&config, &config.profiles["p"], 0);
+        assert!(!check.passed, "{check:?}");
+        assert!(check.message.contains("notify_user"), "{check:?}");
+
+        // Without a `request` rule nothing needs a prompt: only a warning.
+        let config = escalation_config(None, false);
+        let check = escalation_check(&config, &config.profiles["p"], 0);
+        assert!(check.passed, "{check:?}");
+        assert!(check.message.starts_with("warning:"), "{check:?}");
+    }
+
+    #[test]
+    fn escalation_check_reports_an_unusable_notify_user() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let own = unsafe { libc::geteuid() };
+        let other = if own == 0 { 1 } else { 0 };
+        let config = escalation_config(Some(&other.to_string()), true);
+        let check = escalation_check(&config, &config.profiles["p"], own.max(1));
+        assert!(!check.passed, "{check:?}");
+
+        let config = escalation_config(Some(&own.max(1).to_string()), true);
+        let check = escalation_check(&config, &config.profiles["p"], own.max(1));
+        assert!(check.passed, "{check:?}");
+
+        let config = escalation_config(None, true);
+        let check = escalation_check(&config, &config.profiles["p"], own.max(1));
+        assert!(check.passed, "{check:?}");
+    }
+
+    #[test]
+    fn granted_rules_check_fails_for_a_disabled_store() {
+        let path = Path::new("/state/granted-rules/p.toml");
+        let ok = granted_rules_check(Some(&ProfileGrants::Enabled(Vec::new())), path);
+        assert!(ok.passed);
+        let disabled = granted_rules_check(
+            Some(&ProfileGrants::Disabled("mode 0644".to_string())),
+            path,
+        );
+        assert!(!disabled.passed);
+        assert!(disabled.message.contains("mode 0644"), "{disabled:?}");
+        assert!(!granted_rules_check(None, path).passed);
     }
 }

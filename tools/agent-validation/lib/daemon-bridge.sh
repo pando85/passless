@@ -78,22 +78,6 @@ av_daemon_get_browser_status() {
     echo "$output"
 }
 
-av_daemon_get_endpoint_status() {
-    local profile="${1:-${AV_DAEMON_PROFILE:-}}"
-    if [[ -z "$profile" ]]; then
-        av_log_error "No profile for endpoint status"
-        return 1
-    fi
-
-    local output
-    output=$("${AV_PASSLESS_BIN:-passless}" agent --profile "$profile" --output json endpoint-status 2>/dev/null) || {
-        av_log_error "Failed to get endpoint status"
-        return 1
-    }
-
-    echo "$output"
-}
-
 av_daemon_audit_verify() {
     local output
     output=$("${AV_PASSLESS_BIN:-passless}" agent-admin --output json audit verify 2>/dev/null) || {

@@ -801,9 +801,7 @@ run_tier1_tests() {
     run_stage "doc-check" "stage_doc_check" "Documentation link check" || return $?
     run_stage "prompt-protocol" "stage_prompt_protocol" "Production prompt protocol tests (D-Bus)" || return $?
     run_stage "agent-policy" "stage_agent_policy" "Agent policy and authorization tests" || return $?
-    run_stage "backend-composition" "stage_backend_composition" "Local, pass, and swtpm agent storage composition" || return $?
 
-    run_stage "transport-boundary" "stage_transport_boundary" "Test-only CTAP response UP/UV observer" || return $?
     run_stage "secret-scanning" "stage_secret_scanning" "Secret scanning in logs" "true" || return $?
     run_stage "fault-injection" "stage_fault_injection" "Fault injection tests" "true" || return $?
 
@@ -879,43 +877,6 @@ stage_agent_policy() {
     log_info "Running focused agent policy and authorization tests..."
     cargo test --all-features -p passless-core agent::policy
     cargo test --all-features -p passless-rs --bin passless agent::policy_engine
-}
-
-# shellcheck disable=SC2329
-stage_transport_boundary() {
-    log_info "Running non-secret CTAP response observer tests..."
-    cargo test --all-features -p passless-rs --bin passless ceremony_observer -- --test-threads=1
-}
-
-# shellcheck disable=SC2329
-stage_backend_composition() {
-    log_info "Running local agent storage composition tests..."
-    cargo test --all-features -p passless-rs --bin passless \
-        agent::storage_factory::tests::composition_conformance -- --test-threads=1
-
-    local required=(gpg pass swtpm)
-    local missing=()
-    local command
-    for command in "${required[@]}"; do
-        command -v "$command" &>/dev/null || missing+=("$command")
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_warn "Backend composition prerequisites unavailable: ${missing[*]}"
-        STAGE_SKIPPED=true
-        return 0
-    fi
-
-    local tests=(
-        agent::storage_factory::tests::composition_conformance::pass_composition_full_flow
-        agent::storage_factory::tests::composition_conformance::tpm_composition::tpm_composition_full_flow
-        agent::storage_factory::tests::composition_conformance::tpm_composition::tpm_profile_isolation
-        agent::storage_factory::tests::composition_conformance::tpm_composition::tpm_cleanup_propagation
-    )
-    local test_name
-    for test_name in "${tests[@]}"; do
-        cargo test --all-features -p passless-rs --bin passless "$test_name" -- \
-            --exact --ignored --test-threads=1
-    done
 }
 
 generate_final_report() {

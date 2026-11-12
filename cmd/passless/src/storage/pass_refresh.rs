@@ -1,6 +1,8 @@
 use crate::storage::index::load_credential_paths;
 use crate::storage::pass::sync::PassGitSync;
-use crate::storage::pass::{GpgBackend, PassStorageAdapter as InnerPassStorageAdapter};
+use crate::storage::pass::{
+    GpgBackend, PassStorageAdapter as InnerPassStorageAdapter, TEMP_FILE_EXCLUDE_PATTERN,
+};
 use crate::storage::{CredentialFilter, CredentialStorage, RelyingPartyMetadata};
 use git2::{Oid, Repository};
 use log::{debug, warn};
@@ -83,6 +85,10 @@ impl PassStorageAdapter {
             sync,
         };
 
+        // Never let a Git-sync `git add .` stage a temporary file a crash left behind.
+        adapter
+            .sync
+            .ensure_local_exclude_pattern(TEMP_FILE_EXCLUDE_PATTERN);
         adapter.sync.prepare_startup();
         let generation = repository_generation(&adapter.store_path, &adapter.path);
         if generation != adapter.indexed_generation {
@@ -173,11 +179,9 @@ impl CredentialStorage for PassStorageAdapter {
     }
 
     fn write(&mut self, cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
-        let implicit = self.sync.begin_implicit_operation();
+        // The guard ends the implicit operation on every exit, a panic included.
+        let implicit = self.sync.implicit_operation();
         if let Err(error) = self.prepare_for_access() {
-            if implicit {
-                self.sync.end_operation();
-            }
             return Err(soft_fido2::Error::from(error));
         }
 
@@ -186,19 +190,16 @@ impl CredentialStorage for PassStorageAdapter {
             self.sync.mark_dirty("Update Passless credential state.");
             self.record_current_generation();
         }
-        if implicit {
-            self.sync.end_operation();
+        if implicit.is_some() {
+            drop(implicit);
             self.record_current_generation();
         }
         result
     }
 
     fn delete(&mut self, id: &[u8]) -> soft_fido2::Result<()> {
-        let implicit = self.sync.begin_implicit_operation();
+        let implicit = self.sync.implicit_operation();
         if let Err(error) = self.prepare_for_access() {
-            if implicit {
-                self.sync.end_operation();
-            }
             return Err(soft_fido2::Error::from(error));
         }
 
@@ -207,8 +208,8 @@ impl CredentialStorage for PassStorageAdapter {
             self.sync.mark_dirty("Update Passless credential state.");
             self.record_current_generation();
         }
-        if implicit {
-            self.sync.end_operation();
+        if implicit.is_some() {
+            drop(implicit);
             self.record_current_generation();
         }
         result

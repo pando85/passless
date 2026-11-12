@@ -1,43 +1,65 @@
-use std::fmt;
+//! The daemon side of escalation prompts (ADR 0014 section 8.2; plan P7 section 1).
+//!
+//! [`NotificationPrompter`] is the escalation coordinator's [`Prompter`]. One driver thread per
+//! profile owns that profile's prompt child (`escalation_prompt.rs`): it spawns the child, sends
+//! it the prompt, reads its events, posts the decisions into the coordinator, and withdraws the
+//! child when told. The daemon itself never connects to a session bus.
+//!
+//! - The child must report `shown` within [`SHOWN_TIMEOUT`], or the prompt fails.
+//! - A withdrawal sends `{"withdraw":true}` and closes the child's stdin; a child that has not
+//!   exited within [`WITHDRAW_GRACE`] is killed with `SIGKILL`.
+//! - "Allow always" earlier than the minimum review delay after `shown` is a deny, and so is a
+//!   dismissal. The child applies the same rule against its own clock.
+//! - `server_lost` is reported as such: the coordinator expires the escalation without cooldown.
+//!
+//! The child runs as `agents.notify_user` when the daemon is root ([`plan_prompt_child`]),
+//! connected to `unix:path=/run/user/<uid>/bus`, which must be a socket owned by that user.
+//! Otherwise it runs as the daemon's user, on the daemon's own session bus.
+
+use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
-use notify_rust::{Notification, Timeout, Urgency};
 use serde::{Deserialize, Serialize};
 
-use passless_core::agent::{CredentialRef, ProfileId};
+use passless_core::agent::ProfileId;
 
-#[cfg(test)]
-use std::sync::Mutex;
+use super::audit_events::EscalationDenyCause;
+use super::escalation::{PromptEvent, PromptSink, PromptTicket, Prompter};
+use super::escalation_prompt::{
+    ACTION_ALLOW_ALWAYS, ACTION_DENY, ChildEvent, ControlMessage, DEFAULT_MIN_REVIEW_DELAY_MS,
+    HIDDEN_ARG, MAX_LINE_BYTES, PromptFields, PromptRequest, render_prompt,
+};
+use super::launcher::{
+    DEFAULT_RLIMIT_AS, DEFAULT_RLIMIT_CORE, DEFAULT_RLIMIT_NOFILE, DEFAULT_RLIMIT_NPROC,
+    HardenedChildSetup,
+};
+use super::lock_order::{self, LockLevel};
 
-const NOTIFICATIONS_WELL_KNOWN_NAME: &str = "org.freedesktop.Notifications";
-const NOTIFICATIONS_IFACE: &str = "org.freedesktop.Notifications";
+/// The child must report `shown` within this time.
+pub const SHOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// A withdrawn child still running after this time is killed.
+pub const WITHDRAW_GRACE: Duration = Duration::from_secs(2);
+/// "Allow always" earlier than this after `shown` is a deny.
+pub const MIN_REVIEW_DELAY: Duration = Duration::from_millis(DEFAULT_MIN_REVIEW_DELAY_MS);
 
-const MAX_UNTRUSTED_LEN: usize = 256;
-const MAX_RP_ID_LEN: usize = 253;
-const MAX_CREDENTIAL_LABEL_LEN: usize = 128;
-const DEFAULT_PROMPT_TIMEOUT_SECS: u64 = 60;
-const MAX_PROMPT_TIMEOUT_SECS: u64 = 300;
-const MIN_PROMPT_TIMEOUT_SECS: u64 = 5;
-const DEFAULT_MIN_REVIEW_DELAY_MS: u64 = 1000;
-const MAX_MIN_REVIEW_DELAY_MS: u64 = 30_000;
-#[cfg(test)]
-const MIN_MIN_REVIEW_DELAY_MS: u64 = 0;
-
+/// Identity mode recorded by historic `prompt.*` audit records (P0–P6). Nothing emits those any
+/// more; the type stays so old audit logs still deserialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
     Isolated,
 }
 
-impl fmt::Display for PromptMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Isolated => write!(f, "isolated"),
-        }
-    }
-}
-
+/// Action recorded by historic `prompt.*` audit records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptAction {
@@ -45,35 +67,7 @@ pub enum PromptAction {
     Authenticate,
 }
 
-impl fmt::Display for PromptAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Register => write!(f, "register"),
-            Self::Authenticate => write!(f, "authenticate"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptDecision {
-    Approved,
-    Denied,
-    Timeout,
-    Error,
-}
-
-impl fmt::Display for PromptDecision {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Approved => write!(f, "approved"),
-            Self::Denied => write!(f, "denied"),
-            Self::Timeout => write!(f, "timeout"),
-            Self::Error => write!(f, "error"),
-        }
-    }
-}
-
+/// Error kind recorded by historic `prompt.error` audit records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptErrorKind {
@@ -84,2010 +78,1740 @@ pub enum PromptErrorKind {
     InternalError,
 }
 
-impl fmt::Display for PromptErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotificationUnsupported => write!(f, "notification_unsupported"),
-            Self::ServerCapabilityRejected => write!(f, "server_capability_rejected"),
-            Self::RenderFailed => write!(f, "render_failed"),
-            Self::ActionAmbiguous => write!(f, "action_ambiguous"),
-            Self::InternalError => write!(f, "internal_error"),
-        }
+/// Who the prompt child runs as and which bus it uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptChildPlan {
+    /// The `(uid, gid)` to drop to; `None` keeps the daemon's user.
+    pub target: Option<(u32, u32)>,
+    /// The child's only environment variable, `DBUS_SESSION_BUS_ADDRESS`.
+    pub bus_address: String,
+}
+
+/// Resolves user names (a seam for tests).
+pub trait UserDirectory {
+    /// `(uid, primary gid)` of `name`.
+    fn lookup(&self, name: &str) -> Option<(u32, u32)>;
+}
+
+/// The system user database.
+pub struct SystemUsers;
+
+impl UserDirectory for SystemUsers {
+    fn lookup(&self, name: &str) -> Option<(u32, u32)> {
+        nix::unistd::User::from_name(name)
+            .ok()
+            .flatten()
+            .map(|user| (user.uid.as_raw(), user.gid.as_raw()))
     }
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PromptError {
-    pub kind: PromptErrorKind,
+/// What a bus socket path is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketInfo {
+    pub is_socket: bool,
+    pub owner: u32,
 }
 
-impl fmt::Display for PromptError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "prompt error: {}", self.kind)
-    }
+/// Inspects a bus socket path without following symlinks (a seam for tests).
+pub trait SocketProbe {
+    fn probe(&self, path: &Path) -> io::Result<SocketInfo>;
 }
 
-impl std::error::Error for PromptError {}
+/// The file system.
+pub struct FsSockets;
 
-fn is_bidi_or_zero_width_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061c}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}'
-    )
-}
-
-/// Render display-controlled prompt data as one bounded visual line.
-///
-/// The confirmation notification is a security boundary. Agent/page strings
-/// must not insert lines that look like trusted RP/action data, alter visual
-/// direction with Bidi controls, or trigger UTF-8 boundary panics while being
-/// truncated.
-fn sanitize_prompt_text(input: &str, max_bytes: usize) -> String {
-    let mut out = String::with_capacity(input.len().min(max_bytes));
-    let mut previous_was_space = false;
-
-    for original in input.chars() {
-        let ch = if matches!(original, '\n' | '\r' | '\t') {
-            ' '
-        } else if original.is_control() || is_bidi_or_zero_width_control(original) {
-            continue;
-        } else {
-            original
-        };
-
-        let is_space = ch.is_whitespace();
-        if is_space && previous_was_space {
-            continue;
-        }
-        let rendered = if is_space { ' ' } else { ch };
-        if out.len() + rendered.len_utf8() > max_bytes {
-            break;
-        }
-        out.push(rendered);
-        previous_was_space = is_space;
-    }
-
-    out.trim().to_string()
-}
-
-#[derive(Debug, Clone)]
-pub struct BoundedString<const MAX: usize>(String);
-
-impl<const MAX: usize> BoundedString<MAX> {
-    pub fn new(s: impl Into<String>) -> Self {
-        let s = s.into();
-        Self(sanitize_prompt_text(&s, MAX))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    #[allow(dead_code)]
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl<const MAX: usize> Serialize for BoundedString<MAX> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de, const MAX: usize> Deserialize<'de> for BoundedString<MAX> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(Self::new(s))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptRequest {
-    profile_id: ProfileId,
-    mode: PromptMode,
-    action: PromptAction,
-    rp_id: String,
-    credential_label: Option<String>,
-    credential_ref: Option<CredentialRef>,
-    grant_ttl_secs: u64,
-    session_ttl_secs: u64,
-    untrusted_reason: BoundedString<MAX_UNTRUSTED_LEN>,
-    untrusted_page_title: BoundedString<MAX_UNTRUSTED_LEN>,
-    untrusted_page_url: BoundedString<MAX_UNTRUSTED_LEN>,
-    untrusted_account_label: BoundedString<MAX_UNTRUSTED_LEN>,
-}
-
-impl PromptRequest {
-    pub fn builder() -> PromptRequestBuilder {
-        PromptRequestBuilder::new()
-    }
-
-    pub fn profile_id(&self) -> &ProfileId {
-        &self.profile_id
-    }
-
-    pub fn mode(&self) -> PromptMode {
-        self.mode
-    }
-
-    pub fn rp_id(&self) -> &str {
-        &self.rp_id
-    }
-
-    pub fn action(&self) -> PromptAction {
-        self.action
-    }
-
-    pub fn credential_label(&self) -> Option<&str> {
-        self.credential_label.as_deref()
-    }
-
-    pub fn credential_ref(&self) -> Option<&CredentialRef> {
-        self.credential_ref.as_ref()
-    }
-
-    pub fn grant_ttl_secs(&self) -> u64 {
-        self.grant_ttl_secs
-    }
-
-    pub fn session_ttl_secs(&self) -> u64 {
-        self.session_ttl_secs
-    }
-
-    pub fn untrusted_reason(&self) -> &str {
-        self.untrusted_reason.as_str()
-    }
-
-    pub fn untrusted_page_title(&self) -> &str {
-        self.untrusted_page_title.as_str()
-    }
-
-    pub fn untrusted_page_url(&self) -> &str {
-        self.untrusted_page_url.as_str()
-    }
-
-    pub fn untrusted_account_label(&self) -> &str {
-        self.untrusted_account_label.as_str()
-    }
-
-    #[cfg(test)]
-    pub fn snapshot(&self) -> PromptSnapshot {
-        PromptSnapshot {
-            profile_id: self.profile_id.as_str().to_string(),
-            mode: self.mode,
-            action: self.action,
-            rp_id: self.rp_id.clone(),
-            credential_label: self.credential_label.clone(),
-            credential_ref: self.credential_ref.as_ref().map(|c| c.to_hex()),
-            grant_ttl_secs: self.grant_ttl_secs,
-            session_ttl_secs: self.session_ttl_secs,
-            untrusted_reason: self.untrusted_reason.as_str().to_string(),
-            untrusted_page_title: self.untrusted_page_title.as_str().to_string(),
-            untrusted_page_url: self.untrusted_page_url.as_str().to_string(),
-            untrusted_account_label: self.untrusted_account_label.as_str().to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct PromptSnapshot {
-    pub profile_id: String,
-    pub mode: PromptMode,
-    pub action: PromptAction,
-    pub rp_id: String,
-    pub credential_label: Option<String>,
-    pub credential_ref: Option<String>,
-    pub grant_ttl_secs: u64,
-    pub session_ttl_secs: u64,
-    pub untrusted_reason: String,
-    pub untrusted_page_title: String,
-    pub untrusted_page_url: String,
-    pub untrusted_account_label: String,
-}
-
-pub struct PromptRequestBuilder {
-    profile_id: Option<ProfileId>,
-    mode: Option<PromptMode>,
-    action: Option<PromptAction>,
-    rp_id: Option<String>,
-    credential_label: Option<String>,
-    credential_ref: Option<CredentialRef>,
-    grant_ttl_secs: u64,
-    session_ttl_secs: u64,
-    untrusted_reason: String,
-    untrusted_page_title: String,
-    untrusted_page_url: String,
-    untrusted_account_label: String,
-}
-
-impl PromptRequestBuilder {
-    pub fn new() -> Self {
-        Self {
-            profile_id: None,
-            mode: None,
-            action: None,
-            rp_id: None,
-            credential_label: None,
-            credential_ref: None,
-            grant_ttl_secs: 300,
-            session_ttl_secs: 3600,
-            untrusted_reason: String::new(),
-            untrusted_page_title: String::new(),
-            untrusted_page_url: String::new(),
-            untrusted_account_label: String::new(),
-        }
-    }
-
-    pub fn profile_id(mut self, id: ProfileId) -> Self {
-        self.profile_id = Some(id);
-        self
-    }
-
-    pub fn mode(mut self, mode: PromptMode) -> Self {
-        self.mode = Some(mode);
-        self
-    }
-
-    pub fn action(mut self, action: PromptAction) -> Self {
-        self.action = Some(action);
-        self
-    }
-
-    pub fn rp_id(mut self, rp_id: impl Into<String>) -> Self {
-        self.rp_id = Some(rp_id.into());
-        self
-    }
-
-    pub fn credential_label(mut self, label: impl Into<String>) -> Self {
-        self.credential_label = Some(label.into());
-        self
-    }
-
-    #[cfg(test)]
-    pub fn credential_ref(mut self, cr: CredentialRef) -> Self {
-        self.credential_ref = Some(cr);
-        self
-    }
-
-    pub fn credential_ref_opt(mut self, cr: Option<CredentialRef>) -> Self {
-        self.credential_ref = cr;
-        self
-    }
-
-    pub fn grant_ttl_secs(mut self, secs: u64) -> Self {
-        self.grant_ttl_secs = secs;
-        self
-    }
-
-    pub fn session_ttl_secs(mut self, secs: u64) -> Self {
-        self.session_ttl_secs = secs;
-        self
-    }
-
-    pub fn untrusted_reason(mut self, reason: impl Into<String>) -> Self {
-        self.untrusted_reason = reason.into();
-        self
-    }
-
-    #[cfg(test)]
-    pub fn untrusted_page_title(mut self, title: impl Into<String>) -> Self {
-        self.untrusted_page_title = title.into();
-        self
-    }
-
-    #[cfg(test)]
-    pub fn untrusted_page_url(mut self, url: impl Into<String>) -> Self {
-        self.untrusted_page_url = url.into();
-        self
-    }
-
-    #[cfg(test)]
-    pub fn untrusted_account_label(mut self, label: impl Into<String>) -> Self {
-        self.untrusted_account_label = label.into();
-        self
-    }
-
-    pub fn build(self) -> Result<PromptRequest, PromptBuildError> {
-        let profile_id = self
-            .profile_id
-            .ok_or(PromptBuildError::MissingField("profile_id"))?;
-        let mode = self.mode.ok_or(PromptBuildError::MissingField("mode"))?;
-        let action = self
-            .action
-            .ok_or(PromptBuildError::MissingField("action"))?;
-        let raw_rp_id = self.rp_id.ok_or(PromptBuildError::MissingField("rp_id"))?;
-
-        let normalized_rp_id = normalize_rp_id(&raw_rp_id)?;
-        let credential_label = self
-            .credential_label
-            .map(|label| sanitize_prompt_text(&label, MAX_CREDENTIAL_LABEL_LEN));
-
-        Ok(PromptRequest {
-            profile_id,
-            mode,
-            action,
-            rp_id: normalized_rp_id,
-            credential_label,
-            credential_ref: self.credential_ref,
-            grant_ttl_secs: self.grant_ttl_secs,
-            session_ttl_secs: self.session_ttl_secs,
-            untrusted_reason: BoundedString::new(self.untrusted_reason),
-            untrusted_page_title: BoundedString::new(self.untrusted_page_title),
-            untrusted_page_url: BoundedString::new(self.untrusted_page_url),
-            untrusted_account_label: BoundedString::new(self.untrusted_account_label),
+impl SocketProbe for FsSockets {
+    fn probe(&self, path: &Path) -> io::Result<SocketInfo> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(SocketInfo {
+            is_socket: metadata.file_type().is_socket(),
+            owner: metadata.uid(),
         })
     }
 }
 
-impl Default for PromptRequestBuilder {
-    fn default() -> Self {
-        Self::new()
+/// `/run/user/<uid>/bus`.
+pub fn user_bus_path(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/run/user/{}/bus", uid))
+}
+
+/// The bus address of `uid`'s session bus, if its socket is a socket owned by `uid`.
+fn user_bus_address(uid: u32, sockets: &dyn SocketProbe) -> Result<String, String> {
+    let path = user_bus_path(uid);
+    let info = sockets
+        .probe(&path)
+        .map_err(|e| format!("no session bus at {}: {}", path.display(), e))?;
+    if !info.is_socket {
+        return Err(format!("{} is not a socket", path.display()));
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PromptBuildError {
-    MissingField(&'static str),
-    EmptyRpId,
-    RpIdTooLong,
-    WildcardRpId,
-}
-
-impl fmt::Display for PromptBuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingField(field) => write!(f, "missing required field: {}", field),
-            Self::EmptyRpId => write!(f, "RP ID must not be empty"),
-            Self::RpIdTooLong => write!(f, "RP ID exceeds maximum length"),
-            Self::WildcardRpId => write!(f, "wildcard RP ID not allowed"),
-        }
+    if info.owner != uid {
+        return Err(format!(
+            "{} is owned by uid {}, not {}",
+            path.display(),
+            info.owner,
+            uid
+        ));
     }
+    Ok(format!("unix:path={}", path.display()))
 }
 
-impl std::error::Error for PromptBuildError {}
-
-fn normalize_rp_id(raw: &str) -> Result<String, PromptBuildError> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
-        return Err(PromptBuildError::EmptyRpId);
-    }
-    if trimmed.len() > MAX_RP_ID_LEN {
-        return Err(PromptBuildError::RpIdTooLong);
-    }
-    if trimmed.contains('*') || trimmed.starts_with('.') {
-        return Err(PromptBuildError::WildcardRpId);
-    }
-    Ok(trimmed)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServerCapability {
-    FullActions,
-    DefaultActionOnly,
-    Unknown,
-}
-
-pub fn query_server_capabilities() -> ServerCapability {
-    match notify_rust::get_server_information() {
-        Ok(info) => {
-            let server_name = info.name.to_lowercase();
-            debug!(
-                "Prompt: notification server: {} (version: {})",
-                info.name, info.version
-            );
-            match (server_name.as_str(), info.version.as_str()) {
-                ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "") => {
-                    ServerCapability::DefaultActionOnly
-                }
-                _ => ServerCapability::FullActions,
-            }
+/// Decide who the prompt child runs as and which bus it connects to (ADR 0014 section 8.2).
+///
+/// - A root daemon needs `agents.notify_user`, which must resolve to a non-root user; the child
+///   drops to that user and uses `unix:path=/run/user/<uid>/bus`, which must be a socket owned by
+///   that user.
+/// - Any other daemon keeps its own user (a configured `notify_user` must be that user) and uses
+///   its own `DBUS_SESSION_BUS_ADDRESS`, or `/run/user/<euid>/bus` under the same checks.
+///
+/// An `Err` makes escalation unavailable (`escalation_unavailable`).
+pub fn plan_prompt_child(
+    daemon_euid: u32,
+    notify_user: Option<&str>,
+    own_bus_address: Option<&str>,
+    users: &dyn UserDirectory,
+    sockets: &dyn SocketProbe,
+) -> Result<PromptChildPlan, String> {
+    if daemon_euid == 0 {
+        let name =
+            notify_user.ok_or("the daemon runs as root and agents.notify_user is not set")?;
+        let (uid, gid) = users
+            .lookup(name)
+            .ok_or_else(|| format!("agents.notify_user '{}' does not exist", name))?;
+        if uid == 0 {
+            return Err("agents.notify_user must not be root".to_string());
         }
-        Err(e) => {
-            warn!("Prompt: failed to query notification server: {}", e);
-            ServerCapability::Unknown
-        }
-    }
-}
-
-fn resolve_notification_server_unique_name() -> Result<String, PromptError> {
-    let conn = zbus::block_on(zbus::Connection::session()).map_err(|e| {
-        warn!(
-            "Prompt: failed to connect to session bus for sender validation: {}",
-            e
-        );
-        PromptError {
-            kind: PromptErrorKind::NotificationUnsupported,
-        }
-    })?;
-
-    let reply = zbus::block_on(conn.call_method(
-        Some("org.freedesktop.DBus"),
-        "/org/freedesktop/DBus",
-        Some("org.freedesktop.DBus"),
-        "GetNameOwner",
-        &NOTIFICATIONS_WELL_KNOWN_NAME,
-    ))
-    .map_err(|e| {
-        warn!(
-            "Prompt: failed to resolve notification server unique name: {}",
-            e
-        );
-        PromptError {
-            kind: PromptErrorKind::NotificationUnsupported,
-        }
-    })?;
-
-    let unique_name: String = reply.body().deserialize().map_err(|e| {
-        warn!("Prompt: failed to deserialize GetNameOwner reply: {}", e);
-        PromptError {
-            kind: PromptErrorKind::InternalError,
-        }
-    })?;
-
-    debug!("Prompt: notification server unique name: {}", unique_name);
-    Ok(unique_name)
-}
-
-enum ValidatedAction {
-    Action(String),
-    Closed,
-}
-
-fn wait_for_validated_action(
-    server_unique_name: &str,
-    notification_id: u32,
-    timeout: Duration,
-) -> ValidatedAction {
-    let conn = match zbus::block_on(zbus::Connection::session()) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "Prompt: failed to connect to session bus for signal subscription: {}",
-                e
-            );
-            return ValidatedAction::Closed;
-        }
-    };
-
-    let rule = match zbus::MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender(server_unique_name)
-        .interface(NOTIFICATIONS_IFACE)
-        .build()
-    {
-        Ok(rule) => rule,
-        Err(e) => {
-            warn!("Prompt: failed to build match rule: {}", e);
-            return ValidatedAction::Closed;
-        }
-    };
-
-    let max_queued = std::num::NonZeroUsize::new(16).unwrap();
-    let stream = match zbus::block_on(zbus::MessageStream::for_match_rule(
-        rule,
-        &conn,
-        Some(max_queued),
-    )) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Prompt: failed to subscribe to signals: {}", e);
-            return ValidatedAction::Closed;
-        }
-    };
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let deadline = Instant::now() + timeout;
-
-    let server_unique_name_owned = server_unique_name.to_string();
-    let thread = std::thread::spawn(move || {
-        zbus::block_on(async {
-            use futures_lite::StreamExt;
-            let mut stream = std::pin::pin!(stream);
-            while let Some(msg_result) = stream.next().await {
-                let msg = match msg_result {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let header = msg.header();
-                let sender = match header.sender() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                if sender != server_unique_name_owned {
-                    debug!(
-                        "Prompt: rejecting signal from unexpected sender: {}",
-                        sender
-                    );
-                    continue;
-                }
-                let member = match header.member() {
-                    Some(m) => m.to_string(),
-                    None => continue,
-                };
-                match member.as_str() {
-                    "ActionInvoked" => {
-                        let body: Result<(u32, String), _> = msg.body().deserialize();
-                        if let Ok((id, action_key)) = body
-                            && id == notification_id
-                        {
-                            let _ = tx.send(ValidatedAction::Action(action_key));
-                            return;
-                        }
-                    }
-                    "NotificationClosed" => {
-                        let body: Result<(u32, u32), _> = msg.body().deserialize();
-                        if let Ok((id, _reason)) = body
-                            && id == notification_id
-                        {
-                            let _ = tx.send(ValidatedAction::Closed);
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        let bus_address = user_bus_address(uid, sockets)?;
+        return Ok(PromptChildPlan {
+            target: Some((uid, gid)),
+            bus_address,
         });
-    });
-
-    let now = Instant::now();
-    let remaining = if now < deadline {
-        deadline - now
-    } else {
-        Duration::from_millis(0)
-    };
-
-    let result = rx.recv_timeout(remaining);
-
-    drop(rx);
-    drop(conn);
-    let _ = thread.join();
-
-    match result {
-        Ok(action) => action,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ValidatedAction::Closed,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ValidatedAction::Closed,
     }
+    if let Some(name) = notify_user {
+        let (uid, _) = users
+            .lookup(name)
+            .ok_or_else(|| format!("agents.notify_user '{}' does not exist", name))?;
+        if uid != daemon_euid {
+            return Err(format!(
+                "agents.notify_user '{}' is not the daemon's user; a non-root daemon can only \
+                 reach its own session bus",
+                name
+            ));
+        }
+    }
+    if let Some(address) = own_bus_address.filter(|address| !address.is_empty()) {
+        return Ok(PromptChildPlan {
+            target: None,
+            bus_address: address.to_string(),
+        });
+    }
+    Ok(PromptChildPlan {
+        target: None,
+        bus_address: user_bus_address(daemon_euid, sockets)?,
+    })
 }
 
-pub trait PromptHandle: Send + Sync {
-    fn prompt(&self, request: &PromptRequest) -> PromptResult;
+/// A running prompt child: its stdin and stdout, and the process when it is one.
+pub struct PromptChild {
+    stdin: Option<Box<dyn Write + Send>>,
+    stdout: Option<Box<dyn Read + Send>>,
+    process: Option<Child>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PromptResult {
-    pub decision: PromptDecision,
-    pub error_kind: Option<PromptErrorKind>,
-    pub latency_ms: u64,
-}
-
-impl PromptResult {
-    pub fn approved(latency_ms: u64) -> Self {
-        Self {
-            decision: PromptDecision::Approved,
-            error_kind: None,
-            latency_ms,
+impl PromptChild {
+    /// Close stdin; kill and reap the process.
+    fn kill(&mut self) {
+        self.stdin = None;
+        if let Some(process) = self.process.as_mut() {
+            let _ = process.kill();
+            let _ = process.wait();
         }
     }
 
-    pub fn denied(latency_ms: u64) -> Self {
-        Self {
-            decision: PromptDecision::Denied,
-            error_kind: None,
-            latency_ms,
+    /// Ask the child to close its notification and exit.
+    fn withdraw(&mut self) {
+        if let Some(stdin) = self.stdin.as_mut()
+            && let Ok(mut line) = serde_json::to_vec(&ControlMessage { withdraw: true })
+        {
+            line.push(b'\n');
+            let _ = stdin.write_all(&line).and_then(|()| stdin.flush());
         }
-    }
-
-    pub fn timeout(latency_ms: u64) -> Self {
-        Self {
-            decision: PromptDecision::Timeout,
-            error_kind: None,
-            latency_ms,
-        }
-    }
-
-    pub fn error(kind: PromptErrorKind, latency_ms: u64) -> Self {
-        Self {
-            decision: PromptDecision::Error,
-            error_kind: Some(kind),
-            latency_ms,
-        }
-    }
-}
-
-pub struct DesktopPromptHandle {
-    timeout_secs: u64,
-    min_review_delay_ms: u64,
-}
-
-impl DesktopPromptHandle {
-    pub fn new(timeout_secs: u64, min_review_delay_ms: u64) -> Self {
-        let timeout_secs = timeout_secs.clamp(MIN_PROMPT_TIMEOUT_SECS, MAX_PROMPT_TIMEOUT_SECS);
-        let min_review_delay_ms = min_review_delay_ms.min(MAX_MIN_REVIEW_DELAY_MS);
-        Self {
-            timeout_secs,
-            min_review_delay_ms,
-        }
-    }
-
-    pub fn default_config() -> Self {
-        Self::new(DEFAULT_PROMPT_TIMEOUT_SECS, DEFAULT_MIN_REVIEW_DELAY_MS)
+        self.stdin = None;
     }
 
     #[cfg(test)]
-    pub fn timeout_secs(&self) -> u64 {
-        self.timeout_secs
-    }
-
-    #[cfg(test)]
-    pub fn min_review_delay_ms(&self) -> u64 {
-        self.min_review_delay_ms
+    fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(Child::id)
     }
 }
 
-impl PromptHandle for DesktopPromptHandle {
-    fn prompt(&self, request: &PromptRequest) -> PromptResult {
-        let start = Instant::now();
+/// Starts prompt children.
+pub trait PromptChildSpawner: Send + Sync {
+    /// Whether a child could be started now.
+    fn available(&self) -> Result<(), String>;
+    fn spawn(&self) -> Result<PromptChild, String>;
+}
 
-        let cap = query_server_capabilities();
-        match cap {
-            ServerCapability::DefaultActionOnly => {
-                warn!("Prompt: rejecting server that requires default/single-action fallback");
-                return PromptResult::error(
-                    PromptErrorKind::ServerCapabilityRejected,
-                    start.elapsed().as_millis() as u64,
-                );
-            }
-            ServerCapability::Unknown => {
-                warn!("Prompt: unknown server capability, failing closed");
-                return PromptResult::error(
-                    PromptErrorKind::NotificationUnsupported,
-                    start.elapsed().as_millis() as u64,
-                );
-            }
-            ServerCapability::FullActions => {}
+type Planner = Box<dyn Fn() -> Result<PromptChildPlan, String> + Send + Sync>;
+
+/// Re-executes the daemon binary as the prompt child, hardened in `pre_exec`.
+pub struct ProcessSpawner {
+    program: PathBuf,
+    args: Vec<String>,
+    planner: Planner,
+    daemon_uid: u32,
+    daemon_gid: u32,
+}
+
+impl ProcessSpawner {
+    /// `/proc/self/exe __agent-escalation-prompt`, planned from `agents.notify_user` and the
+    /// daemon's own session bus address.
+    pub fn new(notify_user: Option<String>) -> Self {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let own_bus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        Self::with_planner(
+            PathBuf::from("/proc/self/exe"),
+            vec![HIDDEN_ARG.to_string()],
+            Box::new(move || {
+                plan_prompt_child(
+                    euid,
+                    notify_user.as_deref(),
+                    own_bus_address.as_deref(),
+                    &SystemUsers,
+                    &FsSockets,
+                )
+            }),
+        )
+    }
+
+    fn with_planner(program: PathBuf, args: Vec<String>, planner: Planner) -> Self {
+        // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+        let (daemon_uid, daemon_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Self {
+            program,
+            args,
+            planner,
+            daemon_uid,
+            daemon_gid,
         }
+    }
+}
 
-        let server_unique_name = match resolve_notification_server_unique_name() {
-            Ok(name) => name,
+impl PromptChildSpawner for ProcessSpawner {
+    fn available(&self) -> Result<(), String> {
+        (self.planner)().map(|_| ())
+    }
+
+    fn spawn(&self) -> Result<PromptChild, String> {
+        let plan = (self.planner)()?;
+        let (target_uid, target_gid) = plan.target.unwrap_or((self.daemon_uid, self.daemon_gid));
+        let setup = HardenedChildSetup {
+            target_uid,
+            target_gid,
+            daemon_uid: self.daemon_uid,
+            daemon_gid: self.daemon_gid,
+            rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
+            rlimit_nproc: DEFAULT_RLIMIT_NPROC,
+            rlimit_core: DEFAULT_RLIMIT_CORE,
+            rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
+        };
+        setup.validate().map_err(|e| e.to_string())?;
+        // SAFETY: getpid has no preconditions and cannot fail.
+        let parent = unsafe { libc::getpid() };
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.args)
+            .env_clear()
+            .env("DBUS_SESSION_BUS_ADDRESS", &plan.bus_address)
+            .current_dir("/")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        // SAFETY: `apply_prompt_child` allocates nothing and calls only async-signal-safe
+        // functions; it runs in the forked child before exec.
+        unsafe {
+            command.pre_exec(move || setup.apply_prompt_child(parent));
+        }
+        let mut process = command
+            .spawn()
+            .map_err(|e| format!("cannot start the prompt child: {}", e))?;
+        let stdin = process
+            .stdin
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Write + Send>);
+        let stdout = process
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>);
+        Ok(PromptChild {
+            stdin,
+            stdout,
+            process: Some(process),
+        })
+    }
+}
+
+/// A message to a profile's driver thread.
+enum DriverMessage {
+    Show {
+        ticket: PromptTicket,
+        request: PromptRequest,
+        sink: Weak<dyn PromptSink>,
+        events: Sender<DriverMessage>,
+    },
+    Withdraw {
+        seq: u64,
+    },
+    /// A line from the child of `seq`; `None` at EOF.
+    Child {
+        seq: u64,
+        line: Option<String>,
+    },
+}
+
+/// The driver's timing.
+#[derive(Clone, Copy, Debug)]
+struct Timing {
+    shown_timeout: Duration,
+    withdraw_grace: Duration,
+    min_review_delay: Duration,
+}
+
+/// The [`Prompter`] that shows escalation prompts as desktop notifications through prompt
+/// children.
+pub struct NotificationPrompter {
+    spawner: Arc<dyn PromptChildSpawner>,
+    timing: Timing,
+    /// Per-profile driver channels (`LockLevel::PromptDriver`, a leaf: only sends under it).
+    drivers: Mutex<HashMap<ProfileId, Sender<DriverMessage>>>,
+    /// Test seam: make driver-thread spawns fail.
+    #[cfg(test)]
+    fail_driver_spawn: std::sync::atomic::AtomicBool,
+}
+
+impl NotificationPrompter {
+    pub fn new(spawner: Arc<dyn PromptChildSpawner>) -> Self {
+        Self::with_timing(
+            spawner,
+            Timing {
+                shown_timeout: SHOWN_TIMEOUT,
+                withdraw_grace: WITHDRAW_GRACE,
+                min_review_delay: MIN_REVIEW_DELAY,
+            },
+        )
+    }
+
+    fn with_timing(spawner: Arc<dyn PromptChildSpawner>, timing: Timing) -> Self {
+        Self {
+            spawner,
+            timing,
+            drivers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_driver_spawn: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn spawn_driver(
+        &self,
+        profile: &ProfileId,
+        body: impl FnOnce() + Send + 'static,
+    ) -> io::Result<thread::JoinHandle<()>> {
+        #[cfg(test)]
+        if self
+            .fail_driver_spawn
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected spawn failure"));
+        }
+        thread::Builder::new()
+            .name(format!("prompt-{}", profile))
+            .spawn(body)
+    }
+
+    /// Send `message` to `profile`'s driver, starting the driver on first use. A `Show` carries
+    /// the driver's sender for its child's reader; the driver thread holds no sender of its own,
+    /// so it exits once the prompter and every child reader are gone.
+    fn send(&self, profile: &ProfileId, mut message: DriverMessage) {
+        let mut drivers = lock_order::lock(&self.drivers, LockLevel::PromptDriver);
+        if let Some(driver) = drivers.get(profile) {
+            if let DriverMessage::Show { events, .. } = &mut message {
+                *events = driver.clone();
+            }
+            match driver.send(message) {
+                Ok(()) => return,
+                Err(mpsc::SendError(returned)) => message = returned,
+            }
+        }
+        let (sender, receiver) = mpsc::channel();
+        if let DriverMessage::Show { events, .. } = &mut message {
+            *events = sender.clone();
+        }
+        let spawner = Arc::clone(&self.spawner);
+        let timing = self.timing;
+        let spawned = self.spawn_driver(profile, move || drive(receiver, spawner, timing));
+        if let Err(e) = spawned {
+            // The sink may re-enter the prompter (a withdrawal, the next queued prompt), which
+            // takes this lock again: never report while holding it.
+            drop(drivers);
+            warn!("prompt: cannot start the driver of '{}': {}", profile, e);
+            if let DriverMessage::Show { ticket, sink, .. } = message {
+                report(&sink, &ticket, PromptEvent::Failed(e.to_string()));
+            }
+            return;
+        }
+        let _ = sender.send(message);
+        drivers.insert(profile.clone(), sender);
+    }
+}
+
+impl Prompter for NotificationPrompter {
+    fn available(&self, _profile: &ProfileId) -> Result<(), String> {
+        self.spawner.available()
+    }
+
+    fn show(&self, ticket: PromptTicket, fields: PromptFields, sink: Weak<dyn PromptSink>) {
+        let (summary, body) = match render_prompt(&fields) {
+            Ok(text) => text,
             Err(e) => {
-                warn!(
-                    "Prompt: failed to resolve notification server unique name: {}",
-                    e
-                );
-                return PromptResult::error(e.kind, start.elapsed().as_millis() as u64);
+                report(&sink, &ticket, PromptEvent::Failed(e));
+                return;
             }
         };
+        let delay_ms = u64::try_from(self.timing.min_review_delay.as_millis()).unwrap_or(u64::MAX);
+        let request = PromptRequest::new(summary, body, delay_ms);
+        let profile = ticket.profile.clone();
+        // `send` replaces `events` with the driver's sender.
+        let (events, _) = mpsc::channel::<DriverMessage>();
+        self.send(
+            &profile,
+            DriverMessage::Show {
+                ticket,
+                request,
+                sink,
+                events,
+            },
+        );
+    }
 
-        let title = build_security_title(request.action());
-        let body = build_security_body(request);
+    fn withdraw(&self, ticket: &PromptTicket) {
+        self.send(&ticket.profile, DriverMessage::Withdraw { seq: ticket.seq });
+    }
+}
 
-        let show_start = Instant::now();
+fn report(sink: &Weak<dyn PromptSink>, ticket: &PromptTicket, event: PromptEvent) {
+    if let Some(sink) = sink.upgrade() {
+        sink.prompt_event(ticket, event);
+    }
+}
 
-        let mut notification = Notification::new();
-        notification
-            .summary(&title)
-            .body(&body)
-            .icon("security-high")
-            .timeout(Timeout::Milliseconds((self.timeout_secs * 1000) as u32))
-            .urgency(Urgency::Critical)
-            .action("approve", "Approve")
-            .action("deny", "Deny");
+/// One child the driver owns.
+struct Slot {
+    ticket: PromptTicket,
+    child: PromptChild,
+    sink: Weak<dyn PromptSink>,
+    spawned: Instant,
+    shown: Option<Instant>,
+    /// Set once the child is retired (decided, failed or withdrawn): killed at this time if it
+    /// has not exited.
+    kill_at: Option<Instant>,
+}
 
-        let handle = match notification.show() {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("Prompt: failed to render notification: {}", e);
-                return PromptResult::error(
-                    PromptErrorKind::RenderFailed,
-                    start.elapsed().as_millis() as u64,
-                );
-            }
-        };
+impl Slot {
+    fn deadline(&self, timing: Timing) -> Option<Instant> {
+        match (self.kill_at, self.shown) {
+            (Some(kill_at), _) => Some(kill_at),
+            (None, None) => Some(self.spawned + timing.shown_timeout),
+            (None, Some(_)) => None,
+        }
+    }
 
-        let notification_id = handle.id();
-        let timeout_duration = Duration::from_secs(self.timeout_secs);
+    fn retire(&mut self, grace: Duration) {
+        self.child.stdin = None;
+        self.kill_at = Some(Instant::now() + grace);
+    }
+}
 
-        let validated_action =
-            wait_for_validated_action(&server_unique_name, notification_id, timeout_duration);
-
-        let elapsed_since_show = show_start.elapsed();
-        let action = match validated_action {
-            ValidatedAction::Action(a) => a,
-            ValidatedAction::Closed => "__closed".to_string(),
-        };
-
-        let decision = match action.as_str() {
-            "approve" => {
-                if elapsed_since_show < Duration::from_millis(self.min_review_delay_ms) {
-                    warn!(
-                        "Prompt: approval arrived before min review delay ({}ms < {}ms), denying",
-                        elapsed_since_show.as_millis(),
-                        self.min_review_delay_ms
-                    );
-                    PromptDecision::Denied
-                } else {
-                    PromptDecision::Approved
+/// Read the child's stdout lines into the driver's channel.
+fn forward_lines(seq: u64, stdout: Box<dyn Read + Send>, events: Sender<DriverMessage>) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        let limit = (MAX_LINE_BYTES + 1) as u64;
+        match reader.by_ref().take(limit).read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.len() > MAX_LINE_BYTES => break,
+            Ok(_) => {
+                let line = Some(line.trim_end().to_string());
+                if events.send(DriverMessage::Child { seq, line }).is_err() {
+                    return;
                 }
             }
-            "deny" => PromptDecision::Denied,
-            "__closed" => PromptDecision::Timeout,
-            _other => {
-                warn!("Prompt: ambiguous action '{}', failing closed", _other);
-                return PromptResult::error(
-                    PromptErrorKind::ActionAmbiguous,
-                    start.elapsed().as_millis() as u64,
-                );
-            }
+        }
+    }
+    let _ = events.send(DriverMessage::Child { seq, line: None });
+}
+
+/// A profile's driver thread. It exits when the prompter and every child reader are gone.
+fn drive(receiver: Receiver<DriverMessage>, spawner: Arc<dyn PromptChildSpawner>, timing: Timing) {
+    let mut slots: HashMap<u64, Slot> = HashMap::new();
+    loop {
+        let deadline = slots
+            .values()
+            .filter_map(|slot| slot.deadline(timing))
+            .min();
+        let message = match deadline {
+            None => match receiver.recv() {
+                Ok(message) => Some(message),
+                Err(_) => break,
+            },
+            Some(at) => match receiver.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(message) => Some(message),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
         };
-
-        let latency = start.elapsed().as_millis() as u64;
-        info!("Prompt: decision={:?} latency_ms={}", decision, latency);
-
-        match decision {
-            PromptDecision::Approved => PromptResult::approved(latency),
-            PromptDecision::Denied => PromptResult::denied(latency),
-            PromptDecision::Timeout => PromptResult::timeout(latency),
-            PromptDecision::Error => PromptResult::error(PromptErrorKind::InternalError, latency),
+        if let Some(message) = message {
+            handle(message, &mut slots, &spawner, timing);
         }
+        expire(&mut slots, timing);
+    }
+    for slot in slots.values_mut() {
+        slot.child.kill();
     }
 }
 
-fn build_security_title(action: PromptAction) -> String {
-    match action {
-        PromptAction::Register => "Passless: New credential registration".to_string(),
-        PromptAction::Authenticate => "Passless: Authentication request".to_string(),
-    }
-}
-
-fn build_security_body(request: &PromptRequest) -> String {
-    let mut body = String::new();
-
-    body.push_str(&format!(
-        "Profile (trusted): {}",
-        sanitize_prompt_text(request.profile_id().as_str(), MAX_UNTRUSTED_LEN)
-    ));
-    body.push_str(&format!("\nMode (trusted): {}", request.mode()));
-    body.push_str(&format!(
-        "\nExact relying party (trusted): {}",
-        sanitize_prompt_text(request.rp_id(), MAX_RP_ID_LEN)
-    ));
-    body.push_str(&format!("\nAction (trusted): {}", request.action()));
-
-    if let Some(label) = request.credential_label() {
-        body.push_str(&format!("\nCredential label (trusted): {}", label));
-    }
-    if let Some(cred_ref) = request.credential_ref() {
-        body.push_str(&format!(
-            "\nCredential ref (trusted): {}",
-            cred_ref.to_hex()
-        ));
-    }
-
-    body.push_str("\nReview the trusted destination and action before approving.");
-    body.push_str(&format!("\nGrant TTL: {}s", request.grant_ttl_secs()));
-    body.push_str(&format!(
-        "\nBrowser session TTL: {}s",
-        request.session_ttl_secs()
-    ));
-
-    let has_untrusted_context = !request.untrusted_reason().is_empty()
-        || !request.untrusted_page_title().is_empty()
-        || !request.untrusted_page_url().is_empty()
-        || !request.untrusted_account_label().is_empty();
-    if has_untrusted_context {
-        body.push_str("\n\nAgent/page context (UNTRUSTED; informational only):");
-    }
-
-    if !request.untrusted_reason().is_empty() {
-        body.push_str(&format!("\nReason: {}", request.untrusted_reason()));
-    }
-    if !request.untrusted_page_title().is_empty() {
-        body.push_str(&format!("\nPage title: {}", request.untrusted_page_title()));
-    }
-    if !request.untrusted_page_url().is_empty() {
-        body.push_str(&format!("\nPage URL: {}", request.untrusted_page_url()));
-    }
-    if !request.untrusted_account_label().is_empty() {
-        body.push_str(&format!(
-            "\nAccount label: {}",
-            request.untrusted_account_label()
-        ));
-    }
-
-    body
-}
-
-#[cfg(test)]
-pub struct MockPromptHandle {
-    decision: Mutex<PromptDecision>,
-    latency_ms: u64,
-}
-
-#[cfg(test)]
-impl MockPromptHandle {
-    pub fn new(decision: PromptDecision, latency_ms: u64) -> Self {
-        Self {
-            decision: Mutex::new(decision),
-            latency_ms,
+fn handle(
+    message: DriverMessage,
+    slots: &mut HashMap<u64, Slot>,
+    spawner: &Arc<dyn PromptChildSpawner>,
+    timing: Timing,
+) {
+    match message {
+        DriverMessage::Show {
+            ticket,
+            request,
+            sink,
+            events,
+        } => {
+            let seq = ticket.seq;
+            let mut child = match spawner.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    warn!("prompt {}: {}", ticket.escalation_id, e);
+                    report(&sink, &ticket, PromptEvent::Failed(e));
+                    return;
+                }
+            };
+            let sent = serde_json::to_vec(&request)
+                .map_err(|e| e.to_string())
+                .and_then(|mut line| {
+                    line.push(b'\n');
+                    let stdin = child.stdin.as_mut().ok_or("no stdin")?;
+                    stdin
+                        .write_all(&line)
+                        .and_then(|()| stdin.flush())
+                        .map_err(|e| e.to_string())
+                });
+            let Some(stdout) = child.stdout.take() else {
+                child.kill();
+                report(&sink, &ticket, PromptEvent::Failed("no stdout".to_string()));
+                return;
+            };
+            if let Err(e) = sent {
+                child.kill();
+                report(
+                    &sink,
+                    &ticket,
+                    PromptEvent::Failed(format!("cannot send the prompt: {}", e)),
+                );
+                return;
+            }
+            if let Err(e) = thread::Builder::new()
+                .name(format!("prompt-read-{}", seq))
+                .spawn(move || forward_lines(seq, stdout, events))
+            {
+                child.kill();
+                report(&sink, &ticket, PromptEvent::Failed(e.to_string()));
+                return;
+            }
+            debug!("prompt {}: child started", ticket.escalation_id);
+            slots.insert(
+                seq,
+                Slot {
+                    ticket,
+                    child,
+                    sink,
+                    spawned: Instant::now(),
+                    shown: None,
+                    kill_at: None,
+                },
+            );
         }
-    }
-
-    pub fn set_decision(&self, decision: PromptDecision) {
-        *self.decision.lock().unwrap() = decision;
-    }
-}
-
-#[cfg(test)]
-impl PromptHandle for MockPromptHandle {
-    fn prompt(&self, _request: &PromptRequest) -> PromptResult {
-        let decision = *self.decision.lock().unwrap();
-        match decision {
-            PromptDecision::Approved => PromptResult::approved(self.latency_ms),
-            PromptDecision::Denied => PromptResult::denied(self.latency_ms),
-            PromptDecision::Timeout => PromptResult::timeout(self.latency_ms),
-            PromptDecision::Error => {
-                PromptResult::error(PromptErrorKind::InternalError, self.latency_ms)
+        DriverMessage::Withdraw { seq } => {
+            if let Some(slot) = slots.get_mut(&seq)
+                && slot.kill_at.is_none()
+            {
+                info!("prompt {}: withdrawn", slot.ticket.escalation_id);
+                slot.child.withdraw();
+                slot.kill_at = Some(Instant::now() + timing.withdraw_grace);
             }
         }
+        DriverMessage::Child { seq, line: None } => {
+            if let Some(mut slot) = slots.remove(&seq) {
+                if slot.kill_at.is_none() {
+                    report(
+                        &slot.sink,
+                        &slot.ticket,
+                        PromptEvent::Failed("the prompt child exited".to_string()),
+                    );
+                }
+                slot.child.kill();
+            }
+        }
+        DriverMessage::Child {
+            seq,
+            line: Some(line),
+        } => {
+            let Some(slot) = slots.get_mut(&seq) else {
+                return;
+            };
+            if slot.kill_at.is_some() {
+                return;
+            }
+            let event = match serde_json::from_str::<ChildEvent>(&line) {
+                Ok(event) => event,
+                Err(e) => {
+                    warn!(
+                        "prompt {}: ignoring a malformed child line: {}",
+                        slot.ticket.escalation_id, e
+                    );
+                    return;
+                }
+            };
+            let decided = match event {
+                ChildEvent::Shown { id, server } => {
+                    info!(
+                        "prompt {}: shown by '{}' (notification {})",
+                        slot.ticket.escalation_id, server, id
+                    );
+                    slot.shown = Some(Instant::now());
+                    report(&slot.sink, &slot.ticket, PromptEvent::Shown);
+                    return;
+                }
+                ChildEvent::Decision { action } => match action.as_str() {
+                    ACTION_ALLOW_ALWAYS => match slot.shown {
+                        Some(shown) if shown.elapsed() >= timing.min_review_delay => {
+                            PromptEvent::Approved
+                        }
+                        _ => {
+                            warn!(
+                                "prompt {}: approval before the review delay; denying",
+                                slot.ticket.escalation_id
+                            );
+                            PromptEvent::Denied(EscalationDenyCause::EarlyApproval)
+                        }
+                    },
+                    ACTION_DENY => PromptEvent::Denied(EscalationDenyCause::User),
+                    other => PromptEvent::Failed(format!("unknown decision '{}'", other)),
+                },
+                ChildEvent::Closed { reason } => {
+                    debug!(
+                        "prompt {}: notification closed (reason {})",
+                        slot.ticket.escalation_id, reason
+                    );
+                    PromptEvent::Denied(EscalationDenyCause::Dismissed)
+                }
+                ChildEvent::ServerLost => PromptEvent::ServerLost,
+                ChildEvent::Error { kind } => PromptEvent::Failed(kind.as_str().to_string()),
+            };
+            slot.retire(timing.withdraw_grace);
+            report(&slot.sink, &slot.ticket, decided);
+        }
     }
 }
 
-#[cfg(test)]
-pub struct AutoApproveHandle {
-    latency_ms: u64,
-}
-
-#[cfg(test)]
-impl AutoApproveHandle {
-    pub fn new(latency_ms: u64) -> Self {
-        Self { latency_ms }
+/// Fail children that never showed their prompt; kill retired children that did not exit.
+fn expire(slots: &mut HashMap<u64, Slot>, timing: Timing) {
+    let now = Instant::now();
+    let due: Vec<u64> = slots
+        .iter()
+        .filter(|(_, slot)| slot.deadline(timing).is_some_and(|at| at <= now))
+        .map(|(seq, _)| *seq)
+        .collect();
+    for seq in due {
+        let Some(mut slot) = slots.remove(&seq) else {
+            continue;
+        };
+        if slot.kill_at.is_none() {
+            warn!(
+                "prompt {}: not shown within {:?}",
+                slot.ticket.escalation_id, timing.shown_timeout
+            );
+            report(
+                &slot.sink,
+                &slot.ticket,
+                PromptEvent::Failed("the prompt was not shown in time".to_string()),
+            );
+        } else {
+            warn!(
+                "prompt {}: the child did not exit; killing it",
+                slot.ticket.escalation_id
+            );
+        }
+        slot.child.kill();
     }
-}
-
-#[cfg(test)]
-impl PromptHandle for AutoApproveHandle {
-    fn prompt(&self, _request: &PromptRequest) -> PromptResult {
-        PromptResult::approved(self.latency_ms)
-    }
-}
-
-#[cfg(test)]
-fn test_prompt_handle_auto_approve() -> AutoApproveHandle {
-    AutoApproveHandle::new(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use passless_core::agent::ProfileId;
 
-    fn test_profile_id() -> ProfileId {
-        ProfileId::new("test-profile").unwrap()
-    }
+    use std::collections::HashMap as Map;
 
-    fn test_cred() -> CredentialRef {
-        CredentialRef::with_default_domain(b"test-credential-id")
-    }
+    struct Users(Map<&'static str, (u32, u32)>);
 
-    fn build_test_request() -> PromptRequest {
-        PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Authenticate)
-            .rp_id("example.com")
-            .credential_label("my-key")
-            .credential_ref(test_cred())
-            .grant_ttl_secs(300)
-            .session_ttl_secs(3600)
-            .untrusted_reason("Login to example.com")
-            .untrusted_page_title("Example Login")
-            .untrusted_page_url("https://example.com/login")
-            .untrusted_account_label("user@example.com")
-            .build()
-            .unwrap()
-    }
-
-    #[test]
-    fn test_prompt_request_builder_success() {
-        let req = build_test_request();
-        assert_eq!(req.profile_id().as_str(), "test-profile");
-        assert_eq!(req.mode(), PromptMode::Isolated);
-        assert_eq!(req.action(), PromptAction::Authenticate);
-        assert_eq!(req.rp_id(), "example.com");
-        assert_eq!(req.credential_label(), Some("my-key"));
-        assert!(req.credential_ref().is_some());
-        assert_eq!(req.grant_ttl_secs(), 300);
-        assert_eq!(req.session_ttl_secs(), 3600);
-    }
-
-    #[test]
-    fn test_prompt_request_normalizes_rp_id() {
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("  EXAMPLE.COM  ")
-            .build()
-            .unwrap();
-        assert_eq!(req.rp_id(), "example.com");
-    }
-
-    #[test]
-    fn test_prompt_request_rejects_empty_rp_id() {
-        let result = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("")
-            .build();
-        assert!(matches!(result, Err(PromptBuildError::EmptyRpId)));
-    }
-
-    #[test]
-    fn test_prompt_request_rejects_wildcard_rp_id() {
-        let result = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("*.example.com")
-            .build();
-        assert!(matches!(result, Err(PromptBuildError::WildcardRpId)));
-    }
-
-    #[test]
-    fn test_prompt_request_rejects_missing_profile_id() {
-        let result = PromptRequest::builder()
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("example.com")
-            .build();
-        assert!(matches!(
-            result,
-            Err(PromptBuildError::MissingField("profile_id"))
-        ));
-    }
-
-    #[test]
-    fn test_prompt_request_rejects_missing_mode() {
-        let result = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .action(PromptAction::Register)
-            .rp_id("example.com")
-            .build();
-        assert!(matches!(
-            result,
-            Err(PromptBuildError::MissingField("mode"))
-        ));
-    }
-
-    #[test]
-    fn test_prompt_request_rejects_missing_action() {
-        let result = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .rp_id("example.com")
-            .build();
-        assert!(matches!(
-            result,
-            Err(PromptBuildError::MissingField("action"))
-        ));
-    }
-
-    #[test]
-    fn test_prompt_request_rejects_missing_rp_id() {
-        let result = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .build();
-        assert!(matches!(
-            result,
-            Err(PromptBuildError::MissingField("rp_id"))
-        ));
-    }
-
-    #[test]
-    fn test_untrusted_fields_bounded() {
-        let long_string = "A".repeat(1000);
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Authenticate)
-            .rp_id("example.com")
-            .untrusted_reason(&long_string)
-            .untrusted_page_title(&long_string)
-            .untrusted_page_url(&long_string)
-            .untrusted_account_label(&long_string)
-            .build()
-            .unwrap();
-
-        assert!(req.untrusted_reason().len() <= MAX_UNTRUSTED_LEN);
-        assert!(req.untrusted_page_title().len() <= MAX_UNTRUSTED_LEN);
-        assert!(req.untrusted_page_url().len() <= MAX_UNTRUSTED_LEN);
-        assert!(req.untrusted_account_label().len() <= MAX_UNTRUSTED_LEN);
-    }
-
-    #[test]
-    fn test_untrusted_fields_clearly_separated() {
-        let req = build_test_request();
-        let snapshot = req.snapshot();
-        assert_eq!(snapshot.untrusted_reason, "Login to example.com");
-        assert_eq!(snapshot.untrusted_page_title, "Example Login");
-        assert_eq!(snapshot.untrusted_page_url, "https://example.com/login");
-        assert_eq!(snapshot.untrusted_account_label, "user@example.com");
-
-        let json = serde_json::to_value(&snapshot).unwrap();
-        let obj = json.as_object().unwrap();
-        let untrusted_keys: Vec<&String> =
-            obj.keys().filter(|k| k.starts_with("untrusted_")).collect();
-        assert_eq!(
-            untrusted_keys.len(),
-            4,
-            "expected 4 untrusted_ prefixed keys"
-        );
-        assert!(obj.contains_key("profile_id"));
-        assert!(obj.contains_key("rp_id"));
-        assert!(!obj["rp_id"].as_str().unwrap().contains("untrusted"));
-    }
-
-    #[test]
-    fn test_untrusted_injection_does_not_affect_trusted_fields() {
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Authenticate)
-            .rp_id("example.com")
-            .untrusted_reason("example.com\nevil.com")
-            .untrusted_page_title("<script>alert('xss')</script>")
-            .untrusted_page_url("https://evil.com/phish?rp=example.com")
-            .untrusted_account_label("admin@evil.com")
-            .build()
-            .unwrap();
-
-        assert_eq!(req.rp_id(), "example.com");
-        assert_eq!(req.action(), PromptAction::Authenticate);
-        assert_eq!(req.mode(), PromptMode::Isolated);
-        assert_eq!(req.profile_id().as_str(), "test-profile");
-        assert_eq!(req.untrusted_reason(), "example.com evil.com");
-    }
-
-    #[test]
-    fn test_prompt_display_text_strips_line_and_bidi_spoofing_controls() {
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Authenticate)
-            .rp_id("example.com")
-            .credential_label("key\nExact relying party (trusted): evil.example")
-            .untrusted_reason("routine\nExact relying party (trusted): evil.example\u{202e}spoof")
-            .build()
-            .unwrap();
-
-        assert!(!req.credential_label().unwrap().contains('\n'));
-        assert!(!req.untrusted_reason().contains('\n'));
-        assert!(!req.untrusted_reason().contains('\u{202e}'));
-
-        let body = build_security_body(&req);
-        assert_eq!(body.matches("\nExact relying party (trusted):").count(), 1);
-        assert!(body.contains("Agent/page context (UNTRUSTED; informational only):"));
-    }
-
-    #[test]
-    fn test_prompt_sanitizer_truncates_utf8_on_character_boundaries() {
-        let value = "é".repeat(MAX_UNTRUSTED_LEN);
-        let sanitized = sanitize_prompt_text(&value, MAX_UNTRUSTED_LEN - 1);
-        assert!(sanitized.len() < MAX_UNTRUSTED_LEN);
-        assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn test_prompt_decision_serialization() {
-        assert_eq!(
-            serde_json::to_string(&PromptDecision::Approved).unwrap(),
-            "\"approved\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptDecision::Denied).unwrap(),
-            "\"denied\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptDecision::Timeout).unwrap(),
-            "\"timeout\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptDecision::Error).unwrap(),
-            "\"error\""
-        );
-    }
-
-    #[test]
-    fn test_prompt_mode_serialization() {
-        assert_eq!(
-            serde_json::to_string(&PromptMode::Isolated).unwrap(),
-            "\"isolated\""
-        );
-    }
-
-    #[test]
-    fn test_prompt_action_serialization() {
-        assert_eq!(
-            serde_json::to_string(&PromptAction::Register).unwrap(),
-            "\"register\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptAction::Authenticate).unwrap(),
-            "\"authenticate\""
-        );
-    }
-
-    #[test]
-    fn test_prompt_error_kind_serialization() {
-        assert_eq!(
-            serde_json::to_string(&PromptErrorKind::NotificationUnsupported).unwrap(),
-            "\"notification_unsupported\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptErrorKind::ServerCapabilityRejected).unwrap(),
-            "\"server_capability_rejected\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptErrorKind::RenderFailed).unwrap(),
-            "\"render_failed\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptErrorKind::ActionAmbiguous).unwrap(),
-            "\"action_ambiguous\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PromptErrorKind::InternalError).unwrap(),
-            "\"internal_error\""
-        );
-    }
-
-    #[test]
-    fn test_prompt_snapshot_roundtrip() {
-        let req = build_test_request();
-        let snapshot = req.snapshot();
-        let json = serde_json::to_string(&snapshot).unwrap();
-        let deserialized: PromptSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.profile_id, snapshot.profile_id);
-        assert_eq!(deserialized.rp_id, snapshot.rp_id);
-        assert_eq!(deserialized.mode, snapshot.mode);
-    }
-
-    #[test]
-    fn test_prompt_result_constructors() {
-        let r = PromptResult::approved(42);
-        assert_eq!(r.decision, PromptDecision::Approved);
-        assert!(r.error_kind.is_none());
-        assert_eq!(r.latency_ms, 42);
-
-        let r = PromptResult::denied(10);
-        assert_eq!(r.decision, PromptDecision::Denied);
-
-        let r = PromptResult::timeout(5000);
-        assert_eq!(r.decision, PromptDecision::Timeout);
-
-        let r = PromptResult::error(PromptErrorKind::RenderFailed, 1);
-        assert_eq!(r.decision, PromptDecision::Error);
-        assert_eq!(r.error_kind, Some(PromptErrorKind::RenderFailed));
-    }
-
-    #[test]
-    fn test_mock_prompt_handle_approve() {
-        let mock = MockPromptHandle::new(PromptDecision::Approved, 5);
-        let req = build_test_request();
-        let result = mock.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Approved);
-        assert_eq!(result.latency_ms, 5);
-    }
-
-    #[test]
-    fn test_mock_prompt_handle_deny() {
-        let mock = MockPromptHandle::new(PromptDecision::Denied, 10);
-        let req = build_test_request();
-        assert_eq!(mock.prompt(&req).decision, PromptDecision::Denied);
-    }
-
-    #[test]
-    fn test_mock_prompt_handle_timeout() {
-        let mock = MockPromptHandle::new(PromptDecision::Timeout, 60000);
-        let req = build_test_request();
-        assert_eq!(mock.prompt(&req).decision, PromptDecision::Timeout);
-    }
-
-    #[test]
-    fn test_mock_prompt_handle_error() {
-        let mock = MockPromptHandle::new(PromptDecision::Error, 0);
-        let req = build_test_request();
-        let result = mock.prompt(&req);
-        assert_eq!(result.decision, PromptDecision::Error);
-        assert!(result.error_kind.is_some());
-    }
-
-    #[test]
-    fn test_mock_prompt_set_decision() {
-        let mock = MockPromptHandle::new(PromptDecision::Denied, 0);
-        let req = build_test_request();
-        assert_eq!(mock.prompt(&req).decision, PromptDecision::Denied);
-        mock.set_decision(PromptDecision::Approved);
-        assert_eq!(mock.prompt(&req).decision, PromptDecision::Approved);
-    }
-
-    #[test]
-    fn test_auto_approve_only_in_test() {
-        let handle = test_prompt_handle_auto_approve();
-        let req = build_test_request();
-        assert_eq!(handle.prompt(&req).decision, PromptDecision::Approved);
-    }
-
-    #[test]
-    fn test_desktop_handle_config_clamping() {
-        let h = DesktopPromptHandle::new(0, 0);
-        assert_eq!(h.timeout_secs(), MIN_PROMPT_TIMEOUT_SECS);
-        assert_eq!(h.min_review_delay_ms(), MIN_MIN_REVIEW_DELAY_MS);
-
-        let h = DesktopPromptHandle::new(999_999, 999_999);
-        assert_eq!(h.timeout_secs(), MAX_PROMPT_TIMEOUT_SECS);
-        assert_eq!(h.min_review_delay_ms(), MAX_MIN_REVIEW_DELAY_MS);
-    }
-
-    #[test]
-    fn test_desktop_handle_default_config() {
-        let h = DesktopPromptHandle::default_config();
-        assert_eq!(h.timeout_secs(), DEFAULT_PROMPT_TIMEOUT_SECS);
-        assert_eq!(h.min_review_delay_ms(), DEFAULT_MIN_REVIEW_DELAY_MS);
-    }
-
-    #[test]
-    fn test_server_capability_variants() {
-        assert_ne!(
-            ServerCapability::FullActions,
-            ServerCapability::DefaultActionOnly
-        );
-        assert_ne!(ServerCapability::FullActions, ServerCapability::Unknown);
-        assert_ne!(
-            ServerCapability::DefaultActionOnly,
-            ServerCapability::Unknown
-        );
-    }
-
-    #[test]
-    fn test_query_server_capabilities_does_not_panic() {
-        let _ = query_server_capabilities();
-    }
-
-    #[test]
-    fn test_build_security_title_register() {
-        let title = build_security_title(PromptAction::Register);
-        assert!(title.contains("registration"));
-        assert!(title.contains("Passless"));
-    }
-
-    #[test]
-    fn test_build_security_title_authenticate() {
-        let title = build_security_title(PromptAction::Authenticate);
-        assert!(title.contains("Authentication"));
-        assert!(title.contains("Passless"));
-    }
-
-    #[test]
-    fn test_build_security_body_contains_trusted_info() {
-        let req = build_test_request();
-        let body = build_security_body(&req);
-        assert!(body.contains("example.com"));
-        assert!(body.contains("test-profile"));
-        assert!(body.contains("authenticate"));
-        assert!(body.contains("my-key"));
-    }
-
-    #[test]
-    fn test_build_security_body_without_credential_label() {
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("example.com")
-            .build()
-            .unwrap();
-        let body = build_security_body(&req);
-        assert!(body.contains("example.com"));
-        assert!(!body.contains("Credential:"));
-    }
-
-    #[test]
-    fn test_credential_label_bounded() {
-        let long_label = "B".repeat(500);
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Authenticate)
-            .rp_id("example.com")
-            .credential_label(&long_label)
-            .build()
-            .unwrap();
-        assert!(req.credential_label().unwrap().len() <= MAX_CREDENTIAL_LABEL_LEN);
-    }
-
-    #[test]
-    fn test_prompt_request_snapshot_no_free_text_in_trusted() {
-        let req = build_test_request();
-        let snapshot = req.snapshot();
-        let json = serde_json::to_value(&snapshot).unwrap();
-        let obj = json.as_object().unwrap();
-
-        let trusted_keys_with_strings =
-            ["profile_id", "rp_id", "credential_label", "credential_ref"];
-        for key in &trusted_keys_with_strings {
-            if let Some(val) = obj.get(*key)
-                && let Some(s) = val.as_str()
-            {
-                assert!(
-                    s.len() <= MAX_UNTRUSTED_LEN,
-                    "trusted field '{}' exceeds max length",
-                    key
-                );
-            }
+    impl UserDirectory for Users {
+        fn lookup(&self, name: &str) -> Option<(u32, u32)> {
+            self.0.get(name).copied()
         }
     }
 
+    struct Sockets(Map<PathBuf, SocketInfo>);
+
+    impl SocketProbe for Sockets {
+        fn probe(&self, path: &Path) -> io::Result<SocketInfo> {
+            self.0
+                .get(path)
+                .copied()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+    }
+
+    fn users() -> Users {
+        Users(Map::from([
+            ("alice", (1000, 1000)),
+            ("bob", (1001, 1001)),
+            ("root", (0, 0)),
+        ]))
+    }
+
+    fn sockets(entries: &[(u32, bool, u32)]) -> Sockets {
+        Sockets(
+            entries
+                .iter()
+                .map(|&(uid, is_socket, owner)| {
+                    (user_bus_path(uid), SocketInfo { is_socket, owner })
+                })
+                .collect(),
+        )
+    }
+
     #[test]
-    fn test_prompt_request_closed_struct_no_extra_fields() {
-        let req = build_test_request();
-        let json = serde_json::to_value(&req).unwrap();
-        let obj = json.as_object().unwrap();
-        let expected_keys: std::collections::HashSet<&str> = [
-            "profile_id",
-            "mode",
-            "rp_id",
-            "action",
-            "credential_label",
-            "credential_ref",
-            "grant_ttl_secs",
-            "session_ttl_secs",
-            "untrusted_reason",
-            "untrusted_page_title",
-            "untrusted_page_url",
-            "untrusted_account_label",
-        ]
-        .iter()
-        .copied()
-        .collect();
-        let actual_keys: std::collections::HashSet<&str> = obj.keys().map(|k| k.as_str()).collect();
+    fn root_daemon_drops_to_notify_user_on_its_bus() {
+        let plan = plan_prompt_child(
+            0,
+            Some("alice"),
+            None,
+            &users(),
+            &sockets(&[(1000, true, 1000)]),
+        )
+        .unwrap();
         assert_eq!(
-            actual_keys, expected_keys,
-            "PromptRequest has unexpected fields"
+            plan,
+            PromptChildPlan {
+                target: Some((1000, 1000)),
+                bus_address: "unix:path=/run/user/1000/bus".to_string(),
+            }
+        );
+        // The daemon's own bus address is never used by a root daemon.
+        let plan = plan_prompt_child(
+            0,
+            Some("alice"),
+            Some("unix:path=/tmp/evil"),
+            &users(),
+            &sockets(&[(1000, true, 1000)]),
+        )
+        .unwrap();
+        assert_eq!(plan.bus_address, "unix:path=/run/user/1000/bus");
+    }
+
+    #[test]
+    fn root_daemon_without_a_usable_notify_user_has_no_escalation() {
+        let good = sockets(&[(1000, true, 1000)]);
+        assert!(plan_prompt_child(0, None, None, &users(), &good).is_err());
+        assert!(plan_prompt_child(0, Some("nobody-here"), None, &users(), &good).is_err());
+        assert!(
+            plan_prompt_child(0, Some("root"), None, &users(), &sockets(&[(0, true, 0)])).is_err()
+        );
+        // Missing bus, not a socket, or a socket owned by someone else.
+        assert!(plan_prompt_child(0, Some("alice"), None, &users(), &sockets(&[])).is_err());
+        assert!(
+            plan_prompt_child(
+                0,
+                Some("alice"),
+                None,
+                &users(),
+                &sockets(&[(1000, false, 1000)])
+            )
+            .is_err()
+        );
+        assert!(
+            plan_prompt_child(
+                0,
+                Some("alice"),
+                None,
+                &users(),
+                &sockets(&[(1000, true, 1001)])
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn test_min_review_delay_enforcement() {
-        let handle = DesktopPromptHandle::new(60, 5000);
-        assert_eq!(handle.min_review_delay_ms(), 5000);
+    fn user_daemon_keeps_its_user_and_bus() {
+        let none = sockets(&[]);
+        let plan = plan_prompt_child(
+            1000,
+            None,
+            Some("unix:path=/run/user/1000/bus"),
+            &users(),
+            &none,
+        )
+        .unwrap();
+        assert_eq!(plan.target, None);
+        assert_eq!(plan.bus_address, "unix:path=/run/user/1000/bus");
+        assert!(
+            plan_prompt_child(
+                1000,
+                Some("alice"),
+                Some("unix:abstract=x"),
+                &users(),
+                &none
+            )
+            .is_ok()
+        );
+        // A different notify_user cannot be reached by a non-root daemon.
+        assert!(
+            plan_prompt_child(1000, Some("bob"), Some("unix:abstract=x"), &users(), &none).is_err()
+        );
+        // Without an address, the user's own bus socket is used if it checks out.
+        let plan = plan_prompt_child(
+            1000,
+            None,
+            Some(""),
+            &users(),
+            &sockets(&[(1000, true, 1000)]),
+        )
+        .unwrap();
+        assert_eq!(plan.bus_address, "unix:path=/run/user/1000/bus");
+        assert!(plan_prompt_child(1000, None, None, &users(), &none).is_err());
     }
 
     #[test]
-    fn test_prompt_request_rejects_leading_dot_rp_id() {
-        let result = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id(".example.com")
-            .build();
-        assert!(matches!(result, Err(PromptBuildError::WildcardRpId)));
+    fn the_planned_identity_passes_the_hardened_setup_checks() {
+        let setup = |target: (u32, u32), daemon: (u32, u32)| HardenedChildSetup {
+            target_uid: target.0,
+            target_gid: target.1,
+            daemon_uid: daemon.0,
+            daemon_gid: daemon.1,
+            rlimit_nofile: DEFAULT_RLIMIT_NOFILE,
+            rlimit_nproc: DEFAULT_RLIMIT_NPROC,
+            rlimit_core: DEFAULT_RLIMIT_CORE,
+            rlimit_as: DEFAULT_RLIMIT_AS,
+            bind_parent_death: true,
+        };
+        assert!(setup((1000, 1000), (0, 0)).validate().is_ok());
+        assert!(setup((1000, 1000), (1000, 1000)).validate().is_ok());
+        assert!(setup((0, 0), (0, 0)).validate().is_err());
+        assert!(setup((1001, 1001), (1000, 1000)).validate().is_err());
     }
 
-    #[test]
-    fn test_build_security_body_exact_trusted_labels() {
-        let req = build_test_request();
-        let body = build_security_body(&req);
-
-        assert!(body.contains("Profile (trusted): test-profile"));
-        assert!(body.contains("Mode (trusted): isolated"));
-        assert!(body.contains("Exact relying party (trusted): example.com"));
-        assert!(body.contains("Action (trusted): authenticate"));
-        assert!(body.contains("Credential label (trusted): my-key"));
-        assert!(body.contains("Credential ref (trusted):"));
-        assert!(body.contains("Agent/page context (UNTRUSTED; informational only):"));
-        assert!(body.contains("Reason: Login to example.com"));
-        assert!(body.contains("Page title: Example Login"));
-        assert!(body.contains("Page URL: https://example.com/login"));
-        assert!(body.contains("Account label: user@example.com"));
-        assert!(!body.contains("Agent-supplied reason (untrusted):"));
-    }
-
-    #[test]
-    fn test_build_security_body_exact_snapshot_with_clamped_ttls() {
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("login.example.com")
-            .credential_label("work-key")
-            .grant_ttl_secs(300)
-            .session_ttl_secs(3600)
-            .untrusted_reason("Sign in")
-            .untrusted_page_title("Login Page")
-            .untrusted_page_url("https://login.example.com/auth")
-            .untrusted_account_label("user@example.com")
-            .build()
+    /// Runs `script` under `/bin/sh` with the prompt child's hardening and returns its output.
+    fn run_hardened(script: &str) -> String {
+        let spawner = ProcessSpawner::with_planner(
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), script.to_string()],
+            Box::new(|| {
+                Ok(PromptChildPlan {
+                    target: None,
+                    bus_address: "unix:path=/nonexistent/bus".to_string(),
+                })
+            }),
+        );
+        let mut child = spawner.spawn().unwrap();
+        child.stdin = None;
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
             .unwrap();
-
-        let body = build_security_body(&req);
-        let expected = "Profile (trusted): test-profile\n\
-            Mode (trusted): isolated\n\
-            Exact relying party (trusted): login.example.com\n\
-            Action (trusted): register\n\
-            Credential label (trusted): work-key\n\
-            Review the trusted destination and action before approving.\n\
-            Grant TTL: 300s\n\
-            Browser session TTL: 3600s\n\n\
-            Agent/page context (UNTRUSTED; informational only):\n\
-            Reason: Sign in\n\
-            Page title: Login Page\n\
-            Page URL: https://login.example.com/auth\n\
-            Account label: user@example.com";
-        assert_eq!(body, expected);
+        child.kill();
+        output
     }
 
     #[test]
-    fn test_build_security_body_no_credential_ref_omits_label() {
-        let req = PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Register)
-            .rp_id("example.com")
-            .build()
-            .unwrap();
-
-        let body = build_security_body(&req);
-        assert!(!body.contains("Credential label"));
-        assert!(!body.contains("Credential ref"));
+    fn process_child_has_a_scrubbed_environment_no_new_privs_and_no_inherited_fds() {
+        // An inheritable descriptor in the daemon must not reach the child. It is placed at 100
+        // or above so it never takes a free stdio slot of the test process.
+        // SAFETY: plain open(2)/fcntl(2)/close(2) of /dev/null; the copy is closed below.
+        let leaked = unsafe {
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            assert!(fd >= 0);
+            let high = libc::fcntl(fd, libc::F_DUPFD, 100);
+            libc::close(fd);
+            high
+        };
+        assert!(leaked >= 100);
+        let output = run_hardened(
+            "tr '\\0' '\\n' < /proc/$$/environ; echo ---; ls /proc/$$/fd; echo ---; \
+             grep NoNewPrivs /proc/$$/status; pwd",
+        );
+        // SAFETY: closing the descriptor opened above.
+        unsafe { libc::close(leaked) };
+        let parts: Vec<&str> = output.split("---\n").collect();
+        assert_eq!(parts.len(), 3, "{output}");
+        let env: Vec<&str> = parts[0].lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(env, ["DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/bus"]);
+        let fds: Vec<i32> = parts[1]
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        assert!(!fds.contains(&leaked), "fd {leaked} leaked: {fds:?}");
+        assert!(fds.iter().all(|fd| *fd <= 2), "{fds:?}");
+        assert!(parts[2].contains("NoNewPrivs:\t1"), "{}", parts[2]);
+        assert_eq!(
+            parts[2].lines().last(),
+            Some("/"),
+            "the working directory is /"
+        );
     }
 }
 
-#[cfg(all(test, feature = "agent"))]
+#[cfg(test)]
 mod dbus_tests {
-    use std::collections::HashMap;
-    use std::env;
-    use std::process::Command;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use tokio::sync::{Mutex as AsyncMutex, Notify};
-    use zbus::connection::Builder;
-    use zbus::interface;
+    //! The prompt child and the driver against `tools/notify-double` on a private, minimal
+    //! `dbus-daemon` (never the real session bus).
 
     use super::*;
-    use passless_core::agent::{CredentialRef, ProfileId};
 
-    const TEST_TIMEOUT_SECS: u64 = 10;
-    const NOTIFY_WAIT_TIMEOUT_MS: u64 = 5000;
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Mutex as StdMutex;
 
-    static DBUS_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+    use futures_lite::StreamExt;
+    use notify_double::server::{Config, NotificationDouble};
+    use notify_double::{LogWriter, OBJECT_PATH, Script, WELL_KNOWN_NAME};
+    use serde_json::Value as Json;
 
-    #[derive(Debug, Clone)]
-    struct CapturedNotification {
-        app_name: String,
-        summary: String,
-        body: String,
-        actions: Vec<String>,
-        expire_timeout: i32,
-    }
+    use crate::agent::escalation::EscalationId;
+    use crate::agent::escalation_prompt::{ChildErrorKind, InProcessChild, PromptVerb};
 
-    #[derive(Clone, Copy)]
-    enum ServerKind {
-        FullActions,
-        DefaultActionOnly,
-        Unknown,
-    }
+    const EVENT_WAIT: Duration = Duration::from_secs(10);
 
-    struct SharedState {
-        next_id: u32,
-        captured: Option<CapturedNotification>,
-    }
-
-    struct TestNotificationService {
-        state: Arc<Mutex<SharedState>>,
-        notify_ready: Arc<Notify>,
-        server_kind: ServerKind,
-    }
-
-    impl TestNotificationService {
-        fn new(server_kind: ServerKind) -> (Self, Arc<Mutex<SharedState>>, Arc<Notify>) {
-            let state = Arc::new(Mutex::new(SharedState {
-                next_id: 1,
-                captured: None,
-            }));
-            let notify_ready = Arc::new(Notify::new());
-            let svc = Self {
-                state: Arc::clone(&state),
-                notify_ready: Arc::clone(&notify_ready),
-                server_kind,
-            };
-            (svc, state, notify_ready)
-        }
-    }
-
-    #[interface(name = "org.freedesktop.Notifications")]
-    impl TestNotificationService {
-        async fn get_capabilities(&self) -> Vec<String> {
-            match self.server_kind {
-                ServerKind::FullActions => vec![
-                    "actions".to_string(),
-                    "body".to_string(),
-                    "body-markup".to_string(),
-                ],
-                ServerKind::DefaultActionOnly => vec!["body".to_string()],
-                ServerKind::Unknown => vec![],
-            }
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        async fn notify(
-            &self,
-            app_name: &str,
-            replaces_id: u32,
-            _app_icon: &str,
-            summary: &str,
-            body: &str,
-            actions: Vec<String>,
-            _hints: HashMap<String, zbus::Variant<'_>>,
-            expire_timeout: i32,
-        ) -> zbus::fdo::Result<u32> {
-            let mut state = self.state.lock().unwrap();
-            let id = if replaces_id == 0 {
-                let id = state.next_id;
-                state.next_id += 1;
-                id
-            } else {
-                replaces_id
-            };
-
-            state.captured = Some(CapturedNotification {
-                app_name: app_name.to_string(),
-                summary: summary.to_string(),
-                body: body.to_string(),
-                actions,
-                expire_timeout,
-            });
-            self.notify_ready.notify_one();
-            Ok(id)
-        }
-
-        async fn close_notification(&self, id: u32) -> zbus::fdo::Result<()> {
-            let _ = id;
-            Ok(())
-        }
-
-        async fn get_server_information(
-            &self,
-        ) -> zbus::fdo::Result<(String, String, String, String)> {
-            match self.server_kind {
-                ServerKind::FullActions => Ok((
-                    "TestNotificationServer".to_string(),
-                    "1.0".to_string(),
-                    "1.0".to_string(),
-                    "1.2".to_string(),
-                )),
-                ServerKind::DefaultActionOnly => Ok((
-                    "notify-osd".to_string(),
-                    "1.0".to_string(),
-                    "1.0".to_string(),
-                    "1.2".to_string(),
-                )),
-                ServerKind::Unknown => Err(zbus::fdo::Error::Failed(
-                    "no notification server".to_string(),
-                )),
-            }
-        }
-    }
-
-    async fn emit_action_invoked(conn: &zbus::Connection, id: u32, action: &str) {
-        let _ = conn
-            .emit_signal(
-                None::<zbus::names::BusName<'_>>,
-                "/org/freedesktop/Notifications",
-                "org.freedesktop.Notifications",
-                "ActionInvoked",
-                &(id, action),
-            )
-            .await;
-    }
-
-    async fn emit_notification_closed(conn: &zbus::Connection, id: u32, reason: u32) {
-        let _ = conn
-            .emit_signal(
-                None::<zbus::names::BusName<'_>>,
-                "/org/freedesktop/Notifications",
-                "org.freedesktop.Notifications",
-                "NotificationClosed",
-                &(id, reason),
-            )
-            .await;
-    }
-
-    struct PrivateDBus {
-        pid: u32,
+    /// A private session bus with no service activation, killed and reaped on drop.
+    struct PrivateBus {
+        // Field order matters: the daemon is killed before its directory is removed.
+        daemon: Child,
+        dir: tempfile::TempDir,
         address: String,
     }
 
-    impl PrivateDBus {
+    impl PrivateBus {
         fn start() -> Self {
-            let output = Command::new("dbus-daemon")
-                .args(["--print-address=1", "--print-pid=2", "--fork", "--session"])
-                .output()
-                .expect("failed to start dbus-daemon");
-
-            let address = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let pid_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            assert!(!address.is_empty(), "dbus-daemon did not print address");
-            assert!(!pid_str.is_empty(), "dbus-daemon did not print pid");
-            let pid: u32 = pid_str.parse().expect("invalid pid from dbus-daemon");
-            Self { pid, address }
-        }
-
-        fn address(&self) -> &str {
-            &self.address
+            // Keep the socket path short (sun_path is limited to ~108 bytes).
+            let base = if std::env::temp_dir().as_os_str().len() > 40 {
+                PathBuf::from("/tmp")
+            } else {
+                std::env::temp_dir()
+            };
+            let dir = tempfile::Builder::new()
+                .prefix("passless-bus-")
+                .tempdir_in(base)
+                .expect("scratch dir");
+            let sock = dir.path().join("bus.sock");
+            let conf = dir.path().join("bus.conf");
+            fs::write(
+                &conf,
+                format!(
+                    "<busconfig>\n<type>session</type>\n<listen>unix:path={}</listen>\n\
+                     <auth>EXTERNAL</auth>\n<policy context=\"default\">\n\
+                     <allow send_destination=\"*\" eavesdrop=\"true\"/>\n\
+                     <allow eavesdrop=\"true\"/>\n<allow own=\"*\"/>\n<allow user=\"*\"/>\n\
+                     </policy>\n</busconfig>\n",
+                    sock.display()
+                ),
+            )
+            .expect("bus config");
+            let mut command = Command::new("dbus-daemon");
+            command
+                .arg(format!("--config-file={}", conf.display()))
+                .args(["--nofork", "--print-address=1"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", dir.path())
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .env("XDG_DATA_DIRS", dir.path().join("share"))
+                .env("XDG_RUNTIME_DIR", dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .process_group(0);
+            // SAFETY: the closure only calls the async-signal-safe `prctl`.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut daemon = command.spawn().expect("dbus-daemon");
+            let stdout = daemon.stdout.take().expect("piped stdout");
+            let mut address = String::new();
+            let read = BufReader::new(stdout).read_line(&mut address);
+            let bus = Self {
+                daemon,
+                dir,
+                address: address.trim().to_string(),
+            };
+            read.expect("dbus-daemon address");
+            assert!(!bus.address.is_empty());
+            bus
         }
     }
 
-    impl Drop for PrivateDBus {
+    impl Drop for PrivateBus {
         fn drop(&mut self) {
+            // SAFETY: the process group id equals the leader's pid (`process_group(0)`).
             unsafe {
-                libc::kill(self.pid as i32, libc::SIGKILL);
+                libc::kill(-(self.daemon.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+        }
+    }
+
+    /// `notify-double` served in-process on the private bus.
+    struct Double {
+        runtime: tokio::runtime::Runtime,
+        conn: Option<zbus::Connection>,
+        log: PathBuf,
+    }
+
+    impl Double {
+        fn start(bus: &PrivateBus, script: &str, capabilities: &[&str]) -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            static DOUBLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = DOUBLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let log = bus.dir.path().join(format!("notify-{n}.jsonl"));
+            let writer = Arc::new(LogWriter::open(&log).unwrap());
+            let config = Config {
+                script: Script::parse_list(script).unwrap(),
+                capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+                server_name: "notify-double".to_string(),
+            };
+            let conn = runtime.block_on(async {
+                zbus::connection::Builder::address(bus.address.as_str())
+                    .name(WELL_KNOWN_NAME)
+                    .serve_at(OBJECT_PATH, NotificationDouble::new(config, writer))
+                    .build()
+                    .await
+                    .unwrap()
+            });
+            Self {
+                runtime,
+                conn: Some(conn),
+                log,
             }
         }
-    }
 
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-
-    impl EnvGuard {
-        unsafe fn set(key: &'static str, value: &str) -> Self {
-            let prev = env::var(key).ok();
-            unsafe {
-                env::set_var(key, value);
-            }
-            Self { key, prev }
+        fn events(&self) -> Vec<Json> {
+            fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
         }
-    }
 
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(ref val) = self.prev {
-                    env::set_var(self.key, val);
-                } else {
-                    env::remove_var(self.key);
+        fn kinds(&self) -> Vec<String> {
+            self.events()
+                .iter()
+                .map(|event| event["event"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        fn wait_for(&self, kind: &str) -> Json {
+            let start = Instant::now();
+            loop {
+                if let Some(event) = self.events().into_iter().find(|e| e["event"] == kind) {
+                    return event;
                 }
+                assert!(
+                    start.elapsed() < EVENT_WAIT,
+                    "no {kind}: {:?}",
+                    self.kinds()
+                );
+                thread::sleep(Duration::from_millis(20));
             }
+        }
+
+        /// Stop serving: the well-known name is released (`NameOwnerChanged`).
+        fn stop(&mut self) {
+            if let Some(conn) = self.conn.take() {
+                self.runtime.block_on(async {
+                    let _ = conn.close().await;
+                });
+            }
+        }
+
+        /// Emit a signal from another connection on the bus (a spoofing peer).
+        fn spoof<B>(&self, bus: &PrivateBus, member: &str, body: B)
+        where
+            B: serde::Serialize + zbus::zvariant::DynamicType,
+        {
+            self.runtime.block_on(async {
+                let conn = zbus::connection::Builder::address(bus.address.as_str())
+                    .build()
+                    .await
+                    .unwrap();
+                conn.emit_signal(
+                    None::<zbus::names::BusName<'_>>,
+                    OBJECT_PATH,
+                    WELL_KNOWN_NAME,
+                    member,
+                    &body,
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
         }
     }
 
-    fn test_profile_id() -> ProfileId {
-        ProfileId::new("test-profile").unwrap()
+    /// A prompt child on a thread of this process, talking the line protocol.
+    struct ChildHarness {
+        stdin: Option<io::PipeWriter>,
+        events: Receiver<ChildEvent>,
+        thread: Option<thread::JoinHandle<i32>>,
     }
 
-    fn test_cred() -> CredentialRef {
-        CredentialRef::with_default_domain(b"test-credential-id")
+    impl ChildHarness {
+        fn start(bus: &PrivateBus, min_review_delay_ms: u64) -> Self {
+            let mut child = InProcessChild::spawn(Some(bus.address.clone())).unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let request = PromptRequest::new(
+                "Passless: agent sign-in request".to_string(),
+                "body".to_string(),
+                min_review_delay_ms,
+            );
+            let mut line = serde_json::to_vec(&request).unwrap();
+            line.push(b'\n');
+            stdin.write_all(&line).unwrap();
+            let (sender, events) = mpsc::channel();
+            let stdout = child.stdout.take().unwrap();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    let event: ChildEvent = serde_json::from_str(&line).unwrap();
+                    if sender.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                stdin: Some(stdin),
+                events,
+                thread: child.thread.take(),
+            }
+        }
+
+        fn next(&self) -> ChildEvent {
+            self.events
+                .recv_timeout(EVENT_WAIT)
+                .expect("no event from the prompt child")
+        }
+
+        fn shown(&self) -> u32 {
+            match self.next() {
+                ChildEvent::Shown { id, server } => {
+                    assert_eq!(server, "notify-double");
+                    id
+                }
+                other => panic!("expected shown, got {other:?}"),
+            }
+        }
+
+        fn send(&mut self, line: &str) {
+            let stdin = self.stdin.as_mut().unwrap();
+            stdin.write_all(line.as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+
+        fn exit_code(&mut self) -> i32 {
+            self.thread.take().unwrap().join().unwrap()
+        }
     }
 
-    fn build_test_request() -> PromptRequest {
-        PromptRequest::builder()
-            .profile_id(test_profile_id())
-            .mode(PromptMode::Isolated)
-            .action(PromptAction::Authenticate)
-            .rp_id("example.com")
-            .credential_label("my-key")
-            .credential_ref(test_cred())
-            .grant_ttl_secs(300)
-            .session_ttl_secs(3600)
-            .untrusted_reason("Login to example.com")
-            .untrusted_page_title("Example Login")
-            .untrusted_page_url("https://example.com/login")
-            .untrusted_account_label("user@example.com")
-            .build()
-            .unwrap()
-    }
-
-    async fn run_prompt_test<F, Fut>(
-        server_kind: ServerKind,
-        _timeout_secs: u64,
-        _min_review_delay_ms: u64,
-        test_fn: F,
-    ) -> PromptResult
-    where
-        F: FnOnce(Arc<Mutex<SharedState>>, Arc<zbus::Connection>, Arc<Notify>) -> Fut
-            + Send
-            + 'static,
-        Fut: std::future::Future<Output = PromptResult> + Send,
-    {
-        let _lock = DBUS_ENV_LOCK.lock().await;
-        let dbus = PrivateDBus::start();
-        let _env_guard = unsafe { EnvGuard::set("DBUS_SESSION_BUS_ADDRESS", dbus.address()) };
-
-        let timeout_result = tokio::time::timeout(Duration::from_secs(TEST_TIMEOUT_SECS), async {
-            let (service, state, notify_ready) = TestNotificationService::new(server_kind);
-            let conn = Builder::session()
-                .name("org.freedesktop.Notifications")
-                .serve_at("/org/freedesktop/Notifications", service)
+    #[test]
+    fn child_subscribes_before_notify() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "ignore", &["actions", "body"]);
+        // An eavesdropper records every method call on the bus, in bus order.
+        let calls: Arc<StdMutex<Vec<(String, String, String)>>> = Arc::default();
+        let recorder = Arc::clone(&calls);
+        let address = bus.address.clone();
+        let eavesdropper = double.runtime.spawn(async move {
+            let conn = zbus::connection::Builder::address(address.as_str())
                 .build()
                 .await
                 .unwrap();
-            let conn = Arc::new(conn);
-            let result = test_fn(state, Arc::clone(&conn), notify_ready).await;
-            let _ = (*conn).clone().close().await;
-            result
-        })
-        .await;
+            let mut stream = zbus::MessageStream::from(&conn);
+            conn.call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "AddMatch",
+                &"type='method_call',eavesdrop='true'",
+            )
+            .await
+            .unwrap();
+            while let Some(Ok(message)) = stream.next().await {
+                let header = message.header();
+                if header.message_type() != zbus::message::Type::MethodCall {
+                    continue;
+                }
+                let member = header.member().map(|m| m.to_string()).unwrap_or_default();
+                let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
+                let arg = message.body().deserialize::<String>().unwrap_or_default();
+                recorder.lock().unwrap().push((sender, member, arg));
+            }
+        });
+        thread::sleep(Duration::from_millis(200));
 
-        match timeout_result {
-            Ok(result) => result,
-            Err(_) => panic!("Test timed out after {}s", TEST_TIMEOUT_SECS),
+        let mut child = ChildHarness::start(&bus, 1000);
+        child.shown();
+        thread::sleep(Duration::from_millis(100));
+        eavesdropper.abort();
+
+        let calls = calls.lock().unwrap().clone();
+        let notify = calls
+            .iter()
+            .position(|(_, member, _)| member == "Notify")
+            .expect("Notify recorded");
+        let sender = &calls[notify].0;
+        let before: Vec<&(String, String, String)> = calls[..notify]
+            .iter()
+            .filter(|(s, member, _)| s == sender && member == "AddMatch")
+            .collect();
+        assert!(
+            before.iter().any(
+                |(_, _, rule)| rule.contains("org.freedesktop.Notifications")
+                    && rule.contains("sender='")
+                    && !rule.contains("NameOwnerChanged")
+            ),
+            "no sender-filtered notification match before Notify: {calls:?}"
+        );
+        assert!(
+            before
+                .iter()
+                .any(|(_, _, rule)| rule.contains("NameOwnerChanged")),
+            "no NameOwnerChanged match before Notify: {calls:?}"
+        );
+        drop(child.stdin.take());
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    #[test]
+    fn child_ignores_a_spoofed_sender() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "deny:1500", &["actions", "body"]);
+        let mut child = ChildHarness::start(&bus, 0);
+        let id = child.shown();
+        double.spoof(&bus, "ActionInvoked", (id, ACTION_ALLOW_ALWAYS));
+        double.spoof(&bus, "NotificationClosed", (id, 2u32));
+        // The first event is the real server's deny, not the spoofed approval or close.
+        assert_eq!(
+            child.next(),
+            ChildEvent::Decision {
+                action: ACTION_DENY.to_string()
+            }
+        );
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    #[test]
+    fn child_reports_server_lost() {
+        let bus = PrivateBus::start();
+        let mut double = Double::start(&bus, "ignore", &["actions", "body"]);
+        let mut child = ChildHarness::start(&bus, 1000);
+        child.shown();
+        double.stop();
+        assert_eq!(child.next(), ChildEvent::ServerLost);
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    #[test]
+    fn withdraw_and_eof_send_close_notification() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "ignore", &["actions", "body"]);
+        let mut child = ChildHarness::start(&bus, 1000);
+        let id = child.shown();
+        child.send(r#"{"withdraw":true}"#);
+        assert_eq!(child.exit_code(), 0);
+        let closed = double.wait_for("CloseNotification");
+        assert_eq!(closed["id"], id);
+
+        let mut child = ChildHarness::start(&bus, 1000);
+        let id = child.shown();
+        drop(child.stdin.take());
+        assert_eq!(child.exit_code(), 0);
+        let closes: Vec<Json> = double
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "CloseNotification")
+            .collect();
+        assert_eq!(closes.last().unwrap()["id"], id);
+    }
+
+    #[test]
+    fn capability_gate_rejects_servers_without_actions() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "ignore", &["body"]);
+        let mut child = ChildHarness::start(&bus, 1000);
+        assert_eq!(
+            child.next(),
+            ChildEvent::Error {
+                kind: ChildErrorKind::CapabilityRejected
+            }
+        );
+        assert_eq!(child.exit_code(), 1);
+        assert!(!double.kinds().contains(&"Notify".to_string()));
+    }
+
+    #[test]
+    fn child_without_a_server_or_a_bus_fails() {
+        let bus = PrivateBus::start();
+        let mut child = ChildHarness::start(&bus, 1000);
+        assert_eq!(
+            child.next(),
+            ChildEvent::Error {
+                kind: ChildErrorKind::NoServer
+            }
+        );
+        assert_eq!(child.exit_code(), 1);
+
+        let mut child = InProcessChild::spawn(None).unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ChildEvent>(&line).unwrap(),
+            ChildEvent::Error {
+                kind: ChildErrorKind::BusUnavailable
+            }
+        );
+    }
+
+    #[test]
+    fn child_denies_an_approval_before_its_review_delay() {
+        let bus = PrivateBus::start();
+        let _double = Double::start(&bus, "approve:0", &["actions", "body"]);
+        let mut child = ChildHarness::start(&bus, 1000);
+        child.shown();
+        assert_eq!(
+            child.next(),
+            ChildEvent::Decision {
+                action: ACTION_DENY.to_string()
+            }
+        );
+        assert_eq!(child.exit_code(), 0);
+
+        let bus = PrivateBus::start();
+        let _double = Double::start(&bus, "approve:300", &["actions", "body"]);
+        let mut child = ChildHarness::start(&bus, 100);
+        child.shown();
+        assert_eq!(
+            child.next(),
+            ChildEvent::Decision {
+                action: ACTION_ALLOW_ALWAYS.to_string()
+            }
+        );
+        assert_eq!(child.exit_code(), 0);
+    }
+
+    /// Records the driver's reports.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: StdMutex<Vec<PromptEvent>>,
+    }
+
+    impl PromptSink for RecordingSink {
+        fn prompt_event(&self, _ticket: &PromptTicket, event: PromptEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl RecordingSink {
+        fn wait_for(&self, count: usize) -> Vec<PromptEvent> {
+            let start = Instant::now();
+            loop {
+                let events = self.events.lock().unwrap().clone();
+                if events.len() >= count {
+                    return events;
+                }
+                assert!(start.elapsed() < EVENT_WAIT, "only {events:?}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// Spawns the child protocol in-process (the daemon re-executes itself instead).
+    struct InProcessSpawner {
+        address: String,
+    }
+
+    impl PromptChildSpawner for InProcessSpawner {
+        fn available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn spawn(&self) -> Result<PromptChild, String> {
+            let mut child =
+                InProcessChild::spawn(Some(self.address.clone())).map_err(|e| e.to_string())?;
+            Ok(PromptChild {
+                stdin: child
+                    .stdin
+                    .take()
+                    .map(|s| Box::new(s) as Box<dyn Write + Send>),
+                stdout: child
+                    .stdout
+                    .take()
+                    .map(|s| Box::new(s) as Box<dyn Read + Send>),
+                process: None,
+            })
+        }
+    }
+
+    fn fields() -> PromptFields {
+        PromptFields {
+            profile: "work".to_string(),
+            mode: "isolated".to_string(),
+            principal_user: "agent".to_string(),
+            verb: PromptVerb::Authenticate,
+            rp_id: "bücher.example".to_string(),
+            origin: "https://bücher.example".to_string(),
+        }
+    }
+
+    fn ticket(seq: u64) -> PromptTicket {
+        PromptTicket {
+            profile: ProfileId::new("work").unwrap(),
+            escalation_id: EscalationId::for_tests(&format!("esc-{seq}")),
+            seq,
+        }
+    }
+
+    fn prompter(bus: &PrivateBus, min_review_delay: Duration) -> NotificationPrompter {
+        NotificationPrompter::with_timing(
+            Arc::new(InProcessSpawner {
+                address: bus.address.clone(),
+            }),
+            Timing {
+                shown_timeout: SHOWN_TIMEOUT,
+                withdraw_grace: Duration::from_millis(300),
+                min_review_delay,
+            },
+        )
+    }
+
+    fn show(prompter: &NotificationPrompter, seq: u64) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        let weak: Weak<dyn PromptSink> = Arc::downgrade(&sink) as Weak<dyn PromptSink>;
+        prompter.show(ticket(seq), fields(), weak);
+        sink
+    }
+
+    #[test]
+    fn driver_shows_daemon_fields_only_with_the_fixed_actions() {
+        let bus = PrivateBus::start();
+        let double = Double::start(&bus, "ignore", &["actions", "body", "body-markup"]);
+        let prompter = prompter(&bus, MIN_REVIEW_DELAY);
+        let sink = show(&prompter, 1);
+        assert_eq!(sink.wait_for(1), [PromptEvent::Shown]);
+        let notify = double.wait_for("Notify");
+        let (summary, body) = render_prompt(&fields()).unwrap();
+        assert_eq!(notify["summary"], summary.as_str());
+        assert_eq!(notify["body"], body.as_str());
+        assert!(body.contains("Profile: work (isolated)"));
+        assert!(body.contains("Principal user: agent"));
+        assert!(body.contains("Site: xn--bcher-kva.example (any page under this site)"));
+        assert!(body.contains("Origin: https://xn--bcher-kva.example"));
+        assert!(body.contains("saved permanently"));
+        assert_eq!(
+            notify["actions"],
+            serde_json::json!(["allow_always", "Allow always", "deny", "Deny"])
+        );
+        assert_eq!(notify["expire_timeout"], 0);
+        assert_eq!(notify["hints"]["urgency"], 2);
+        assert_eq!(notify["app_name"], "Passless");
+
+        prompter.withdraw(&ticket(1));
+        let closed = double.wait_for("CloseNotification");
+        assert_eq!(closed["id"], notify["id"]);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            sink.wait_for(1),
+            [PromptEvent::Shown],
+            "a withdrawal reports nothing"
+        );
+    }
+
+    #[test]
+    fn driver_maps_decisions_and_the_review_delay() {
+        let bus = PrivateBus::start();
+        // Approve too early, approve after the delay, deny, dismiss.
+        let _double = Double::start(
+            &bus,
+            "invoke=allow_always:100,approve:700,deny:50,close:50",
+            &["actions", "body"],
+        );
+        let prompter = prompter(&bus, Duration::from_millis(500));
+        let expected = [
+            PromptEvent::Denied(EscalationDenyCause::EarlyApproval),
+            PromptEvent::Approved,
+            PromptEvent::Denied(EscalationDenyCause::User),
+            PromptEvent::Denied(EscalationDenyCause::Dismissed),
+        ];
+        for (n, want) in expected.into_iter().enumerate() {
+            let sink = show(&prompter, n as u64 + 1);
+            let events = sink.wait_for(2);
+            assert_eq!(events[0], PromptEvent::Shown);
+            // The child's own (earlier-starting) clock may already have turned the early
+            // approval into a deny.
+            if want == PromptEvent::Denied(EscalationDenyCause::EarlyApproval) {
+                assert!(matches!(events[1], PromptEvent::Denied(_)), "{events:?}");
+            } else {
+                assert_eq!(events[1], want);
+            }
         }
     }
 
     #[test]
-    fn test_desktop_prompt_trusted_content() {
-        let request = build_test_request();
-        let title = build_security_title(request.action());
-        let body = build_security_body(&request);
+    fn driver_reports_server_lost_and_failures() {
+        let bus = PrivateBus::start();
+        let mut double = Double::start(&bus, "ignore", &["actions", "body"]);
+        let prompter = prompter(&bus, MIN_REVIEW_DELAY);
+        let sink = show(&prompter, 1);
+        sink.wait_for(1);
+        double.stop();
+        assert_eq!(sink.wait_for(2)[1], PromptEvent::ServerLost);
 
-        assert!(title.contains("Authentication"));
-        assert!(body.contains("Profile (trusted): test-profile"));
-        assert!(body.contains("Mode (trusted): isolated"));
-        assert!(body.contains("Exact relying party (trusted): example.com"));
-        assert!(body.contains("Action (trusted): authenticate"));
-        assert!(body.contains("Agent/page context (UNTRUSTED; informational only):"));
-        assert!(body.contains("Reason: Login to example.com"));
-        assert!(body.contains("Page title: Example Login"));
-        assert!(body.contains("Page URL: https://example.com/login"));
-    }
-
-    #[test]
-    fn test_desktop_prompt_timeout_with_private_dbus() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::FullActions,
-                5,
-                10,
-                |state, conn, notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 10));
-                    let request = build_test_request();
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-                    let wait_result = tokio::time::timeout(
-                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
-                        notify_ready.notified(),
-                    )
-                    .await;
-                    assert!(wait_result.is_ok(), "Notify() was not called");
-                    let captured = state
-                        .lock()
-                        .unwrap()
-                        .captured
-                        .clone()
-                        .expect("notification not captured");
-                    assert!(!captured.app_name.is_empty());
-                    assert!(captured.summary.contains("Authentication"));
-                    assert!(captured.body.contains("example.com"));
-                    assert!(captured.actions.contains(&"approve".to_string()));
-                    assert!(captured.actions.contains(&"deny".to_string()));
-                    assert_eq!(captured.expire_timeout, 5000);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    emit_notification_closed(&conn, 1, 1).await;
-                    prompt_task.await.unwrap()
-                },
-            )
-            .await
-        });
-        assert_eq!(result.decision, PromptDecision::Timeout);
-    }
-
-    #[test]
-    fn test_desktop_prompt_delayed_approve() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::FullActions,
-                5,
-                100,
-                |_state, conn, notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
-                    let request = build_test_request();
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-                    let wait_result = tokio::time::timeout(
-                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
-                        notify_ready.notified(),
-                    )
-                    .await;
-                    assert!(wait_result.is_ok(), "Notify() was not called");
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    emit_action_invoked(&conn, 1, "approve").await;
-                    prompt_task.await.unwrap()
-                },
-            )
-            .await
-        });
-        assert_eq!(result.decision, PromptDecision::Approved);
-    }
-
-    #[test]
-    fn test_desktop_prompt_premature_approve_denied() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::FullActions,
-                5,
-                1000,
-                |_state, conn, notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 1000));
-                    let request = build_test_request();
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-                    let wait_result = tokio::time::timeout(
-                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
-                        notify_ready.notified(),
-                    )
-                    .await;
-                    assert!(wait_result.is_ok(), "Notify() was not called");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    emit_action_invoked(&conn, 1, "approve").await;
-                    prompt_task.await.unwrap()
-                },
-            )
-            .await
-        });
-        assert_eq!(result.decision, PromptDecision::Denied);
-    }
-
-    #[test]
-    fn test_desktop_prompt_explicit_deny() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::FullActions,
-                5,
-                100,
-                |state, conn, notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
-                    let request = build_test_request();
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-                    let wait_result = tokio::time::timeout(
-                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
-                        notify_ready.notified(),
-                    )
-                    .await;
-                    assert!(wait_result.is_ok(), "Notify() was not called");
-                    let captured = state
-                        .lock()
-                        .unwrap()
-                        .captured
-                        .clone()
-                        .expect("notification not captured");
-                    assert!(captured.summary.contains("Authentication"));
-                    assert!(captured.body.contains("test-profile"));
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    emit_action_invoked(&conn, 1, "deny").await;
-                    prompt_task.await.unwrap()
-                },
-            )
-            .await
-        });
-        assert_eq!(result.decision, PromptDecision::Denied);
-    }
-
-    #[test]
-    fn test_desktop_prompt_close_signal() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::FullActions,
-                5,
-                100,
-                |_state, conn, notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
-                    let request = build_test_request();
-                    let prompt_task = tokio::task::spawn_blocking({
-                        let handle = Arc::clone(&handle);
-                        let request = request.clone();
-                        move || handle.prompt(&request)
-                    });
-                    let wait_result = tokio::time::timeout(
-                        Duration::from_millis(NOTIFY_WAIT_TIMEOUT_MS),
-                        notify_ready.notified(),
-                    )
-                    .await;
-                    assert!(wait_result.is_ok(), "Notify() was not called");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    emit_notification_closed(&conn, 1, 2).await;
-                    prompt_task.await.unwrap()
-                },
-            )
-            .await
-        });
-        assert_eq!(result.decision, PromptDecision::Timeout);
-    }
-
-    #[test]
-    fn test_desktop_prompt_capability_default_action_only_rejected() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::DefaultActionOnly,
-                5,
-                100,
-                |_state, _conn, _notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
-                    let request = build_test_request();
-                    tokio::task::spawn_blocking(move || handle.prompt(&request))
-                        .await
-                        .unwrap()
-                },
-            )
-            .await
-        });
-        assert_eq!(result.decision, PromptDecision::Error);
+        // No server any more: the child fails before showing anything.
+        let sink = show(&prompter, 2);
         assert_eq!(
-            result.error_kind,
-            Some(PromptErrorKind::ServerCapabilityRejected)
+            sink.wait_for(1),
+            [PromptEvent::Failed("no_server".to_string())]
         );
     }
 
+    /// A spawner whose children never start.
+    struct RefusingSpawner;
+
+    impl PromptChildSpawner for RefusingSpawner {
+        fn available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn spawn(&self) -> Result<PromptChild, String> {
+            Err("refused".to_string())
+        }
+    }
+
+    /// On its first report, re-enters the prompter like the escalation coordinator can.
+    struct ReentrantSink {
+        prompter: StdMutex<Option<Arc<NotificationPrompter>>>,
+        events: StdMutex<Vec<PromptEvent>>,
+        reentered: std::sync::atomic::AtomicBool,
+    }
+
+    impl PromptSink for ReentrantSink {
+        fn prompt_event(&self, failed: &PromptTicket, event: PromptEvent) {
+            self.events.lock().unwrap().push(event);
+            if self
+                .reentered
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let prompter = self.prompter.lock().unwrap().clone().unwrap();
+            // The withdrawal and the next queued prompt both take the driver lock.
+            prompter.withdraw(failed);
+            prompter
+                .fail_driver_spawn
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let next: Weak<dyn PromptSink> = Weak::<RecordingSink>::new();
+            prompter.show(ticket(failed.seq + 1), fields(), next);
+        }
+    }
+
     #[test]
-    fn test_desktop_prompt_capability_unknown_rejected() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            run_prompt_test(
-                ServerKind::Unknown,
-                5,
-                100,
-                |_state, _conn, _notify_ready| async move {
-                    let handle = Arc::new(DesktopPromptHandle::new(5, 100));
-                    let request = build_test_request();
-                    tokio::task::spawn_blocking(move || handle.prompt(&request))
-                        .await
-                        .unwrap()
-                },
-            )
-            .await
+    fn a_failed_driver_spawn_reports_without_holding_the_driver_lock() {
+        let prompter = Arc::new(NotificationPrompter::with_timing(
+            Arc::new(RefusingSpawner),
+            Timing {
+                shown_timeout: SHOWN_TIMEOUT,
+                withdraw_grace: Duration::from_millis(300),
+                min_review_delay: MIN_REVIEW_DELAY,
+            },
+        ));
+        prompter
+            .fail_driver_spawn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let sink = Arc::new(ReentrantSink {
+            prompter: StdMutex::new(Some(prompter.clone())),
+            events: StdMutex::default(),
+            reentered: std::sync::atomic::AtomicBool::new(false),
         });
-        assert_eq!(result.decision, PromptDecision::Error);
-        assert_eq!(
-            result.error_kind,
-            Some(PromptErrorKind::NotificationUnsupported)
+        let (done_tx, done_rx) = mpsc::channel();
+        let runner = {
+            let sink = sink.clone();
+            let prompter = prompter.clone();
+            thread::spawn(move || {
+                let weak: Weak<dyn PromptSink> = Arc::downgrade(&sink) as Weak<dyn PromptSink>;
+                prompter.show(ticket(1), fields(), weak);
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(EVENT_WAIT).is_ok(),
+            "deadlock: the spawn failure was reported under the driver lock"
         );
+        runner.join().unwrap();
+        let events = sink.events.lock().unwrap().clone();
+        assert!(
+            matches!(events.as_slice(), [PromptEvent::Failed(m)] if m.contains("injected")),
+            "{events:?}"
+        );
+        // The queued prompt got a working driver (its child refuses to spawn).
+        let profile = ticket(1).profile;
+        let start = Instant::now();
+        while !prompter.drivers.lock().unwrap().contains_key(&profile) {
+            assert!(start.elapsed() < EVENT_WAIT, "no driver started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        *sink.prompter.lock().unwrap() = None;
+    }
+
+    /// A child that never answers.
+    struct SilentSpawner {
+        pids: StdMutex<Vec<u32>>,
+    }
+
+    impl PromptChildSpawner for SilentSpawner {
+        fn available(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn spawn(&self) -> Result<PromptChild, String> {
+            let script = "trap '' TERM; while :; do sleep 1; done";
+            let spawner = ProcessSpawner::with_planner(
+                PathBuf::from("/bin/sh"),
+                vec!["-c".to_string(), script.to_string()],
+                Box::new(|| {
+                    Ok(PromptChildPlan {
+                        target: None,
+                        bus_address: "unix:path=/nonexistent".to_string(),
+                    })
+                }),
+            );
+            let child = spawner.spawn()?;
+            if let Some(pid) = child.pid() {
+                self.pids.lock().unwrap().push(pid);
+            }
+            Ok(child)
+        }
+    }
+
+    fn running(pid: u32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|stat| !stat.contains(") Z "))
+            .unwrap_or(false)
+    }
+
+    /// Timing is asserted from recorded instants, never from sleeps: a timer deadline is computed
+    /// after the instant recorded before the request, so "not before the deadline" holds however
+    /// long the scheduler stalls this thread. Waits poll up to `EVENT_WAIT`.
+    #[test]
+    fn driver_fails_a_silent_child_and_kills_a_withdrawn_one() {
+        const SILENT_TIMEOUT: Duration = Duration::from_millis(300);
+        const GRACE: Duration = Duration::from_millis(300);
+        let spawner = Arc::new(SilentSpawner {
+            pids: StdMutex::default(),
+        });
+        let prompter = NotificationPrompter::with_timing(
+            spawner.clone(),
+            Timing {
+                shown_timeout: SILENT_TIMEOUT,
+                withdraw_grace: GRACE,
+                min_review_delay: MIN_REVIEW_DELAY,
+            },
+        );
+        let requested = Instant::now();
+        let sink = show(&prompter, 1);
+        assert_eq!(
+            sink.wait_for(1),
+            [PromptEvent::Failed(
+                "the prompt was not shown in time".to_string()
+            )]
+        );
+        assert!(
+            requested.elapsed() >= SILENT_TIMEOUT,
+            "failed a silent child after only {:?}",
+            requested.elapsed()
+        );
+        let first = spawner.pids.lock().unwrap()[0];
+        let start = Instant::now();
+        while running(first) {
+            assert!(start.elapsed() < EVENT_WAIT, "child {first} still running");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // A withdrawn child that ignores the withdrawal is killed after the grace period.
+        let prompter = NotificationPrompter::with_timing(
+            spawner.clone(),
+            Timing {
+                shown_timeout: Duration::from_secs(60),
+                withdraw_grace: GRACE,
+                min_review_delay: MIN_REVIEW_DELAY,
+            },
+        );
+        let sink = show(&prompter, 2);
+        let start = Instant::now();
+        while spawner.pids.lock().unwrap().len() < 2 {
+            assert!(start.elapsed() < EVENT_WAIT);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let second = spawner.pids.lock().unwrap()[1];
+        let withdrawn = Instant::now();
+        prompter.withdraw(&ticket(2));
+        let start = Instant::now();
+        while running(second) {
+            assert!(start.elapsed() < EVENT_WAIT, "child {second} not killed");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            withdrawn.elapsed() >= GRACE,
+            "killed after only {:?}, before the grace period",
+            withdrawn.elapsed()
+        );
+        assert!(sink.events.lock().unwrap().is_empty());
     }
 }

@@ -1,0 +1,5 @@
+<!doctype html><meta charset="utf-8"><title>E2E popup opener</title>
+<body><button id="open">open popup</button></body>
+<script>
+  window.openPopup = (path) => { window.popup = window.open(path || '/sw', 'e2e-popup', 'width=400,height=300'); return !!window.popup; };
+</script>

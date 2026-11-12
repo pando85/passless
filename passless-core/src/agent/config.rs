@@ -8,25 +8,32 @@ use passless_config_doc::ConfigDoc;
 use serde::{Deserialize, Serialize};
 
 use super::ids::{CredentialRef, ProfileId};
+use super::resolve::{GrantSource, MatchedRule, resolve_rules};
 use crate::error::{Error, Result};
 
 const MAX_DURATION_SECS: u64 = 86_400 * 365;
 const MIN_DURATION_SECS: u64 = 1;
 
-const UHID_NAME_MAX: usize = 128;
-const UHID_PHYS_MAX: usize = 64;
-const UHID_UNIQ_MAX: usize = 64;
-
-const DEVICE_NAME_MAX: usize = UHID_NAME_MAX - 1;
-const DEVICE_PHYS_MAX: usize = UHID_PHYS_MAX - 1;
-const DEVICE_UNIQ_MAX: usize = UHID_UNIQ_MAX - 1;
-
-const HUMAN_DEVICE_NAME: &str = "virtual-fido";
-const HUMAN_DEVICE_PHYS: &str = "virtual-fido-001";
-const HUMAN_VENDOR_ID: u16 = 0x15d9;
-const HUMAN_PRODUCT_ID: u16 = 0x0a37;
-
 pub const ANY_RP_ID: &str = "*";
+/// The one single-label RP ID that is valid, for exact rules only (plan R15).
+pub const LOCALHOST_RP_ID: &str = "localhost";
+/// The most RP IDs one browser session grant can cover (see `AgentProfileConfig::rule_rp_ids`).
+pub const MAX_GRANT_RP_IDS: usize = 32;
+
+/// Default cap on a profile's persistent granted rules (ADR 0014 section 8.4).
+pub const DEFAULT_MAX_GRANTED_RULES: u16 = 64;
+/// Upper bound for `max_granted_rules`; it keeps a full store under the 256 KiB file cap.
+pub const MAX_GRANTED_RULES_LIMIT: u16 = 256;
+/// Default `agents.escalation_cooldown` in seconds.
+pub const DEFAULT_ESCALATION_COOLDOWN_SECS: u64 = 600;
+/// Smallest `agents.escalation_cooldown`: 1 s is accepted by debug builds only, for tests.
+pub const MIN_ESCALATION_COOLDOWN_SECS: u64 = if cfg!(debug_assertions) { 1 } else { 60 };
+/// Largest `agents.escalation_cooldown` in seconds.
+pub const MAX_ESCALATION_COOLDOWN_SECS: u64 = 86_400;
+/// Largest `agents.escalation_timeout`: Chromium's 20 hour ceremony maximum.
+pub const MAX_ESCALATION_TIMEOUT_SECS: u64 = 72_000;
+/// Default `agents.state_dir` of a root (system unit) daemon.
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/passless-agent";
 
 const DEFAULT_MAX_OPERATIONS: u16 = 64;
 const MAX_OPERATIONS: u16 = 4096;
@@ -41,6 +48,14 @@ fn default_max_concurrent_sessions() -> u16 {
     DEFAULT_MAX_CONCURRENT_SESSIONS
 }
 
+fn default_max_granted_rules() -> u16 {
+    DEFAULT_MAX_GRANTED_RULES
+}
+
+fn default_escalation_cooldown() -> u64 {
+    DEFAULT_ESCALATION_COOLDOWN_SECS
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CredentialSelection {
     #[default]
@@ -48,6 +63,17 @@ pub enum CredentialSelection {
     FirstMatching,
     Newest,
     Credential(CredentialRef),
+}
+
+impl fmt::Display for CredentialSelection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single => f.write_str("single"),
+            Self::FirstMatching => f.write_str("first-matching"),
+            Self::Newest => f.write_str("newest"),
+            Self::Credential(reference) => write!(f, "credential:{reference}"),
+        }
+    }
 }
 
 impl Serialize for CredentialSelection {
@@ -87,14 +113,6 @@ impl<'de> Deserialize<'de> for CredentialSelection {
                 }),
         }
     }
-}
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HumanVerificationPrompt {
-    #[default]
-    Always,
-    WhenRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,166 +211,60 @@ impl std::str::FromStr for BrowserScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// What a rule does for one action (ADR 0014 section 6.1).
+///
+/// * `deny`: reject before credential enumeration or key access; never prompts.
+/// * `allow`: authorize autonomously. UP and UV come from validated agent-session evidence; rules
+///   carry no evidence fields.
+/// * `request`: not authorized yet; the ceremony raises an escalation (ADR 0014 section 8): a
+///   notification asks the operator, and approval persists a granted rule. Without a usable
+///   notification server the request is denied with `escalation_unavailable`.
+///
+/// A missing action denies.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AgentAuthorization {
+pub enum RuleAction {
+    #[default]
     Deny,
-    Confirm,
     Allow,
+    Request,
 }
 
-impl fmt::Display for AgentAuthorization {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl RuleAction {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Deny => f.write_str("deny"),
-            Self::Confirm => f.write_str("confirm"),
-            Self::Allow => f.write_str("allow"),
+            Self::Deny => "deny",
+            Self::Allow => "allow",
+            Self::Request => "request",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum UserPresenceSource {
-    #[serde(rename = "human")]
-    Human,
-    #[serde(rename = "agent", alias = "policy")]
-    Agent,
-    #[serde(rename = "none")]
-    None,
-}
-
-impl fmt::Display for UserPresenceSource {
+impl fmt::Display for RuleAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The two ceremonies a rule governs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyAction {
+    Authenticate,
+    Register,
+}
+
+impl PolicyAction {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Human => f.write_str("human"),
-            Self::Agent => f.write_str("agent"),
-            Self::None => f.write_str("none"),
+            Self::Authenticate => "authenticate",
+            Self::Register => "register",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum UserVerificationSource {
-    #[serde(rename = "human")]
-    Human,
-    #[serde(rename = "agent", alias = "policy")]
-    Agent,
-    #[serde(rename = "none")]
-    None,
-}
-
-impl fmt::Display for UserVerificationSource {
+impl fmt::Display for PolicyAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Human => f.write_str("human"),
-            Self::Agent => f.write_str("agent"),
-            Self::None => f.write_str("none"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ConfigDoc)]
-pub struct AgentCeremonyPolicy {
-    pub authorization: AgentAuthorization,
-    pub user_presence: UserPresenceSource,
-    pub user_verification: UserVerificationSource,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentCeremonyPolicyFields {
-    authorization: AgentAuthorization,
-    user_presence: UserPresenceSource,
-    user_verification: UserVerificationSource,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum AgentCeremonyPolicyRepr {
-    Alias(String),
-    Fields(AgentCeremonyPolicyFields),
-}
-
-impl<'de> Deserialize<'de> for AgentCeremonyPolicy {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let repr = AgentCeremonyPolicyRepr::deserialize(deserializer)?;
-        match repr {
-            AgentCeremonyPolicyRepr::Alias(alias) => match alias.as_str() {
-                "deny" => Ok(Self::deny()),
-                "autonomous" => Ok(Self::autonomous()),
-                "supervised" => Ok(Self::supervised()),
-                other => Err(serde::de::Error::custom(format!(
-                    "unknown agent ceremony policy alias '{other}'; expected deny, autonomous, or supervised"
-                ))),
-            },
-            AgentCeremonyPolicyRepr::Fields(fields) => Ok(Self {
-                authorization: fields.authorization,
-                user_presence: fields.user_presence,
-                user_verification: fields.user_verification,
-            }),
-        }
-    }
-}
-
-impl AgentCeremonyPolicy {
-    pub fn validate(&self, profile_id: &ProfileId, rp_id: &str, action: &str) -> Result<()> {
-        if self.authorization == AgentAuthorization::Deny
-            && (self.user_presence != UserPresenceSource::None
-                || self.user_verification != UserVerificationSource::None)
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': {} policy for '{}' must use no UP or UV evidence when authorization is deny",
-                profile_id, action, rp_id,
-            )));
-        }
-        if self.authorization == AgentAuthorization::Allow
-            && self.user_presence == UserPresenceSource::Human
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': {} policy for '{}' cannot require human UP when authorization is allow",
-                profile_id, action, rp_id,
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn legacy_confirm(require_uv: bool) -> Self {
-        Self {
-            authorization: AgentAuthorization::Confirm,
-            user_presence: UserPresenceSource::Human,
-            user_verification: if require_uv {
-                UserVerificationSource::Human
-            } else {
-                UserVerificationSource::None
-            },
-        }
-    }
-
-    pub fn deny() -> Self {
-        Self {
-            authorization: AgentAuthorization::Deny,
-            user_presence: UserPresenceSource::None,
-            user_verification: UserVerificationSource::None,
-        }
-    }
-
-    pub fn autonomous() -> Self {
-        Self {
-            authorization: AgentAuthorization::Allow,
-            user_presence: UserPresenceSource::Agent,
-            user_verification: UserVerificationSource::Agent,
-        }
-    }
-
-    pub fn supervised() -> Self {
-        Self {
-            authorization: AgentAuthorization::Confirm,
-            user_presence: UserPresenceSource::Human,
-            user_verification: UserVerificationSource::Human,
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -360,10 +272,192 @@ impl AgentCeremonyPolicy {
 #[serde(deny_unknown_fields)]
 pub struct AgentRpRule {
     pub rp_id: String,
-    pub register: AgentCeremonyPolicy,
-    pub authenticate: AgentCeremonyPolicy,
+    #[serde(default)]
+    pub register: RuleAction,
+    #[serde(default)]
+    pub authenticate: RuleAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_selection: Option<CredentialSelection>,
+}
+
+impl AgentRpRule {
+    pub fn action(&self, action: PolicyAction) -> RuleAction {
+        match action {
+            PolicyAction::Authenticate => self.authenticate,
+            PolicyAction::Register => self.register,
+        }
+    }
+
+    pub fn is_wildcard(&self) -> bool {
+        normalize_rp_id(&self.rp_id) == ANY_RP_ID
+    }
+}
+
+/// Deprecated config vocabulary found while parsing a profile (ADR 0014 section 6.4, plan R8).
+///
+/// Legacy rule vocabulary is mapped at parse time and each mapping is recorded in `warnings`;
+/// removed profile keys are recorded in `removed_keys`, and rule values that cannot be mapped safely
+/// in `errors`. The latter two fail `AgentProfileConfig::validate` with a migration message, which
+/// runs only when `agents.enabled = true`: parsing never fails on legacy vocabulary, so a bad legacy
+/// rule cannot break the human authenticator's config load (invariant 23). The unmappable action is
+/// parsed as `deny`. Nothing here is serialized.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LegacyConfigUse {
+    pub warnings: Vec<String>,
+    pub removed_keys: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LegacyAuthorization {
+    Deny,
+    Confirm,
+    Allow,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Clone, Copy)]
+enum LegacyEvidence {
+    #[serde(rename = "human")]
+    Human,
+    #[serde(rename = "agent", alias = "policy")]
+    Agent,
+    #[serde(rename = "none")]
+    None,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCeremonyFields {
+    authorization: LegacyAuthorization,
+    user_presence: LegacyEvidence,
+    user_verification: LegacyEvidence,
+}
+
+/// A rule action as written in a config file: the new words, or the legacy aliases and evidence
+/// tables that are still accepted until the release after next (plan R8).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuleActionRepr {
+    Word(String),
+    Legacy(LegacyCeremonyFields),
+    /// Anything else (a number, an array, a table with unknown evidence values): reported by
+    /// `validate`, never at parse time.
+    Other(toml::Value),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRpRuleRepr {
+    rp_id: String,
+    #[serde(default)]
+    register: Option<RuleActionRepr>,
+    #[serde(default)]
+    authenticate: Option<RuleActionRepr>,
+    #[serde(default)]
+    credential_selection: Option<CredentialSelection>,
+}
+
+/// The legacy-to-new mapping of ADR 0014 section 6.4. Returns the new action and, for a legacy
+/// spelling, the deprecation warning. Anything that cannot be mapped safely is an error.
+fn map_rule_action(
+    repr: Option<RuleActionRepr>,
+    rp_id: &str,
+    field: &str,
+) -> std::result::Result<(RuleAction, Option<String>), String> {
+    let Some(repr) = repr else {
+        return Ok((RuleAction::Deny, None));
+    };
+    let deprecated = |what: String, new: RuleAction| {
+        Some(format!(
+            "rule '{rp_id}': {what} is deprecated and was mapped to `{field} = \"{new}\"`; \
+             update the config (legacy rule vocabulary is removed in the release after next)"
+        ))
+    };
+    match repr {
+        RuleActionRepr::Word(word) => match word.as_str() {
+            "deny" => Ok((RuleAction::Deny, None)),
+            "allow" => Ok((RuleAction::Allow, None)),
+            "request" => Ok((RuleAction::Request, None)),
+            "autonomous" => Ok((
+                RuleAction::Allow,
+                deprecated(format!("`{field} = \"autonomous\"`"), RuleAction::Allow),
+            )),
+            "supervised" => Ok((
+                RuleAction::Request,
+                deprecated(format!("`{field} = \"supervised\"`"), RuleAction::Request),
+            )),
+            other => Err(format!(
+                "rule '{rp_id}': unknown `{field}` value '{other}'; expected \"deny\", \"allow\" or \"request\""
+            )),
+        },
+        RuleActionRepr::Other(value) => Err(format!(
+            "rule '{rp_id}': `{field}` has an unrecognized value ({value}); expected \"deny\", \"allow\" or \"request\""
+        )),
+        RuleActionRepr::Legacy(fields) => {
+            let table = || format!("the `{field}` evidence table");
+            match (
+                fields.authorization,
+                fields.user_presence,
+                fields.user_verification,
+            ) {
+                (LegacyAuthorization::Deny, LegacyEvidence::None, LegacyEvidence::None) => {
+                    Ok((RuleAction::Deny, deprecated(table(), RuleAction::Deny)))
+                }
+                (LegacyAuthorization::Deny, _, _) => Err(format!(
+                    "rule '{rp_id}': `{field}` is a legacy `deny` evidence table with UP or UV evidence, \
+                     which cannot be mapped safely; write `{field} = \"deny\"`"
+                )),
+                (LegacyAuthorization::Confirm, _, _) => Ok((
+                    RuleAction::Request,
+                    deprecated(table(), RuleAction::Request),
+                )),
+                (LegacyAuthorization::Allow, LegacyEvidence::Agent, LegacyEvidence::Agent) => {
+                    Ok((RuleAction::Allow, deprecated(table(), RuleAction::Allow)))
+                }
+                (LegacyAuthorization::Allow, up, uv) => {
+                    let describe = |source: LegacyEvidence| match source {
+                        LegacyEvidence::Human => "human",
+                        LegacyEvidence::Agent => "agent",
+                        LegacyEvidence::None => "none",
+                    };
+                    Err(format!(
+                        "rule '{rp_id}': `{field}` is a legacy `allow` table with user_presence = {}, user_verification = {}, \
+                         which cannot be mapped safely: agent rules carry no evidence fields and `allow` always uses \
+                         agent evidence (ADR 0014 sections 6.4 and 7). Use `{field} = \"allow\"` for autonomous use \
+                         or `{field} = \"request\"` to require human approval",
+                        describe(up),
+                        describe(uv),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn convert_rule(repr: AgentRpRuleRepr, legacy: &mut LegacyConfigUse) -> AgentRpRule {
+    let mut action = |value: Option<RuleActionRepr>, field: &str| match map_rule_action(
+        value,
+        &repr.rp_id,
+        field,
+    ) {
+        Ok((action, warning)) => {
+            legacy.warnings.extend(warning);
+            action
+        }
+        Err(message) => {
+            legacy.errors.push(message);
+            RuleAction::Deny
+        }
+    };
+    let register = action(repr.register, "register");
+    let authenticate = action(repr.authenticate, "authenticate");
+    AgentRpRule {
+        rp_id: repr.rp_id,
+        register,
+        authenticate,
+        credential_selection: repr.credential_selection,
+    }
 }
 
 fn default_gpg_backend() -> String {
@@ -588,72 +682,20 @@ impl<'de> Deserialize<'de> for BoundedDuration {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigDoc)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceIdentity {
-    pub name: String,
-    pub phys: String,
-    pub uniq: String,
-    pub vendor_id: u16,
-    pub product_id: u16,
-}
-
-impl DeviceIdentity {
-    pub fn validate(&self, profile_id: &ProfileId) -> Result<()> {
-        validate_device_field(&self.name, "name", DEVICE_NAME_MAX, profile_id)?;
-        validate_device_field(&self.phys, "phys", DEVICE_PHYS_MAX, profile_id)?;
-        validate_device_field(&self.uniq, "uniq", DEVICE_UNIQ_MAX, profile_id)?;
-
-        if self.name == HUMAN_DEVICE_NAME
-            && self.phys == HUMAN_DEVICE_PHYS
-            && self.vendor_id == HUMAN_VENDOR_ID
-            && self.product_id == HUMAN_PRODUCT_ID
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': device identity collides with the human authenticator \
-                 (virtual-fido / 0x{:04x}:0x{:04x})",
-                profile_id, HUMAN_VENDOR_ID, HUMAN_PRODUCT_ID,
-            )));
-        }
-
-        Ok(())
-    }
-}
-
-fn validate_device_field(
-    value: &str,
-    field: &'static str,
-    max: usize,
-    profile_id: &ProfileId,
-) -> Result<()> {
-    if value.contains('\0') {
-        return Err(Error::Config(format!(
-            "agent profile '{}': device.{} must not contain NUL bytes",
-            profile_id, field,
-        )));
-    }
-    if value.len() > max {
-        return Err(Error::Config(format!(
-            "agent profile '{}': device.{} exceeds maximum length of {} bytes (got {}); \
-             limit reserves 1 byte for NUL terminator",
-            profile_id,
-            field,
-            max,
-            value.len(),
-        )));
-    }
-    Ok(())
-}
+/// Legacy per-profile UHID identity.
+///
+/// Agents have no UHID or hidraw device of their own (ADR 0014 section 5): the isolated route was
+/// removed, so a `[agents.profiles.<id>.device]` table is parsed only so that old configs keep
+/// loading. Its contents are ignored and a deprecation warning is logged by
+/// `AgentProfileConfig::validate`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceIdentity {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "AgentProfileConfigRepr")]
 pub struct AgentProfileConfig {
     pub mode: AgentMode,
     pub principal_user: String,
-    #[serde(default)]
-    pub rp_ids: Vec<String>,
-    #[serde(default)]
-    pub require_uv: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_refs: Option<Vec<CredentialRef>>,
@@ -673,21 +715,22 @@ pub struct AgentProfileConfig {
     pub max_concurrent_sessions: u16,
     #[serde(default)]
     pub browser_scope: BrowserScope,
+    /// Most persistent granted rules this profile may hold; escalations beyond it are denied.
+    #[serde(default = "default_max_granted_rules")]
+    pub max_granted_rules: u16,
+    /// Profile default selection; a rule may override it, and the wildcard rule is always `single`.
     #[serde(default)]
     pub credential_selection: CredentialSelection,
-    #[serde(default)]
-    pub human_verification_prompt: HumanVerificationPrompt,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<AgentStorageConfig>,
-    #[serde(default)]
-    pub registration_allowed: bool,
 
     #[serde(default)]
     pub rules: Vec<AgentRpRule>,
 
-    #[serde(default)]
-    pub device: DeviceIdentity,
+    /// Deprecated and ignored: agents no longer use a UHID device.
+    #[serde(default, skip_serializing)]
+    pub device: Option<DeviceIdentity>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
@@ -701,80 +744,237 @@ pub struct AgentProfileConfig {
     pub browser_cdp_expose: Option<CdpExposeMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_cdp_port: Option<u16>,
+
+    /// Deprecated vocabulary seen while parsing (not part of the config schema).
+    #[serde(default, skip_serializing)]
+    pub legacy: LegacyConfigUse,
+}
+
+/// The profile as written in a config file. It carries the removed profile keys so that a config
+/// that still uses them fails with a migration message instead of "unknown field", and the rules
+/// in their legacy spelling (ADR 0014 section 6.4).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentProfileConfigRepr {
+    mode: AgentMode,
+    principal_user: String,
+    #[serde(default)]
+    credential_refs: Option<Vec<CredentialRef>>,
+    #[serde(default)]
+    max_grant_ttl: Option<BoundedDuration>,
+    #[serde(default, alias = "session_ttl")]
+    max_session_ttl: Option<BoundedDuration>,
+    #[serde(default = "default_max_operations")]
+    max_operations: u16,
+    #[serde(default = "default_max_concurrent_sessions")]
+    max_concurrent_sessions: u16,
+    #[serde(default)]
+    browser_scope: BrowserScope,
+    #[serde(default = "default_max_granted_rules")]
+    max_granted_rules: u16,
+    #[serde(default)]
+    credential_selection: CredentialSelection,
+    #[serde(default)]
+    storage: Option<AgentStorageConfig>,
+    #[serde(default)]
+    rules: Vec<AgentRpRuleRepr>,
+    #[serde(default)]
+    device: Option<DeviceIdentity>,
+    #[serde(default)]
+    start_url: Option<String>,
+    #[serde(default)]
+    browser_command: Option<Vec<String>>,
+    #[serde(default)]
+    browser_user: Option<String>,
+    #[serde(default)]
+    browser_runtime_root: Option<PathBuf>,
+    #[serde(default)]
+    browser_cdp_expose: Option<CdpExposeMode>,
+    #[serde(default)]
+    browser_cdp_port: Option<u16>,
+
+    // Removed profile keys (ADR 0014 section 6.4): detected only to produce a migration message.
+    #[serde(default)]
+    rp_ids: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    require_uv: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    registration_allowed: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    human_verification_prompt: Option<serde::de::IgnoredAny>,
+}
+
+impl From<AgentProfileConfigRepr> for AgentProfileConfig {
+    fn from(repr: AgentProfileConfigRepr) -> Self {
+        let mut legacy = LegacyConfigUse::default();
+        for (key, present) in [
+            ("rp_ids", repr.rp_ids.is_some()),
+            ("require_uv", repr.require_uv.is_some()),
+            ("registration_allowed", repr.registration_allowed.is_some()),
+            (
+                "human_verification_prompt",
+                repr.human_verification_prompt.is_some(),
+            ),
+        ] {
+            if present {
+                legacy.removed_keys.push(key.to_string());
+            }
+        }
+
+        let mut rules = Vec::with_capacity(repr.rules.len());
+        for rule in repr.rules {
+            rules.push(convert_rule(rule, &mut legacy));
+        }
+
+        Self {
+            mode: repr.mode,
+            principal_user: repr.principal_user,
+            credential_refs: repr.credential_refs,
+            max_grant_ttl: repr.max_grant_ttl,
+            max_session_ttl: repr.max_session_ttl,
+            max_operations: repr.max_operations,
+            max_concurrent_sessions: repr.max_concurrent_sessions,
+            browser_scope: repr.browser_scope,
+            max_granted_rules: repr.max_granted_rules,
+            credential_selection: repr.credential_selection,
+            storage: repr.storage,
+            rules,
+            device: repr.device,
+            start_url: repr.start_url,
+            browser_command: repr.browser_command,
+            browser_user: repr.browser_user,
+            browser_runtime_root: repr.browser_runtime_root,
+            browser_cdp_expose: repr.browser_cdp_expose,
+            browser_cdp_port: repr.browser_cdp_port,
+            legacy,
+        }
+    }
 }
 
 impl AgentProfileConfig {
-    pub fn effective_rules(&self) -> Vec<AgentRpRule> {
-        if !self.rules.is_empty() {
-            return self.rules.clone();
+    /// The coarse RP scope of a browser session and its grant (at most [`MAX_GRANT_RP_IDS`]).
+    ///
+    /// A denied RP must still reach the daemon so that the deny is resolved and audited there, and
+    /// a profile whose rules are all `deny` still has a scope (B4), so `deny` rules are included.
+    /// With a wildcard rule the scope collapses to `*` (plus `localhost` when an exact `localhost`
+    /// rule exists, since `*` never matches it); resolution stays the authority. Without a wildcard
+    /// `validate` enforces the limit, so the grant request cannot fail at runtime.
+    pub fn rule_rp_ids(&self) -> Vec<String> {
+        if self.rules.iter().any(|rule| rule.is_wildcard()) {
+            let mut scope = vec![ANY_RP_ID.to_string()];
+            if self
+                .rules
+                .iter()
+                .any(|rule| normalize_rp_id(&rule.rp_id) == LOCALHOST_RP_ID)
+            {
+                scope.push(LOCALHOST_RP_ID.to_string());
+            }
+            return scope;
         }
-
-        self.rp_ids
-            .iter()
-            .map(|rp_id| AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.clone(),
-                register: if self.registration_allowed {
-                    AgentCeremonyPolicy::legacy_confirm(self.require_uv)
-                } else {
-                    AgentCeremonyPolicy::deny()
-                },
-                authenticate: AgentCeremonyPolicy::legacy_confirm(self.require_uv),
-            })
-            .collect()
+        self.rules.iter().map(|rule| rule.rp_id.clone()).collect()
     }
 
+    /// RP IDs of every rule that is not `deny` for both actions (including the wildcard).
     pub fn allowed_rp_ids(&self) -> Vec<String> {
-        self.effective_rules()
-            .into_iter()
+        self.rules
+            .iter()
             .filter(|rule| {
-                rule.register.authorization != AgentAuthorization::Deny
-                    || rule.authenticate.authorization != AgentAuthorization::Deny
+                rule.register != RuleAction::Deny || rule.authenticate != RuleAction::Deny
             })
-            .map(|rule| rule.rp_id)
+            .map(|rule| rule.rp_id.clone())
             .collect()
     }
 
-    pub fn rule_for_rp(&self, rp_id: &str) -> Option<AgentRpRule> {
-        let normalized = validate_rp_id(rp_id).ok()?;
-        let rules = self.effective_rules();
-        if let Some(rule) = rules
-            .iter()
-            .find(|rule| normalize_rp_id(&rule.rp_id) == normalized)
-        {
-            return Some(rule.clone());
-        }
-        rules
-            .into_iter()
-            .find(|rule| normalize_rp_id(&rule.rp_id) == ANY_RP_ID)
+    /// Resolve `(action, rp_id)` against this configuration alone, with no granted rules
+    /// (ADR 0014 section 6.2). Runtime ceremonies resolve through `PolicyRuntime::resolve`, which
+    /// also consults the granted-rules store.
+    pub fn resolve(&self, action: PolicyAction, rp_id: &str) -> MatchedRule {
+        resolve_rules(
+            &self.rules,
+            &self.credential_selection,
+            action,
+            rp_id,
+            |_| false,
+        )
+    }
+
+    /// Like [`Self::resolve`], upgrading a `request` through `grants`.
+    pub fn resolve_with(
+        &self,
+        profile_id: &ProfileId,
+        action: PolicyAction,
+        rp_id: &str,
+        grants: &dyn GrantSource,
+    ) -> MatchedRule {
+        resolve_rules(
+            &self.rules,
+            &self.credential_selection,
+            action,
+            rp_id,
+            |rp_id| grants.is_granted(profile_id, rp_id),
+        )
     }
 
     pub fn credential_selection_for_rp(&self, rp_id: &str) -> CredentialSelection {
-        self.rule_for_rp(rp_id)
-            .and_then(|rule| rule.credential_selection)
-            .unwrap_or_else(|| self.credential_selection.clone())
+        self.resolve(PolicyAction::Authenticate, rp_id).selection
     }
 
     pub fn allows_registration(&self) -> bool {
-        self.effective_rules()
+        self.rules
             .iter()
-            .any(|rule| rule.register.authorization != AgentAuthorization::Deny)
+            .any(|rule| rule.register != RuleAction::Deny)
     }
 
     pub fn allows_authentication(&self) -> bool {
-        self.effective_rules()
+        self.rules
             .iter()
-            .any(|rule| rule.authenticate.authorization != AgentAuthorization::Deny)
+            .any(|rule| rule.authenticate != RuleAction::Deny)
     }
 
-    pub fn requires_human_uv(&self) -> bool {
-        self.effective_rules().iter().any(|rule| {
-            rule.register.user_verification == UserVerificationSource::Human
-                || rule.authenticate.user_verification == UserVerificationSource::Human
-        })
+    /// Deprecation warnings for legacy keys and vocabulary that are still accepted.
+    pub fn deprecation_warnings(&self, profile_id: &ProfileId) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.device.is_some() {
+            warnings.push(format!(
+                "agent profile '{}': the [device] table is deprecated and ignored: agents have no \
+                 UHID device (ADR 0014 section 5); remove it",
+                profile_id
+            ));
+        }
+        for warning in &self.legacy.warnings {
+            warnings.push(format!("agent profile '{}': {}", profile_id, warning));
+        }
+        warnings
     }
 
     pub fn validate(&self, profile_id: &ProfileId) -> Result<()> {
+        if !self.legacy.errors.is_empty() {
+            return Err(Error::Config(format!(
+                "agent profile '{}': {}",
+                profile_id,
+                self.legacy.errors.join("; ")
+            )));
+        }
+        if !self.legacy.removed_keys.is_empty() {
+            return Err(Error::Config(format!(
+                "agent profile '{}': the profile keys {} were removed (ADR 0014 section 6.4). \
+                 Replace `rp_ids`, `registration_allowed` and `require_uv` with explicit \
+                 [[agents.profiles.{}.rules]] entries (rp_id, authenticate = \"allow\" | \"request\" | \"deny\", \
+                 register = \"allow\" | \"request\" | \"deny\"), and delete `human_verification_prompt`: \
+                 agent ceremonies never prompt for human UP or UV",
+                profile_id,
+                self.legacy
+                    .removed_keys
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                profile_id,
+            )));
+        }
+        for warning in self.deprecation_warnings(profile_id) {
+            log::warn!("{}", warning);
+        }
         if self.principal_user.is_empty() {
             return Err(Error::Config(format!(
                 "agent profile '{}': principal_user must not be empty",
@@ -785,6 +985,12 @@ impl AgentProfileConfig {
             return Err(Error::Config(format!(
                 "agent profile '{}': max_operations must be between 1 and {}",
                 profile_id, MAX_OPERATIONS
+            )));
+        }
+        if self.max_granted_rules == 0 || self.max_granted_rules > MAX_GRANTED_RULES_LIMIT {
+            return Err(Error::Config(format!(
+                "agent profile '{}': max_granted_rules must be between 1 and {}",
+                profile_id, MAX_GRANTED_RULES_LIMIT
             )));
         }
         if self.browser_scope == BrowserScope::Session {
@@ -826,18 +1032,8 @@ impl AgentProfileConfig {
             )));
         }
 
-        if !self.rules.is_empty()
-            && (!self.rp_ids.is_empty() || self.registration_allowed || self.require_uv)
-        {
-            return Err(Error::Config(format!(
-                "agent profile '{}': explicit rules cannot be combined with legacy rp_ids, registration_allowed, or require_uv",
-                profile_id,
-            )));
-        }
-
-        let effective_rules = self.effective_rules();
         let mut normalized_rules = std::collections::BTreeSet::new();
-        for rule in &effective_rules {
+        for rule in &self.rules {
             validate_agent_rp_rule_id(&rule.rp_id)?;
             let normalized = rule.rp_id.trim().to_ascii_lowercase();
             if !normalized_rules.insert(normalized) {
@@ -846,10 +1042,14 @@ impl AgentProfileConfig {
                     profile_id, rule.rp_id,
                 )));
             }
-            rule.register
-                .validate(profile_id, &rule.rp_id, "registration")?;
-            rule.authenticate
-                .validate(profile_id, &rule.rp_id, "authentication")?;
+            if rule.register == RuleAction::Request && rule.authenticate == RuleAction::Deny {
+                return Err(Error::Config(format!(
+                    "agent profile '{}': rule '{}' has register = \"request\" with authenticate = \"deny\": \
+                     a registration escalation persists authenticate = allow for the new credential \
+                     (ADR 0014 section 8.3); set authenticate to \"allow\" or \"request\", or register to \"deny\"",
+                    profile_id, rule.rp_id,
+                )));
+            }
             if let Some(CredentialSelection::Credential(reference)) = &rule.credential_selection
                 && self
                     .credential_refs
@@ -863,16 +1063,18 @@ impl AgentProfileConfig {
             }
         }
 
-        if let Some(wildcard_rule) = effective_rules
-            .iter()
-            .find(|rule| normalize_rp_id(&rule.rp_id) == ANY_RP_ID)
-        {
-            if self.rules.is_empty() {
-                return Err(Error::Config(format!(
-                    "agent profile '{}': wildcard RP scope '*' requires explicit rules",
-                    profile_id
-                )));
-            }
+        if self.rule_rp_ids().len() > MAX_GRANT_RP_IDS {
+            return Err(Error::Config(format!(
+                "agent profile '{}': {} RP rules exceed the limit of {} (every rule's RP is in the \
+                 browser session grant scope); remove rules, or use a `*` rule (same-user only), \
+                 which collapses the scope",
+                profile_id,
+                self.rules.len(),
+                MAX_GRANT_RP_IDS,
+            )));
+        }
+
+        if let Some(wildcard_rule) = self.rules.iter().find(|rule| rule.is_wildcard()) {
             if self.mode != AgentMode::SameUser {
                 return Err(Error::Config(format!(
                     "agent profile '{}': wildcard RP scope '*' is only supported in same-user mode",
@@ -885,18 +1087,20 @@ impl AgentProfileConfig {
                     profile_id
                 )));
             }
-            if wildcard_rule.register.authorization != AgentAuthorization::Deny {
+            if wildcard_rule.register != RuleAction::Deny {
                 return Err(Error::Config(format!(
-                    "agent profile '{}': wildcard RP scope '*' must deny registration",
+                    "agent profile '{}': wildcard RP scope '*' must have register = \"deny\" (a wildcard never permits or requests registration)",
                     profile_id
                 )));
             }
-            if matches!(
-                &wildcard_rule.credential_selection,
-                Some(CredentialSelection::Credential(_))
-            ) {
+            if wildcard_rule
+                .credential_selection
+                .as_ref()
+                .is_some_and(|selection| *selection != CredentialSelection::Single)
+            {
                 return Err(Error::Config(format!(
-                    "agent profile '{}': wildcard RP scope '*' cannot select one RP-specific credential reference",
+                    "agent profile '{}': wildcard RP scope '*' always selects with `single`; \
+                     a wildcard never chooses between several accounts (ADR 0014 section 6.3)",
                     profile_id
                 )));
             }
@@ -929,16 +1133,6 @@ impl AgentProfileConfig {
                 }
             }
             AgentMode::Isolated => {
-                if self.device.name.is_empty()
-                    || self.device.phys.is_empty()
-                    || self.device.uniq.is_empty()
-                {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': isolated mode requires a complete device identity",
-                        profile_id
-                    )));
-                }
-                self.device.validate(profile_id)?;
                 if self.storage.is_none() {
                     return Err(Error::Config(format!(
                         "agent profile '{}': isolated mode requires storage backend configuration",
@@ -951,12 +1145,6 @@ impl AgentProfileConfig {
                 if self.browser_user.is_some() {
                     return Err(Error::Config(format!(
                         "agent profile '{}': isolated mode must not specify browser_user",
-                        profile_id
-                    )));
-                }
-                if self.browser_runtime_root.is_some() {
-                    return Err(Error::Config(format!(
-                        "agent profile '{}': isolated mode must not specify browser_runtime_root",
                         profile_id
                     )));
                 }
@@ -982,7 +1170,7 @@ impl AgentProfileConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
@@ -1001,13 +1189,425 @@ pub struct AgentConfig {
     /// Profile IDs for which the operator explicitly accepts writes to the human credential backend.
     #[serde(default)]
     pub acknowledge_same_user_registration: Vec<String>,
+
+    /// Concurrency caps of the agent ceremony server (plan R11). Read when the daemon starts.
+    #[serde(default)]
+    pub limits: AgentRequestLimits,
+
+    /// User whose session bus receives escalation prompts (ADR 0014 section 8.2). A root daemon
+    /// needs it for escalation; a non-root daemon may only name its own user. Read when the
+    /// daemon starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_user: Option<String>,
+
+    /// Directory of persistent agent state such as the granted-rules store (ADR 0014 section
+    /// 8.4). Defaults to `$XDG_STATE_HOME/passless/agent`, or `/var/lib/passless-agent` for a
+    /// root daemon. Read when the daemon starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<PathBuf>,
+
+    /// Optional cap in seconds on how long a ceremony waits for an escalation decision (unset:
+    /// the ceremony's own timeout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_timeout: Option<u64>,
+
+    /// Seconds during which a denied or expired escalation key is denied without a prompt.
+    #[serde(default = "default_escalation_cooldown")]
+    pub escalation_cooldown: u64,
+
+    /// Accept running agents while `PASSLESS_INTERACTION_MODE=automatic` auto-approves the human
+    /// authenticator's prompts (ADR 0014 section 7, R19). Without it, the daemon refuses to start
+    /// agents in that mode when any same-user profile has an `allow` or `request` rule, because a
+    /// request from a managed browser that reached the native path would be signed silently.
+    #[serde(default)]
+    pub allow_automatic_human_path: bool,
+
+    /// Browser binary the managed browser runs when a profile sets no `browser_command`
+    /// (ADR 0014 section 4.2, R14). Unset: the daemon picks the first supported browser it finds
+    /// (Playwright Chromium, then Chrome for Testing, then the distribution's `chromium`). Branded
+    /// Google Chrome and `chrome-headless-shell` are refused: neither can load the interception
+    /// extension. With a distinct-UID principal the binary must be owned by root and not writable
+    /// by the principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_path: Option<PathBuf>,
+}
+
+/// Default global cap on concurrent agent ceremony requests.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u16 = 32;
+/// Default cap on concurrent requests of one profile (all its sessions).
+pub const DEFAULT_MAX_REQUESTS_PER_PROFILE: u16 = 16;
+/// Default cap on concurrent requests carried by one connection.
+pub const DEFAULT_MAX_REQUESTS_PER_CONNECTION: u16 = 8;
+/// Default cap on concurrent requests of one bearer session.
+pub const DEFAULT_MAX_REQUESTS_PER_SESSION: u16 = 8;
+/// Upper bound for every request cap.
+pub const MAX_REQUEST_LIMIT: u16 = 1024;
+
+fn default_max_concurrent_requests() -> u16 {
+    DEFAULT_MAX_CONCURRENT_REQUESTS
+}
+
+fn default_max_requests_per_profile() -> u16 {
+    DEFAULT_MAX_REQUESTS_PER_PROFILE
+}
+
+fn default_max_requests_per_connection() -> u16 {
+    DEFAULT_MAX_REQUESTS_PER_CONNECTION
+}
+
+fn default_max_requests_per_session() -> u16 {
+    DEFAULT_MAX_REQUESTS_PER_SESSION
+}
+
+/// Concurrency caps of the agent ceremony server. A request over any cap is answered with an
+/// explicit `busy` error instead of being dropped (plan R11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRequestLimits {
+    /// Concurrent ceremony requests across all sessions and connections.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: u16,
+    /// Concurrent ceremony requests of one profile, so that one profile cannot exhaust the global
+    /// cap.
+    #[serde(default = "default_max_requests_per_profile")]
+    pub max_requests_per_profile: u16,
+    /// Concurrent ceremony requests carried by one connection.
+    #[serde(default = "default_max_requests_per_connection")]
+    pub max_requests_per_connection: u16,
+    /// Concurrent ceremony requests of one bearer session (one managed browser).
+    #[serde(default = "default_max_requests_per_session")]
+    pub max_requests_per_session: u16,
+}
+
+impl Default for AgentRequestLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_requests_per_profile: DEFAULT_MAX_REQUESTS_PER_PROFILE,
+            max_requests_per_connection: DEFAULT_MAX_REQUESTS_PER_CONNECTION,
+            max_requests_per_session: DEFAULT_MAX_REQUESTS_PER_SESSION,
+        }
+    }
+}
+
+impl AgentRequestLimits {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("max_concurrent_requests", self.max_concurrent_requests),
+            ("max_requests_per_profile", self.max_requests_per_profile),
+            (
+                "max_requests_per_connection",
+                self.max_requests_per_connection,
+            ),
+            ("max_requests_per_session", self.max_requests_per_session),
+        ] {
+            if value == 0 || value > MAX_REQUEST_LIMIT {
+                return Err(Error::Config(format!(
+                    "agents.limits.{} must be between 1 and {}",
+                    name, MAX_REQUEST_LIMIT
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profiles: BTreeMap::new(),
+            audit_path: None,
+            acknowledge_global_same_user: Vec::new(),
+            acknowledge_same_user_registration: Vec::new(),
+            limits: AgentRequestLimits::default(),
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: DEFAULT_ESCALATION_COOLDOWN_SECS,
+            allow_automatic_human_path: false,
+            browser_path: None,
+        }
+    }
+}
+
+/// Look up a user name's UID; `None` when the user does not exist.
+pub type UidLookup<'a> = &'a dyn Fn(&str) -> Option<u32>;
+
+/// Resolve a user name (or a numeric UID) through the system user database.
+pub fn lookup_user_uid(name: &str) -> Option<u32> {
+    if let Ok(uid) = name.parse::<u32>() {
+        return Some(uid);
+    }
+    nix::unistd::User::from_name(name)
+        .ok()
+        .flatten()
+        .map(|user| user.uid.as_raw())
 }
 
 impl AgentConfig {
+    /// The state directory in force: `agents.state_dir`, else `/var/lib/passless-agent` for a
+    /// root daemon, else `$XDG_STATE_HOME/passless/agent` (`~/.local/state/passless/agent`).
+    pub fn effective_state_dir(&self, daemon_uid: u32) -> Option<PathBuf> {
+        if let Some(dir) = &self.state_dir {
+            return Some(dir.clone());
+        }
+        if daemon_uid == 0 {
+            return Some(PathBuf::from(SYSTEM_STATE_DIR));
+        }
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))?;
+        Some(base.join("passless").join("agent"))
+    }
+
+    /// The same-user profiles with an `allow` or `request` rule for either action: with the human
+    /// path in automatic interaction mode, a request of theirs that reached the native path would
+    /// be signed without anybody approving it (ADR 0014 section 7, R19).
+    pub fn profiles_exposed_to_automatic_human_path(&self) -> Vec<&str> {
+        self.profiles
+            .iter()
+            .filter(|(_, profile)| profile.mode == AgentMode::SameUser)
+            .filter(|(_, profile)| {
+                profile.rules.iter().any(|rule| {
+                    [rule.authenticate, rule.register]
+                        .iter()
+                        .any(|action| matches!(action, RuleAction::Allow | RuleAction::Request))
+                })
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// R19: refuse agents while the human path is in automatic interaction mode
+    /// (`PASSLESS_INTERACTION_MODE=automatic`) and a same-user profile has an `allow` or
+    /// `request` rule, unless `allow_automatic_human_path` acknowledges it.
+    pub fn validate_human_path_interaction(&self, human_path_automatic: bool) -> Result<()> {
+        if !human_path_automatic || self.allow_automatic_human_path {
+            return Ok(());
+        }
+        let exposed = self.profiles_exposed_to_automatic_human_path();
+        if exposed.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Config(format!(
+            "PASSLESS_INTERACTION_MODE=automatic approves the human authenticator's prompts \
+             without user interaction, and same-user agent profile(s) {} have allow or request \
+             rules: a WebAuthn request from a managed browser that reached the native path would \
+             be signed silently. Unset PASSLESS_INTERACTION_MODE (or set it to desktop), or set \
+             agents.allow_automatic_human_path = true to accept this",
+            exposed
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
+    /// The escalation timeout cap, if configured.
+    pub fn escalation_timeout(&self) -> Option<Duration> {
+        self.escalation_timeout.map(Duration::from_secs)
+    }
+
+    /// The escalation cooldown.
+    pub fn escalation_cooldown(&self) -> Duration {
+        Duration::from_secs(self.escalation_cooldown)
+    }
+
+    /// Why escalation prompts cannot be shown under this configuration, if they cannot: a root
+    /// daemon without `agents.notify_user`. Reported by `doctor`; the request is then denied with
+    /// `escalation_unavailable`.
+    pub fn escalation_unavailable_reason(&self, daemon_uid: u32) -> Option<String> {
+        if daemon_uid == 0 && self.notify_user.is_none() {
+            return Some(
+                "the daemon runs as root and agents.notify_user is not set: escalation prompts \
+                 have no session bus, so `request` rules are denied with escalation_unavailable"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Validate the escalation keys (ADR 0014 section 8.2) for a daemon running as `daemon_uid`.
+    ///
+    /// - `escalation_cooldown` and `escalation_timeout` must be in range;
+    /// - a root daemon's `notify_user` must resolve and differ from every `principal_user` and
+    ///   `browser_user` (distinct-UID escalation integrity);
+    /// - a non-root daemon can only reach its own session bus, so its `notify_user` must be its
+    ///   own user.
+    pub fn validate_escalation(&self, daemon_uid: u32, lookup: UidLookup<'_>) -> Result<()> {
+        if self.escalation_cooldown < MIN_ESCALATION_COOLDOWN_SECS
+            || self.escalation_cooldown > MAX_ESCALATION_COOLDOWN_SECS
+        {
+            return Err(Error::Config(format!(
+                "agents.escalation_cooldown must be between {} and {} seconds",
+                MIN_ESCALATION_COOLDOWN_SECS, MAX_ESCALATION_COOLDOWN_SECS
+            )));
+        }
+        if let Some(timeout) = self.escalation_timeout
+            && (timeout == 0 || timeout > MAX_ESCALATION_TIMEOUT_SECS)
+        {
+            return Err(Error::Config(format!(
+                "agents.escalation_timeout must be between 1 and {} seconds",
+                MAX_ESCALATION_TIMEOUT_SECS
+            )));
+        }
+        if let Some(state_dir) = &self.state_dir
+            && !state_dir.is_absolute()
+        {
+            return Err(Error::Config(format!(
+                "agents.state_dir must be an absolute path, got '{}'",
+                state_dir.display()
+            )));
+        }
+        let Some(notify_user) = self.notify_user.as_deref() else {
+            return Ok(());
+        };
+        if notify_user.is_empty() {
+            return Err(Error::Config(
+                "agents.notify_user must not be empty".to_string(),
+            ));
+        }
+        let Some(notify_uid) = lookup(notify_user) else {
+            return Err(Error::Config(format!(
+                "agents.notify_user '{}' does not exist",
+                notify_user
+            )));
+        };
+        if daemon_uid != 0 {
+            if notify_uid != daemon_uid {
+                return Err(Error::Config(format!(
+                    "agents.notify_user '{}' (uid {}) differs from the daemon's user (uid {}): a \
+                     non-root daemon can only prompt on its own session bus; remove notify_user \
+                     or set it to the daemon's user",
+                    notify_user, notify_uid, daemon_uid
+                )));
+            }
+            return Ok(());
+        }
+        if notify_uid == 0 {
+            return Err(Error::Config(
+                "agents.notify_user must not be root".to_string(),
+            ));
+        }
+        for (name, profile) in &self.profiles {
+            let principal_and_browser =
+                std::iter::once(("principal_user", &profile.principal_user)).chain(
+                    profile
+                        .browser_user
+                        .iter()
+                        .map(|user| ("browser_user", user)),
+                );
+            for (key, user) in principal_and_browser {
+                let same = user == notify_user || lookup(user).is_some_and(|uid| uid == notify_uid);
+                if same {
+                    return Err(Error::Config(format!(
+                        "agent profile '{}': {} '{}' is agents.notify_user: in a distinct-UID \
+                         deployment the notification user must differ from every principal and \
+                         browser user, or the agent could approve its own escalations (ADR 0014 \
+                         section 8.2)",
+                        name, key, user
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse the `[agents]` table of a Passless TOML configuration. A missing table is the default
+    /// (disabled) configuration. Validation is separate ([`Self::validate`]).
+    pub fn from_toml_str(content: &str, source: &str) -> Result<Self> {
+        let table = toml::from_str::<toml::Table>(content).map_err(|e| {
+            Error::Config(format!(
+                "failed to parse config file {} as TOML: {}",
+                source, e
+            ))
+        })?;
+        match table.get("agents") {
+            Some(agents_value) => {
+                Deserialize::deserialize(agents_value.clone()).map_err(|e: toml::de::Error| {
+                    Error::Config(format!(
+                        "failed to parse [agents] section in {}: {}",
+                        source, e
+                    ))
+                })
+            }
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Read and parse the `[agents]` table of the configuration file at `path`.
+    pub fn from_config_file(path: &std::path::Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            Error::Config(format!(
+                "failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Self::from_toml_str(&content, &path.display().to_string())
+    }
+
+    /// Why `next` cannot replace `self` in a running daemon, if it cannot.
+    ///
+    /// A policy reload applies rules, selection, acknowledgements, budgets and TTLs. It cannot add
+    /// or remove profiles or change what was bound when the daemon started (backends, users, modes,
+    /// browser scope, session concurrency, audit location, request caps); those need a restart.
+    pub fn reload_incompatibility(&self, next: &AgentConfig) -> Option<String> {
+        if self.enabled != next.enabled {
+            return Some("agents.enabled changed".to_string());
+        }
+        if self.audit_path != next.audit_path {
+            return Some("agents.audit_path changed".to_string());
+        }
+        if self.limits != next.limits {
+            return Some("agents.limits changed".to_string());
+        }
+        if self.notify_user != next.notify_user {
+            return Some("agents.notify_user changed".to_string());
+        }
+        if self.state_dir != next.state_dir {
+            return Some("agents.state_dir changed".to_string());
+        }
+        if !self.profiles.keys().eq(next.profiles.keys()) {
+            return Some("the set of agent profiles changed".to_string());
+        }
+        for (name, current) in &self.profiles {
+            let Some(candidate) = next.profiles.get(name) else {
+                return Some(format!("agent profile '{}' was removed", name));
+            };
+            let storage = |p: &AgentProfileConfig| p.storage.as_ref().map(|s| format!("{:?}", s));
+            let changed = if current.mode != candidate.mode {
+                Some("mode")
+            } else if current.principal_user != candidate.principal_user {
+                Some("principal_user")
+            } else if current.browser_user != candidate.browser_user {
+                Some("browser_user")
+            } else if storage(current) != storage(candidate) {
+                Some("storage")
+            } else if current.browser_scope != candidate.browser_scope {
+                Some("browser_scope")
+            } else if current.max_concurrent_sessions != candidate.max_concurrent_sessions {
+                Some("max_concurrent_sessions")
+            } else {
+                None
+            };
+            if let Some(field) = changed {
+                return Some(format!("agent profile '{}': {} changed", name, field));
+            }
+        }
+        None
+    }
+
     pub fn validate(&self, human_state_path: Option<&std::path::Path>) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
+
+        self.limits.validate()?;
+        self.validate_escalation(nix::unistd::geteuid().as_raw(), &lookup_user_uid)?;
 
         if self.audit_path.is_none() {
             return Err(Error::Config(
@@ -1036,10 +1636,7 @@ impl AgentConfig {
             profile.validate(&pid)?;
 
             let global_same_user = profile.mode == AgentMode::SameUser
-                && profile.effective_rules().iter().any(|rule| {
-                    normalize_rp_id(&rule.rp_id) == ANY_RP_ID
-                        && rule.authenticate.authorization != AgentAuthorization::Deny
-                });
+                && profile.rules.iter().any(|rule| rule.is_wildcard());
             if global_same_user
                 && !self
                     .acknowledge_global_same_user
@@ -1075,6 +1672,13 @@ impl AgentConfig {
             all_roots.push((
                 "audit_path".to_string(),
                 crate::config::BackendConfig::canonicalize_path(audit),
+            ));
+        }
+
+        if let Some(ref state_dir) = self.state_dir {
+            all_roots.push((
+                "state_dir/granted-rules".to_string(),
+                crate::config::BackendConfig::canonicalize_path(&state_dir.join("granted-rules")),
             ));
         }
 
@@ -1116,28 +1720,21 @@ impl AgentConfig {
             }
         }
 
-        let mut device_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (pid, profile) in &validated_profiles {
-            if profile.mode == AgentMode::SameUser {
-                continue;
-            }
-            let key = format!(
-                "{}:{}:{}:{}:{}",
-                profile.device.name,
-                profile.device.phys,
-                profile.device.uniq,
-                profile.device.vendor_id,
-                profile.device.product_id,
-            );
-            if !device_keys.insert(key) {
-                return Err(Error::Config(format!(
-                    "agent profile '{}': device identity collides with another profile",
-                    pid
-                )));
-            }
-        }
-
         Ok(())
+    }
+
+    /// Deprecation warnings of every profile (legacy rule vocabulary, `[device]` tables). Logged
+    /// once per load by `validate` and reported by `passless agent doctor`.
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                ProfileId::new(name.as_str())
+                    .ok()
+                    .map(|id| profile.deprecation_warnings(&id))
+            })
+            .flatten()
+            .collect()
     }
 
     pub fn get_profile(&self, name: &str) -> Option<&AgentProfileConfig> {
@@ -1151,9 +1748,9 @@ impl AgentConfig {
         self.profiles
             .iter()
             .filter(|(_, profile)| {
-                profile.effective_rules().iter().any(|rule| {
+                profile.rules.iter().any(|rule| {
                     let rule_rp = normalize_rp_id(&rule.rp_id);
-                    rule_rp == normalized || rule_rp == ANY_RP_ID
+                    rule_rp == normalized || (rule_rp == ANY_RP_ID && normalized != LOCALHOST_RP_ID)
                 })
             })
             .collect()
@@ -1274,6 +1871,19 @@ pub fn validate_rp_id(raw: &str) -> Result<String> {
         )));
     }
 
+    // `localhost` is the one exception to the public-suffix rule (ADR 0014 section 6.1, plan R15):
+    // valid for exact rules only (resolution never matches it through the wildcard). Subdomains of
+    // `localhost` are never valid.
+    if normalized == LOCALHOST_RP_ID {
+        return Ok(normalized);
+    }
+    if normalized.ends_with(".localhost") {
+        return Err(Error::Config(format!(
+            "RP ID must not be a subdomain of localhost: '{}'",
+            normalized
+        )));
+    }
+
     if !normalized.contains('.') {
         return Err(Error::Config(format!(
             "RP ID must have at least two labels: '{}'",
@@ -1293,6 +1903,7 @@ pub fn validate_rp_id(raw: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::resolve::RuleIdentity;
     use super::*;
 
     #[test]
@@ -1361,8 +1972,8 @@ mod tests {
 
     #[test]
     fn test_rp_id_reject_single_label() {
-        assert!(validate_rp_id("localhost").is_err());
         assert!(validate_rp_id("com").is_err());
+        assert!(validate_rp_id("intranet").is_err());
     }
 
     #[test]
@@ -1446,133 +2057,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ceremony_policy_aliases() {
-        let autonomous: AgentCeremonyPolicy = serde_json::from_str("\"autonomous\"").unwrap();
-        assert_eq!(autonomous, AgentCeremonyPolicy::autonomous());
-
-        let supervised: AgentCeremonyPolicy = serde_json::from_str("\"supervised\"").unwrap();
-        assert_eq!(supervised, AgentCeremonyPolicy::supervised());
-
-        let denied: AgentCeremonyPolicy = serde_json::from_str("\"deny\"").unwrap();
-        assert_eq!(denied, AgentCeremonyPolicy::deny());
-    }
-
-    #[test]
-    fn test_legacy_policy_evidence_alias_normalizes_to_agent() {
-        let policy: AgentCeremonyPolicy = serde_json::from_str(
-            r#"{"authorization":"allow","user_presence":"policy","user_verification":"policy"}"#,
-        )
-        .unwrap();
-        assert_eq!(policy.user_presence, UserPresenceSource::Agent);
-        assert_eq!(policy.user_verification, UserVerificationSource::Agent);
-        let serialized = serde_json::to_string(&policy).unwrap();
-        assert!(serialized.contains("\"agent\""));
-        assert!(!serialized.contains("\"policy\""));
-    }
-
-    #[test]
-    fn test_same_user_profile_parses_without_storage_or_device() {
-        let toml_str = r#"
-enabled = true
-audit_path = "/tmp/passless-agent-audit.jsonl"
-
-[profiles.opencode]
-mode = "same-user"
-principal_user = "alice"
-session_ttl = 600
-max_operations = 16
-
-[[profiles.opencode.rules]]
-rp_id = "github.com"
-authenticate = "autonomous"
-register = "deny"
-"#;
-        let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        let profile = config.profiles.get("opencode").unwrap();
-        assert_eq!(profile.mode, AgentMode::SameUser);
-        assert_eq!(profile.max_operations, 16);
-        assert_eq!(profile.max_session_ttl.unwrap().as_secs(), 600);
-        assert!(profile.storage.is_none());
-        assert_eq!(
-            profile.rules[0].authenticate,
-            AgentCeremonyPolicy::autonomous()
-        );
-        assert!(config.validate(None).is_ok());
-    }
-
-    #[test]
-    fn test_same_user_wildcard_rule_matches_valid_rps_and_exact_rule_wins() {
-        let toml_str = r#"
-enabled = true
-audit_path = "/tmp/passless-agent-audit.jsonl"
-acknowledge_global_same_user = ["opencode"]
-
-[profiles.opencode]
-mode = "same-user"
-principal_user = "alice"
-
-[[profiles.opencode.rules]]
-rp_id = "*"
-authenticate = "autonomous"
-register = "deny"
-
-[[profiles.opencode.rules]]
-rp_id = "bank.example.com"
-authenticate = "supervised"
-register = "deny"
-"#;
-        let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.validate(None).is_ok());
-        let profile = config.profiles.get("opencode").unwrap();
-
-        assert_eq!(
-            profile.rule_for_rp("github.com").unwrap().authenticate,
-            AgentCeremonyPolicy::autonomous()
-        );
-        let exact = profile.rule_for_rp("bank.example.com").unwrap();
-        assert_eq!(exact.authenticate, AgentCeremonyPolicy::supervised());
-        assert_eq!(exact.register, AgentCeremonyPolicy::deny());
-        assert!(profile.rule_for_rp("com").is_none());
-
-        let matches = config.profiles_for_rp_id("github.com");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0, "opencode");
-
-        let mut restricted = profile.clone();
-        restricted.credential_refs = Some(vec![CredentialRef::with_default_domain(b"restricted")]);
-        let err = restricted
-            .validate(&ProfileId::new("restricted").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("credential_refs to be omitted"));
-
-        let mut registering = profile.clone();
-        registering.rules[0].register = AgentCeremonyPolicy::autonomous();
-        let err = registering
-            .validate(&ProfileId::new("registering").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("must deny registration"));
-
-        let mut isolated = profile.clone();
-        isolated.mode = AgentMode::Isolated;
-        let err = isolated
-            .validate(&ProfileId::new("isolated-wildcard").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("only supported in same-user mode"));
-
-        let mut legacy = profile.clone();
-        legacy.rules.clear();
-        legacy.rp_ids = vec![ANY_RP_ID.to_string()];
-        let err = legacy
-            .validate(&ProfileId::new("legacy-wildcard").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("requires explicit rules"));
-    }
-
-    #[test]
     fn test_same_user_profile_rejects_storage() {
         let mut profile = make_isolated_profile();
         profile.mode = AgentMode::SameUser;
-        profile.device = DeviceIdentity::default();
         assert!(
             profile
                 .validate(&ProfileId::new("same-user").unwrap())
@@ -1593,17 +2080,24 @@ register = "deny"
         assert!(config.validate(None).is_ok());
     }
 
+    fn rule(rp_id: &str, authenticate: RuleAction, register: RuleAction) -> AgentRpRule {
+        AgentRpRule {
+            rp_id: rp_id.to_string(),
+            register,
+            authenticate,
+            credential_selection: None,
+        }
+    }
+
     fn make_isolated_profile() -> AgentProfileConfig {
         AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
             credential_selection: CredentialSelection::Single,
-            human_verification_prompt: HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: "test-user".to_string(),
-            rp_ids: vec!["example.com".to_string()],
-            require_uv: true,
             credential_refs: None,
             max_grant_ttl: None,
             max_session_ttl: None,
@@ -1611,15 +2105,9 @@ register = "deny"
                 path: PathBuf::from("/tmp/test-agent/creds"),
                 pin_path: PathBuf::from("/tmp/test-agent/pin"),
             }),
-            registration_allowed: true,
-            rules: vec![],
-            device: DeviceIdentity {
-                name: "passless-agent-iso".to_string(),
-                phys: "iso-phys".to_string(),
-                uniq: "iso-uniq-001".to_string(),
-                vendor_id: 0x1234,
-                product_id: 0x5679,
-            },
+            rules: vec![rule("example.com", RuleAction::Allow, RuleAction::Deny)],
+            legacy: Default::default(),
+            device: None,
             start_url: None,
             browser_command: None,
             browser_user: None,
@@ -1627,6 +2115,124 @@ register = "deny"
             browser_cdp_expose: None,
             browser_cdp_port: None,
         }
+    }
+
+    fn same_user_profile(rules: Vec<AgentRpRule>) -> AgentProfileConfig {
+        let mut profile = make_isolated_profile();
+        profile.mode = AgentMode::SameUser;
+        profile.storage = None;
+        profile.rules = rules;
+        profile
+    }
+
+    fn pid(name: &str) -> ProfileId {
+        ProfileId::new(name).unwrap()
+    }
+
+    fn parse_profile(body: &str) -> std::result::Result<AgentProfileConfig, toml::de::Error> {
+        toml::from_str(&format!(
+            "mode = \"same-user\"\nprincipal_user = \"alice\"\n{body}"
+        ))
+    }
+
+    fn agent_config(
+        profile: AgentProfileConfig,
+        acknowledge_global: bool,
+        acknowledge_registration: bool,
+    ) -> AgentConfig {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("coding".to_string(), profile);
+        AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
+            enabled: true,
+            profiles,
+            audit_path: Some(PathBuf::from("/tmp/passless-agent-audit-p4")),
+            acknowledge_global_same_user: if acknowledge_global {
+                vec!["coding".to_string()]
+            } else {
+                vec![]
+            },
+            acknowledge_same_user_registration: if acknowledge_registration {
+                vec!["coding".to_string()]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    // B6 regression: an isolated profile no longer needs (or can collide on) a `[device]` identity.
+    #[test]
+    fn test_isolated_profile_valid_without_device() {
+        let profile = make_isolated_profile();
+        assert!(profile.device.is_none());
+        let pid = ProfileId::new("test").unwrap();
+        profile.validate(&pid).unwrap();
+        assert!(profile.deprecation_warnings(&pid).is_empty());
+    }
+
+    #[test]
+    fn test_legacy_device_key_warns_and_is_ignored() {
+        let input = r#"
+mode = "isolated"
+principal_user = "agent"
+
+[storage.local]
+path = "/tmp/legacy-device/credentials"
+pin_path = "/tmp/legacy-device/pin"
+
+[device]
+name = "legacy"
+phys = "legacy-phys"
+uniq = "legacy-uniq"
+vendor_id = 4660
+product_id = 22136
+"#;
+        let profile: AgentProfileConfig = toml::from_str(input).unwrap();
+        let pid = ProfileId::new("legacy").unwrap();
+        let warnings = profile.deprecation_warnings(&pid);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[device]") && warnings[0].contains("ignored"));
+        profile.validate(&pid).unwrap();
+        // The legacy identity is never written back out.
+        let rendered = toml::to_string(&profile).unwrap();
+        assert!(!rendered.contains("legacy-phys"), "{rendered}");
+    }
+
+    #[test]
+    fn test_identical_legacy_devices_do_not_collide_across_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        for name in ["a", "b"] {
+            let mut profile = make_isolated_profile();
+            profile.storage = Some(AgentStorageConfig::Local {
+                path: dir.path().join(name).join("creds"),
+                pin_path: dir.path().join(name).join("pin"),
+            });
+            // The same legacy identity on two profiles used to be a config error.
+            profile.device = Some(DeviceIdentity::default());
+            profiles.insert(name.to_string(), profile);
+        }
+        let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
+            enabled: true,
+            profiles,
+            audit_path: Some(dir.path().join("audit")),
+            acknowledge_global_same_user: vec![],
+            acknowledge_same_user_registration: vec![],
+        };
+        config.validate(None).unwrap();
     }
 
     #[test]
@@ -1645,144 +2251,58 @@ register = "deny"
         assert!(profile.validate(&pid).is_ok());
     }
 
-    fn policy(
-        authorization: AgentAuthorization,
-        user_presence: UserPresenceSource,
-        user_verification: UserVerificationSource,
-    ) -> AgentCeremonyPolicy {
-        AgentCeremonyPolicy {
-            authorization,
-            user_presence,
-            user_verification,
-        }
-    }
-
+    /// R19 (ADR 0014 section 7): automatic interaction mode on the human path refuses agents
+    /// when a same-user profile has an `allow` or `request` rule, unless acknowledged.
     #[test]
-    fn test_explicit_policy_allow_validates() {
-        let mut profile = make_isolated_profile();
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
-        profile.rules = vec![AgentRpRule {
-            credential_selection: None,
-            rp_id: "example.com".to_string(),
-            register: policy(
-                AgentAuthorization::Allow,
-                UserPresenceSource::Agent,
-                UserVerificationSource::Agent,
-            ),
-            authenticate: policy(
-                AgentAuthorization::Confirm,
-                UserPresenceSource::Human,
-                UserVerificationSource::Human,
-            ),
-        }];
+    fn automatic_human_path_refuses_same_user_allow_and_request_rules_unless_acknowledged() {
+        let parse = |extra: &str, mode: &str, authenticate: &str, register: &str| -> AgentConfig {
+            toml::from_str(&format!(
+                r#"
+enabled = true
+{extra}
 
-        assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
-        assert_eq!(profile.allowed_rp_ids(), vec!["example.com"]);
-        assert!(profile.allows_registration());
-        assert!(profile.requires_human_uv());
-    }
+[profiles.agent]
+mode = "{mode}"
+principal_user = "alice"
 
-    #[test]
-    fn test_explicit_policy_rejects_legacy_fields() {
-        let mut profile = make_isolated_profile();
-        profile.rules = vec![AgentRpRule {
-            credential_selection: None,
-            rp_id: "example.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::deny(),
-        }];
-        let err = profile
-            .validate(&ProfileId::new("test").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("cannot be combined"));
-    }
-
-    #[test]
-    fn test_allow_rejects_human_up() {
-        let err = policy(
-            AgentAuthorization::Allow,
-            UserPresenceSource::Human,
-            UserVerificationSource::None,
-        )
-        .validate(
-            &ProfileId::new("test").unwrap(),
-            "example.com",
-            "authentication",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("cannot require human UP"));
-    }
-
-    #[test]
-    fn test_deny_rejects_evidence() {
-        let err = policy(
-            AgentAuthorization::Deny,
-            UserPresenceSource::Agent,
-            UserVerificationSource::None,
-        )
-        .validate(
-            &ProfileId::new("test").unwrap(),
-            "example.com",
-            "registration",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("must use no UP or UV evidence"));
-    }
-
-    #[test]
-    fn test_duplicate_explicit_rp_rule_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
-        let rule = AgentRpRule {
-            credential_selection: None,
-            rp_id: "example.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: policy(
-                AgentAuthorization::Allow,
-                UserPresenceSource::Agent,
-                UserVerificationSource::None,
-            ),
-        };
-        profile.rules = vec![rule.clone(), rule];
-        let err = profile
-            .validate(&ProfileId::new("test").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("duplicate RP rule"));
-    }
-
-    #[test]
-    fn test_explicit_rules_toml_roundtrip() {
-        let input = r#"
-mode = "isolated"
-principal_user = "agent"
-
-[[rules]]
+[[profiles.agent.rules]]
 rp_id = "example.com"
-register = { authorization = "deny", user_presence = "none", user_verification = "none" }
-authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
-
-[storage.local]
-path = "/tmp/rules/credentials"
-pin_path = "/tmp/rules/pin"
-
-[device]
-name = "rules"
-phys = "rules-phys"
-uniq = "rules-uniq"
-vendor_id = 4660
-product_id = 22136
-"#;
-        let profile: AgentProfileConfig = toml::from_str(input).unwrap();
-        assert_eq!(profile.rules.len(), 1);
-        assert_eq!(
-            profile.rules[0].authenticate.authorization,
-            AgentAuthorization::Allow
+authenticate = "{authenticate}"
+register = "{register}"
+"#
+            ))
+            .unwrap()
+        };
+        for (authenticate, register) in [("allow", "deny"), ("request", "deny"), ("deny", "allow")]
+        {
+            let config = parse("", "same-user", authenticate, register);
+            assert_eq!(config.profiles_exposed_to_automatic_human_path(), ["agent"]);
+            let err = config
+                .validate_human_path_interaction(true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("allow_automatic_human_path"), "{err}");
+            assert!(err.contains("'agent'"), "{err}");
+            assert!(config.validate_human_path_interaction(false).is_ok());
+            let acknowledged = parse(
+                "allow_automatic_human_path = true",
+                "same-user",
+                authenticate,
+                register,
+            );
+            assert!(acknowledged.validate_human_path_interaction(true).is_ok());
+        }
+        // Deny-only same-user profiles and isolated profiles are not exposed.
+        let deny_only = parse("", "same-user", "deny", "deny");
+        assert!(deny_only.validate_human_path_interaction(true).is_ok());
+        let isolated = parse("", "isolated", "allow", "deny");
+        assert!(
+            isolated
+                .profiles_exposed_to_automatic_human_path()
+                .is_empty()
         );
-        assert!(profile.validate(&ProfileId::new("rules").unwrap()).is_ok());
+        assert!(isolated.validate_human_path_interaction(true).is_ok());
+        assert!(!AgentConfig::default().allow_automatic_human_path);
     }
 
     #[test]
@@ -1803,8 +2323,6 @@ enabled = true
 [profiles.test]
 mode = "isolated"
 principal_user = "u"
-rp_ids = ["example.com"]
-require_uv = true
 extra_field = "bad"
 
 [profiles.test.device]
@@ -1823,35 +2341,6 @@ pin_path = "/tmp/p"
     }
 
     #[test]
-    fn test_config_toml_isolated_roundtrip() {
-        let toml_str = r#"
-enabled = true
-
-[profiles.release-bot]
-mode = "isolated"
-principal_user = "passless-release"
-rp_ids = ["github.com"]
-require_uv = true
-registration_allowed = true
-
-[profiles.release-bot.device]
-name = "passless-agent-release"
-phys = "release-phys"
-uniq = "release-uniq"
-vendor_id = 4660
-product_id = 22137
-
-[profiles.release-bot.storage.local]
-path = "/var/lib/passless-agent/release/credentials"
-pin_path = "/var/lib/passless-agent/release/pin"
-"#;
-        let config: AgentConfig = toml::from_str(toml_str).unwrap();
-        let profile = config.profiles.get("release-bot").unwrap();
-        assert_eq!(profile.mode, AgentMode::Isolated);
-        assert!(profile.registration_allowed);
-    }
-
-    #[test]
     fn test_profiles_for_rp_id_matches_explicit_rules() {
         let toml_str = r#"
 enabled = true
@@ -1862,8 +2351,8 @@ principal_user = "passless-release"
 
 [[profiles.release-bot.rules]]
 rp_id = "github.com"
-register = { authorization = "deny", user_presence = "none", user_verification = "none" }
-authenticate = { authorization = "allow", user_presence = "policy", user_verification = "policy" }
+register = "deny"
+authenticate = "allow"
 
 [profiles.release-bot.device]
 name = "passless-agent-release"
@@ -1898,101 +2387,18 @@ verbose = false
     }
 
     #[test]
-    fn test_config_device_identity_collision() {
-        let mut profiles = BTreeMap::new();
-        let device = DeviceIdentity {
-            name: "same".to_string(),
-            phys: "same".to_string(),
-            uniq: "same".to_string(),
-            vendor_id: 1,
-            product_id: 2,
-        };
-        profiles.insert(
-            "a".to_string(),
-            AgentProfileConfig {
-                max_operations: 64,
-                max_concurrent_sessions: 1,
-                browser_scope: BrowserScope::Session,
-                credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
-                mode: AgentMode::Isolated,
-                principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
-                credential_refs: None,
-                max_grant_ttl: None,
-                max_session_ttl: None,
-                storage: Some(AgentStorageConfig::Local {
-                    path: PathBuf::from("/tmp/a/creds"),
-                    pin_path: PathBuf::from("/tmp/a/pin"),
-                }),
-                registration_allowed: false,
-                rules: vec![],
-                device: device.clone(),
-                start_url: None,
-                browser_command: None,
-                browser_user: None,
-                browser_runtime_root: None,
-                browser_cdp_expose: None,
-                browser_cdp_port: None,
-            },
-        );
-        profiles.insert(
-            "b".to_string(),
-            AgentProfileConfig {
-                max_operations: 64,
-                max_concurrent_sessions: 1,
-                browser_scope: BrowserScope::Session,
-                credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
-                mode: AgentMode::Isolated,
-                principal_user: "u2".to_string(),
-                rp_ids: vec!["b.com".to_string()],
-                require_uv: true,
-                credential_refs: None,
-                max_grant_ttl: None,
-                max_session_ttl: None,
-                storage: Some(AgentStorageConfig::Local {
-                    path: PathBuf::from("/tmp/b/creds"),
-                    pin_path: PathBuf::from("/tmp/b/pin"),
-                }),
-                registration_allowed: false,
-                rules: vec![],
-                device,
-                start_url: None,
-                browser_command: None,
-                browser_user: None,
-                browser_runtime_root: None,
-                browser_cdp_expose: None,
-                browser_cdp_port: None,
-            },
-        );
-        let config = AgentConfig {
-            enabled: true,
-            profiles,
-            audit_path: Some(PathBuf::from("/tmp/agent-audit")),
-            acknowledge_global_same_user: vec![],
-            acknowledge_same_user_registration: vec![],
-        };
-        let err = config.validate(None).unwrap_err();
-        assert!(err.to_string().contains("collides"));
-    }
-
-    #[test]
     fn test_config_overlapping_roots_rejected() {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2000,15 +2406,9 @@ verbose = false
                     path: PathBuf::from("/tmp/agent/data"),
                     pin_path: PathBuf::from("/tmp/agent/data/sub"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2018,6 +2418,13 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/agent-audit-roots")),
@@ -2038,15 +2445,13 @@ verbose = false
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2054,15 +2459,9 @@ verbose = false
                     path: human_path.join("creds"),
                     pin_path: dir.path().join("pin"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2072,6 +2471,13 @@ verbose = false
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -2090,8 +2496,6 @@ enabled = true
 [profiles.test]
 mode = "delegated"
 principal_user = "u"
-rp_ids = ["example.com"]
-require_uv = true
 
 [profiles.test.device]
 name = "n"
@@ -2112,136 +2516,15 @@ product_id = 2
     }
 
     #[test]
-    fn test_device_identity_nul_in_name_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "te\0st".to_string();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_device_identity_nul_in_phys_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "ph\0ys".to_string();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_device_identity_nul_in_uniq_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "un\0iq".to_string();
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL"));
-    }
-
-    #[test]
-    fn test_device_identity_name_too_long_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "a".repeat(DEVICE_NAME_MAX + 1);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_phys_too_long_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "a".repeat(DEVICE_PHYS_MAX + 1);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_uniq_too_long_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "a".repeat(DEVICE_UNIQ_MAX + 1);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_name_at_nul_boundary_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "a".repeat(UHID_NAME_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_phys_at_nul_boundary_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "a".repeat(UHID_PHYS_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_uniq_at_nul_boundary_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "a".repeat(UHID_UNIQ_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("NUL terminator"));
-    }
-
-    #[test]
-    fn test_device_identity_name_at_max_accepted() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "a".repeat(DEVICE_NAME_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_device_identity_phys_at_max_accepted() {
-        let mut profile = make_isolated_profile();
-        profile.device.phys = "a".repeat(DEVICE_PHYS_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_device_identity_uniq_at_max_accepted() {
-        let mut profile = make_isolated_profile();
-        profile.device.uniq = "a".repeat(DEVICE_UNIQ_MAX);
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
-    fn test_device_identity_human_collision_rejected() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "virtual-fido".to_string();
-        profile.device.phys = "virtual-fido-001".to_string();
-        profile.device.vendor_id = 0x15d9;
-        profile.device.product_id = 0x0a37;
-        let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("human authenticator"));
-    }
-
-    #[test]
-    fn test_device_identity_partial_human_match_allowed() {
-        let mut profile = make_isolated_profile();
-        profile.device.name = "virtual-fido".to_string();
-        profile.device.phys = "virtual-fido-001".to_string();
-        profile.device.vendor_id = 0x1234;
-        profile.device.product_id = 0x5678;
-        let pid = ProfileId::new("test").unwrap();
-        assert!(profile.validate(&pid).is_ok());
-    }
-
-    #[test]
     fn test_enabled_requires_audit_path() {
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles: BTreeMap::new(),
             audit_path: None,
@@ -2255,6 +2538,13 @@ product_id = 2
     #[test]
     fn test_disabled_does_not_require_audit_path() {
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: false,
             profiles: BTreeMap::new(),
             audit_path: None,
@@ -2270,15 +2560,13 @@ product_id = 2
         profiles.insert(
             "myprofile".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2286,15 +2574,9 @@ product_id = 2
                     path: PathBuf::from("/tmp/overlap/data"),
                     pin_path: PathBuf::from("/tmp/overlap/data/sub"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "overlap-test".to_string(),
-                    phys: "p".to_string(),
-                    uniq: "u".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2304,6 +2586,13 @@ product_id = 2
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/overlap-audit")),
@@ -2322,15 +2611,13 @@ product_id = 2
             profiles.insert(
                 name.to_string(),
                 AgentProfileConfig {
+                    max_granted_rules: 64,
                     max_operations: 64,
                     max_concurrent_sessions: 1,
                     browser_scope: BrowserScope::Session,
                     credential_selection: CredentialSelection::Single,
-                    human_verification_prompt: HumanVerificationPrompt::Always,
                     mode: AgentMode::Isolated,
                     principal_user: format!("u-{}", name),
-                    rp_ids: vec!["a.com".to_string()],
-                    require_uv: true,
                     credential_refs: None,
                     max_grant_ttl: None,
                     max_session_ttl: None,
@@ -2338,15 +2625,9 @@ product_id = 2
                         path: PathBuf::from(format!("/tmp/{}", name)),
                         pin_path: PathBuf::from(format!("/tmp/{}-pin", name)),
                     }),
-                    registration_allowed: false,
                     rules: vec![],
-                    device: DeviceIdentity {
-                        name: format!("dev-{}", name),
-                        phys: format!("phys-{}", name),
-                        uniq: format!("uniq-{}", name),
-                        vendor_id: 1,
-                        product_id: 1,
-                    },
+                    legacy: Default::default(),
+                    device: None,
                     start_url: None,
                     browser_command: None,
                     browser_user: None,
@@ -2457,15 +2738,13 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2473,15 +2752,9 @@ backend_type = "local"
                     path: real_dir.clone(),
                     pin_path: symlink_dir.clone(),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2491,6 +2764,13 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -2521,15 +2801,13 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2537,15 +2815,9 @@ backend_type = "local"
                     path: nested.clone(),
                     pin_path: dir.path().join("pin"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2555,6 +2827,13 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(audit_link),
@@ -2577,15 +2856,13 @@ backend_type = "local"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2593,15 +2870,9 @@ backend_type = "local"
                     path: human_real.join("creds"),
                     pin_path: dir.path().join("pin"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2611,6 +2882,13 @@ backend_type = "local"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(dir.path().join("audit")),
@@ -2629,11 +2907,8 @@ enabled = true
 [profiles.bot]
 mode = "isolated"
 principal_user = "u"
-rp_ids = ["example.com"]
-require_uv = true
 credential_store = "/tmp/creds"
 pin_store = "/tmp/pin"
-registration_allowed = true
 
 [profiles.bot.device]
 name = "n"
@@ -2660,8 +2935,6 @@ enabled = true
 [profiles.bot]
 mode = "isolated"
 principal_user = "u"
-rp_ids = ["example.com"]
-require_uv = true
 pin_store = "/tmp/pin"
 
 [profiles.bot.storage.local]
@@ -2688,9 +2961,6 @@ enabled = true
 [profiles.bot]
 mode = "isolated"
 principal_user = "bot-user"
-rp_ids = ["example.com"]
-require_uv = true
-registration_allowed = true
 
 [profiles.bot.device]
 name = "agent-bot"
@@ -2726,9 +2996,6 @@ enabled = true
 [profiles.ci]
 mode = "isolated"
 principal_user = "ci-user"
-rp_ids = ["ci.example.com"]
-require_uv = true
-registration_allowed = false
 
 [profiles.ci.device]
 name = "agent-ci"
@@ -2778,8 +3045,6 @@ enabled = true
 [profiles.ci]
 mode = "isolated"
 principal_user = "ci-user"
-rp_ids = ["ci.example.com"]
-require_uv = true
 
 [profiles.ci.device]
 name = "agent-ci"
@@ -2819,8 +3084,6 @@ enabled = true
 [profiles.secure]
 mode = "isolated"
 principal_user = "secure-user"
-rp_ids = ["secure.example.com"]
-require_uv = true
 
 [profiles.secure.device]
 name = "agent-secure"
@@ -2864,8 +3127,6 @@ enabled = true
 [profiles.secure]
 mode = "isolated"
 principal_user = "secure-user"
-rp_ids = ["secure.example.com"]
-require_uv = true
 
 [profiles.secure.device]
 name = "agent-secure"
@@ -2947,15 +3208,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2963,15 +3222,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     path: PathBuf::from("/tmp/a/creds"),
                     pin_path: shared_pin.clone(),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -2983,15 +3236,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u2".to_string(),
-                rp_ids: vec!["b.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -2999,15 +3250,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     path: PathBuf::from("/tmp/b/creds"),
                     pin_path: shared_pin,
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "b".to_string(),
-                    phys: "b".to_string(),
-                    uniq: "b".to_string(),
-                    vendor_id: 2,
-                    product_id: 2,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3017,6 +3262,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/audit")),
@@ -3066,15 +3318,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -3082,15 +3332,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     path: shared_cred.clone(),
                     pin_path: PathBuf::from("/tmp/a/pin"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3102,15 +3346,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "b".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u2".to_string(),
-                rp_ids: vec!["b.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -3118,15 +3360,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     path: shared_cred,
                     pin_path: PathBuf::from("/tmp/b/pin"),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "b".to_string(),
-                    phys: "b".to_string(),
-                    uniq: "b".to_string(),
-                    vendor_id: 2,
-                    product_id: 2,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3136,6 +3372,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(PathBuf::from("/tmp/audit")),
@@ -3154,15 +3397,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         profiles.insert(
             "a".to_string(),
             AgentProfileConfig {
+                max_granted_rules: 64,
                 max_operations: 64,
                 max_concurrent_sessions: 1,
                 browser_scope: BrowserScope::Session,
                 credential_selection: CredentialSelection::Single,
-                human_verification_prompt: HumanVerificationPrompt::Always,
                 mode: AgentMode::Isolated,
                 principal_user: "u1".to_string(),
-                rp_ids: vec!["a.com".to_string()],
-                require_uv: true,
                 credential_refs: None,
                 max_grant_ttl: None,
                 max_session_ttl: None,
@@ -3170,15 +3411,9 @@ pin_path = "/var/lib/passless-agent/secure/pin"
                     path: dir.path().join("creds"),
                     pin_path: audit.clone(),
                 }),
-                registration_allowed: false,
                 rules: vec![],
-                device: DeviceIdentity {
-                    name: "a".to_string(),
-                    phys: "a".to_string(),
-                    uniq: "a".to_string(),
-                    vendor_id: 1,
-                    product_id: 1,
-                },
+                legacy: Default::default(),
+                device: None,
                 start_url: None,
                 browser_command: None,
                 browser_user: None,
@@ -3188,6 +3423,13 @@ pin_path = "/var/lib/passless-agent/secure/pin"
             },
         );
         let config = AgentConfig {
+            notify_user: None,
+            state_dir: None,
+            escalation_timeout: None,
+            escalation_cooldown: 600,
+            allow_automatic_human_path: false,
+            browser_path: None,
+            limits: Default::default(),
             enabled: true,
             profiles,
             audit_path: Some(audit),
@@ -3236,13 +3478,18 @@ pin_path = "/var/lib/passless-agent/secure/pin"
         assert!(err.to_string().contains("browser_user"));
     }
 
+    /// Defect B7: an isolated profile could not set `browser_runtime_root`, so its browser was
+    /// stuck with the default `$XDG_RUNTIME_DIR/passless/browser`. The runtime root says where the
+    /// browser's per-lease directories live; it does not depend on where the credentials are.
     #[test]
-    fn test_isolated_mode_rejects_browser_runtime_root() {
+    fn test_isolated_mode_accepts_browser_runtime_root() {
         let mut profile = make_isolated_profile();
         profile.browser_runtime_root = Some(PathBuf::from("/var/run/browser"));
         let pid = ProfileId::new("test").unwrap();
-        let err = profile.validate(&pid).unwrap_err();
-        assert!(err.to_string().contains("browser_runtime_root"));
+        profile.validate(&pid).unwrap();
+        // The restrictions that remain: an isolated profile still has no separate browser user.
+        profile.browser_user = Some("browser-user".to_string());
+        assert!(profile.validate(&pid).is_err());
     }
 
     #[cfg(feature = "tpm")]
@@ -3302,8 +3549,6 @@ enabled = true
 [profiles.secure]
 mode = "isolated"
 principal_user = "secure-user"
-rp_ids = ["secure.example.com"]
-require_uv = true
 
 [profiles.secure.device]
 name = "agent-secure"
@@ -3351,7 +3596,7 @@ principal_user = "alice"
 
 [[profiles.coding.rules]]
 rp_id = "*"
-authenticate = "autonomous"
+authenticate = "allow"
 register = "deny"
 "#;
         let cfg: AgentConfig = toml::from_str(raw).unwrap();
@@ -3372,7 +3617,7 @@ principal_user = "alice"
 
 [[profiles.coding.rules]]
 rp_id = "*"
-authenticate = "autonomous"
+authenticate = "allow"
 register = "deny"
 "#;
         let cfg: AgentConfig = toml::from_str(raw).unwrap();
@@ -3391,8 +3636,8 @@ principal_user = "alice"
 
 [[profiles.coding.rules]]
 rp_id = "example.com"
-authenticate = "deny"
-register = "supervised"
+authenticate = "allow"
+register = "request"
 "#;
         let cfg: AgentConfig = toml::from_str(raw).unwrap();
         let err = cfg.validate(None).unwrap_err().to_string();
@@ -3415,13 +3660,10 @@ acknowledge_global_same_user = ["missing"]
     fn credential_selection_for_rp_uses_exact_rule_override() {
         let mut profile = make_isolated_profile();
         profile.credential_selection = CredentialSelection::Single;
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
         profile.rules = vec![AgentRpRule {
             rp_id: "github.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::autonomous(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
             credential_selection: Some(CredentialSelection::Newest),
         }];
         assert_eq!(
@@ -3431,68 +3673,13 @@ acknowledge_global_same_user = ["missing"]
     }
 
     #[test]
-    fn credential_selection_for_rp_uses_wildcard_fallback() {
-        let mut profile = make_isolated_profile();
-        profile.credential_selection = CredentialSelection::Single;
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
-        profile.mode = AgentMode::SameUser;
-        profile.rules = vec![AgentRpRule {
-            rp_id: "*".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::autonomous(),
-            credential_selection: Some(CredentialSelection::FirstMatching),
-        }];
-        assert_eq!(
-            profile.credential_selection_for_rp("any-rp.com"),
-            CredentialSelection::FirstMatching
-        );
-    }
-
-    #[test]
-    fn credential_selection_for_rp_exact_beats_wildcard() {
-        let mut profile = make_isolated_profile();
-        profile.credential_selection = CredentialSelection::Single;
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
-        profile.mode = AgentMode::SameUser;
-        profile.rules = vec![
-            AgentRpRule {
-                rp_id: "*".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy::autonomous(),
-                credential_selection: Some(CredentialSelection::FirstMatching),
-            },
-            AgentRpRule {
-                rp_id: "github.com".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy::autonomous(),
-                credential_selection: Some(CredentialSelection::Newest),
-            },
-        ];
-        assert_eq!(
-            profile.credential_selection_for_rp("github.com"),
-            CredentialSelection::Newest
-        );
-        assert_eq!(
-            profile.credential_selection_for_rp("other.com"),
-            CredentialSelection::FirstMatching
-        );
-    }
-
-    #[test]
     fn credential_selection_for_rp_falls_back_to_profile_default() {
         let mut profile = make_isolated_profile();
         profile.credential_selection = CredentialSelection::Newest;
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
         profile.rules = vec![AgentRpRule {
             rp_id: "github.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::autonomous(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
             credential_selection: None,
         }];
         assert_eq!(
@@ -3505,14 +3692,11 @@ acknowledge_global_same_user = ["missing"]
     fn rule_credential_ref_must_be_in_credential_refs() {
         let cred_ref = CredentialRef::with_default_domain(b"test-cred");
         let mut profile = make_isolated_profile();
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
         profile.credential_refs = Some(vec![cred_ref.clone()]);
         profile.rules = vec![AgentRpRule {
             rp_id: "github.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::autonomous(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
             credential_selection: Some(CredentialSelection::Credential(cred_ref)),
         }];
         assert!(profile.validate(&ProfileId::new("test").unwrap()).is_ok());
@@ -3523,14 +3707,11 @@ acknowledge_global_same_user = ["missing"]
         let cred_ref = CredentialRef::with_default_domain(b"test-cred");
         let other_ref = CredentialRef::with_default_domain(b"other-cred");
         let mut profile = make_isolated_profile();
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
         profile.credential_refs = Some(vec![cred_ref]);
         profile.rules = vec![AgentRpRule {
             rp_id: "github.com".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::autonomous(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
             credential_selection: Some(CredentialSelection::Credential(other_ref)),
         }];
         let err = profile
@@ -3546,23 +3727,17 @@ acknowledge_global_same_user = ["missing"]
     fn wildcard_rule_cannot_use_credential_ref() {
         let cred_ref = CredentialRef::with_default_domain(b"test-cred");
         let mut profile = make_isolated_profile();
-        profile.rp_ids.clear();
-        profile.registration_allowed = false;
-        profile.require_uv = false;
         profile.mode = AgentMode::SameUser;
         profile.rules = vec![AgentRpRule {
             rp_id: "*".to_string(),
-            register: AgentCeremonyPolicy::deny(),
-            authenticate: AgentCeremonyPolicy::autonomous(),
+            register: RuleAction::Deny,
+            authenticate: RuleAction::Allow,
             credential_selection: Some(CredentialSelection::Credential(cred_ref)),
         }];
         let err = profile
             .validate(&ProfileId::new("test").unwrap())
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot select one RP-specific credential reference")
-        );
+        assert!(err.to_string().contains("always selects with `single`"));
     }
 
     #[test]
@@ -3691,5 +3866,1101 @@ acknowledge_global_same_user = ["missing"]
         assert_eq!(profile, BrowserScope::Profile);
         let default: BrowserScope = serde_json::from_str("null").unwrap_or_default();
         assert_eq!(default, BrowserScope::Session);
+    }
+
+    // ---- P4: rule schema, legacy mapping, validation and resolution ----
+
+    #[test]
+    fn rule_action_defaults_to_deny_and_roundtrips_lowercase() {
+        assert_eq!(RuleAction::default(), RuleAction::Deny);
+        for (action, text) in [
+            (RuleAction::Deny, "\"deny\""),
+            (RuleAction::Allow, "\"allow\""),
+            (RuleAction::Request, "\"request\""),
+        ] {
+            assert_eq!(serde_json::to_string(&action).unwrap(), text);
+            assert_eq!(serde_json::from_str::<RuleAction>(text).unwrap(), action);
+            assert_eq!(action.to_string(), text.trim_matches('"'));
+        }
+        assert!(serde_json::from_str::<RuleAction>("\"autonomous\"").is_err());
+    }
+
+    #[test]
+    fn missing_rule_action_denies() {
+        let profile = parse_profile("[[rules]]\nrp_id = \"example.com\"\n").unwrap();
+        assert_eq!(profile.rules[0].authenticate, RuleAction::Deny);
+        assert_eq!(profile.rules[0].register, RuleAction::Deny);
+        assert!(profile.legacy.warnings.is_empty());
+
+        let profile =
+            parse_profile("[[rules]]\nrp_id = \"example.com\"\nauthenticate = \"allow\"\n")
+                .unwrap();
+        assert_eq!(profile.rules[0].authenticate, RuleAction::Allow);
+        assert_eq!(profile.rules[0].register, RuleAction::Deny);
+
+        // A profile without any rule resolves everything to deny.
+        let profile = parse_profile("").unwrap();
+        assert!(profile.rules.is_empty());
+        assert_eq!(
+            profile
+                .resolve(PolicyAction::Authenticate, "example.com")
+                .action,
+            RuleAction::Deny
+        );
+    }
+
+    #[test]
+    fn rule_rejects_unknown_fields() {
+        let err = parse_profile(
+            "[[rules]]\nrp_id = \"example.com\"\nauthenticate = \"allow\"\nuser_presence = \"agent\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("user_presence") || err.contains("unknown field"),
+            "{err}"
+        );
+    }
+
+    fn evidence_table(authorization: &str, up: &str, uv: &str) -> String {
+        format!(
+            "{{ authorization = \"{authorization}\", user_presence = \"{up}\", user_verification = \"{uv}\" }}"
+        )
+    }
+
+    enum Expect {
+        /// Parses to this action; `true` when exactly one deprecation warning is recorded.
+        Mapped(RuleAction, bool),
+        /// Fails to parse with a message containing this text.
+        Rejected(&'static str),
+    }
+
+    fn legacy_mapping_rows() -> Vec<(String, Expect)> {
+        use Expect::{Mapped, Rejected};
+        const UNSAFE: &str = "cannot be mapped safely";
+        let table = |a: &str, up: &str, uv: &str| evidence_table(a, up, uv);
+        let mut rows: Vec<(String, Expect)> = vec![
+            // The new vocabulary: no warning.
+            ("\"deny\"".into(), Mapped(RuleAction::Deny, false)),
+            ("\"allow\"".into(), Mapped(RuleAction::Allow, false)),
+            ("\"request\"".into(), Mapped(RuleAction::Request, false)),
+            // Presets.
+            ("\"autonomous\"".into(), Mapped(RuleAction::Allow, true)),
+            ("\"supervised\"".into(), Mapped(RuleAction::Request, true)),
+            ("\"maybe\"".into(), Rejected("unknown")),
+            // deny: only with no evidence.
+            (
+                table("deny", "none", "none"),
+                Mapped(RuleAction::Deny, true),
+            ),
+            (table("deny", "agent", "none"), Rejected(UNSAFE)),
+            (table("deny", "none", "agent"), Rejected(UNSAFE)),
+            (table("deny", "human", "human"), Rejected(UNSAFE)),
+            (table("deny", "policy", "policy"), Rejected(UNSAFE)),
+            // confirm: anything maps to request.
+            (
+                table("confirm", "human", "human"),
+                Mapped(RuleAction::Request, true),
+            ),
+            (
+                table("confirm", "agent", "agent"),
+                Mapped(RuleAction::Request, true),
+            ),
+            (
+                table("confirm", "none", "none"),
+                Mapped(RuleAction::Request, true),
+            ),
+            (
+                table("confirm", "human", "none"),
+                Mapped(RuleAction::Request, true),
+            ),
+            // allow: only agent (or its `policy` alias) evidence maps.
+            (
+                table("allow", "agent", "agent"),
+                Mapped(RuleAction::Allow, true),
+            ),
+            (
+                table("allow", "policy", "policy"),
+                Mapped(RuleAction::Allow, true),
+            ),
+            (
+                table("allow", "policy", "agent"),
+                Mapped(RuleAction::Allow, true),
+            ),
+        ];
+        // Every other allow combination (human or none evidence) is a parse error.
+        for up in ["human", "agent", "none"] {
+            for uv in ["human", "agent", "none"] {
+                if up == "agent" && uv == "agent" {
+                    continue;
+                }
+                rows.push((table("allow", up, uv), Rejected(UNSAFE)));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn legacy_mapping_table_maps_every_row() {
+        for field in ["authenticate", "register"] {
+            for (value, expect) in legacy_mapping_rows() {
+                let body = format!("[[rules]]\nrp_id = \"example.com\"\n{field} = {value}\n");
+                let parsed = parse_profile(&body);
+                match expect {
+                    Expect::Mapped(action, warns) => {
+                        let profile = parsed
+                            .unwrap_or_else(|err| panic!("`{field} = {value}` must parse: {err}"));
+                        let rule = &profile.rules[0];
+                        let (mapped, other) = match field {
+                            "authenticate" => (rule.authenticate, rule.register),
+                            _ => (rule.register, rule.authenticate),
+                        };
+                        assert_eq!(mapped, action, "`{field} = {value}`");
+                        assert_eq!(other, RuleAction::Deny, "the other action stays deny");
+                        if warns {
+                            assert_eq!(
+                                profile.legacy.warnings.len(),
+                                1,
+                                "`{field} = {value}`: {:?}",
+                                profile.legacy.warnings
+                            );
+                            let warning = &profile.legacy.warnings[0];
+                            assert!(warning.contains(field), "{warning}");
+                            assert!(warning.contains("example.com"), "{warning}");
+                            assert!(
+                                warning.contains(&format!("`{field} = \"{action}\"`")),
+                                "warning names the replacement: {warning}"
+                            );
+                            let reported = profile.deprecation_warnings(&pid("coding"));
+                            assert_eq!(reported.len(), 1);
+                            assert!(reported[0].contains("coding"), "{}", reported[0]);
+                        } else {
+                            assert!(
+                                profile.legacy.warnings.is_empty(),
+                                "`{field} = {value}` is the new vocabulary: {:?}",
+                                profile.legacy.warnings
+                            );
+                            assert!(profile.deprecation_warnings(&pid("coding")).is_empty());
+                        }
+                        assert!(profile.legacy.removed_keys.is_empty());
+                    }
+                    Expect::Rejected(needle) => {
+                        // Parsing never fails on legacy vocabulary (invariant 23): the unmappable
+                        // action parses as `deny` and `validate` reports the problem.
+                        let profile = parsed.unwrap_or_else(|e| {
+                            panic!("`{field} = {value}` must parse leniently: {e}")
+                        });
+                        let rule = &profile.rules[0];
+                        assert_eq!(
+                            if field == "authenticate" {
+                                rule.authenticate
+                            } else {
+                                rule.register
+                            },
+                            RuleAction::Deny
+                        );
+                        let err = profile
+                            .validate(&pid("coding"))
+                            .err()
+                            .unwrap_or_else(|| panic!("`{field} = {value}` must fail validate"))
+                            .to_string();
+                        assert!(err.contains(needle), "`{field} = {value}`: {err}");
+                        assert!(err.contains(field), "error names the field: {err}");
+                        assert!(err.contains("example.com"), "error names the rule: {err}");
+                        if needle == "cannot be mapped safely" {
+                            // Actionable: it says what to write instead.
+                            assert!(
+                                err.contains(&format!("{field} = \"")),
+                                "error suggests a replacement: {err}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_allow_with_human_or_no_evidence_names_the_evidence() {
+        let human = parse_profile(&format!(
+            "[[rules]]\nrp_id = \"example.com\"\nauthenticate = {}\n",
+            evidence_table("allow", "human", "human")
+        ))
+        .unwrap()
+        .validate(&pid("coding"))
+        .unwrap_err()
+        .to_string();
+        assert!(human.contains("cannot be mapped safely"), "{human}");
+        assert!(human.contains("user_presence = human"), "{human}");
+
+        let none = parse_profile(&format!(
+            "[[rules]]\nrp_id = \"example.com\"\nregister = {}\n",
+            evidence_table("allow", "none", "none")
+        ))
+        .unwrap()
+        .validate(&pid("coding"))
+        .unwrap_err()
+        .to_string();
+        assert!(none.contains("cannot be mapped safely"), "{none}");
+        assert!(none.contains("user_presence = none"), "{none}");
+    }
+
+    #[test]
+    fn invalid_legacy_rule_does_not_break_load_when_agents_disabled() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let local = dir.path().join("store");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+backend_type = "local"
+
+[local]
+path = "{}"
+
+[agents]
+enabled = false
+
+[agents.profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+
+[[agents.profiles.coding.rules]]
+rp_id = "example.com"
+authenticate = {{ authorization = "allow", user_presence = "none", user_verification = "none" }}
+register = "maybe"
+"#,
+                local.display()
+            ),
+        )
+        .unwrap();
+        let mut args =
+            crate::config::Args::try_parse_from(["passless", "-c", config_path.to_str().unwrap()])
+                .unwrap();
+        let config = crate::config::AppConfig::load(&mut args)
+            .expect("an invalid legacy rule must not break the human config load");
+        // The human authenticator config is usable, and agents stay disabled and unvalidated.
+        assert_eq!(config.backend_type, "local");
+        assert!(config.backend().is_ok());
+        assert!(!config.agents.enabled);
+        config.validate().expect("validate skips disabled agents");
+
+        // Enabled, the same config fails validation with an actionable message.
+        let mut enabled = config.agents.clone();
+        enabled.enabled = true;
+        enabled.audit_path = Some(dir.path().join("audit"));
+        let err = enabled.validate(None).unwrap_err().to_string();
+        assert!(err.contains("coding"), "{err}");
+        assert!(err.contains("cannot be mapped safely"), "{err}");
+        assert!(err.contains("unknown `register` value 'maybe'"), "{err}");
+    }
+
+    #[test]
+    fn wrongly_typed_legacy_action_is_reported_by_validate_not_parse() {
+        let profile = parse_profile("[[rules]]\nrp_id = \"example.com\"\nauthenticate = 7\n")
+            .expect("parses leniently");
+        assert_eq!(profile.rules[0].authenticate, RuleAction::Deny);
+        let err = profile.validate(&pid("coding")).unwrap_err().to_string();
+        assert!(err.contains("unrecognized value"), "{err}");
+    }
+
+    #[test]
+    fn grant_scope_is_capped_without_wildcard_and_collapses_with_one() {
+        let denies = |n: usize| -> Vec<AgentRpRule> {
+            (0..n)
+                .map(|i| {
+                    rule(
+                        &format!("deny{i}.example.com"),
+                        RuleAction::Deny,
+                        RuleAction::Deny,
+                    )
+                })
+                .collect()
+        };
+
+        // Exactly at the limit: valid, and every rule's RP is in the scope.
+        let at_limit = same_user_profile(denies(MAX_GRANT_RP_IDS));
+        at_limit.validate(&pid("coding")).unwrap();
+        assert_eq!(at_limit.rule_rp_ids().len(), MAX_GRANT_RP_IDS);
+
+        // One over, no wildcard: rejected at config validation with a clear message, never at runtime.
+        let over = same_user_profile(denies(MAX_GRANT_RP_IDS + 1));
+        let err = over.validate(&pid("coding")).unwrap_err().to_string();
+        assert!(err.contains("exceed the limit of 32"), "{err}");
+        assert!(err.contains("coding"), "{err}");
+
+        // A wildcard collapses the scope: `*` allow plus many exact denies is valid and the scope is `*`.
+        let mut rules = denies(MAX_GRANT_RP_IDS + 20);
+        rules.push(rule("*", RuleAction::Allow, RuleAction::Deny));
+        let wildcard = same_user_profile(rules.clone());
+        wildcard.validate(&pid("coding")).unwrap();
+        assert_eq!(wildcard.rule_rp_ids(), vec!["*".to_string()]);
+
+        // `localhost` is never matched by `*`, so an exact localhost rule stays in the scope.
+        rules.push(rule("localhost", RuleAction::Allow, RuleAction::Deny));
+        let with_localhost = same_user_profile(rules);
+        with_localhost.validate(&pid("coding")).unwrap();
+        assert_eq!(
+            with_localhost.rule_rp_ids(),
+            vec!["*".to_string(), "localhost".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_rule_with_both_fields_records_one_warning_per_field() {
+        let profile = parse_profile(
+            "[[rules]]\nrp_id = \"example.com\"\nauthenticate = \"autonomous\"\nregister = \"supervised\"\n",
+        )
+        .unwrap();
+        assert_eq!(profile.rules[0].authenticate, RuleAction::Allow);
+        assert_eq!(profile.rules[0].register, RuleAction::Request);
+        assert_eq!(profile.legacy.warnings.len(), 2);
+    }
+
+    #[test]
+    fn config_deprecation_warnings_aggregate_across_profiles() {
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit-p4"
+
+[profiles.alpha]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.alpha.rules]]
+rp_id = "a.example.com"
+authenticate = "autonomous"
+register = "supervised"
+
+[profiles.beta]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.beta.rules]]
+rp_id = "b.example.com"
+authenticate = { authorization = "confirm", user_presence = "human", user_verification = "human" }
+
+[profiles.gamma]
+mode = "same-user"
+principal_user = "alice"
+
+[profiles.gamma.device]
+name = "legacy"
+
+[[profiles.gamma.rules]]
+rp_id = "c.example.com"
+authenticate = "allow"
+register = "deny"
+
+[profiles.clean]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.clean.rules]]
+rp_id = "d.example.com"
+authenticate = "request"
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        let warnings = cfg.deprecation_warnings();
+        let count = |profile: &str| {
+            warnings
+                .iter()
+                .filter(|w| w.contains(&format!("agent profile '{profile}'")))
+                .count()
+        };
+        assert_eq!(count("alpha"), 2, "{warnings:?}");
+        assert_eq!(count("beta"), 1, "{warnings:?}");
+        assert_eq!(count("gamma"), 1, "device table only: {warnings:?}");
+        assert_eq!(count("clean"), 0, "{warnings:?}");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+    }
+
+    #[test]
+    fn config_without_legacy_vocabulary_has_no_warnings() {
+        let raw = r#"
+enabled = true
+audit_path = "/tmp/passless-agent-audit-p4"
+acknowledge_global_same_user = ["coding"]
+
+[profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+
+[[profiles.coding.rules]]
+rp_id = "github.com"
+authenticate = "allow"
+register = "deny"
+
+[[profiles.coding.rules]]
+rp_id = "*"
+authenticate = "request"
+register = "deny"
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.deprecation_warnings().is_empty());
+        cfg.validate(None).unwrap();
+    }
+
+    #[test]
+    fn removed_profile_keys_parse_but_fail_validation_with_migration_message() {
+        for (key, value) in [
+            ("rp_ids", "[\"example.com\"]"),
+            ("require_uv", "true"),
+            ("registration_allowed", "true"),
+            ("human_verification_prompt", "\"always\""),
+        ] {
+            let profile = parse_profile(&format!("{key} = {value}\n")).unwrap();
+            assert_eq!(profile.legacy.removed_keys, vec![key.to_string()]);
+
+            let err = profile
+                .validate(&pid("legacy-bot"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("legacy-bot"), "{err}");
+            assert!(err.contains(&format!("`{key}`")), "{err}");
+            assert!(
+                err.contains("[[agents.profiles.legacy-bot.rules]]"),
+                "{err}"
+            );
+
+            // The same failure surfaces through the whole-config validation.
+            let cfg = agent_config(profile, false, false);
+            let err = cfg.validate(None).unwrap_err().to_string();
+            assert!(
+                err.contains("coding") && err.contains(&format!("`{key}`")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_profile_keys_are_all_reported_together() {
+        let profile = parse_profile(
+            "rp_ids = [\"example.com\"]\nrequire_uv = true\nregistration_allowed = false\nhuman_verification_prompt = \"never\"\n",
+        )
+        .unwrap();
+        assert_eq!(profile.legacy.removed_keys.len(), 4);
+        let err = profile.validate(&pid("bot")).unwrap_err().to_string();
+        for key in [
+            "rp_ids",
+            "require_uv",
+            "registration_allowed",
+            "human_verification_prompt",
+        ] {
+            assert!(err.contains(&format!("`{key}`")), "{err}");
+        }
+    }
+
+    #[test]
+    fn unknown_profile_keys_are_still_rejected() {
+        assert!(parse_profile("extra_field = \"bad\"\n").is_err());
+    }
+
+    #[test]
+    fn rules_toml_roundtrip_uses_new_vocabulary() {
+        let profile = parse_profile(
+            r#"
+[[rules]]
+rp_id = "example.com"
+authenticate = "allow"
+register = "request"
+credential_selection = "newest"
+
+[[rules]]
+rp_id = "other.example.com"
+authenticate = "request"
+"#,
+        )
+        .unwrap();
+        assert_eq!(profile.rules.len(), 2);
+        assert!(profile.legacy.warnings.is_empty());
+        let rendered = toml::to_string(&profile).unwrap();
+        assert!(rendered.contains("authenticate = \"allow\""), "{rendered}");
+        assert!(rendered.contains("register = \"request\""), "{rendered}");
+        let reparsed: AgentProfileConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.rules, profile.rules);
+        assert!(reparsed.legacy.warnings.is_empty());
+    }
+
+    #[test]
+    fn explicit_rules_report_allowed_rps_and_registration() {
+        let mut profile = make_isolated_profile();
+        profile.rules = vec![
+            rule("example.com", RuleAction::Request, RuleAction::Allow),
+            rule("denied.example.com", RuleAction::Deny, RuleAction::Deny),
+        ];
+        profile.validate(&pid("test")).unwrap();
+        assert_eq!(profile.allowed_rp_ids(), vec!["example.com"]);
+        assert!(profile.allows_registration());
+        assert!(profile.allows_authentication());
+
+        profile.rules = vec![rule("example.com", RuleAction::Deny, RuleAction::Deny)];
+        assert!(profile.allowed_rp_ids().is_empty());
+        assert!(!profile.allows_registration());
+        assert!(!profile.allows_authentication());
+    }
+
+    #[test]
+    fn duplicate_rp_rule_rejected_case_insensitively() {
+        let mut profile = make_isolated_profile();
+        profile.rules = vec![
+            rule("example.com", RuleAction::Allow, RuleAction::Deny),
+            rule("Example.COM", RuleAction::Request, RuleAction::Deny),
+        ];
+        let err = profile.validate(&pid("test")).unwrap_err();
+        assert!(err.to_string().contains("duplicate RP rule"));
+    }
+
+    // ---- validation: wildcard ----
+
+    #[test]
+    fn wildcard_requires_same_user_mode() {
+        let mut profile = make_isolated_profile();
+        profile.rules = vec![rule("*", RuleAction::Allow, RuleAction::Deny)];
+        let err = profile.validate(&pid("test")).unwrap_err();
+        assert!(err.to_string().contains("only supported in same-user mode"));
+
+        let profile = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Deny)]);
+        profile.validate(&pid("test")).unwrap();
+    }
+
+    #[test]
+    fn wildcard_requires_global_same_user_acknowledgement() {
+        // Allow, request and even deny/deny wildcard rules need the acknowledgement.
+        for authenticate in [RuleAction::Allow, RuleAction::Request, RuleAction::Deny] {
+            let profile = same_user_profile(vec![rule("*", authenticate, RuleAction::Deny)]);
+            let err = agent_config(profile.clone(), false, false)
+                .validate(None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("acknowledge_global_same_user"),
+                "authenticate = {authenticate}: {err}"
+            );
+            agent_config(profile, true, false).validate(None).unwrap();
+        }
+    }
+
+    #[test]
+    fn wildcard_requires_register_deny_including_request() {
+        for register in [RuleAction::Allow, RuleAction::Request] {
+            let profile = same_user_profile(vec![rule("*", RuleAction::Allow, register)]);
+            let err = profile.validate(&pid("test")).unwrap_err().to_string();
+            assert!(
+                err.contains("register = \"deny\""),
+                "register = {register}: {err}"
+            );
+            // The acknowledgements do not lift the restriction.
+            let err = agent_config(profile, true, true)
+                .validate(None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("register = \"deny\""), "{err}");
+        }
+    }
+
+    #[test]
+    fn wildcard_selection_is_forced_to_single() {
+        let cred_ref = CredentialRef::with_default_domain(b"wild");
+        for rejected in [
+            CredentialSelection::FirstMatching,
+            CredentialSelection::Newest,
+            CredentialSelection::Credential(cred_ref),
+        ] {
+            let mut wildcard = rule("*", RuleAction::Allow, RuleAction::Deny);
+            wildcard.credential_selection = Some(rejected.clone());
+            let err = same_user_profile(vec![wildcard])
+                .validate(&pid("test"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("always selects with `single`"),
+                "{rejected:?}: {err}"
+            );
+        }
+
+        for accepted in [None, Some(CredentialSelection::Single)] {
+            let mut wildcard = rule("*", RuleAction::Allow, RuleAction::Deny);
+            wildcard.credential_selection = accepted.clone();
+            same_user_profile(vec![wildcard])
+                .validate(&pid("test"))
+                .unwrap_or_else(|err| panic!("{accepted:?} must validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn wildcard_forbids_credential_refs() {
+        let mut profile = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Deny)]);
+        profile.credential_refs = Some(vec![CredentialRef::with_default_domain(b"restricted")]);
+        let err = profile.validate(&pid("test")).unwrap_err().to_string();
+        assert!(err.contains("credential_refs to be omitted"), "{err}");
+    }
+
+    // ---- validation: register = request ----
+
+    #[test]
+    fn register_request_accepted_on_exact_rp_with_authenticate_allow_or_request() {
+        for authenticate in [RuleAction::Allow, RuleAction::Request] {
+            let mut isolated = make_isolated_profile();
+            isolated.rules = vec![rule("example.com", authenticate, RuleAction::Request)];
+            isolated
+                .validate(&pid("test"))
+                .unwrap_or_else(|err| panic!("isolated, authenticate = {authenticate}: {err}"));
+
+            let same_user =
+                same_user_profile(vec![rule("example.com", authenticate, RuleAction::Request)]);
+            agent_config(same_user, false, true)
+                .validate(None)
+                .unwrap_or_else(|err| panic!("same-user, authenticate = {authenticate}: {err}"));
+        }
+    }
+
+    #[test]
+    fn register_request_rejected_with_authenticate_deny() {
+        let mut profile = make_isolated_profile();
+        profile.rules = vec![rule("example.com", RuleAction::Deny, RuleAction::Request)];
+        let err = profile.validate(&pid("test")).unwrap_err().to_string();
+        assert!(
+            err.contains("register = \"request\" with authenticate = \"deny\""),
+            "{err}"
+        );
+        assert!(err.contains("example.com"), "{err}");
+    }
+
+    #[test]
+    fn register_request_rejected_on_wildcard() {
+        let profile = same_user_profile(vec![rule("*", RuleAction::Request, RuleAction::Request)]);
+        let err = profile.validate(&pid("test")).unwrap_err().to_string();
+        assert!(err.contains("register = \"deny\""), "{err}");
+    }
+
+    #[test]
+    fn same_user_register_request_requires_registration_acknowledgement() {
+        let profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Allow,
+            RuleAction::Request,
+        )]);
+        let err = agent_config(profile.clone(), false, false)
+            .validate(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acknowledge_same_user_registration"), "{err}");
+        agent_config(profile, false, true).validate(None).unwrap();
+    }
+
+    #[test]
+    fn same_user_register_allow_requires_registration_acknowledgement() {
+        let profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Allow,
+            RuleAction::Allow,
+        )]);
+        let err = agent_config(profile.clone(), false, false)
+            .validate(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acknowledge_same_user_registration"), "{err}");
+        agent_config(profile, false, true).validate(None).unwrap();
+    }
+
+    #[test]
+    fn same_user_authenticate_only_needs_no_registration_acknowledgement() {
+        let profile = same_user_profile(vec![rule(
+            "example.com",
+            RuleAction::Request,
+            RuleAction::Deny,
+        )]);
+        agent_config(profile, false, false).validate(None).unwrap();
+    }
+
+    // ---- localhost ----
+
+    #[test]
+    fn localhost_is_a_valid_exact_rp_id_only() {
+        assert_eq!(validate_rp_id("localhost").unwrap(), LOCALHOST_RP_ID);
+        assert_eq!(validate_rp_id("LOCALHOST").unwrap(), "localhost");
+        assert_eq!(validate_rp_id(" LocalHost ").unwrap(), "localhost");
+        assert!(validate_rp_id("foo.localhost").is_err());
+        assert!(validate_rp_id("a.b.localhost").is_err());
+        assert!(validate_rp_id("*.localhost").is_err());
+        assert!(validate_rp_id("localhost:8443").is_err());
+        assert!(validate_rp_id("http://localhost").is_err());
+
+        assert_eq!(validate_agent_rp_rule_id("localhost").unwrap(), "localhost");
+        assert!(validate_agent_rp_rule_id("foo.localhost").is_err());
+        assert!(validate_agent_rp_rule_id("*.localhost").is_err());
+    }
+
+    #[test]
+    fn exact_localhost_rule_validates() {
+        let mut profile = make_isolated_profile();
+        profile.rules = vec![rule("localhost", RuleAction::Allow, RuleAction::Deny)];
+        profile.validate(&pid("test")).unwrap();
+
+        let profile = same_user_profile(vec![rule(
+            "LocalHost",
+            RuleAction::Request,
+            RuleAction::Deny,
+        )]);
+        agent_config(profile, false, false).validate(None).unwrap();
+
+        let mut bad = make_isolated_profile();
+        bad.rules = vec![rule("foo.localhost", RuleAction::Allow, RuleAction::Deny)];
+        assert!(bad.validate(&pid("test")).is_err());
+    }
+
+    #[test]
+    fn wildcard_does_not_resolve_localhost_but_exact_rule_does() {
+        let wildcard_only = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Deny)]);
+        for rp_id in ["localhost", "LOCALHOST"] {
+            let matched = wildcard_only.resolve(PolicyAction::Authenticate, rp_id);
+            assert_eq!(matched.action, RuleAction::Deny, "{rp_id}");
+            assert_eq!(matched.rule, RuleIdentity::None, "{rp_id}");
+            assert_eq!(matched.audit_rule(), None);
+        }
+        // The same wildcard still governs an ordinary RP.
+        let matched = wildcard_only.resolve(PolicyAction::Authenticate, "github.com");
+        assert_eq!(matched.action, RuleAction::Allow);
+        assert_eq!(matched.rule, RuleIdentity::Wildcard);
+
+        let with_exact = same_user_profile(vec![
+            rule("*", RuleAction::Allow, RuleAction::Deny),
+            rule("localhost", RuleAction::Allow, RuleAction::Deny),
+        ]);
+        let matched = with_exact.resolve(PolicyAction::Authenticate, "localhost");
+        assert_eq!(matched.action, RuleAction::Allow);
+        assert_eq!(matched.rule, RuleIdentity::Exact("localhost".to_string()));
+        assert_eq!(matched.audit_rule(), Some("localhost"));
+    }
+
+    #[test]
+    fn profiles_for_rp_id_never_matches_localhost_through_wildcard() {
+        let profile = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Deny)]);
+        let cfg = agent_config(profile, true, false);
+        assert_eq!(cfg.profiles_for_rp_id("github.com").len(), 1);
+        assert!(cfg.profiles_for_rp_id("localhost").is_empty());
+
+        let exact = same_user_profile(vec![rule("localhost", RuleAction::Allow, RuleAction::Deny)]);
+        let cfg = agent_config(exact, false, false);
+        assert_eq!(cfg.profiles_for_rp_id("localhost").len(), 1);
+    }
+
+    // ---- B4 ----
+
+    // B4 regression: a profile whose rules are all `deny` authorizes nothing and still loads.
+    #[test]
+    fn all_deny_profile_loads_b4() {
+        let same_user = same_user_profile(vec![
+            rule("example.com", RuleAction::Deny, RuleAction::Deny),
+            rule("other.example.com", RuleAction::Deny, RuleAction::Deny),
+        ]);
+        let cfg = agent_config(same_user, false, false);
+        cfg.validate(None).unwrap();
+        let profile = cfg.get_profile("coding").unwrap();
+        assert!(profile.allowed_rp_ids().is_empty());
+        assert_eq!(
+            profile
+                .resolve(PolicyAction::Authenticate, "example.com")
+                .action,
+            RuleAction::Deny
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut isolated = make_isolated_profile();
+        isolated.storage = Some(AgentStorageConfig::Local {
+            path: dir.path().join("creds"),
+            pin_path: dir.path().join("pin"),
+        });
+        isolated.rules = vec![rule("example.com", RuleAction::Deny, RuleAction::Deny)];
+        let mut cfg = agent_config(isolated, false, false);
+        cfg.audit_path = Some(dir.path().join("audit"));
+        cfg.validate(None).unwrap();
+
+        // No rules at all loads too.
+        let mut empty = make_isolated_profile();
+        empty.storage = cfg.profiles["coding"].storage.clone();
+        empty.rules = vec![];
+        let mut cfg = agent_config(empty, false, false);
+        cfg.audit_path = Some(dir.path().join("audit"));
+        cfg.validate(None).unwrap();
+    }
+
+    // ---- credential selection ----
+
+    #[test]
+    fn credential_selection_for_rp_wildcard_is_always_single() {
+        let mut profile = same_user_profile(vec![rule("*", RuleAction::Allow, RuleAction::Deny)]);
+        profile.credential_selection = CredentialSelection::Newest;
+        assert_eq!(
+            profile.credential_selection_for_rp("any-rp.com"),
+            CredentialSelection::Single,
+            "the wildcard ignores the profile default"
+        );
+
+        // Validation rejects an override on the wildcard; resolution still forces `single`
+        // for a rule that bypassed validation.
+        let mut bypassed = rule("*", RuleAction::Allow, RuleAction::Deny);
+        bypassed.credential_selection = Some(CredentialSelection::FirstMatching);
+        let mut profile = same_user_profile(vec![bypassed]);
+        profile.credential_selection = CredentialSelection::Newest;
+        assert_eq!(
+            profile.credential_selection_for_rp("any-rp.com"),
+            CredentialSelection::Single
+        );
+    }
+
+    #[test]
+    fn credential_selection_for_rp_exact_beats_wildcard_and_default() {
+        let mut exact = rule("github.com", RuleAction::Allow, RuleAction::Deny);
+        exact.credential_selection = Some(CredentialSelection::Newest);
+        let mut profile = same_user_profile(vec![
+            rule("*", RuleAction::Allow, RuleAction::Deny),
+            exact,
+            rule("gitlab.com", RuleAction::Allow, RuleAction::Deny),
+        ]);
+        profile.credential_selection = CredentialSelection::FirstMatching;
+        // Exact override.
+        assert_eq!(
+            profile.credential_selection_for_rp("github.com"),
+            CredentialSelection::Newest
+        );
+        // Exact rule without an override uses the profile default.
+        assert_eq!(
+            profile.credential_selection_for_rp("gitlab.com"),
+            CredentialSelection::FirstMatching
+        );
+        // Wildcard match.
+        assert_eq!(
+            profile.credential_selection_for_rp("other.com"),
+            CredentialSelection::Single
+        );
+    }
+
+    #[test]
+    fn credential_selection_for_rp_unmatched_rp_uses_profile_default() {
+        let mut profile = make_isolated_profile();
+        profile.credential_selection = CredentialSelection::Newest;
+        assert_eq!(
+            profile.credential_selection_for_rp("unlisted.example.com"),
+            CredentialSelection::Newest
+        );
+    }
+
+    fn escalation_config(principal: &str, browser: Option<&str>) -> AgentConfig {
+        let mut profile = make_isolated_profile();
+        profile.principal_user = principal.to_string();
+        profile.browser_user = browser.map(str::to_string);
+        agent_config(profile, false, false)
+    }
+
+    fn users(name: &str) -> Option<u32> {
+        match name {
+            "root" => Some(0),
+            "alice" => Some(1000),
+            "agent" => Some(1001),
+            "browser" => Some(1002),
+            "alias-of-alice" => Some(1000),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn escalation_keys_have_defaults_and_parse() {
+        let defaults = AgentConfig::from_toml_str("[agents]\nenabled = false\n", "t").unwrap();
+        assert_eq!(
+            defaults.escalation_cooldown,
+            DEFAULT_ESCALATION_COOLDOWN_SECS
+        );
+        assert_eq!(defaults.escalation_timeout, None);
+        assert_eq!(defaults.notify_user, None);
+        assert_eq!(defaults.state_dir, None);
+        assert_eq!(AgentConfig::default().escalation_cooldown, 600);
+
+        let parsed = AgentConfig::from_toml_str(
+            "[agents]\nnotify_user = \"alice\"\nstate_dir = \"/var/lib/x\"\n\
+             escalation_timeout = 900\nescalation_cooldown = 120\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(parsed.notify_user.as_deref(), Some("alice"));
+        assert_eq!(parsed.state_dir, Some(PathBuf::from("/var/lib/x")));
+        assert_eq!(parsed.escalation_timeout(), Some(Duration::from_secs(900)));
+        assert_eq!(parsed.escalation_cooldown(), Duration::from_secs(120));
+
+        let profile = parse_profile("").unwrap();
+        assert_eq!(profile.max_granted_rules, DEFAULT_MAX_GRANTED_RULES);
+        let profile = parse_profile("max_granted_rules = 8").unwrap();
+        assert_eq!(profile.max_granted_rules, 8);
+    }
+
+    #[test]
+    fn max_granted_rules_is_bounded() {
+        for (value, valid) in [(0, false), (1, true), (MAX_GRANTED_RULES_LIMIT, true)] {
+            let mut profile = make_isolated_profile();
+            profile.max_granted_rules = value;
+            assert_eq!(profile.validate(&pid("coding")).is_ok(), valid, "{value}");
+        }
+        let mut profile = make_isolated_profile();
+        profile.max_granted_rules = MAX_GRANTED_RULES_LIMIT + 1;
+        let err = profile.validate(&pid("coding")).unwrap_err().to_string();
+        assert!(err.contains("max_granted_rules"), "{err}");
+    }
+
+    #[test]
+    fn escalation_cooldown_and_timeout_are_bounded() {
+        let mut config = escalation_config("alice", None);
+        for (cooldown, valid) in [
+            (0, false),
+            (1, cfg!(debug_assertions)),
+            (60, true),
+            (MAX_ESCALATION_COOLDOWN_SECS, true),
+            (MAX_ESCALATION_COOLDOWN_SECS + 1, false),
+        ] {
+            config.escalation_cooldown = cooldown;
+            assert_eq!(
+                config.validate_escalation(1000, &users).is_ok(),
+                valid,
+                "cooldown {cooldown}"
+            );
+        }
+        config.escalation_cooldown = 600;
+        for (timeout, valid) in [
+            (0, false),
+            (1, true),
+            (MAX_ESCALATION_TIMEOUT_SECS, true),
+            (MAX_ESCALATION_TIMEOUT_SECS + 1, false),
+        ] {
+            config.escalation_timeout = Some(timeout);
+            assert_eq!(
+                config.validate_escalation(1000, &users).is_ok(),
+                valid,
+                "timeout {timeout}"
+            );
+        }
+        config.escalation_timeout = None;
+        config.state_dir = Some(PathBuf::from("relative/state"));
+        let err = config
+            .validate_escalation(1000, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("state_dir"), "{err}");
+    }
+
+    #[test]
+    fn non_root_daemon_may_only_notify_its_own_user() {
+        let mut config = escalation_config("agent", None);
+        assert!(config.validate_escalation(1000, &users).is_ok());
+        config.notify_user = Some("alice".to_string());
+        assert!(config.validate_escalation(1000, &users).is_ok());
+        config.notify_user = Some("agent".to_string());
+        let err = config
+            .validate_escalation(1000, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("differs from the daemon's user"), "{err}");
+        config.notify_user = Some("ghost".to_string());
+        let err = config
+            .validate_escalation(1000, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        config.notify_user = Some(String::new());
+        assert!(config.validate_escalation(1000, &users).is_err());
+    }
+
+    #[test]
+    fn root_daemon_notify_user_must_differ_from_principal_and_browser_users() {
+        let mut config = escalation_config("agent", Some("browser"));
+        assert!(config.escalation_unavailable_reason(0).is_some());
+        assert!(config.escalation_unavailable_reason(1000).is_none());
+        assert!(config.validate_escalation(0, &users).is_ok());
+
+        config.notify_user = Some("alice".to_string());
+        assert!(config.validate_escalation(0, &users).is_ok());
+        assert!(config.escalation_unavailable_reason(0).is_none());
+
+        config.notify_user = Some("agent".to_string());
+        let err = config
+            .validate_escalation(0, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("principal_user"), "{err}");
+
+        config.notify_user = Some("browser".to_string());
+        let err = config
+            .validate_escalation(0, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("browser_user"), "{err}");
+
+        // The same UID under another name is the same user.
+        let mut aliased = escalation_config("alias-of-alice", None);
+        aliased.notify_user = Some("alice".to_string());
+        assert!(aliased.validate_escalation(0, &users).is_err());
+
+        config.notify_user = Some("root".to_string());
+        let err = config
+            .validate_escalation(0, &users)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be root"), "{err}");
+    }
+
+    #[test]
+    fn notify_user_and_state_dir_are_restart_only() {
+        let current = escalation_config("agent", None);
+        let mut next = current.clone();
+        next.notify_user = Some("alice".to_string());
+        assert_eq!(
+            current.reload_incompatibility(&next).as_deref(),
+            Some("agents.notify_user changed")
+        );
+        let mut next = current.clone();
+        next.state_dir = Some(PathBuf::from("/var/lib/elsewhere"));
+        assert_eq!(
+            current.reload_incompatibility(&next).as_deref(),
+            Some("agents.state_dir changed")
+        );
+        let mut next = current.clone();
+        next.escalation_cooldown = 60;
+        next.escalation_timeout = Some(300);
+        next.profiles.get_mut("coding").unwrap().max_granted_rules = 8;
+        assert_eq!(current.reload_incompatibility(&next), None);
+    }
+
+    #[test]
+    fn explicit_state_dir_store_must_not_overlap_agent_roots() {
+        let mut config = escalation_config("agent", None);
+        config.state_dir = Some(PathBuf::from("/tmp/test-agent/creds"));
+        let err = config.validate(None).unwrap_err().to_string();
+        assert!(err.contains("granted-rules"), "{err}");
+    }
+
+    #[test]
+    fn lookup_user_uid_accepts_numeric_uids() {
+        assert_eq!(lookup_user_uid("1234"), Some(1234));
+        assert_eq!(lookup_user_uid("root"), Some(0));
+        assert_eq!(lookup_user_uid("passless-no-such-user-xyz"), None);
+    }
+
+    #[test]
+    fn effective_state_dir_prefers_the_configured_one() {
+        let mut config = AgentConfig::default();
+        assert_eq!(
+            config.effective_state_dir(0),
+            Some(PathBuf::from(SYSTEM_STATE_DIR))
+        );
+        config.state_dir = Some(PathBuf::from("/srv/passless"));
+        assert_eq!(
+            config.effective_state_dir(0),
+            Some(PathBuf::from("/srv/passless"))
+        );
+        assert_eq!(
+            config.effective_state_dir(1000),
+            Some(PathBuf::from("/srv/passless"))
+        );
     }
 }

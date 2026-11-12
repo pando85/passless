@@ -91,7 +91,10 @@ fn aes_gcm_encrypt_with_aad(
         log::error!("Failed to create AES cipher: {}", e);
         soft_fido2::Error::Other
     })?;
-    let nonce = Nonce::try_from(nonce).expect("valid nonce length");
+    let nonce = Nonce::try_from(nonce).map_err(|_| {
+        log::error!("AES-GCM nonce has the wrong length: {}", nonce.len());
+        soft_fido2::Error::Other
+    })?;
     cipher
         .encrypt(
             &nonce,
@@ -116,7 +119,10 @@ fn aes_gcm_decrypt_with_aad(
         log::error!("Failed to create AES cipher: {}", e);
         soft_fido2::Error::Other
     })?;
-    let nonce = Nonce::try_from(nonce).expect("valid nonce length");
+    let nonce = Nonce::try_from(nonce).map_err(|_| {
+        log::error!("AES-GCM nonce has the wrong length: {}", nonce.len());
+        soft_fido2::Error::Other
+    })?;
     cipher
         .decrypt(
             &nonce,
@@ -430,16 +436,22 @@ impl TpmStorageAdapter {
     pub fn seal_data(&self, data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         debug!("Sealing {} bytes with TPM (hybrid encryption)", data.len());
 
+        // `try_fill_bytes`, not `fill_bytes`: an OS RNG failure is an error, never a panic, because
+        // agent ceremonies write credentials here under the shared storage lock (ADR 0014
+        // invariant 23).
         let mut aes_key = [0u8; 32];
-        OsRng.fill_bytes(&mut aes_key);
-
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-
-        let mut context = self.context.lock().map_err(|e| {
-            log::error!("Failed to lock TPM context: {}", e);
+        OsRng.try_fill_bytes(&mut aes_key).map_err(|e| {
+            log::error!("OS RNG failed: {}", e);
             soft_fido2::Error::Other
         })?;
+
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.try_fill_bytes(&mut nonce_bytes).map_err(|e| {
+            log::error!("OS RNG failed: {}", e);
+            soft_fido2::Error::Other
+        })?;
+
+        let mut context = portable::context::lock_context(&self.context);
 
         let parent_key = self.sealing_parent_handle(&mut context)?;
         let sealing_pub = self.create_sealing_public()?;
@@ -531,10 +543,7 @@ impl TpmStorageAdapter {
     pub fn unseal_data(&self, sealed_data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         debug!("Unsealing data with TPM (hybrid decryption)");
 
-        let mut context = self.context.lock().map_err(|e| {
-            log::error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = portable::context::lock_context(&self.context);
 
         let sealed_blob: SealedBlob = serde_json::from_slice(sealed_data).map_err(|e| {
             log::error!("Failed to deserialize sealed blob: {}", e);

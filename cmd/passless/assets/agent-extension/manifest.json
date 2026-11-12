@@ -1,30 +1,17 @@
 {
   "manifest_version": 3,
   "name": "passless-agent",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Routes WebAuthn requests of a Passless managed browser to the Passless daemon.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtBwHbqMRABQ9osgfXAqCM9uPJ6oLWos/gssHBa8n/cr4MsKMhcdlO/im8Mqs73Pddmm16Dp6NfMXHIuH+bEb/2uSgQzN31MWho+5Sur+le5ejnSotr1ghwKa5zmrUjv0h3X+lYXlsWKoxg0byu3sOlso1NU6zLDGsYf7lKiHrxaX7M+FX6D2WK1j0OhGyqlQEw+C2etMV4nx57K4hjdxlaYbZjfVWwMO0A/F/bivn3bCcBIFIbRamMwG8TnAoCJcZ8QCzM8ACZUaR2CqHIj0IiJ9LrU0zFx0L/8auFg/EVDf+w54FTXvDLXpXaeXSFomIpr3BFgkk34UOxj9mXlU4wIDAQAB",
   "permissions": [
-    "nativeMessaging"
+    "webAuthenticationProxy",
+    "nativeMessaging",
+    "storage"
   ],
-  "host_permissions": [
-    "https://*/*"
-  ],
+  "incognito": "spanning",
   "background": {
     "service_worker": "worker.js"
-  },
-  "content_scripts": [
-    {
-      "matches": ["https://*/*"],
-      "js": ["broker.js"],
-      "run_at": "document_start",
-      "world": "ISOLATED",
-      "all_frames": true
-    },
-    {
-      "matches": ["https://*/*"],
-      "js": ["main.js"],
-      "run_at": "document_start",
-      "world": "MAIN",
-      "all_frames": true
-    }
-  ]
+  }
 }

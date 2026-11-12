@@ -2,14 +2,15 @@
 #
 # Tier 2 Stage: Real Notifications
 #
-# Uses the production agent-prompt-probe binary (built with agent-validation feature)
-# as the subject under test inside isolated dbus-run-session + Xvfb + dunst sessions.
+# Uses the production agent-prompt-probe binary (built with agent-validation feature), which runs
+# the escalation prompt child protocol, as the subject under test inside isolated
+# dbus-run-session + Xvfb + dunst sessions.
 #
 # Scenarios (each in its own isolated session):
-#   delayed_approve    => Approved  (approve after min_review_delay elapsed)
-#   premature_approve  => Denied    (approve before min_review_delay elapsed)
+#   delayed_approve    => Approved  ("Allow always" after min_review_delay elapsed)
+#   premature_approve  => Denied    ("Allow always" before min_review_delay elapsed)
 #   deny               => Denied    (explicit deny action)
-#   close              => Timeout   (notification closed/expired without action)
+#   close              => Denied    (a dismissal is a deny)
 #
 
 set -euo pipefail
@@ -315,7 +316,7 @@ stage_real_notifications() {
     _av_rn_run_scenario "delayed_approve"    "delayed_approve"   "approved"  "$display" "$probe_bin"
     _av_rn_run_scenario "premature_approve"  "premature_approve" "denied"    "$display" "$probe_bin"
     _av_rn_run_scenario "deny"               "deny"              "denied"    "$display" "$probe_bin"
-    _av_rn_run_scenario "close"              "close"             "timeout"   "$display" "$probe_bin"
+    _av_rn_run_scenario "close"              "close"             "denied"    "$display" "$probe_bin"
 
     _av_rn_write_results "$results_file"
 
