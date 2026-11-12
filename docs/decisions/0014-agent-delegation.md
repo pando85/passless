@@ -188,6 +188,14 @@ Playwright MCP uses a Passless HTTP bootstrap on an ephemeral loopback port: `GE
 authenticates an ephemeral bearer, runs the principal-scoped `EnsureBrowser` after full principal
 checks, and returns Chromium's real `webSocketDebuggerUrl`. It never relays WebSocket frames. The
 bearer gates lazy startup only; it does not protect Chromium's listener.
+*Amendment (MCP wrapper across daemon restarts):* outside a principal session, `agent mcp playwright`
+keeps the client's stdio, the Playwright MCP server and this bootstrap in the process the client
+started, and obtains its principal session through the admin socket exactly like `agent run`, as a
+broker that alone holds the capability and only answers "ensure the browser" (`direct_cdp`); a session
+lost with its daemon instance is launched again the same way on the next discovery, one the live
+daemon ended is not, and a profile whose sessions run as another Unix user keeps the server inside the
+session (`commands/mcp_session.rs`, E2E-57). A failed discovery points Playwright at
+`/passless/unavailable/<class>`, which answers `503` with the class and a fixed hint.
 
 In both modes the WebAuthn ceremony is mediated by the daemon; CDP exposure decides only who holds
 authenticated browser-session authority.

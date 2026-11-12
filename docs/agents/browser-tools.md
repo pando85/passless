@@ -32,8 +32,18 @@ passless agent mcp --print-config claude-code     # or opencode, cursor, vscode
 ```
 
 The entry runs `passless agent mcp playwright --profile <name>`, which runs `npx --yes
-@playwright/mcp --cdp-endpoint <endpoint>` inside a principal session. The browser starts on the
-first discovery request from Playwright MCP, not when the server starts.
+@playwright/mcp --cdp-endpoint <endpoint>` as its own child and starts a principal session for the
+profile, which answers Playwright MCP's discovery requests. The browser starts on the first
+discovery request from Playwright MCP, not when the server starts.
+
+The server survives a daemon restart or upgrade: the process your MCP client started keeps the stdio
+connection and the Playwright MCP server. While the daemon is down, browser tool calls fail at once
+with `passless daemon unavailable, retrying ...`; the first browser tool call after it is back starts
+a new principal session, with the new daemon's policy and grants, and a new browser. The pages of the
+old browser are gone, as after any restart. A session that the running daemon ends (revoked, expired,
+its grants revoked or its profile disabled) is not renewed: the server exits and the client must
+restart it. This needs the session to run as your own Unix user; for a profile whose sessions run as
+another user the server runs inside the session, as that user, and exits with the daemon.
 
 - `--profile` may be left out when exactly one profile is configured.
 - Pass options through to Playwright MCP after `--`. For contexts that Playwright creates over CDP
@@ -106,8 +116,10 @@ passless agent mcp --print-config claude-code --server chrome-devtools
 Runs `npx --yes chrome-devtools-mcp --browserUrl <endpoint>`. Unlike the Playwright adapter the
 browser starts when the server starts: puppeteer asks for `<browserUrl>/json/version` and cannot send
 the bootstrap's bearer header. The server exits when the browser's debugging port stops answering,
-and the MCP client restarts it. The same `--package`, `--npx` and `--url` options apply; extra
-arguments for `chrome-devtools-mcp` go after `--`.
+and the MCP client restarts it. Unlike the Playwright adapter it does not survive a daemon restart:
+it is bound to the browser's own endpoint, which a new daemon replaces. A client that does not restart
+MCP servers (opencode) needs a restart after the daemon's. The same `--package`, `--npx` and `--url`
+options apply; extra arguments for `chrome-devtools-mcp` go after `--`.
 
 ## Playwright library with connectOverCDP
 

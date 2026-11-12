@@ -52,14 +52,15 @@ Run `passless agent-admin profile check <profile>`.
 - Containment refused the launch: the browser's user can open a hidraw device and `bwrap` does not work.
   Install bubblewrap, and check that unprivileged user namespaces are enabled
   (`passless doctor --agents` shows the case).
-- The MCP client says `Unexpected status 503 when connecting to http://127.0.0.1:<port>/json/version/`:
-  the browser could not be started. The response body names the class
-  (`{"error":"managed browser unavailable","class":"runtime_root_invalid",...}`; other classes are
-  `launch_failed`, `daemon_unreachable`, `refused` and `unavailable`) and the MCP server's stderr
-  (the client's MCP log) has the full text; the daemon's log has the launch error:
+- A Playwright MCP tool call fails with `WebSocket error: ws://127.0.0.1:<port>/passless/unavailable/<class>
+  503 Service Unavailable` and `passless: managed browser unavailable (<class>): <hint>`: no browser
+  could be handed out. The classes are `daemon_unreachable`, `session_lost`, `session_ended`,
+  `runtime_root_invalid`, `launch_failed`, `refused` and `unavailable`. The MCP server's stderr (the
+  client's MCP log) has the full text; the daemon's log has the launch error:
   `journalctl --user -u passless`. A pipe-mode profile is refused this way (`class` `refused`); the
   stderr line then reads `Playwright browser discovery requires browser_cdp_expose = 'port' ...`
-  (see below).
+  (see below). Older versions answered `Unexpected status 503 when connecting to
+  http://127.0.0.1:<port>/json/version/` with the class in the response body only.
   - `class` `runtime_root_invalid` (`failed to launch browser: invalid runtime root: ...`): the
     browser runtime root, by default `$XDG_RUNTIME_DIR/passless/browser`, cannot be used. Current
     versions create it (mode 0700, yours) when it is missing; an older build fails with `No such file
@@ -69,7 +70,14 @@ Run `passless agent-admin profile check <profile>`.
     the parent exists and is not writable by others; create parents yourself. With a `browser_user`
     that is not the daemon's user, create the root owned by that user with mode 0700 (the default
     root is only created for the daemon's own user).
-  - `class` `daemon_unreachable`: the daemon is not running, or runs without agents (see above).
+  - `class` `daemon_unreachable` (`passless daemon unavailable, retrying ...`): the daemon is not
+    running, or runs without agents (see above). During a restart this is expected: the MCP server
+    stays up and the next browser tool call after the daemon is back works
+    ([Browser tools](browser-tools.md#playwright-mcp)).
+  - `class` `session_lost`: the server's principal session ended a moment ago and the daemon still
+    answers; retry in a few seconds.
+  - `class` `session_ended`: the running daemon ended the server's principal session (revoked, expired,
+    its grants revoked or its profile disabled). The server exits; restart it in the MCP client.
   - `class` `launch_failed`: see `passless doctor --agents` and the daemon log.
 - `browser_cdp_port <port> on 127.0.0.1 is already in use (<process>, pid <pid>)`, or `the CDP endpoint on
   127.0.0.1:<port> does not belong to the launched browser`: another process (often a browser you started
@@ -161,7 +169,10 @@ cannot rewrite (started through a shell or `node` script) are reported too: edit
 - **Principal cannot run admin commands**: expected. Run `agent-admin` outside the principal session.
 - **Audit `verify` fails**: preserve the files, investigate the gap, and repair storage before more
   agent use ([Operations](operations.md#recovery)).
-- **Daemon restart ended the sessions**: expected; start new ones.
+- **Daemon restart ended the sessions**: expected; start new ones. `passless agent mcp playwright`
+  survives it (started outside a principal session, for a profile that runs as your own user): its
+  next browser tool call starts a new session and browser. `passless agent mcp chrome-devtools` and
+  agents started with `passless agent run` end with the daemon; restart them.
 - **The site still shows a session after the browser closed**: expected. Use the site's own logout or
   revocation.
 - **Credential selection is ambiguous**: `single` fails when several credentials match. Pin one with
