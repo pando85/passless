@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify_double::server::{Config, NotificationDouble};
-use notify_double::{LogWriter, OBJECT_PATH, Script, WELL_KNOWN_NAME};
+use notify_double::{Emulation, LogWriter, OBJECT_PATH, Script, WELL_KNOWN_NAME};
 use serde_json::{Value as Json, json};
 
 const HIDDEN_ARG: &str = "__agent-escalation-prompt";
@@ -117,6 +117,7 @@ fn reexecuted_binary_runs_the_prompt_child_with_only_the_bus_address() {
                         script: Script::parse_list("ignore").unwrap(),
                         capabilities: vec!["actions".to_string(), "body".to_string()],
                         server_name: "notify-double".to_string(),
+                        emulation: Emulation::Spec,
                     },
                     Arc::new(LogWriter::open(&log).unwrap()),
                 ),

@@ -570,6 +570,11 @@ chose `allow`.
   a rule without a prompt edit the config.
 - The notification-server capability gate fails closed on servers without distinct actions.
   `min_review_delay_ms` is a timing heuristic, not authentication.
+  Amended (notify-osd): notify-osd 1.0 lacks the `actions` capability but was verified to deliver
+  distinct keys from a fallback dialog that always has id 0, so it is accepted, and every prompt's
+  action keys are `allow_always:<nonce>`/`deny:<nonce>` with a fresh 128-bit nonce (labels
+  unchanged): only the exact key from the verified sender decides, a shared-id close is ignored and
+  not sent, and a stale dialog left visible after withdrawal grants nothing.
 - `agents.notify_user` names the human whose session bus receives escalation prompts. The user
   unit uses its own bus. If no bus can be resolved, escalation is unavailable: the request is denied
   immediately and audited. Headless hosts use explicit `allow` rules.

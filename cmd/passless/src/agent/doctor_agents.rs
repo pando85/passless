@@ -457,7 +457,8 @@ pub fn containment_check(profile: &str, report: &ContainmentReport) -> DoctorChe
 
 /// The notification server on the escalation bus (ADR 0014 section 8.2): the bus the daemon's
 /// prompt child would use answers, and a server owns `org.freedesktop.Notifications` with the
-/// `actions` capability. Only profiles with a `request` rule make it a failure.
+/// `actions` capability (or is notify-osd 1.0, whose fallback dialogs have distinct buttons). Only
+/// profiles with a `request` rule make it a failure.
 pub fn notification_bus_check(config: &AgentConfig, euid: u32) -> DoctorCheck {
     let needs_prompt = config.profiles.values().any(|profile| {
         profile.rules.iter().any(|rule| {
@@ -495,7 +496,7 @@ pub fn notification_bus_check(config: &AgentConfig, euid: u32) -> DoctorCheck {
         Ok(server) => check(
             "notification_bus",
             true,
-            format!("{} on {} supports actions", server, plan.bus_address),
+            format!("{} on {}", server, plan.bus_address),
         ),
         Err(why) => check(
             "notification_bus",
@@ -509,8 +510,10 @@ pub fn notification_bus_check(config: &AgentConfig, euid: u32) -> DoctorCheck {
     }
 }
 
-/// Connect to `address` and ask for the notification server's name and capabilities.
-fn probe_notification_server(address: &str) -> Result<String, String> {
+/// Connect to `address` and classify the notification server with the prompt child's capability
+/// gate (`escalation_prompt::server_support`).
+pub(crate) fn probe_notification_server(address: &str) -> Result<String, String> {
+    use super::escalation_prompt::{ServerSupport, server_support};
     use zbus::connection::Builder;
 
     let address = address.to_string();
@@ -545,9 +548,6 @@ fn probe_notification_server(address: &str) -> Result<String, String> {
             .body()
             .deserialize()
             .map_err(|e| format!("bad GetCapabilities reply: {e}"))?;
-        if !capabilities.iter().any(|c| c == "actions") {
-            return Err("the notification server does not support actions".to_string());
-        }
         let (name, _vendor, version, _spec): (String, String, String, String) = conn
             .call_method(
                 Some(owner.as_str()),
@@ -561,7 +561,16 @@ fn probe_notification_server(address: &str) -> Result<String, String> {
             .body()
             .deserialize()
             .map_err(|e| format!("bad GetServerInformation reply: {e}"))?;
-        Ok(format!("notification server {name} {version}"))
+        match server_support(&name, &version, &capabilities) {
+            Ok(ServerSupport::Actions) => Ok(format!(
+                "notification server {name} {version} supports actions"
+            )),
+            Ok(ServerSupport::FallbackDialog) => Ok(format!(
+                "notification server {name} {version} has no `actions` capability; escalation \
+                 prompts use its fallback dialogs (Allow always / Deny buttons)"
+            )),
+            Err(why) => Err(format!("{why} ({name} {version})")),
+        }
     };
     // Bounded: a stuck bus must not hang the doctor.
     let (tx, rx) = std::sync::mpsc::channel();

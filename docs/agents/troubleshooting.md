@@ -106,7 +106,8 @@ Common causes:
   that RP without a prompt. Wait it out, or change the rule to `allow` and reload the policy.
 - **No notification**: `request` is denied at once when no notification server with action support is
   running on the user's bus. `doctor --agents` warns. Run one (dunst, mako, a desktop shell) or use
-  `allow`.
+  `allow`. notify-osd (Ubuntu) works: it shows the prompt as a dialog with "Allow always" and "Deny"
+  buttons (see [Desktop notifications](../NOTIFICATIONS.md#notify-osd)).
 - **Conditional (autofill) request**: unavailable; the page needs an explicit sign-in button.
 - **Cross-origin iframe**: denied. Sign in on the top-level page.
 - **Extension not attached yet**: wait for `passless agent browser --wait` or the MCP tool's browser to

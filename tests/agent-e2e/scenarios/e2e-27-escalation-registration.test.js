@@ -80,9 +80,15 @@ scenario({ id: 'E2E-28', exposeModes: ['port', 'pipe'], title: 'the notification
     assert.equal(n.summary, expected[i][0]);
     assert.equal(n.body,
       `Profile: agent (same-user)\nPrincipal user: ${user}\nAction: ${expected[i][1]}\nSite: rp-a.test (any page under this site)\nOrigin: https://rp-a.test\n"Allow always" is saved permanently.`);
-    // actions are a flat [key, label, key, label] list.
-    assert.deepEqual(n.actions.filter((_, j) => j % 2 === 0), ['allow_always', 'deny'], `actions: ${JSON.stringify(n.actions)}`);
-    assert.equal(n.actions.length, 4);
+    // actions are a flat [key, label, key, label] list: exactly two, labelled "Allow always" and "Deny". The keys carry
+    // one per-prompt nonce (`allow_always:<nonce>`, `deny:<nonce>`) so a click is attributed to its own prompt even on a
+    // server that reuses ids (notify-osd); the labels never show it.
+    assert.equal(n.actions.length, 4, `actions: ${JSON.stringify(n.actions)}`);
+    assert.deepEqual(n.actions.filter((_, j) => j % 2 === 1), ['Allow always', 'Deny'], `actions: ${JSON.stringify(n.actions)}`);
+    const nonce = (/^allow_always:([0-9a-f]{32})$/.exec(n.actions[0]) || [])[1];
+    assert.ok(nonce, `allow key: ${n.actions[0]}`);
+    assert.equal(n.actions[2], `deny:${nonce}`);
+    if (i > 0) assert.notEqual(n.actions[0], notes[i - 1].actions[0], 'each prompt has its own keys');
     assert.equal(n.expire_timeout, 0, 'the notification does not expire by itself');
   });
 });

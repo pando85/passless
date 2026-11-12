@@ -74,6 +74,56 @@ fn parse_delay(s: &str) -> Result<u64, ScriptError> {
 /// The action key `approve` invokes: Passless's "Allow always" (ADR 0014 section 8.1).
 pub const APPROVE_ACTION: &str = "allow_always";
 
+/// Which notification server the double behaves like.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Emulation {
+    /// A specification-conforming server: unique ids, `CloseNotification` closes.
+    #[default]
+    Spec,
+    /// notify-osd 1.0 as observed on Ubuntu: `GetServerInformation` is [`NOTIFY_OSD_SERVER_INFORMATION`]
+    /// (use [`NOTIFY_OSD_CAPABILITIES`], which lacks `actions`); a notification with actions is a
+    /// fallback dialog whose `Notify` returns id 0, every time; a click emits
+    /// `ActionInvoked(0, key)` then `NotificationClosed(0, 3)`; `CloseNotification` closes nothing.
+    NotifyOsd,
+}
+
+/// notify-osd's `GetServerInformation` reply: name, vendor, version, spec version.
+pub const NOTIFY_OSD_SERVER_INFORMATION: (&str, &str, &str, &str) =
+    ("notify-osd", "Canonical Ltd", "1.0", "1.1");
+
+/// notify-osd's `GetCapabilities` reply (no `actions`).
+pub const NOTIFY_OSD_CAPABILITIES: &[&str] = &[
+    "body",
+    "body-markup",
+    "icon-static",
+    "image/svg+xml",
+    "x-canonical-private-synchronous",
+    "x-canonical-append",
+    "x-canonical-private-icon-only",
+    "x-canonical-truncation",
+    "private-synchronous",
+    "append",
+    "private-icon-only",
+    "truncation",
+];
+
+/// The key a scripted `Invoke(key)` emits for a notification with `actions` (a flat
+/// `[key, label, ...]` list): the notification's own action key that equals `key` or extends it as
+/// `<key>:<suffix>` (clients may make their keys unique per notification), otherwise `key`.
+pub fn resolve_action_key(key: &str, actions: &[String]) -> String {
+    let keys = || actions.iter().step_by(2);
+    if let Some(exact) = keys().find(|k| *k == key) {
+        return exact.clone();
+    }
+    keys()
+        .find(|k| {
+            k.strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with(':'))
+        })
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
+
 /// Parse a single script step.
 ///
 /// Grammar: `approve[:ms]` (invokes [`APPROVE_ACTION`]), `deny[:ms]`, `ignore`, `close[:ms]`,
@@ -298,6 +348,28 @@ mod tests {
         let s = parse_step("invoke=weird key:5").unwrap();
         assert_eq!(s.action, StepAction::Invoke("weird key".into()));
         assert_eq!(s.delay_ms, 5);
+    }
+
+    #[test]
+    fn invoked_keys_resolve_to_the_notifications_own_keys() {
+        let actions: Vec<String> = ["allow_always:ab12", "Allow always", "deny:ab12", "Deny"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            resolve_action_key("allow_always", &actions),
+            "allow_always:ab12"
+        );
+        assert_eq!(resolve_action_key("deny", &actions), "deny:ab12");
+        // A label is never a key, and an unrelated key stays as it is.
+        assert_eq!(resolve_action_key("Deny", &actions), "Deny");
+        assert_eq!(resolve_action_key("default", &actions), "default");
+        let plain: Vec<String> = ["deny", "Deny", "deny_all", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(resolve_action_key("deny", &plain), "deny");
+        assert_eq!(resolve_action_key("allow_always", &plain), "allow_always");
     }
 
     #[test]
