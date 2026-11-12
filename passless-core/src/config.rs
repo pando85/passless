@@ -1489,6 +1489,9 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Print a ready-to-paste MCP server entry for a client instead of running the server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
         /// Extra arguments for @playwright/mcp (after `--`)
         #[arg(last = true)]
         extra: Vec<String>,
@@ -1508,6 +1511,9 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Print a ready-to-paste MCP server entry for a client instead of running the server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
         /// Extra arguments for chrome-devtools-mcp (after `--`)
         #[arg(last = true)]
         extra: Vec<String>,
@@ -2012,6 +2018,44 @@ mod tests {
         }
         assert!(
             Args::try_parse_from(["passless", "agent", "mcp", "--print-config", "emacs"]).is_err()
+        );
+        // The same flag on the adapter subcommand, with `--profile` after it.
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "coding",
+            "--print-config",
+            "claude-code",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                profile: Some(ref profile),
+                action: AgentCommand::Mcp {
+                    print_config: None,
+                    adapter: Some(McpAdapter::Playwright {
+                        print_config: Some(McpConfigTarget::ClaudeCode),
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            }) if profile == "coding"
+        ));
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "mcp",
+                "chrome-devtools",
+                "--print-config",
+                "opencode",
+            ])
+            .is_ok()
         );
         // The old name still parses (hidden alias, one release).
         assert!(
