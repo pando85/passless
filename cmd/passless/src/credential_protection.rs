@@ -28,11 +28,26 @@
 //! # Authorization
 //!
 //! Keys 4 and 5 are mandatory. The pinUvAuthToken must be a live token that carries the `cm`
-//! (credential management) permission, exactly what `delete` and `rename` need: a PIN token when
-//! a PIN is set, otherwise the token issued after the authenticator's built-in user
-//! verification (the desktop notification). Unlike those two commands there is no path without
-//! a token, whether or not a PIN is set. The signed data binds the new level and the exact set
-//! of credential IDs, so a captured parameter authorizes nothing else.
+//! (credential management) permission and is not bound to an RP: a PIN token when a PIN is set,
+//! otherwise the token issued after the authenticator's built-in user verification (the desktop
+//! notification). That is the same token standard credential management needs, and soft-fido2
+//! also always requires a `pinUvAuthParam` there; only the `passless client` helpers for
+//! `list`, `delete` and `rename` may send a request without one. This command has no such
+//! fallback. The signed data binds the new level and the exact set of credential IDs, so a
+//! captured parameter authorizes nothing else.
+//!
+//! # Consent to lower protection
+//!
+//! With a PIN set, typing it is the consent: no UV token can be minted then. Without a PIN the
+//! token comes from one click on a generic "User Verification Required / Credential Management"
+//! prompt that says nothing about what it buys. So when the request would lower any credential
+//! (stored level above the requested one) and no PIN is set, the daemon asks a dedicated
+//! question built only from its own storage ("Lower credential protection: N credential(s) for
+//! <rp>: 3 -> 1 (presence only)") after reading the credentials and before any write. A denial,
+//! timeout or prompt error refuses with no change (`OperationDenied` / `Other`). With
+//! `PASSLESS_INTERACTION_MODE=automatic` the prompt layer would approve everything, so lowering
+//! without a PIN is refused outright (`NotAllowed`). Raising and unchanged levels need no extra
+//! prompt.
 //!
 //! The command exists only on the human CTAP path (`AuthenticatorService::handle`). Agent
 //! sessions and the sign-proxy never reach it.
@@ -40,7 +55,9 @@
 //! # Atomicity
 //!
 //! Every credential is read before any is written. A missing credential fails the whole request
-//! unchanged. A write failure rolls back the credentials already rewritten, best effort.
+//! unchanged. A write failure rolls back the credentials already rewritten, best effort: the
+//! rollback itself can fail, and on `pass` the Git commit of the operation may already exist.
+//! After any error, check the result with `passless client list`.
 
 use crate::authenticator::credential_ref;
 use crate::storage::CredentialStorage;
@@ -218,6 +235,111 @@ pub fn parse_response(body: &[u8]) -> Result<Vec<CredProtectChange>, StatusCode>
             current,
         })
         .collect())
+}
+
+/// A credential the request would touch, as stored right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedChange {
+    pub credential_id: Vec<u8>,
+    /// RP ID from storage (daemon-derived, never from the request).
+    pub rp_id: String,
+    /// Level before the request (no stored level counts as 1).
+    pub previous: u8,
+}
+
+/// Read the credentials a request names, without writing anything.
+pub fn plan<S: CredentialStorage + ?Sized>(
+    storage: &mut S,
+    credential_ids: &[Vec<u8>],
+) -> Result<Vec<PlannedChange>, StatusCode> {
+    let mut planned = Vec::with_capacity(credential_ids.len());
+    for id in credential_ids {
+        match storage.read(id) {
+            Ok(credential) => planned.push(PlannedChange {
+                credential_id: credential.id.clone(),
+                rp_id: credential.rp.id.clone(),
+                previous: effective_level(credential.extensions.cred_protect),
+            }),
+            Err(SoftFido2Error::DoesNotExist) => return Err(StatusCode::NoCredentials),
+            Err(error) => {
+                warn!(
+                    "Cannot read credential {} for credProtect change: {:?}",
+                    bytes_to_hex(id),
+                    error
+                );
+                return Err(StatusCode::Other);
+            }
+        }
+    }
+    Ok(planned)
+}
+
+/// Keep what is shown to the user plain: RP IDs come from relying parties, so anything outside a
+/// conservative set (control characters, markup) is replaced and the length is capped.
+pub fn display_rp_id(rp_id: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut shown: String = rp_id
+        .chars()
+        .take(MAX_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_' | '/' | '@' | '+') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if rp_id.chars().count() > MAX_CHARS {
+        shown.push_str("...");
+    }
+    shown
+}
+
+fn level_effect(level: u8) -> &'static str {
+    match level {
+        1 => "presence only",
+        2 => "verification only when the site gives no credential list",
+        _ => "verification required",
+    }
+}
+
+/// `(summary, body)` of the consent prompt for the credentials that would be lowered, built only
+/// from storage and the validated level. `None` when nothing is lowered.
+pub fn lowering_prompt(planned: &[PlannedChange], level: u8) -> Option<(String, String)> {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<(String, u8), usize> = BTreeMap::new();
+    for change in planned.iter().filter(|change| change.previous > level) {
+        *groups
+            .entry((display_rp_id(&change.rp_id), change.previous))
+            .or_default() += 1;
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    let total: usize = groups.values().sum();
+
+    const MAX_LINES: usize = 6;
+    let mut lines = vec![format!(
+        "Lower credential protection: {total} credential(s)"
+    )];
+    for ((rp, previous), count) in groups.iter().take(MAX_LINES) {
+        lines.push(format!(
+            "{count} for {rp}: {previous} \u{2192} {level} ({})",
+            level_effect(level)
+        ));
+    }
+    if groups.len() > MAX_LINES {
+        lines.push(format!(
+            "... and {} more group(s)",
+            groups.len() - MAX_LINES
+        ));
+    }
+    lines.push("Accept only if you just ran `passless client set-cred-protect`.".to_string());
+    Some((
+        "\u{1f513} Lower Credential Protection".to_string(),
+        lines.join("\n"),
+    ))
 }
 
 /// Set the level of every listed credential, rewriting only the `credProtect` field.
@@ -692,7 +814,13 @@ mod tests {
         rust_sources(&src, &mut sources);
         assert!(sources.len() > 20, "found the source tree");
 
-        let allowed = ["authenticator.rs", "commands/client.rs", "main.rs"];
+        let allowed = [
+            "authenticator.rs",
+            "commands/client.rs",
+            "human_prompts.rs",
+            "main.rs",
+            "notification.rs",
+        ];
         let needles = [
             "credential_protection",
             "CMD_PASSLESS_SET_CRED_PROTECT",
@@ -732,5 +860,61 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn rp_ids_are_made_plain_before_they_are_shown() {
+        assert_eq!(display_rp_id("ssh:"), "ssh:");
+        assert_eq!(display_rp_id("example.com"), "example.com");
+        let hostile = "evil.com\n<b>Allow</b> & <a href=x>y</a>\u{202e}";
+        let shown = display_rp_id(hostile);
+        assert!(
+            shown
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-:_/@+?".contains(c)),
+            "{shown}"
+        );
+        assert!(!shown.contains('<') && !shown.contains('\n') && !shown.contains('&'));
+        let long = "a".repeat(200);
+        assert!(display_rp_id(&long).len() <= 67);
+    }
+
+    #[test]
+    fn lowering_prompt_is_built_from_storage_and_lists_only_lowered_credentials() {
+        let planned = vec![
+            PlannedChange {
+                credential_id: vec![1; 32],
+                rp_id: "ssh:".to_string(),
+                previous: 3,
+            },
+            PlannedChange {
+                credential_id: vec![2; 32],
+                rp_id: "ssh:".to_string(),
+                previous: 3,
+            },
+            PlannedChange {
+                credential_id: vec![3; 32],
+                rp_id: "example.com".to_string(),
+                previous: 1,
+            },
+        ];
+        let (summary, body) = lowering_prompt(&planned, 1).expect("lowering");
+        assert!(summary.contains("Lower Credential Protection"));
+        assert!(
+            body.contains("Lower credential protection: 2 credential(s)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("2 for ssh:: 3 \u{2192} 1 (presence only)"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("example.com"),
+            "unchanged credentials are not listed"
+        );
+
+        // Nothing lowered: raising to 3, or already at the level.
+        assert!(lowering_prompt(&planned, 3).is_none());
+        assert!(lowering_prompt(&planned[2..], 1).is_none());
     }
 }

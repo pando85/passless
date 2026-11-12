@@ -26,6 +26,8 @@ pub type YesNoResult = NotificationResult;
 enum PromptKind {
     UserPresence,
     UserVerification,
+    /// A dedicated consent prompt for lowering credential protection. Never auto-approved.
+    CredentialProtection,
     YesNo,
 }
 
@@ -70,6 +72,12 @@ pub fn human_path_is_automatic() -> bool {
         configured_interaction_mode(),
         Ok(InteractionMode::Automatic)
     )
+}
+
+/// Whether `PASSLESS_INTERACTION_MODE=automatic` makes the human path approve its prompts
+/// without user interaction. `Err` for an unparsable value: callers must then refuse.
+pub fn interaction_mode_is_automatic() -> Result<bool, String> {
+    Ok(configured_interaction_mode()? == InteractionMode::Automatic)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +164,10 @@ fn show_confirmation_notification(
     timeout_seconds: u32,
     prompt_kind: PromptKind,
 ) -> Result<NotificationResult, String> {
-    debug_assert!(prompt_kind != PromptKind::YesNo);
+    debug_assert!(!matches!(
+        prompt_kind,
+        PromptKind::YesNo | PromptKind::CredentialProtection
+    ));
 
     if configured_interaction_mode()? == InteractionMode::Automatic {
         warn!(
@@ -168,8 +179,6 @@ fn show_confirmation_notification(
         return Ok(NotificationResult::Accepted);
     }
 
-    let action_mode = notification_action_mode(prompt_kind);
-
     let mut message = format!("Operation: {}", operation);
     if let Some(rp) = relying_party {
         message.push_str(&format!("\nRelying Party: {}", rp));
@@ -178,18 +187,33 @@ fn show_confirmation_notification(
         message.push_str(&format!("\nUser: {}", user));
     }
 
+    let summary = match prompt_kind {
+        PromptKind::UserPresence => "👆 User Presence Required",
+        PromptKind::UserVerification => "🔒 User Verification Required",
+        PromptKind::CredentialProtection | PromptKind::YesNo => {
+            unreachable!("handled by their own functions")
+        }
+    };
+
+    show_prompt(summary, message, timeout_seconds, prompt_kind)
+}
+
+/// Show `message` under `summary` with Accept and Deny actions and wait for the answer.
+/// Closing the notification or letting it time out denies.
+fn show_prompt(
+    summary: &str,
+    mut message: String,
+    timeout_seconds: u32,
+    prompt_kind: PromptKind,
+) -> Result<NotificationResult, String> {
+    let action_mode = notification_action_mode(prompt_kind);
+
     if action_mode == NotificationActionMode::DunstDefault {
         message.push_str(
             "\n\nDunst: confirm by invoking this notification's action \
              (middle-click by default). Closing the notification denies the request.",
         );
     }
-
-    let summary = match prompt_kind {
-        PromptKind::UserPresence => "👆 User Presence Required",
-        PromptKind::UserVerification => "🔒 User Verification Required",
-        PromptKind::YesNo => unreachable!("yes/no prompts use show_yes_no_notification"),
-    };
 
     info!("Showing {} notification", summary);
 
@@ -239,6 +263,33 @@ fn show_confirmation_notification(
         info!("Notification denied or closed");
         Ok(NotificationResult::Denied)
     }
+}
+
+/// Ask the human to confirm lowering the protection of stored credentials.
+///
+/// `body` must be derived by the daemon from its own storage, never from the client request.
+/// This is a dedicated consent question: it is never auto-approved, not even with
+/// `PASSLESS_INTERACTION_MODE=automatic` (it is denied there), and closing the notification or
+/// letting it time out denies.
+pub fn show_credential_protection_notification(
+    summary: &str,
+    body: &str,
+    timeout_seconds: u32,
+) -> Result<NotificationResult, String> {
+    if configured_interaction_mode()? == InteractionMode::Automatic {
+        warn!(
+            "{}=automatic: denying {:?} instead of auto-approving it",
+            INTERACTION_MODE_ENV,
+            PromptKind::CredentialProtection
+        );
+        return Ok(NotificationResult::Denied);
+    }
+    show_prompt(
+        summary,
+        body.to_string(),
+        timeout_seconds,
+        PromptKind::CredentialProtection,
+    )
 }
 
 /// Show a CTAP user-presence notification and wait for response.
@@ -452,6 +503,11 @@ mod tests {
             action_mode_for_server("dunst", "1.13.0", PromptKind::YesNo),
             NotificationActionMode::Explicit
         );
+        assert_eq!(
+            action_mode_for_server("dunst", "1.13.0", PromptKind::CredentialProtection),
+            NotificationActionMode::Explicit,
+            "the lowering consent needs the explicit Accept action"
+        );
     }
 
     #[test]
@@ -460,6 +516,7 @@ mod tests {
             for prompt_kind in [
                 PromptKind::UserPresence,
                 PromptKind::UserVerification,
+                PromptKind::CredentialProtection,
                 PromptKind::YesNo,
             ] {
                 assert_eq!(
