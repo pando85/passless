@@ -475,7 +475,7 @@ pub fn render_client_config(
 /// name `passless` (found through the client's `PATH`) when the path is unknown, no longer exists
 /// (a replaced binary reads as `... (deleted)`), is not valid UTF-8 or holds a quote that would
 /// break the shell one-liner printed next to it.
-fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
+pub(super) fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
     current_exe
         .and_then(std::fs::canonicalize)
         .ok()
@@ -519,6 +519,26 @@ pub fn dispatch_mcp(
     if let Some(target) = print {
         return print_config(profile, target, server);
     }
+    if let Some(McpAdapter::Install {
+        client,
+        project,
+        yes,
+        skill,
+        passless_path,
+        ..
+    }) = adapter
+    {
+        return super::agent_mcp_install::run(
+            profile,
+            &super::agent_mcp_install::InstallRequest {
+                client: *client,
+                project: project.as_deref(),
+                yes: *yes,
+                skill: *skill,
+                passless_path: passless_path.as_deref(),
+            },
+        );
+    }
     let Some(adapter) = adapter else {
         return Err(Error::Other(
             "choose an adapter (`agent mcp playwright` or `agent mcp chrome-devtools`) or pass \
@@ -540,6 +560,7 @@ pub fn dispatch_mcp(
             url,
             extra,
         } => (McpAdapterKind::ChromeDevtools, package, npx, url, extra),
+        McpAdapter::Install { .. } => unreachable!("handled above"),
     };
     let adapter_name = entry_parts(profile, kind).1[2].clone();
     if !in_principal_session(profile)? {

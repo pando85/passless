@@ -207,7 +207,7 @@ pub(super) fn configured_profile_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn load_agent_config() -> Option<AgentConfig> {
+pub(super) fn load_agent_config() -> Option<AgentConfig> {
     let config_path = std::env::var("PASSLESS_CONFIG")
         .ok()
         .map(PathBuf::from)

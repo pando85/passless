@@ -23,6 +23,7 @@ pub mod identity;
 pub mod ipc;
 pub mod launcher;
 pub mod lock_order;
+pub mod mcp_clients;
 pub mod operation_audit;
 pub mod policy_engine;
 pub mod prompt;

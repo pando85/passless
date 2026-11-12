@@ -4,6 +4,8 @@ pub mod agent;
 pub mod agent_admin;
 #[cfg(feature = "agent")]
 pub mod agent_browser;
+#[cfg(feature = "agent")]
+pub mod agent_mcp_install;
 pub mod client;
 pub mod custom;
 #[cfg(feature = "agent")]

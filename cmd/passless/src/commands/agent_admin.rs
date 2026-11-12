@@ -21,8 +21,8 @@ use crate::agent::client::{AdminClient, resolve_runtime_base};
 
 const ENVELOPE_VERSION: &str = "1";
 
-const SKILL_NAME: &str = "passless-agent";
-const SKILL_CONTENT: &str = include_str!("../../assets/skills/passless-agent/SKILL.md");
+pub(super) const SKILL_NAME: &str = "passless-agent";
+pub(super) const SKILL_CONTENT: &str = include_str!("../../assets/skills/passless-agent/SKILL.md");
 
 // Pi skill paths per official docs:
 // https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/skills.md
@@ -75,7 +75,7 @@ impl AgentKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallStatus {
+pub(super) enum InstallStatus {
     Installed,
     Current,
 }
@@ -1009,7 +1009,11 @@ fn project_root(current_dir: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-fn install_skill(path: &Path, trusted_root: &Path, force: bool) -> Result<InstallStatus> {
+pub(super) fn install_skill(
+    path: &Path,
+    trusted_root: &Path,
+    force: bool,
+) -> Result<InstallStatus> {
     let skill_dir = path.parent().ok_or_else(|| {
         Error::Other(format!(
             "Invalid skill installation path: {}",
