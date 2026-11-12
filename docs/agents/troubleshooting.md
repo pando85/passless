@@ -134,6 +134,22 @@ The endpoint is printed only for an intercepted browser, by `passless agent brow
 (`browser_cdp_expose = "port"`) is required; in pipe mode there is no endpoint (use `browser-control`). A tool that launches its own Chromium instead of
 attaching gets no passkeys. See [Browser tools](browser-tools.md).
 
+## `doctor --agents` warns that an MCP entry starts its own browser
+
+```text
+[warn] mcp_client: claude-code/project/playwright: ... entry 'playwright' starts its own browser
+(@playwright/mcp via pnpm dlx): passkeys from this MCP reach your human authenticator, not the agent
+policy. Fix: passless agent mcp install --client claude-code --project <DIR> --profile coding --yes
+```
+
+The doctor scans the user-level opencode and Claude Code configuration (honouring `XDG_CONFIG_HOME` and
+`CLAUDE_CONFIG_DIR`) and `opencode.json` and `.mcp.json` in the current directory. A plain Playwright MCP
+or chrome-devtools-mcp entry starts a browser the daemon does not own, so there is no interception and
+the agent policy never applies. Run the printed command without `--yes` to preview the diff, then with it
+to write; see [Browser tools](browser-tools.md#switching-from-a-plain-playwright-mcp). A wrapped entry
+that names a profile which is missing or not in port mode is also a warning. Entries the installer
+cannot rewrite (started through a shell or `node` script) are reported too: edit them by hand.
+
 ## Other
 
 - **Principal cannot run admin commands**: expected. Run `agent-admin` outside the principal session.

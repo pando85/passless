@@ -97,6 +97,19 @@ command also prints a `claude mcp add-json` one-liner). Other clients: `opencode
 `vscode`. The entry runs `passless agent mcp playwright --profile coding`, which starts a
 Passless-managed Chromium on the first browser tool call and points Playwright MCP at it.
 
+Already have a plain Playwright MCP in your opencode or Claude Code config? Switch it with one
+command instead of pasting: preview the change first (the default is a dry run that prints a diff),
+then write it. `--skill` also refreshes the bundled agent skill.
+
+```bash
+passless agent mcp install --client claude-code --project . --profile coding            # dry run
+passless agent mcp install --client claude-code --project . --profile coding --yes      # write
+passless agent mcp install --client opencode --user --profile coding --yes --skill
+```
+
+It keeps each entry's name, version pin and other keys, and saves `<file>.passless-backup-<UTC
+timestamp>` first. See [Browser tools](browser-tools.md#switching-from-a-plain-playwright-mcp).
+
 The entry's `command` is the absolute path of the `passless` you ran (for a `cargo install`,
 `~/.cargo/bin/passless`), so the client needs nothing on its `PATH`. If you move or reinstall the
 binary, print the entry again; if passless cannot tell its own path, the entry says `passless`, which

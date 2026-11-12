@@ -31,13 +31,13 @@ works only if the operator allowed it for that site.
 
 ## What you will see
 
-- **Allowed**: the site logs you in. This is the normal case for sites the operator trusts.
-- **Pending**: the operator's rule asks the user. The passkey call stays open, so the page looks busy,
+- **Allowed** (rule `allow`): the site logs you in. This is the normal case for sites the operator trusts.
+- **Pending** (rule `request`): the operator's rule asks the user. The passkey call stays open, so the page looks busy,
   possibly for minutes. A notification with **Allow always** and **Deny** is on the user's desktop. Tell
   the user a sign-in to `<site>` is waiting for their approval, then wait and re-check the page. Do not
   click the button again, reload, or open another tab for the same site: that does not speed it up. The
   wait ends when the user answers or the page's own timeout (minutes to hours) passes.
-- **Denied**: the page reports a failed or cancelled passkey sign-in (the browser error is
+- **Denied** (rule `deny`, or no rule): the page reports a failed or cancelled passkey sign-in (the browser error is
   `NotAllowedError`). It has no detail on purpose. The reason can be: no rule for this site, the user
   pressed Deny, the approval timed out, no notification server is running, the session budget or
   lifetime ran out, or the request came from a cross-origin frame or an autofill field.
@@ -71,6 +71,11 @@ If the tools report that the browser is not intercepting, that no profile is con
 browser is unsupported, or a Passless error that is not a normal denial, stop and report the message.
 Operators can run `passless doctor --agents` and read `docs/agents/troubleshooting.md` in the Passless
 repository. Do not try to fix it by launching your own browser or editing Passless configuration.
+
+If your browser tools do not come from `passless agent mcp playwright` (a plain `@playwright/mcp` or
+`chrome-devtools-mcp` launches its own browser), passkeys in that browser reach the user's own
+authenticator and not the operator's rules. Do not use it for passkey sign-in; tell the user to run
+`passless agent mcp install --client <opencode|claude-code>` (it shows a diff first).
 
 For more: `docs/agents/quick-start.md`, `docs/agents/rules.md`, `docs/agents/browser-tools.md`. Inside a
 Passless principal session `passless agent --profile <profile> capabilities` shows the authority your
