@@ -55,7 +55,7 @@ credential_selection = "single"
 | `rules` | Per-RP rules, see [Rules](rules.md). Missing rules deny. |
 | `credential_refs` | Optional list restricting the credentials the profile may use. |
 | `credential_selection` | `single` (default), `first-matching`, `newest` or `credential:<ref>`. A rule may override it. |
-| `max_session_ttl` | Seconds of authority per session (1 to a year). |
+| `max_session_ttl` | Seconds of authority per session (1 to a year). It caps each principal session and its browser lease. `passless agent mcp playwright` renews an expired session on its next browser tool call, through the admin socket with every check applied again; a revoked session, or one whose profile was disabled, is final. |
 | `max_operations` | Shared budget of allowed ceremonies per session, 1 to 4096. Only allowed requests count. |
 | `max_concurrent_sessions` | Live principal sessions per profile (default 1). |
 | `max_granted_rules` | Granted rules per profile (default 64, 1 to 256). |

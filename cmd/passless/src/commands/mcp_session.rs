@@ -28,11 +28,14 @@
 //! - the broker answers one request, "ensure the browser" (with `direct_cdp`), and exits on its
 //!   stdin's EOF, after a sign that its session is no longer valid, or when its parent (the
 //!   daemon) is gone;
-//! - a session the live daemon ended (revoked, expired, its grants revoked, its profile disabled)
-//!   is not re-established: the wrapper exits, as it did before. Only a session lost with its
-//!   daemon instance (the daemon is gone, or another daemon process answers) is re-established,
-//!   lazily, on the next browser tool call, and one the wrapper revoked itself (its broker did not
-//!   answer in time, or broke the protocol);
+//! - why a session ended comes from the daemon that ended it (`AdminRequest::SessionEnd`, a
+//!   reason it records before it stops the session's process), never from timing. A session it
+//!   revoked, terminated or ended with its profile is not re-established: the wrapper exits, as
+//!   it did before; so does one it cannot explain (an older daemon, after the grace period).
+//!   Re-established, lazily on the next browser tool call: a session lost with its daemon
+//!   instance (the daemon is gone, or another daemon process answers), an expired one (once per
+//!   expiry, and not a renewal that expired before its first use), and one the wrapper revoked
+//!   itself (its broker did not answer in time, or broke the protocol);
 //! - this applies only when the session runs as the wrapper's own Unix user. A profile whose
 //!   sessions run as another user needs the MCP server to run as that user, inside the session, so
 //!   the wrapper falls back to the in-session server, which does not survive a restart.
@@ -47,7 +50,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use passless_core::agent::protocol::{AdminRequest, AdminResponse, ErrorCode};
-use passless_core::agent::{PrincipalRequest, PrincipalResponse, PrincipalSessionId, ProfileId};
+use passless_core::agent::{
+    PrincipalRequest, PrincipalResponse, PrincipalSessionId, ProfileId, SessionEndReason,
+};
 use passless_core::{Error, Result};
 
 use serde::{Deserialize, Serialize};
@@ -253,8 +258,9 @@ pub(crate) struct Launched<L, S> {
 pub(crate) enum LaunchError {
     /// Nothing answers on the admin socket (or it does not answer in time).
     Unreachable(String),
-    /// The daemon answered and refused, or the session did not start.
-    Refused(String),
+    /// The daemon answered and refused, or the session did not start. `fatal`: the daemon
+    /// refused the profile itself (unknown or disabled), which no retry changes.
+    Refused { message: String, fatal: bool },
     /// The profile's sessions run as another Unix user.
     ForeignUser { uid: u32, gid: u32 },
 }
@@ -268,6 +274,16 @@ pub(crate) enum Probe {
     Silent,
     /// A daemon answers; which process, if the kernel says.
     Answering(Option<DaemonInstance>),
+}
+
+/// What the daemon says about a session (`AdminRequest::SessionEnd`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SessionEnd {
+    Running,
+    /// It ended, for this recorded reason.
+    Ended(SessionEndReason),
+    /// The daemon cannot say: it predates the request, or no longer knows the session.
+    Unknown,
 }
 
 /// Why the link to a broker is unusable.
@@ -294,6 +310,8 @@ pub(crate) trait Daemon {
     type Session;
     fn launch(&mut self) -> std::result::Result<Launched<Self::Link, Self::Session>, LaunchError>;
     fn probe(&mut self) -> Probe;
+    /// Why the daemon ended a session (asked of the daemon that launched it).
+    fn session_end(&mut self, session: &Self::Session) -> SessionEnd;
     /// Revoke a session; `true` when this revocation ended it (the daemon still had it).
     fn revoke(&mut self, session: &Self::Session) -> bool;
 }
@@ -305,43 +323,56 @@ pub(crate) trait Link {
     fn lost(&mut self) -> Option<LinkLost>;
 }
 
+/// How the current session came to be, for the renewal limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Origin {
+    /// Launched to replace an expired session.
+    renewal: bool,
+    /// It handed out an endpoint at least once.
+    served: bool,
+}
+
 enum State<L, S> {
     Live {
         link: L,
         instance: Option<DaemonInstance>,
         session: S,
+        origin: Origin,
     },
     /// The session is gone; `instance` launched it.
     Lost {
         instance: Option<DaemonInstance>,
+        session: S,
+        origin: Origin,
         since: Instant,
     },
-    /// No session, and launching one is allowed: the next browser request does.
-    Idle,
-    /// The daemon that launched the session ended it: no new one.
-    Ended,
+    /// No session, and launching one is allowed: the next browser request does. `renewal`: the
+    /// one it replaces expired.
+    Idle { renewal: bool },
+    /// No new session, for the reason given: the wrapper exits.
+    Ended(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Health {
     Running,
-    /// The live daemon ended the session; the wrapper exits.
-    Ended,
+    /// The live daemon ended the session for good; the wrapper exits with this message.
+    Ended(String),
 }
 
 enum Resolution {
     /// The daemon is down: the next request launches when it is back.
     Down,
-    /// Another daemon instance answers: launch now.
-    Restarted,
-    /// The same instance still answers (or nobody answers yet): undecided.
+    /// Another daemon instance answers, or the session expired: launch now.
+    Relaunch,
+    /// Not decided yet (no answer, or the end not recorded yet).
     Pending,
-    /// The same instance kept answering past the grace period: it ended the session.
+    /// No new session.
     Ended,
 }
 
 /// The wrapper's principal session: launched at start, re-established after its daemon went
-/// away, never after the live daemon ended it.
+/// away or after it expired, never after the live daemon ended it on purpose.
 pub(crate) struct SessionKeeper<D: Daemon> {
     daemon: D,
     state: State<D::Link, D::Session>,
@@ -354,27 +385,33 @@ impl<D: Daemon> SessionKeeper<D> {
         let launched = daemon.launch()?;
         Ok(Self {
             daemon,
-            state: live(launched),
+            state: live(launched, false),
             grace,
         })
     }
 
     /// The managed browser's endpoint, from the current session's broker, after re-establishing
-    /// the session if its daemon went away. Never blocks beyond the admin and link timeouts.
+    /// the session if its daemon went away or it expired. At most one launch per call, and never
+    /// blocks beyond the admin and link timeouts.
     pub(crate) fn ensure(&mut self) -> std::result::Result<String, EnsureError> {
-        // Enough for: a lost link, a probe, a launch and the request on the new link.
-        for _ in 0..4 {
-            match std::mem::replace(&mut self.state, State::Idle) {
+        let mut launched = false;
+        // Enough for: a lost link, its resolution, a launch, the request on the new link and,
+        // if that one is lost too, its resolution (the single launch bounds the rest).
+        for _ in 0..6 {
+            match std::mem::replace(&mut self.state, State::Idle { renewal: false }) {
                 State::Live {
                     mut link,
                     instance,
                     session,
+                    mut origin,
                 } => match link.ensure() {
                     Ok(BrokerReply::Endpoint(endpoint)) => {
+                        origin.served = true;
                         self.state = State::Live {
                             link,
                             instance,
                             session,
+                            origin,
                         };
                         return Ok(endpoint);
                     }
@@ -383,43 +420,69 @@ impl<D: Daemon> SessionKeeper<D> {
                             link,
                             instance,
                             session,
+                            origin,
                         };
                         return Err(EnsureError::from(message));
                     }
                     Ok(BrokerReply::SessionGone(_)) | Err(LinkLost::Closed) => {
-                        self.lose(link, instance, None);
+                        self.lose(link, instance, session, origin, false);
                     }
-                    Err(LinkLost::Broken) => self.lose(link, instance, Some(session)),
+                    Err(LinkLost::Broken) => self.lose(link, instance, session, origin, true),
                 },
-                State::Lost { instance, since } => {
-                    self.state = State::Lost { instance, since };
+                lost @ State::Lost { .. } => {
+                    self.state = lost;
                     match self.resolve() {
-                        Resolution::Restarted => {}
+                        Resolution::Relaunch => {}
                         Resolution::Down => return Err(unavailable("it does not answer")),
                         Resolution::Pending => return Err(session_lost()),
-                        Resolution::Ended => return Err(session_ended()),
+                        Resolution::Ended => return Err(self.ended_error()),
                     }
                 }
-                State::Idle => match self.daemon.launch() {
-                    Ok(launched) => self.state = live(launched),
-                    Err(LaunchError::Unreachable(detail)) => return Err(unavailable(&detail)),
-                    Err(LaunchError::Refused(message)) => return Err(EnsureError::from(message)),
-                    Err(LaunchError::ForeignUser { uid, gid }) => {
-                        // The profile changed under a running wrapper: its server would have to
-                        // run as that user now.
-                        self.state = State::Ended;
-                        return Err(EnsureError::new(
-                            "session_ended",
-                            format!(
-                                "the profile's principal sessions now run as uid {uid} gid {gid}, \
-                                 not as this MCP server's user; restart the MCP server"
-                            ),
-                        ));
+                State::Idle { renewal } if launched => {
+                    // A session launched by this very call is gone already: stop here rather
+                    // than launch another; the next call decides.
+                    self.state = State::Idle { renewal };
+                    return Err(session_lost());
+                }
+                State::Idle { renewal } => {
+                    launched = true;
+                    match self.daemon.launch() {
+                        Ok(new) => self.state = live(new, renewal),
+                        Err(LaunchError::Unreachable(detail)) => {
+                            self.state = State::Idle { renewal };
+                            return Err(unavailable(&detail));
+                        }
+                        Err(LaunchError::Refused {
+                            message,
+                            fatal: false,
+                        }) => {
+                            self.state = State::Idle { renewal };
+                            return Err(EnsureError::from(message));
+                        }
+                        Err(LaunchError::Refused {
+                            message,
+                            fatal: true,
+                        }) => {
+                            self.state = State::Ended(format!(
+                                "the daemon refuses this MCP server's profile ({message}); it \
+                                 is not re-established"
+                            ));
+                            return Err(self.ended_error());
+                        }
+                        Err(LaunchError::ForeignUser { uid, gid }) => {
+                            // The profile changed under a running wrapper: its server would
+                            // have to run as that user now.
+                            self.state = State::Ended(format!(
+                                "the profile's principal sessions now run as uid {uid} gid \
+                                 {gid}, not as this MCP server's user; restart the MCP server"
+                            ));
+                            return Err(self.ended_error());
+                        }
                     }
-                },
-                State::Ended => {
-                    self.state = State::Ended;
-                    return Err(session_ended());
+                }
+                ended @ State::Ended(_) => {
+                    self.state = ended;
+                    return Err(self.ended_error());
                 }
             }
         }
@@ -427,7 +490,7 @@ impl<D: Daemon> SessionKeeper<D> {
     }
 
     /// Notice a lost session between requests (the wrapper polls this), and tell whether the
-    /// live daemon ended it.
+    /// live daemon ended it for good.
     pub(crate) fn poll(&mut self) -> Health {
         if let State::Live { link, .. } = &mut self.state
             && let Some(how) = link.lost()
@@ -435,25 +498,25 @@ impl<D: Daemon> SessionKeeper<D> {
                 link,
                 instance,
                 session,
-            } = std::mem::replace(&mut self.state, State::Idle)
+                origin,
+            } = std::mem::replace(&mut self.state, State::Idle { renewal: false })
         {
             // Data nobody asked for is a protocol violation: that broker may still run.
-            let revoke = (how == LinkLost::Broken).then_some(session);
-            self.lose(link, instance, revoke);
+            self.lose(link, instance, session, origin, how == LinkLost::Broken);
         }
         if matches!(self.state, State::Lost { .. }) {
             self.resolve();
         }
-        match self.state {
-            State::Ended => Health::Ended,
+        match &self.state {
+            State::Ended(message) => Health::Ended(message.clone()),
             _ => Health::Running,
         }
     }
 
     /// Close the link (the broker exits on its EOF), revoking the session too when asked.
     pub(crate) fn shutdown(&mut self, revoke: bool) {
-        if let State::Live { link, session, .. } = std::mem::replace(&mut self.state, State::Ended)
-        {
+        let ended = State::Ended("this MCP server is stopping".to_string());
+        if let State::Live { link, session, .. } = std::mem::replace(&mut self.state, ended) {
             drop(link);
             if revoke {
                 let _ = self.daemon.revoke(&session);
@@ -461,47 +524,109 @@ impl<D: Daemon> SessionKeeper<D> {
         }
     }
 
-    /// Drop a link that is no longer usable. A broker that may still run is revoked (closing the
-    /// link also makes it exit): when that revocation is what ended the session, the wrapper
-    /// ended it, and a new one may be launched. Otherwise (the broker closed the link, or the
-    /// daemon no longer knew the session) the session is lost, and [`Self::resolve`] decides why.
+    /// Drop a link that is no longer usable. A broker that may still run (`revoke`) is revoked
+    /// (closing the link also makes it exit): when that revocation is what ended the session,
+    /// the wrapper ended it, and a new one may be launched. Otherwise (the broker closed the
+    /// link, or the daemon no longer had the session) the session is lost, and
+    /// [`Self::resolve`] asks the daemon why.
     fn lose(
         &mut self,
         link: D::Link,
         instance: Option<DaemonInstance>,
-        revoke: Option<D::Session>,
+        session: D::Session,
+        origin: Origin,
+        revoke: bool,
     ) {
         drop(link);
-        if let Some(session) = revoke
-            && self.daemon.revoke(&session)
-        {
-            self.state = State::Idle;
+        if revoke && self.daemon.revoke(&session) {
+            self.state = State::Idle { renewal: false };
             return;
         }
         self.state = State::Lost {
             instance,
+            session,
+            origin,
             since: Instant::now(),
         };
     }
 
-    /// Decide what a lost session means: its daemon went away (re-establish), or the live daemon
-    /// ended it (do not).
+    /// Decide what a lost session means from what the daemon says, never from timing alone:
+    /// - its daemon is gone, or another daemon process answers: launch a new one;
+    /// - the daemon that launched it says it expired: renew it, once per expiry, and not when a
+    ///   renewed session expired before it handed out a single endpoint (a `max_session_ttl`
+    ///   too short to use: renewing it would only loop);
+    /// - it says the session was revoked, terminated, its profile disabled, or it exited: end;
+    /// - it says nothing yet (still running, no answer): wait;
+    /// - it cannot say (a daemon without `SessionEnd`, a forgotten session): as before reasons
+    ///   existed, wait for the grace period, then end. An unknown reason never renews.
     fn resolve(&mut self) -> Resolution {
-        let State::Lost { instance, since } = self.state else {
+        let State::Lost {
+            instance,
+            ref session,
+            origin,
+            since,
+        } = self.state
+        else {
             return Resolution::Pending;
         };
-        let resolution = match self.daemon.probe() {
-            Probe::Down => Resolution::Down,
-            Probe::Answering(Some(now)) if instance != Some(now) => Resolution::Restarted,
-            Probe::Answering(_) if since.elapsed() >= self.grace => Resolution::Ended,
-            Probe::Answering(_) | Probe::Silent => Resolution::Pending,
+        let (resolution, renewal, message) = match self.daemon.probe() {
+            Probe::Down => (Resolution::Down, false, None),
+            Probe::Answering(Some(now)) if instance != Some(now) => {
+                (Resolution::Relaunch, false, None)
+            }
+            Probe::Silent => (Resolution::Pending, false, None),
+            Probe::Answering(_) => match self.daemon.session_end(session) {
+                SessionEnd::Ended(SessionEndReason::Expired)
+                    if origin.renewal && !origin.served =>
+                {
+                    (
+                        Resolution::Ended,
+                        false,
+                        Some(
+                            "its renewed principal session expired before it was used \
+                             (max_session_ttl is too short to use); not renewing it again"
+                                .to_string(),
+                        ),
+                    )
+                }
+                SessionEnd::Ended(SessionEndReason::Expired) => (Resolution::Relaunch, true, None),
+                SessionEnd::Ended(reason) => (
+                    Resolution::Ended,
+                    false,
+                    Some(format!(
+                        "the daemon ended this MCP server's principal session ({}); it is not \
+                         re-established",
+                        describe(reason)
+                    )),
+                ),
+                SessionEnd::Running => (Resolution::Pending, false, None),
+                SessionEnd::Unknown if since.elapsed() >= self.grace => (
+                    Resolution::Ended,
+                    false,
+                    Some(
+                        "the daemon ended this MCP server's principal session and does not say \
+                         why; it is not re-established"
+                            .to_string(),
+                    ),
+                ),
+                SessionEnd::Unknown => (Resolution::Pending, false, None),
+            },
         };
         match resolution {
-            Resolution::Down | Resolution::Restarted => self.state = State::Idle,
-            Resolution::Ended => self.state = State::Ended,
+            Resolution::Down | Resolution::Relaunch => self.state = State::Idle { renewal },
+            Resolution::Ended => {
+                self.state = State::Ended(message.unwrap_or_else(|| session_ended().message));
+            }
             Resolution::Pending => {}
         }
         resolution
+    }
+
+    fn ended_error(&self) -> EnsureError {
+        match &self.state {
+            State::Ended(message) => EnsureError::new("session_ended", message.clone()),
+            _ => session_ended(),
+        }
     }
 
     #[cfg(test)]
@@ -509,17 +634,35 @@ impl<D: Daemon> SessionKeeper<D> {
         match self.state {
             State::Live { .. } => "live",
             State::Lost { .. } => "lost",
-            State::Idle => "idle",
-            State::Ended => "ended",
+            State::Idle { .. } => "idle",
+            State::Ended(_) => "ended",
         }
     }
 }
 
-fn live<L, S>(launched: Launched<L, S>) -> State<L, S> {
+fn live<L, S>(launched: Launched<L, S>, renewal: bool) -> State<L, S> {
     State::Live {
         link: launched.link,
         instance: launched.instance,
         session: launched.session,
+        origin: Origin {
+            renewal,
+            served: false,
+        },
+    }
+}
+
+/// A recorded end reason, as the wrapper's message says it.
+fn describe(reason: SessionEndReason) -> &'static str {
+    match reason {
+        SessionEndReason::Expired => "expired",
+        SessionEndReason::Revoked => "revoked",
+        SessionEndReason::Terminated => "terminated",
+        SessionEndReason::ProfileDisabled => "its profile was disabled",
+        SessionEndReason::Exited => "its process exited",
+        SessionEndReason::ClientGone => "its client is gone",
+        SessionEndReason::DaemonShutdown => "the daemon shut down",
+        SessionEndReason::Unknown => "for a reason this passless does not know",
     }
 }
 
@@ -533,16 +676,15 @@ fn unavailable(detail: &str) -> EnsureError {
 fn session_lost() -> EnsureError {
     EnsureError::new(
         "session_lost",
-        "the principal session ended while its daemon still answers; checking whether the \
-         daemon is restarting",
+        "the principal session ended and the daemon has not said why yet; retry in a moment",
     )
 }
 
 fn session_ended() -> EnsureError {
     EnsureError::new(
         "session_ended",
-        "the daemon ended this MCP server's principal session (revoked, expired, its grants \
-         revoked or its profile disabled); it is not re-established",
+        "the daemon ended this MCP server's principal session (revoked, its profile disabled or \
+         removed); it is not re-established",
     )
 }
 
@@ -580,8 +722,10 @@ impl Daemon for AdminDaemon {
             .connect(ADMIN_TIMEOUT)
             .map_err(|e| LaunchError::Unreachable(e.to_string()))?;
         let instance = client.daemon_instance();
-        let (ours, theirs) = UnixStream::pair()
-            .map_err(|e| LaunchError::Refused(format!("cannot create the broker link: {e}")))?;
+        let (ours, theirs) = UnixStream::pair().map_err(|e| LaunchError::Refused {
+            message: format!("cannot create the broker link: {e}"),
+            fatal: false,
+        })?;
         let response = client.launch_principal_with_stdio(
             &self.profile,
             self.argv.clone(),
@@ -594,14 +738,20 @@ impl Daemon for AdminDaemon {
         let session = match response {
             Ok(AdminResponse::PrincipalLaunched(launched)) => launched.session_id,
             Ok(_) => {
-                return Err(LaunchError::Refused(
-                    "the daemon answered the session launch with an unexpected response".into(),
-                ));
+                return Err(LaunchError::Refused {
+                    message: "the daemon answered the session launch with an unexpected response"
+                        .into(),
+                    fatal: false,
+                });
             }
             Err(ClientError::Protocol(e)) => {
-                return Err(LaunchError::Refused(format!(
-                    "the daemon refused the principal session: {e}"
-                )));
+                // An unknown or disabled profile (or an executable the daemon will not run)
+                // stays refused; a full session limit may not.
+                let fatal = matches!(e.code, ErrorCode::NotFound | ErrorCode::Forbidden);
+                return Err(LaunchError::Refused {
+                    message: format!("the daemon refused the principal session: {e}"),
+                    fatal,
+                });
             }
             Err(e) => return Err(LaunchError::Unreachable(e.to_string())),
         };
@@ -623,17 +773,38 @@ impl Daemon for AdminDaemon {
             Ok((link, (protocol, _, _))) => {
                 drop(link);
                 let _ = self.revoke(&session);
-                Err(LaunchError::Refused(format!(
-                    "the principal session speaks broker protocol {protocol}, this MCP server \
-                     {BROKER_PROTOCOL} (passless was upgraded): restart the MCP server"
-                )))
+                Err(LaunchError::Refused {
+                    message: format!(
+                        "the principal session speaks broker protocol {protocol}, this MCP \
+                         server {BROKER_PROTOCOL} (passless was upgraded): restart the MCP server"
+                    ),
+                    fatal: true,
+                })
             }
             Err(_) => {
                 let _ = self.revoke(&session);
-                Err(LaunchError::Refused(
-                    "the principal session started but its broker did not answer".to_string(),
-                ))
+                Err(LaunchError::Refused {
+                    message: "the principal session started but its broker did not answer"
+                        .to_string(),
+                    fatal: false,
+                })
             }
+        }
+    }
+
+    fn session_end(&mut self, session: &PrincipalSessionId) -> SessionEnd {
+        let Ok(mut client) = self.connect(PROBE_TIMEOUT) else {
+            return SessionEnd::Unknown;
+        };
+        // A daemon that predates `SessionEnd` refuses it (malformed): the reason is unknown.
+        match client.request(AdminRequest::SessionEnd {
+            session_id: session.clone(),
+        }) {
+            Ok(AdminResponse::SessionEnd(end)) if end.running => SessionEnd::Running,
+            Ok(AdminResponse::SessionEnd(end)) => {
+                SessionEnd::Ended(end.reason.unwrap_or(SessionEndReason::Unknown))
+            }
+            _ => SessionEnd::Unknown,
         }
     }
 
@@ -781,7 +952,7 @@ pub(super) fn run_playwright(
             );
             return Ok(None);
         }
-        Err(LaunchError::Unreachable(message) | LaunchError::Refused(message)) => {
+        Err(LaunchError::Unreachable(message) | LaunchError::Refused { message, .. }) => {
             return Err(Error::Other(message));
         }
     };
@@ -877,13 +1048,10 @@ fn supervise<D: Daemon>(
                 Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().poll(),
                 Err(TryLockError::WouldBlock) => Health::Running,
             };
-            if health == Health::Ended {
+            if let Health::Ended(message) = health {
                 stop_child(&mut child);
                 shutdown(keeper, false);
-                return Err(Error::Other(format!(
-                    "{}; stopped Playwright MCP",
-                    session_ended().message
-                )));
+                return Err(Error::Other(format!("{message}; stopped Playwright MCP")));
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1035,7 +1203,10 @@ mod tests {
         foreign: bool,
         /// The daemon already ended the sessions it handed out (a revocation finds nothing).
         forgot: bool,
-        refuse: Option<String>,
+        /// A launch refusal and whether it is fatal.
+        refuse: Option<(String, bool)>,
+        /// What `SessionEnd` answers (an old daemon: `Unknown`).
+        end: SessionEnd,
         next: u32,
         /// The `gone` switch of every link handed out, by session.
         links: Vec<Arc<AtomicBool>>,
@@ -1051,6 +1222,7 @@ mod tests {
                 foreign: false,
                 forgot: false,
                 refuse: None,
+                end: SessionEnd::Unknown,
                 next: 1,
                 links: Vec::new(),
                 replies: VecDeque::new(),
@@ -1068,8 +1240,11 @@ mod tests {
                     "the passless daemon is not running".into(),
                 ));
             };
-            if let Some(reason) = &self.refuse {
-                return Err(LaunchError::Refused(reason.clone()));
+            if let Some((message, fatal)) = &self.refuse {
+                return Err(LaunchError::Refused {
+                    message: message.clone(),
+                    fatal: *fatal,
+                });
             }
             if self.foreign {
                 return Err(LaunchError::ForeignUser {
@@ -1101,6 +1276,10 @@ mod tests {
                 (Some(_), true) => Probe::Silent,
                 (Some(instance), false) => Probe::Answering(Some(instance)),
             }
+        }
+
+        fn session_end(&mut self, _session: &u32) -> SessionEnd {
+            self.end
         }
 
         fn revoke(&mut self, session: &u32) -> bool {
@@ -1225,24 +1404,150 @@ mod tests {
         assert_eq!(calls_to(&journal, 2), 2);
     }
 
-    /// The live daemon ended the session (revocation, expiry): it is not re-established. While
-    /// undecided the request fails as `session_lost`; past the grace period the wrapper ends.
+    /// A daemon that cannot say why the session ended (it predates `SessionEnd`, or forgot the
+    /// session) keeps the earlier behaviour: undecided (`session_lost`) for the grace period,
+    /// then the wrapper ends. An unknown reason never renews.
     #[test]
-    fn a_session_the_live_daemon_ended_is_not_re_established() {
+    fn an_unknown_end_reason_ends_the_wrapper_after_the_grace_period() {
         let (mut keeper, journal) = keeper(Duration::from_millis(200));
+        assert_eq!(keeper.daemon.end, SessionEnd::Unknown);
         broker_exits(&keeper, 1);
         assert_eq!(keeper.poll(), Health::Running);
         assert_eq!(keeper.state_name(), "lost");
         assert_eq!(keeper.ensure().unwrap_err().class, Some("session_lost"));
 
         std::thread::sleep(Duration::from_millis(250));
-        assert_eq!(keeper.poll(), Health::Ended);
+        assert!(matches!(keeper.poll(), Health::Ended(m) if m.contains("does not say why")));
         let err = keeper.ensure().unwrap_err();
         assert_eq!(err.class, Some("session_ended"), "{err:?}");
         // Even if the daemon later restarts, an ended wrapper stays ended.
         keeper.daemon.up = Some(B);
         assert_eq!(keeper.ensure().unwrap_err().class, Some("session_ended"));
         assert_eq!(lock(&journal).launched, [1], "no second session");
+    }
+
+    /// The daemon says the session expired: the next browser request launches a new one through
+    /// the daemon (no grace period, no guessing), and nothing of the old one is used again.
+    #[test]
+    fn an_expired_session_is_renewed_on_the_next_request() {
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        keeper.ensure().unwrap();
+        keeper.daemon.end = SessionEnd::Ended(SessionEndReason::Expired);
+        broker_exits(&keeper, 1);
+        assert_eq!(
+            keeper.poll(),
+            Health::Running,
+            "expiry does not end the wrapper"
+        );
+        assert_eq!(keeper.state_name(), "idle");
+        assert_eq!(lock(&journal).launched, [1], "renewal is lazy");
+        let calls_before = calls_to(&journal, 1);
+
+        assert_eq!(
+            keeper.ensure().unwrap(),
+            "ws://127.0.0.1:9/devtools/browser/2"
+        );
+        assert_eq!(lock(&journal).launched, [1, 2]);
+        assert_eq!(
+            calls_to(&journal, 1),
+            calls_before,
+            "the expired session is never reused"
+        );
+        assert!(lock(&journal).revoked.is_empty());
+
+        // The renewed session served, so its own expiry is renewed too (once per expiry).
+        broker_exits(&keeper, 2);
+        keeper.ensure().unwrap();
+        assert_eq!(lock(&journal).launched, [1, 2, 3]);
+    }
+
+    /// The expiry is also noticed during a request (no poll in between): that request renews.
+    #[test]
+    fn a_request_on_an_expired_session_renews_it() {
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        keeper.daemon.end = SessionEnd::Ended(SessionEndReason::Expired);
+        broker_exits(&keeper, 1);
+        assert_eq!(
+            keeper.ensure().unwrap(),
+            "ws://127.0.0.1:9/devtools/browser/2"
+        );
+        assert_eq!(lock(&journal).launched, [1, 2]);
+    }
+
+    /// Every deliberate end the daemon records (revoked, terminated, profile disabled), and an
+    /// exit or a reason this build does not know, ends the wrapper at once, with no new session.
+    #[test]
+    fn a_deliberate_end_ends_the_wrapper() {
+        for (reason, says) in [
+            (SessionEndReason::Revoked, "revoked"),
+            (SessionEndReason::Terminated, "terminated"),
+            (SessionEndReason::ProfileDisabled, "profile was disabled"),
+            (SessionEndReason::Exited, "process exited"),
+            (SessionEndReason::ClientGone, "client is gone"),
+            (SessionEndReason::Unknown, "does not know"),
+        ] {
+            let (mut keeper, journal) = keeper(LOST_GRACE);
+            keeper.daemon.end = SessionEnd::Ended(reason);
+            broker_exits(&keeper, 1);
+            match keeper.poll() {
+                Health::Ended(message) => assert!(message.contains(says), "{reason:?}: {message}"),
+                other => panic!("{reason:?}: {other:?}"),
+            }
+            let err = keeper.ensure().unwrap_err();
+            assert_eq!(err.class, Some("session_ended"), "{reason:?}");
+            keeper.daemon.up = Some(B);
+            assert_eq!(keeper.ensure().unwrap_err().class, Some("session_ended"));
+            assert_eq!(lock(&journal).launched, [1], "{reason:?}: no new session");
+        }
+    }
+
+    /// A session the daemon still lists as running (its end not recorded yet) is undecided; once
+    /// the daemon records the expiry, it is renewed.
+    #[test]
+    fn an_end_not_recorded_yet_waits_for_the_reason() {
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        keeper.daemon.end = SessionEnd::Running;
+        broker_exits(&keeper, 1);
+        assert_eq!(keeper.poll(), Health::Running);
+        assert_eq!(keeper.state_name(), "lost");
+        assert_eq!(keeper.ensure().unwrap_err().class, Some("session_lost"));
+        keeper.daemon.end = SessionEnd::Ended(SessionEndReason::Expired);
+        keeper.ensure().unwrap();
+        assert_eq!(lock(&journal).launched, [1, 2]);
+    }
+
+    /// Loop protection: a renewed session that expires before it handed out a single endpoint
+    /// (a `max_session_ttl` too short to use) is not renewed again; the wrapper stops. And one
+    /// request never launches more than one session.
+    #[test]
+    fn a_renewal_that_expires_before_use_is_not_renewed_again() {
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        keeper.daemon.end = SessionEnd::Ended(SessionEndReason::Expired);
+        broker_exits(&keeper, 1);
+        // The renewal's broker is gone before it answers its first request.
+        keeper.daemon.replies.push_back(Err(LinkLost::Closed));
+        let err = keeper.ensure().unwrap_err();
+        assert_eq!(err.class, Some("session_ended"), "{err:?}");
+        assert!(err.message.contains("too short"), "{err:?}");
+        assert_eq!(lock(&journal).launched, [1, 2], "one renewal, then stop");
+        assert!(matches!(keeper.poll(), Health::Ended(_)));
+        assert_eq!(keeper.ensure().unwrap_err().class, Some("session_ended"));
+        assert_eq!(lock(&journal).launched, [1, 2]);
+    }
+
+    /// A request whose fresh session is gone at once (the daemon has not said why yet) does not
+    /// launch a second one in the same request.
+    #[test]
+    fn one_request_launches_at_most_one_session() {
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        keeper.daemon.up = None;
+        broker_exits(&keeper, 1);
+        keeper.poll();
+        keeper.daemon.up = Some(B);
+        keeper.daemon.end = SessionEnd::Running;
+        keeper.daemon.replies.push_back(Err(LinkLost::Closed));
+        assert_eq!(keeper.ensure().unwrap_err().class, Some("session_lost"));
+        assert_eq!(lock(&journal).launched, [1, 2]);
     }
 
     /// A daemon that accepts the connection but does not answer (shutting down) is undecided,
@@ -1318,8 +1623,8 @@ mod tests {
         assert_eq!(lock(&journal).launched, [1]);
     }
 
-    /// A relaunch the daemon refuses (the profile was disabled meanwhile) says so and retries
-    /// on the next request.
+    /// A relaunch the daemon refuses for now (its session limit is full) says so and retries on
+    /// the next request.
     #[test]
     fn a_refused_relaunch_is_reported_and_retried() {
         let (mut keeper, journal) = keeper(LOST_GRACE);
@@ -1327,12 +1632,31 @@ mod tests {
         broker_exits(&keeper, 1);
         keeper.poll();
         keeper.daemon.up = Some(B);
-        keeper.daemon.refuse = Some("profile 'agent' is disabled".into());
+        keeper.daemon.refuse = Some(("session limit reached".into(), false));
         let err = keeper.ensure().unwrap_err();
-        assert!(err.message.contains("disabled"), "{err:?}");
+        assert!(err.message.contains("session limit"), "{err:?}");
         keeper.daemon.refuse = None;
         keeper.ensure().unwrap();
         assert_eq!(lock(&journal).launched, [1, 2]);
+    }
+
+    /// A relaunch refused for the profile itself (disabled or removed while the daemon was
+    /// restarting) ends the wrapper.
+    #[test]
+    fn a_relaunch_refused_for_the_profile_ends_the_wrapper() {
+        let (mut keeper, journal) = keeper(LOST_GRACE);
+        keeper.daemon.up = None;
+        broker_exits(&keeper, 1);
+        keeper.poll();
+        keeper.daemon.up = Some(B);
+        keeper.daemon.refuse = Some(("profile 'agent' is disabled".into(), true));
+        let err = keeper.ensure().unwrap_err();
+        assert_eq!(err.class, Some("session_ended"), "{err:?}");
+        assert!(err.message.contains("disabled"), "{err:?}");
+        assert!(matches!(keeper.poll(), Health::Ended(_)));
+        keeper.daemon.refuse = None;
+        assert_eq!(keeper.ensure().unwrap_err().class, Some("session_ended"));
+        assert_eq!(lock(&journal).launched, [1]);
     }
 
     #[test]

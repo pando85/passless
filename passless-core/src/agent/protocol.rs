@@ -408,6 +408,46 @@ pub enum AdminRequest {
         profile_id: ProfileId,
     },
     Shutdown,
+    /// Whether a principal session is still running and, once it ended, why (the daemon keeps
+    /// the reason for a while). Unlike `WaitPrincipal` it never consumes the record. A daemon
+    /// that predates it refuses the request as malformed, which a caller reads as "reason
+    /// unknown".
+    SessionEnd {
+        session_id: PrincipalSessionId,
+    },
+}
+
+/// Why a principal session ended, as the daemon that ended it recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEndReason {
+    /// Its `max_session_ttl` ran out.
+    Expired,
+    /// `RevokeSession` (`agent-admin principals revoke`).
+    Revoked,
+    /// `TerminatePrincipal`.
+    Terminated,
+    /// Its profile was disabled.
+    ProfileDisabled,
+    /// The session's process exited by itself.
+    Exited,
+    /// The client that launched it is gone.
+    ClientGone,
+    /// The daemon shut down.
+    DaemonShutdown,
+    /// A reason this build does not know (sent by a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to `AdminRequest::SessionEnd`: `running`, or the reason it ended. A session the
+/// daemon does not know (never launched, or its record expired) is a `NotFound` error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEndResponse {
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SessionEndReason>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -448,6 +488,7 @@ pub enum AdminResponse {
     GrantedRuleList(GrantedRuleList),
     GrantedRulesRevoked { revoked: u32 },
     ShutdownAccepted,
+    SessionEnd(SessionEndResponse),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1261,6 +1302,7 @@ impl Validate for AdminRequest {
             | Self::ListSessions { .. }
             | Self::ShowSession { .. }
             | Self::RevokeSession { .. }
+            | Self::SessionEnd { .. }
             | Self::ListProfiles
             | Self::EnableProfile { .. }
             | Self::DisableProfile { .. }
@@ -1759,6 +1801,32 @@ mod tests {
     {
         let bytes = serde_json::to_vec(val).unwrap();
         serde_json::from_slice::<T>(&bytes).unwrap()
+    }
+
+    /// `SessionEnd` round-trips; a reason this build does not know reads as `Unknown`, and an
+    /// absent reason is allowed.
+    #[test]
+    fn session_end_round_trips_and_tolerates_new_reasons() {
+        let request = AdminRequest::SessionEnd {
+            session_id: PrincipalSessionId::new(),
+        };
+        assert_eq!(json_roundtrip(&request), request);
+        assert!(request.validate().is_ok());
+        let response = AdminResponse::SessionEnd(SessionEndResponse {
+            running: false,
+            reason: Some(SessionEndReason::Expired),
+        });
+        assert_eq!(json_roundtrip(&response), response);
+        assert_eq!(
+            serde_json::to_string(&SessionEndReason::ProfileDisabled).unwrap(),
+            "\"profile_disabled\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionEndReason>("\"some_future_reason\"").unwrap(),
+            SessionEndReason::Unknown
+        );
+        let running: SessionEndResponse = serde_json::from_str(r#"{"running":true}"#).unwrap();
+        assert_eq!(running.reason, None);
     }
 
     #[test]

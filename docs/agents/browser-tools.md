@@ -40,10 +40,13 @@ The server survives a daemon restart or upgrade: the process your MCP client sta
 connection and the Playwright MCP server. While the daemon is down, browser tool calls fail at once
 with `passless daemon unavailable, retrying ...`; the first browser tool call after it is back starts
 a new principal session, with the new daemon's policy and grants, and a new browser. The pages of the
-old browser are gone, as after any restart. A session that the running daemon ends (revoked, expired,
-its grants revoked or its profile disabled) is not renewed: the server exits and the client must
-restart it. This needs the session to run as your own Unix user; for a profile whose sessions run as
-another user the server runs inside the session, as that user, and exits with the daemon.
+old browser are gone, as after any restart. The same happens when the session reaches the profile's
+`max_session_ttl`: the next browser tool call starts a new session and browser, once per expiry (a
+renewed session that expires before it is used is not renewed again: the TTL is too short). A
+session that the running daemon ends on purpose (`agent-admin principals revoke`, or its profile
+disabled or removed) is not renewed: the server exits and the client must restart it. This needs the
+session to run as your own Unix user; for a profile whose sessions run as another user the server runs
+inside the session, as that user, and exits with the daemon or when the session expires.
 
 - `--profile` may be left out when exactly one profile is configured.
 - Pass options through to Playwright MCP after `--`. For contexts that Playwright creates over CDP

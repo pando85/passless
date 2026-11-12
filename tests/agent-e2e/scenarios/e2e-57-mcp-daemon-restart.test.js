@@ -164,3 +164,65 @@ scenario({ id: 'E2E-57', title: 'agent mcp playwright survives a daemon restart 
   await waitFor('the new lease to be closed in the audit', async () =>
     auditEvents(await stack.daemon.audit()).some(e => /^browser_lease\.(revoke|cleanup)$/.test(e.kind) && e.lease_id === newLease), { timeoutMs: 30000, intervalMs: 500 });
 });
+
+/** The live principal sessions of `profile`, as the daemon lists them. */
+async function sessionsOf(stack, profile) {
+  return (await stack.daemon.adminJson('principals', 'list', '--profile', profile)).sessions.map(s => s.session_id);
+}
+
+// E2E-57/ttl: `max_session_ttl` caps each principal session, not the MCP server. When the wrapper's session expires (the
+// daemon records why, `SessionEnd` = expired), the next browser tool call launches a new session through the admin socket,
+// with a new lease, over the same stdio session; nothing of the expired one is reused, and its lease is closed. A
+// deliberate end is final: `agent-admin principals revoke` ends the wrapper (and its Playwright MCP server).
+// Port-only: Playwright MCP needs a CDP endpoint, which a pipe-mode profile refuses (ADR 0014 §4.3; the refusal is E2E-53).
+const TTL_SECS = 20;
+scenario({ id: 'E2E-57/ttl', title: 'agent mcp playwright renews an expired session; a revoked one ends it', ci: true, timeoutMs: 240000 }, async ctx => {
+  const stack = await ctx.stack({
+    rps: { a: { host: 'rp-a.test' } },
+    profiles: { agent: { ...profiles.agent, max_session_ttl: TTL_SECS } },
+  });
+  const rp = stack.rp.a;
+  await stack.seedHuman(rp, 'alice');
+
+  const mcp = stack.adapter('playwright', { profile: 'agent' });
+  const wrapperPid = mcp.client.child.pid;
+  await mcp.client.initialize();
+  const first = await signIn(mcp, rp, 'first sign-in');
+  const [firstBroker] = brokers(stack);
+  const [firstSession] = await sessionsOf(stack, 'agent');
+  const [firstLease] = leaseLaunches(await stack.daemon.audit()).map(e => e.lease_id);
+  assert.ok(firstBroker && firstSession && firstLease, 'a session, its broker and its lease');
+
+  // Wait past the TTL: the daemon ends the session and its browser; the wrapper stays.
+  await waitFor('the session to expire', async () => brokers(stack).length === 0 && (await sessionsOf(stack, 'agent')).length === 0
+    && browserProcesses(stack, processesMentioning).length === 0, { timeoutMs: (TTL_SECS + 30) * 1000, intervalMs: 500 });
+  await new Promise(r => setTimeout(r, 1500)); // the wrapper notices within a poll interval
+  assert.equal(mcp.client.child.exitCode, null, `the wrapper exited on expiry: ${mcp.client.stderr.slice(-600)}`);
+
+  // The next sign-in renews: a new session (through the admin socket), a new broker, a new lease.
+  const again = await signIn(mcp, rp, 'sign-in after the expiry');
+  assert.ok(again.counter > first.counter, 'counter increases');
+  const [renewedSession, ...more] = await sessionsOf(stack, 'agent');
+  assert.ok(renewedSession && !more.length && renewedSession !== firstSession, `a new principal session: ${renewedSession}`);
+  const [renewedBroker] = brokers(stack);
+  assert.ok(renewedBroker && renewedBroker !== firstBroker, 'a new broker process');
+  const audit = await stack.daemon.audit();
+  const leases = leaseLaunches(audit).map(e => e.lease_id);
+  assert.equal(leases.length, 2, `a new lease: ${JSON.stringify(leases)}`);
+  assert.notEqual(leases[1], firstLease, 'not the expired lease');
+  assert.ok(auditEvents(audit).some(e => /^browser_lease\.(revoke|expire|cleanup)$/.test(e.kind) && e.lease_id === firstLease),
+    `the expired session's lease is closed: ${JSON.stringify(auditEvents(audit).filter(e => /lease/.test(e.kind)))}`);
+  assert.equal(mcp.npxCalls().length, 1, 'the same Playwright MCP server');
+  assert.equal(mcp.client.child.pid, wrapperPid);
+
+  // A revocation is final: the wrapper exits and is not renewed.
+  const exited = new Promise(resolve => mcp.client.child.once('exit', (code, signal) => resolve({ code, signal })));
+  await stack.daemon.adminJson('principals', 'revoke', renewedSession, '--confirm');
+  const exit = await Promise.race([exited, new Promise(r => setTimeout(() => r(null), 20000))]);
+  assert.ok(exit, `the wrapper did not exit after the revocation: ${mcp.client.stderr.slice(-600)}`);
+  assert.notEqual(exit.code, 0, `a revoked session is an error exit: ${JSON.stringify(exit)}`);
+  assert.match(mcp.client.stderr, /principal session \(revoked\); it is not re-established/, mcp.client.stderr.slice(-600));
+  await waitFor('no session, broker or browser left', async () => brokers(stack).length === 0 && (await sessionsOf(stack, 'agent')).length === 0
+    && browserProcesses(stack, processesMentioning).length === 0, { timeoutMs: 20000, intervalMs: 300 });
+  assert.equal(leaseLaunches(await stack.daemon.audit()).length, 2, 'no session was launched after the revocation');
+});

@@ -347,13 +347,13 @@ fn hint_for(class: &str) -> &'static str {
              `passless doctor --agents`"
         }
         "session_lost" => {
-            "the principal session of this MCP server ended while the daemon still answers; \
-             retry in a few seconds (a restarting daemon gets a new session on the next call)"
+            "the principal session of this MCP server ended and the daemon has not said why yet; \
+             retry in a few seconds (an expired session or a restarted daemon gets a new session \
+             on the next call)"
         }
         "session_ended" => {
-            "the daemon ended the principal session of this MCP server (revoked, expired, its \
-             grants revoked or its profile disabled); the server exits: restart it in your MCP \
-             client"
+            "the daemon ended the principal session of this MCP server on purpose (revoked, or \
+             its profile disabled or removed); the server exits: restart it in your MCP client"
         }
         "runtime_root_invalid" => {
             "the browser runtime root could not be used: see the passless daemon's log \

@@ -399,6 +399,12 @@ register = "deny"
 the profile value (§10.1). Policy is owned by the operator; a principal cannot add, broaden,
 reload or revoke it, and cannot choose an evidence source at request time.
 
+*Amendment (session TTL):* `max_session_ttl` bounds each principal session and its lease, not the
+launcher; the daemon records why a session ended (`AdminRequest::SessionEnd`: expired, revoked,
+terminated, profile disabled, exited), and `agent mcp playwright` renews only an expired session,
+through the admin socket like any launch (every check and the new daemon state applied, nothing of
+the old session reused, once per expiry), while every other or unknown reason is final.
+
 RP IDs are normalized exact DNS names: no scheme, port, path, trailing dot, IP address or public
 suffix. The only pattern is the constrained `*` (§6.3). The one exception to the public-suffix rule
 is `localhost`: `rp_id = "localhost"` and origins `http://localhost[:port]` are valid for exact

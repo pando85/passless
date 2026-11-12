@@ -74,10 +74,11 @@ Run `passless agent-admin profile check <profile>`.
     running, or runs without agents (see above). During a restart this is expected: the MCP server
     stays up and the next browser tool call after the daemon is back works
     ([Browser tools](browser-tools.md#playwright-mcp)).
-  - `class` `session_lost`: the server's principal session ended a moment ago and the daemon still
-    answers; retry in a few seconds.
-  - `class` `session_ended`: the running daemon ended the server's principal session (revoked, expired,
-    its grants revoked or its profile disabled). The server exits; restart it in the MCP client.
+  - `class` `session_lost`: the server's principal session ended a moment ago and the daemon has not
+    said why yet; retry in a few seconds. An expired session is renewed on the next call.
+  - `class` `session_ended`: the running daemon ended the server's principal session on purpose
+    (`agent-admin principals revoke`, or its profile disabled or removed), or cannot say why (an older
+    daemon). The server exits; restart it in the MCP client. Expiry (`max_session_ttl`) is not final.
   - `class` `launch_failed`: see `passless doctor --agents` and the daemon log.
 - `browser_cdp_port <port> on 127.0.0.1 is already in use (<process>, pid <pid>)`, or `the CDP endpoint on
   127.0.0.1:<port> does not belong to the launched browser`: another process (often a browser you started
