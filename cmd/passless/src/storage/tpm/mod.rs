@@ -892,6 +892,11 @@ impl CredentialStorage for TpmStorageAdapter {
         count
     }
 
+    /// From the path index: nothing is unsealed and the TPM context is not touched.
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        Some(self.indexes.count_for_rp(rp_id))
+    }
+
     fn disable_user_verification(&self) -> bool {
         // TPM backend supports user verification
         false

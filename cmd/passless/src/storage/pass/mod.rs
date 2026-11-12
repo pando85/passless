@@ -984,6 +984,12 @@ impl CredentialStorage for PassStorageAdapter {
         count
     }
 
+    /// From the path index: no GPG operation. (Every decrypting path takes `&mut self` for the
+    /// cache and the decryption-key affinity; this one cannot reach them.)
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        Some(self.indexes.count_for_rp(rp_id))
+    }
+
     fn disable_user_verification(&self) -> bool {
         // Pass backend doesn't support user verification
         true
@@ -1086,6 +1092,36 @@ mod tests {
         assert_eq!(metadata[0].credential_count, 2);
         assert_eq!(metadata[1].id, "example.org");
         assert_eq!(metadata[1].credential_count, 1);
+    }
+
+    #[test]
+    fn count_for_rp_uses_the_path_index_without_gpg() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fido2 = root.join("fido2");
+        for (rp, id) in [
+            ("example.com", "aa"),
+            ("example.com", "bb"),
+            ("example.org", "cc"),
+        ] {
+            let rp_dir = fido2.join(rp);
+            fs::create_dir_all(&rp_dir).unwrap();
+            let path = rp_dir.join(format!("{id}.gpg"));
+            // Not ciphertext, and unreadable: GPG could never be handed its contents.
+            fs::write(&path, b"not gpg").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let mut adapter = create_adapter(root);
+        adapter.indexes = load_credential_paths(&fido2, "gpg").unwrap();
+        assert_eq!(adapter.count_for_rp("example.com"), Some(2));
+        assert_eq!(adapter.count_for_rp("example.org"), Some(1));
+        assert_eq!(adapter.count_for_rp("example.net"), Some(0));
+        // Nothing was decrypted: no cached plaintext and no learned decryption key.
+        assert!(adapter.cache.is_empty());
+        assert!(adapter.decryption_affinity.is_empty());
     }
 
     #[test]

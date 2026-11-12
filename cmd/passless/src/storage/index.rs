@@ -117,6 +117,20 @@ impl CredentialIndexes {
                 .unwrap_or_default(),
         }
     }
+
+    /// How many credentials the index holds for exactly `rp_id`, counted from the path index
+    /// alone: no credential file is opened, decrypted or unsealed. It counts what
+    /// [`CredentialFilter::ByRp`] would iterate, so a file that would fail to decrypt is counted.
+    // Read by the agent registration path only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub fn count_for_rp(&self, rp_id: &str) -> usize {
+        self.rp.get(rp_id).map_or(0, |cred_ids| {
+            cred_ids
+                .iter()
+                .filter(|cred_id| self.id.contains_key(*cred_id))
+                .count()
+        })
+    }
 }
 
 pub struct CachedCredential {
@@ -137,6 +151,12 @@ impl CredentialCache {
 
     pub fn get(&self, path: &Path) -> Option<&CachedCredential> {
         self.cache.get(path)
+    }
+
+    /// Whether nothing is cached (tests assert that a metadata-only read decrypted nothing).
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
     }
 
     pub fn insert(&mut self, path: PathBuf, credential: soft_fido2::Credential) {
@@ -338,5 +358,65 @@ pub fn update_indexes_on_delete(indexes: &mut CredentialIndexes, cred_id: &[u8])
                 indexes.rp_hash.remove(&rp_hash);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Credential files whose contents cannot be read: any attempt to open one for decryption or
+    /// unsealing would fail, so a count that matches proves the count reads paths only.
+    fn unreadable_store(extension: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (rp, ids) in [
+            ("example.com", &["aa", "bb"][..]),
+            ("example.org", &["cc"][..]),
+            ("login.example.com", &["dd"][..]),
+        ] {
+            let rp_dir = dir.path().join(rp);
+            std::fs::create_dir_all(&rp_dir).unwrap();
+            for id in ids {
+                let path = rp_dir.join(format!("{id}.{extension}"));
+                std::fs::write(&path, b"not a credential").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+        }
+        // Files of another backend's extension and hidden directories are not credentials.
+        std::fs::write(dir.path().join("example.com").join("ee.other"), b"x").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git").join("example.com")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn count_for_rp_counts_the_path_index_of_every_extension() {
+        for extension in ["bin", "gpg", "tpm"] {
+            let dir = unreadable_store(extension);
+            let indexes = load_credential_paths(dir.path(), extension).unwrap();
+            assert_eq!(indexes.count_for_rp("example.com"), 2, "{extension}");
+            assert_eq!(indexes.count_for_rp("example.org"), 1, "{extension}");
+            // Exact RP only: a parent or a sibling domain is another RP.
+            assert_eq!(indexes.count_for_rp("login.example.com"), 1, "{extension}");
+            assert_eq!(indexes.count_for_rp("unlisted.example"), 0, "{extension}");
+            assert_eq!(indexes.count_for_rp(""), 0, "{extension}");
+        }
+    }
+
+    #[test]
+    fn count_for_rp_follows_index_writes_and_deletes() {
+        let dir = unreadable_store("bin");
+        let mut indexes = load_credential_paths(dir.path(), "bin").unwrap();
+        let rp = ValidatedRpId::try_from("example.org").unwrap();
+        let path = get_credential_path(dir.path(), &rp, &[0x01, 0x02], "bin");
+        update_indexes_on_write(
+            &mut indexes,
+            CredentialPathInfo::from_path(&path, "bin").unwrap(),
+        );
+        assert_eq!(indexes.count_for_rp("example.org"), 2);
+        update_indexes_on_delete(&mut indexes, &[0x01, 0x02]);
+        update_indexes_on_delete(&mut indexes, &[0xcc]);
+        assert_eq!(indexes.count_for_rp("example.org"), 0);
     }
 }

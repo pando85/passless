@@ -142,6 +142,19 @@ pub trait CredentialStorage: Send + Sync {
     /// Count total number of stored credentials
     fn count_credentials(&self) -> usize;
 
+    /// How many credentials the store holds for exactly `rp_id`, when the backend can tell
+    /// without decrypting or unsealing anything (ADR 0014 amendment section 5.2).
+    ///
+    /// The count is shown to the human in a registration prompt only. It must come from metadata
+    /// such as the path index, never from [`Self::list_relying_parties`]'s default (which reads
+    /// every credential) or any other decrypting read. A backend that cannot count that way keeps
+    /// the default `None`, and the prompt then omits the count instead of showing 0.
+    // Read by the agent registration path only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    fn count_for_rp(&self, _rp_id: &str) -> Option<usize> {
+        None
+    }
+
     /// Check if user verification should be disabled for this backend
     ///
     /// Some backends (like pass) don't support user verification.
@@ -208,6 +221,10 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn count_credentials(&self) -> usize {
         (**self).count_credentials()
+    }
+
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        (**self).count_for_rp(rp_id)
     }
 
     fn disable_user_verification(&self) -> bool {
