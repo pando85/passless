@@ -3,6 +3,8 @@ pub mod agent;
 mod authenticator;
 mod commands;
 mod credential_backup;
+mod credential_protection;
+mod human_prompts;
 mod instance_lock;
 mod logging;
 mod notification;
@@ -480,6 +482,19 @@ fn run() -> Result<()> {
                     credential_id,
                     user_name.as_deref(),
                     display_name.as_deref(),
+                ),
+                ClientAction::SetCredProtect {
+                    credential_id,
+                    rp_id,
+                    level,
+                    yes,
+                } => commands::client::set_cred_protect(
+                    *output,
+                    device.as_deref(),
+                    credential_id.as_deref(),
+                    rp_id.as_deref(),
+                    *level,
+                    *yes,
                 ),
                 ClientAction::Backup {
                     credential_id,
