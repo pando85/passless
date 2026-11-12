@@ -719,6 +719,14 @@ impl AppConfig {
         self.pin.clone()
     }
 
+    /// Everything the daemon checks of the configuration before it starts serving: [`Self::validate`]
+    /// and the backend's own validation (`main.rs` runs the same steps one by one, with its own
+    /// log messages). Used by `passless config check` and `passless doctor`.
+    pub fn check_startup(&self) -> crate::error::Result<()> {
+        self.validate()?;
+        self.backend()?.validate()
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> crate::error::Result<()> {
         self.pin.validate()?;
@@ -947,6 +955,18 @@ pub enum TpmAction {
 pub enum ConfigAction {
     /// Print the default configuration in TOML format
     Print,
+    /// Validate the configuration offline, as the daemon would at startup
+    ///
+    /// Loads the file like the daemon does (CLI flags and file merged, agent profiles parsed) and
+    /// runs the daemon's validation, including the agent profile rules and deprecation warnings.
+    /// Prints the warnings and exits non-zero on an error. It needs no running daemon, D-Bus or
+    /// UHID: run it before restarting the service.
+    Check {
+        /// Configuration file to check (default: `PASSLESS_CONFIG`, else
+        /// `~/.config/passless/config.toml`)
+        #[arg(short = 'c', long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
 }
 
 /// Agent administration actions
@@ -1489,6 +1509,9 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Print a ready-to-paste MCP server entry for a client instead of running the server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
         /// Extra arguments for @playwright/mcp (after `--`)
         #[arg(last = true)]
         extra: Vec<String>,
@@ -1508,6 +1531,9 @@ pub enum McpAdapter {
         /// Open this URL once interception is attached
         #[arg(long, value_name = "URL")]
         url: Option<String>,
+        /// Print a ready-to-paste MCP server entry for a client instead of running the server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
         /// Extra arguments for chrome-devtools-mcp (after `--`)
         #[arg(last = true)]
         extra: Vec<String>,
@@ -1518,7 +1544,11 @@ pub enum McpAdapter {
     /// `yarn dlx`, a `playwright-mcp` binary, `chrome-devtools-mcp`) in the client's MCP
     /// configuration and rewrites each in place to `passless agent mcp playwright|chrome-devtools`,
     /// so the agent keeps its tools and passkeys go through the managed browser and the profile's
-    /// rules. The default is a dry run that prints a diff; `--yes` writes, after saving a backup.
+    /// rules. A file with no such entry gets a new `playwright` server that runs through Passless
+    /// (a file that does not exist is created; a different server named `playwright` is never
+    /// replaced). With `--user` on Claude Code, entries kept per project by `claude mcp add`
+    /// (local scope, in `projects.<path>.mcpServers`) are rewritten too. The default is a dry run
+    /// that prints a diff; `--yes` writes, after saving a backup.
     /// The profile is the global `--profile`: required unless exactly one usable profile (with
     /// `browser_cdp_expose = "port"`) is configured.
     Install {
@@ -2008,6 +2038,44 @@ mod tests {
         }
         assert!(
             Args::try_parse_from(["passless", "agent", "mcp", "--print-config", "emacs"]).is_err()
+        );
+        // The same flag on the adapter subcommand, with `--profile` after it.
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "coding",
+            "--print-config",
+            "claude-code",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                profile: Some(ref profile),
+                action: AgentCommand::Mcp {
+                    print_config: None,
+                    adapter: Some(McpAdapter::Playwright {
+                        print_config: Some(McpConfigTarget::ClaudeCode),
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            }) if profile == "coding"
+        ));
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "mcp",
+                "chrome-devtools",
+                "--print-config",
+                "opencode",
+            ])
+            .is_ok()
         );
         // The old name still parses (hidden alias, one release).
         assert!(

@@ -169,7 +169,7 @@ fn dispatch_doctor(output: OutputFormat, profile: &str) -> Result<()> {
                 let status = if doc.healthy { "healthy" } else { "unhealthy" };
                 println!("status: {}", status);
                 for check in &doc.checks {
-                    let mark = if check.passed { "ok" } else { "FAIL" };
+                    let mark = check.mark();
                     println!("  [{}] {}: {}", mark, check.name, check.message);
                 }
                 Ok(())

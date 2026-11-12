@@ -650,30 +650,52 @@ impl AuditGate {
 
     fn ensure_secure_dir(dir: &Path) -> Result<(), AuditError> {
         if dir.exists() {
-            let metadata = fs::symlink_metadata(dir)?;
-            if metadata.file_type().is_symlink() {
-                return Err(AuditError::SymlinkDetected(dir.display().to_string()));
-            }
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode != AUDIT_DIR_MODE {
-                return Err(AuditError::ModeMismatch(format!(
-                    "dir mode {:o} != expected {:o}",
-                    mode, AUDIT_DIR_MODE
-                )));
-            }
-            let uid = unsafe { libc::getuid() };
-            if metadata.uid() != uid {
-                return Err(AuditError::OwnerMismatch(format!(
-                    "dir uid {} != expected {}",
-                    metadata.uid(),
-                    uid
-                )));
-            }
+            Self::verify_existing_dir(dir)?;
         } else {
             fs::create_dir(dir)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(AUDIT_DIR_MODE))?;
         }
         Ok(())
+    }
+
+    fn verify_existing_dir(dir: &Path) -> Result<(), AuditError> {
+        let metadata = fs::symlink_metadata(dir)?;
+        if metadata.file_type().is_symlink() {
+            return Err(AuditError::SymlinkDetected(dir.display().to_string()));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != AUDIT_DIR_MODE {
+            return Err(AuditError::ModeMismatch(format!(
+                "dir mode {:o} != expected {:o}",
+                mode, AUDIT_DIR_MODE
+            )));
+        }
+        let uid = unsafe { libc::getuid() };
+        if metadata.uid() != uid {
+            return Err(AuditError::OwnerMismatch(format!(
+                "dir uid {} != expected {}",
+                metadata.uid(),
+                uid
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::open`] could use `dir` as the audit directory, without touching it: an
+    /// existing directory must be private and ours; a missing one is created one level deep, so
+    /// its parent must exist. For the offline configuration check.
+    pub fn check_dir(dir: &Path) -> Result<(), AuditError> {
+        if dir.exists() {
+            return Self::verify_existing_dir(dir);
+        }
+        match dir.parent() {
+            Some(parent) if parent.as_os_str().is_empty() || parent.is_dir() => Ok(()),
+            _ => Err(AuditError::Io(format!(
+                "the parent directory of {} does not exist (the daemon creates only the last \
+                 component)",
+                dir.display()
+            ))),
+        }
     }
 
     // # Startup recovery model

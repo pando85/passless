@@ -590,13 +590,19 @@ pub fn build_profile_diagnostic_report(
         },
     });
 
+    // Only an isolated profile has a store of its own to hold a PIN; a same-user profile uses the
+    // human backend, and agent ceremonies carry no PIN. Its absence is not a failure there.
+    let pin_storage_required = mode == AgentMode::Isolated;
     checks.push(DoctorCheck {
         name: "pin_storage".into(),
-        passed: pin_storage_available,
+        passed: pin_storage_available || !pin_storage_required,
         message: if pin_storage_available {
             "PIN storage is available".into()
-        } else {
+        } else if pin_storage_required {
             "PIN storage is not available".into()
+        } else {
+            "not used: a same-user profile has no PIN store of its own (agent ceremonies carry no PIN)"
+                .into()
         },
     });
 
@@ -1115,6 +1121,52 @@ mod tests {
             .find(|c| c.name == "pin_storage")
             .unwrap();
         assert!(!pin_storage_check.passed);
+    }
+
+    #[test]
+    fn a_same_user_profile_without_a_pin_store_is_healthy() {
+        // `agent-admin profile check` used to print `[FAIL] pin_storage` for every healthy
+        // same-user profile: only an isolated profile has a PIN store to be missing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit = AuditGate::open(dir.path()).unwrap();
+        let pid = ProfileId::new("same").unwrap();
+
+        let report = build_profile_diagnostic_report(ProfileDiagnosticParams {
+            profile_id: &pid,
+            enabled: true,
+            mode: AgentMode::SameUser,
+            browser_lease_state: None,
+            policy_generation: 1,
+            audit_gate: &audit,
+            pin_storage_available: false,
+            pin_set: false,
+            require_uv: false,
+        });
+
+        assert!(report.is_healthy());
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "pin_storage")
+            .unwrap();
+        assert!(check.passed && check.mark() == "ok", "{check:?}");
+        assert!(check.message.starts_with("not used"), "{check:?}");
+    }
+
+    #[test]
+    fn a_deprecation_prints_as_a_warning_and_a_failure_as_fail() {
+        let check = |passed, message: &str| DoctorCheck {
+            name: "config_deprecation".into(),
+            passed,
+            message: message.into(),
+        };
+        assert_eq!(
+            check(true, "warning: rule 'x': ... is deprecated").mark(),
+            "warn"
+        );
+        assert_eq!(check(true, "fine").mark(), "ok");
+        assert_eq!(check(false, "warning: but failed").mark(), "FAIL");
     }
 
     #[test]

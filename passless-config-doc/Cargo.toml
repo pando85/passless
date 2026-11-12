@@ -6,7 +6,6 @@ keywords = ["passless", "config", "documentation", "proc-macro", "toml"]
 categories = ["config", "development-tools"]
 authors.workspace = true
 edition.workspace = true
-homepage.workspace = true
 license-file.workspace = true
 repository.workspace = true
 version.workspace = true

@@ -28,7 +28,18 @@ passless`) or reload a profile's policy with `passless agent-admin policy reload
 
 ## Configuration errors
 
-Run `passless agent-admin profile check <profile>`.
+Validate the file offline, before restarting the service, with no daemon, D-Bus or UHID needed:
+
+```bash
+passless config check                       # PASSLESS_CONFIG, else ~/.config/passless/config.toml
+passless config check --config-path /path/to/config.toml
+```
+
+It loads the file the way the daemon does and runs the daemon's own validation, including every agent
+profile rule and the audit directory, then prints `ok` (with deprecation warnings, if any) or the
+error and exits non-zero. `passless doctor --agents` reports the same validation as its `config` check
+(a `FAIL` means the daemon would refuse to start). With a daemon running, `passless agent-admin profile
+check <profile>` checks the live profile.
 
 | Error | Cause and fix |
 |---|---|
@@ -47,8 +58,8 @@ Run `passless agent-admin profile check <profile>`.
 
 - `... is branded Google Chrome` or `... is chrome-headless-shell`: neither can load the extension.
   Remove `browser_command` and `agents.browser_path` so Passless detects a supported browser, or
-  install Playwright's Chromium (`npx playwright install chromium`), Chrome for Testing or your
-  distribution's `chromium`. See [Containment](containment.md#supported-browsers).
+  install one (the [Quick start](quick-start.md#agent-quick-start) lists the prerequisites, including
+  `npx playwright install chromium`). See [Containment](containment.md#supported-browsers).
 - Containment refused the launch: the browser's user can open a hidraw device and `bwrap` does not work.
   Install bubblewrap, and check that unprivileged user namespaces are enabled
   (`passless doctor --agents` shows the case).
@@ -119,9 +130,11 @@ Common causes:
 - **`request` denied or timed out**: a cooldown (10 minutes by default) denies further requests for
   that RP without a prompt. Wait it out, or change the rule to `allow` and reload the policy.
 - **No notification**: `request` is denied at once when no notification server with action support is
-  running on the user's bus. `doctor --agents` warns. Run one (dunst, mako, a desktop shell) or use
-  `allow`. notify-osd (Ubuntu) works: it shows the prompt as a dialog with "Allow always" and "Deny"
-  buttons (see [Desktop notifications](../NOTIFICATIONS.md#notify-osd)).
+  running on the user's bus (`doctor --agents` fails `notification_bus` when a rule uses `request`, and
+  only warns otherwise). Run a supported one (dunst, a mako that does not report version `0.0.0`, a
+  desktop shell that advertises `actions`; mako 0.0.0 and quickshell are rejected) or use `allow`.
+  notify-osd (Ubuntu) works: it shows the prompt as a dialog with "Allow always" and "Deny" buttons.
+  See [which servers are supported](../NOTIFICATIONS.md#supported-notification-servers).
 - **Conditional (autofill) request**: unavailable; the page needs an explicit sign-in button.
 - **Cross-origin iframe**: denied. Sign in on the top-level page.
 - **Extension not attached yet**: wait for `passless agent browser --wait` or the MCP tool's browser to
@@ -149,6 +162,14 @@ The endpoint is printed only for an intercepted browser, by `passless agent brow
 (`browser_cdp_expose = "port"`) is required; in pipe mode there is no endpoint (use `browser-control`). A tool that launches its own Chromium instead of
 attaching gets no passkeys. See [Browser tools](browser-tools.md).
 
+## A passkey prompt still reaches the human authenticator, or the agent has the wrong browser
+
+An MCP entry that starts its own browser, or a plain `playwright` entry in a project that overrides
+your user-level Passless one, bypasses the agent policy. `doctor --agents` warns about both (next
+sections). Claude Code applies local-scope entries first, then the project's `.mcp.json`, then user
+scope; see [Multiple accounts and repo-level MCP entries](browser-tools.md#multiple-accounts-and-repo-level-mcp-entries).
+Restart a running session after changing an MCP entry: it reads them at start.
+
 ## `doctor --agents` warns that an MCP entry starts its own browser
 
 ```text
@@ -164,6 +185,22 @@ the agent policy never applies. Run the printed command without `--yes` to previ
 to write; see [Browser tools](browser-tools.md#switching-from-a-plain-playwright-mcp). A wrapped entry
 that names a profile which is missing or not in port mode is also a warning. Entries the installer
 cannot rewrite (started through a shell or `node` script) are reported too: edit them by hand.
+
+Claude Code's local-scope entries (`claude mcp add` without `--scope`, kept under
+`projects.<path>.mcpServers` in `~/.claude.json`) are reported as
+`mcp_client: claude-code/local[<project>]/playwright`, with whether that project is the current
+directory. `agent mcp install --client claude-code --user` rewrites them too.
+
+```text
+[warn] mcp_shadow: claude-code/project/playwright: warning: ~/.claude.json runs `playwright` through
+Passless, but /repo/.mcp.json (it runs `npx`) overrides it ...
+```
+
+A user-level Passless `playwright` entry is overridden by a plain `playwright` entry of the same name in
+the current directory's local scope or `.mcp.json`. The warning names the fixes: remove the entry from
+the repository's `.mcp.json`; override it for you only with `claude mcp add-json playwright --scope
+local '<json>'` (the JSON is printed); or `passless agent mcp install --client claude-code --project .`.
+For opencode a project `opencode.json` is merged over the global one, so the warning is softer.
 
 ## Other
 

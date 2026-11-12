@@ -17,7 +17,7 @@ const run = (bin, args, { env, cwd }) => new Promise(resolve => {
   });
 });
 
-// Catalogue E2E-55: switching a plain Playwright MCP to Passless with `passless agent mcp install`. A project `.mcp.json` in the
+// Catalogue E2E-55: switching a plain Playwright MCP to Passless with `passless agent mcp install`, and adding the entry where there is none. A project `.mcp.json` in the
 // shape real configs have (`pnpm dlx @playwright/mcp@<pin> --browser chromium --headless --isolated --viewport-size ...`) launches a
 // browser of its own, so `doctor --agents` warns. `install --yes` rewrites the entry (pin kept as `--package`, `--isolated` and
 // `--viewport-size` passed through, `--browser` and `--headless` dropped), after which the doctor is happy and the entry, started
@@ -45,8 +45,8 @@ scenario({ id: 'E2E-55', title: 'agent mcp install: a plain Playwright MCP entry
   }, null, 2) + '\n';
   fs.writeFileSync(mcpFile, original);
 
-  const doctor = async () => {
-    const r = await run(bin, ['doctor', '--agents', '--output', 'json'], { env: cliEnv, cwd: project });
+  const doctor = async (cwd = project) => {
+    const r = await run(bin, ['doctor', '--agents', '--output', 'json'], { env: cliEnv, cwd });
     const checks = JSON.parse(r.stdout).data.checks;
     return checks.filter(c => c.name.startsWith('mcp_client'));
   };
@@ -94,6 +94,39 @@ scenario({ id: 'E2E-55', title: 'agent mcp install: a plain Playwright MCP entry
   assert.equal(after[0].passed, true);
   assert.ok(!after[0].message.startsWith('warning:'), after[0].message);
   assert.match(after[0].message, /runs through Passless \(profile agent\)/);
+
+  // 4b. A project with no Playwright MCP at all gets a new `playwright` entry (a dry run first, then --yes), with the same command
+  // and args shape the rewrite produces; the file did not exist, so there is no backup. A second run changes nothing.
+  const fresh = path.join(stack.env.dirs.work, 'project-new');
+  fs.mkdirSync(fresh, { recursive: true });
+  const freshFile = path.join(fresh, '.mcp.json');
+  const add = ['agent', 'mcp', 'install', '--client', 'claude-code', '--project', fresh, '--profile', 'agent', '--passless-path', fs.realpathSync(bin)];
+  const addDry = await run(bin, add, { env: cliEnv, cwd: fresh });
+  assert.equal(addDry.code, 0, addDry.stderr);
+  assert.match(addDry.stdout, /adding `playwright` \(mcpServers\.playwright\)/);
+  assert.match(addDry.stdout, /Dry run: nothing was changed/);
+  assert.ok(!fs.existsSync(freshFile), 'the dry run created the file');
+  const addYes = await run(bin, [...add, '--yes'], { env: cliEnv, cwd: fresh });
+  assert.equal(addYes.code, 0, addYes.stderr + addYes.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(freshFile, 'utf8')), {
+    mcpServers: { playwright: { type: 'stdio', command: fs.realpathSync(bin), args: ['agent', 'mcp', 'playwright', '--profile', 'agent'] } },
+  });
+  assert.deepEqual(fs.readdirSync(fresh), ['.mcp.json'], 'a new file has no backup');
+  const addAgain = await run(bin, [...add, '--yes'], { env: cliEnv, cwd: fresh });
+  assert.equal(addAgain.code, 0, addAgain.stderr);
+  assert.match(addAgain.stdout, /already uses Passless/);
+  const freshDoctor = await doctor(fresh);
+  assert.equal(freshDoctor.length, 1, JSON.stringify(freshDoctor));
+  assert.match(freshDoctor[0].message, /runs through Passless \(profile agent\)/);
+  // Another server named `playwright` is never replaced.
+  const foreign = path.join(stack.env.dirs.work, 'project-foreign');
+  fs.mkdirSync(foreign, { recursive: true });
+  const foreignText = JSON.stringify({ mcpServers: { playwright: { type: 'http', url: 'https://mcp.invalid/' } } }) + '\n';
+  fs.writeFileSync(path.join(foreign, '.mcp.json'), foreignText);
+  const refused = await run(bin, ['agent', 'mcp', 'install', '--client', 'claude-code', '--project', foreign, '--profile', 'agent', '--passless-path', fs.realpathSync(bin), '--yes'], { env: cliEnv, cwd: foreign });
+  assert.notEqual(refused.code, 0, 'a foreign `playwright` server must be refused');
+  assert.match(refused.stderr, /already exists and is not a Playwright MCP server/);
+  assert.equal(fs.readFileSync(path.join(foreign, '.mcp.json'), 'utf8'), foreignText);
 
   // 5. The entry, started exactly as written, is an MCP stdio server that signs in through the agent policy. `npx` is the harness's
   // stand-in, found on the client's PATH as a real configuration finds it.
