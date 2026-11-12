@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-11-10
 - **Decision owners:** Passless maintainers
-- **Implementation status:** Implemented on branch `feat/agent-delegation-adr-0014` (P2 to P12); the final verification gate (P12) passed at commit 602db70 on 2026-11-12. The two accepted residuals (unfocused-tab registration; the evaluated systemd directives) remain marked as such in [Implementation status](#19-implementation-status)
+- **Implementation status:** Implemented on branch `feat/agent-delegation-adr-0014` (P2 to P12); the final verification gate (P12) passed at commit 602db70 on 2026-11-12, and its full E2E matrix was re-run clean across both attach modes (port and pipe) at 5b0bace. The two accepted residuals (unfocused-tab registration; the evaluated systemd directives) remain marked as such in [Implementation status](#19-implementation-status)
 - **Amended:** 2026-11-11, with maintainer-resolved decisions and the results of the browser and
   environment spikes (see [History](#20-history))
 

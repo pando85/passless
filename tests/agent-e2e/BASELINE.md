@@ -1,5 +1,27 @@
 # E2E baseline
 
+## Final matrix across attach modes, 2026-11-12
+
+Branch `feat/agent-delegation-adr-0014` at HEAD `5b0bace`. Debug build, `--features agent`, default `target/`. Supersedes the P12 full
+run below, which exited 2 because of an external hermeticity write.
+
+- Command: `make test-agent-e2e-full` (`AGENT_E2E_MATRIX=full`, `AGENT_E2E_EXPOSE=all`: chromium, pw-chromium and cft, headed and
+  headless, port and pipe): exit 0, 590 PASS (588 scenario results and the 2 smoke checks), 0 FAIL, 0 XFAIL, 0 XPASS, 0 SKIP,
+  0 cancelled, 7,953 s (limit 14,400 s). By attach mode: port 380 PASS, pipe 210 PASS.
+- `make test-agent-e2e` (CI subset, port): exit 0, PASS=46 (61 node tests including setup), 0 FAIL, 0 cancelled.
+- Hermeticity guard: clean on both runs ("real user config/state/store untouched").
+
+| Variant | port PASS/FAIL/SKIP | pipe PASS/FAIL/SKIP |
+|---|---|---|
+| chromium headed | 63 / 0 / 0 | 35 / 0 / 0 |
+| chromium headless | 63 / 0 / 0 | 35 / 0 / 0 |
+| pw-chromium headed | 63 / 0 / 0 | 35 / 0 / 0 |
+| pw-chromium headless | 63 / 0 / 0 | 35 / 0 / 0 |
+| cft headed | 63 / 0 / 0 | 35 / 0 / 0 |
+| cft headless | 63 / 0 / 0 | 35 / 0 / 0 |
+
+The 2 smoke checks (SMOKE-01, SMOKE-02) also pass, and are counted in the 590 but not in the table.
+
 ## Pipe-mode attach axis (ADR 0014 section 4.3), 2026-11-12
 
 Branch `feat/agent-delegation-adr-0014`, on top of `794942d`. Debug build, `--features agent`, no Rust changes. The matrix gained a
