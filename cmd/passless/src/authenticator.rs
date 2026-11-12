@@ -3,7 +3,7 @@ use crate::credential_backup::{
     CMD_PASSLESS_RESTORE, backup_commit_auth_data, backup_prepare_auth_data, bundle_token,
     decrypt_credential, encrypt_credential, restore_auth_data,
 };
-use crate::notification::{show_user_presence_notification, show_verification_notification};
+use crate::notification::show_user_presence_notification;
 use crate::pin_storage::{PinStorage, lock_pin_storage};
 use crate::storage::{CredentialFilter, CredentialStorage, lock_shared_storage};
 use crate::util::bytes_to_hex;
@@ -854,18 +854,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                 always_uv: Some(security_config.always_uv),
                 make_cred_uv_not_required: Some(true),
             }
-            rk: true,
-            up: true,
-            uv: Some(true),
-            plat: false,
-            client_pin: Some(true),
-            pin_uv_auth_token: Some(true),
-            cred_mgmt: Some(true),
-            bio_enroll: None,
-            large_blobs: None,
-            ep: None,
-            always_uv: Some(security_config.always_uv),
-            make_cred_uv_not_required: Some(true),
         };
 
         let config = AuthenticatorConfig::builder()
@@ -914,11 +902,6 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                 uv_config,
             ),
         };
-            storage,
-            pin_storage.clone(),
-            security_config,
-            pin_config.clone(),
-        );
 
         let authenticator = if let Some(ps) = pin_storage {
             Authenticator::with_config_and_pin_storage(
@@ -1162,18 +1145,6 @@ impl<
                 always_uv: Some(security_config.always_uv),
                 make_cred_uv_not_required: Some(true),
             }
-            rk: true,
-            up: true,
-            uv: Some(true),
-            plat: false,
-            client_pin: Some(true),
-            pin_uv_auth_token: Some(true),
-            cred_mgmt: Some(true),
-            bio_enroll: None,
-            large_blobs: None,
-            ep: None,
-            always_uv: Some(security_config.always_uv),
-            make_cred_uv_not_required: Some(true),
         };
 
         let config = AuthenticatorConfig::builder()
@@ -1222,11 +1193,6 @@ impl<
                 uv_config,
             ),
         };
-            storage,
-            pin_storage.clone(),
-            security_config,
-            pin_config.clone(),
-        );
 
         let authenticator = if let Some(ps) = pin_storage {
             Authenticator::with_config_and_pin_storage_and_key_provider(
@@ -2033,6 +1999,7 @@ mod tests {
             None,
             security_config,
             PinConfig::default(),
+            UvConfig::default(),
         )
         .expect("the human path constructs its authenticator");
 
