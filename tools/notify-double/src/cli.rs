@@ -7,7 +7,7 @@ use crate::{Emulation, NOTIFY_OSD_CAPABILITIES, Script};
 
 pub const USAGE: &str = "usage: notify-double --log <path> [--script <spec>]... \
 [--ready-file <path>] [--capabilities a,b,c] [--server-name <name>] [--emulate spec|notify-osd]\n\
-script steps: approve[:ms] (invokes allow_always) | deny[:ms] | ignore | close[:ms] | invoke=<key>[:ms]\n\
+script steps: approve[:ms] (invokes register_once on a registration prompt, else allow_always) | deny[:ms] | ignore | close[:ms] | invoke=<key>[:ms]\n\
 (an invoked key resolves to the notification's own key that equals it or extends it as <key>:<suffix>)\n\
 --emulate notify-osd: id 0 for every notification with actions, notify-osd's server information \
 and (unless --capabilities is given) capabilities, CloseNotification closes nothing\n\
