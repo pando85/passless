@@ -499,8 +499,15 @@ mod tests {
         let doctor = port_holder(port).expect("the doctor sees the holder");
         assert_eq!(doctor.pid, Some(std::process::id()));
         drop(held);
-        assert!(ensure_port_free(port).is_ok());
-        assert!(port_holder(port).is_none());
+        // Another test may bind the freed ephemeral port at once: a port nobody holds is seen as
+        // free soon (the same retry as `the_browser_watch_sees_a_closed_port`).
+        let freed = std::iter::once(port)
+            .chain((0..20).map(|_| {
+                let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+                probe.local_addr().unwrap().port()
+            }))
+            .any(|port| ensure_port_free(port).is_ok() && port_holder(port).is_none());
+        assert!(freed, "a released port is reported free");
     }
 
     #[test]
