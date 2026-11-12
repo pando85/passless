@@ -1449,6 +1449,20 @@ pub enum AgentCommand {
         #[arg(last = true, required = true)]
         command: Vec<std::path::PathBuf>,
     },
+    /// Internal: the principal-session side of `agent mcp playwright`
+    ///
+    /// Started by `agent mcp playwright` through the admin socket, never by hand. It holds the
+    /// principal session's capability descriptor and answers one request on its stdin, "ensure
+    /// the browser", with the CDP endpoint. It exits when its stdin closes.
+    #[command(hide = true)]
+    McpSessionBroker {
+        /// Profile of the principal session
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Start URL to open in the managed browser
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
     /// Launch a detached principal session
     Run {
         /// Profile to launch

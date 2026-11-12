@@ -568,6 +568,16 @@ pub fn dispatch_mcp(
         // Resolve npx here: the principal session runs with the daemon's environment, whose PATH
         // need not have it.
         let npx = resolve_npx(npx.as_deref())?;
+        if kind == McpAdapterKind::Playwright {
+            // This process keeps the MCP stdio and runs the server; a principal session of its
+            // own (re-established after a daemon restart) answers the discovery requests.
+            let package = package.as_deref().unwrap_or(PLAYWRIGHT_PACKAGE);
+            let command = npx_command(&npx, package, extra);
+            if let Some(()) = super::mcp_session::run_playwright(profile, url.as_deref(), &command)?
+            {
+                return Ok(());
+            }
+        }
         let mut args = vec![
             "agent".to_string(),
             "mcp".to_string(),
@@ -681,6 +691,21 @@ pub(super) fn spawn_without_capability(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             let _ = libc::close(crate::agent::launcher::CONTROL_FD);
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Tie the child's life to this process's, outside a principal session: there is no capability
+/// descriptor to close (descriptor 3 is whatever this process opened, possibly the pipe through
+/// which `spawn` learns that `exec` failed).
+pub(super) fn spawn_bound_to_wrapper(command: &mut Command) {
+    // SAFETY: the closure only calls async-signal-safe `prctl`.
+    unsafe {
+        command.pre_exec(|| {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                 return Err(std::io::Error::last_os_error());
             }

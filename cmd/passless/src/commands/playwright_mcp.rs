@@ -37,51 +37,73 @@ pub(super) fn run_as_principal(
     url: Option<&str>,
     command: &[PathBuf],
 ) -> Result<()> {
-    if command.is_empty() {
-        return Err(Error::Other(
-            "playwright-mcp requires an executable after '--'".to_string(),
-        ));
-    }
-
-    let executable = &command[0];
-    if !executable.is_absolute() {
-        return Err(Error::Other(format!(
-            "Playwright MCP executable must be an absolute path, got '{}'",
-            executable.display()
-        )));
-    }
-
-    let token = crate::agent::sign::generate_bearer_token()
-        .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))?;
-    let profile_owned = profile.to_string();
+    let executable = check_command(command)?;
+    let token = bootstrap_token()?;
+    let profile_for_bootstrap = profile.to_string();
     let start_url = url.map(ToOwned::to_owned);
-    let shared_browser = profile_uses_shared_browser(profile);
-    let profile_for_bootstrap = profile_owned.clone();
     let bootstrap = CdpBootstrap::start(token.clone(), move || {
         let (endpoint, _) = ensure_browser(&profile_for_bootstrap, start_url.as_deref(), false)?;
         Ok(endpoint)
     })
     .map_err(|e| Error::Other(e.to_string()))?;
 
-    let bootstrap_endpoint = bootstrap.endpoint();
+    let child_command = server_command(profile, command, &bootstrap.endpoint(), &token, true);
+    let result = supervise(child_command, "Playwright MCP", executable);
+    drop(bootstrap);
+    result
+}
+
+/// The Playwright MCP command line must be an absolute executable and its arguments.
+pub(super) fn check_command(command: &[PathBuf]) -> Result<&std::path::Path> {
+    let Some(executable) = command.first() else {
+        return Err(Error::Other(
+            "playwright-mcp requires an executable after '--'".to_string(),
+        ));
+    };
+    if !executable.is_absolute() {
+        return Err(Error::Other(format!(
+            "Playwright MCP executable must be an absolute path, got '{}'",
+            executable.display()
+        )));
+    }
+    Ok(executable)
+}
+
+/// A fresh bearer for the discovery bootstrap: it lives as long as the process that serves the
+/// bootstrap and is only ever given to that process's Playwright MCP child.
+pub(super) fn bootstrap_token() -> Result<String> {
+    crate::agent::sign::generate_bearer_token()
+        .map_err(|e| Error::Other(format!("failed to generate CDP bootstrap token: {e}")))
+}
+
+/// The Playwright MCP server pointed at the bootstrap `endpoint` (see [`playwright_command`]),
+/// with `--shared-browser-context` for a profile whose sessions share one browser. The
+/// Playwright process needs browser authority, not Passless principal IPC authority: inside a
+/// session the capability descriptor is closed before exec. Either way the server dies with the
+/// process that supervises it.
+pub(super) fn server_command(
+    profile: &str,
+    command: &[PathBuf],
+    endpoint: &str,
+    token: &str,
+    in_session: bool,
+) -> Command {
     let has_shared_flag = command.iter().skip(1).any(|arg| {
         arg.to_str()
             .is_some_and(|s| s == "--shared-browser-context")
     });
     let mut child_command = playwright_command(
         command,
-        &bootstrap_endpoint,
-        &token,
-        shared_browser && !has_shared_flag,
+        endpoint,
+        token,
+        profile_uses_shared_browser(profile) && !has_shared_flag,
     );
-
-    // The Playwright process needs browser authority, not Passless principal IPC authority.
-    // Close the inherited capability fd before exec and arrange for the MCP child to die if the
-    // principal wrapper disappears unexpectedly.
-    super::agent_browser::spawn_without_capability(&mut child_command);
-    let result = supervise(child_command, "Playwright MCP", executable);
-    drop(bootstrap);
-    result
+    if in_session {
+        super::agent_browser::spawn_without_capability(&mut child_command);
+    } else {
+        super::agent_browser::spawn_bound_to_wrapper(&mut child_command);
+    }
+    child_command
 }
 
 /// The `@playwright/mcp` command: the user's arguments, the bootstrap as `--cdp-endpoint`, and the
@@ -155,6 +177,11 @@ pub(super) fn supervise_watching(
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
 
+    exit_result(label, status)
+}
+
+/// The child's exit status is ours.
+pub(super) fn exit_result(label: &str, status: std::process::ExitStatus) -> Result<()> {
     if status.success() {
         Ok(())
     } else if let Some(code) = status.code() {
@@ -236,11 +263,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_empty_command_inside_principal_helper() {
-        // The pure command validation is intentionally duplicated here rather than attempting to
-        // manufacture a principal capability fd in this unit test.
-        let command: Vec<PathBuf> = Vec::new();
-        assert!(command.is_empty());
+    fn the_command_must_be_an_absolute_executable() {
+        assert!(check_command(&[]).is_err());
+        let err = check_command(&[PathBuf::from("npx")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute"), "{err}");
+        assert_eq!(
+            check_command(&[PathBuf::from("/usr/bin/npx"), PathBuf::from("--yes")]).unwrap(),
+            std::path::Path::new("/usr/bin/npx")
+        );
     }
 
     #[test]
@@ -320,11 +352,5 @@ mod tests {
             &mut || true,
         )
         .unwrap();
-    }
-
-    #[test]
-    fn playwright_command_must_be_absolute() {
-        let path = PathBuf::from("npx");
-        assert!(!path.is_absolute());
     }
 }

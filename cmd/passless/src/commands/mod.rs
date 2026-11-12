@@ -11,6 +11,8 @@ pub mod custom;
 #[cfg(feature = "agent")]
 pub mod doctor;
 #[cfg(feature = "agent")]
+pub mod mcp_session;
+#[cfg(feature = "agent")]
 pub mod playwright_mcp;
 #[cfg(feature = "tpm")]
 pub mod tpm;
