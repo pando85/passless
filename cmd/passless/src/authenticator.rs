@@ -3,6 +3,10 @@ use crate::credential_backup::{
     CMD_PASSLESS_RESTORE, backup_commit_auth_data, backup_prepare_auth_data, bundle_token,
     decrypt_credential, encrypt_credential, restore_auth_data,
 };
+use crate::credential_protection::{
+    CMD_PASSLESS_SET_CRED_PROTECT, CredProtectChange, apply as apply_cred_protect, encode_response,
+    parse_request, set_cred_protect_auth_data,
+};
 use crate::notification::{show_user_presence_notification, show_verification_notification};
 use crate::pin_storage::{PinStorage, lock_pin_storage};
 use crate::storage::{CredentialFilter, CredentialStorage, lock_shared_storage};
@@ -40,6 +44,26 @@ fn error_status_byte(error: SoftFido2Error) -> u8 {
     match error {
         SoftFido2Error::CtapError(code) => code,
         error => StatusCode::from(error) as u8,
+    }
+}
+
+/// Borrow every field of a stored credential for a storage write.
+pub(crate) fn credential_ref(credential: &Credential) -> CredentialRef<'_> {
+    CredentialRef {
+        id: &credential.id,
+        rp_id: &credential.rp.id,
+        rp_name: credential.rp.name.as_deref(),
+        user_id: &credential.user.id,
+        user_name: credential.user.name.as_deref(),
+        user_display_name: credential.user.display_name.as_deref(),
+        sign_count: &credential.sign_count,
+        alg: &credential.alg,
+        key: &credential.key,
+        created: &credential.created,
+        discoverable: &credential.discoverable,
+        cred_protect: credential.extensions.cred_protect.as_ref(),
+        backup_state: &credential.backup_state,
+        cred_random: credential.extensions.cred_random.as_ref(),
     }
 }
 
@@ -1032,26 +1056,7 @@ impl<
         }
     }
 
-    fn credential_ref(credential: &Credential) -> CredentialRef<'_> {
-        CredentialRef {
-            id: &credential.id,
-            rp_id: &credential.rp.id,
-            rp_name: credential.rp.name.as_deref(),
-            user_id: &credential.user.id,
-            user_name: credential.user.name.as_deref(),
-            user_display_name: credential.user.display_name.as_deref(),
-            sign_count: &credential.sign_count,
-            alg: &credential.alg,
-            key: &credential.key,
-            created: &credential.created,
-            discoverable: &credential.discoverable,
-            cred_protect: credential.extensions.cred_protect.as_ref(),
-            backup_state: &credential.backup_state,
-            cred_random: credential.extensions.cred_random.as_ref(),
-        }
-    }
-
-    fn verify_backup_authorization(
+    fn verify_credential_management_authorization(
         &mut self,
         protocol: u8,
         param: &[u8],
@@ -1115,7 +1120,8 @@ impl<
                     }
                 };
                 let auth_data = backup_prepare_auth_data(&credential_id, &recipient);
-                if let Err(status) = self.verify_backup_authorization(protocol, &param, &auth_data)
+                if let Err(status) =
+                    self.verify_credential_management_authorization(protocol, &param, &auth_data)
                 {
                     response.push(status);
                     return;
@@ -1195,7 +1201,8 @@ impl<
                     }
                 };
                 let auth_data = backup_commit_auth_data(&credential_id, &token);
-                if let Err(status) = self.verify_backup_authorization(protocol, &param, &auth_data)
+                if let Err(status) =
+                    self.verify_credential_management_authorization(protocol, &param, &auth_data)
                 {
                     response.push(status);
                     return;
@@ -1215,7 +1222,7 @@ impl<
                     let mut storage = lock_shared_storage(&self.storage);
                     let mut credential = storage.read(&credential_id)?;
                     credential.backup_state = CredentialBackupState::BackedUp;
-                    storage.write(Self::credential_ref(&credential))
+                    storage.write(credential_ref(&credential))
                 })();
                 match result {
                     Ok(()) => {
@@ -1270,7 +1277,9 @@ impl<
             }
         };
         let auth_data = restore_auth_data(&bundle, replace);
-        if let Err(status) = self.verify_backup_authorization(protocol, &param, &auth_data) {
+        if let Err(status) =
+            self.verify_credential_management_authorization(protocol, &param, &auth_data)
+        {
             response.push(status);
             return;
         }
@@ -1300,9 +1309,9 @@ impl<
                     .delete(&credential_id)
                     .map_err(|_| StatusCode::Other)?;
             }
-            if storage.write(Self::credential_ref(&credential)).is_err() {
+            if storage.write(credential_ref(&credential)).is_err() {
                 if let Some(previous) = existing {
-                    let _ = storage.write(Self::credential_ref(&previous));
+                    let _ = storage.write(credential_ref(&previous));
                 }
                 return Err(StatusCode::Other);
             }
@@ -1429,6 +1438,52 @@ impl<
         }
     }
 
+    /// Handle the Passless vendor command that changes stored `credProtect` levels.
+    ///
+    /// Wire format and rationale: `crate::credential_protection`. Authorization is mandatory in
+    /// every mode: the request must carry a pinUvAuthParam computed with a live pinUvAuthToken
+    /// that has the credential-management permission (a PIN token, or the token issued after the
+    /// built-in user verification when no PIN is set). There is deliberately no path without it.
+    fn handle_set_cred_protect_command(&mut self, payload: &[u8], response: &mut Vec<u8>) {
+        response.clear();
+
+        let request = match parse_request(payload) {
+            Ok(request) => request,
+            Err(status) => {
+                response.push(status as u8);
+                return;
+            }
+        };
+        let Some((protocol, param)) = request.auth else {
+            warn!("Rejected credProtect change without PIN/UV authorization");
+            response.push(StatusCode::PuatRequired as u8);
+            return;
+        };
+        let auth_data = set_cred_protect_auth_data(request.level, &request.credential_ids);
+        if let Err(status) =
+            self.verify_credential_management_authorization(protocol, &param, &auth_data)
+        {
+            warn!(
+                "Rejected credProtect change: PIN/UV authorization failed (status 0x{:02x})",
+                status
+            );
+            response.push(status);
+            return;
+        }
+
+        let result: core::result::Result<Vec<CredProtectChange>, StatusCode> = {
+            let mut storage = lock_shared_storage(&self.storage);
+            apply_cred_protect(&mut *storage, &request.credential_ids, request.level)
+        };
+        match result.and_then(|changes| encode_response(&changes)) {
+            Ok(body) => {
+                response.push(StatusCode::Success as u8);
+                response.extend_from_slice(&body);
+            }
+            Err(status) => response.push(status as u8),
+        }
+    }
+
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         self.refresh_built_in_uv_state()?;
@@ -1439,6 +1494,10 @@ impl<
         }
         if request.first() == Some(&CMD_PASSLESS_RESTORE) {
             self.handle_restore_command(&request[1..], response_buffer);
+            return Ok(());
+        }
+        if request.first() == Some(&CMD_PASSLESS_SET_CRED_PROTECT) {
+            self.handle_set_cred_protect_command(&request[1..], response_buffer);
             return Ok(());
         }
         if request.first() == Some(&CMD_PASSLESS_RESET_UV_RETRIES) {
@@ -1556,6 +1615,7 @@ impl<
 mod tests {
     use super::*;
 
+    use crate::credential_protection::set_cred_protect_auth_data;
     use crate::storage::LocalStorageAdapter;
 
     use soft_fido2_ctap::SecPinHash;
@@ -2504,6 +2564,345 @@ mod tests {
 
         let reloaded = storage.read(&credential_id).expect("re-read credential");
         assert_eq!(reloaded.backup_state, CredentialBackupState::NotEligible);
+    }
+
+    /// Platform side of the PIN/UV protocol, enough to obtain a pinUvAuthToken in process.
+    mod platform {
+        use super::*;
+
+        use soft_fido2_crypto::{ecdh::KeyPair, pin_protocol::v2};
+
+        use sha2::{Digest, Sha256};
+        use soft_fido2_ctap::cbor::{MapBuilder, Value, decode};
+        use zeroize::Zeroizing;
+
+        pub const PIN: &str = "1234";
+
+        fn map_entry(value: &Value, key: i128) -> Option<Value> {
+            match value {
+                Value::Map(entries) => entries.iter().find_map(|(k, v)| match k {
+                    Value::Integer(i) if *i == key => Some(v.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            }
+        }
+
+        fn bytes(value: Option<Value>) -> Vec<u8> {
+            match value {
+                Some(Value::Bytes(bytes)) => bytes,
+                other => panic!("expected a byte string, got {other:?}"),
+            }
+        }
+
+        pub fn pin_state() -> PinState {
+            let mut state = PinState::new();
+            state.pin_hash = Some(SecPinHash::new(Sha256::digest(PIN.as_bytes()).into()));
+            state
+        }
+
+        /// Run getKeyAgreement and PIN-token retrieval (protocol 2) against `service`.
+        ///
+        /// Returns the pinUvAuthToken, or the status the authenticator answered.
+        pub fn pin_token<S: CredentialStorage + 'static, P: PinStorage + 'static>(
+            service: &mut AuthenticatorService<S, P>,
+            pin: &str,
+            permissions: u8,
+            rp_id: Option<&str>,
+        ) -> core::result::Result<[u8; 32], u8> {
+            let platform = KeyPair::generate().expect("platform key pair");
+
+            let mut request = vec![0x06];
+            request.extend(
+                MapBuilder::new()
+                    .insert(1, 2u8)
+                    .and_then(|b| b.insert(2, 0x02u8))
+                    .and_then(|b| b.build())
+                    .expect("getKeyAgreement"),
+            );
+            let mut response = Vec::new();
+            service.handle(&request, &mut response).expect("handle");
+            assert_eq!(response.first(), Some(&0x00), "getKeyAgreement status");
+            let reply: Value = decode(&response[1..]).expect("key agreement reply");
+            let cose = map_entry(&reply, 1).expect("authenticator key");
+            let mut peer = vec![0x04];
+            peer.extend(bytes(map_entry(&cose, -2)));
+            peer.extend(bytes(map_entry(&cose, -3)));
+            let shared = platform.shared_secret(&peer).expect("ECDH");
+            let enc_key: Zeroizing<[u8; 32]> = v2::derive_encryption_key(&shared);
+
+            let pin_hash = Sha256::digest(pin.as_bytes());
+            let pin_hash_enc = v2::encrypt(&enc_key, &pin_hash[..16]).expect("encrypt PIN hash");
+            let (x, y) = platform.public_key_cose();
+            let platform_cose = Value::Map(vec![
+                (Value::Integer(1), Value::Integer(2)),
+                (Value::Integer(3), Value::Integer(-25)),
+                (Value::Integer(-1), Value::Integer(1)),
+                (Value::Integer(-2), Value::Bytes(x.to_vec())),
+                (Value::Integer(-3), Value::Bytes(y.to_vec())),
+            ]);
+            let mut builder = MapBuilder::new()
+                .insert(1, 2u8)
+                .and_then(|b| b.insert(2, 0x09u8))
+                .and_then(|b| b.insert(3, &platform_cose))
+                .and_then(|b| b.insert_bytes(6, &pin_hash_enc))
+                .and_then(|b| b.insert(9, permissions))
+                .expect("PIN token request");
+            if let Some(rp_id) = rp_id {
+                builder = builder.insert(10, rp_id).expect("rp id");
+            }
+            let mut request = vec![0x06];
+            request.extend(builder.build().expect("PIN token request"));
+            let mut response = Vec::new();
+            service.handle(&request, &mut response).expect("handle");
+            if response.first() != Some(&0x00) {
+                return Err(response.first().copied().unwrap_or(0xff));
+            }
+            let reply: Value = decode(&response[1..]).expect("token reply");
+            let token = v2::decrypt(&enc_key, &bytes(map_entry(&reply, 2))).expect("decrypt token");
+            Ok(token[..32].try_into().expect("32-byte token"))
+        }
+
+        pub fn authenticate(token: &[u8; 32], data: &[u8]) -> Vec<u8> {
+            v2::authenticate(token, data).to_vec()
+        }
+    }
+
+    /// Service over a local store seeded with `credentials` and a configured PIN.
+    fn cred_protect_service(
+        credentials: &[Credential],
+        with_pin: bool,
+    ) -> (
+        AuthenticatorService<LocalStorageAdapter, TestPinStorage>,
+        tempfile::TempDir,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let cred_dir = temp_dir.path().join("credentials");
+        std::fs::create_dir_all(&cred_dir).expect("create credential directory");
+        let mut storage = LocalStorageAdapter::new(cred_dir).expect("create credential storage");
+        for credential in credentials {
+            storage
+                .write(credential_ref(credential))
+                .expect("seed credential");
+        }
+        let state = if with_pin {
+            platform::pin_state()
+        } else {
+            PinState::new()
+        };
+        let service = AuthenticatorService::with_pin_storage(
+            storage,
+            Some(Arc::new(Mutex::new(TestPinStorage::new(state)))),
+            SecurityConfig::default(),
+            PinConfig::default(),
+        )
+        .expect("create authenticator service");
+        (service, temp_dir)
+    }
+
+    fn stored_level(
+        service: &AuthenticatorService<LocalStorageAdapter, TestPinStorage>,
+        id: &[u8],
+    ) -> Option<u8> {
+        lock_shared_storage(&service.storage)
+            .read(id)
+            .expect("read credential")
+            .extensions
+            .cred_protect
+    }
+
+    /// Send the vendor command; `auth` is `(protocol, param)` or `None` for no authorization.
+    fn send_set_cred_protect(
+        service: &mut AuthenticatorService<LocalStorageAdapter, TestPinStorage>,
+        ids: &[Vec<u8>],
+        level: u8,
+        auth: Option<(u8, Vec<u8>)>,
+    ) -> Vec<u8> {
+        use soft_fido2_ctap::cbor::MapBuilder;
+
+        let mut builder = MapBuilder::new()
+            .insert(1, crate::credential_protection::SET_CRED_PROTECT_SUBCOMMAND)
+            .and_then(|b| {
+                b.insert(
+                    2,
+                    ids.iter()
+                        .map(|id| serde_bytes::ByteBuf::from(id.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .and_then(|b| b.insert(3, level))
+            .expect("request");
+        if let Some((protocol, param)) = auth {
+            builder = builder
+                .insert(4, protocol)
+                .and_then(|b| b.insert_bytes(5, &param))
+                .expect("authorization");
+        }
+        let mut request = vec![CMD_PASSLESS_SET_CRED_PROTECT];
+        request.extend(builder.build().expect("request"));
+        let mut response = Vec::new();
+        service
+            .handle(&request, &mut response)
+            .expect("handle set-cred-protect");
+        response
+    }
+
+    fn authorized(token: &[u8; 32], ids: &[Vec<u8>], level: u8) -> Option<(u8, Vec<u8>)> {
+        Some((
+            2,
+            platform::authenticate(token, &set_cred_protect_auth_data(level, ids)),
+        ))
+    }
+
+    const CM_PERMISSION: u8 = soft_fido2::request::Permission::CredentialManagement as u8;
+
+    #[test]
+    fn test_set_cred_protect_changes_only_the_level_after_pin_authorization() {
+        use crate::credential_protection::{parse_response, test_support::test_credential};
+
+        let ssh_a = test_credential(1, "ssh:", Some(3));
+        let ssh_b = test_credential(2, "ssh:", Some(3));
+        let other = test_credential(3, "example.com", Some(3));
+        let (mut service, _dir) =
+            cred_protect_service(&[ssh_a.clone(), ssh_b.clone(), other.clone()], true);
+        let ids = vec![ssh_a.id.clone(), ssh_b.id.clone()];
+
+        let token = platform::pin_token(&mut service, platform::PIN, CM_PERMISSION, None)
+            .expect("PIN token");
+        let response = send_set_cred_protect(&mut service, &ids, 1, authorized(&token, &ids, 1));
+        assert_eq!(response.first(), Some(&0x00), "status {response:02x?}");
+        let changes = parse_response(&response[1..]).expect("response");
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|c| c.previous == 3 && c.current == 1));
+        assert_eq!(changes[0].credential_id, ssh_a.id);
+
+        for original in [&ssh_a, &ssh_b] {
+            let stored = lock_shared_storage(&service.storage)
+                .read(&original.id)
+                .expect("read");
+            let mut expected = original.clone();
+            expected.extensions.cred_protect = Some(1);
+            assert_eq!(stored, expected, "only credProtect may differ");
+        }
+        assert_eq!(
+            stored_level(&service, &other.id),
+            Some(3),
+            "other RP untouched"
+        );
+
+        // Raising works too (a fresh token: the previous one covered other data).
+        let token = platform::pin_token(&mut service, platform::PIN, CM_PERMISSION, None)
+            .expect("PIN token");
+        let one = vec![ssh_a.id.clone()];
+        let response = send_set_cred_protect(&mut service, &one, 3, authorized(&token, &one, 3));
+        assert_eq!(response.first(), Some(&0x00));
+        assert_eq!(stored_level(&service, &ssh_a.id), Some(3));
+        assert_eq!(stored_level(&service, &ssh_b.id), Some(1));
+    }
+
+    #[test]
+    fn test_set_cred_protect_rejects_requests_without_valid_authorization() {
+        use crate::credential_protection::test_support::test_credential;
+
+        let credential = test_credential(1, "ssh:", Some(3));
+        let ids = vec![credential.id.clone()];
+
+        for with_pin in [true, false] {
+            let (mut service, _dir) =
+                cred_protect_service(std::slice::from_ref(&credential), with_pin);
+            let unchanged = |service: &AuthenticatorService<_, _>| {
+                assert_eq!(stored_level(service, &credential.id), Some(3));
+            };
+
+            // No authorization at all, whether or not a PIN is set.
+            let response = send_set_cred_protect(&mut service, &ids, 1, None);
+            assert_eq!(
+                response,
+                vec![StatusCode::PuatRequired as u8],
+                "pin={with_pin}"
+            );
+            unchanged(&service);
+
+            // An authorization parameter without any token having been issued.
+            let response = send_set_cred_protect(&mut service, &ids, 1, Some((2, vec![0u8; 32])));
+            assert_eq!(
+                response,
+                vec![StatusCode::PuatRequired as u8],
+                "pin={with_pin}"
+            );
+            unchanged(&service);
+        }
+
+        let (mut service, _dir) = cred_protect_service(std::slice::from_ref(&credential), true);
+        let token = platform::pin_token(&mut service, platform::PIN, CM_PERMISSION, None)
+            .expect("PIN token");
+
+        // A well-formed parameter computed over a different level does not authorize this one.
+        let response = send_set_cred_protect(&mut service, &ids, 1, authorized(&token, &ids, 2));
+        assert_eq!(response, vec![StatusCode::PinAuthInvalid as u8]);
+        // Nor does one computed over a different credential.
+        let other_ids = vec![vec![9u8; 32]];
+        let response =
+            send_set_cred_protect(&mut service, &ids, 1, authorized(&token, &other_ids, 1));
+        assert_eq!(response, vec![StatusCode::PinAuthInvalid as u8]);
+        // Nor does an unknown protocol.
+        let response = send_set_cred_protect(
+            &mut service,
+            &ids,
+            1,
+            Some((7, platform::authenticate(&token, b"x"))),
+        );
+        assert_ne!(response.first(), Some(&0x00));
+        assert_eq!(stored_level(&service, &credential.id), Some(3));
+
+        // A genuine token without the credential-management permission is not enough.
+        let token = platform::pin_token(
+            &mut service,
+            platform::PIN,
+            soft_fido2::request::Permission::MakeCredential as u8,
+            Some("ssh:"),
+        )
+        .expect("make-credential token");
+        let response = send_set_cred_protect(&mut service, &ids, 1, authorized(&token, &ids, 1));
+        assert_eq!(response, vec![StatusCode::UnauthorizedPermission as u8]);
+        assert_eq!(stored_level(&service, &credential.id), Some(3));
+
+        // And a wrong PIN yields no token at all.
+        assert!(platform::pin_token(&mut service, "0000", CM_PERMISSION, None).is_err());
+    }
+
+    #[test]
+    fn test_set_cred_protect_rejects_invalid_levels_and_unknown_credentials() {
+        use crate::credential_protection::test_support::test_credential;
+
+        let credential = test_credential(1, "ssh:", Some(3));
+        let ids = vec![credential.id.clone()];
+        let (mut service, _dir) = cred_protect_service(std::slice::from_ref(&credential), true);
+        let token = platform::pin_token(&mut service, platform::PIN, CM_PERMISSION, None)
+            .expect("PIN token");
+
+        for level in [0u8, 4, 255] {
+            let response =
+                send_set_cred_protect(&mut service, &ids, level, authorized(&token, &ids, level));
+            assert_eq!(
+                response,
+                vec![StatusCode::InvalidParameter as u8],
+                "level {level}"
+            );
+        }
+        assert_eq!(stored_level(&service, &credential.id), Some(3));
+
+        let unknown = vec![vec![9u8; 32]];
+        let response =
+            send_set_cred_protect(&mut service, &unknown, 1, authorized(&token, &unknown, 1));
+        assert_eq!(response, vec![StatusCode::NoCredentials as u8]);
+
+        // A missing credential in a batch leaves the existing one unchanged.
+        let batch = vec![credential.id.clone(), vec![9u8; 32]];
+        let response =
+            send_set_cred_protect(&mut service, &batch, 1, authorized(&token, &batch, 1));
+        assert_eq!(response, vec![StatusCode::NoCredentials as u8]);
+        assert_eq!(stored_level(&service, &credential.id), Some(3));
     }
 }
 

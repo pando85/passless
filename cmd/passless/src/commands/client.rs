@@ -3,7 +3,13 @@
 use crate::authenticator::{CMD_PASSLESS_RESET_UV_RETRIES, RESET_UV_RETRIES_SUBCOMMAND};
 use crate::credential_backup::{
     BACKUP_COMMIT_SUBCOMMAND, BACKUP_PREPARE_SUBCOMMAND, CMD_PASSLESS_BACKUP, CMD_PASSLESS_RESTORE,
-    MAX_BACKUP_BUNDLE_SIZE, backup_commit_auth_data, backup_prepare_auth_data, restore_auth_data,
+    MAX_BACKUP_BUNDLE_SIZE, PASSLESS_AAGUID, backup_commit_auth_data, backup_prepare_auth_data,
+    restore_auth_data,
+};
+use crate::credential_protection::{
+    CMD_PASSLESS_SET_CRED_PROTECT, CredProtectChange, MAX_CRED_PROTECT_LEVEL,
+    MIN_CRED_PROTECT_LEVEL, effective_level, encode_request, level_name, parse_response,
+    set_cred_protect_auth_data,
 };
 
 use std::collections::HashMap;
@@ -15,6 +21,8 @@ use std::path::{Path, PathBuf};
 use passless_core::{OutputFormat, Result};
 
 use rpassword::read_password;
+
+use zeroize::Zeroizing;
 
 use serde::Serialize;
 
@@ -316,6 +324,19 @@ fn authenticate_for_credential_management(
     transport: &mut Transport,
     output: OutputFormat,
 ) -> Result<soft_fido2::request::PinUvAuth> {
+    authenticate_for_credential_management_cached(transport, output, &mut None)
+}
+
+/// A PIN typed by the user, kept in memory for the duration of one command so that a command
+/// that needs two tokens (list, then change) asks for it once.
+type PinCache = Option<Zeroizing<String>>;
+
+/// Like [`authenticate_for_credential_management`], reusing and filling `pin_cache`.
+fn authenticate_for_credential_management_cached(
+    transport: &mut Transport,
+    output: OutputFormat,
+    pin_cache: &mut PinCache,
+) -> Result<soft_fido2::request::PinUvAuth> {
     if output == OutputFormat::Plain {
         println!("Attempting user verification...");
     }
@@ -336,7 +357,7 @@ fn authenticate_for_credential_management(
                 }
             }
 
-            fallback_to_pin_auth(transport, output, uv_error)
+            fallback_to_pin_auth(transport, output, uv_error, pin_cache)
         }
     }
 }
@@ -383,6 +404,7 @@ fn fallback_to_pin_auth(
     transport: &mut Transport,
     output: OutputFormat,
     uv_error: soft_fido2::Error,
+    pin_cache: &mut PinCache,
 ) -> Result<soft_fido2::request::PinUvAuth> {
     if output == OutputFormat::Plain {
         println!("  Checking if PIN authentication is available...");
@@ -423,29 +445,45 @@ fn fallback_to_pin_auth(
             if output == OutputFormat::Plain {
                 println!("  PIN is set on this authenticator");
                 println!("  Falling back to PIN authentication...\n");
-                println!("Enter PIN: ");
             }
 
-            let pin = read_password()
-                .map_err(|e| passless_core::Error::Other(format!("Failed to read PIN: {:?}", e)))?;
+            let pin = match pin_cache.clone() {
+                Some(pin) => pin,
+                None => {
+                    if output == OutputFormat::Plain {
+                        println!("Enter PIN: ");
+                    }
 
-            if pin.is_empty() {
-                return Err(passless_core::Error::Other(
-                    "PIN is required for credential management on this authenticator".to_string(),
-                ));
-            }
+                    let pin = Zeroizing::new(read_password().map_err(|e| {
+                        passless_core::Error::Other(format!("Failed to read PIN: {:?}", e))
+                    })?);
 
-            if output == OutputFormat::Plain {
-                println!();
-            }
+                    if pin.is_empty() {
+                        return Err(passless_core::Error::Other(
+                            "PIN is required for credential management on this authenticator"
+                                .to_string(),
+                        ));
+                    }
 
-            Client::get_pin_token_for_credential_management(transport, &pin, PinProtocol::V2)
-                .map_err(|e| {
+                    if output == OutputFormat::Plain {
+                        println!();
+                    }
+                    pin
+                }
+            };
+
+            let token =
+                Client::get_pin_token_for_credential_management(transport, &pin, PinProtocol::V2)
+                    .map_err(|e| {
+                    // A rejected PIN must not be offered again.
+                    *pin_cache = None;
                     passless_core::Error::Other(format!(
                         "PIN authentication failed: {:?}. UV was also unavailable: {:?}",
                         e, uv_error
                     ))
-                })
+                })?;
+            *pin_cache = Some(pin);
+            Ok(token)
         }
         Some(false) => {
             if is_uv_blocked_error(&uv_error) {
@@ -1244,6 +1282,15 @@ fn vendor_pin_uv_auth(
     auth_data: &[u8],
 ) -> Result<(u8, Vec<u8>)> {
     let token = authenticate_for_credential_management(transport, output)?;
+    vendor_auth_from_token(transport, &token, auth_data)
+}
+
+/// Compute `(pinUvAuthProtocol, pinUvAuthParam)` over `auth_data` with an already obtained token.
+fn vendor_auth_from_token(
+    transport: &mut Transport,
+    token: &soft_fido2::request::PinUvAuth,
+    auth_data: &[u8],
+) -> Result<(u8, Vec<u8>)> {
     let protocol = token.protocol_u8();
     let pin_protocol = match protocol {
         1 => PinProtocol::V1,
@@ -1260,7 +1307,7 @@ fn vendor_pin_uv_auth(
         .authenticate(auth_data, token.param())
         .map_err(|error| {
             passless_core::Error::Other(format!(
-                "Failed to authenticate credential backup request: {:?}",
+                "Failed to authenticate vendor request: {:?}",
                 error
             ))
         })?;
@@ -1498,6 +1545,324 @@ pub fn credential_restore(
         ),
     }
     Ok(())
+}
+
+/// What `set-cred-protect` applies to.
+enum CredProtectTarget {
+    Credential(Vec<u8>),
+    Rp(String),
+}
+
+/// One credential found for `--rp`.
+struct RpCredential {
+    id: Vec<u8>,
+    user_name: Option<String>,
+    level: u8,
+}
+
+fn format_level(level: u8) -> String {
+    format!("{} ({})", level, level_name(level))
+}
+
+/// Explain a CTAP status returned by the set-cred-protect vendor command.
+fn set_cred_protect_error(error: &soft_fido2::Error) -> String {
+    use soft_fido2::StatusCode;
+
+    let soft_fido2::Error::CtapError(code) = error else {
+        return format!("Failed to change credProtect: {:?}", error);
+    };
+    let code = *code;
+    let reason = if code == StatusCode::InvalidCommand as u8 {
+        "this authenticator does not support set-cred-protect (it needs a Passless daemon \
+         that provides it)"
+            .to_string()
+    } else if code == StatusCode::NoCredentials as u8 {
+        "credential not found".to_string()
+    } else if code == StatusCode::PuatRequired as u8
+        || code == StatusCode::PinAuthInvalid as u8
+        || code == StatusCode::UnauthorizedPermission as u8
+    {
+        "PIN/user verification was not accepted; nothing was changed".to_string()
+    } else if code == StatusCode::InvalidParameter as u8 {
+        "the authenticator rejected the request parameters".to_string()
+    } else {
+        format!("CTAP status 0x{:02x}", code)
+    };
+    format!("Failed to change credProtect: {}", reason)
+}
+
+/// Refuse to send a vendor command to anything that is not a Passless authenticator.
+fn require_passless_authenticator(transport: &mut Transport) -> Result<()> {
+    let info_response = Client::authenticator_get_info(transport).map_err(|e| {
+        passless_core::Error::Other(format!("Failed to get authenticator info: {:?}", e))
+    })?;
+    let info_value: soft_fido2_ctap::cbor::Value = soft_fido2_ctap::cbor::decode(&info_response)
+        .map_err(|e| {
+            passless_core::Error::Other(format!("Failed to decode info response: {:?}", e))
+        })?;
+    let info = parse_authenticator_info(&info_value)?;
+    if info.aaguid.as_deref() != Some(PASSLESS_AAGUID.as_slice()) {
+        return Err(passless_core::Error::Other(
+            "set-cred-protect is a Passless command and the selected device is not a Passless \
+             authenticator; select the Passless device with --device"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// List the credentials of `rp_id` with their stored levels.
+fn list_rp_credentials(
+    transport: &mut Transport,
+    token: &soft_fido2::request::PinUvAuth,
+    rp_id: &str,
+) -> Result<Vec<RpCredential>> {
+    let rps = Client::enumerate_rps(
+        transport,
+        CredentialManagementRequest::new(Some(token.clone())),
+    )
+    .map_err(|e| passless_core::Error::Other(format!("Failed to enumerate RPs: {:?}", e)))?;
+
+    let rp = rps.into_iter().find(|rp| rp.id == rp_id).ok_or_else(|| {
+        passless_core::Error::Other(format!("No credentials stored for RP '{}'", rp_id))
+    })?;
+
+    let credentials = Client::enumerate_credentials(
+        transport,
+        EnumerateCredentialsRequest::new(Some(token.clone()), rp.rp_id_hash),
+    )
+    .map_err(|e| {
+        passless_core::Error::Other(format!("Failed to enumerate credentials: {:?}", e))
+    })?;
+
+    Ok(credentials
+        .into_iter()
+        .map(|credential| RpCredential {
+            id: credential.credential_id.id,
+            user_name: credential.user.name,
+            level: effective_level(credential.cred_protect),
+        })
+        .collect())
+}
+
+/// Ask a yes/no question; anything but "y" or "yes" (also end of input) is no.
+fn confirm<R: std::io::BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    question: &str,
+) -> Result<bool> {
+    write!(writer, "{} [y/N]: ", question)
+        .and_then(|_| writer.flush())
+        .map_err(|e| passless_core::Error::Other(format!("Failed to write prompt: {}", e)))?;
+    let mut answer = String::new();
+    reader
+        .read_line(&mut answer)
+        .map_err(|e| passless_core::Error::Other(format!("Failed to read answer: {}", e)))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Change the stored credProtect level of one credential (`--id`) or every credential of an RP
+/// (`--rp`) through the running authenticator.
+///
+/// Always authorized by a credential-management pinUvAuthToken (PIN, or built-in user
+/// verification when no PIN is set); there is no fallback without a token. With `--rp` two
+/// tokens are used: one to list the credentials, one (after the confirmation) to change them,
+/// because a token authorizes new requests for only a few seconds.
+pub fn set_cred_protect(
+    output: OutputFormat,
+    device: Option<&str>,
+    credential_id_hex: Option<&str>,
+    rp_id: Option<&str>,
+    level: u8,
+    yes: bool,
+) -> Result<()> {
+    if !(MIN_CRED_PROTECT_LEVEL..=MAX_CRED_PROTECT_LEVEL).contains(&level) {
+        return Err(passless_core::Error::Other(format!(
+            "--level must be between {} and {}",
+            MIN_CRED_PROTECT_LEVEL, MAX_CRED_PROTECT_LEVEL
+        )));
+    }
+    let target = match (credential_id_hex, rp_id) {
+        (Some(id), None) => CredProtectTarget::Credential(hex::decode(id).map_err(|e| {
+            passless_core::Error::Other(format!("Invalid credential ID hex: {:?}", e))
+        })?),
+        (None, Some(rp)) if !rp.is_empty() => CredProtectTarget::Rp(rp.to_string()),
+        _ => {
+            return Err(passless_core::Error::Other(
+                "Give exactly one of --id <CREDENTIAL_ID> and --rp <RP_ID>".to_string(),
+            ));
+        }
+    };
+    if output == OutputFormat::Json && matches!(target, CredProtectTarget::Rp(_)) && !yes {
+        return Err(passless_core::Error::Other(
+            "--rp with -o json cannot ask for confirmation; pass --yes".to_string(),
+        ));
+    }
+
+    let mut transport = open_authenticator(device)?;
+    require_passless_authenticator(&mut transport)?;
+    let mut pin_cache: PinCache = None;
+
+    let (ids, listing) = match &target {
+        CredProtectTarget::Credential(id) => (vec![id.clone()], None),
+        CredProtectTarget::Rp(rp) => {
+            let token = authenticate_for_credential_management_cached(
+                &mut transport,
+                output,
+                &mut pin_cache,
+            )?;
+            let credentials = list_rp_credentials(&mut transport, &token, rp)?;
+            if credentials.is_empty() {
+                return Err(passless_core::Error::Other(format!(
+                    "No credentials stored for RP '{}'",
+                    rp
+                )));
+            }
+            if output == OutputFormat::Plain {
+                println!("Credentials of RP '{}':", rp);
+                for credential in &credentials {
+                    println!(
+                        "  {}  user: {}  credProtect: {}",
+                        hex::encode(&credential.id),
+                        credential.user_name.as_deref().unwrap_or("(none)"),
+                        format_level(credential.level)
+                    );
+                }
+                println!();
+            }
+            if credentials.iter().all(|c| c.level == level) {
+                match output {
+                    OutputFormat::Plain => println!(
+                        "All {} credential(s) already have credProtect {}; nothing to do.",
+                        credentials.len(),
+                        format_level(level)
+                    ),
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "success": true,
+                            "rp_id": rp,
+                            "level": level,
+                            "credentials": credentials.iter().map(|c| serde_json::json!({
+                                "credential_id": hex::encode(&c.id),
+                                "previous_level": c.level,
+                                "level": level,
+                                "changed": false,
+                            })).collect::<Vec<_>>(),
+                        })
+                    ),
+                }
+                transport.close();
+                return Ok(());
+            }
+            if !yes {
+                if credentials.iter().any(|c| c.level > level) {
+                    println!(
+                        "Lowering credProtect to {} means these credentials no longer require \
+                         user verification where the old level did.",
+                        format_level(level)
+                    );
+                }
+                let question = format!(
+                    "Set credProtect to {} for {} credential(s) of '{}'?",
+                    format_level(level),
+                    credentials.len(),
+                    rp
+                );
+                let stdin = std::io::stdin();
+                if !confirm(&mut stdin.lock(), &mut std::io::stdout(), &question)? {
+                    return Err(passless_core::Error::Other(
+                        "Cancelled; nothing was changed".to_string(),
+                    ));
+                }
+            }
+            (
+                credentials.iter().map(|c| c.id.clone()).collect(),
+                Some(credentials),
+            )
+        }
+    };
+
+    let token =
+        authenticate_for_credential_management_cached(&mut transport, output, &mut pin_cache)?;
+    let auth_data = set_cred_protect_auth_data(level, &ids);
+    let (protocol, auth_param) = vendor_auth_from_token(&mut transport, &token, &auth_data)?;
+    let request = encode_request(level, &ids, protocol, &auth_param).map_err(|status| {
+        passless_core::Error::Other(format!("Failed to encode request: {:?}", status))
+    })?;
+    let response = transport
+        .send_ctap_command(CMD_PASSLESS_SET_CRED_PROTECT, &request, 30_000)
+        .map_err(|error| passless_core::Error::Other(set_cred_protect_error(&error)))?;
+    let payload = vendor_response_payload(&response, "Set credProtect")?;
+    let changes = parse_response(payload).map_err(|status| {
+        passless_core::Error::Other(format!("Invalid set-cred-protect response: {:?}", status))
+    })?;
+    transport.close();
+
+    print_cred_protect_changes(output, &target, listing.as_deref(), level, &changes);
+    Ok(())
+}
+
+fn print_cred_protect_changes(
+    output: OutputFormat,
+    target: &CredProtectTarget,
+    listing: Option<&[RpCredential]>,
+    level: u8,
+    changes: &[CredProtectChange],
+) {
+    let user_of = |id: &[u8]| {
+        listing
+            .and_then(|list| list.iter().find(|c| c.id == id))
+            .and_then(|c| c.user_name.clone())
+    };
+    match output {
+        OutputFormat::Plain => {
+            for change in changes {
+                let user = user_of(&change.credential_id)
+                    .map(|name| format!(" (user: {})", name))
+                    .unwrap_or_default();
+                if change.previous == change.current {
+                    println!(
+                        "Credential {}{}: credProtect already {}; unchanged",
+                        hex::encode(&change.credential_id),
+                        user,
+                        format_level(change.current)
+                    );
+                } else {
+                    println!(
+                        "Credential {}{}: credProtect {} -> {}",
+                        hex::encode(&change.credential_id),
+                        user,
+                        format_level(change.previous),
+                        format_level(change.current)
+                    );
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let rp = match target {
+                CredProtectTarget::Rp(rp) => Some(rp.as_str()),
+                CredProtectTarget::Credential(_) => None,
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": true,
+                    "rp_id": rp,
+                    "level": level,
+                    "credentials": changes.iter().map(|change| serde_json::json!({
+                        "credential_id": hex::encode(&change.credential_id),
+                        "previous_level": change.previous,
+                        "level": change.current,
+                        "changed": change.previous != change.current,
+                    })).collect::<Vec<_>>(),
+                })
+            );
+        }
+    }
 }
 
 /// Set PIN on authenticator
@@ -2046,5 +2411,138 @@ fn print_authenticator_info(info: &AuthenticatorInfo) {
 
     if let Some(remaining) = info.remaining_discoverable_credentials {
         println!("\nRemaining Discoverable Credentials: {}", remaining);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Cursor;
+
+    fn error_text(result: Result<()>) -> String {
+        result.expect_err("expected an error").to_string()
+    }
+
+    #[test]
+    fn confirm_accepts_only_yes() {
+        for (answer, expected) in [
+            ("y\n", true),
+            ("Y\n", true),
+            ("yes\n", true),
+            (" YES \n", true),
+            ("n\n", false),
+            ("\n", false),
+            ("", false),
+            ("yep\n", false),
+            ("1\n", false),
+        ] {
+            let mut output = Vec::new();
+            let result = confirm(&mut Cursor::new(answer), &mut output, "Proceed?").unwrap();
+            assert_eq!(result, expected, "answer {answer:?}");
+            assert_eq!(String::from_utf8(output).unwrap(), "Proceed? [y/N]: ");
+        }
+    }
+
+    // These all fail before any authenticator is opened: no test here reaches a device.
+    #[test]
+    fn set_cred_protect_validates_arguments_before_touching_a_device() {
+        let id = "ab".repeat(32);
+
+        let message = error_text(set_cred_protect(
+            OutputFormat::Plain,
+            None,
+            Some(&id),
+            None,
+            0,
+            false,
+        ));
+        assert!(message.contains("--level"), "{message}");
+        let message = error_text(set_cred_protect(
+            OutputFormat::Plain,
+            None,
+            Some(&id),
+            None,
+            4,
+            false,
+        ));
+        assert!(message.contains("--level"), "{message}");
+
+        let message = error_text(set_cred_protect(
+            OutputFormat::Plain,
+            None,
+            None,
+            None,
+            1,
+            false,
+        ));
+        assert!(message.contains("exactly one"), "{message}");
+        let message = error_text(set_cred_protect(
+            OutputFormat::Plain,
+            None,
+            Some(&id),
+            Some("ssh:"),
+            1,
+            false,
+        ));
+        assert!(message.contains("exactly one"), "{message}");
+        let message = error_text(set_cred_protect(
+            OutputFormat::Plain,
+            None,
+            None,
+            Some(""),
+            1,
+            false,
+        ));
+        assert!(message.contains("exactly one"), "{message}");
+
+        let message = error_text(set_cred_protect(
+            OutputFormat::Plain,
+            None,
+            Some("not-hex"),
+            None,
+            1,
+            false,
+        ));
+        assert!(message.contains("Invalid credential ID"), "{message}");
+
+        let message = error_text(set_cred_protect(
+            OutputFormat::Json,
+            None,
+            None,
+            Some("ssh:"),
+            1,
+            false,
+        ));
+        assert!(message.contains("--yes"), "{message}");
+    }
+
+    #[test]
+    fn set_cred_protect_errors_explain_the_ctap_status() {
+        use soft_fido2::StatusCode;
+
+        let text = |status: StatusCode| {
+            set_cred_protect_error(&soft_fido2::Error::CtapError(status as u8))
+        };
+        assert!(text(StatusCode::InvalidCommand).contains("does not support"));
+        assert!(text(StatusCode::NoCredentials).contains("not found"));
+        for status in [
+            StatusCode::PuatRequired,
+            StatusCode::PinAuthInvalid,
+            StatusCode::UnauthorizedPermission,
+        ] {
+            assert!(text(status).contains("nothing was changed"));
+        }
+        assert!(text(StatusCode::Other).contains("0x"));
+    }
+
+    #[test]
+    fn levels_are_shown_with_their_names() {
+        assert_eq!(format_level(1), "1 (userVerificationOptional)");
+        assert_eq!(
+            format_level(2),
+            "2 (userVerificationOptionalWithCredentialIDList)"
+        );
+        assert_eq!(format_level(3), "3 (userVerificationRequired)");
     }
 }
