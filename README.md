@@ -209,7 +209,9 @@ passless client set-cred-protect --id <CREDENTIAL_ID> --level 3
 ```
 
 See [SSH keys and always_uv](docs/CRED_PROTECT.md#ssh-keys-and-always_uv) before lowering a
-level: level 1 means user presence only for that key.
+level: level 1 means user presence only for that key, which with
+`security.user_verification_authentication = false` is silent signing for any process with hidraw
+access, and lowering has no effect while `always_uv = true`.
 
 ## Configuration
 
