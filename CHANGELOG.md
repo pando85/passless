@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.24.1](https://github.com/pando85/passless/tree/v0.24.1) - 2026-11-12
+
+### Fixed
+
+- Ship shell completions with Cargo 1.100 build layout (#586) ([7657de5](https://github.com/pando85/passless/commit/7657de50d4eab7ce60f884559572844ef7a5c311))
+
 ## [v0.24.0](https://github.com/pando85/passless/tree/v0.24.0) - 2026-11-12
 
 ### Added
