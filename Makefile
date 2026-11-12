@@ -97,17 +97,25 @@ release:	## generate vendor.tar.gz, $(PKG_BASE_NAME).tar.gz, and completions
 	tar -czf vendor.tar.gz vendor
 	cargo build --frozen --release --all-features --target ${CARGO_TARGET}
 	tar -czf $(PKG_BASE_NAME).tar.gz -C $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release passless passless-git-sync sign-proxy agent-prompt-probe
-	@# Create completions tarball
-	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build/passless-*/out/completions -type d 2>/dev/null | head -1); \
-	if [ -n "$$COMPLETION_DIR" ]; then \
-		mkdir -p completions-tmp; \
-		cp "$$COMPLETION_DIR"/* completions-tmp/ 2>/dev/null || true; \
-		tar -czf passless-completions-$(PROJECT_VERSION).tar.gz -C completions-tmp .; \
-		rm -rf completions-tmp; \
-		echo "Created completions tarball: passless-completions-$(PROJECT_VERSION).tar.gz"; \
-	else \
-		echo "Warning: Completions directory not found"; \
-	fi
+	@# Create completions tarball. Cargo >= 1.100 places build script output in build/<pkg>/<hash>/out,
+	@# older versions in build/<pkg>-<hash>/out, so match both and pick the newest. Fail if missing.
+	@COMPLETION_DIR=$$(find $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build -type d -path '*/passless-rs*/out/completions' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-); \
+	if [ -z "$$COMPLETION_DIR" ]; then \
+		echo "Error: completions directory not found under $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/build" >&2; \
+		exit 1; \
+	fi; \
+	for f in passless.bash _passless passless.fish passless.elv; do \
+		if [ ! -f "$$COMPLETION_DIR/$$f" ]; then \
+			echo "Error: $$f missing in $$COMPLETION_DIR" >&2; \
+			exit 1; \
+		fi; \
+	done; \
+	rm -rf completions-tmp; \
+	mkdir completions-tmp; \
+	cp "$$COMPLETION_DIR"/* completions-tmp/; \
+	tar -czf passless-completions-$(PROJECT_VERSION).tar.gz -C completions-tmp .; \
+	rm -rf completions-tmp; \
+	echo "Created completions tarball from $$COMPLETION_DIR: passless-completions-$(PROJECT_VERSION).tar.gz"
 	@echo Released binaries in $(CARGO_TARGET_DIR)/$(CARGO_TARGET)/release/: passless, passless-git-sync, sign-proxy, agent-prompt-probe
 
 .PHONY: update-version
