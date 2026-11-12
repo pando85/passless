@@ -13,9 +13,7 @@ use passless_core::{
 };
 
 use passless_core::agent::PrincipalSessionId;
-use passless_core::agent::protocol::{
-    AdminRequest, AuditExportFormat, GrantedRuleInfo, GrantedRuleList, ProfileGrantedRules,
-};
+use passless_core::agent::protocol::{AdminRequest, AuditExportFormat, GrantedRuleList};
 
 use serde::Serialize;
 
@@ -1207,6 +1205,8 @@ mod tests {
     use super::*;
 
     use std::os::unix::fs::symlink;
+
+    use passless_core::agent::protocol::{GrantedRuleInfo, ProfileGrantedRules};
 
     fn info(rp_id: &str, kind: &str, rule: &str, credential: Option<&str>) -> GrantedRuleInfo {
         GrantedRuleInfo {
