@@ -42,13 +42,7 @@ pub fn dispatch(args: &mut Args, agents: bool, output: OutputFormat) -> Result<(
                 }
             );
             for check in &report.checks {
-                let mark = if !check.passed {
-                    "FAIL"
-                } else if check.message.starts_with("warning:") {
-                    "warn"
-                } else {
-                    "ok"
-                };
+                let mark = check.mark();
                 println!("  [{mark}] {}: {}", check.name, check.message);
             }
         }

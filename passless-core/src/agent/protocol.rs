@@ -914,6 +914,21 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
+impl DoctorCheck {
+    /// How a report prints the check: `FAIL`, `warn` or `ok`. A warning is a passing check whose
+    /// message starts with `warning:` (the JSON schema has no severity: `passed` stays what the
+    /// health of the report is computed from).
+    pub fn mark(&self) -> &'static str {
+        if !self.passed {
+            "FAIL"
+        } else if self.message.starts_with("warning:") {
+            "warn"
+        } else {
+            "ok"
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileDiagnosticReport {
@@ -930,10 +945,8 @@ pub struct ProfileDiagnosticReport {
 
 impl ProfileDiagnosticReport {
     pub fn is_healthy(&self) -> bool {
-        self.enabled
-            && self.audit_gate_healthy
-            && self.pin_storage_available
-            && self.checks.iter().all(|c| c.passed)
+        // The `pin_storage` check says whether the missing PIN storage matters for the mode.
+        self.enabled && self.audit_gate_healthy && self.checks.iter().all(|c| c.passed)
     }
 }
 

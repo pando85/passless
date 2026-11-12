@@ -201,7 +201,7 @@ fn dispatch_profile(output: OutputFormat, action: &AdminProfileAction) -> Result
                         println!("policy_generation: {}", report.policy_generation);
                         println!("audit_gate_healthy: {}", report.audit_gate_healthy);
                         for check in &report.checks {
-                            let mark = if check.passed { "ok" } else { "FAIL" };
+                            let mark = check.mark();
                             println!("  [{}] {}: {}", mark, check.name, check.message);
                         }
                         Ok(())
