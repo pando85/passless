@@ -1419,6 +1419,7 @@ fn test_client_set_cred_protect() {
             &target_id,
             "--level",
             "1",
+            "--yes",
         ],
     );
     assert!(ok, "set-cred-protect --id failed: {stderr}\n{stdout}");

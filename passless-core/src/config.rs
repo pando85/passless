@@ -1328,9 +1328,15 @@ pub enum ClientAction {
     /// Change the stored credProtect level of credentials (requires user verification)
     ///
     /// Levels: 1 = user verification optional (presence only), 2 = optional with a credential
-    /// ID list, 3 = user verification required. Lowering the level weakens protection of the
-    /// credential; the authenticator asks for the same PIN or built-in user verification as
-    /// for `delete` and `rename`.
+    /// ID list, 3 = user verification required. The credentials are shown first; lowering asks
+    /// for confirmation unless --yes is given, and the authenticator asks for the PIN or, with
+    /// no PIN set, shows its own prompt naming what is lowered.
+    ///
+    /// WARNING: lowering weakens the credentials. With
+    /// security.user_verification_authentication = false, level 1 means silent signing by any
+    /// process that can reach the authenticator's hidraw device. Lowering has no effect while
+    /// security.always_uv = true, because the authenticator then forces user verification
+    /// whatever the level. After an error, check the result with `passless client list`.
     SetCredProtect {
         /// Credential ID in hexadecimal format
         #[arg(

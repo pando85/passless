@@ -414,4 +414,16 @@ fn client_set_cred_protect_appears_in_client_help() {
     for flag in ["--id", "--rp", "--level", "--yes"] {
         assert!(stdout.contains(flag), "{flag} missing from help");
     }
+    // The help states the risk plainly.
+    for text in [
+        "hidraw",
+        "silent signing",
+        "always_uv = true",
+        "passless client list",
+    ] {
+        assert!(
+            stdout.contains(text),
+            "{text:?} missing from help:\n{stdout}"
+        );
+    }
 }
