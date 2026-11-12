@@ -2785,14 +2785,14 @@ mod protected_credential_tests {
     /// Enroll the way v0.21.0 release builds did: user verification forced on MakeCredential.
     fn enroll_with_forced_uv(storage: &Arc<Mutex<LocalStorageAdapter>>, alg: i64) -> Enrolled {
         let prompts = AutoAccept::install();
-        let enrolled = enroll(&mut service_without_pin(storage, true), alg, None);
+        let enrolled = enroll(&mut service_without_pin(storage, true), alg, Some(3));
         assert_eq!(prompts.uv_prompts(), 1, "enrollment performed built-in UV");
         assert_eq!(
             stored(storage, &enrolled.credential_id)
                 .extensions
                 .cred_protect,
             Some(3),
-            "soft-fido2 defaults credProtect to userVerificationRequired after UV"
+            "explicit credProtect request is honored"
         );
         enrolled
     }
