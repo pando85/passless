@@ -1,6 +1,6 @@
 # ADR 0014 amendment: pins with the wildcard, registration at unlisted sites, agent pre-requests
 
-- **Status:** Accepted (2026-11-12)
+- **Status:** Accepted (2026-11-12); Phase 1 implemented and folded into ADR 0014
 - **Date:** 2026-11-12
 - **Amends:** [ADR 0014](0014-agent-delegation.md) §6.2, §6.3, §6.4, §8.1 to §8.4, §9, §10.1, §10.3, §12,
   §14, §15, §17
