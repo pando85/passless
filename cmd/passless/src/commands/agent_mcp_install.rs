@@ -2,6 +2,9 @@
 //! MCP client's configuration to run through Passless (see [`crate::agent::mcp_clients`] for what
 //! is detected and how the entries are rewritten).
 //!
+//! A file with no browser MCP entry gets a new `playwright` server that runs through Passless; a
+//! file that does not exist is created (never over an existing one).
+//!
 //! The default is a dry run that prints a diff. `--yes` writes the file atomically, after saving a
 //! `<file>.passless-backup-<UTC timestamp>` copy with the same permissions.
 
@@ -16,7 +19,7 @@ use passless_core::agent::config::CdpExposeMode;
 use passless_core::{Error, McpAdapterKind, McpInstallClient, Result};
 
 use crate::agent::mcp_clients::{
-    self, Outcome, Plan, Roots, Scope, client_name, config_path, skill_dirs, unified_diff,
+    self, AddPlan, Outcome, Plan, Roots, Scope, client_name, config_path, skill_dirs, unified_diff,
     utc_timestamp,
 };
 
@@ -295,6 +298,50 @@ pub fn write_atomic(path: &Path, expected: &[u8], new: &[u8]) -> Result<()> {
     result
 }
 
+/// Create `path` with `content`, atomically and never over an existing file: the content goes to a
+/// temporary file in the same directory, which is then hard-linked to `path` (that fails when
+/// `path` exists, even as a dangling symlink), so a reader never sees a partial file and nothing
+/// is ever truncated.
+pub fn create_new(path: &Path, content: &[u8], mode: u32) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("{} has no parent directory", path.display())))?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = dir.join(format!(
+        ".{name}.passless-tmp-{}-{nonce}",
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temp)?;
+        file.write_all(content)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&temp, path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::Other(format!(
+                    "{} appeared while it was being created: nothing was written, run the command again",
+                    path.display()
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        fs::File::open(dir).and_then(|dir| dir.sync_all())?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temp);
+    result
+}
+
 fn metadata_uid(metadata: &fs::Metadata) -> u32 {
     std::os::unix::fs::MetadataExt::uid(metadata)
 }
@@ -325,9 +372,6 @@ pub fn report(file: &Path, client: McpInstallClient, scope: &Scope, plan: &Plan)
         client_name(client),
         scope_label(scope)
     );
-    if plan.entries.is_empty() {
-        out.push_str("  no Playwright MCP or chrome-devtools-mcp entry found\n");
-    }
     for entry in &plan.entries {
         let name = &entry.entry.name;
         let location = entry.entry.location();
@@ -367,6 +411,23 @@ pub fn report(file: &Path, client: McpInstallClient, scope: &Scope, plan: &Plan)
         }
     }
     out
+}
+
+/// The line about a new entry.
+pub fn report_add(plan: &Plan, add: &AddPlan, file_exists: bool) -> String {
+    let why = if !file_exists {
+        "no such file: it will be created"
+    } else if plan.entries.is_empty() {
+        "no Playwright MCP or chrome-devtools-mcp entry found"
+    } else {
+        "no browser MCP entry at this level"
+    };
+    format!(
+        "  {why}; adding `{}` ({}) -> {}\n",
+        add.entry.name,
+        add.entry.location(),
+        add.argv[1..].join(" ")
+    )
 }
 
 fn absolute_dir(dir: &Path) -> Result<PathBuf> {
@@ -455,7 +516,7 @@ pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
                 .map_err(|_| Error::Other(format!("{} is not valid UTF-8", file.display())))?;
             if let Err(e) = install_file(
                 &file,
-                &text,
+                Some(&text),
                 request,
                 &scope,
                 &passless,
@@ -466,7 +527,17 @@ pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("{}: no such file, nothing to rewrite", file.display());
+            if let Err(e) = install_file(
+                &file,
+                None,
+                request,
+                &scope,
+                &passless,
+                &profile,
+                note.as_deref(),
+            ) {
+                failure = Some(e);
+            }
         }
         Err(e) => {
             return Err(Error::Other(format!("cannot read {}: {e}", file.display())));
@@ -480,10 +551,11 @@ pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
 }
 
 /// Plan (and with `--yes` write) one file, then print `note` after it, in a dry run and with
-/// `--yes` alike. The note never changes the result.
+/// `--yes` alike. The note never changes the result. `text` is `None` for a file that does not
+/// exist.
 fn install_file(
     file: &Path,
-    text: &str,
+    text: Option<&str>,
     request: &InstallRequest,
     scope: &Scope,
     passless: &str,
@@ -497,60 +569,124 @@ fn install_file(
     result
 }
 
+/// The mode of a file this command creates: private for a user-level file (it can hold keys),
+/// like any other file in a project.
+fn new_file_mode(scope: &Scope) -> u32 {
+    match scope {
+        Scope::User => 0o600,
+        Scope::Project(_) => 0o644,
+    }
+}
+
 fn install_plan(
     file: &Path,
-    text: &str,
+    text: Option<&str>,
     request: &InstallRequest,
     scope: &Scope,
     passless: &str,
     profile: &str,
 ) -> Result<()> {
-    let plan = mcp_clients::plan(request.client, text, passless, profile)
-        .map_err(|e| Error::Other(format!("{}: {e}", file.display())))?;
+    let fail = |e: mcp_clients::PlanError| Error::Other(format!("{}: {e}", file.display()));
+    let plan = match text {
+        Some(text) => mcp_clients::plan(request.client, text, passless, profile).map_err(fail)?,
+        None => Plan {
+            entries: Vec::new(),
+            jsonc: false,
+            new_text: None,
+        },
+    };
+    // A file with no browser MCP entry of its own gets one (after any rewrite of the entries it
+    // has: the Claude Code local-scope entries of other projects).
+    let add = if plan.has_scope_level_entry() {
+        None
+    } else {
+        let base = plan.new_text.as_deref().or(text);
+        Some(mcp_clients::plan_add(request.client, base, passless, profile).map_err(fail)?)
+    };
     print!("{}", report(file, request.client, scope, &plan));
+    if let Some(add) = &add {
+        print!("{}", report_add(&plan, add, text.is_some()));
+    }
 
     for entry in &plan.entries {
         if let Outcome::Unsupported { snippet, .. } = &entry.outcome {
             println!("\nSnippet for {}:\n{snippet}", entry.entry.name);
         }
     }
-    if plan.jsonc {
+    let jsonc = plan.jsonc || add.as_ref().is_some_and(|add| add.jsonc);
+    if jsonc {
         println!(
             "\n{} has comments or trailing commas, which an automatic edit would lose, so it is \
-             not rewritten. Replace the entries by hand with:",
+             not changed. Edit it by hand:",
             file.display()
         );
         for entry in plan.rewritten() {
             if let Outcome::Rewritten { snippet, .. } = &entry.outcome {
-                println!("\n{snippet}");
+                println!("\nReplace the entry with:\n{snippet}");
             }
         }
-        if plan.rewritten().next().is_some() && request.yes {
+        if let Some(add) = &add {
+            println!(
+                "\nAdd to {}:\n{}",
+                mcp_clients::client_name(request.client),
+                add.snippet
+            );
+        }
+        if (plan.rewritten().next().is_some() || add.is_some()) && request.yes {
             return Err(Error::Other(format!(
-                "refusing to rewrite {} (JSONC): nothing was written",
+                "refusing to change {} (JSONC): nothing was written",
                 file.display()
             )));
         }
         return Ok(());
     }
-    let Some(new_text) = &plan.new_text else {
+    let new_text = add
+        .as_ref()
+        .and_then(|add| add.new_text.clone())
+        .or(plan.new_text.clone());
+    let Some(new_text) = new_text else {
         println!("\nNothing to change.");
         return Ok(());
     };
+    let old = text.unwrap_or("");
     let label = file.to_string_lossy();
     println!(
         "\n{}",
-        unified_diff(label.trim_start_matches('/'), text, new_text)
+        unified_diff(label.trim_start_matches('/'), old, &new_text)
     );
     if !request.yes {
         println!(
-            "Dry run: nothing was changed. Run again with --yes to write the file (a backup is saved first)."
+            "Dry run: nothing was changed. Run again with --yes to {} (a backup is saved first).",
+            if text.is_some() {
+                "write the file"
+            } else {
+                "create the file"
+            }
         );
         return Ok(());
     }
-    let backup = write_backup(file, SystemTime::now())?;
-    write_atomic(file, text.as_bytes(), new_text.as_bytes())?;
-    println!("Backup: {}\nWritten: {}", backup.display(), file.display());
+    if text.is_none() {
+        if let Some(dir) = file.parent()
+            && !dir.is_dir()
+        {
+            // Only opencode's user directory is ours to create; a missing CLAUDE_CONFIG_DIR is
+            // more likely a typo than a wish.
+            if request.client == McpInstallClient::Opencode && matches!(scope, Scope::User) {
+                fs::create_dir_all(dir)?;
+            } else {
+                return Err(Error::Other(format!(
+                    "{} does not exist: nothing was created",
+                    dir.display()
+                )));
+            }
+        }
+        create_new(file, new_text.as_bytes(), new_file_mode(scope))?;
+        println!("Created: {}", file.display());
+    } else {
+        let backup = write_backup(file, SystemTime::now())?;
+        write_atomic(file, old.as_bytes(), new_text.as_bytes())?;
+        println!("Backup: {}\nWritten: {}", backup.display(), file.display());
+    }
     println!("Restart the client to load the new MCP command.");
     Ok(())
 }

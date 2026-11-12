@@ -592,7 +592,22 @@ pub struct EntryRef {
 
 impl EntryRef {
     pub fn location(&self) -> String {
-        self.path.join(".")
+        match self.path.as_slice() {
+            // A Claude Code local-scope entry: `projects[<abs path>].mcpServers.<name>`.
+            [projects, project, servers, name] if projects == "projects" => {
+                format!("{projects}[{project}].{servers}.{name}")
+            }
+            _ => self.path.join("."),
+        }
+    }
+
+    /// The project directory of a Claude Code local-scope entry (`claude mcp add` without
+    /// `--scope`, kept under `projects.<abs path>.mcpServers` of the user-level file).
+    pub fn local_project(&self) -> Option<&str> {
+        match self.path.as_slice() {
+            [projects, project, _, _] if projects == "projects" => Some(project),
+            _ => None,
+        }
     }
 }
 
@@ -622,7 +637,8 @@ fn env_keys_of(entry: &Value, key: &str) -> Vec<String> {
 }
 
 /// The entries of `root` that launch a command: opencode `mcp.servers.<name>` (and the legacy
-/// `mcp.<name>`, which its schema marks deprecated), Claude Code `mcpServers.<name>`.
+/// `mcp.<name>`, which its schema marks deprecated), Claude Code `mcpServers.<name>` and, in the
+/// user-level file, the local-scope `projects.<abs path>.mcpServers.<name>`.
 pub fn find_entries(client: McpInstallClient, root: &Value) -> Vec<FoundEntry> {
     let mut found = Vec::new();
     let mut add = |path: Vec<String>, entry: &Value| {
@@ -696,6 +712,24 @@ pub fn find_entries(client: McpInstallClient, root: &Value) -> Vec<FoundEntry> {
                     add(vec!["mcpServers".into(), name.clone()], entry);
                 }
             }
+            if let Some(projects) = root.get("projects").and_then(Value::as_object) {
+                for (project, config) in projects {
+                    let Some(servers) = config.get("mcpServers").and_then(Value::as_object) else {
+                        continue;
+                    };
+                    for (name, entry) in servers {
+                        add(
+                            vec![
+                                "projects".into(),
+                                project.clone(),
+                                "mcpServers".into(),
+                                name.clone(),
+                            ],
+                            entry,
+                        );
+                    }
+                }
+            }
         }
     }
     found
@@ -759,6 +793,15 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Whether the file has a browser MCP entry at its own level: not one of the Claude Code
+    /// local-scope entries of other projects, which are rewritten but do not make a user-level
+    /// install redundant.
+    pub fn has_scope_level_entry(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|plan| plan.entry.local_project().is_none())
+    }
+
     pub fn rewritten(&self) -> impl Iterator<Item = &EntryPlan> {
         self.entries
             .iter()
@@ -772,6 +815,9 @@ pub enum PlanError {
     Invalid(String),
     /// The rewrite did not verify; nothing was changed.
     Internal(String),
+    /// The change is refused (a server of that name is not ours, the file has an unexpected
+    /// shape); nothing was changed.
+    Refused(String),
 }
 
 impl std::fmt::Display for PlanError {
@@ -779,6 +825,7 @@ impl std::fmt::Display for PlanError {
         match self {
             Self::Invalid(why) => write!(f, "not valid JSON: {why}"),
             Self::Internal(why) => write!(f, "internal error, nothing was changed: {why}"),
+            Self::Refused(why) => write!(f, "{why}"),
         }
     }
 }
@@ -1232,6 +1279,353 @@ fn apply_edits(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Adding an entry
+// ---------------------------------------------------------------------------------------------
+
+/// The name of the server `agent mcp install` adds when a file has no browser MCP entry. It is the
+/// name Playwright MCP's own documentation uses, so the tools stay `mcp__playwright__*` in Claude
+/// Code and the entry is the same one `agent mcp --print-config` prints.
+pub const NEW_ENTRY_NAME: &str = "playwright";
+
+/// A small JSON tree with a fixed key order, rendered in the layout of the file it goes into
+/// (`serde_json` maps do not keep the order the entries are built in).
+enum Node {
+    Str(String),
+    List(Vec<String>),
+    Obj(Vec<(String, Node)>),
+}
+
+impl Node {
+    fn render(&self, unit: &str, base: &str, multiline: bool) -> String {
+        let inner = format!("{base}{unit}");
+        match self {
+            Node::Str(text) => json_string(text),
+            Node::List(items) if items.is_empty() => "[]".to_owned(),
+            Node::List(items) => {
+                let items: Vec<String> = items.iter().map(|item| json_string(item)).collect();
+                if multiline {
+                    let body: Vec<String> =
+                        items.iter().map(|item| format!("{inner}{item}")).collect();
+                    format!("[\n{}\n{base}]", body.join(",\n"))
+                } else {
+                    format!("[{}]", items.join(", "))
+                }
+            }
+            Node::Obj(members) => {
+                let members: Vec<String> = members
+                    .iter()
+                    .map(|(key, node)| {
+                        format!(
+                            "{}: {}",
+                            json_string(key),
+                            node.render(unit, &inner, multiline)
+                        )
+                    })
+                    .collect();
+                if multiline {
+                    let body: Vec<String> = members
+                        .iter()
+                        .map(|member| format!("{inner}{member}"))
+                        .collect();
+                    format!("{{\n{}\n{base}}}", body.join(",\n"))
+                } else {
+                    format!("{{{}}}", members.join(", "))
+                }
+            }
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Node::Str(text) => Value::String(text.clone()),
+            Node::List(items) => items.clone().into(),
+            Node::Obj(members) => Value::Object(
+                members
+                    .iter()
+                    .map(|(key, node)| (key.clone(), node.to_value()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// `keys` wrapped around `leaf`: `["a", "b"]` gives `{"a": {"b": leaf}}`.
+fn nest(keys: &[String], leaf: Node) -> Node {
+    keys.iter()
+        .rev()
+        .fold(leaf, |node, key| Node::Obj(vec![(key.clone(), node)]))
+}
+
+/// Where a new entry goes: the layout the existing rewrite and `--print-config` use.
+fn new_entry_path(client: McpInstallClient) -> Vec<String> {
+    let path: &[&str] = match client {
+        McpInstallClient::Opencode => &["mcp", "servers", NEW_ENTRY_NAME],
+        McpInstallClient::ClaudeCode => &["mcpServers", NEW_ENTRY_NAME],
+    };
+    path.iter().map(|key| (*key).to_owned()).collect()
+}
+
+fn new_entry_node(client: McpInstallClient, argv: &[String]) -> Node {
+    match client {
+        McpInstallClient::Opencode => Node::Obj(vec![
+            ("type".into(), Node::Str("local".into())),
+            ("command".into(), Node::List(argv.to_vec())),
+        ]),
+        McpInstallClient::ClaudeCode => Node::Obj(vec![
+            ("type".into(), Node::Str("stdio".into())),
+            ("command".into(), Node::Str(argv[0].clone())),
+            ("args".into(), Node::List(argv[1..].to_vec())),
+        ]),
+    }
+}
+
+/// A new `playwright` entry for a file that has no browser MCP entry.
+#[derive(Debug, Clone)]
+pub struct AddPlan {
+    pub entry: EntryRef,
+    /// `[passless, agent, mcp, playwright, --profile, P]`: the command line a rewrite of a plain
+    /// `npx @playwright/mcp` produces, without a pin or flags to carry over.
+    pub argv: Vec<String>,
+    /// The file already has comments or trailing commas: it is not edited.
+    pub jsonc: bool,
+    /// The new file content (the whole file when `text` was `None`); `None` for a JSONC file.
+    pub new_text: Option<String>,
+    /// The entry on its own, for a file that is not edited.
+    pub snippet: String,
+}
+
+/// The indentation of the line `pos` is on.
+fn leading_indent(src: &str, pos: usize) -> &str {
+    let line_start = src[..pos].rfind('\n').map_or(0, |at| at + 1);
+    let rest = &src[line_start..];
+    let width = rest
+        .find(|c: char| c != ' ' && c != '\t')
+        .unwrap_or(rest.len());
+    &rest[..width]
+}
+
+/// What an existing server of the reserved name is, for the refusal.
+fn describe_existing(entry: &Value) -> String {
+    let command = match entry.get("command") {
+        Some(Value::String(command)) => Some(command.clone()),
+        Some(Value::Array(argv)) => Some(
+            argv.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    };
+    match (command, entry.get("url").and_then(Value::as_str)) {
+        (Some(command), _) => format!("it runs `{command}`"),
+        (None, Some(url)) => format!("it connects to {url}"),
+        _ => "it is not a command that starts a Playwright MCP server".to_owned(),
+    }
+}
+
+/// Plan a new `playwright` entry. `text` is the file, or `None` when it does not exist (the plan
+/// then holds the content of the new file). The caller has established that the file has no
+/// browser MCP entry ([`plan`] found none): this refuses when another server already uses the
+/// name.
+///
+/// Like the rewrite, the edit is a text splice: only the new member is inserted, in the layout of
+/// its neighbours, and every other byte of the file stays as it was.
+pub fn plan_add(
+    client: McpInstallClient,
+    text: Option<&str>,
+    passless: &str,
+    profile: &str,
+) -> Result<AddPlan, PlanError> {
+    let launch = PlainLaunch {
+        adapter: McpAdapterKind::Playwright,
+        runner: Runner::Npx,
+        npx_path: None,
+        package: None,
+        args: Vec::new(),
+        runner_notes: Vec::new(),
+    };
+    let argv = rewrite(&launch, passless, profile, &[]).argv;
+    let path = new_entry_path(client);
+    let entry = EntryRef {
+        name: NEW_ENTRY_NAME.to_owned(),
+        path: path.clone(),
+    };
+    let node = new_entry_node(client, &argv);
+    let snippet = entry_snippet(
+        client,
+        &entry,
+        &entry_with_argv(client, &Value::Object(Default::default()), &argv),
+    );
+    let done = |jsonc: bool, new_text: Option<String>| AddPlan {
+        entry: entry.clone(),
+        argv: argv.clone(),
+        jsonc,
+        new_text,
+        snippet: snippet.clone(),
+    };
+
+    let Some(text) = text else {
+        let mut members = Vec::new();
+        if client == McpInstallClient::Opencode {
+            members.push((
+                "$schema".to_owned(),
+                Node::Str("https://opencode.ai/config.json".to_owned()),
+            ));
+        }
+        members.push((path[0].clone(), nest(&path[1..], node)));
+        let content = Node::Obj(members).render("  ", "", true) + "\n";
+        return Ok(done(false, Some(content)));
+    };
+
+    let (root, jsonc) = parse_config(text)?;
+    if !root.is_object() {
+        return Err(PlanError::Refused(
+            "the top level of the file is not a JSON object".to_owned(),
+        ));
+    }
+    // A server of that name that is not one of ours: never replaced. (`mcp.playwright` is the
+    // legacy opencode spelling of `mcp.servers.playwright`.)
+    let mut names = vec![path.clone()];
+    if client == McpInstallClient::Opencode {
+        names.push(vec!["mcp".to_owned(), NEW_ENTRY_NAME.to_owned()]);
+    }
+    for name in &names {
+        if let Some(existing) = root_value(&root, name) {
+            return Err(PlanError::Refused(format!(
+                "a server named `{NEW_ENTRY_NAME}` ({}) already exists and is not a Playwright MCP \
+                 server ({}): refusing to replace it. Rename or remove it first, then run the \
+                 command again",
+                name.join("."),
+                describe_existing(existing)
+            )));
+        }
+    }
+    if jsonc {
+        return Ok(done(true, None));
+    }
+
+    let scanner = Scanner {
+        src: text.as_bytes(),
+    };
+    // The deepest existing object on the way to the entry; the missing keys below it are nested
+    // around the entry.
+    let mut object = (
+        scanner.skip_ws(0),
+        scanner
+            .value_end(scanner.skip_ws(0), 0)
+            .ok_or_else(|| PlanError::Internal("cannot scan the file".to_owned()))?,
+    );
+    let mut depth = 0;
+    while depth < path.len() - 1 {
+        let (members, _) = scanner
+            .members(object.0, 0)
+            .ok_or_else(|| PlanError::Internal("cannot scan the file".to_owned()))?;
+        match members.into_iter().rfind(|m| m.key == path[depth]) {
+            Some(member) => {
+                if text.as_bytes().get(member.value.0) != Some(&b'{') {
+                    return Err(PlanError::Refused(format!(
+                        "`{}` is not a JSON object: refusing to change it",
+                        path[..=depth].join(".")
+                    )));
+                }
+                object = member.value;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    let key = &path[depth];
+    let value = nest(&path[depth + 1..], node);
+
+    let (members, end) = scanner
+        .members(object.0, 0)
+        .ok_or_else(|| PlanError::Internal("cannot scan the file".to_owned()))?;
+    let root_start = scanner.skip_ws(0);
+    let root_end = scanner.value_end(root_start, 0).unwrap_or(text.len());
+    let multiline = text[root_start..root_end].contains('\n');
+    // One level of indentation of this file: the indent of the first top-level member.
+    let unit = scanner
+        .members(root_start, 0)
+        .and_then(|(top, _)| {
+            top.iter()
+                .find_map(|m| line_indent(text, m.key_start).filter(|i| !i.is_empty()))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "  ".to_owned());
+    let key_text = json_string(key);
+    let mut out = text.to_owned();
+    match members.last() {
+        Some(last) => match line_indent(text, last.key_start) {
+            Some(indent) => out.insert_str(
+                last.value.1,
+                &format!(
+                    ",\n{indent}{key_text}: {}",
+                    value.render(&unit, indent, true)
+                ),
+            ),
+            None => out.insert_str(
+                last.value.1,
+                &format!(", {key_text}: {}", value.render(&unit, "", false)),
+            ),
+        },
+        // An empty top-level object (`{}`) is always spread out: nobody wants a compact config.
+        None if multiline || object.0 == root_start => {
+            let parent = leading_indent(text, object.0);
+            let inner = format!("{parent}{unit}");
+            out.replace_range(
+                object.0..end,
+                &format!(
+                    "{{\n{inner}{key_text}: {}\n{parent}}}",
+                    value.render(&unit, &inner, true)
+                ),
+            );
+        }
+        None => out.replace_range(
+            object.0..end,
+            &format!("{{{key_text}: {}}}", value.render(&unit, "", false)),
+        ),
+    }
+
+    // The result must parse, hold exactly the old content plus the new entry, and read back as
+    // a Passless entry.
+    let (check, _) = parse_config(&out)
+        .map_err(|e| PlanError::Internal(format!("the new file does not parse: {e}")))?;
+    let mut expected = root.clone();
+    let mut cursor = &mut expected;
+    for (i, step) in path.iter().enumerate() {
+        let Some(map) = cursor.as_object_mut() else {
+            return Err(PlanError::Internal("the file changed shape".to_owned()));
+        };
+        cursor = if i + 1 == path.len() {
+            map.entry(step.clone())
+                .or_insert_with(|| new_entry_node(client, &argv).to_value())
+        } else {
+            map.entry(step.clone())
+                .or_insert_with(|| Value::Object(Default::default()))
+        };
+    }
+    if check != expected {
+        return Err(PlanError::Internal(
+            "the new file differs from the old one by more than the new entry".to_owned(),
+        ));
+    }
+    let wrapped = find_entries(client, &check).into_iter().any(|found| {
+        found.entry.path == path && found.argv == argv && matches!(found.kind, Kind::Wrapped { .. })
+    });
+    if !wrapped {
+        return Err(PlanError::Internal(
+            "the new entry did not read back as a Passless entry".to_owned(),
+        ));
+    }
+    Ok(done(false, Some(out)))
+}
+
+/// The value at `path` of `root`, if there is one.
+fn root_value<'a>(root: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(root, |value, key| value.get(key))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Unified diff
 // ---------------------------------------------------------------------------------------------
 
@@ -1542,6 +1936,190 @@ pub fn doctor_targets(roots: &Roots) -> Vec<Target> {
         );
     }
     targets
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entries that shadow a user-level Passless entry
+// ---------------------------------------------------------------------------------------------
+
+/// Which configuration overrides the user-level entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowScope {
+    /// Claude Code local scope: `projects[<abs path>].mcpServers` of the user-level file.
+    Local,
+    /// A project file: Claude Code `.mcp.json`, opencode `opencode.json(c)`.
+    Project,
+}
+
+/// A plain (not Passless) server named `playwright` that overrides the user-level Passless one.
+#[derive(Debug, Clone)]
+pub struct Shadow {
+    pub client: McpInstallClient,
+    pub scope: ShadowScope,
+    /// The user-level file with the Passless entry.
+    pub user_file: PathBuf,
+    /// The user-level Passless entry, as the client's JSON.
+    pub user_entry: Value,
+    /// The file with the entry that wins.
+    pub file: PathBuf,
+    /// What the winning entry is (`it runs ...`).
+    pub what: String,
+    /// The precedence is documented for this case. Otherwise (an ancestor directory's file,
+    /// opencode's merge of several files) the entry only may win.
+    pub certain: bool,
+}
+
+/// How a server named `playwright` appears in a parsed file at `path`.
+enum Named {
+    Passless(Value),
+    Other(String),
+}
+
+fn named_server(client: McpInstallClient, root: &Value, path: &[&str]) -> Option<Named> {
+    let owned: Vec<String> = path.iter().map(|key| (*key).to_owned()).collect();
+    let value = root_value(root, &owned)?;
+    let found = find_entries(client, root)
+        .into_iter()
+        .find(|found| found.entry.path == owned);
+    Some(match found {
+        Some(found) if matches!(found.kind, Kind::Wrapped { .. }) => Named::Passless(value.clone()),
+        _ => Named::Other(describe_existing(value)),
+    })
+}
+
+fn read_config(path: &Path) -> Option<Value> {
+    parse_config(&std::fs::read_to_string(path).ok()?)
+        .ok()
+        .map(|(root, _)| root)
+}
+
+/// The plain `playwright` entries that win over a user-level Passless `playwright` entry in the
+/// current directory. Claude Code: local scope, then a project `.mcp.json` (the working directory
+/// and its ancestors), then user scope. opencode: a project `opencode.json(c)` is merged over the
+/// global one.
+pub fn find_shadows(roots: &Roots) -> Vec<Shadow> {
+    let mut shadows = Vec::new();
+    let Some(cwd) = roots.cwd.as_deref() else {
+        return shadows;
+    };
+    let name = NEW_ENTRY_NAME;
+
+    if let Some(user_file) = config_path(McpInstallClient::ClaudeCode, &Scope::User, roots)
+        && let Some(user_root) = read_config(&user_file)
+        && let Some(Named::Passless(user_entry)) = named_server(
+            McpInstallClient::ClaudeCode,
+            &user_root,
+            &["mcpServers", name],
+        )
+    {
+        let canonical = std::fs::canonicalize(cwd).ok();
+        let keys: Vec<String> = [Some(cwd.to_path_buf()), canonical]
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        let project_key = keys.iter().find(|key| {
+            user_root
+                .get("projects")
+                .and_then(|projects| projects.get(key.as_str()))
+                .is_some()
+        });
+        let local = project_key.and_then(|key| {
+            named_server(
+                McpInstallClient::ClaudeCode,
+                &user_root,
+                &["projects", key, "mcpServers", name],
+            )
+        });
+        match local {
+            Some(Named::Other(what)) => shadows.push(Shadow {
+                client: McpInstallClient::ClaudeCode,
+                scope: ShadowScope::Local,
+                user_file: user_file.clone(),
+                user_entry: user_entry.clone(),
+                file: user_file.clone(),
+                what,
+                certain: true,
+            }),
+            // A Passless entry in local scope wins: nothing is shadowed.
+            Some(Named::Passless(_)) => {}
+            None => {
+                let disabled = project_key
+                    .and_then(|key| {
+                        user_root["projects"][key.as_str()].get("disabledMcpjsonServers")
+                    })
+                    .and_then(Value::as_array)
+                    .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(name)));
+                for (depth, dir) in cwd.ancestors().enumerate() {
+                    let file = dir.join(".mcp.json");
+                    let Some(root) = read_config(&file) else {
+                        continue;
+                    };
+                    match named_server(McpInstallClient::ClaudeCode, &root, &["mcpServers", name]) {
+                        Some(Named::Other(what)) if !disabled => shadows.push(Shadow {
+                            client: McpInstallClient::ClaudeCode,
+                            scope: ShadowScope::Project,
+                            user_file: user_file.clone(),
+                            user_entry: user_entry.clone(),
+                            file,
+                            what,
+                            certain: depth == 0,
+                        }),
+                        Some(_) => {}
+                        None => continue,
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // opencode: the user-level files, then the project file of the working directory.
+    let targets = doctor_targets(roots);
+    let opencode = |scope_is_user: bool| {
+        targets.iter().filter(move |target| {
+            target.client == McpInstallClient::Opencode
+                && matches!(target.scope, Scope::User) == scope_is_user
+        })
+    };
+    let user = opencode(true).find_map(|target| {
+        let root = read_config(&target.path)?;
+        [vec!["mcp", "servers", name], vec!["mcp", name]]
+            .iter()
+            .find_map(
+                |path| match named_server(McpInstallClient::Opencode, &root, path)? {
+                    Named::Passless(entry) => Some((target.path.clone(), entry)),
+                    Named::Other(_) => None,
+                },
+            )
+    });
+    if let Some((user_file, user_entry)) = user {
+        for target in opencode(false) {
+            let Some(root) = read_config(&target.path) else {
+                continue;
+            };
+            let plain = [vec!["mcp", "servers", name], vec!["mcp", name]]
+                .iter()
+                .find_map(
+                    |path| match named_server(McpInstallClient::Opencode, &root, path)? {
+                        Named::Other(what) => Some(what),
+                        Named::Passless(_) => None,
+                    },
+                );
+            if let Some(what) = plain {
+                shadows.push(Shadow {
+                    client: McpInstallClient::Opencode,
+                    scope: ShadowScope::Project,
+                    user_file: user_file.clone(),
+                    user_entry: user_entry.clone(),
+                    file: target.path.clone(),
+                    what,
+                    certain: false,
+                });
+            }
+        }
+    }
+    shadows
 }
 
 pub fn client_name(client: McpInstallClient) -> &'static str {

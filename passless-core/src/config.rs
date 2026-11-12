@@ -1518,7 +1518,11 @@ pub enum McpAdapter {
     /// `yarn dlx`, a `playwright-mcp` binary, `chrome-devtools-mcp`) in the client's MCP
     /// configuration and rewrites each in place to `passless agent mcp playwright|chrome-devtools`,
     /// so the agent keeps its tools and passkeys go through the managed browser and the profile's
-    /// rules. The default is a dry run that prints a diff; `--yes` writes, after saving a backup.
+    /// rules. A file with no such entry gets a new `playwright` server that runs through Passless
+    /// (a file that does not exist is created; a different server named `playwright` is never
+    /// replaced). With `--user` on Claude Code, entries kept per project by `claude mcp add`
+    /// (local scope, in `projects.<path>.mcpServers`) are rewritten too. The default is a dry run
+    /// that prints a diff; `--yes` writes, after saving a backup.
     /// The profile is the global `--profile`: required unless exactly one usable profile (with
     /// `browser_cdp_expose = "port"`) is configured.
     Install {

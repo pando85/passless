@@ -231,7 +231,7 @@ fn a_failed_write_leaves_the_original_untouched() {
 fn install(file: &Path, text: &str, yes: bool) -> Result<()> {
     install_file(
         file,
-        text,
+        Some(text),
         &request(McpInstallClient::ClaudeCode, yes),
         &Scope::Project(file.parent().unwrap().to_owned()),
         PASSLESS,
@@ -311,9 +311,13 @@ fn a_jsonc_file_is_refused_with_yes_and_left_alone() {
         [".mcp.json"],
         "no backup for a refused write"
     );
-    // Comments in a file without browser entries are not a problem.
+    // Comments in a file without browser entries: nothing to rewrite, and a dry run only reports
+    // the entry to add by hand; --yes refuses, as it does for a rewrite.
     let harmless = "{\n  // other tools\n  \"mcpServers\": {}\n}\n";
-    install(&file, harmless, true).unwrap();
+    install(&file, harmless, false).unwrap();
+    let err = install(&file, harmless, true).unwrap_err().to_string();
+    assert!(err.contains("JSONC"), "{err}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), jsonc);
 }
 
 #[test]
@@ -729,7 +733,7 @@ fn the_note_changes_neither_the_result_nor_any_file() {
     let with_note = |file: &Path, text: &str, yes: bool, note: Option<&str>| {
         install_file(
             file,
-            text,
+            Some(text),
             &request(McpInstallClient::ClaudeCode, yes),
             &Scope::Project(file.parent().unwrap().to_owned()),
             PASSLESS,
@@ -759,4 +763,210 @@ fn the_note_changes_neither_the_result_nor_any_file() {
     let (_dir, file) = project_with(jsonc, 0o600);
     assert!(with_note(&file, jsonc, true, note.as_deref()).is_err());
     assert!(with_note(&file, jsonc, true, None).is_err());
+}
+
+// ---- adding an entry --------------------------------------------------------------------------
+
+fn install_with(
+    client: McpInstallClient,
+    scope: Scope,
+    file: &Path,
+    text: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    install_file(
+        file,
+        text,
+        &request(client, yes),
+        &scope,
+        PASSLESS,
+        "agent",
+        None,
+    )
+}
+
+const NEW_CLAUDE_ENTRY: &str = r#"{
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "/usr/bin/passless",
+      "args": [
+        "agent",
+        "mcp",
+        "playwright",
+        "--profile",
+        "agent"
+      ]
+    }
+  }
+}
+"#;
+
+#[test]
+fn a_missing_project_file_is_created_only_with_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(".mcp.json");
+    let scope = Scope::Project(dir.path().to_owned());
+    install_with(
+        McpInstallClient::ClaudeCode,
+        scope.clone(),
+        &file,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(!file.exists(), "a dry run creates nothing");
+
+    install_with(McpInstallClient::ClaudeCode, scope, &file, None, true).unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), NEW_CLAUDE_ENTRY);
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(
+        entries(dir.path()),
+        [".mcp.json"],
+        "no backup, no temporary file"
+    );
+}
+
+#[test]
+fn a_new_user_level_file_is_private_and_never_replaces_a_file_that_appeared() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(".claude.json");
+    install_with(McpInstallClient::ClaudeCode, Scope::User, &file, None, true).unwrap();
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // `create_new` never truncates: a file that appeared meanwhile is left alone.
+    let other = dir.path().join("other.json");
+    fs::write(&other, "keep me").unwrap();
+    let err = create_new(&other, b"{}", 0o600).unwrap_err().to_string();
+    assert!(err.contains("appeared"), "{err}");
+    assert_eq!(fs::read_to_string(&other).unwrap(), "keep me");
+    assert_eq!(entries(dir.path()), [".claude.json", "other.json"]);
+}
+
+#[test]
+fn a_missing_claude_config_dir_is_not_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("typo/.claude.json");
+    let err = install_with(McpInstallClient::ClaudeCode, Scope::User, &file, None, true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(!dir.path().join("typo").exists());
+}
+
+#[test]
+fn an_existing_file_gets_the_entry_after_a_backup_and_a_second_run_changes_nothing() {
+    let original = "{\n  \"numStartups\": 7,\n  \"mcpServers\": {\n    \"other\": {\"command\": \"bash\"}\n  }\n}\n";
+    let (dir, file) = project_with(original, 0o640);
+    install(&file, original, true).unwrap();
+    let written = fs::read_to_string(&file).unwrap();
+    assert!(
+        written.starts_with("{\n  \"numStartups\": 7,\n  \"mcpServers\": {\n    \"other\": {\"command\": \"bash\"},\n"),
+        "{written}"
+    );
+    assert!(written.contains("\"playwright\": {"), "{written}");
+    assert!(written.contains("\"type\": \"stdio\""), "{written}");
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    let names = entries(dir.path());
+    assert_eq!(names.len(), 2, "{names:?}");
+    let backup = names
+        .iter()
+        .find(|n| n.contains("passless-backup-"))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join(backup)).unwrap(),
+        original
+    );
+
+    install(&file, &written, true).unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), written, "idempotent");
+    assert_eq!(entries(dir.path()).len(), 2, "no second backup");
+}
+
+#[test]
+fn another_server_named_playwright_is_never_replaced() {
+    let original =
+        "{\"mcpServers\": {\"playwright\": {\"type\": \"http\", \"url\": \"https://x.test/mcp\"}}}";
+    let (dir, file) = project_with(original, 0o600);
+    let err = install(&file, original, true).unwrap_err().to_string();
+    assert!(
+        err.contains("already exists") && err.contains("https://x.test/mcp"),
+        "{err}"
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    assert_eq!(entries(dir.path()), [".mcp.json"]);
+}
+
+#[test]
+fn a_passless_entry_already_there_means_nothing_to_do() {
+    let (dir, file) = project_with(NEW_CLAUDE_ENTRY, 0o600);
+    install(&file, NEW_CLAUDE_ENTRY, true).unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), NEW_CLAUDE_ENTRY);
+    assert_eq!(entries(dir.path()), [".mcp.json"]);
+}
+
+#[test]
+fn opencode_gets_the_layout_of_its_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("opencode.json");
+    let scope = Scope::Project(dir.path().to_owned());
+    install_with(McpInstallClient::Opencode, scope.clone(), &file, None, true).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(written["$schema"], "https://opencode.ai/config.json");
+    assert_eq!(
+        written["mcp"]["servers"]["playwright"],
+        serde_json::json!({"type": "local", "command": [PASSLESS, "agent", "mcp", "playwright", "--profile", "agent"]})
+    );
+
+    // An opencode.json that has no `mcp` yet gets one, and keeps the rest as it was.
+    let text = "{\n\t\"theme\": \"dark\"\n}\n";
+    fs::write(&file, text).unwrap();
+    install_with(McpInstallClient::Opencode, scope, &file, Some(text), true).unwrap();
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(
+        after.starts_with("{\n\t\"theme\": \"dark\",\n\t\"mcp\": {\n\t\t\"servers\""),
+        "{after}"
+    );
+}
+
+#[test]
+fn claude_local_scope_entries_are_rewritten_by_a_user_install() {
+    // `claude mcp add` without --scope writes `projects.<path>.mcpServers`.
+    let original = r#"{
+  "projects": {
+    "/work/app": {
+      "mcpServers": {"playwright": {"type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"]}}
+    }
+  }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(".claude.json");
+    fs::write(&file, original).unwrap();
+    install_with(
+        McpInstallClient::ClaudeCode,
+        Scope::User,
+        &file,
+        Some(original),
+        true,
+    )
+    .unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(
+        written["projects"]["/work/app"]["mcpServers"]["playwright"]["command"],
+        PASSLESS
+    );
+    // ... and the user level, which had no entry, got one.
+    assert_eq!(written["mcpServers"]["playwright"]["command"], PASSLESS);
 }

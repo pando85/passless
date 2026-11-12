@@ -1062,3 +1062,282 @@ fn timestamps_are_utc_and_sortable() {
         "20240301T000000Z"
     );
 }
+
+// ---- adding an entry --------------------------------------------------------------------------
+
+fn added(client: McpInstallClient, text: &str) -> String {
+    plan_add(client, Some(text), PASSLESS, "agent")
+        .unwrap()
+        .new_text
+        .unwrap()
+}
+
+#[test]
+fn an_entry_is_inserted_in_the_layout_of_the_file() {
+    let claude = McpInstallClient::ClaudeCode;
+    // Empty object, empty `mcpServers`, tabs, one-line files: valid JSON with the new entry, and
+    // every other byte of the file as it was.
+    for (text, expect_prefix) in [
+        ("{}", "{\n  \"mcpServers\""),
+        ("{\n}\n", "{\n  \"mcpServers\""),
+        ("{\n\t\"a\": 1\n}\n", "{\n\t\"a\": 1,\n\t\"mcpServers\""),
+        (
+            "{\"a\": 1}",
+            "{\"a\": 1, \"mcpServers\": {\"playwright\": {\"type\": \"stdio\"",
+        ),
+        (
+            "{\n  \"mcpServers\": {}\n}\n",
+            "{\n  \"mcpServers\": {\n    \"playwright\": {\n      \"type\"",
+        ),
+        (
+            "{\n  \"mcpServers\": {\"x\": {\"command\": \"y\"}},\n  \"z\": 2\n}\n",
+            "{\n  \"mcpServers\": {\"x\": {\"command\": \"y\"}, \"playwright\": {\"type\": \"stdio\"",
+        ),
+    ] {
+        let out = added(claude, text);
+        assert!(out.starts_with(expect_prefix), "{text:?} -> {out}");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["mcpServers"]["playwright"]["command"], PASSLESS,
+            "{out}"
+        );
+        let mut without = value.clone();
+        without["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("playwright");
+        let before: Value = serde_json::from_str(text).unwrap();
+        let mut before = before;
+        before
+            .as_object_mut()
+            .unwrap()
+            .entry("mcpServers")
+            .or_insert_with(|| Value::Object(Default::default()));
+        assert_eq!(without, before, "{out}");
+    }
+    // The trailing `"z": 2` survives untouched.
+    assert!(
+        added(
+            claude,
+            "{\n  \"mcpServers\": {\"x\": {\"command\": \"y\"}},\n  \"z\": 2\n}\n"
+        )
+        .ends_with("\"agent\"]}},\n  \"z\": 2\n}\n")
+    );
+}
+
+#[test]
+fn a_server_of_the_same_name_that_is_not_ours_is_refused() {
+    for (client, text) in [
+        (
+            McpInstallClient::ClaudeCode,
+            r#"{"mcpServers": {"playwright": {"command": "my-tool"}}}"#,
+        ),
+        (
+            McpInstallClient::ClaudeCode,
+            r#"{"mcpServers": {"playwright": {"type": "http", "url": "https://x.test"}}}"#,
+        ),
+        (
+            McpInstallClient::Opencode,
+            r#"{"mcp": {"playwright": {"type": "remote", "url": "https://x.test"}}}"#,
+        ),
+        (
+            McpInstallClient::Opencode,
+            r#"{"mcp": {"servers": {"playwright": {"type": "local", "command": ["my-tool"]}}}}"#,
+        ),
+    ] {
+        let err = plan_add(client, Some(text), PASSLESS, "agent").unwrap_err();
+        assert!(matches!(err, PlanError::Refused(_)), "{err}");
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+    // Shapes it does not dare to change.
+    for text in ["[]", r#"{"mcpServers": null}"#, r#"{"mcpServers": []}"#] {
+        assert!(
+            matches!(
+                plan_add(McpInstallClient::ClaudeCode, Some(text), PASSLESS, "agent"),
+                Err(PlanError::Refused(_))
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_new_entry_reads_back_like_a_rewrite_produces_it() {
+    let out = added(
+        McpInstallClient::Opencode,
+        "{\n  \"mcp\": {\n    \"servers\": {}\n  }\n}\n",
+    );
+    let found = find_entries(
+        McpInstallClient::Opencode,
+        &serde_json::from_str(&out).unwrap(),
+    );
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].argv,
+        s(&[PASSLESS, "agent", "mcp", "playwright", "--profile", "agent"])
+    );
+    assert!(matches!(
+        found[0].kind,
+        Kind::Wrapped {
+            adapter: McpAdapterKind::Playwright,
+            ..
+        }
+    ));
+    // A JSONC file is analysed, not edited.
+    let jsonc = plan_add(
+        McpInstallClient::ClaudeCode,
+        Some("{ // c\n}"),
+        PASSLESS,
+        "agent",
+    )
+    .unwrap();
+    assert!(jsonc.jsonc && jsonc.new_text.is_none() && jsonc.snippet.contains("\"playwright\""));
+}
+
+// ---- local-scope entries and shadowing --------------------------------------------------------
+
+#[test]
+fn local_scope_entries_of_the_user_file_are_found_and_rewritten() {
+    let text = r#"{
+  "projects": {
+    "/work/app": {"mcpServers": {"playwright": {"type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"]}}},
+    "/work/other": {"mcpServers": {"fs": {"command": "x"}}}
+  }
+}"#;
+    let plan = plan(McpInstallClient::ClaudeCode, text, PASSLESS, "agent").unwrap();
+    assert_eq!(plan.entries.len(), 1);
+    let entry = &plan.entries[0].entry;
+    assert_eq!(entry.local_project(), Some("/work/app"));
+    assert_eq!(
+        entry.location(),
+        "projects[/work/app].mcpServers.playwright"
+    );
+    assert!(!plan.has_scope_level_entry());
+    let out = plan.new_text.unwrap();
+    assert!(
+        out.contains("\"command\": \"/usr/bin/passless\"") || out.contains("/usr/bin/passless")
+    );
+}
+
+fn write(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+const USER_WRAPPED: &str = r#"{"mcpServers": {"playwright": {"type": "stdio", "command": "/usr/bin/passless", "args": ["agent", "mcp", "playwright", "--profile", "p"]}}"#;
+
+#[test]
+fn a_plain_project_entry_shadows_the_user_level_passless_one() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    write(
+        &home.path().join(".claude.json"),
+        &format!("{USER_WRAPPED}}}"),
+    );
+    write(
+        &repo.join(".mcp.json"),
+        r#"{"mcpServers": {"playwright": {"command": "npx", "args": ["@playwright/mcp"]}}}"#,
+    );
+    let roots = Roots {
+        home: Some(home.path().to_owned()),
+        cwd: Some(repo.clone()),
+        ..Roots::default()
+    };
+    let shadows = find_shadows(&roots);
+    assert_eq!(shadows.len(), 1, "{shadows:?}");
+    assert_eq!(shadows[0].scope, ShadowScope::Project);
+    assert_eq!(shadows[0].file, repo.join(".mcp.json"));
+    assert!(shadows[0].certain);
+
+    // From a subdirectory the `.mcp.json` above applies, but less certainly.
+    let sub = Roots {
+        cwd: Some(repo.join("src")),
+        ..roots.clone()
+    };
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    assert!(!find_shadows(&sub)[0].certain);
+
+    // A Passless entry in the repo's file is not a shadow.
+    write(&repo.join(".mcp.json"), &format!("{USER_WRAPPED}}}"));
+    assert!(find_shadows(&roots).is_empty());
+}
+
+#[test]
+fn a_local_entry_wins_over_the_project_file_and_claude_config_dir_is_respected() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    let personal = home.path().join(".claude-personal");
+    let key = repo.to_string_lossy().into_owned();
+    // The default account has no Passless entry; the personal one has, and a plain local entry.
+    write(&home.path().join(".claude.json"), "{}");
+    write(
+        &personal.join(".claude.json"),
+        &format!(
+            r#"{USER_WRAPPED}, "projects": {{"{key}": {{"mcpServers": {{"playwright": {{"command": "npx", "args": ["@playwright/mcp"]}}}}}}}}}}"#
+        ),
+    );
+    write(&repo.join(".mcp.json"), &format!("{USER_WRAPPED}}}"));
+    let mut roots = Roots {
+        home: Some(home.path().to_owned()),
+        cwd: Some(repo.clone()),
+        ..Roots::default()
+    };
+    assert!(
+        find_shadows(&roots).is_empty(),
+        "the default account has nothing to shadow"
+    );
+    roots.claude_config_dir = Some(personal.clone());
+    let shadows = find_shadows(&roots);
+    assert_eq!(shadows.len(), 1, "{shadows:?}");
+    assert_eq!(shadows[0].scope, ShadowScope::Local);
+    assert_eq!(shadows[0].file, personal.join(".claude.json"));
+}
+
+#[test]
+fn a_disabled_project_server_does_not_shadow() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    let key = repo.to_string_lossy().into_owned();
+    write(
+        &home.path().join(".claude.json"),
+        &format!(
+            r#"{USER_WRAPPED}, "projects": {{"{key}": {{"disabledMcpjsonServers": ["playwright"]}}}}}}"#
+        ),
+    );
+    write(
+        &repo.join(".mcp.json"),
+        r#"{"mcpServers": {"playwright": {"command": "npx"}}}"#,
+    );
+    let roots = Roots {
+        home: Some(home.path().to_owned()),
+        cwd: Some(repo),
+        ..Roots::default()
+    };
+    assert!(find_shadows(&roots).is_empty());
+}
+
+#[test]
+fn a_project_opencode_json_may_shadow_the_global_one() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    write(
+        &home.path().join(".config/opencode/opencode.json"),
+        r#"{"mcp": {"servers": {"playwright": {"type": "local", "command": ["/usr/bin/passless", "agent", "mcp", "playwright", "--profile", "p"]}}}}"#,
+    );
+    write(
+        &repo.join("opencode.json"),
+        r#"{"mcp": {"playwright": {"type": "local", "command": ["npx", "@playwright/mcp"]}}}"#,
+    );
+    let roots = Roots {
+        home: Some(home.path().to_owned()),
+        cwd: Some(repo),
+        ..Roots::default()
+    };
+    let shadows = find_shadows(&roots);
+    assert_eq!(shadows.len(), 1, "{shadows:?}");
+    assert_eq!(shadows[0].client, McpInstallClient::Opencode);
+    assert!(
+        !shadows[0].certain,
+        "opencode merges several files: only a soft warning"
+    );
+}
