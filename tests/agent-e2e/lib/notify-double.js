@@ -12,8 +12,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 /**
  * @param {object} env  from createEnv()
  * @param {{script?: string[]}} opts  script steps, e.g. ['approve'], ['deny:200'], ['ignore'] (see
- *   tools/notify-double: approve (invokes the prompt's allow_always:<nonce> key)|deny|ignore|close|invoke=<key>, each with an
- *   optional :<delay_ms>)
+ *   tools/notify-double: approve (invokes the prompt's own approving key: allow_always:<nonce> on a sign-in prompt,
+ *   register_once:<nonce> on a registration prompt, so one script step approves either kind)|deny|ignore|close|invoke=<key>
+ *   (sends exactly the key named: a test can send the wrong kind of approval, which the daemon treats as a deny), each with an
+ *   optional :<delay_ms>; the daemon accepts an approval only 1000 ms after the prompt was shown, so script `approve:1500`)
  */
 async function startNotifyDouble(env, opts = {}) {
   const bin = ensureBuilt().notifyDouble;
