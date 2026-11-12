@@ -126,4 +126,5 @@ CONF
 fi
 
 # ---- inner phase: private bus, scrubbed env (and Xvfb when headed) ----
+node lib/preflight.js || exit 1
 exec node --test --test-concurrency=1 --test-reporter=spec scenarios/*.test.js smoke/*.test.js

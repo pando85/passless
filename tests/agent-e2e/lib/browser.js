@@ -237,20 +237,63 @@ async function stopExtensionWorker(browser, timeoutMs = 10000) {
  * keeps working nested inside bwrap's user namespace.
  */
 async function launchPlain(env, variant, extraArgs = [], { hidraw = null } = {}) {
+  const prof = fs.mkdtempSync(path.join(env.dirs.work, 'plain-'));
+  const started = await startPlain(variant, prof, extraArgs, { hidraw, spawnFn: (...a) => env.spawnTracked(spawn, ...a), env: env.env, timeoutMs: 30000 });
+  if (!started.ok) { env.killTree(started.child.pid); throw new Error(`plain browser (bwrap) did not start: ${started.detail}`); }
+  return { cdpUrl: started.cdpUrl, kill: () => env.killTree(started.child.pid) };
+}
+
+/**
+ * Start the plain browser under bwrap in `prof` and wait for its DevToolsActivePort file. Resolves
+ * `{ok, child, cdpUrl}`, or `{ok: false, child, detail}` when the browser exits first or the wait runs out; `detail`
+ * carries the exit status and the tail of the browser's (and bwrap's) stderr, which is captured in `prof/browser.stderr`.
+ */
+async function startPlain(variant, prof, extraArgs, { hidraw, spawnFn, env, timeoutMs }) {
   const bwrap = bwrapPath();
   if (!bwrap) throw new Error('bubblewrap (bwrap) is required to run an extension-less browser hermetically; install it (unprivileged user namespaces must be enabled)');
-  const prof = fs.mkdtempSync(path.join(env.dirs.work, 'plain-'));
   const args = [`--user-data-dir=${prof}`, '--no-first-run', '--no-default-browser-check', '--disable-sync', '--password-store=basic',
     '--disable-background-networking', '--disable-component-update', '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
     '--remote-allow-origins=*', ...variantArgs(variant), ...extraArgs, 'about:blank'];
   const prefix = ['--dev-bind', '/', '/', '--dev', '/dev', '--die-with-parent'];
   if (hidraw) prefix.push('--dev-bind', hidraw, hidraw);
-  const child = env.spawnTracked(spawn, bwrap, [...prefix, variant.browser.exe, ...args], { stdio: 'ignore', env: env.env });
+  const errFile = path.join(prof, 'browser.stderr');
+  const errFd = fs.openSync(errFile, 'w');
+  const child = spawnFn(bwrap, [...prefix, variant.browser.exe, ...args], { stdio: ['ignore', 'ignore', errFd], env });
+  fs.closeSync(errFd);
+  let exited = null;
+  child.once('exit', (code, signal) => { exited = signal ? `signal ${signal}` : `exit status ${code}`; });
   const portFile = path.join(prof, 'DevToolsActivePort');
-  for (let i = 0; i < 150 && !fs.existsSync(portFile); i++) await sleep(200);
-  if (!fs.existsSync(portFile)) { env.killTree(child.pid); throw new Error('plain browser (bwrap) did not start'); }
-  const port = fs.readFileSync(portFile, 'utf8').split('\n')[0];
-  return { cdpUrl: `http://127.0.0.1:${port}`, kill: () => env.killTree(child.pid) };
+  for (let waited = 0; waited < timeoutMs && !fs.existsSync(portFile) && !exited; waited += 200) await sleep(200);
+  if (!fs.existsSync(portFile)) {
+    let tail = '';
+    try { tail = fs.readFileSync(errFile, 'utf8').trim().split('\n').slice(-12).join('\n'); } catch { /* no stderr captured */ }
+    return { ok: false, child, detail: `${exited ? `the browser exited (${exited})` : `no DevToolsActivePort after ${timeoutMs / 1000}s`}${tail ? `; stderr tail:\n${tail}` : ''}` };
+  }
+  return { ok: true, child, cdpUrl: `http://127.0.0.1:${fs.readFileSync(portFile, 'utf8').split('\n')[0]}` };
+}
+
+/**
+ * Preflight for the selected variants: a plain browser under bwrap (the launch every scenario's seeding and the
+ * product's contained launch rely on) must come up. Returns the list of failures (empty when all is well), so a
+ * runner whose sandbox prerequisites are missing fails in seconds with the browser's own stderr instead of timing
+ * out scenario by scenario.
+ */
+async function preflightPlainBrowsers() {
+  const failures = [];
+  for (const variant of matrix().variants.filter(v => !v.skip)) {
+    const prof = fs.mkdtempSync(path.join(process.env.AGENT_E2E_TMPDIR || os.tmpdir(), 'pl-pre-'));
+    let child = null;
+    try {
+      const r = await startPlain(variant, prof, [], { hidraw: null, spawnFn: (bin, a, o) => spawn(bin, a, { ...o, detached: true }), env: process.env, timeoutMs: 30000 });
+      child = r.child;
+      if (!r.ok) failures.push({ variant: variant.name, detail: r.detail });
+    } catch (e) { failures.push({ variant: variant.name, detail: e.message }); }
+    finally {
+      if (child && child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
+      fs.rmSync(prof, { recursive: true, force: true });
+    }
+  }
+  return failures;
 }
 
 function bwrapPath() {
@@ -258,4 +301,4 @@ function bwrapPath() {
   return null;
 }
 
-module.exports = { bwrapPath, discover, matrix, variantArgs, connect, launchPlain, classify, waitForExtensionWorker, extensionWorkerTargets, stopExtensionWorker, EXTENSION_ID, EXTENSION_WORKER_URL };
+module.exports = { bwrapPath, discover, matrix, variantArgs, connect, launchPlain, preflightPlainBrowsers, classify, waitForExtensionWorker, extensionWorkerTargets, stopExtensionWorker, EXTENSION_ID, EXTENSION_WORKER_URL };

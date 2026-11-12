@@ -16,6 +16,14 @@ tests/agent-e2e/run.sh E2E-01 E2E-06     # selected scenarios
 replace them), wraps the run in `dbus-run-session` (and `xvfb-run -a` for headed variants), prints a
 scenario x variant table, and exits non-zero on any `FAIL` or `XPASS`.
 
+Before the first scenario, `lib/preflight.js` starts a plain browser under bwrap for every selected variant and fails
+the run in seconds, with the browser's stderr, when that is impossible.
+
+CI runner setup (Ubuntu 24.04+, `.github/workflows/rust.yml`, job `agent-e2e`): besides
+`kernel.apparmor_restrict_unprivileged_userns=0`, the AppArmor profile for `/usr/bin/bwrap`
+(`/etc/apparmor.d/bwrap-userns-restrict`) must be unloaded. It denies every capability inside bwrap, which makes
+Chromium's own namespace sandbox abort (exit 134) when the browser runs under bwrap.
+
 | Variable | Meaning |
 |---|---|
 | `AGENT_E2E_MATRIX` | `ci` (default) or `full` |

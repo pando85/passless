@@ -99,7 +99,21 @@ jobs:
           test -r /dev/uhid -a -w /dev/uhid
 
       - name: Allow unprivileged user namespaces (Chromium sandbox, bubblewrap)
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Ubuntu 24.04+ (apparmor package) also ships a profile for /usr/bin/bwrap that stacks an
+          # `audit deny capability` profile onto everything running inside bwrap. The sysctl above does not
+          # lift that, and it breaks Chromium's own namespace sandbox nested in bwrap (the browser aborts with
+          # SIGABRT, exit 134). Unload it on this runner, and keep it off should apparmor reload its profiles.
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo mkdir -p /etc/apparmor.d/disable
+            sudo ln -sf /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/disable/bwrap-userns-restrict
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict || true
+          fi
+          echo "bwrap/userns AppArmor profiles still loaded:"
+          sudo aa-status 2>/dev/null | grep -iE 'bwrap|unprivileged_userns' || echo "  none"
+          unshare --user --map-root-user true && echo "unprivileged user namespaces: ok"
+          bwrap --dev-bind / / --dev /dev true && echo "bwrap: ok"
 
       - name: Install stable toolchain
         shell: bash
@@ -122,6 +136,12 @@ jobs:
 
       - name: Run agent E2E (CI subset)
         run: make test-agent-e2e
+
+      - name: Show AppArmor denials
+        if: failure()
+        run: |
+          sudo dmesg 2>/dev/null | grep -i 'apparmor=.*DENIED' | tail -n 40 || true
+          sudo aa-status 2>&1 | head -n 40 || true
 
       - name: Upload failure artifacts
         if: failure()
