@@ -6,9 +6,11 @@ use clap_complete::{Shell, generate_to};
 use shadow_rs::{BuildPattern, ShadowBuilder};
 
 fn main() {
-    // Initialize shadow-rs to generate build info
+    // Initialize shadow-rs to generate build info. `Lazy` behaves like `RealTime` in release builds, but in debug
+    // builds it does not mark the crate dirty on every cargo invocation (`RealTime` reruns this script and recompiles
+    // the crate each time: ~25s per `cargo test` call on CI, and the agent validation makes about 35 of them).
     ShadowBuilder::builder()
-        .build_pattern(BuildPattern::RealTime)
+        .build_pattern(BuildPattern::Lazy)
         .build()
         .unwrap();
 
