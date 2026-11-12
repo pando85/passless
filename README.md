@@ -67,6 +67,7 @@ Users should choose the solution that best fits their own security and practical
 - Security hardening (memory locking, core dump prevention)
 - Credential management via CTAP commands
 - Encrypted credential [backup and restore](docs/CREDENTIAL_BACKUP.md) (software credentials)
+- Change a credential's [credProtect level](docs/CRED_PROTECT.md), for example for SSH keys after `always_uv = false`
 
 ## Agent authentication (experimental)
 
@@ -195,6 +196,20 @@ which seals credentials to the TPM hardware. The experimental
 [portable TPM backend](docs/TPM_PORTABLE.md) goes further: signing keys are generated inside
 the TPM and never exposed to host memory, and credential blobs can be synchronized across
 multiple TPMs provisioned from the same recovery seed.
+
+## Credential protection level
+
+Credentials created while user verification ran (such as `ed25519-sk` SSH keys) can be stored
+with credProtect level 3, which needs a PIN or UV for every use. To change the level of your own
+credentials, authorized by your PIN or the verification prompt:
+
+```bash
+passless client set-cred-protect --rp ssh: --level 1   # lists the keys, asks, then lowers them
+passless client set-cred-protect --id <CREDENTIAL_ID> --level 3
+```
+
+See [SSH keys and always_uv](docs/CRED_PROTECT.md#ssh-keys-and-always_uv) before lowering a
+level: level 1 means user presence only for that key.
 
 ## Configuration
 
