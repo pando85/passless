@@ -76,6 +76,14 @@ test-e2e-tpm:	## run E2E tests for TPM backend only (requires swtpm)
 test-agent-validation:	## run deterministic agent validation (no privileged or live browser changes)
 	tools/agent-validation/test-deterministic.sh
 
+.PHONY: test-agent-e2e
+test-agent-e2e:	## run the CI subset of the real-browser agent E2E scenarios (hermetic; Chromium, dbus, /dev/uhid)
+	tests/agent-e2e/run.sh
+
+.PHONY: test-agent-e2e-full
+test-agent-e2e-full:	## run the full agent E2E matrix (all scenarios, all browsers, headed and headless)
+	AGENT_E2E_MATRIX=full tests/agent-e2e/run.sh
+
 .PHONY: test-agent-fuzz-smoke
 test-agent-fuzz-smoke:	## run bounded agent protocol fuzz smoke tests (requires cargo-fuzz + nightly)
 	cargo +nightly fuzz run agent_protocol_decode -- -max_total_time=$(AGENT_FUZZ_SMOKE_SECS) -max_len=20000

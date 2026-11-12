@@ -3,8 +3,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use nix::dir::Dir;
@@ -57,8 +57,14 @@ pub enum AuditError {
     SymlinkDetected(String),
     LockFailed(String),
     InvalidFrame(String),
-    HashMismatch { expected: String, actual: String },
-    SequenceGap { expected: u64, actual: u64 },
+    HashMismatch {
+        expected: String,
+        actual: String,
+    },
+    SequenceGap {
+        expected: u64,
+        actual: u64,
+    },
     CircuitBroken(String),
     SchemaViolation(String),
     RotationFailed(String),
@@ -67,6 +73,11 @@ pub enum AuditError {
     OwnerMismatch(String),
     ModeMismatch(String),
     AnchorViolation(String),
+    /// The record is durable (written and fsynced) but a later step failed (directory fsync or
+    /// anchor update), so the gate did not acknowledge it and has broken its circuit. A caller that
+    /// needs the record to be on disk (an operation reservation) must treat it as written: a
+    /// restart's recovery finds it (`AuditGate::open_reservations`).
+    DurableUnacknowledged(String),
 }
 
 impl std::fmt::Display for AuditError {
@@ -90,6 +101,9 @@ impl std::fmt::Display for AuditError {
             Self::OwnerMismatch(msg) => write!(f, "owner mismatch: {}", msg),
             Self::ModeMismatch(msg) => write!(f, "mode mismatch: {}", msg),
             Self::AnchorViolation(msg) => write!(f, "anchor violation: {}", msg),
+            Self::DurableUnacknowledged(msg) => {
+                write!(f, "record durable but not acknowledged: {}", msg)
+            }
         }
     }
 }
@@ -545,6 +559,11 @@ pub struct AuditGate {
     #[cfg(test)]
     fault_injector: Box<dyn FaultInjector + Sync>,
     segment_file_ino: Mutex<u64>,
+    /// Serializes `record`, including segment rotation. Every other `AuditGate` mutex is only taken
+    /// under it (or alone, by read-only accessors), so their relative order cannot deadlock, and a
+    /// record cannot interleave with another one between computing its sequence and writing it.
+    /// The audit gate is a leaf: nothing outside it is acquired while it is held (LOCKING.md).
+    append_lock: Mutex<()>,
 }
 
 impl AuditGate {
@@ -621,6 +640,7 @@ impl AuditGate {
             #[cfg(test)]
             fault_injector: fi,
             segment_file_ino: Mutex::new(0),
+            append_lock: Mutex::new(()),
         };
 
         gate.initialize_or_verify()?;
@@ -1255,6 +1275,17 @@ impl AuditGate {
         Ok(())
     }
 
+    /// Lock one of the gate's state mutexes on the record path. A poisoned one means a record
+    /// panicked half way, so the chain state may no longer match the segment on disk: the circuit
+    /// is broken and the record refused, never a panic. Records are written under the human
+    /// operation and storage locks (ADR 0014 invariant 23).
+    fn lock_state<'a, T>(&self, mutex: &'a Mutex<T>) -> Result<MutexGuard<'a, T>, AuditError> {
+        mutex.lock().map_err(|_| {
+            self.circuit_broken.store(true, Ordering::SeqCst);
+            AuditError::CircuitBroken("audit state lock poisoned".into())
+        })
+    }
+
     pub fn record(&self, event: AuditEvent) -> Result<AuditReceipt, AuditError> {
         if self.circuit_broken.load(Ordering::SeqCst) {
             return Err(AuditError::CircuitBroken(
@@ -1274,9 +1305,13 @@ impl AuditGate {
         let wall_time_ms = event.timestamp_ms();
         let monotonic_ms = self.epoch.elapsed().as_millis() as u64;
 
-        let mut seq_guard = self.sequence.lock().unwrap();
-        let mut hash_guard = self.last_hash.lock().unwrap();
-        let mut writer_guard = self.writer.lock().unwrap();
+        let _append = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut seq_guard = self.lock_state(&self.sequence)?;
+        let mut hash_guard = self.lock_state(&self.last_hash)?;
+        let mut writer_guard = self.lock_state(&self.writer)?;
 
         let next_seq = seq_guard.checked_add(1).ok_or(AuditError::Overflow)?;
         let prev_hash = *hash_guard;
@@ -1293,7 +1328,7 @@ impl AuditGate {
             &current_hash,
         );
 
-        let current_seg_name = self.current_segment_name.lock().unwrap().clone();
+        let current_seg_name = self.lock_state(&self.current_segment_name)?.clone();
         let should_rotate = if let Ok(stat) = nix::sys::stat::fstatat(
             &self.dir_fd,
             current_seg_name.as_str(),
@@ -1310,9 +1345,9 @@ impl AuditGate {
             drop(hash_guard);
             drop(seq_guard);
             self.rotate_segment()?;
-            seq_guard = self.sequence.lock().unwrap();
-            hash_guard = self.last_hash.lock().unwrap();
-            writer_guard = self.writer.lock().unwrap();
+            seq_guard = self.lock_state(&self.sequence)?;
+            hash_guard = self.lock_state(&self.last_hash)?;
+            writer_guard = self.lock_state(&self.writer)?;
         }
 
         let save_offset = writer_guard.current_offset().map_err(|e| {
@@ -1371,15 +1406,22 @@ impl AuditGate {
         #[cfg(test)]
         if self.fault_injector.should_fail(FaultPoint::FsyncDir) {
             self.circuit_broken.store(true, Ordering::SeqCst);
-            return Err(AuditError::Io("injected fsync dir failure".into()));
+            return Err(AuditError::DurableUnacknowledged(
+                "injected fsync dir failure".into(),
+            ));
         }
 
+        // From here the frame is durable: its data was fsynced above. A failure of the steps that
+        // follow is reported as `DurableUnacknowledged`, not as a failed write.
         if let Err(e) = fsync_dir(&self.dir_fd) {
             self.circuit_broken.store(true, Ordering::SeqCst);
-            return Err(AuditError::Io(format!("fsync dir: {}", e)));
+            return Err(AuditError::DurableUnacknowledged(format!(
+                "fsync dir: {}",
+                e
+            )));
         }
 
-        let seg_idx = *self.segment_index.lock().unwrap();
+        let seg_idx = *self.lock_state(&self.segment_index)?;
         let new_anchor = AnchorState {
             segment_index: seg_idx,
             sequence: next_seq,
@@ -1388,12 +1430,15 @@ impl AuditGate {
 
         if let Err(e) = self.write_anchor(&new_anchor) {
             self.circuit_broken.store(true, Ordering::SeqCst);
-            return Err(AuditError::Io(format!("write anchor: {}", e)));
+            return Err(AuditError::DurableUnacknowledged(format!(
+                "write anchor: {}",
+                e
+            )));
         }
 
         *seq_guard = next_seq;
         *hash_guard = current_hash;
-        *self.anchor.lock().unwrap() = new_anchor;
+        *self.lock_state(&self.anchor)? = new_anchor;
 
         Ok(AuditReceipt {
             #[cfg(test)]
@@ -1403,11 +1448,12 @@ impl AuditGate {
         })
     }
 
+    /// Called only from `record`, under `append_lock`.
     fn rotate_segment(&self) -> Result<(), AuditError> {
-        let seg_idx = self.segment_index.lock().unwrap();
-        let mut writer_guard = self.writer.lock().unwrap();
-        let hash_guard = self.last_hash.lock().unwrap();
-        let seq_guard = self.sequence.lock().unwrap();
+        let seg_idx = self.lock_state(&self.segment_index)?;
+        let mut writer_guard = self.lock_state(&self.writer)?;
+        let hash_guard = self.lock_state(&self.last_hash)?;
+        let seq_guard = self.lock_state(&self.sequence)?;
 
         writer_guard.sync_data().map_err(|e| {
             self.circuit_broken.store(true, Ordering::SeqCst);
@@ -1469,11 +1515,11 @@ impl AuditGate {
 
         let seg_ino = check_file_at(&self.dir_fd, seg_name.as_str())?.0;
 
-        *self.current_segment.lock().unwrap() = self.dir.join(&seg_name);
-        *self.current_segment_name.lock().unwrap() = seg_name;
-        *self.writer.lock().unwrap() = Box::new(FileWriter::new(file_for_write));
-        *self.segment_index.lock().unwrap() = next_idx;
-        *self.segment_file_ino.lock().unwrap() = seg_ino;
+        *self.lock_state(&self.current_segment)? = self.dir.join(&seg_name);
+        *self.lock_state(&self.current_segment_name)? = seg_name;
+        *self.lock_state(&self.writer)? = Box::new(FileWriter::new(file_for_write));
+        *self.lock_state(&self.segment_index)? = next_idx;
+        *self.lock_state(&self.segment_file_ino)? = seg_ino;
 
         Ok(())
     }
@@ -1524,6 +1570,74 @@ impl AuditGate {
         )
         .build();
         self.record(event)
+    }
+
+    /// The operation reservations (`policy.allow` records with a request ID) that have no
+    /// `operation.terminal` record, found in the last `max_segments` segments (ADR 0014 section
+    /// 12). A crash between a reservation and its terminal record leaves such an orphan at the end
+    /// of the log; opening the gate may rotate to a new segment, so a bound of two segments always
+    /// reaches the previous run's tail. Older segments are not scanned. Nothing is verified or
+    /// modified here.
+    pub fn open_reservations(&self, max_segments: usize) -> Result<Vec<AuditEvent>, AuditError> {
+        let segments = self.list_segments()?;
+        let first = segments.len().saturating_sub(max_segments);
+        let mut reservations: Vec<AuditEvent> = Vec::new();
+        let mut closed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for seg_path in &segments[first..] {
+            let seg_name = seg_path.file_name().unwrap().to_str().unwrap();
+            check_file_at(&self.dir_fd, seg_name)?;
+            let mut file = open_file_at(
+                &self.dir_fd,
+                seg_name,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )?;
+            if file.metadata()?.len() <= HEADER_SIZE as u64 {
+                continue;
+            }
+            let mut header_buf = [0u8; HEADER_SIZE];
+            file.read_exact(&mut header_buf)?;
+            SegmentHeader::decode(&header_buf)?;
+            loop {
+                let mut magic_buf = [0u8; 4];
+                match file.read_exact(&mut magic_buf) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let mut len_buf = [0u8; 8];
+                file.read_exact(&mut len_buf)?;
+                let frame_len = u64::from_le_bytes(len_buf);
+                if u32::from_le_bytes(magic_buf) != FRAME_MAGIC
+                    || !(FRAME_OVERHEAD as u64..=MAX_FRAME_SIZE).contains(&frame_len)
+                {
+                    return Err(AuditError::InvalidFrame(
+                        "bad frame in reservation scan".into(),
+                    ));
+                }
+                let mut frame_buf = vec![0u8; frame_len as usize];
+                file.read_exact(&mut frame_buf)?;
+                let mut full_frame = Vec::with_capacity(12 + frame_buf.len());
+                full_frame.extend_from_slice(&magic_buf);
+                full_frame.extend_from_slice(&len_buf);
+                full_frame.extend_from_slice(&frame_buf);
+                let decoded = decode_frame(&full_frame)?;
+                let Ok(event) = serde_json::from_slice::<AuditEvent>(&decoded.payload) else {
+                    continue;
+                };
+                if let Some(id) = event.terminal_request_id() {
+                    closed.insert(id.to_string());
+                } else if event.reservation_request_id().is_some() {
+                    reservations.push(event);
+                }
+            }
+        }
+        reservations.retain(|event| {
+            event
+                .reservation_request_id()
+                .is_some_and(|id| !closed.contains(id))
+        });
+        Ok(reservations)
     }
 
     pub fn export_verified(
@@ -1746,6 +1860,58 @@ fn csv_escape(s: &str) -> String {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
+    }
+}
+
+/// Test helper: decode the frames of an audit directory into their JSON payloads.
+#[cfg(test)]
+pub(crate) mod test_support {
+    const FRAME_MAGIC: u32 = 0x41554449;
+    const HEADER_SIZE: usize = 88;
+
+    pub fn read_audit_events(audit_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        let mut entries: Vec<_> = std::fs::read_dir(audit_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("audit-") && name.ends_with(".log")
+            })
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let data = std::fs::read(entry.path()).unwrap();
+            if data.len() <= HEADER_SIZE {
+                continue;
+            }
+            let mut offset = HEADER_SIZE;
+            while offset + 12 <= data.len() {
+                let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                if magic != FRAME_MAGIC {
+                    break;
+                }
+                let frame_len =
+                    u64::from_le_bytes(data[offset + 4..offset + 12].try_into().unwrap()) as usize;
+                if offset + 12 + frame_len > data.len() {
+                    break;
+                }
+                let body = &data[offset + 12..offset + 12 + frame_len];
+                if body.len() < 28 {
+                    break;
+                }
+                let payload_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
+                if body.len() < 28 + payload_len + 64 {
+                    break;
+                }
+                let payload = &body[28..28 + payload_len];
+                events.push(serde_json::from_slice(payload).unwrap());
+                offset += 12 + frame_len;
+            }
+        }
+        events
     }
 }
 
@@ -2332,7 +2498,14 @@ mod tests {
             DaemonStartBuilder::new(1234, BackendKind::Local).build(),
             ProfileCreateBuilder::new(test_profile_id()).build(),
             CredentialCreateBuilder::new(test_cred(), "example.com").build(),
-            GrantApproveBuilder::new(test_grant_id(), test_profile_id(), 300).build(),
+            GrantApproveBuilder::new(
+                test_grant_id(),
+                test_profile_id(),
+                &[7u8; 32],
+                vec!["example.com".to_string()],
+                300,
+            )
+            .build(),
         ];
         for event in events {
             let receipt = gate.record(event).unwrap();

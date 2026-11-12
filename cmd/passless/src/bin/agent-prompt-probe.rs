@@ -1,15 +1,31 @@
-#[path = "../agent/prompt.rs"]
-#[allow(dead_code, unused_imports, unused_variables)]
-mod prompt;
+//! Validation-only probe of the escalation prompt child (ADR 0014 section 8.2).
+//!
+//! It runs the production prompt child protocol (`agent/escalation_prompt.rs`) against the
+//! session bus in `DBUS_SESSION_BUS_ADDRESS` and prints one JSON line:
+//! `{"decision":"approved"|"denied"|"timeout"|"error","error_kind":…,"latency_class":…}`.
+//! A dismissal is a deny, like in the daemon. After `--timeout` seconds without a decision the
+//! prompt is withdrawn (`CloseNotification`) and the decision is `timeout`.
 
+#[path = "../agent/escalation_prompt.rs"]
+#[allow(dead_code, unused_imports)]
+mod escalation_prompt;
+
+use std::io::{BufRead, BufReader, Write};
 use std::process;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Serialize;
 
-use passless_core::agent::ProfileId;
+use escalation_prompt::{
+    ACTION_ALLOW_ALWAYS, ChildEvent, ControlMessage, InProcessChild, PromptFields, PromptRequest,
+    PromptVerb, render_prompt,
+};
 
-use prompt::{DesktopPromptHandle, PromptAction, PromptHandle, PromptMode, PromptRequest};
+/// How long the probe waits for the child to close a withdrawn notification.
+const WITHDRAW_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,13 +57,15 @@ struct ProbeOutput {
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-prompt-probe",
-    about = "Validation-only production prompt probe"
+    about = "Validation-only escalation prompt probe"
 )]
 struct Args {
+    /// Seconds to wait for a decision before withdrawing the prompt.
     #[arg(long, default_value_t = 60)]
     timeout: u64,
 
-    #[arg(long, default_value_t = 1000)]
+    /// Milliseconds after which "Allow always" is accepted.
+    #[arg(long, default_value_t = escalation_prompt::DEFAULT_MIN_REVIEW_DELAY_MS)]
     min_review_delay: u64,
 
     #[arg(long, default_value = "authenticate")]
@@ -57,77 +75,111 @@ struct Args {
     rp_id: String,
 }
 
+fn finish(decision: &str, error_kind: Option<&str>, start: Instant) -> ! {
+    let output = ProbeOutput {
+        decision: decision.to_string(),
+        error_kind: error_kind.map(str::to_string),
+        latency_class: LatencyClass::from_ms(start.elapsed().as_millis() as u64),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&output).expect("probe output serializes")
+    );
+    process::exit(if decision == "error" { 1 } else { 0 });
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp(None)
         .init();
-
     let args = Args::parse();
+    let start = Instant::now();
 
-    let action = match args.action.as_str() {
-        "register" => PromptAction::Register,
-        "authenticate" => PromptAction::Authenticate,
+    let verb = match args.action.as_str() {
+        "register" => PromptVerb::Register,
+        "authenticate" => PromptVerb::Authenticate,
         other => {
-            let output = ProbeOutput {
-                decision: "error".to_string(),
-                error_kind: Some("internal_error".to_string()),
-                latency_class: LatencyClass::Fast,
-            };
             eprintln!("invalid action: {other}");
-            println!("{}", serde_json::to_string(&output).unwrap());
-            process::exit(1);
+            finish("error", Some("internal_error"), start);
         }
     };
-
-    let profile_id = match ProfileId::new("validation-probe") {
-        Ok(id) => id,
+    let fields = PromptFields {
+        profile: "validation-probe".to_string(),
+        mode: "isolated".to_string(),
+        principal_user: "validation".to_string(),
+        verb,
+        rp_id: args.rp_id.clone(),
+        origin: format!("https://{}", args.rp_id),
+    };
+    let (summary, body) = match render_prompt(&fields) {
+        Ok(text) => text,
         Err(e) => {
-            let output = ProbeOutput {
-                decision: "error".to_string(),
-                error_kind: Some("internal_error".to_string()),
-                latency_class: LatencyClass::Fast,
-            };
-            eprintln!("failed to construct profile id: {e}");
-            println!("{}", serde_json::to_string(&output).unwrap());
-            process::exit(1);
+            eprintln!("cannot render the prompt: {e}");
+            finish("error", Some("internal_error"), start);
         }
     };
+    let request = PromptRequest::new(summary, body, args.min_review_delay);
 
-    let request = match PromptRequest::builder()
-        .profile_id(profile_id)
-        .mode(PromptMode::Isolated)
-        .action(action)
-        .rp_id(&args.rp_id)
-        .grant_ttl_secs(300)
-        .session_ttl_secs(3600)
-        .untrusted_reason("validation probe")
-        .build()
-    {
-        Ok(r) => r,
+    let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+    let mut child = match InProcessChild::spawn(address) {
+        Ok(child) => child,
         Err(e) => {
-            let output = ProbeOutput {
-                decision: "error".to_string(),
-                error_kind: Some("internal_error".to_string()),
-                latency_class: LatencyClass::Fast,
-            };
-            eprintln!("failed to build prompt request: {e}");
-            println!("{}", serde_json::to_string(&output).unwrap());
-            process::exit(1);
+            eprintln!("cannot start the prompt: {e}");
+            finish("error", Some("internal_error"), start);
         }
     };
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut line = serde_json::to_vec(&request).expect("request serializes");
+    line.push(b'\n');
+    if stdin.write_all(&line).is_err() {
+        finish("error", Some("internal_error"), start);
+    }
 
-    let handle = DesktopPromptHandle::new(args.timeout, args.min_review_delay);
+    let (sender, events) = mpsc::channel();
+    let stdout = child.stdout.take().expect("child stdout");
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(event) = serde_json::from_str::<ChildEvent>(&line)
+                && sender.send(event).is_err()
+            {
+                break;
+            }
+        }
+    });
 
-    let result = handle.prompt(&request);
-
-    let latency_class = LatencyClass::from_ms(result.latency_ms);
-    let error_kind = result.error_kind.map(|k| format!("{k}"));
-
-    let output = ProbeOutput {
-        decision: format!("{}", result.decision),
-        error_kind,
-        latency_class,
-    };
-
-    println!("{}", serde_json::to_string(&output).unwrap());
+    let deadline = start + Duration::from_secs(args.timeout);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(ChildEvent::Shown { .. }) => {}
+            Ok(ChildEvent::Decision { action }) if action == ACTION_ALLOW_ALWAYS => {
+                finish("approved", None, start)
+            }
+            Ok(ChildEvent::Decision { .. }) | Ok(ChildEvent::Closed { .. }) => {
+                finish("denied", None, start)
+            }
+            Ok(ChildEvent::ServerLost) => finish("error", Some("server_lost"), start),
+            Ok(ChildEvent::Error { kind }) => finish("error", Some(kind.as_str()), start),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut withdraw = serde_json::to_vec(&ControlMessage { withdraw: true })
+                    .expect("control message serializes");
+                withdraw.push(b'\n');
+                let _ = stdin.write_all(&withdraw);
+                drop(stdin);
+                if let Some(thread) = child.thread.take() {
+                    let (done, finished) = mpsc::channel();
+                    thread::spawn(move || {
+                        let _ = thread.join();
+                        let _ = done.send(());
+                    });
+                    let _ = finished.recv_timeout(WITHDRAW_GRACE);
+                }
+                finish("timeout", None, start);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                finish("error", Some("internal_error"), start)
+            }
+        }
+    }
 }

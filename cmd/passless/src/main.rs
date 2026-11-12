@@ -69,6 +69,17 @@ struct CliArgs {
     args: passless_core::Args,
 }
 
+/// Take the backend operation lock. It guards no data (`Mutex<()>`), so a poisoned lock is
+/// recovered: a thread that panicked while holding it (for example an agent ceremony) must not
+/// disable the human authenticator for the rest of the daemon's life.
+pub(crate) fn lock_operation(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        warn!("operation lock was poisoned by a panicked thread; recovering");
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Wrapper for AuthenticatorService that implements CommandHandler
 ///
 /// Lock order (documented): operation_lock → service (storage).
@@ -114,10 +125,7 @@ impl<
             return Err(soft_fido2_transport::Error::InvalidCommand);
         }
 
-        let _op = self.operation_lock.lock().map_err(|e| {
-            error!("Failed to lock operation: {}", e);
-            soft_fido2_transport::Error::Other("Failed to lock operation".to_string())
-        })?;
+        let _op = lock_operation(&self.operation_lock);
 
         let mut service = self.service.lock().map_err(|e| {
             error!("Failed to lock service: {}", e);
@@ -125,10 +133,7 @@ impl<
         })?;
 
         {
-            let mut storage = service.storage.lock().map_err(|e| {
-                error!("Failed to lock storage while beginning operation: {}", e);
-                soft_fido2_transport::Error::Other("Failed to begin storage operation".to_string())
-            })?;
+            let mut storage = storage::lock_shared_storage(&service.storage);
             storage.begin_operation().map_err(|e| {
                 error!("Failed to begin storage operation: {:?}", e);
                 soft_fido2_transport::Error::Other("Failed to begin storage operation".to_string())
@@ -139,10 +144,7 @@ impl<
         let command_result = service.handle(data, &mut response);
 
         {
-            let mut storage = service.storage.lock().map_err(|e| {
-                error!("Failed to lock storage while ending operation: {}", e);
-                soft_fido2_transport::Error::Other("Failed to end storage operation".to_string())
-            })?;
+            let mut storage = storage::lock_shared_storage(&service.storage);
             if let Err(e) = storage.end_operation() {
                 warn!("Failed to end storage operation: {:?}", e);
             }
@@ -192,11 +194,13 @@ fn spawn_agent_runtime(
     human_pin_storage: Arc<Mutex<Box<dyn PinStorage>>>,
     human_operation_lock: Arc<Mutex<()>>,
     human_key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
+    human_backend_kind: agent::audit_events::BackendKind,
     agent_config: passless_core::agent::AgentConfig,
     security_config: passless_core::config::SecurityConfig,
     pin_config: passless_core::config::PinConfig,
     uv_config: passless_core::config::UvConfig,
     shutdown: Arc<AtomicBool>,
+    config_source: Option<agent::runtime::AgentConfigSource>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let shutdown_for_runtime = shutdown.clone();
     match std::thread::Builder::new()
@@ -207,11 +211,14 @@ fn spawn_agent_runtime(
                 human_pin_storage,
                 human_operation_lock,
                 human_key_provider,
+                human_backend_kind,
                 &agent_config,
                 security_config,
                 pin_config,
                 uv_config,
                 shutdown_for_runtime.clone(),
+                config_source,
+                notification::human_path_is_automatic(),
             ) {
                 Ok(runtime) => {
                     while !shutdown_for_runtime.load(Ordering::Relaxed) {
@@ -284,9 +291,7 @@ fn run_with_service_inner<
         config,
         shutdown.clone(),
         Box::new(move || {
-            if let Ok(mut storage) = service_ref.lock() {
-                storage.cleanup_expired_cache();
-            }
+            storage::lock_shared_storage(&service_ref).cleanup_expired_cache();
         }),
     );
 
@@ -324,6 +329,16 @@ Run the following commands as root:\n\
   udevadm control --reload-rules && udevadm trigger";
 
 fn main() {
+    // The escalation prompt child (ADR 0014 section 8.2) is this binary re-executed with a hidden
+    // first argument. It is dispatched before argument parsing and before any config is loaded.
+    #[cfg(feature = "agent")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == agent::escalation_prompt::HIDDEN_ARG)
+    {
+        process::exit(agent::escalation_prompt::child_main());
+    }
+
     // Run main logic and format errors cleanly
     if let Err(e) = run() {
         eprintln!("Error: {}", e.format_cli());
@@ -335,6 +350,13 @@ fn run() -> Result<()> {
     // Parse CLI arguments
     let cli_args = CliArgs::parse();
     let mut args = cli_args.args;
+
+    // `doctor` loads the configuration itself (it needs no daemon).
+    #[cfg(feature = "agent")]
+    if let Some(Commands::Doctor { agents, output }) = &args.command {
+        let (agents, output) = (*agents, *output);
+        return commands::doctor::dispatch(&mut args, agents, output);
+    }
 
     // Handle subcommands first
     if let Some(command) = &args.command {
@@ -490,6 +512,8 @@ fn run() -> Result<()> {
                 commands::agent_admin::dispatch_admin(*output, action)
             }
             #[cfg(feature = "agent")]
+            Commands::Doctor { .. } => unreachable!("handled above"),
+            #[cfg(feature = "agent")]
             Commands::Agent {
                 profile,
                 output,
@@ -512,6 +536,13 @@ fn run() -> Result<()> {
     let config = AppConfig::load(&mut args).inspect_err(|e| {
         error!("{}", e.format_cli());
     })?;
+    // A policy reload re-reads the agent configuration from the same file (ADR 0014 section 6.4).
+    #[cfg(feature = "agent")]
+    let agent_config_source =
+        AppConfig::config_file_path(&args).map(|path| agent::runtime::AgentConfigSource {
+            path,
+            human_state_path: config.backend().ok().map(|backend| backend.state_path()),
+        });
 
     // Validate configuration
     if let Err(e) = config.validate() {
@@ -583,12 +614,6 @@ fn run() -> Result<()> {
             debug!("Daemon locks acquired");
 
             let shutdown = Arc::new(AtomicBool::new(false));
-            let mut endpoint_manager = agent::endpoint_manager::EndpointManager::new(
-                config.agents.profiles.len().max(1),
-                shutdown.clone(),
-                worker::WorkerConfig::default(),
-            );
-            debug!("Endpoint manager initialized");
 
             info!("Creating UHID device...");
 
@@ -665,17 +690,17 @@ fn run() -> Result<()> {
                         pin_storage.clone(),
                         operation_lock.clone(),
                         Arc::new(SoftwareCredentialKeyProvider),
+                        agent::audit_events::BackendKind::Local,
                         config.agents.clone(),
                         security_config,
                         pin_config,
                         uv_config,
                         shutdown.clone(),
+                        agent_config_source.clone(),
                     );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                     join_agent_runtime(agent_runtime);
-                    endpoint_manager.cancel_all();
-                    let _ = endpoint_manager.shutdown_all(None);
                     result
                 }
                 BackendConfig::Pass {
@@ -717,17 +742,17 @@ fn run() -> Result<()> {
                         pin_storage.clone(),
                         operation_lock.clone(),
                         Arc::new(SoftwareCredentialKeyProvider),
+                        agent::audit_events::BackendKind::Pass,
                         config.agents.clone(),
                         security_config,
                         pin_config,
                         uv_config,
                         shutdown.clone(),
+                        agent_config_source.clone(),
                     );
 
                     let result = run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                     join_agent_runtime(agent_runtime);
-                    endpoint_manager.cancel_all();
-                    let _ = endpoint_manager.shutdown_all(None);
                     result
                 }
                 #[cfg(feature = "tpm")]
@@ -767,18 +792,18 @@ fn run() -> Result<()> {
                             pin_storage.clone(),
                             operation_lock.clone(),
                             agent_key_provider,
+                            agent::audit_events::BackendKind::Tpm,
                             config.agents.clone(),
                             security_config,
                             pin_config,
                             uv_config,
                             shutdown.clone(),
+                            agent_config_source.clone(),
                         );
 
                         let result =
                             run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                         join_agent_runtime(agent_runtime);
-                        endpoint_manager.cancel_all();
-                        let _ = endpoint_manager.shutdown_all(None);
                         result
                     } else {
                         let storage = TpmStorageAdapter::new_with_options(
@@ -804,18 +829,18 @@ fn run() -> Result<()> {
                             pin_storage.clone(),
                             operation_lock.clone(),
                             Arc::new(SoftwareCredentialKeyProvider),
+                            agent::audit_events::BackendKind::Tpm,
                             config.agents.clone(),
                             security_config,
                             pin_config,
                             uv_config,
                             shutdown.clone(),
+                            agent_config_source.clone(),
                         );
 
                         let result =
                             run_with_service_and_lock(service, uhid, shutdown, operation_lock);
                         join_agent_runtime(agent_runtime);
-                        endpoint_manager.cancel_all();
-                        let _ = endpoint_manager.shutdown_all(None);
                         result
                     }
                 }
@@ -976,5 +1001,27 @@ fn run() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod operation_lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_holder_does_not_disable_the_human_path() {
+        let lock = Arc::new(Mutex::new(()));
+        let holder = lock.clone();
+        let panicked = std::thread::spawn(move || {
+            let _op = holder.lock().unwrap();
+            panic!("agent ceremony panicked while holding the operation lock");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(lock.is_poisoned());
+        // The human path still gets the lock, and the poison is cleared.
+        drop(lock_operation(&lock));
+        assert!(!lock.is_poisoned());
+        drop(lock_operation(&lock));
     }
 }

@@ -1,160 +1,84 @@
 # Agent audit
 
-> **EXPERIMENTAL** — Agent mode is not yet validated for production use.
+> **EXPERIMENTAL.** Agent mode is implemented but not yet validated for production use.
 
-Agent audit events are hash-chained, owner-only, append-oriented JSONL records covering authorization lifecycle, credential use/creation, browser leases, policy changes, denials, and degraded-state handling.
+Agent events are hash-chained, owner-only, append-oriented JSONL records. The authoritative field
+list is [ADR 0014 section 12](../decisions/0014-agent-delegation.md#12-audit); this page summarises it.
 
-## Audit path
+## Where and how
 
-The audit directory is configured in `[agents].audit_path` and must be protected from principal processes. A typical daemon-owned layout is:
+The directory is `agents.audit_path`. It must be protected from the agent (in a different-user
+deployment it is) and must not overlap storage roots. `passless agent-admin profile check` and the
+daemon's start-up diagnostics verify ownership and mode.
 
-```toml
-[agents]
-enabled = true
-audit_path = "/var/lib/passless-agent/audit"
-```
-
-Use `profile check` / startup diagnostics to verify ownership, mode, and path isolation on the deployment host.
-
-## Event categories
-
-Audit events include:
-
-- **Daemon lifecycle:** agent subsystem start, stop, degraded state, and recovery.
-- **Principal and endpoint:** creation, readiness, activation, draining, destruction, and failure.
-- **Policy:** load/reload, allow/deny decisions, expiry, revocation, and generation changes.
-- **Authorization/session:** intents, grants/session authority, binding, cancellation, consumption, replay rejection, timeout, and operation-budget exhaustion where represented by the current event schema.
-- **Prompt/human interaction:** display, approval, denial, timeout, and verification outcome.
-- **Credential:** isolated or human-namespace credential selection, creation, use, state update, revocation, quarantine, and deletion as applicable to the active mode.
-- **Browser lease:** start, expiry, revocation, browser exit, cleanup, quarantine, and recovery.
-- **Audit integrity:** rotation, verification, degradation, and acknowledgement.
-
-The removed `delegated-session` identity mode is not a current audit category. Current identity modes are `same-user` and `isolated`. Administrative types may retain historical names such as `delegation` for grant lifecycle compatibility; interpret events by their actual profile mode/namespace rather than inferring a removed identity mode from an old API noun.
-
-## Effective identity and evidence
-
-Audit is the place where Passless can distinguish security facts that a relying party generally cannot.
-
-For every credential operation, records should make it possible to determine at least:
-
-- profile and identity mode (`same-user` or `isolated`);
-- human vs isolated credential namespace where the event schema supports it;
-- concrete RP ID and action;
-- policy generation / authorization result;
-- credential reference where safe and applicable;
-- authorization source;
-- UP source (`agent`, `human`, or absent);
-- UV source (`agent`, `human`, or absent);
-- terminal result;
-- browser/session lifecycle context required for investigation.
-
-**Agent-derived UP/UV must never be described as human evidence.** An autonomous same-user assertion may set ordinary WebAuthn UP/UV flags that the RP accepts as authentication, while audit must still record that the evidence source was the bound agent/session policy path rather than ceremony-time human PIN/biometric interaction.
-
-## Event format
-
-Each event is a single-line JSON record containing integrity/lifecycle fields such as:
-
-- `seq`: monotonically increasing sequence number;
-- `prev_hash`: hash of the previous record where the current rotation format links one;
-- `hash`: hash of the current canonical event record;
-- wall-clock timestamp for operator display;
-- monotonic timing information where used for expiry decisions;
-- `event`: event type identifier;
-- event-specific profile, RP, action, policy, credential, result, and lifecycle metadata.
-
-Do not treat wall-clock timestamps as the source of authority expiry when the runtime uses monotonic state for security decisions.
-
-## Durability and fail-closed behavior
-
-Credential use/creation is gated by the audit subsystem rather than being logged on a best-effort basis after the fact.
-
-Operational expectations:
-
-- required audit reservation/recording occurs before irreversible credential use/creation;
-- an audit write/reservation failure prevents the agent credential operation from proceeding successfully;
-- terminal failure after an irreversible step moves agent support into the documented degraded/fail-closed path;
-- ordinary human authenticator availability should not be coupled to agent-audit degradation unless explicitly required by the human path itself.
-
-Check current state with:
+Audit gates credential use. Before any credential is created or used, the daemon appends and fsyncs a
+reservation record; if that fails, the operation does not proceed. Every reservation is closed by
+exactly one terminal record. A terminal write failure puts agent support into a degraded, fail-closed
+state until an administrator repairs it; your own authenticator stays available. After a crash, the
+next start closes open reservations from the newest two segments (`failure_class = abandoned`).
 
 ```bash
 passless agent-admin audit status
 passless agent-admin audit verify
+passless agent-admin audit export --format json   # or csv
 ```
 
-Repair audit storage before resuming agent credential use after a degraded/integrity failure.
+`verify` checks chain integrity across rotations. `export` prints a JSON envelope with the entry
+count and the `path` of the export, `<audit_path>/audit-export-<unix time>.jsonl` (`.csv` for
+`--format csv`); the entries are in that file, one JSON object per line. Exports hold no secrets, but
+RP IDs, denials and timing are still sensitive account metadata.
 
-## Secrecy requirements
+## Operation records
 
-Audit must not contain:
+`policy.allow` (the reservation), `policy.deny`, `policy.replay_served` and `operation.terminal` carry
+the same keys; keys that do not apply yet are `null`:
 
-- credential private keys or raw wrapped key material;
-- PINs or local-verification secrets;
-- principal/session bearer capabilities;
-- browser cookies or storage values;
-- raw assertion signatures;
-- unrestricted credential records;
-- full CDP response bodies;
-- browser profile contents.
+| Group | Fields |
+|---|---|
+| Identity | `session_id_hash`, `request_id`, `escalation_id`, `profile_id`, `mode`, `principal_relationship` |
+| Policy state | `revocation_epoch`, `grant_epoch`, `rule` (`exact` or `*`), `grant_source` (`config` or `granted`), `decision`, `evidence_source` (`agent` or absent) |
+| Request | `action`, `rp_id`, `origin`, `top_origin` (null on the proxy path), `cross_origin` |
+| Credential | `credential_ref`, `selection_rule`, `backend` (`local`, `pass`, `tpm`), `key_provider`, `counter_before`, `counter_after` |
+| Outcome | `result` (`success`, `replay_served`, `denied`, `aborted`, `revoked`, `timeout`, `busy`, `error`), `failure_class` |
 
-Non-secret references, bounded policy metadata, RP IDs, evidence source labels, lifecycle state, and result codes may be recorded when required for security investigation.
+A reservation and its terminal record share `request_id`. Evidence is always `agent`: agent-derived
+UP and UV are never recorded, or described, as human interaction.
 
-## Browser/CDP events
+`policy.deny` and `policy.replay_served` also carry `reason` and `suppressed`. A page can loop a
+refused request, so refusals are coalesced per session, RP, action and reason: the first 16 in a
+60 second window are written in full, and the rest are counted. The count is written as one
+`policy.deny` with `suppressed` set to the number of refusals it stands for (its `origin` fields are
+null; an RP the session no longer tracks is named `unknown`). The count is written when the next
+window starts, when it reaches 1024, and when the session is revoked or dropped. Every refusal is
+either a record or part of a count. `suppressed` is null on every other record.
 
-CDP is full browser-session authority, but audit should avoid turning that authority into a second secret store.
+## Other records
 
-Record bounded method/outcome/lifecycle metadata where useful; do not record raw CDP response bodies because they may contain cookies, DOM, tokens, network data, or other authenticated session state.
+- Escalation: `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted`
+  or `server_lost`) and `revoked` (operator revocation or policy reload), each with `origin` and
+  `rule`.
+- Granted rules: `granted_rule.add` and `granted_rule.revoke`.
+- Browser sessions: `grant.request` and `grant.approve` (profile, principal, RP scope, TTL), and
+  browser lease creation, expiry, revocation, exit and cleanup.
+- Daemon: start, stop, degraded state and recovery, including the human backend kind.
 
-Passless audit also cannot prove what application-level actions an agent performed after login unless those actions are independently visible through browser/application telemetry. A successful WebAuthn audit record proves authentication activity, not a complete post-login action trace.
+Request caps answered `busy` before a ceremony exists write no operation record.
 
-## Hash-chain verification
+## What is never recorded
 
-Verify the local chain with:
+Private keys, PINs, bearers, cookies, tokens, raw assertions or signatures, client-data hashes,
+credential records and browser profile contents. CDP response bodies are never recorded either: they
+may hold cookies and session state.
 
-```bash
-passless agent-admin audit verify
-```
+## Limits
 
-A discontinuity can indicate tampering, corruption, rotation/storage failure, or incomplete write. Preserve affected files and investigate before treating later local history as trustworthy.
+The local hash chain is not an external trust anchor: owner-only permissions and chaining detect
+accidental damage and non-root edits, but host root can rewrite local history, and a deleted rotated
+file cannot be reconstructed. A WebAuthn audit shows authentication, not what the agent did inside the
+site afterwards.
 
-## Rotation
+## What to look for
 
-Rotation retains bounded audit storage while starting/continuing integrity state according to the implementation's current format. Operators should verify across the retained files rather than assuming that file existence alone proves an unbroken history.
-
-If rotated files are deleted or rotation fails, verification may detect a discontinuity but cannot reconstruct missing records.
-
-## Export
-
-Export non-secret event views with:
-
-```bash
-passless agent-admin audit export --format json
-passless agent-admin audit export --format csv
-```
-
-Treat exports as security-sensitive operational records even though they exclude credential secrets: RP IDs, identities, denials, and session timing can still reveal account/activity metadata.
-
-## Routine review
-
-For privileged `same-user`, autonomous, wildcard, registration-enabled, or CDP-exposed profiles, review audit more aggressively.
-
-Useful questions include:
-
-- Did authentication occur to an RP outside the operator's intended task?
-- Did a same-user profile register a new human credential unexpectedly?
-- Was UP/UV agent-derived or human-derived?
-- Are repeated denials/replays/operation-budget exhaustion signs of a bad automation loop or hostile page behavior?
-- Did policy generation change during a task?
-- Did a browser/session survive longer than expected locally?
-- Does the RP still retain a server-side session after local teardown?
-
-## Integrity limits
-
-The local hash chain is not an external trust anchor.
-
-- Owner-only permissions and chaining protect/detect many non-root modifications and accidental corruption.
-- Host root can rewrite local files/state unless the chain is anchored independently.
-- A lost rotated file cannot be reconstructed by verification.
-- Audit of WebAuthn does not scope or enumerate all actions performed inside the authenticated RP session.
-
-A future TPM/remote checkpoint could strengthen tamper evidence, but until such anchoring is implemented, do not claim root-resistant audit immutability.
+Sign-ins to RPs outside the task; a `same-user` profile registering a credential; repeated denials,
+replays or budget exhaustion (a loop or a hostile page); escalations and their outcomes; whether the
+site still holds a session after local teardown.

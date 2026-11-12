@@ -308,7 +308,11 @@ impl TpmPinStorage {
             return Err(StatusCode::Other);
         }
 
-        let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).expect("valid nonce length");
+        // The nonce comes from the sealed file: a corrupt file is an error, never a panic.
+        let nonce = Nonce::try_from(sealed_blob.nonce.as_slice()).map_err(|_| {
+            warn!("Sealed PIN blob has a nonce of the wrong length");
+            StatusCode::Other
+        })?;
         let cipher = Aes256Gcm::new_from_slice(aes_key).map_err(|e| {
             warn!("Failed to create AES cipher: {:?}", e);
             StatusCode::Other

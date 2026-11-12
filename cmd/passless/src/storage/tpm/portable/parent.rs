@@ -108,10 +108,7 @@ impl PortableParent {
 
     /// Verify the provisioned parent matches expected metadata
     pub fn verify_parent(&self, metadata: &PortableParentMetadata) -> Result<()> {
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let persistent_tpm_handle = tss_esapi::handles::PersistentTpmHandle::new(
             metadata.persistent_handle,
@@ -172,10 +169,7 @@ impl PortableParent {
 
         let material = derive_parent_material(seed)?;
 
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let temp_primary = create_temp_primary(&mut context)?;
 
@@ -330,10 +324,7 @@ impl PortableParent {
     pub fn remove(&self) -> Result<()> {
         let metadata = self.load_metadata()?;
 
-        let mut context = self.context.lock().map_err(|e| {
-            error!("Failed to lock TPM context: {}", e);
-            soft_fido2::Error::Other
-        })?;
+        let mut context = super::context::lock_context(&self.context);
 
         let persistent_tpm_handle = tss_esapi::handles::PersistentTpmHandle::new(
             metadata.persistent_handle,

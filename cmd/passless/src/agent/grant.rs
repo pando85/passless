@@ -5,14 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use passless_core::agent::config::ANY_RP_ID;
 use passless_core::agent::{
-    CredentialRef, EndpointId, GrantId, PolicyDigest, PolicyGenerationId, PrincipalSessionId,
-    ProfileId, RegistrationGrantId,
+    CredentialRef, GrantId, PolicyDigest, PolicyGenerationId, PrincipalSessionId, ProfileId,
 };
 
 use super::audit::AuditGate;
 use super::audit_events::{GrantApproveBuilder, GrantRequestBuilder};
 use super::browser::Clock;
-use super::intent::AdminAuthority;
+use super::identity::AdminAuthority;
 
 const GRANT_STATE_ACTIVE: u8 = 0;
 const GRANT_STATE_REVOKED: u8 = 1;
@@ -21,7 +20,7 @@ const GRANT_STATE_EXPIRED: u8 = 2;
 const CLAIM_NONCE_BYTES: usize = 32;
 const MAX_RP_ID_LEN: usize = 253;
 const MAX_CREDENTIALS_PER_GRANT: usize = 64;
-const MAX_RP_IDS_PER_GRANT: usize = 32;
+const MAX_RP_IDS_PER_GRANT: usize = passless_core::agent::MAX_GRANT_RP_IDS;
 const MIN_TTL_SECS: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,10 +31,7 @@ pub enum GrantError {
     RpIdTooLong(String),
     TooManyRpIds(usize),
     TooManyCredentials(usize),
-    TtlExceedsProfileMax {
-        requested: u64,
-        max: u64,
-    },
+    TtlExceedsProfileMax { requested: u64, max: u64 },
     TtlZero,
     GrantNotActive(GrantId),
     GrantNotFound(GrantId),
@@ -50,15 +46,7 @@ pub enum GrantError {
     ClockAmbiguity,
     PendingRequestNotFound(GrantRequestId),
     RequestAlreadyResolved(GrantRequestId),
-    MaxConcurrentGrantsExceeded {
-        limit: u64,
-    },
-    RegistrationGrantNotFound(RegistrationGrantId),
-    RegistrationGrantNotActive(RegistrationGrantId),
-    RegistrationRpIdMismatch {
-        grant_rp: String,
-        request_rp: String,
-    },
+    MaxConcurrentGrantsExceeded { limit: u64 },
 }
 
 impl fmt::Display for GrantError {
@@ -95,22 +83,6 @@ impl fmt::Display for GrantError {
             Self::RequestAlreadyResolved(id) => write!(f, "request {} already resolved", id),
             Self::MaxConcurrentGrantsExceeded { limit } => {
                 write!(f, "max concurrent grants exceeded (limit: {})", limit)
-            }
-            Self::RegistrationGrantNotFound(id) => {
-                write!(f, "registration grant {} not found", id)
-            }
-            Self::RegistrationGrantNotActive(id) => {
-                write!(f, "registration grant {} is not active", id)
-            }
-            Self::RegistrationRpIdMismatch {
-                grant_rp,
-                request_rp,
-            } => {
-                write!(
-                    f,
-                    "registration grant RP ID '{}' does not match request RP ID '{}'",
-                    grant_rp, request_rp
-                )
             }
         }
     }
@@ -318,7 +290,6 @@ fn validate_rp_ids(rp_ids: &[String]) -> Result<BTreeSet<String>, GrantError> {
 pub struct GrantRequestParams {
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
     pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credentials: Vec<CredentialRef>,
@@ -329,11 +300,12 @@ pub struct GrantRequestParams {
 pub struct GrantRequest {
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
     pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credentials: Vec<CredentialRef>,
     pub requested_ttl_secs: u64,
+    /// The TTL bound the request was validated against; approval clamps to the same bound.
+    pub max_ttl_secs: u64,
     pub allow_empty_credentials: bool,
     pub resolved: bool,
     pub resolved_grant_id: Option<GrantId>,
@@ -344,7 +316,6 @@ pub struct Grant {
     pub id: GrantId,
     pub profile_id: ProfileId,
     pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
     pub principal_digest: [u8; 32],
     pub policy_generation: PolicyGenerationId,
     pub policy_digest: PolicyDigest,
@@ -424,6 +395,8 @@ impl fmt::Debug for AuthorizationClaim {
 pub struct GrantSnapshotForSign {
     pub grant_id: GrantId,
     pub profile_id: ProfileId,
+    /// Digest of the principal process the grant was issued to (ADR 0014 sections 7 and 9).
+    pub principal_digest: [u8; 32],
     pub rp_ids: Vec<String>,
     pub credential_refs: Vec<CredentialRef>,
     pub state: GrantState,
@@ -452,7 +425,6 @@ pub struct GrantDetails {
 pub struct GrantQueryParams<'a> {
     pub profile_id: &'a ProfileId,
     pub session_id: &'a PrincipalSessionId,
-    pub endpoint_id: &'a EndpointId,
     pub principal_digest: &'a [u8; 32],
     pub policy_generation: &'a PolicyGenerationId,
     pub policy_digest: &'a PolicyDigest,
@@ -468,6 +440,10 @@ pub struct GrantRegistry {
     policy_generation: PolicyGenerationId,
     policy_digest: PolicyDigest,
     max_ttl_secs: u64,
+    /// Upper bound for bearer-session grants (`max_session_ttl`), which is independent of the
+    /// intent grant bound `max_ttl_secs` (`max_grant_ttl`). Defect B5: session grants used to be
+    /// validated against `max_grant_ttl` (300 s by default), so a longer session TTL failed.
+    max_session_ttl_secs: u64,
     allowed_actions: BTreeSet<String>,
     max_concurrent_grants: u64,
     last_seen_mono: u64,
@@ -492,6 +468,7 @@ impl GrantRegistry {
             policy_generation,
             policy_digest,
             max_ttl_secs,
+            max_session_ttl_secs: max_ttl_secs,
             allowed_actions,
             max_concurrent_grants,
             last_seen_mono: 0,
@@ -509,24 +486,45 @@ impl GrantRegistry {
         Ok(())
     }
 
+    /// Set the bound for bearer-session grants (`max_session_ttl`, ADR 0014 section 9).
+    pub fn with_max_session_ttl(mut self, max_session_ttl_secs: u64) -> Self {
+        self.max_session_ttl_secs = max_session_ttl_secs;
+        self
+    }
+
     pub fn request_grant(
         &mut self,
         params: GrantRequestParams,
     ) -> Result<GrantRequestId, GrantError> {
-        self.request_grant_inner(params, false)
+        let max_ttl = self.max_ttl_secs;
+        self.request_grant_inner(params, false, max_ttl)
     }
 
     pub fn request_dynamic_grant(
         &mut self,
         params: GrantRequestParams,
     ) -> Result<GrantRequestId, GrantError> {
-        self.request_grant_inner(params, true)
+        let max_ttl = self.max_ttl_secs;
+        self.request_grant_inner(params, true, max_ttl)
+    }
+
+    /// Request the grant that backs a browser bearer session. Its TTL is bounded by the profile's
+    /// `max_session_ttl`, not by `max_grant_ttl` (defect B5). `dynamic` allows an empty credential
+    /// set (credentials are discovered per request).
+    pub fn request_session_grant(
+        &mut self,
+        params: GrantRequestParams,
+        dynamic: bool,
+    ) -> Result<GrantRequestId, GrantError> {
+        let max_ttl = self.max_session_ttl_secs;
+        self.request_grant_inner(params, dynamic, max_ttl)
     }
 
     fn request_grant_inner(
         &mut self,
         params: GrantRequestParams,
         allow_empty_credentials: bool,
+        max_ttl_secs: u64,
     ) -> Result<GrantRequestId, GrantError> {
         self.check_clock()?;
 
@@ -541,24 +539,26 @@ impl GrantRegistry {
         if params.requested_ttl_secs == 0 {
             return Err(GrantError::TtlZero);
         }
-        if params.requested_ttl_secs > self.max_ttl_secs {
+        if params.requested_ttl_secs > max_ttl_secs {
             return Err(GrantError::TtlExceedsProfileMax {
                 requested: params.requested_ttl_secs,
-                max: self.max_ttl_secs,
+                max: max_ttl_secs,
             });
         }
 
         let request_id = GrantRequestId::new();
         let audit_profile_id = params.profile_id.clone();
         let audit_rp_ids = params.rp_ids.clone();
+        let audit_principal = params.principal_digest;
+        let audit_ttl_secs = params.requested_ttl_secs;
         let request = GrantRequest {
             profile_id: params.profile_id,
             session_id: params.session_id,
-            endpoint_id: params.endpoint_id,
             principal_digest: params.principal_digest,
             rp_ids: params.rp_ids,
             credentials: cred_set.sorted,
             requested_ttl_secs: params.requested_ttl_secs,
+            max_ttl_secs,
             allow_empty_credentials,
             resolved: false,
             resolved_grant_id: None,
@@ -567,8 +567,14 @@ impl GrantRegistry {
         self.pending_requests.insert(request_id.clone(), request);
 
         if let Some(ref sink) = self.audit_sink {
-            let event =
-                GrantRequestBuilder::new(&request_id, audit_profile_id, audit_rp_ids).build();
+            let event = GrantRequestBuilder::new(
+                &request_id,
+                audit_profile_id,
+                &audit_principal,
+                audit_rp_ids,
+                audit_ttl_secs,
+            )
+            .build();
             let _ = sink.record(event);
         }
 
@@ -608,16 +614,17 @@ impl GrantRegistry {
         } else {
             CredentialSet::new(request.credentials.clone())?
         };
-        let ttl = clamp_ttl(request.requested_ttl_secs, self.max_ttl_secs);
+        let ttl = clamp_ttl(request.requested_ttl_secs, request.max_ttl_secs);
         let now = self.clock.monotonic_secs();
         let profile_id = request.profile_id.clone();
+        let audit_principal = request.principal_digest;
+        let audit_rp_ids = request.rp_ids.clone();
 
         let grant_id = GrantId::new();
         let grant = Grant {
             id: grant_id.clone(),
             profile_id: profile_id.clone(),
             session_id: request.session_id.clone(),
-            endpoint_id: request.endpoint_id.clone(),
             principal_digest: request.principal_digest,
             policy_generation: self.policy_generation.clone(),
             policy_digest: self.policy_digest.clone(),
@@ -636,7 +643,14 @@ impl GrantRegistry {
         }
 
         if let Some(ref sink) = self.audit_sink {
-            let event = GrantApproveBuilder::new(grant_id.clone(), profile_id, ttl).build();
+            let event = GrantApproveBuilder::new(
+                grant_id.clone(),
+                profile_id,
+                &audit_principal,
+                audit_rp_ids,
+                ttl,
+            )
+            .build();
             let _ = sink.record(event);
         }
 
@@ -822,7 +836,6 @@ impl GrantRegistry {
                 g.state() == GrantState::Active
                     && g.profile_id == *query.profile_id
                     && g.session_id == *query.session_id
-                    && g.endpoint_id == *query.endpoint_id
                     && g.principal_digest == *query.principal_digest
                     && g.policy_generation == *query.policy_generation
                     && g.policy_digest == *query.policy_digest
@@ -939,6 +952,7 @@ impl GrantRegistry {
         Some(GrantSnapshotForSign {
             grant_id: grant.id.clone(),
             profile_id: grant.profile_id.clone(),
+            principal_digest: grant.principal_digest,
             rp_ids,
             credential_refs: cred_refs,
             state,
@@ -972,231 +986,6 @@ impl GrantRegistry {
 
     pub fn cancel_claims_for_grant(&mut self, grant_id: &GrantId) {
         self.claims.retain(|_, c| c.grant_id != *grant_id);
-    }
-}
-
-#[derive(Debug)]
-pub struct RegistrationGrant {
-    pub id: RegistrationGrantId,
-    pub profile_id: ProfileId,
-    pub session_id: PrincipalSessionId,
-    pub endpoint_id: EndpointId,
-    pub principal_digest: [u8; 32],
-    pub rp_id: String,
-    pub issued_at_mono: u64,
-    pub expiry_mono: u64,
-    state: AtomicU8,
-}
-
-impl RegistrationGrant {
-    pub fn state(&self) -> GrantState {
-        GrantState::from_atomic(self.state.load(Ordering::Acquire)).unwrap_or(GrantState::Revoked)
-    }
-
-    fn try_transition(&self, from: GrantState, to: GrantState) -> bool {
-        self.state
-            .compare_exchange(
-                from.to_atomic(),
-                to.to_atomic(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RegistrationGrantSnapshot {
-    pub grant_id: RegistrationGrantId,
-    pub profile_id: ProfileId,
-    pub rp_id: String,
-    pub state: GrantState,
-    pub issued_at_mono: u64,
-    pub expiry_mono: u64,
-}
-
-pub struct RegistrationGrantRegistry {
-    grants: HashMap<RegistrationGrantId, RegistrationGrant>,
-    clock: Arc<dyn Clock>,
-    max_ttl_secs: u64,
-    last_seen_mono: u64,
-}
-
-impl RegistrationGrantRegistry {
-    pub fn new(clock: Arc<dyn Clock>, max_ttl_secs: u64) -> Self {
-        Self {
-            grants: HashMap::new(),
-            clock,
-            max_ttl_secs,
-            last_seen_mono: 0,
-        }
-    }
-
-    fn check_clock(&mut self) -> Result<(), GrantError> {
-        let now = self.clock.monotonic_secs();
-        if now < self.last_seen_mono {
-            self.fail_closed_all();
-            return Err(GrantError::ClockAmbiguity);
-        }
-        self.last_seen_mono = now;
-        Ok(())
-    }
-
-    pub fn request_registration(
-        &mut self,
-        profile_id: ProfileId,
-        session_id: PrincipalSessionId,
-        endpoint_id: EndpointId,
-        principal_digest: [u8; 32],
-        rp_id: String,
-        ttl_secs: u64,
-    ) -> Result<RegistrationGrantId, GrantError> {
-        self.check_clock()?;
-
-        let normalized_rp = normalize_rp_id(&rp_id)?;
-
-        if ttl_secs == 0 {
-            return Err(GrantError::TtlZero);
-        }
-        if ttl_secs > self.max_ttl_secs {
-            return Err(GrantError::TtlExceedsProfileMax {
-                requested: ttl_secs,
-                max: self.max_ttl_secs,
-            });
-        }
-
-        let ttl = clamp_ttl(ttl_secs, self.max_ttl_secs);
-        let now = self.clock.monotonic_secs();
-        let grant_id = RegistrationGrantId::new();
-
-        let grant = RegistrationGrant {
-            id: grant_id.clone(),
-            profile_id,
-            session_id,
-            endpoint_id,
-            principal_digest,
-            rp_id: normalized_rp,
-            issued_at_mono: now,
-            expiry_mono: now.saturating_add(ttl),
-            state: AtomicU8::new(GRANT_STATE_ACTIVE),
-        };
-
-        self.grants.insert(grant_id.clone(), grant);
-        Ok(grant_id)
-    }
-
-    pub fn resolve_registration_grant(
-        &self,
-        grant_id: &RegistrationGrantId,
-        rp_id: &str,
-    ) -> Option<RegistrationGrantSnapshot> {
-        let grant = self.grants.get(grant_id)?;
-        let normalized_rp = normalize_rp_id(rp_id).ok()?;
-
-        if grant.state() != GrantState::Active {
-            return None;
-        }
-
-        let now = self.clock.monotonic_secs();
-        if now >= grant.expiry_mono {
-            return None;
-        }
-
-        if grant.rp_id != normalized_rp {
-            return None;
-        }
-
-        Some(RegistrationGrantSnapshot {
-            grant_id: grant.id.clone(),
-            profile_id: grant.profile_id.clone(),
-            rp_id: grant.rp_id.clone(),
-            state: grant.state(),
-            issued_at_mono: grant.issued_at_mono,
-            expiry_mono: grant.expiry_mono,
-        })
-    }
-
-    pub fn revoke_registration(&self, grant_id: &RegistrationGrantId) -> Result<(), GrantError> {
-        let grant = self
-            .grants
-            .get(grant_id)
-            .ok_or_else(|| GrantError::RegistrationGrantNotFound(grant_id.clone()))?;
-
-        let current = grant.state();
-        if current != GrantState::Active {
-            return Err(GrantError::RegistrationGrantNotActive(grant_id.clone()));
-        }
-
-        if grant.try_transition(GrantState::Active, GrantState::Revoked) {
-            Ok(())
-        } else {
-            Err(GrantError::RegistrationGrantNotActive(grant_id.clone()))
-        }
-    }
-
-    pub fn check_expired(&mut self) -> Vec<RegistrationGrantId> {
-        let now = self.clock.monotonic_secs();
-        let mut expired = Vec::new();
-
-        for (id, grant) in &self.grants {
-            if grant.state() == GrantState::Active && now >= grant.expiry_mono {
-                expired.push(id.clone());
-            }
-        }
-
-        for id in &expired {
-            if let Some(grant) = self.grants.get(id) {
-                let _ = grant.try_transition(GrantState::Active, GrantState::Expired);
-            }
-        }
-
-        expired
-    }
-
-    pub fn on_principal_exit(&mut self, session_id: &PrincipalSessionId) {
-        for grant in self.grants.values() {
-            if grant.session_id == *session_id && grant.state() == GrantState::Active {
-                let _ = grant.try_transition(GrantState::Active, GrantState::Revoked);
-            }
-        }
-    }
-
-    pub fn on_daemon_restart(&mut self) {
-        self.grants.clear();
-        self.last_seen_mono = 0;
-    }
-
-    fn fail_closed_all(&mut self) {
-        for grant in self.grants.values() {
-            if grant.state() == GrantState::Active {
-                let _ = grant.try_transition(GrantState::Active, GrantState::Revoked);
-            }
-        }
-    }
-
-    pub fn grant_count(&self) -> usize {
-        self.grants.len()
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.grants
-            .values()
-            .filter(|g| g.state() == GrantState::Active)
-            .count()
-    }
-
-    pub fn list_all_snapshots(&self) -> Vec<RegistrationGrantSnapshot> {
-        self.grants
-            .values()
-            .map(|grant| RegistrationGrantSnapshot {
-                grant_id: grant.id.clone(),
-                profile_id: grant.profile_id.clone(),
-                rp_id: grant.rp_id.clone(),
-                state: grant.state(),
-                issued_at_mono: grant.issued_at_mono,
-                expiry_mono: grant.expiry_mono,
-            })
-            .collect()
     }
 }
 
@@ -1301,10 +1090,6 @@ mod tests {
         PrincipalSessionId::new()
     }
 
-    fn test_endpoint_id() -> EndpointId {
-        EndpointId::new()
-    }
-
     fn test_policy_gen() -> PolicyGenerationId {
         PolicyGenerationId::new()
     }
@@ -1314,7 +1099,6 @@ mod tests {
             &test_profile_id(),
             vec!["make_credential".to_string(), "get_assertion".to_string()],
             5,
-            true,
             300,
         )
         .unwrap();
@@ -1352,12 +1136,11 @@ mod tests {
         creds: Vec<CredentialRef>,
         ttl: u64,
     ) -> GrantId {
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let req_id = registry
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids,
                 credentials: creds,
@@ -1557,7 +1340,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session.clone(),
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![test_cred(b"c1")],
@@ -1578,7 +1360,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![test_cred(b"c1")],
@@ -1624,7 +1405,7 @@ mod tests {
             60,
         );
 
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let state = registry.revoke_grant(&gid, &authority).unwrap();
         assert_eq!(state, GrantState::Revoked);
         assert_eq!(
@@ -1638,7 +1419,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let gid = request_and_approve(
             &mut registry,
             &session,
@@ -1658,7 +1439,7 @@ mod tests {
     fn test_revocation_of_nonexistent() {
         let clock = test_clock();
         let registry = make_registry(&clock);
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let fake_id = GrantId::new();
         assert!(matches!(
             registry.revoke_grant(&fake_id, &authority),
@@ -1831,12 +1612,11 @@ mod tests {
         let session = test_session_id();
         let cred = test_cred(b"c1");
 
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let req_id = registry
             .request_grant(GrantRequestParams {
                 profile_id: ProfileId::new("profile-a").unwrap(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![cred.clone()],
@@ -1858,12 +1638,11 @@ mod tests {
             None,
         );
 
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let req_id2 = other_registry
             .request_grant(GrantRequestParams {
                 profile_id: ProfileId::new("profile-b").unwrap(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(2000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![cred.clone()],
@@ -1896,7 +1675,6 @@ mod tests {
             &test_profile_id(),
             vec!["different_action".to_string()],
             5,
-            true,
             300,
         )
         .unwrap();
@@ -2053,7 +1831,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![test_cred(b"c2")],
@@ -2073,7 +1850,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["*.example.com".to_string()],
             credentials: vec![test_cred(b"c1")],
@@ -2088,13 +1864,12 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         let req_id = registry
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![test_cred(b"c1")],
@@ -2116,13 +1891,12 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         let req_id = registry
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session,
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![test_cred(b"c1")],
@@ -2171,7 +1945,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
         let cred = test_cred(b"c1");
         let gid = request_and_approve(
             &mut registry,
@@ -2333,7 +2107,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec![],
             credentials: vec![test_cred(b"c1")],
@@ -2351,7 +2124,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: vec!["example.com".to_string()],
             credentials: vec![],
@@ -2365,7 +2137,7 @@ mod tests {
         let clock = test_clock();
         let mut registry = make_registry(&clock);
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         assert_eq!(registry.grant_count(), 0);
         assert_eq!(registry.active_count(), 0);
@@ -2403,7 +2175,6 @@ mod tests {
             .request_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![test_cred(b"c1")],
@@ -2441,7 +2212,6 @@ mod tests {
         let result = registry.request_grant(GrantRequestParams {
             profile_id: test_profile_id(),
             session_id: session,
-            endpoint_id: test_endpoint_id(),
             principal_digest: test_digest(1000),
             rp_ids: rps,
             credentials: vec![test_cred(b"c1")],
@@ -2558,347 +2328,6 @@ mod tests {
         assert_eq!(ids.len(), unique.len());
     }
 
-    fn make_reg_registry(clock: &Arc<MockClock>) -> RegistrationGrantRegistry {
-        RegistrationGrantRegistry::new(clock.clone(), 300)
-    }
-
-    #[test]
-    fn test_registration_grant_creation() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let gid = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "example.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        let snap = registry
-            .resolve_registration_grant(&gid, "example.com")
-            .unwrap();
-        assert_eq!(snap.state, GrantState::Active);
-        assert_eq!(snap.rp_id, "example.com");
-        assert_eq!(snap.profile_id, test_profile_id());
-    }
-
-    #[test]
-    fn test_registration_grant_rp_id_mismatch() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let gid = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "example.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        assert!(
-            registry
-                .resolve_registration_grant(&gid, "other.com")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_registration_grant_expiry() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let gid = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "example.com".to_string(),
-                10,
-            )
-            .unwrap();
-
-        assert!(
-            registry
-                .resolve_registration_grant(&gid, "example.com")
-                .is_some()
-        );
-
-        clock.advance(Duration::from_secs(11));
-        let expired = registry.check_expired();
-        assert_eq!(expired.len(), 1);
-
-        assert!(
-            registry
-                .resolve_registration_grant(&gid, "example.com")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_registration_grant_revocation() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let gid = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "example.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        registry.revoke_registration(&gid).unwrap();
-
-        assert!(
-            registry
-                .resolve_registration_grant(&gid, "example.com")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_registration_grant_revoke_nonexistent() {
-        let clock = test_clock();
-        let registry = make_reg_registry(&clock);
-        let fake_id = RegistrationGrantId::new();
-
-        assert!(matches!(
-            registry.revoke_registration(&fake_id),
-            Err(GrantError::RegistrationGrantNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn test_registration_grant_ttl_zero_rejected() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let result = registry.request_registration(
-            test_profile_id(),
-            session,
-            test_endpoint_id(),
-            test_digest(1000),
-            "example.com".to_string(),
-            0,
-        );
-        assert!(matches!(result, Err(GrantError::TtlZero)));
-    }
-
-    #[test]
-    fn test_registration_grant_ttl_exceeds_max() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let result = registry.request_registration(
-            test_profile_id(),
-            session,
-            test_endpoint_id(),
-            test_digest(1000),
-            "example.com".to_string(),
-            999,
-        );
-        assert!(matches!(
-            result,
-            Err(GrantError::TtlExceedsProfileMax { .. })
-        ));
-    }
-
-    #[test]
-    fn test_registration_grant_wildcard_rp_rejected() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let result = registry.request_registration(
-            test_profile_id(),
-            session,
-            test_endpoint_id(),
-            test_digest(1000),
-            ANY_RP_ID.to_string(),
-            60,
-        );
-        assert!(matches!(result, Err(GrantError::WildcardRpId(_))));
-    }
-
-    #[test]
-    fn test_registration_grant_rp_normalization() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let gid = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "Example.COM".to_string(),
-                60,
-            )
-            .unwrap();
-
-        let snap = registry
-            .resolve_registration_grant(&gid, "EXAMPLE.com")
-            .unwrap();
-        assert_eq!(snap.rp_id, "example.com");
-    }
-
-    #[test]
-    fn test_registration_grant_principal_exit() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let s1 = test_session_id();
-        let s2 = test_session_id();
-
-        let g1 = registry
-            .request_registration(
-                test_profile_id(),
-                s1.clone(),
-                test_endpoint_id(),
-                test_digest(1000),
-                "a.com".to_string(),
-                60,
-            )
-            .unwrap();
-        let g2 = registry
-            .request_registration(
-                test_profile_id(),
-                s2.clone(),
-                test_endpoint_id(),
-                test_digest(2000),
-                "b.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        assert_eq!(registry.active_count(), 2);
-
-        registry.on_principal_exit(&s1);
-
-        assert!(registry.resolve_registration_grant(&g1, "a.com").is_none());
-        assert!(registry.resolve_registration_grant(&g2, "b.com").is_some());
-    }
-
-    #[test]
-    fn test_registration_grant_daemon_restart() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let _gid = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "example.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        assert_eq!(registry.grant_count(), 1);
-
-        registry.on_daemon_restart();
-
-        assert_eq!(registry.grant_count(), 0);
-        assert_eq!(registry.active_count(), 0);
-    }
-
-    #[test]
-    fn test_registration_grant_id_unique() {
-        let ids: Vec<String> = (0..100)
-            .map(|_| RegistrationGrantId::new().as_str().to_string())
-            .collect();
-        let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(ids.len(), unique.len());
-    }
-
-    #[test]
-    fn test_registration_grant_counts() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        assert_eq!(registry.grant_count(), 0);
-        assert_eq!(registry.active_count(), 0);
-
-        let g1 = registry
-            .request_registration(
-                test_profile_id(),
-                session.clone(),
-                test_endpoint_id(),
-                test_digest(1000),
-                "a.com".to_string(),
-                60,
-            )
-            .unwrap();
-        let _g2 = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "b.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        assert_eq!(registry.grant_count(), 2);
-        assert_eq!(registry.active_count(), 2);
-
-        registry.revoke_registration(&g1).unwrap();
-        assert_eq!(registry.active_count(), 1);
-        assert_eq!(registry.grant_count(), 2);
-    }
-
-    #[test]
-    fn test_registration_grant_list_snapshots() {
-        let clock = test_clock();
-        let mut registry = make_reg_registry(&clock);
-        let session = test_session_id();
-
-        let _g1 = registry
-            .request_registration(
-                test_profile_id(),
-                session.clone(),
-                test_endpoint_id(),
-                test_digest(1000),
-                "a.com".to_string(),
-                60,
-            )
-            .unwrap();
-        let _g2 = registry
-            .request_registration(
-                test_profile_id(),
-                session,
-                test_endpoint_id(),
-                test_digest(1000),
-                "b.com".to_string(),
-                60,
-            )
-            .unwrap();
-
-        let snapshots = registry.list_all_snapshots();
-        assert_eq!(snapshots.len(), 2);
-    }
-
     #[test]
     fn test_grant_request_and_approve_emit_audit_records() {
         use super::super::audit::AuditGate;
@@ -2920,13 +2349,12 @@ mod tests {
         );
 
         let session = test_session_id();
-        let authority = super::super::intent::admin_authority();
+        let authority = super::super::identity::admin_authority();
 
         let req_id = registry
             .request_dynamic_grant(GrantRequestParams {
                 profile_id: test_profile_id(),
                 session_id: session.clone(),
-                endpoint_id: test_endpoint_id(),
                 principal_digest: test_digest(1000),
                 rp_ids: vec!["example.com".to_string()],
                 credentials: vec![],

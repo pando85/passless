@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::ids::{
-    CredentialRef, EndpointId, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
-    RegistrationGrantId,
-};
+use super::ids::{CredentialRef, GrantId, PrincipalSessionId, ProfileId};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
@@ -20,10 +17,8 @@ const MAX_START_URL_LEN: usize = 2048;
 pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
 
 const MAX_RP_ID_LEN: usize = 253;
-const MAX_PROFILE_ID_LEN: usize = 128;
 const MAX_USER_NAME_LEN: usize = 256;
 const MAX_DISPLAY_NAME_LEN: usize = 256;
-const MAX_REASON_LEN: usize = 1024;
 const MAX_DIAGNOSTIC_LEN: usize = 4096;
 const MAX_REG_ORIGIN_LEN: usize = 2048;
 const MAX_REG_CHALLENGE_B64U_LEN: usize = 1376;
@@ -152,11 +147,28 @@ pub enum ErrorCode {
     Forbidden,
     NotFound,
     Conflict,
-    InteractionRequired,
     Internal,
     VersionMismatch,
     MessageTooLarge,
     MalformedMessage,
+    /// The RP asked for an option, extension or algorithm the agent authenticator cannot honor
+    /// (WebAuthn `NotSupportedError`, ADR 0014 section 10.3).
+    NotSupported,
+    /// A credential in `excludeCredentials` already exists (WebAuthn `InvalidStateError`).
+    InvalidState,
+    /// The origin is not valid for the RP ID (WebAuthn `SecurityError`).
+    OriginInvalid,
+    /// The daemon is at a concurrency cap; the request was not processed (plan R11).
+    Busy,
+    /// The ceremony deadline passed before an outcome was available.
+    Timeout,
+    /// The replay key of the request was already used in this session (ADR 0014 section 9).
+    Replayed,
+    /// The session's operation budget is used up.
+    BudgetExhausted,
+    /// The browser cancelled the request (`onRequestCanceled`) before an outcome was available
+    /// (WebAuthn `AbortError`).
+    Aborted,
 }
 
 impl fmt::Display for ErrorCode {
@@ -167,11 +179,18 @@ impl fmt::Display for ErrorCode {
             Self::Forbidden => write!(f, "forbidden"),
             Self::NotFound => write!(f, "not_found"),
             Self::Conflict => write!(f, "conflict"),
-            Self::InteractionRequired => write!(f, "interaction_required"),
             Self::Internal => write!(f, "internal"),
             Self::VersionMismatch => write!(f, "version_mismatch"),
             Self::MessageTooLarge => write!(f, "message_too_large"),
             Self::MalformedMessage => write!(f, "malformed_message"),
+            Self::NotSupported => write!(f, "not_supported"),
+            Self::InvalidState => write!(f, "invalid_state"),
+            Self::OriginInvalid => write!(f, "origin_invalid"),
+            Self::Busy => write!(f, "busy"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::Replayed => write!(f, "replayed"),
+            Self::BudgetExhausted => write!(f, "budget_exhausted"),
+            Self::Aborted => write!(f, "aborted"),
         }
     }
 }
@@ -367,25 +386,26 @@ pub enum AdminRequest {
     ProfileCheck {
         profile_id: ProfileId,
     },
-    RequestDelegation {
-        profile_id: ProfileId,
-        rp_id: String,
-        credential_ref: CredentialRef,
-        max_session_ttl: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    RequestRegistration {
-        profile_id: ProfileId,
-        rp_id: String,
-        max_session_ttl: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
     LaunchBrowser {
         profile_id: ProfileId,
         #[serde(skip_serializing_if = "Option::is_none")]
         start_url: Option<String>,
+    },
+    /// List the persistent granted rules (ADR 0014 section 8.4). Distinct from `ListGrants`,
+    /// which lists browser session grants.
+    ListGrantedRules {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile_id: Option<ProfileId>,
+    },
+    /// Revoke the granted rule of one RP and action.
+    RevokeGrantedRule {
+        profile_id: ProfileId,
+        rp_id: String,
+        action: GrantAction,
+    },
+    /// Revoke every granted rule of a profile.
+    ClearGrantedRules {
+        profile_id: ProfileId,
     },
     Shutdown,
 }
@@ -425,12 +445,8 @@ pub enum AdminResponse {
     PrincipalTerminated,
     PrincipalWait(PrincipalWaitResponse),
     ProfileCheck(ProfileDiagnosticReport),
-    DelegationRequested {
-        request_id: PendingRequestId,
-    },
-    RegistrationGranted {
-        registration_grant_id: RegistrationGrantId,
-    },
+    GrantedRuleList(GrantedRuleList),
+    GrantedRulesRevoked { revoked: u32 },
     ShutdownAccepted,
 }
 
@@ -439,49 +455,9 @@ pub enum AdminResponse {
 pub enum PrincipalRequest {
     Ping,
     Status,
-    Capabilities,
     Authority,
     Instructions,
     Doctor,
-    CreateIntent {
-        profile_id: ProfileId,
-        action: IntentAction,
-        rp_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        credential_ref: Option<CredentialRef>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        grant_ttl_secs: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_ttl_secs: Option<u64>,
-    },
-    ShowIntent {
-        request_id: PendingRequestId,
-    },
-    WaitIntent {
-        request_id: PendingRequestId,
-    },
-    CancelIntent {
-        request_id: PendingRequestId,
-    },
-    RequestDelegation {
-        profile_id: ProfileId,
-        rp_id: String,
-        credential_ref: CredentialRef,
-        max_session_ttl: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    ShowDelegation {
-        request_id: PendingRequestId,
-    },
-    WaitDelegation {
-        request_id: PendingRequestId,
-    },
-    CancelDelegation {
-        request_id: PendingRequestId,
-    },
     ListCredentials {
         profile_id: ProfileId,
     },
@@ -489,18 +465,29 @@ pub enum PrincipalRequest {
     EnsureBrowser {
         #[serde(skip_serializing_if = "Option::is_none")]
         start_url: Option<String>,
+        /// Start a headed browser instead of the default `--headless=new`. Honoured only when the
+        /// profile sets no `browser_command` (that command carries its own flags).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        headed: bool,
+        /// The caller can only use a CDP endpoint (the Playwright bootstrap, the chrome-devtools
+        /// adapter). A pipe-mode profile has none, so the daemon refuses before it starts a
+        /// browser nobody could reach. `agent browser` leaves it out: in pipe mode it drives the
+        /// browser through `browser-control`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        direct_cdp: bool,
     },
-    EndpointStatus,
     BrowserControl {
         request_json: String,
         timeout_ms: u32,
     },
-    SignAssertion(SignAssertionRequest),
 }
 
+/// The action a rule or a granted rule applies to. The wire form is `register` or `authenticate`
+/// (it was `IntentAction` before the principal intent protocol was removed; the names on the wire
+/// did not change).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub enum IntentAction {
+pub enum GrantAction {
     Register,
     Authenticate,
 }
@@ -510,39 +497,15 @@ pub enum IntentAction {
 pub enum PrincipalResponse {
     Pong,
     Status(DaemonStatus),
-    Capabilities(PrincipalCapabilities),
     Authority(EffectiveAuthority),
     Instructions(PrincipalInstructions),
     Doctor(DoctorResponse),
-    IntentCreated {
-        request_id: PendingRequestId,
-    },
-    IntentStatus {
-        request_id: PendingRequestId,
-        state: IntentState,
-    },
-    IntentCancelled,
-    DelegationRequested {
-        request_id: PendingRequestId,
-    },
-    DelegationStatus {
-        request_id: PendingRequestId,
-        state: DelegationState,
-    },
-    DelegationCancelled,
     CredentialList(PrincipalCredentialList),
     BrowserStatus(BrowserStatusResponse),
     BrowserEnsured(BrowserStatusResponse),
-    EndpointStatus(EndpointStatusResponse),
-    BrowserControl {
-        messages: Vec<String>,
-    },
+    BrowserControl { messages: Vec<String> },
     SignAssertionResult(SignAssertionResponse),
 }
-
-const MAX_ORIGIN_LEN: usize = 512;
-const MAX_B64U_LEN: usize = 1024;
-const MAX_ALLOW_CREDENTIALS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -563,6 +526,20 @@ pub struct RegisterCredentialRequest {
     pub pub_key_cred_params: Vec<i32>,
     pub user_verification: bool,
     pub cross_origin: bool,
+    /// Identifiers of the client extensions the RP requested (names only, never their inputs).
+    /// An extension the daemon cannot honor fails with `NotSupportedError` (ADR 0014 section 10.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The RP's attestation conveyance preference (`none`, `indirect`, `direct`, `enterprise`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
+    /// The page's ceremony timeout in milliseconds; bounds how long a duplicate waits (ADR 0014 section 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// `authenticatorSelection.authenticatorAttachment`. Passless is a roaming authenticator, so
+    /// `platform` cannot be honored and fails with `NotSupportedError` (ADR 0014 invariant 22).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticator_attachment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -589,6 +566,13 @@ pub struct SignAssertionRequest {
     pub user_verification: bool,
     #[serde(default)]
     pub cross_origin: bool,
+    /// Identifiers of the client extensions the RP requested (names only, never their inputs).
+    /// An extension the daemon cannot honor fails with `NotSupportedError` (ADR 0014 section 10.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The page's ceremony timeout in milliseconds; bounds how long a duplicate waits (ADR 0014 section 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -599,15 +583,6 @@ pub struct SignAssertionResponse {
     pub signature_b64u: String,
     pub user_handle_b64u: String,
     pub client_data_json_b64u: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrincipalCapabilities {
-    pub profile_id: String,
-    pub mode: String,
-    pub allowed_rp_ids: Vec<String>,
-    pub registration_allowed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,28 +674,6 @@ pub struct PrincipalInstructions {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IntentState {
-    Pending,
-    Approved,
-    Denied,
-    Cancelled,
-    Expired,
-}
-
-impl fmt::Display for IntentState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Approved => write!(f, "approved"),
-            Self::Denied => write!(f, "denied"),
-            Self::Cancelled => write!(f, "cancelled"),
-            Self::Expired => write!(f, "expired"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum DelegationState {
     Pending,
     Approved,
@@ -767,7 +720,6 @@ pub struct ProfileStatusResponse {
     pub policy_generation: u64,
     pub active_grants: u32,
     pub active_sessions: u32,
-    pub pending_intents: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -787,6 +739,46 @@ pub struct GrantInfo {
 pub struct GrantList {
     pub grants: Vec<GrantInfo>,
     pub total: u32,
+}
+
+/// One persistent granted rule (ADR 0014 section 8.4).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantedRuleInfo {
+    pub rp_id: String,
+    pub action: String,
+    /// `escalation` or `registration`.
+    pub kind: String,
+    /// RFC 3339 time of the approval.
+    pub granted_at: String,
+    /// The approving escalation's ID.
+    pub request_id: String,
+    /// The origin of the ceremony that requested it.
+    pub origin: String,
+    /// The permitting configuration rule: the exact RP ID or `*`.
+    pub rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+}
+
+/// The granted rules of one profile. A store that failed to load is disabled (fail closed) and
+/// lists no rules.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileGrantedRules {
+    pub profile_id: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// Digest of the profile's granted rules (separate from the policy digest).
+    pub digest: String,
+    pub rules: Vec<GrantedRuleInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantedRuleList {
+    pub profiles: Vec<ProfileGrantedRules>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -847,6 +839,13 @@ pub struct BrowserLaunchedResponse {
     pub start_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_endpoint: Option<String>,
+    /// WebAuthn interception of the lease: `attached`, `pending` (re-attaching within the grace
+    /// period) or `degraded` (ADR 0014 section 7, plan D6 layer 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interception: Option<String>,
+    /// The extension's last reported `isAllowedIncognitoAccess()` (enforced from P10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incognito_allowed: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -874,29 +873,12 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EndpointDiagnosticState {
-    Ready,
-    Unavailable,
-}
-
-impl fmt::Display for EndpointDiagnosticState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ready => write!(f, "ready"),
-            Self::Unavailable => write!(f, "unavailable"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileDiagnosticReport {
     pub profile_id: String,
     pub enabled: bool,
     pub mode: String,
-    pub endpoint_state: EndpointDiagnosticState,
     pub browser_lease_state: Option<String>,
     pub policy_generation: u64,
     pub audit_gate_healthy: bool,
@@ -923,14 +905,17 @@ pub struct BrowserStatusResponse {
     pub cdp_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_browser_context: Option<bool>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EndpointStatusResponse {
-    pub endpoint_id: EndpointId,
-    pub status: String,
-    pub connected: bool,
+    /// WebAuthn interception of the lease: `attached`, `pending` (re-attaching within the grace
+    /// period) or `degraded` (ADR 0014 section 7, plan D6 layer 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interception: Option<String>,
+    /// The extension's last reported `isAllowedIncognitoAccess()` (enforced from P10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incognito_allowed: Option<bool>,
+    /// How CDP reaches the lease's browser: `pipe` (only through `browser-control`, no endpoint)
+    /// or `port` (the loopback `cdp_endpoint`). Absent when there is no browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_exposure: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1001,7 +986,6 @@ pub struct ProfileInfo {
     pub policy_generation: u64,
     pub active_grants: u32,
     pub active_sessions: u32,
-    pub pending_intents: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1010,6 +994,10 @@ pub struct PolicyInfo {
     pub profile_id: String,
     pub policy_generation: u64,
     pub digest: String,
+    /// Digest of the profile's granted rules (ADR 0014 section 8.4), reported next to the
+    /// configuration digest and never folded into it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1284,6 +1272,10 @@ impl Validate for AdminRequest {
             Self::ShowProfile { .. } | Self::ShowPolicy { .. } | Self::ProfileCheck { .. } => {}
             Self::AuditExport { .. } => {}
             Self::LaunchBrowser { .. } => {}
+            Self::ListGrantedRules { .. } | Self::ClearGrantedRules { .. } => {}
+            Self::RevokeGrantedRule { rp_id, .. } => {
+                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
+            }
             Self::LaunchPrincipal { command, .. } => {
                 if command.is_empty() {
                     errors.push("launch_principal: command must not be empty".into());
@@ -1313,18 +1305,6 @@ impl Validate for AdminRequest {
                 }
             }
             Self::TerminatePrincipal { .. } => {}
-            Self::RequestDelegation { rp_id, reason, .. } => {
-                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                if let Some(r) = reason {
-                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
-                }
-            }
-            Self::RequestRegistration { rp_id, reason, .. } => {
-                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                if let Some(r) = reason {
-                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
-                }
-            }
             Self::WaitPrincipal { timeout_ms, .. } => {
                 if *timeout_ms > 5000 {
                     errors.push(format!(
@@ -1348,52 +1328,12 @@ impl Validate for PrincipalRequest {
         match self {
             Self::Ping
             | Self::Status
-            | Self::Capabilities
             | Self::Authority
             | Self::Instructions
             | Self::Doctor
-            | Self::BrowserStatus
-            | Self::EndpointStatus => {}
-            Self::CreateIntent {
-                profile_id,
-                rp_id,
-                reason,
-                ..
-            } => {
-                check_str(
-                    profile_id.as_str(),
-                    "profile_id",
-                    MAX_PROFILE_ID_LEN,
-                    &mut errors,
-                );
-                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                if let Some(r) = reason {
-                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
-                }
-            }
-            Self::ShowIntent { .. } | Self::WaitIntent { .. } | Self::CancelIntent { .. } => {}
-            Self::RequestDelegation {
-                profile_id,
-                rp_id,
-                reason,
-                ..
-            } => {
-                check_str(
-                    profile_id.as_str(),
-                    "profile_id",
-                    MAX_PROFILE_ID_LEN,
-                    &mut errors,
-                );
-                check_str(rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                if let Some(r) = reason {
-                    check_str(r, "reason", MAX_REASON_LEN, &mut errors);
-                }
-            }
-            Self::ShowDelegation { .. }
-            | Self::WaitDelegation { .. }
-            | Self::CancelDelegation { .. } => {}
+            | Self::BrowserStatus => {}
             Self::ListCredentials { .. } => {}
-            Self::EnsureBrowser { start_url } => {
+            Self::EnsureBrowser { start_url, .. } => {
                 if let Some(url) = start_url {
                     check_str(url, "start_url", MAX_START_URL_LEN, &mut errors);
                 }
@@ -1419,29 +1359,6 @@ impl Validate for PrincipalRequest {
                     errors.push(format!(
                         "browser_control: timeout_ms must be between 1 and {}",
                         MAX_CDP_TIMEOUT_MS
-                    ));
-                }
-            }
-            Self::SignAssertion(req) => {
-                check_str(&req.origin, "origin", MAX_ORIGIN_LEN, &mut errors);
-                if let Some(ref top_origin) = req.top_origin {
-                    check_str(top_origin, "top_origin", MAX_ORIGIN_LEN, &mut errors);
-                }
-                check_str(&req.rp_id, "rp_id", MAX_RP_ID_LEN, &mut errors);
-                check_str(
-                    &req.challenge_b64u,
-                    "challenge_b64u",
-                    MAX_B64U_LEN,
-                    &mut errors,
-                );
-                if req.challenge_b64u.is_empty() {
-                    errors.push("sign_assertion: challenge_b64u must not be empty".into());
-                }
-                if req.allow_credentials.len() > MAX_ALLOW_CREDENTIALS {
-                    errors.push(format!(
-                        "sign_assertion: allow_credentials exceeds maximum length {} (got {})",
-                        MAX_ALLOW_CREDENTIALS,
-                        req.allow_credentials.len()
                     ));
                 }
             }
@@ -1922,11 +1839,18 @@ mod tests {
             ErrorCode::Forbidden,
             ErrorCode::NotFound,
             ErrorCode::Conflict,
-            ErrorCode::InteractionRequired,
             ErrorCode::Internal,
             ErrorCode::VersionMismatch,
             ErrorCode::MessageTooLarge,
             ErrorCode::MalformedMessage,
+            ErrorCode::NotSupported,
+            ErrorCode::InvalidState,
+            ErrorCode::OriginInvalid,
+            ErrorCode::Busy,
+            ErrorCode::Timeout,
+            ErrorCode::Replayed,
+            ErrorCode::BudgetExhausted,
+            ErrorCode::Aborted,
         ] {
             assert_eq!(json_roundtrip(&code), code);
         }
@@ -2040,6 +1964,76 @@ mod tests {
     }
 
     #[test]
+    fn admin_granted_rule_requests_roundtrip() {
+        let profile_id = ProfileId::new("agent").unwrap();
+        for (seq, request) in [
+            AdminRequest::ListGrantedRules { profile_id: None },
+            AdminRequest::ListGrantedRules {
+                profile_id: Some(profile_id.clone()),
+            },
+            AdminRequest::RevokeGrantedRule {
+                profile_id: profile_id.clone(),
+                rp_id: "example.com".into(),
+                action: GrantAction::Authenticate,
+            },
+            AdminRequest::ClearGrantedRules { profile_id },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(request.validate().is_ok());
+            let frame = RequestFrame::Admin(AdminRequestFrame::new(seq as u64 + 1, request));
+            assert_eq!(json_roundtrip(&frame), frame);
+        }
+        let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":9,"action":{"revoke_granted_rule":{"profile_id":"agent","rp_id":"example.com","action":"authenticate"}}}"#;
+        assert!(serde_json::from_str::<RequestFrame>(json).is_ok());
+        let empty_rp = AdminRequest::RevokeGrantedRule {
+            profile_id: ProfileId::new("agent").unwrap(),
+            rp_id: String::new(),
+            action: GrantAction::Authenticate,
+        };
+        assert!(empty_rp.validate().is_err());
+    }
+
+    #[test]
+    fn admin_granted_rule_responses_roundtrip() {
+        let list = GrantedRuleList {
+            profiles: vec![
+                ProfileGrantedRules {
+                    profile_id: "agent".into(),
+                    enabled: true,
+                    disabled_reason: None,
+                    digest: "00".repeat(32),
+                    rules: vec![GrantedRuleInfo {
+                        rp_id: "example.com".into(),
+                        action: "authenticate".into(),
+                        kind: "registration".into(),
+                        granted_at: "2026-11-11T00:00:00Z".into(),
+                        request_id: "esc-1".into(),
+                        origin: "https://example.com".into(),
+                        rule: "example.com".into(),
+                        credential_ref: Some("ab".repeat(16)),
+                    }],
+                },
+                ProfileGrantedRules {
+                    profile_id: "broken".into(),
+                    enabled: false,
+                    disabled_reason: Some("mode 0644".into()),
+                    digest: "00".repeat(32),
+                    rules: vec![],
+                },
+            ],
+        };
+        for response in [
+            AdminResponse::GrantedRuleList(list),
+            AdminResponse::GrantedRulesRevoked { revoked: 3 },
+        ] {
+            let frame = ResponseFrame::Admin(AdminResponseFrame::ok(4, response));
+            assert_eq!(json_roundtrip(&frame), frame);
+        }
+    }
+
+    #[test]
     fn admin_pong_response_roundtrip() {
         let frame = ResponseFrame::Admin(AdminResponseFrame::ok(1, AdminResponse::Pong));
         assert_eq!(json_roundtrip(&frame), frame);
@@ -2121,16 +2115,6 @@ mod tests {
     }
 
     #[test]
-    fn principal_capabilities_request_roundtrip() {
-        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
-            3,
-            PrincipalRequest::Capabilities,
-            test_capability_proof(),
-        ));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
     fn principal_authority_request_roundtrip() {
         let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
             4,
@@ -2141,69 +2125,9 @@ mod tests {
     }
 
     #[test]
-    fn principal_create_intent_roundtrip() {
-        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
-            4,
-            PrincipalRequest::CreateIntent {
-                profile_id: ProfileId::new("test").unwrap(),
-                action: IntentAction::Authenticate,
-                rp_id: "example.com".into(),
-                credential_ref: Some(test_cred_ref("abcdef01")),
-                reason: Some("login".into()),
-                grant_ttl_secs: None,
-                session_ttl_secs: None,
-            },
-            test_capability_proof(),
-        ));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
-    fn principal_request_delegation_roundtrip() {
-        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
-            5,
-            PrincipalRequest::RequestDelegation {
-                profile_id: ProfileId::new("test").unwrap(),
-                rp_id: "example.com".into(),
-                credential_ref: test_cred_ref("abcdef01"),
-                max_session_ttl: 900,
-                reason: None,
-            },
-            test_capability_proof(),
-        ));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
-    fn principal_cancel_intent_roundtrip() {
-        let req_id = PendingRequestId::new();
-        let frame = RequestFrame::Principal(PrincipalRequestFrame::new(
-            6,
-            PrincipalRequest::CancelIntent { request_id: req_id },
-            test_capability_proof(),
-        ));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
     fn principal_pong_response_roundtrip() {
         let frame =
             ResponseFrame::Principal(PrincipalResponseFrame::ok(1, PrincipalResponse::Pong));
-        assert_eq!(json_roundtrip(&frame), frame);
-    }
-
-    #[test]
-    fn principal_capabilities_response_roundtrip() {
-        let caps = PrincipalCapabilities {
-            profile_id: "test".into(),
-            mode: "isolated".into(),
-            allowed_rp_ids: vec!["example.com".into()],
-            registration_allowed: true,
-        };
-        let frame = ResponseFrame::Principal(PrincipalResponseFrame::ok(
-            2,
-            PrincipalResponse::Capabilities(caps),
-        ));
         assert_eq!(json_roundtrip(&frame), frame);
     }
 
@@ -2416,53 +2340,6 @@ mod tests {
     #[test]
     fn validate_principal_ping_ok() {
         assert!(PrincipalRequest::Ping.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_principal_create_intent_ok() {
-        let req = PrincipalRequest::CreateIntent {
-            profile_id: ProfileId::new("test").unwrap(),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".into(),
-            credential_ref: Some(test_cred_ref("abcdef01")),
-            reason: None,
-            grant_ttl_secs: None,
-            session_ttl_secs: None,
-        };
-        assert!(req.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_principal_create_intent_empty_profile() {
-        let req = PrincipalRequest::CreateIntent {
-            profile_id: ProfileId::from_string_unchecked(String::new()),
-            action: IntentAction::Authenticate,
-            rp_id: "example.com".into(),
-            credential_ref: None,
-            reason: None,
-            grant_ttl_secs: None,
-            session_ttl_secs: None,
-        };
-        let errs = req.validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("profile_id")));
-    }
-
-    #[test]
-    fn validate_principal_request_delegation_ok() {
-        let req = PrincipalRequest::RequestDelegation {
-            profile_id: ProfileId::new("test").unwrap(),
-            rp_id: "example.com".into(),
-            credential_ref: test_cred_ref("abcdef01"),
-            max_session_ttl: 900,
-            reason: None,
-        };
-        assert!(req.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_principal_request_delegation_rejects_invalid_ref_serde() {
-        let json = r#"{"request_delegation":{"profile_id":"test","rp_id":"example.com","credential_ref":"","max_session_ttl":900}}"#;
-        assert!(serde_json::from_str::<PrincipalRequest>(json).is_err());
     }
 
     #[test]
@@ -2754,7 +2631,7 @@ mod tests {
 
     #[test]
     fn admin_frame_rejects_principal_action() {
-        let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":1,"action":{"create_intent":{"profile_id":"t","action":"authenticate","rp_id":"x"}}}"#;
+        let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":1,"action":"capabilities"}"#;
         assert!(serde_json::from_str::<RequestFrame>(json).is_err());
     }
 
@@ -2795,21 +2672,6 @@ mod tests {
             serde_json::from_str::<RequestFrame>(json_cancel).is_err(),
             "principal must not have CancelUv"
         );
-    }
-
-    #[test]
-    fn principal_capabilities_response_no_secrets() {
-        let caps = PrincipalCapabilities {
-            profile_id: "test".into(),
-            mode: "isolated".into(),
-            allowed_rp_ids: vec!["example.com".into()],
-            registration_allowed: false,
-        };
-        let json = serde_json::to_string(&caps).unwrap();
-        assert!(!json.contains("private"));
-        assert!(!json.contains("key"));
-        assert!(!json.contains("pin"));
-        assert!(!json.contains("secret"));
     }
 
     #[cfg(target_os = "linux")]
@@ -3101,6 +2963,8 @@ mod tests {
 
     fn valid_sign_request() -> SignAssertionRequest {
         SignAssertionRequest {
+            extensions: Vec::new(),
+            timeout_ms: None,
             origin: "https://example.com".to_string(),
             top_origin: None,
             rp_id: "example.com".to_string(),
@@ -3114,89 +2978,15 @@ mod tests {
     #[test]
     fn sign_assertion_valid_roundtrip() {
         let req = valid_sign_request();
-        assert!(
-            PrincipalRequest::SignAssertion(req.clone())
-                .validate()
-                .is_ok()
-        );
         let json = serde_json::to_string(&req).unwrap();
         let decoded: SignAssertionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, req);
     }
 
     #[test]
-    fn sign_assertion_empty_origin_rejected() {
-        let mut req = valid_sign_request();
-        req.origin = String::new();
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("origin")));
-    }
-
-    #[test]
-    fn sign_assertion_oversized_origin_rejected() {
-        let mut req = valid_sign_request();
-        req.origin = "x".repeat(MAX_ORIGIN_LEN + 1);
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("origin")));
-    }
-
-    #[test]
-    fn sign_assertion_empty_rp_id_rejected() {
-        let mut req = valid_sign_request();
-        req.rp_id = String::new();
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("rp_id")));
-    }
-
-    #[test]
-    fn sign_assertion_oversized_rp_id_rejected() {
-        let mut req = valid_sign_request();
-        req.rp_id = "x".repeat(MAX_RP_ID_LEN + 1);
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("rp_id")));
-    }
-
-    #[test]
-    fn sign_assertion_empty_challenge_rejected() {
-        let mut req = valid_sign_request();
-        req.challenge_b64u = String::new();
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("challenge_b64u")));
-    }
-
-    #[test]
-    fn sign_assertion_oversized_challenge_rejected() {
-        let mut req = valid_sign_request();
-        req.challenge_b64u = "x".repeat(MAX_B64U_LEN + 1);
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("challenge_b64u")));
-    }
-
-    #[test]
-    fn sign_assertion_oversized_allow_credentials_rejected() {
-        let mut req = valid_sign_request();
-        req.allow_credentials = vec!["x".repeat(64); MAX_ALLOW_CREDENTIALS + 1];
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("allow_credentials")));
-    }
-
-    #[test]
-    fn sign_assertion_null_in_origin_rejected() {
-        let mut req = valid_sign_request();
-        req.origin = "https://exam\0ple.com".to_string();
-        let errs = PrincipalRequest::SignAssertion(req).validate().unwrap_err();
-        assert!(errs.0.iter().any(|e| e.contains("origin")));
-    }
-
-    #[test]
     fn sign_assertion_user_verification_roundtrip() {
         let mut req = valid_sign_request();
         req.user_verification = true;
-        assert!(
-            PrincipalRequest::SignAssertion(req.clone())
-                .validate()
-                .is_ok()
-        );
         let json = serde_json::to_string(&req).unwrap();
         let decoded: SignAssertionRequest = serde_json::from_str(&json).unwrap();
         assert!(decoded.user_verification);
@@ -3216,6 +3006,8 @@ mod tests {
             pid: 1234,
             start_url: Some("https://example.com".into()),
             cdp_endpoint: None,
+            interception: None,
+            incognito_allowed: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("cdp_endpoint"));
@@ -3231,6 +3023,8 @@ mod tests {
             pid: 5678,
             start_url: None,
             cdp_endpoint: Some("http://127.0.0.1:9222".into()),
+            interception: Some("attached".into()),
+            incognito_allowed: Some(false),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("cdp_endpoint"));

@@ -4,115 +4,95 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use passless_core::agent::protocol::{
     AdminRequest, AdminResponse, AuthorityBrowser, AuthorityCeremony, AuthorityCredentialScope,
     AuthorityIdentity, AuthorityRisk, AuthorityRpRule, AuthoritySession, DoctorResponse,
-    EffectiveAuthority, ErrorCode, PeerCred, PrincipalCapabilities, PrincipalInstructions,
-    PrincipalLaunchedResponse, PrincipalRequest, PrincipalResponse, PrincipalWaitResponse,
-    ProtocolError, RecommendedAction,
+    EffectiveAuthority, ErrorCode, PeerCred, PrincipalInstructions, PrincipalLaunchedResponse,
+    PrincipalRequest, PrincipalResponse, PrincipalWaitResponse, ProtocolError, RecommendedAction,
 };
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, BrowserLeaseId, BrowserScope, DaemonStatus,
-    EndpointId, EndpointStatusResponse, GrantId, PendingRequestId, PrincipalSessionId, ProfileId,
+    GrantId, PrincipalSessionId, ProfileId,
 };
 use passless_core::config::{PinConfig, SecurityConfig, UvConfig};
 
 use super::audit::AuditGate;
 use super::audit_events::{
-    BackendKind, DaemonStartBuilder, DaemonStopBuilder, EndpointCreateBuilder, FailReason,
-    ProfileCreateBuilder, ProfileFailBuilder, StopReason,
+    BackendKind, DaemonStartBuilder, DaemonStopBuilder, FailReason, ProfileCreateBuilder,
+    ProfileFailBuilder, RevokeReason, StopReason,
 };
 use super::backend::CredentialBackendHandle;
 use super::browser::{BrowserConfig, BrowserProcessManager, Clock, SystemClock};
-use super::ceremony::{
-    AgentCeremonyHandler, CeremonyPreparationSlot, StaticCeremonyContext,
-    StaticCeremonyContextConfig,
+use super::escalation::{
+    EscalationDeps, EscalationService, Prompter, StoreGrantWriter, UnavailablePrompter,
 };
-use super::device::EndpointBinding;
-use super::endpoint_manager::EndpointManager;
-use super::intent::SystemClock as IntentSystemClock;
-use super::interaction::AgentInteractionManager;
+use super::granted_rules::GrantedRulesStore;
 use super::ipc::{AdminHandler, IpcServer, PrincipalHandler, ProfileAccess, RuntimeDir};
 use super::launcher::{
     PrincipalSession, SessionCapability, SpawnConfig, dup_fd_cloexec, spawn_principal,
     verify_process_ancestry,
 };
+use super::operation_audit::AuditDeployment;
 use super::policy_engine::PolicyRuntime;
-use super::prompt::{DesktopPromptHandle, PromptHandle, PromptMode};
-use super::sign::{SignContextRegistry, SignHttpServer};
-use super::storage::{CeremonyScope, ForwardingStorageHandle, IsolatedScopedStorage};
+use super::prompt::{NotificationPrompter, ProcessSpawner};
+use super::sign::SignContextRegistry;
 use super::storage_factory::{create_storage_bundle_with_options, key_provider_for_config};
+use super::transport::{ReadinessRegistry, SignTransportServer, TransportOptions};
 use passless_core::agent::config::CdpExposeMode;
 
-use crate::authenticator::AuthenticatorService;
 use crate::storage::CredentialStorage;
-use crate::worker::{WorkerConfig, WorkerHooks};
-
-#[cfg(feature = "agent")]
-use passless_uhid::RawUhidDevice;
-
 mod browser_ensure;
+mod gates;
+mod interception;
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WORKERS: usize = 16;
 const MAX_COMPLETED_SESSIONS: usize = 256;
 const COMPLETED_SESSION_TTL: Duration = Duration::from_secs(600);
 const WAIT_PRINCIPAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub type EndpointFactory = Arc<
-    dyn Fn(&passless_core::agent::DeviceIdentity) -> Result<RawUhidDevice, String> + Send + Sync,
->;
-
-#[cfg(test)]
-pub type TestTransportFactory =
-    Arc<dyn Fn() -> Result<Box<dyn crate::worker::HidEndpoint>, String> + Send + Sync>;
-
 pub struct RuntimeStartParams<'a> {
     pub human_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
     pub human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
     pub human_operation_lock: Arc<Mutex<()>>,
     pub human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
+    /// The storage kind of the human backend (the one same-user profiles share), for audit records.
+    pub human_backend_kind: BackendKind,
     pub agent_config: &'a AgentConfig,
     pub security_config: SecurityConfig,
     pub pin_config: PinConfig,
     pub uv_config: UvConfig,
     pub shutdown: Arc<AtomicBool>,
-    pub endpoint_factory: Option<EndpointFactory>,
+    /// Where a policy reload re-reads the configuration from. `None` disables reload.
+    pub config_source: Option<AgentConfigSource>,
+    /// `PASSLESS_INTERACTION_MODE=automatic` is in force for the human path (R19).
+    pub human_path_automatic: bool,
 }
 
-struct CreateIntentParams<'a> {
-    profile_id: &'a ProfileId,
-    session_id: &'a PrincipalSessionId,
-    endpoint_id: &'a EndpointId,
-    action: &'a passless_core::agent::protocol::IntentAction,
-    rp_id: &'a str,
-    credential_ref: Option<&'a passless_core::agent::CredentialRef>,
-    principal_reason: Option<String>,
-    clamped_grant_ttl_secs: Option<u64>,
-    clamped_session_ttl_secs: Option<u64>,
-    profile: &'a ProfileRuntime,
-    session_digest: &'a super::intent::ProcessIdentityDigest,
+/// The configuration file a policy reload re-reads and validates (ADR 0014 section 6.4).
+#[derive(Clone, Debug)]
+pub struct AgentConfigSource {
+    /// The Passless configuration file the daemon started from.
+    pub path: std::path::PathBuf,
+    /// The human backend state path, for the agent root overlap check of `AgentConfig::validate`.
+    pub human_state_path: Option<std::path::PathBuf>,
 }
 
-#[allow(dead_code)]
-struct RequestDelegationParams<'a> {
-    profile_id: &'a ProfileId,
-    session_id: &'a PrincipalSessionId,
-    endpoint_id: &'a EndpointId,
-    rp_id: &'a str,
-    credential_ref: &'a passless_core::agent::CredentialRef,
-    max_session_ttl: u64,
-    principal_reason: Option<String>,
-    profile: &'a ProfileRuntime,
-    session_digest: &'a super::intent::ProcessIdentityDigest,
+impl AgentConfigSource {
+    /// Read, parse and validate the `[agents]` table of the configuration file.
+    pub fn load(&self) -> Result<AgentConfig, String> {
+        let config = AgentConfig::from_config_file(&self.path).map_err(|e| e.format_cli())?;
+        config
+            .validate(self.human_state_path.as_deref())
+            .map_err(|e| e.format_cli())?;
+        Ok(config)
+    }
 }
 
 #[derive(Clone)]
@@ -136,14 +116,289 @@ pub struct EndpointSpec {
     pub isolated_deps: Option<IsolatedEndpointDeps>,
 }
 
-#[derive(Clone)]
-pub struct IsolatedEndpointDeps {
-    pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
-    pub pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
-    pub ceremony_scope: CeremonyScope,
-    #[cfg(feature = "tpm")]
-    pub tpm_key_provider:
-        Arc<Mutex<Option<crate::storage::tpm::portable::TpmCredentialKeyProvider>>>,
+/// Open the granted-rules store under the effective `agents.state_dir`. Without a state directory
+/// every profile's grants are disabled (fail closed).
+fn open_granted_rules(agent_config: &AgentConfig) -> GrantedRulesStore {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let profiles = agent_config
+        .profiles
+        .keys()
+        .filter_map(|name| ProfileId::new(name.as_str()).ok());
+    match agent_config.effective_state_dir(euid) {
+        Some(state_dir) => GrantedRulesStore::open(&state_dir, profiles),
+        None => GrantedRulesStore::disabled(
+            profiles,
+            "no agents.state_dir and no home directory to derive it from",
+        ),
+    }
+}
+
+/// The escalation coordinator (ADR 0014 section 8): prompts go to `agents.notify_user` through
+/// the privilege-dropping prompt child. A daemon that cannot reach any session bus
+/// (`escalation_unavailable_reason`) refuses every escalation with `escalation_unavailable`
+/// without prompting.
+fn build_escalation_service(
+    agent_config: &AgentConfig,
+    daemon_uid: u32,
+    audit_gate: Arc<AuditGate>,
+    granted_rules: Arc<GrantedRulesStore>,
+    policy_runtime: Arc<PolicyRuntime>,
+) -> Arc<EscalationService> {
+    let prompter: Arc<dyn Prompter> = match agent_config.escalation_unavailable_reason(daemon_uid) {
+        Some(reason) => {
+            warn!("agent escalation unavailable: {}", reason);
+            Arc::new(UnavailablePrompter::new(reason))
+        }
+        None => Arc::new(NotificationPrompter::new(Arc::new(ProcessSpawner::new(
+            agent_config.notify_user.clone(),
+        )))),
+    };
+    EscalationService::new(EscalationDeps {
+        audit: audit_gate,
+        grants: Arc::new(StoreGrantWriter {
+            store: granted_rules,
+            policy: policy_runtime,
+        }),
+        prompter,
+        clock: Arc::new(super::identity::SystemClock::new()),
+        cooldown: agent_config.escalation_cooldown(),
+    })
+}
+
+fn granted_rules_error(error: super::granted_rules::GrantStoreError) -> ProtocolError {
+    use super::granted_rules::GrantStoreError;
+    let code = match &error {
+        GrantStoreError::UnknownProfile(_) | GrantStoreError::NotFound => ErrorCode::NotFound,
+        GrantStoreError::InvalidRpId(_) => ErrorCode::BadRequest,
+        GrantStoreError::Unavailable(_)
+        | GrantStoreError::CapReached(_)
+        | GrantStoreError::Revoked => ErrorCode::Conflict,
+        GrantStoreError::Io(_) => ErrorCode::Internal,
+    };
+    ProtocolError::new(code, error.to_string(), RecommendedAction::FixRequest)
+}
+
+/// The RP ID of an admin revoke request, normalized as the granted-rules store normalizes it
+/// (`validate_rp_id`), so the `granted_rule.revoke` audit names the rule that was removed. An
+/// invalid one is a bad request.
+fn normalize_admin_rp_id(raw: &str) -> Result<String, ProtocolError> {
+    passless_core::agent::validate_rp_id(raw).map_err(|e| {
+        ProtocolError::new(
+            ErrorCode::BadRequest,
+            format!("invalid RP ID: {e}"),
+            RecommendedAction::FixRequest,
+        )
+    })
+}
+
+/// Remove every granted rule of `profile_id` and audit it. An approval in flight may write its
+/// grant after the clear, so the profile's escalations are cancelled once the store has been
+/// cleared: a late approval is compensated (`escalation.revoked`, reason `policy_reload`) and its
+/// prompt is withdrawn. No lock is held on entry; the caller revokes the stale sessions.
+pub(crate) fn clear_granted_rules(
+    store: &GrantedRulesStore,
+    policy_runtime: &PolicyRuntime,
+    escalation: &EscalationService,
+    audit_gate: &AuditGate,
+    profile_id: &ProfileId,
+) -> Result<super::granted_rules::RevokeOutcome, ProtocolError> {
+    let outcome = store
+        .clear(policy_runtime, profile_id)
+        .map_err(granted_rules_error)?;
+    escalation.cancel_profile(profile_id);
+    if outcome.revoked > 0 {
+        let event = super::audit_events::GrantedRuleRevokeBuilder::new(
+            profile_id.clone(),
+            None,
+            outcome.revoked,
+        )
+        .build();
+        let _ = audit_gate.record(event);
+    }
+    Ok(outcome)
+}
+
+/// Revoke the granted rule of one RP and audit it. As with [`clear_granted_rules`], an approval in
+/// flight for that RP may write its grant after the revocation, so the RP's escalations (any
+/// action) are cancelled once the store call has returned: a late approval is compensated and its
+/// prompt withdrawn (review L2). No lock is held on entry (LOCKING.md, "Granted rules"); the
+/// caller revokes the stale sessions.
+pub(crate) fn revoke_granted_rule(
+    store: &GrantedRulesStore,
+    policy_runtime: &PolicyRuntime,
+    escalation: &EscalationService,
+    audit_gate: &AuditGate,
+    profile_id: &ProfileId,
+    rp_id: &str,
+    action: super::granted_rules::GrantedAction,
+) -> Result<super::granted_rules::RevokeOutcome, ProtocolError> {
+    let revoked = store.revoke(policy_runtime, profile_id, rp_id, action);
+    // Also when nothing was stored: an approval between its last re-check and its store write
+    // would otherwise persist the grant the operator just asked to be gone.
+    escalation.cancel_rp(profile_id, rp_id);
+    let outcome = revoked.map_err(granted_rules_error)?;
+    let event = super::audit_events::GrantedRuleRevokeBuilder::new(
+        profile_id.clone(),
+        Some(rp_id.to_string()),
+        outcome.revoked,
+    )
+    .build();
+    let _ = audit_gate.record(event);
+    Ok(outcome)
+}
+
+/// Close the leases named by `lease_ids` (see [`close_lease_audited`]); a lease that is already
+/// gone, or an id that does not parse, is skipped.
+fn close_leases_by_id(
+    audit_gate: &AuditGate,
+    sign_registry: &SignContextRegistry,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_ids: &[String],
+    reason: RevokeReason,
+) {
+    for raw in lease_ids {
+        if let Ok(lease_id) = raw.parse::<BrowserLeaseId>() {
+            close_lease_audited(audit_gate, sign_registry, browser_mgr, &lease_id, reason);
+        }
+    }
+}
+
+/// Revoke, terminate and clean up one lease and audit it (ADR 0014 section 12):
+/// `browser_lease.revoke` with `reason`, then `browser_lease.cleanup` (and `quarantine` when the
+/// cleanup found a problem). A lease that is already gone writes nothing, so each teardown is
+/// audited once however many paths race to it. The audit gate is a terminal leaf (LOCKING.md,
+/// rule 5), so it may be called under the browser manager.
+fn close_lease_audited(
+    audit_gate: &AuditGate,
+    sign_registry: &SignContextRegistry,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+    reason: RevokeReason,
+) {
+    sign_registry.revoke_by_lease(lease_id.as_str());
+    if browser_mgr.revoke(lease_id).is_ok() {
+        let _ = audit_gate.record(
+            super::audit_events::BrowserLeaseRevokeBuilder::new(lease_id.clone(), reason).build(),
+        );
+    }
+    let _ = browser_mgr.terminate(lease_id);
+    finish_lease_audited(audit_gate, browser_mgr, lease_id);
+}
+
+/// Clean up the directory of a lease and forget it, auditing `browser_lease.cleanup` (and
+/// `quarantine`). A lease the manager no longer holds is only forgotten: nothing was cleaned.
+fn finish_lease_audited(
+    audit_gate: &AuditGate,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+) {
+    let quarantine = match browser_mgr.cleanup(lease_id) {
+        Ok(super::browser::CleanupSafety::Clean) => None,
+        Ok(super::browser::CleanupSafety::Quarantined { .. }) => {
+            Some(super::audit_events::QuarantineReason::IntegrityViolation)
+        }
+        Ok(super::browser::CleanupSafety::Failed { .. }) => {
+            Some(super::audit_events::QuarantineReason::ManifestTampered)
+        }
+        // Already gone: nothing was closed, nothing to audit.
+        Err(_) => {
+            browser_mgr.remove(lease_id);
+            return;
+        }
+    };
+    let _ = audit_gate
+        .record(super::audit_events::BrowserLeaseCleanupBuilder::new(lease_id.clone()).build());
+    if let Some(reason) = quarantine {
+        let _ = audit_gate.record(
+            super::audit_events::BrowserLeaseQuarantineBuilder::new(lease_id.clone(), reason)
+                .build(),
+        );
+    }
+    browser_mgr.remove(lease_id);
+}
+
+/// How a lease ended without anyone revoking it.
+enum LeaseEnd {
+    /// The browser exited on its own (`browser_lease.crash`, with the exit code, -1 for a signal).
+    Crashed { exit_code: Option<i32> },
+    /// The login or session deadline passed (`browser_lease.expire`).
+    Expired,
+}
+
+/// Audit the end of a lease the runtime loop found dead (`browser_lease.crash` or `expire`), then
+/// clean it up and audit that. The loop finds each dead lease once: `check_exits` marks the child
+/// reaped and `check_expired` moves the lease out of the live states.
+fn retire_dead_lease_audited(
+    audit_gate: &AuditGate,
+    browser_mgr: &mut BrowserProcessManager,
+    lease_id: &BrowserLeaseId,
+    end: LeaseEnd,
+) {
+    let event = match end {
+        LeaseEnd::Crashed { exit_code } => super::audit_events::BrowserLeaseCrashBuilder::new(
+            lease_id.clone(),
+            exit_code.unwrap_or(-1),
+        )
+        .build(),
+        LeaseEnd::Expired => {
+            super::audit_events::BrowserLeaseExpireBuilder::new(lease_id.clone()).build()
+        }
+    };
+    let _ = audit_gate.record(event);
+    finish_lease_audited(audit_gate, browser_mgr, lease_id);
+}
+
+/// Audit `browser_lease.launch` for a lease that was spawned and recorded.
+fn audit_lease_launch(
+    audit_gate: &AuditGate,
+    lease_id: &BrowserLeaseId,
+    profile_id: &ProfileId,
+    cdp_expose: passless_core::agent::config::CdpExposeMode,
+) {
+    let _ = audit_gate.record(
+        super::audit_events::BrowserLeaseLaunchBuilder::new(lease_id.clone(), profile_id.clone())
+            .with_cdp_expose(cdp_expose.to_string())
+            .build(),
+    );
+}
+
+/// Re-read and validate the configuration file, check it can replace `current` without a restart,
+/// and apply it to `policy_runtime`. On any error nothing changes: the old generation, sessions and
+/// revocation epoch stay in force (ADR 0014 section 6.4).
+fn reload_policy_from_source(
+    source: Option<&AgentConfigSource>,
+    current: &AgentConfig,
+    policy_runtime: &PolicyRuntime,
+    human_path_automatic: bool,
+) -> Result<(AgentConfig, super::policy_engine::ReloadOutcome), String> {
+    let source =
+        source.ok_or_else(|| "the daemon was started without a configuration file".to_string())?;
+    let config = source.load()?;
+    if let Some(reason) = current.reload_incompatibility(&config) {
+        return Err(format!("{} (restart the daemon to apply it)", reason));
+    }
+    // R19 holds for a reloaded configuration too: it may not add an `allow` or `request` rule to
+    // a same-user profile while the human path is automatic, unless acknowledged.
+    config
+        .validate_human_path_interaction(human_path_automatic)
+        .map_err(|e| e.to_string())?;
+    let outcome = policy_runtime
+        .reload(&config)
+        .map_err(|e| format!("policy recompile failed: {}", e))?;
+    Ok((config, outcome))
+}
+
+/// Default bearer session TTL when a profile sets no `max_session_ttl`.
+const DEFAULT_SESSION_TTL_SECS: u64 = 300;
+
+/// The TTL of a profile's bearer sessions and of the session grants behind them.
+fn session_ttl_secs(profile_config: &AgentProfileConfig) -> u64 {
+    profile_config
+        .max_session_ttl
+        .as_ref()
+        .map(|ttl| ttl.as_secs())
+        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
 }
 
 fn extract_cdp_method_for_audit(json: &str) -> String {
@@ -158,25 +413,6 @@ fn extract_cdp_method_for_audit(json: &str) -> String {
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
-#[derive(Debug, Clone)]
-pub enum EndpointEvent {
-    ResponseSent {
-        endpoint_id: EndpointId,
-        profile_id: ProfileId,
-    },
-}
-
-pub type EndpointEventSender = mpsc::Sender<EndpointEvent>;
-pub type EndpointEventReceiver = mpsc::Receiver<EndpointEvent>;
-
-pub struct PendingRuntime {
-    pub request_id: PendingRequestId,
-    pub prep_generation: u64,
-    pub session_id: PrincipalSessionId,
-    pub browser_lease_id: Option<BrowserLeaseId>,
-    pub clamped_session_ttl_secs: u64,
-}
-
 pub struct ActiveBrowserLease {
     pub lease_id: BrowserLeaseId,
     pub session_id: PrincipalSessionId,
@@ -184,6 +420,11 @@ pub struct ActiveBrowserLease {
 
 pub struct SharedBrowserLease {
     pub lease_id: BrowserLeaseId,
+    /// The principal session that launched the browser. The worker's bearer, the session grant
+    /// and the bearer session behind the lease are the owner's: a session that attaches later
+    /// (`browser_scope = "profile"`) rides on them. So the browser lives only as long as its
+    /// owner (see [`detach_session_from_shared`]).
+    pub owner_session: PrincipalSessionId,
     pub ref_count: usize,
     pub attached_sessions: std::collections::HashSet<PrincipalSessionId>,
 }
@@ -219,7 +460,13 @@ fn detach_session_from_shared(
         return SharedDetachOutcome::Keep;
     }
     lease.sync_ref_count();
-    if lease.ref_count == 0 {
+    // The last session out closes the browser. So does the owner, even when others remain: the
+    // bearer the worker holds, and the grant and bearer session behind it, are the owner's
+    // (revoked with its exit), so the browser could no longer intercept for the sessions left
+    // (P5 review L5). They are detached from it and launch their own on their next `EnsureBrowser`,
+    // with a bearer and grant bound to themselves; rebinding the worker's baked-in bearer to
+    // another principal is not possible.
+    if lease.ref_count == 0 || lease.owner_session == *session_id {
         let lease_id = lease.lease_id.clone();
         shared.remove(profile_id);
         SharedDetachOutcome::Terminate(lease_id)
@@ -235,19 +482,36 @@ fn cleanup_all_shared_for_profile(
     shared.remove(profile_id).map(|lease| lease.lease_id)
 }
 
+/// The wire form of a rule action. `allow` always uses agent evidence (ADR 0014 section 7), and
+/// `deny` and `request` set no UP or UV at all.
+///
+/// The `user_presence` / `user_verification` wire fields remain in the authority report for client
+/// compatibility; they only ever say `agent` or `none`.
+fn authority_ceremony(action: passless_core::agent::RuleAction) -> AuthorityCeremony {
+    let evidence = if action == passless_core::agent::RuleAction::Allow {
+        "agent"
+    } else {
+        "none"
+    };
+    AuthorityCeremony {
+        authorization: action.to_string(),
+        user_presence: evidence.to_string(),
+        user_verification: evidence.to_string(),
+    }
+}
+
 pub struct ProfileRuntime {
     pub profile_name: String,
     pub profile_id: ProfileId,
     pub uid: u32,
     pub gid: u32,
-    pub endpoint_id: Mutex<Option<EndpointId>>,
     pub lifecycle_lock: Mutex<()>,
-    pub endpoint_spec: EndpointSpec,
-    pub preparation_slot: Arc<CeremonyPreparationSlot>,
+    pub security_config: SecurityConfig,
     pub operation_lock: Arc<Mutex<()>>,
     pub mode: AgentMode,
+    /// The storage kind this profile's operations use (audit records, ADR 0014 section 12).
+    pub backend_kind: BackendKind,
     pub profile_config: AgentProfileConfig,
-    pub current_pending: Mutex<Option<PendingRuntime>>,
     pub active_browser: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>>,
     pub shared_browsers: Mutex<HashMap<ProfileId, SharedBrowserLease>>,
     pub daemon_uid: u32,
@@ -261,12 +525,10 @@ pub struct ProfileRuntime {
 
 impl core::fmt::Debug for ProfileRuntime {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let eid = self.endpoint_id.lock().unwrap().clone();
         f.debug_struct("ProfileRuntime")
             .field("profile_name", &self.profile_name)
             .field("uid", &self.uid)
             .field("gid", &self.gid)
-            .field("endpoint_id", &eid)
             .field("mode", &self.mode)
             .field("daemon_uid", &self.daemon_uid)
             .field("daemon_gid", &self.daemon_gid)
@@ -276,13 +538,68 @@ impl core::fmt::Debug for ProfileRuntime {
     }
 }
 
+impl ProfileRuntime {
+    /// The profile's place in the section 13 matrix: its mode and the principal relationship.
+    pub fn deployment_axes(&self) -> super::deployment::DeploymentAxes {
+        super::deployment::DeploymentAxes::new(self.mode, self.uid, self.daemon_uid)
+    }
+
+    /// What this profile's operation records say about the deployment (ADR 0014 sections 5, 12
+    /// and 13): the identity mode, the principal relationship (the principal's UID against the
+    /// daemon's), the storage kind and the key provider.
+    pub fn audit_deployment(&self) -> AuditDeployment {
+        AuditDeployment::new(
+            self.mode,
+            self.deployment_axes().relationship,
+            self.backend_kind,
+            &*self.backend.key_provider,
+        )
+    }
+}
+
+/// Credentials across the distinct storages in `storages` (a storage shared by several profiles is
+/// counted once). The lock is taken with recovery: a poisoned lock must not silently drop a
+/// backend from the count.
+fn distinct_credential_count<'a>(
+    storages: impl Iterator<Item = &'a Arc<Mutex<Box<dyn CredentialStorage>>>>,
+) -> u32 {
+    let mut seen: Vec<*const Mutex<Box<dyn CredentialStorage>>> = Vec::new();
+    let mut total = 0usize;
+    for storage in storages {
+        let ptr = Arc::as_ptr(storage);
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        total += crate::storage::lock_shared_storage(storage).count_credentials();
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+/// The storage kind a profile's operations use: a same-user profile shares the human backend, so it
+/// reports the human backend's kind; an isolated profile reports its own storage's kind (and the
+/// human kind if its storage is missing, which profile start-up rejects anyway).
+pub fn profile_backend_kind(
+    mode: AgentMode,
+    human_backend_kind: BackendKind,
+    storage: Option<&passless_core::agent::config::AgentStorageConfig>,
+) -> BackendKind {
+    use passless_core::agent::config::AgentStorageConfig;
+    match (mode, storage) {
+        (AgentMode::Isolated, Some(AgentStorageConfig::Local { .. })) => BackendKind::Local,
+        (AgentMode::Isolated, Some(AgentStorageConfig::Pass { .. })) => BackendKind::Pass,
+        #[cfg(feature = "tpm")]
+        (AgentMode::Isolated, Some(AgentStorageConfig::Tpm { .. })) => BackendKind::Tpm,
+        _ => human_backend_kind,
+    }
+}
+
 #[derive(Debug)]
 pub enum RuntimeError {
     Config(String),
     UserResolve { user: String, detail: String },
     Audit(String),
     Ipc(String),
-    Endpoint(String),
     Storage(String),
     Policy(String),
     Service(String),
@@ -297,7 +614,6 @@ impl std::fmt::Display for RuntimeError {
             }
             Self::Audit(msg) => write!(f, "audit subsystem error: {}", msg),
             Self::Ipc(msg) => write!(f, "IPC error: {}", msg),
-            Self::Endpoint(msg) => write!(f, "endpoint error: {}", msg),
             Self::Storage(msg) => write!(f, "storage error: {}", msg),
             Self::Policy(msg) => write!(f, "policy error: {}", msg),
             Self::Service(msg) => write!(f, "service error: {}", msg),
@@ -306,6 +622,29 @@ impl std::fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+/// The daemon's runtime base: the XDG runtime directory, or `/tmp/passless-agent-<uid>`. The
+/// `/tmp` fallback sits in a world-writable sticky directory, so it is created without following
+/// a symlink, owned by the daemon and mode 0700; a pre-existing entry of that name that the
+/// daemon does not own (planted by another user) is refused, never chmodded or used.
+fn daemon_runtime_base() -> Result<PathBuf, RuntimeError> {
+    if let Some(dir) = dirs::runtime_dir() {
+        return Ok(dir);
+    }
+    // SAFETY: no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let base = PathBuf::from(format!("/tmp/passless-agent-{uid}"));
+    super::safe_fs::Dir::open_or_create_path(&base, 0o700, std::path::Path::new("/tmp")).map_err(
+        |e| {
+            RuntimeError::Config(format!(
+                "cannot create the runtime directory {}: {e}; remove it if it is not yours, or set \
+             XDG_RUNTIME_DIR",
+                base.display()
+            ))
+        },
+    )?;
+    Ok(base)
+}
 
 #[derive(Clone)]
 struct ResolvedUser {
@@ -543,7 +882,7 @@ pub struct ManagedPrincipalSession {
     pub session_id: PrincipalSessionId,
     pub profile_id: ProfileId,
     pub session: PrincipalSession,
-    pub process_digest: super::intent::ProcessIdentityDigest,
+    pub process_digest: super::identity::ProcessIdentityDigest,
     pub created_at: Instant,
     pub deadline: Instant,
     pub client_pid: i32,
@@ -570,7 +909,6 @@ pub struct CompletedSession {
 }
 
 pub struct AgentRuntime {
-    endpoint_manager: Mutex<EndpointManager>,
     ipc_server: Arc<IpcServer>,
     audit_gate: Arc<AuditGate>,
     policy_runtime: Arc<PolicyRuntime>,
@@ -578,7 +916,6 @@ pub struct AgentRuntime {
     profiles: BTreeMap<ProfileId, ProfileRuntime>,
     managed_sessions: BTreeMap<ProfileId, Mutex<Vec<ManagedPrincipalSession>>>,
     completed_sessions: Mutex<BTreeMap<String, CompletedSession>>,
-    event_rx: Mutex<EndpointEventReceiver>,
     shutdown: Arc<AtomicBool>,
     shutdown_requested: AtomicBool,
     runtime_cleanup_started: AtomicBool,
@@ -587,11 +924,23 @@ pub struct AgentRuntime {
     daemon_uid: u32,
     daemon_gid: u32,
     agent_config: std::sync::RwLock<AgentConfig>,
+    config_source: Option<AgentConfigSource>,
     sign_registry: Arc<SignContextRegistry>,
     sign_server_shutdown: Arc<AtomicBool>,
     sign_server_handle: Mutex<Option<JoinHandle<()>>>,
     #[allow(dead_code)]
     sign_socket_path: std::path::PathBuf,
+    /// The sign socket of each browser UID other than the daemon's, or why it is unavailable.
+    sign_uid_sockets: HashMap<u32, Result<PathBuf, String>>,
+    /// Interception readiness per bearer, reported by the extension worker's hello (plan D6.1).
+    sign_readiness: Arc<ReadinessRegistry>,
+    /// The persistent granted-rules store (ADR 0014 section 8.4), also installed as the policy
+    /// runtime's grant source.
+    granted_rules: Arc<GrantedRulesStore>,
+    /// The escalation coordinator every `request` resolution waits on (ADR 0014 section 8).
+    escalation: Arc<EscalationService>,
+    /// `PASSLESS_INTERACTION_MODE=automatic` was in force at start; reloads keep R19.
+    human_path_automatic: bool,
 }
 
 impl AgentRuntime {
@@ -601,23 +950,28 @@ impl AgentRuntime {
         human_pin_storage: Arc<Mutex<Box<dyn crate::pin_storage::PinStorage>>>,
         human_operation_lock: Arc<Mutex<()>>,
         human_key_provider: Arc<dyn soft_fido2::CredentialKeyProvider + Send + Sync>,
+        human_backend_kind: BackendKind,
         agent_config: &AgentConfig,
         security_config: SecurityConfig,
         pin_config: PinConfig,
         uv_config: UvConfig,
         shutdown: Arc<AtomicBool>,
+        config_source: Option<AgentConfigSource>,
+        human_path_automatic: bool,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factories(RuntimeStartParams {
             human_storage,
             human_pin_storage,
             human_operation_lock,
             human_key_provider,
+            human_backend_kind,
             agent_config,
             security_config,
             pin_config,
             uv_config,
             shutdown,
-            endpoint_factory: None,
+            config_source,
+            human_path_automatic,
         })
     }
 
@@ -627,13 +981,21 @@ impl AgentRuntime {
             human_pin_storage,
             human_operation_lock,
             human_key_provider,
+            human_backend_kind,
             agent_config,
             security_config,
             pin_config,
             uv_config,
             shutdown,
-            endpoint_factory,
+            config_source,
+            human_path_automatic,
         } = params;
+        // R19 (ADR 0014 section 7): with the human path approving its own prompts, a request
+        // that reached the native path would be signed silently. Refused before anything starts;
+        // the human path stays available.
+        agent_config
+            .validate_human_path_interaction(human_path_automatic)
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
         let human_backend = CredentialBackendHandle::human(
             human_storage,
             human_pin_storage,
@@ -645,8 +1007,6 @@ impl AgentRuntime {
         let _startup_mono = Instant::now();
 
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let monotonic_clock: Arc<dyn super::intent::MonotonicClock> =
-            Arc::new(IntentSystemClock::new());
 
         let audit_path = agent_config.audit_path.as_ref().ok_or_else(|| {
             RuntimeError::Config("agents.audit_path is required when agent is enabled".into())
@@ -656,17 +1016,27 @@ impl AgentRuntime {
                 .map_err(|e| RuntimeError::Audit(format!("failed to open audit gate: {}", e)))?,
         );
 
-        let start_event = DaemonStartBuilder::new(std::process::id(), BackendKind::Local).build();
+        // Close the reservations that the previous run left open, before this run writes.
+        super::operation_audit::recover_orphan_reservations(&audit_gate);
+
+        let start_event = DaemonStartBuilder::new(std::process::id(), human_backend_kind).build();
         let _ = audit_gate.record(start_event);
 
+        let granted_rules = Arc::new(open_granted_rules(agent_config));
         let policy_runtime = Arc::new(
-            PolicyRuntime::new(
-                agent_config,
-                clock.clone(),
-                monotonic_clock.clone(),
-                Some(audit_gate.clone()),
-            )
-            .map_err(|e| RuntimeError::Policy(format!("failed to create policy runtime: {}", e)))?,
+            PolicyRuntime::new(agent_config, clock.clone(), Some(audit_gate.clone()))
+                .map_err(|e| {
+                    RuntimeError::Policy(format!("failed to create policy runtime: {}", e))
+                })?
+                .with_grant_source(granted_rules.clone()),
+        );
+
+        let escalation = build_escalation_service(
+            agent_config,
+            daemon_uid,
+            audit_gate.clone(),
+            granted_rules.clone(),
+            policy_runtime.clone(),
         );
 
         let browser_manager =
@@ -680,47 +1050,36 @@ impl AgentRuntime {
             let user = resolve_user(&profile.principal_user)?;
 
             let is_root = unsafe { libc::geteuid() == 0 };
-            if is_root {
-                if user.uid == daemon_uid {
-                    return Err(RuntimeError::Config(format!(
-                        "profile '{}': principal uid {} must differ from daemon uid",
-                        name, daemon_uid
-                    )));
-                }
-                if user.uid == 0 {
-                    return Err(RuntimeError::Config(format!(
-                        "profile '{}': principal must not be root",
-                        name
-                    )));
-                }
-            }
+            super::deployment::validate_principal_uid(is_root, user.uid, daemon_uid)
+                .map_err(|e| RuntimeError::Config(format!("profile '{}': {}", name, e)))?;
 
             let cdp_port_mode = profile.browser_cdp_expose
                 == Some(passless_core::agent::config::CdpExposeMode::Port);
 
             let browser_user_resolved = if let Some(ref browser_user) = profile.browser_user {
                 let bu = resolve_user(browser_user)?;
-                if is_root && !cdp_port_mode {
-                    if bu.uid == user.uid {
-                        return Err(RuntimeError::Config(format!(
-                            "profile '{}': browser uid {} must differ from principal uid {}",
-                            name, bu.uid, user.uid
-                        )));
-                    }
-                    if bu.uid == daemon_uid {
-                        return Err(RuntimeError::Config(format!(
-                            "profile '{}': browser uid {} must differ from daemon uid {}",
-                            name, bu.uid, daemon_uid
-                        )));
-                    }
-                    if bu.uid == 0 {
-                        return Err(RuntimeError::Config(format!(
-                            "profile '{}': browser must not be root",
-                            name
-                        )));
-                    }
-                }
+                gates::validate_pipe_browser_user(
+                    name,
+                    is_root,
+                    cdp_port_mode,
+                    bu.uid,
+                    user.uid,
+                    daemon_uid,
+                )
+                .map_err(RuntimeError::Config)?;
                 if let Some(ref runtime_root) = profile.browser_runtime_root {
+                    // A missing final component is created (see `ensure_runtime_root`), so a
+                    // fresh machine starts; a root that exists is judged as before.
+                    super::browser::ensure_runtime_root(runtime_root, bu.uid, bu.gid).map_err(
+                        |e| {
+                            RuntimeError::Config(format!(
+                                "profile '{}': browser_runtime_root '{}': {}",
+                                name,
+                                runtime_root.display(),
+                                e
+                            ))
+                        },
+                    )?;
                     validate_browser_runtime_root_at_startup(runtime_root, bu.uid, name)?;
                 }
                 Some(bu)
@@ -774,86 +1133,7 @@ impl AgentRuntime {
                     None
                 };
 
-                let mut uid_checks = Vec::new();
-                let is_root = unsafe { libc::geteuid() == 0 };
-                if is_root {
-                    uid_checks.push(super::doctor::UidCheck {
-                        label: "principal_vs_daemon".into(),
-                        passed: resolved.uid != daemon_uid,
-                        message: if resolved.uid != daemon_uid {
-                            format!(
-                                "principal uid {} differs from daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        } else {
-                            format!(
-                                "principal uid {} same as daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        },
-                    });
-                    uid_checks.push(super::doctor::UidCheck {
-                        label: "principal_not_root".into(),
-                        passed: resolved.uid != 0,
-                        message: if resolved.uid != 0 {
-                            "principal is not root".into()
-                        } else {
-                            "principal must not be root".into()
-                        },
-                    });
-                    if let Some(bu) = resolved_browser_users
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .and_then(|(_, bu)| bu.as_ref())
-                    {
-                        uid_checks.push(super::doctor::UidCheck {
-                            label: "browser_vs_principal".into(),
-                            passed: bu.uid != resolved.uid,
-                            message: if bu.uid != resolved.uid {
-                                format!(
-                                    "browser uid {} differs from principal uid {}",
-                                    bu.uid, resolved.uid
-                                )
-                            } else {
-                                format!(
-                                    "browser uid {} same as principal uid {}",
-                                    bu.uid, resolved.uid
-                                )
-                            },
-                        });
-                        uid_checks.push(super::doctor::UidCheck {
-                            label: "browser_vs_daemon".into(),
-                            passed: bu.uid != daemon_uid,
-                            message: if bu.uid != daemon_uid {
-                                format!(
-                                    "browser uid {} differs from daemon uid {}",
-                                    bu.uid, daemon_uid
-                                )
-                            } else {
-                                format!("browser uid {} same as daemon uid {}", bu.uid, daemon_uid)
-                            },
-                        });
-                        uid_checks.push(super::doctor::UidCheck {
-                            label: "browser_not_root".into(),
-                            passed: bu.uid != 0,
-                            message: if bu.uid != 0 {
-                                "browser is not root".into()
-                            } else {
-                                "browser must not be root".into()
-                            },
-                        });
-                    }
-                }
-
-                let device_key = super::doctor::DeviceIdentityKey {
-                    name: profile.device.name.clone(),
-                    phys: profile.device.phys.clone(),
-                    uniq: profile.device.uniq.clone(),
-                    vendor_id: profile.device.vendor_id,
-                    product_id: profile.device.product_id,
-                };
-
-                profile_startup_infos.push((name.clone(), resolved.uid, device_key, {
+                profile_startup_infos.push((name.clone(), {
                     super::doctor::ProfileStartupInfo {
                         storage_roots: storage_roots
                             .iter()
@@ -866,52 +1146,26 @@ impl AgentRuntime {
                             }
                         }),
                         uid_checks: Vec::new(),
-                        device_identity_unique: true,
+                        deployment: super::deployment::DeploymentAxes::new(
+                            profile.mode,
+                            resolved.uid,
+                            daemon_uid,
+                        ),
                     }
                 }));
             }
 
-            let device_keys: Vec<(String, super::doctor::DeviceIdentityKey)> =
-                profile_startup_infos
-                    .iter()
-                    .map(|(name, _, key, _)| {
-                        (
-                            name.clone(),
-                            super::doctor::DeviceIdentityKey {
-                                name: key.name.clone(),
-                                phys: key.phys.clone(),
-                                uniq: key.uniq.clone(),
-                                vendor_id: key.vendor_id,
-                                product_id: key.product_id,
-                            },
-                        )
-                    })
-                    .collect();
-            let uniqueness = super::doctor::compute_device_identity_uniqueness(&device_keys);
-
             let mut final_infos: Vec<(String, super::doctor::ProfileStartupInfo)> = Vec::new();
-            for (i, (name, _, _, info)) in profile_startup_infos.into_iter().enumerate() {
+            for (i, (name, info)) in profile_startup_infos.into_iter().enumerate() {
                 let mut info = info;
-                info.device_identity_unique = uniqueness[i].1;
 
                 let resolved = &resolved_users[i].1;
                 let is_root = unsafe { libc::geteuid() == 0 };
                 if is_root {
-                    info.uid_checks.push(super::doctor::UidCheck {
-                        label: "principal_vs_daemon".into(),
-                        passed: resolved.uid != daemon_uid,
-                        message: if resolved.uid != daemon_uid {
-                            format!(
-                                "principal uid {} differs from daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        } else {
-                            format!(
-                                "principal uid {} same as daemon uid {}",
-                                resolved.uid, daemon_uid
-                            )
-                        },
-                    });
+                    // A principal that shares the daemon's UID is a legitimate deployment
+                    // (ADR 0014 section 13), reported as an axis and not refused here. A root
+                    // daemon refuses a principal with its UID or UID 0 earlier, in
+                    // `validate_principal_uid`; `principal_not_root` is the diagnostic record.
                     info.uid_checks.push(super::doctor::UidCheck {
                         label: "principal_not_root".into(),
                         passed: resolved.uid != 0,
@@ -975,6 +1229,10 @@ impl AgentRuntime {
                 &final_infos,
             );
 
+            for warning in &diag.warnings {
+                log::warn!("startup diagnostic: {warning}");
+            }
+
             if !diag.is_ok() {
                 for check in &diag.checks {
                     if !check.passed {
@@ -1002,14 +1260,23 @@ impl AgentRuntime {
         }
 
         let ipc_server = if !agent_config.profiles.is_empty() {
-            let runtime_base = dirs::runtime_dir()
-                .or_else(|| {
-                    let uid = unsafe { libc::getuid() };
-                    Some(PathBuf::from(format!("/tmp/passless-agent-{}", uid)))
-                })
-                .ok_or_else(|| RuntimeError::Config("cannot resolve runtime directory".into()))?;
+            let runtime_base = daemon_runtime_base()?;
 
             let agent_runtime_dir = runtime_base.join("agent");
+            // A directory an earlier daemon left behind (it was killed, or crashed) would make
+            // the create below fail with "File exists" and leave the daemon without agents.
+            if RuntimeDir::reclaim_stale(&agent_runtime_dir, daemon_uid).map_err(|e| {
+                RuntimeError::Ipc(format!(
+                    "cannot reclaim the stale runtime dir {}: {}",
+                    agent_runtime_dir.display(),
+                    e
+                ))
+            })? {
+                info!(
+                    "Removed the stale agent runtime directory {} left by an earlier run",
+                    agent_runtime_dir.display()
+                );
+            }
             let runtime_dir =
                 RuntimeDir::create(&agent_runtime_dir, daemon_uid, daemon_gid, &profile_access)
                     .map_err(|e| {
@@ -1036,32 +1303,45 @@ impl AgentRuntime {
 
         let sign_registry = Arc::new(SignContextRegistry::new());
         let sign_server_shutdown = Arc::new(AtomicBool::new(false));
-        let sign_socket_base = dirs::runtime_dir()
-            .or_else(|| {
-                let uid = unsafe { libc::getuid() };
-                Some(PathBuf::from(format!("/tmp/passless-agent-{}", uid)))
-            })
-            .ok_or_else(|| RuntimeError::Config("cannot resolve runtime directory".into()))?;
+        let sign_socket_base = daemon_runtime_base()?;
         let sign_socket_path = sign_socket_base.join("agent").join("sign").join("sock");
-        let sign_server =
-            SignHttpServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone()).map_err(
-                |e| RuntimeError::Service(format!("failed to bind sign HTTP server: {}", e)),
-            )?;
-        info!(
-            "Sign HTTP server listening on {}",
-            sign_socket_path.display()
+        let mut sign_server =
+            SignTransportServer::bind(sign_socket_path.clone(), sign_server_shutdown.clone())
+                .map_err(|e| {
+                    RuntimeError::Service(format!("failed to bind the sign transport: {}", e))
+                })?;
+        info!("Sign transport listening on {}", sign_socket_path.display());
+        // A browser that runs as another user reaches the daemon through its own socket, in a
+        // directory only that user (and root) can enter. Failures do not stop the daemon: the
+        // profiles of that browser user refuse to launch with the reason (and doctor reports it).
+        let mut sign_uid_sockets: HashMap<u32, Result<PathBuf, String>> = HashMap::new();
+        for (_, browser_user) in &resolved_browser_users {
+            let Some(browser_user) = browser_user else {
+                continue;
+            };
+            if browser_user.uid == daemon_uid || sign_uid_sockets.contains_key(&browser_user.uid) {
+                continue;
+            }
+            let bound = sign_server.add_uid_socket(browser_user.uid, browser_user.gid);
+            match &bound {
+                Ok(path) => info!(
+                    "Sign transport listening on {} for browser uid {}",
+                    path.display(),
+                    browser_user.uid
+                ),
+                Err(e) => warn!("no sign socket for browser uid {}: {}", browser_user.uid, e),
+            }
+            sign_uid_sockets.insert(browser_user.uid, bound);
+        }
+        let sign_readiness = Arc::new(ReadinessRegistry::new());
+        let sign_server_handle = sign_server.serve(
+            sign_registry.clone(),
+            super::capacity::RequestLimiter::new(agent_config.limits),
+            sign_readiness.clone(),
+            TransportOptions::from_env(),
         );
-        let sign_server_handle = sign_server.serve(sign_registry.clone());
 
-        let endpoint_manager = Mutex::new(EndpointManager::new(
-            agent_config.profiles.len().max(1),
-            shutdown.clone(),
-            WorkerConfig::default(),
-        ));
-
-        let (event_tx, event_rx) = mpsc::channel();
         let mut profiles = BTreeMap::new();
-        let mut created_endpoint_ids: Vec<EndpointId> = Vec::new();
 
         for (((name, profile), resolved), browser_resolved) in agent_config
             .profiles
@@ -1127,14 +1407,13 @@ impl AgentRuntime {
                             name, e
                         ))
                     })?;
-                    let operation_lock = Arc::new(Mutex::new(()));
                     let key_provider = key_provider_for_config(storage_config).map_err(|e| {
                         RuntimeError::Storage(format!(
                             "profile '{}': failed to resolve credential key provider: {}",
                             name, e
                         ))
                     })?;
-                    let backend = CredentialBackendHandle::isolated(
+                    Ok(CredentialBackendHandle::isolated(
                         profile_id.clone(),
                         bundle.credential_storage.clone(),
                         bundle.pin_storage.clone(),
@@ -1286,10 +1565,16 @@ impl AgentRuntime {
             daemon_uid,
             daemon_gid,
             agent_config: std::sync::RwLock::new(agent_config.clone()),
+            config_source,
             sign_registry,
             sign_server_shutdown,
             sign_server_handle: Mutex::new(Some(sign_server_handle)),
             sign_socket_path,
+            sign_uid_sockets,
+            sign_readiness,
+            granted_rules,
+            escalation,
+            human_path_automatic,
         });
 
         let runtime_for_loop = Arc::clone(&runtime);
@@ -1811,185 +2096,41 @@ impl AgentRuntime {
                 }
             }
 
-            self.drain_endpoint_events();
             self.worker_tracker.reap_finished();
             self.reap_expired_sessions();
             self.prune_completed_sessions();
-            self.cleanup_expired_pending();
-            self.reap_stopped_workers();
+            // Write the late-use refusal counts of revoked bearers whose window has ended.
+            self.sign_registry.flush_due_revoked_refusals();
 
             {
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
+                let mut browser_mgr = super::lock_order::lock(
+                    &self.browser_manager,
+                    super::lock_order::LockLevel::BrowserManager,
+                );
                 let exit_infos = browser_mgr.check_exits();
                 for info in &exit_infos {
                     self.revoke_sign_context_for_lease(&info.lease_id);
-                    let _ = self.audit_gate.record(
-                        super::audit_events::BrowserLeaseCrashBuilder::new(
-                            info.lease_id.clone(),
-                            info.exit_code.unwrap_or(-1),
-                        )
-                        .build(),
+                    self.forget_lease_in_profiles(&info.lease_id);
+                    retire_dead_lease_audited(
+                        &self.audit_gate,
+                        &mut browser_mgr,
+                        &info.lease_id,
+                        LeaseEnd::Crashed {
+                            exit_code: info.exit_code,
+                        },
                     );
-                    for profile in self.profiles.values() {
-                        let mut cleared = false;
-                        {
-                            let mut current = profile.current_pending.lock().unwrap();
-                            if let Some(ref pending) = *current
-                                && pending.browser_lease_id.as_ref() == Some(&info.lease_id)
-                            {
-                                let _ = self.policy_runtime.principal_cancel_pending(
-                                    &pending.request_id,
-                                    &pending.session_id,
-                                );
-                                profile
-                                    .preparation_slot
-                                    .clear_matching(pending.prep_generation);
-                                *current = None;
-                                cleared = true;
-                            }
-                        }
-                        {
-                            let mut active = profile.active_browser.lock().unwrap();
-                            let before = active.len();
-                            active.retain(|_, lease| lease.lease_id != info.lease_id);
-                            cleared |= active.len() != before;
-                        }
-                        {
-                            let mut shared = profile.shared_browsers.lock().unwrap();
-                            if let Some(lease) = shared.get(&profile.profile_id)
-                                && lease.lease_id == info.lease_id
-                            {
-                                shared.remove(&profile.profile_id);
-                                cleared = true;
-                            }
-                        }
-                        if cleared {
-                            let cleanup_result = browser_mgr.cleanup(&info.lease_id);
-                            let _ = self.audit_gate.record(
-                                super::audit_events::BrowserLeaseCleanupBuilder::new(
-                                    info.lease_id.clone(),
-                                )
-                                .build(),
-                            );
-                            match cleanup_result {
-                                Ok(super::browser::CleanupSafety::Clean) => {}
-                                Ok(super::browser::CleanupSafety::Quarantined {
-                                    ref reason,
-                                    ..
-                                }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            info.lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                    let _ = reason;
-                                }
-                                Ok(super::browser::CleanupSafety::Failed { .. }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            info.lease_id.clone(),
-                                            super::audit_events::QuarantineReason::ManifestTampered,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                                Err(_) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            info.lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                            }
-                            browser_mgr.remove(&info.lease_id);
-                        }
-                    }
                 }
+                self.report_interception_transitions(&mut browser_mgr);
                 let expired_leases = browser_mgr.check_expired();
                 for lease_id in &expired_leases {
                     self.revoke_sign_context_for_lease(lease_id);
-                    let _ = self.audit_gate.record(
-                        super::audit_events::BrowserLeaseExpireBuilder::new(lease_id.clone())
-                            .build(),
+                    self.forget_lease_in_profiles(lease_id);
+                    retire_dead_lease_audited(
+                        &self.audit_gate,
+                        &mut browser_mgr,
+                        lease_id,
+                        LeaseEnd::Expired,
                     );
-                    for profile in self.profiles.values() {
-                        let mut cleared = false;
-                        {
-                            let mut current = profile.current_pending.lock().unwrap();
-                            if let Some(ref pending) = *current
-                                && pending.browser_lease_id.as_ref() == Some(lease_id)
-                            {
-                                let _ = self.policy_runtime.principal_cancel_pending(
-                                    &pending.request_id,
-                                    &pending.session_id,
-                                );
-                                profile
-                                    .preparation_slot
-                                    .clear_matching(pending.prep_generation);
-                                *current = None;
-                                cleared = true;
-                            }
-                        }
-                        {
-                            let mut active = profile.active_browser.lock().unwrap();
-                            let before = active.len();
-                            active.retain(|_, lease| lease.lease_id != *lease_id);
-                            cleared |= active.len() != before;
-                        }
-                        {
-                            let mut shared = profile.shared_browsers.lock().unwrap();
-                            if let Some(lease) = shared.get(&profile.profile_id)
-                                && lease.lease_id == *lease_id
-                            {
-                                shared.remove(&profile.profile_id);
-                                cleared = true;
-                            }
-                        }
-                        if cleared {
-                            let cleanup_result = browser_mgr.cleanup(lease_id);
-                            let _ = self.audit_gate.record(
-                                super::audit_events::BrowserLeaseCleanupBuilder::new(
-                                    lease_id.clone(),
-                                )
-                                .build(),
-                            );
-                            match cleanup_result {
-                                Ok(super::browser::CleanupSafety::Clean) => {}
-                                Ok(super::browser::CleanupSafety::Quarantined { .. }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                                Ok(super::browser::CleanupSafety::Failed { .. }) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            lease_id.clone(),
-                                            super::audit_events::QuarantineReason::ManifestTampered,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                                Err(_) => {
-                                    let _ = self.audit_gate.record(
-                                        super::audit_events::BrowserLeaseQuarantineBuilder::new(
-                                            lease_id.clone(),
-                                            super::audit_events::QuarantineReason::IntegrityViolation,
-                                        )
-                                        .build(),
-                                    );
-                                }
-                            }
-                            browser_mgr.remove(lease_id);
-                        }
-                    }
                 }
             }
 
@@ -2106,107 +2247,14 @@ impl AgentRuntime {
         Ok(())
     }
 
-    fn drain_endpoint_events(&self) {
-        let event_rx = self.event_rx.lock().unwrap();
-        let mut events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            events.push(event);
-        }
-        drop(event_rx);
-
-        for event in events {
-            self.handle_endpoint_event(event);
-        }
-    }
-
-    fn handle_endpoint_event(&self, event: EndpointEvent) {
-        match event {
-            EndpointEvent::ResponseSent {
-                endpoint_id,
-                profile_id,
-            } => {
-                let profile = match self.profiles.get(&profile_id) {
-                    Some(p) => p,
-                    None => return,
-                };
-
-                let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-
-                {
-                    let current_eid = profile.endpoint_id.lock().unwrap();
-                    match current_eid.as_ref() {
-                        Some(eid) if *eid == endpoint_id => {}
-                        _ => return,
-                    }
-                }
-
-                let pending_snapshot = {
-                    let current = profile.current_pending.lock().unwrap();
-                    current.as_ref().map(|p| {
-                        (
-                            p.request_id.clone(),
-                            p.session_id.clone(),
-                            p.prep_generation,
-                            p.browser_lease_id.clone(),
-                        )
-                    })
-                };
-
-                let (request_id, session_id, prep_generation, browser_lease_id) =
-                    match pending_snapshot {
-                        Some(s) => s,
-                        None => return,
-                    };
-
-                if !self.has_session(&profile_id, &session_id) {
-                    return;
-                }
-
-                let status = match self
-                    .policy_runtime
-                    .principal_pending_status(&request_id, &session_id)
-                {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-
-                match status.state {
-                    super::policy_engine::PendingState::Approved => {
-                        profile.preparation_slot.clear_matching(prep_generation);
-                        let mut current = profile.current_pending.lock().unwrap();
-                        *current = None;
-                    }
-                    super::policy_engine::PendingState::Waiting => {}
-                    super::policy_engine::PendingState::Denied
-                    | super::policy_engine::PendingState::TimedOut
-                    | super::policy_engine::PendingState::Cancelled => {
-                        if let Some(ref lease_id) = browser_lease_id {
-                            self.revoke_sign_context_for_lease(lease_id);
-                            let mut browser_mgr = self.browser_manager.lock().unwrap();
-                            let _ = browser_mgr.revoke(lease_id);
-                            let _ = browser_mgr.terminate(lease_id);
-                            let _ = browser_mgr.cleanup(lease_id);
-                            browser_mgr.remove(lease_id);
-                        }
-                        profile.preparation_slot.clear_matching(prep_generation);
-                        let mut current = profile.current_pending.lock().unwrap();
-                        *current = None;
-                    }
-                }
-            }
-        }
-    }
-
-    fn has_session(&self, profile_id: &ProfileId, session_id: &PrincipalSessionId) -> bool {
-        self.managed_sessions.get(profile_id).is_some_and(|slot| {
-            slot.lock()
-                .map(|sessions| {
-                    sessions
-                        .iter()
-                        .any(|managed| managed.session_id == *session_id)
-                })
-                .unwrap_or(false)
-        })
+    /// Credentials across the distinct backends the configured profiles use (a same-user profile
+    /// shares the human backend, which is counted once).
+    fn total_credential_count(&self) -> u32 {
+        distinct_credential_count(
+            self.profiles
+                .values()
+                .map(|profile| &profile.backend.credential_storage),
+        )
     }
 
     fn active_session_count(&self, profile_id: &ProfileId) -> usize {
@@ -2221,7 +2269,10 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
         session_id: &PrincipalSessionId,
     ) {
-        let _lifecycle = profile.lifecycle_lock.lock().ok();
+        let _lifecycle = super::lock_order::lock(
+            &profile.lifecycle_lock,
+            super::lock_order::LockLevel::ProfileLifecycle,
+        );
 
         let active = profile
             .active_browser
@@ -2245,27 +2296,137 @@ impl AgentRuntime {
                 }
             };
             if let Some(lease_id) = should_terminate {
-                self.revoke_sign_context_for_lease(&lease_id);
-                let mut browser_mgr = self.browser_manager.lock().unwrap();
-                let _ = browser_mgr.revoke(&lease_id);
-                let _ = browser_mgr.terminate(&lease_id);
-                let _ = browser_mgr.cleanup(&lease_id);
-                browser_mgr.remove(&lease_id);
+                // Sessions still attached to the closing browser (the owner left first) lose it;
+                // their next `EnsureBrowser` launches one bound to themselves.
+                if let Ok(mut active) = profile.active_browser.lock() {
+                    active.retain(|_, other| other.lease_id != lease_id);
+                }
+                let mut browser_mgr = super::lock_order::lock(
+                    &self.browser_manager,
+                    super::lock_order::LockLevel::BrowserManager,
+                );
+                self.close_lease(&mut browser_mgr, &lease_id, RevokeReason::PrincipalExit);
             }
             return;
         }
 
         if let Some(active) = active {
-            self.revoke_sign_context_for_lease(&active.lease_id);
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
-            let _ = browser_mgr.revoke(&active.lease_id);
-            let _ = browser_mgr.terminate(&active.lease_id);
-            let _ = browser_mgr.cleanup(&active.lease_id);
-            browser_mgr.remove(&active.lease_id);
+            let mut browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
+            self.close_lease(
+                &mut browser_mgr,
+                &active.lease_id,
+                RevokeReason::PrincipalExit,
+            );
         }
     }
 
-    fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime) {
+    /// What the managed browser of `profile` runs (ADR 0014 section 4.2, R14, V-H7), see
+    /// [`super::browser_select::resolve_launch`]. Branded Google Chrome and chrome-headless-shell
+    /// are refused with an actionable error. Runs `<browser> --version` (bounded at 10 s).
+    pub(super) fn resolve_browser_launch(
+        &self,
+        profile: &ProfileRuntime,
+        profile_config: &AgentProfileConfig,
+        headed: bool,
+    ) -> Result<super::browser_select::BrowserLaunch, ProtocolError> {
+        let browser_path = {
+            let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+            self.agent_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .browser_path
+                .clone()
+        };
+        let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
+        let home = super::browser_select::home_dir_of_uid(browser_uid);
+        let distinct_uid = profile.uid != profile.daemon_uid;
+        super::browser_select::resolve_launch(
+            profile_config.browser_command.as_deref(),
+            browser_path.as_deref(),
+            home.as_deref(),
+            distinct_uid,
+            headed,
+            &super::browser_select::run_version,
+        )
+        .map_err(|e| {
+            log::warn!(
+                "profile '{}': no usable browser: {e}",
+                profile.profile_id.as_str()
+            );
+            ProtocolError::new(
+                ErrorCode::BadRequest,
+                format!("profile '{}': {e}", profile.profile_id.as_str()),
+                RecommendedAction::FixRequest,
+            )
+        })
+    }
+
+    /// The profile's configuration as currently in force (a policy reload replaces it).
+    fn live_profile_config(&self, profile: &ProfileRuntime) -> AgentProfileConfig {
+        let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+        self.agent_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .profiles
+            .get(profile.profile_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| profile.profile_config.clone())
+    }
+
+    /// A new bearer session for a browser launched for `profile_id`: bound to the principal
+    /// digest, the revocation epoch now in force and the session TTL (ADR 0014 section 9).
+    fn new_bearer_session(
+        &self,
+        profile_id: &ProfileId,
+        principal_digest: [u8; 32],
+        profile_config: &AgentProfileConfig,
+    ) -> Arc<super::session::AgentSession> {
+        super::session::AgentSession::new(super::session::SessionBinding {
+            profile_id: profile_id.clone(),
+            principal_digest,
+            revocation_epoch: self.policy_runtime.revocation_epoch(),
+            ttl: Duration::from_secs(session_ttl_secs(profile_config)),
+        })
+    }
+
+    /// The revocation epoch moved (a policy reload or a grant revocation): drop the stale bearers
+    /// (remembering them, so a late use is audited as `bearer_revoked`), then close every browser
+    /// that held one. The leases the stale bearers were bound to are terminated, cleaned up and
+    /// audited through the browser manager even when no profile bookkeeping names them (an
+    /// admin-launched lease lives only there); the profiles' tracked browsers are closed after.
+    /// Returns how many bearers were revoked. No lock is held on entry (LOCKING.md: reload).
+    fn revoke_stale_bearers_and_close_browsers(&self, current_epoch: u64) -> usize {
+        let stale = self.sign_registry.revoke_stale_sessions(current_epoch);
+        self.close_revoked_leases(&stale.lease_ids);
+        for profile in self.profiles.values() {
+            self.cleanup_all_browsers_for_profile(profile, RevokeReason::PolicyReload);
+        }
+        stale.revoked
+    }
+
+    /// Revoke, terminate, clean up and audit the leases named by `lease_ids` (a lease that is
+    /// already gone is skipped).
+    fn close_revoked_leases(&self, lease_ids: &[String]) {
+        if lease_ids.is_empty() {
+            return;
+        }
+        let mut browser_mgr = super::lock_order::lock(
+            &self.browser_manager,
+            super::lock_order::LockLevel::BrowserManager,
+        );
+        close_leases_by_id(
+            &self.audit_gate,
+            &self.sign_registry,
+            &mut browser_mgr,
+            lease_ids,
+            RevokeReason::PolicyReload,
+        );
+    }
+
+    fn cleanup_all_browsers_for_profile(&self, profile: &ProfileRuntime, reason: RevokeReason) {
         let mut leases: Vec<BrowserLeaseId> = profile
             .active_browser
             .lock()
@@ -2287,13 +2448,12 @@ impl AgentRuntime {
         }
         let mut seen = std::collections::HashSet::new();
         leases.retain(|id| seen.insert(id.clone()));
-        let mut browser_mgr = self.browser_manager.lock().unwrap();
+        let mut browser_mgr = super::lock_order::lock(
+            &self.browser_manager,
+            super::lock_order::LockLevel::BrowserManager,
+        );
         for lease_id in leases {
-            self.revoke_sign_context_for_lease(&lease_id);
-            let _ = browser_mgr.revoke(&lease_id);
-            let _ = browser_mgr.terminate(&lease_id);
-            let _ = browser_mgr.cleanup(&lease_id);
-            browser_mgr.remove(&lease_id);
+            self.close_lease(&mut browser_mgr, &lease_id, reason);
         }
     }
 
@@ -2325,22 +2485,71 @@ impl AgentRuntime {
         self.shutdown_all_sessions();
 
         {
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
+            let mut browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
+            // Every lease still held (admin-launched ones live only here) is closed and audited
+            // before the stop record; `terminate_all` stays as the backstop.
+            for lease_id in browser_mgr.lease_ids() {
+                self.close_lease(&mut browser_mgr, &lease_id, RevokeReason::DaemonShutdown);
+            }
             browser_mgr.terminate_all();
         }
 
         self.worker_tracker.join_all();
 
-        {
-            let mut em = self.endpoint_manager.lock().unwrap();
-            em.cancel_all();
-            let _ = em.shutdown_all(Some(SHUTDOWN_TIMEOUT));
-        }
-
         let stop_event = DaemonStopBuilder::new(StopReason::GracefulShutdown, 0).build();
         let _ = self.audit_gate.record(stop_event);
 
+        // Every listener user has stopped: take the sockets and directories away, so that the
+        // next start does not find them (the drop of the server may never run).
+        self.ipc_server.remove_runtime_dir();
+
         info!("Agent runtime shutdown complete");
+    }
+
+    /// Drop `lease_id` from every profile's bookkeeping (a lease that ended on its own). Takes
+    /// only the short profile bookkeeping locks, which never nest with each other.
+    fn forget_lease_in_profiles(&self, lease_id: &BrowserLeaseId) {
+        for profile in self.profiles.values() {
+            if let Ok(mut active) = profile.active_browser.lock() {
+                active.retain(|_, lease| lease.lease_id != *lease_id);
+            }
+            if let Ok(mut shared) = profile.shared_browsers.lock()
+                && shared
+                    .get(&profile.profile_id)
+                    .is_some_and(|lease| lease.lease_id == *lease_id)
+            {
+                shared.remove(&profile.profile_id);
+            }
+        }
+    }
+
+    /// [`close_lease_audited`] with this runtime's audit gate and sign registry.
+    pub(super) fn close_lease(
+        &self,
+        browser_mgr: &mut BrowserProcessManager,
+        lease_id: &BrowserLeaseId,
+        reason: RevokeReason,
+    ) {
+        close_lease_audited(
+            &self.audit_gate,
+            &self.sign_registry,
+            browser_mgr,
+            lease_id,
+            reason,
+        );
+    }
+
+    /// [`audit_lease_launch`] with this runtime's audit gate.
+    pub(super) fn audit_launch(
+        &self,
+        lease_id: &BrowserLeaseId,
+        profile_id: &ProfileId,
+        config: &BrowserConfig,
+    ) {
+        audit_lease_launch(&self.audit_gate, lease_id, profile_id, config.cdp_expose);
     }
 
     fn revoke_sign_context_for_lease(&self, lease_id: &BrowserLeaseId) {
@@ -2354,20 +2563,21 @@ impl AgentRuntime {
         managed: &ManagedPrincipalSession,
     ) -> EffectiveAuthority {
         let acts_as_human = profile.mode == AgentMode::SameUser;
-        let rules = profile.profile_config.effective_rules();
-        let wildcard = rules
+        // Report the configuration in force: a policy reload may have replaced it (review L4).
+        let live_config = self.live_profile_config(profile);
+        let profile_config = &live_config;
+        let rules = &profile_config.rules;
+        let wildcard = rules.iter().any(|rule| rule.is_wildcard());
+        let autonomous_authentication = rules
             .iter()
-            .any(|rule| rule.rp_id.trim() == passless_core::agent::config::ANY_RP_ID);
-        let autonomous_authentication = rules.iter().any(|rule| {
-            rule.authenticate.authorization == passless_core::agent::AgentAuthorization::Allow
-        });
+            .any(|rule| rule.authenticate == passless_core::agent::RuleAction::Allow);
         let human_backend_registration = acts_as_human
-            && rules.iter().any(|rule| {
-                rule.register.authorization != passless_core::agent::AgentAuthorization::Deny
-            });
-        let direct_cdp = profile.profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
+            && rules
+                .iter()
+                .any(|rule| rule.register != passless_core::agent::RuleAction::Deny);
+        let direct_cdp = profile_config.browser_cdp_expose == Some(CdpExposeMode::Port);
         let ambiguous_selection = matches!(
-            profile.profile_config.credential_selection,
+            profile_config.credential_selection,
             passless_core::agent::config::CredentialSelection::FirstMatching
                 | passless_core::agent::config::CredentialSelection::Newest
         );
@@ -2392,26 +2602,11 @@ impl AgentRuntime {
             risk_flags.push(AuthorityRisk::AmbiguousCredentialSelection);
         }
 
-        let active_lease = profile
-            .active_browser
-            .lock()
-            .ok()
-            .and_then(|active| {
-                active
-                    .get(&managed.session_id)
-                    .map(|lease| lease.lease_id.clone())
-            })
-            .or_else(|| {
-                profile.current_pending.lock().ok().and_then(|pending| {
-                    pending.as_ref().and_then(|pending| {
-                        if pending.session_id == managed.session_id {
-                            pending.browser_lease_id.clone()
-                        } else {
-                            None
-                        }
-                    })
-                })
-            });
+        let active_lease = profile.active_browser.lock().ok().and_then(|active| {
+            active
+                .get(&managed.session_id)
+                .map(|lease| lease.lease_id.clone())
+        });
         let budget = active_lease.as_ref().and_then(|lease_id| {
             self.sign_registry
                 .budget_snapshot_for_lease(lease_id.as_str())
@@ -2425,7 +2620,7 @@ impl AgentRuntime {
             })
             .unwrap_or((None, None));
 
-        let selection = serde_json::to_value(&profile.profile_config.credential_selection)
+        let selection = serde_json::to_value(&profile_config.credential_selection)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "unknown".to_string());
@@ -2439,36 +2634,26 @@ impl AgentRuntime {
                 credential_namespace: if acts_as_human { "human" } else { "isolated" }.into(),
                 rp_identity: if acts_as_human { "human" } else { "agent" }.into(),
             },
-            policy_generation: generation.generation_id.as_str().to_string(),
+            policy_generation: generation.generation.to_string(),
             rp_rules: rules
-                .into_iter()
+                .iter()
                 .map(|rule| AuthorityRpRule {
-                    wildcard: rule.rp_id.trim() == passless_core::agent::config::ANY_RP_ID,
-                    rp_id: rule.rp_id,
-                    authenticate: AuthorityCeremony {
-                        authorization: rule.authenticate.authorization.to_string(),
-                        user_presence: rule.authenticate.user_presence.to_string(),
-                        user_verification: rule.authenticate.user_verification.to_string(),
-                    },
-                    register: AuthorityCeremony {
-                        authorization: rule.register.authorization.to_string(),
-                        user_presence: rule.register.user_presence.to_string(),
-                        user_verification: rule.register.user_verification.to_string(),
-                    },
+                    wildcard: rule.is_wildcard(),
+                    rp_id: rule.rp_id.clone(),
+                    authenticate: authority_ceremony(rule.authenticate),
+                    register: authority_ceremony(rule.register),
                 })
                 .collect(),
             credentials: AuthorityCredentialScope {
-                dynamic_per_rp: profile.profile_config.credential_refs.is_none(),
-                configured_reference_count: profile
-                    .profile_config
+                dynamic_per_rp: profile_config.credential_refs.is_none(),
+                configured_reference_count: profile_config
                     .credential_refs
                     .as_ref()
                     .map_or(0, |refs| refs.len() as u32),
                 selection,
             },
             session: AuthoritySession {
-                max_session_ttl_secs: profile
-                    .profile_config
+                max_session_ttl_secs: profile_config
                     .max_session_ttl
                     .map(|ttl| ttl.as_secs())
                     .unwrap_or(300),
@@ -2476,14 +2661,13 @@ impl AgentRuntime {
                     .deadline
                     .saturating_duration_since(Instant::now())
                     .as_secs(),
-                max_operations: profile.profile_config.max_operations,
+                max_operations: profile_config.max_operations,
                 operations_used,
                 operations_remaining,
             },
             browser: AuthorityBrowser {
                 active: active_lease.is_some(),
-                cdp_exposure: profile
-                    .profile_config
+                cdp_exposure: profile_config
                     .browser_cdp_expose
                     .unwrap_or(CdpExposeMode::Pipe)
                     .to_string(),
@@ -2535,26 +2719,14 @@ impl AgentRuntime {
                 RecommendedAction::Abort,
             )
         })?;
-        let mut sessions = session_slot.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "managed session lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
-        let limit = usize::from(profile.profile_config.max_concurrent_sessions);
-        let unlimited = profile.profile_config.browser_scope == BrowserScope::Profile
-            && profile.profile_config.max_concurrent_sessions == 0;
-        if !unlimited && sessions.len() >= limit {
-            return Err(ProtocolError::new(
-                ErrorCode::Conflict,
-                format!(
-                    "profile '{}' reached max_concurrent_sessions ({})",
-                    profile_id, limit
-                ),
-                RecommendedAction::RetryWithBackoff,
-            ));
-        }
+        let mut sessions =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
+        gates::check_session_limit(
+            profile_id,
+            sessions.len(),
+            profile.profile_config.max_concurrent_sessions,
+            profile.profile_config.browser_scope,
+        )?;
 
         let program = validate_principal_executable(&command[0], self.daemon_uid)?;
         let args = if command.len() > 1 {
@@ -2630,8 +2802,8 @@ impl AgentRuntime {
             .unwrap_or(3600);
         let deadline = now + Duration::from_secs(ttl_secs);
 
-        let process_digest = super::intent::ProcessIdentityDigest::compute_from_session_identity(
-            &super::intent::SessionIdentityParams {
+        let process_digest = super::identity::ProcessIdentityDigest::compute_from_session_identity(
+            &super::identity::SessionIdentityParams {
                 uid: session.identity.uid,
                 gid: session.identity.gid,
                 pid: session.identity.pid,
@@ -2678,13 +2850,8 @@ impl AgentRuntime {
                 RecommendedAction::FixRequest,
             )
         })?;
-        let mut sessions = session_slot.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "managed session lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut sessions =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
         if sessions.is_empty() {
             return Err(ProtocolError::new(
                 ErrorCode::NotFound,
@@ -2742,7 +2909,10 @@ impl AgentRuntime {
         loop {
             let mut found = false;
             for (profile_id, session_slot) in &self.managed_sessions {
-                let mut sessions = session_slot.lock().unwrap();
+                let mut sessions = super::lock_order::lock(
+                    session_slot,
+                    super::lock_order::LockLevel::ManagedSession,
+                );
                 if let Some(pos) = sessions
                     .iter()
                     .position(|managed| managed.session_id == *session_id)
@@ -2857,7 +3027,8 @@ impl AgentRuntime {
         )> = Vec::new();
 
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             let mut index = 0;
             while index < sessions.len() {
                 let should_reap = if now >= sessions[index].deadline {
@@ -2921,65 +3092,8 @@ impl AgentRuntime {
             }
 
             if let Some(profile) = self.profiles.get(&profile_id) {
-                let pending_action = {
-                    let mut current = profile.current_pending.lock().unwrap();
-                    if current
-                        .as_ref()
-                        .is_some_and(|pending| pending.session_id == session_id)
-                    {
-                        current.take().map(|pending| {
-                            (
-                                pending.request_id,
-                                pending.session_id,
-                                pending.prep_generation,
-                                pending.browser_lease_id,
-                            )
-                        })
-                    } else {
-                        None
-                    }
-                };
-                if let Some((request_id, sid, prep_gen, lease_id)) = pending_action {
-                    let _ = self
-                        .policy_runtime
-                        .principal_cancel_pending(&request_id, &sid);
-                    profile.preparation_slot.clear_matching(prep_gen);
-                    if let Some(ref lid) = lease_id {
-                        self.revoke_sign_context_for_lease(lid);
-                        let mut browser_mgr = self.browser_manager.lock().unwrap();
-                        let _ = browser_mgr.revoke(lid);
-                        let _ = browser_mgr.terminate(lid);
-                        let _ = browser_mgr.cleanup(lid);
-                        browser_mgr.remove(lid);
-                    }
-                }
                 self.cleanup_browser_for_session(profile, &session_id);
             }
-        }
-    }
-
-    fn cleanup_expired_pending(&self) {
-        let expired_ids = self.policy_runtime.cleanup_expired_pending();
-
-        for (profile_id, profile) in &self.profiles {
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current
-                && expired_ids.contains(&pending.request_id)
-            {
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-                if let Some(ref lease_id) = pending.browser_lease_id {
-                    self.revoke_sign_context_for_lease(lease_id);
-                    let mut browser_mgr = self.browser_manager.lock().unwrap();
-                    let _ = browser_mgr.revoke(lease_id);
-                    let _ = browser_mgr.terminate(lease_id);
-                    let _ = browser_mgr.cleanup(lease_id);
-                    browser_mgr.remove(lease_id);
-                }
-                *current = None;
-            }
-            let _ = profile_id;
         }
     }
 
@@ -2988,33 +3102,10 @@ impl AgentRuntime {
         Self::prune_completed_before_insert(&mut completed_map);
     }
 
-    fn reap_stopped_workers(&self) {
-        let mut em = self.endpoint_manager.lock().unwrap();
-        let endpoint_ids: Vec<EndpointId> = em
-            .snapshot()
-            .iter()
-            .map(|s| s.handle.id().clone())
-            .collect();
-
-        for endpoint_id in endpoint_ids {
-            if let super::endpoint_manager::ReapOutcome::Reaped { .. } =
-                em.reap_stopped(&endpoint_id)
-            {
-                debug!("Reaped stopped worker for endpoint {}", endpoint_id);
-                for profile in self.profiles.values() {
-                    let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                    if eid_guard.as_ref() == Some(&endpoint_id) {
-                        *eid_guard = None;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     fn shutdown_all_sessions(&self) {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             for managed in sessions.drain(..) {
                 info!(
                     "Shutting down principal session {} for profile {}",
@@ -3026,501 +3117,6 @@ impl AgentRuntime {
                 drop(managed.session);
             }
         }
-    }
-
-    fn resolve_credential_label(
-        storage: &Arc<Mutex<Box<dyn CredentialStorage>>>,
-        credential_ref: &passless_core::agent::CredentialRef,
-    ) -> Option<String> {
-        let mut storage_guard = storage.lock().ok()?;
-        let cred = storage_guard
-            .read_first(crate::storage::CredentialFilter::None)
-            .ok()?;
-        let href = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
-        if href == *credential_ref {
-            return cred
-                .user
-                .display_name
-                .as_ref()
-                .map(|s| s.to_string())
-                .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()));
-        }
-        while let Ok(cred) = storage_guard.read_next() {
-            let href = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
-            if href == *credential_ref {
-                return cred
-                    .user
-                    .display_name
-                    .as_ref()
-                    .map(|s| s.to_string())
-                    .or_else(|| cred.user.name.as_ref().map(|s| s.to_string()));
-            }
-        }
-        None
-    }
-
-    fn handle_create_intent(
-        &self,
-        params: CreateIntentParams<'_>,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let CreateIntentParams {
-            profile_id,
-            session_id,
-            endpoint_id,
-            action,
-            rp_id,
-            credential_ref,
-            principal_reason,
-            clamped_grant_ttl_secs,
-            clamped_session_ttl_secs,
-            profile,
-            session_digest,
-        } = params;
-        use passless_core::agent::protocol::IntentAction;
-
-        if profile.mode != AgentMode::Isolated {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "CreateIntent is allowed only for isolated profiles",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let normalized_rp = rp_id.trim().to_ascii_lowercase();
-        let config = &profile.profile_config;
-
-        let ceremony_policy = config.rule_for_rp(&normalized_rp).map(|rule| match action {
-            IntentAction::Register => rule.register,
-            IntentAction::Authenticate => rule.authenticate,
-        });
-        if ceremony_policy.as_ref().is_none_or(|policy| {
-            policy.authorization == passless_core::agent::AgentAuthorization::Deny
-        }) {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "RP ID does not exactly match configured RP IDs",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        match action {
-            IntentAction::Register => {
-                if credential_ref.is_some() {
-                    return Err(ProtocolError::new(
-                        ErrorCode::Forbidden,
-                        "registration must not include a credential ref",
-                        RecommendedAction::FixRequest,
-                    ));
-                }
-            }
-            IntentAction::Authenticate => {
-                let cred_ref = credential_ref.ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::BadRequest,
-                        "authentication requires a credential ref",
-                        RecommendedAction::FixRequest,
-                    )
-                })?;
-
-                let cred_exists = {
-                    let mut storage = profile.credential_storage.lock().map_err(|_| {
-                        ProtocolError::new(
-                            ErrorCode::Internal,
-                            "credential storage lock poisoned",
-                            RecommendedAction::Abort,
-                        )
-                    })?;
-                    storage.read(cred_ref.as_bytes()).is_ok()
-                };
-
-                if !cred_exists {
-                    return Err(ProtocolError::new(
-                        ErrorCode::NotFound,
-                        "credential ref not found in storage",
-                        RecommendedAction::FixRequest,
-                    ));
-                }
-            }
-        }
-
-        {
-            let current = profile.current_pending.lock().unwrap();
-            if current.is_some() {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "another pending request is already active for this profile",
-                    RecommendedAction::RetryWithBackoff,
-                ));
-            }
-        }
-
-        let generation = self.policy_runtime.current_generation();
-        let _snapshot = generation.find_snapshot(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "profile snapshot not found in current generation",
-                RecommendedAction::Abort,
-            )
-        })?;
-
-        let process_digest = session_digest.clone();
-
-        let intent_action = match action {
-            IntentAction::Register => passless_core::agent::protocol::IntentAction::Register,
-            IntentAction::Authenticate => {
-                passless_core::agent::protocol::IntentAction::Authenticate
-            }
-        };
-
-        let params = super::intent::CreateIntentParams {
-            profile_id: profile_id.clone(),
-            session_id: session_id.clone(),
-            endpoint_id: endpoint_id.clone(),
-            process_digest: process_digest.clone(),
-            action: intent_action.clone(),
-            rp_id: normalized_rp.clone(),
-            credential_ref: credential_ref.cloned(),
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            require_uv: ceremony_policy.as_ref().is_some_and(|policy| {
-                policy.user_verification != passless_core::agent::UserVerificationSource::None
-            }),
-            ttl_ms: Some(300_000),
-        };
-
-        let pending_id = self
-            .policy_runtime
-            .principal_create_pending_intent(params)
-            .map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to create pending intent: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
-
-        let config = &profile.profile_config;
-        let max_grant_ttl = config.max_grant_ttl.map(|d| d.as_secs()).unwrap_or(300);
-        let max_session_ttl = config.max_session_ttl.map(|d| d.as_secs()).unwrap_or(900);
-
-        let requested_grant_ttl = clamped_grant_ttl_secs.unwrap_or(max_grant_ttl);
-        let clamped_grant_ttl = requested_grant_ttl.min(max_grant_ttl).max(5);
-        let requested_session_ttl = clamped_session_ttl_secs.unwrap_or(max_session_ttl);
-        let clamped_session_ttl = requested_session_ttl.min(max_session_ttl).max(60);
-
-        let trusted_credential_label = if let Some(cred_ref) = credential_ref {
-            Self::resolve_credential_label(&profile.credential_storage, cred_ref)
-        } else {
-            None
-        };
-
-        let prep_input = super::ceremony::CeremonyPreparationInput {
-            session_id: session_id.clone(),
-            process_digest,
-            policy_generation: generation.generation_id.clone(),
-            policy_digest: generation.digest.clone(),
-            credential_ref: credential_ref.cloned(),
-            untrusted_metadata: super::ceremony::BoundedUntrustedMetadata::new(
-                normalized_rp,
-                intent_action,
-                ceremony_policy.as_ref().is_some_and(|policy| {
-                    policy.user_verification != passless_core::agent::UserVerificationSource::None
-                }),
-            )
-            .with_principal_reason(principal_reason),
-            clamped_grant_ttl_secs: clamped_grant_ttl,
-            clamped_session_ttl_secs: clamped_session_ttl,
-            trusted_credential_label,
-        };
-
-        let guard = profile.preparation_slot.install(prep_input).map_err(|e| {
-            let _ = self
-                .policy_runtime
-                .principal_cancel_pending(&pending_id, session_id);
-            ProtocolError::new(
-                ErrorCode::Conflict,
-                format!("failed to install preparation: {}", e),
-                RecommendedAction::Retry,
-            )
-        })?;
-
-        let prep_generation = guard.generation();
-        guard.disarm();
-
-        let audit_action = match action {
-            IntentAction::Register => super::audit_events::AuditAction::Register,
-            IntentAction::Authenticate => super::audit_events::AuditAction::Authenticate,
-        };
-        let intent_id = {
-            let status = self
-                .policy_runtime
-                .principal_pending_status(&pending_id, session_id)
-                .map_err(|_| {
-                    ProtocolError::new(
-                        ErrorCode::Internal,
-                        "failed to read pending status",
-                        RecommendedAction::Abort,
-                    )
-                })?;
-            status.intent_id.clone()
-        };
-        let create_event = super::audit_events::IntentCreateBuilder::new(
-            intent_id,
-            profile_id.clone(),
-            audit_action,
-        )
-        .build();
-        if let Err(e) = self.audit_gate.record(create_event) {
-            let _ = self
-                .policy_runtime
-                .principal_cancel_pending(&pending_id, session_id);
-            profile.preparation_slot.clear_matching(prep_generation);
-            return Err(ProtocolError::new(
-                ErrorCode::Internal,
-                format!("audit record failed: {}", e),
-                RecommendedAction::Abort,
-            ));
-        }
-
-        {
-            let mut current = profile.current_pending.lock().unwrap();
-            *current = Some(PendingRuntime {
-                request_id: pending_id.clone(),
-                prep_generation,
-                session_id: session_id.clone(),
-                browser_lease_id: None,
-                clamped_session_ttl_secs: 0,
-            });
-        }
-
-        Ok(PrincipalResponse::IntentCreated {
-            request_id: pending_id,
-        })
-    }
-
-    fn handle_show_intent(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        _profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        if status.kind != super::policy_engine::PendingRequestKind::IsolatedIntent {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not an intent",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        Ok(PrincipalResponse::IntentStatus {
-            request_id: request_id.clone(),
-            state: status.to_intent_state(),
-        })
-    }
-
-    fn handle_cancel_intent(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        if status.kind != super::policy_engine::PendingRequestKind::IsolatedIntent {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not an intent",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let _ = self
-            .policy_runtime
-            .principal_cancel_pending(request_id, session_id);
-
-        {
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current
-                && pending.request_id == *request_id
-            {
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-                *current = None;
-            }
-        }
-
-        let cancel_event =
-            super::audit_events::IntentCancelBuilder::new(status.intent_id.clone()).build();
-        let _ = self.audit_gate.record(cancel_event);
-
-        Ok(PrincipalResponse::IntentCancelled)
-    }
-
-    fn handle_request_delegation(
-        &self,
-        _params: RequestDelegationParams<'_>,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        Err(ProtocolError::new(
-            ErrorCode::Forbidden,
-            "request delegation is not supported; delegated mode has been removed",
-            RecommendedAction::FixRequest,
-        ))
-    }
-
-    fn handle_show_delegation(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        _profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        if status.kind != super::policy_engine::PendingRequestKind::DelegatedAuth {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not a delegation",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        Ok(PrincipalResponse::DelegationStatus {
-            request_id: request_id.clone(),
-            state: status.to_delegation_state(),
-        })
-    }
-
-    fn handle_cancel_delegation(
-        &self,
-        _profile_id: &ProfileId,
-        session_id: &PrincipalSessionId,
-        request_id: &PendingRequestId,
-        profile: &ProfileRuntime,
-    ) -> Result<PrincipalResponse, ProtocolError> {
-        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-        let status = self
-            .policy_runtime
-            .principal_pending_status(request_id, session_id)
-            .map_err(|e| match e {
-                super::policy_engine::PendingStatusError::NotFound => ProtocolError::new(
-                    ErrorCode::NotFound,
-                    "pending request not found",
-                    RecommendedAction::FixRequest,
-                ),
-                super::policy_engine::PendingStatusError::SessionMismatch => ProtocolError::new(
-                    ErrorCode::Unauthorized,
-                    "session mismatch for pending request",
-                    RecommendedAction::Abort,
-                ),
-            })?;
-
-        if status.kind != super::policy_engine::PendingRequestKind::DelegatedAuth {
-            return Err(ProtocolError::new(
-                ErrorCode::BadRequest,
-                "request is not a delegation",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let grant_request_id = status.grant_request_id;
-
-        if let Some(ref grant_req_id) = grant_request_id
-            && let Some(grant_id) = self
-                .policy_runtime
-                .resolved_grant_id_for_request(&status.profile_id, grant_req_id)
-        {
-            let _ = self.policy_runtime.revoke_grant_by_id(&grant_id);
-        }
-
-        let _ = self
-            .policy_runtime
-            .principal_cancel_pending(request_id, session_id);
-
-        {
-            let current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current
-                && pending.request_id == *request_id
-            {
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-            }
-        }
-
-        if let Some(ref lease_id) = {
-            let current = profile.current_pending.lock().unwrap();
-            current.as_ref().and_then(|p| p.browser_lease_id.clone())
-        } {
-            self.revoke_sign_context_for_lease(lease_id);
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
-            let _ = browser_mgr.revoke(lease_id);
-            let _ = browser_mgr.terminate(lease_id);
-            let _ = browser_mgr.cleanup(lease_id);
-            browser_mgr.remove(lease_id);
-        }
-
-        {
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current
-                && pending.request_id == *request_id
-            {
-                *current = None;
-            }
-        }
-
-        let cancel_event =
-            super::audit_events::IntentCancelBuilder::new(status.intent_id.clone()).build();
-        let _ = self.audit_gate.record(cancel_event);
-
-        Ok(PrincipalResponse::DelegationCancelled)
     }
 
     fn handle_list_credentials(
@@ -3560,22 +3156,22 @@ impl AgentRuntime {
             .lock()
             .unwrap()
             .get(session_id)
-            .map(|lease| lease.lease_id.clone())
-            .or_else(|| {
-                let current = profile.current_pending.lock().unwrap();
-                current.as_ref().and_then(|pending| {
-                    if pending.session_id == *session_id {
-                        pending.browser_lease_id.clone()
-                    } else {
-                        None
-                    }
-                })
-            });
+            .map(|lease| lease.lease_id.clone());
 
         if let Some(lease_id) = lease_id {
-            let browser_mgr = self.browser_manager.lock().unwrap();
+            let browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             if let Some(snapshot) = browser_mgr.snapshot(&lease_id) {
                 let cdp_endpoint = browser_mgr.lease_cdp_endpoint(&lease_id).flatten();
+                let cdp_exposure = browser_mgr.lease_has_cdp_pipes(&lease_id).map(|pipes| {
+                    if pipes {
+                        CdpExposeMode::Pipe.to_string()
+                    } else {
+                        CdpExposeMode::Port.to_string()
+                    }
+                });
                 let shared_browser_context =
                     if profile.profile_config.browser_scope == BrowserScope::Profile {
                         let shared = profile.shared_browsers.lock().ok();
@@ -3586,12 +3182,24 @@ impl AgentRuntime {
                     } else {
                         None
                     };
+                let (interception, incognito_allowed) =
+                    self.lease_interception_report(&browser_mgr, &lease_id);
+                // Like the bootstrap, status does not hand out the endpoint of a lease whose
+                // interception is not attached (plan D6 layer 1).
+                // A lease without an interception record withholds it too (fail closed).
+                let cdp_endpoint = cdp_endpoint.filter(|_| {
+                    interception.as_deref()
+                        == Some(super::browser::InterceptionState::Attached.as_str())
+                });
                 return Ok(PrincipalResponse::BrowserStatus(
                     passless_core::agent::BrowserStatusResponse {
                         running: !snapshot.state.is_terminal(),
                         status: format!("{}", snapshot.state),
                         cdp_endpoint,
                         shared_browser_context,
+                        interception,
+                        incognito_allowed,
+                        cdp_exposure,
                     },
                 ));
             }
@@ -3603,6 +3211,9 @@ impl AgentRuntime {
                 status: "no_browser".into(),
                 cdp_endpoint: None,
                 shared_browser_context: None,
+                interception: None,
+                incognito_allowed: None,
+                cdp_exposure: None,
             },
         ))
     }
@@ -3621,16 +3232,6 @@ impl AgentRuntime {
             .unwrap()
             .get(session_id)
             .map(|lease| lease.lease_id.clone())
-            .or_else(|| {
-                let current = profile.current_pending.lock().unwrap();
-                current.as_ref().and_then(|pending| {
-                    if pending.session_id == *session_id {
-                        pending.browser_lease_id.clone()
-                    } else {
-                        None
-                    }
-                })
-            })
             .ok_or_else(|| {
                 ProtocolError::new(
                     ErrorCode::Forbidden,
@@ -3642,20 +3243,33 @@ impl AgentRuntime {
         let cdp_method = extract_cdp_method_for_audit(request_json);
 
         {
-            let browser_mgr = self.browser_manager.lock().unwrap();
-            if let Some(false) = browser_mgr.lease_has_cdp_pipes(&lease_id) {
-                let endpoint_msg = browser_mgr
-                    .lease_cdp_endpoint(&lease_id)
-                    .flatten()
-                    .unwrap_or_else(|| "<endpoint not yet discovered>".to_string());
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    format!(
-                        "browser-control is unavailable in port mode; connect directly via CDP: {}",
-                        endpoint_msg
-                    ),
-                    RecommendedAction::FixRequest,
-                ));
+            let browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
+            // The endpoint is not named: only the bootstrap hands it out, and it withholds it while
+            // the lease's interception is degraded (review L1).
+            gates::check_browser_control_available(browser_mgr.lease_has_cdp_pipes(&lease_id))?;
+            // The same readiness gate as the port-mode bootstrap: no CDP while the daemon cannot
+            // confirm that the browser's WebAuthn requests are intercepted.
+            let interception = browser_mgr
+                .interception_state(
+                    &lease_id,
+                    &self.sign_readiness,
+                    super::browser::INTERCEPTION_DEGRADED_GRACE,
+                )
+                .map(|(state, _)| state);
+            if let Err(refused) = gates::check_control_interception(interception) {
+                let _ = self.audit_gate.record(
+                    super::audit_events::BrowserControlRequestBuilder::new(
+                        profile_id.clone(),
+                        lease_id.clone(),
+                        &cdp_method,
+                        super::audit_events::BrowserControlOutcome::Denied,
+                    )
+                    .build(),
+                );
+                return Err(refused);
             }
         }
 
@@ -3679,8 +3293,11 @@ impl AgentRuntime {
 
         let timeout = Duration::from_millis(timeout_ms as u64);
 
-        let result = {
-            let mut browser_mgr = self.browser_manager.lock().unwrap();
+        {
+            let browser_mgr = super::lock_order::lock(
+                &self.browser_manager,
+                super::lock_order::LockLevel::BrowserManager,
+            );
             let snapshot = browser_mgr.snapshot(&lease_id);
             let state = snapshot
                 .as_ref()
@@ -3722,9 +3339,16 @@ impl AgentRuntime {
                     RecommendedAction::Abort,
                 ));
             }
+        }
 
-            browser_mgr.cdp_round_trip(&lease_id, request_json, timeout)
-        };
+        // The wait for the answer does not hold the browser manager: a `Runtime.evaluate` that
+        // awaits a WebAuthn ceremony needs it to activate the lease (LOCKING.md, rank 30).
+        let result = super::browser::cdp_round_trip_shared(
+            &self.browser_manager,
+            &lease_id,
+            request_json,
+            timeout,
+        );
 
         match result {
             Ok(cdp_result) => {
@@ -3773,6 +3397,25 @@ impl AgentRuntime {
                 Err(ProtocolError::new(
                     ErrorCode::Forbidden,
                     "browser process has exited",
+                    RecommendedAction::FixRequest,
+                ))
+            }
+            Err(super::browser::CdpError::Denied(reason)) => {
+                // The extension filter (review M3): the agent tried to reach the Passless
+                // extension or a browser-internal page. Audited as a denial.
+                let outcome = super::audit_events::BrowserControlOutcome::Denied;
+                let _ = self.audit_gate.record(
+                    super::audit_events::BrowserControlRequestBuilder::new(
+                        profile_id.clone(),
+                        lease_id,
+                        &cdp_method,
+                        outcome,
+                    )
+                    .build(),
+                );
+                Err(ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    format!("CDP request denied: {reason}"),
                     RecommendedAction::FixRequest,
                 ))
             }
@@ -3829,14 +3472,11 @@ impl AgentRuntime {
         let generation = self.policy_runtime.current_generation();
         let policy_gen = generation
             .find_snapshot(profile_id)
-            .map(|_| generation.generation_id.as_str().len() as u64)
+            .map(|_| generation.generation)
             .unwrap_or(0);
         let active_grants = self
             .policy_runtime
             .active_grant_count_for_profile(profile_id);
-        let pending_intents = self
-            .policy_runtime
-            .pending_intent_count_for_profile(profile_id);
         let active_sessions =
             u32::try_from(self.active_session_count(profile_id)).unwrap_or(u32::MAX);
 
@@ -3849,7 +3489,6 @@ impl AgentRuntime {
                 policy_generation: policy_gen,
                 active_grants,
                 active_sessions,
-                pending_intents,
             },
         ))
     }
@@ -3873,7 +3512,6 @@ impl AgentRuntime {
         profile: &ProfileRuntime,
     ) -> passless_core::agent::ProfileDiagnosticReport {
         let enabled = profile.enabled.load(Ordering::Acquire);
-        let endpoint_has_id = profile.endpoint_id.lock().unwrap().is_some();
 
         let browser_lease_state = {
             let active = profile.active_browser.lock().unwrap();
@@ -3883,45 +3521,105 @@ impl AgentRuntime {
         let generation = self.policy_runtime.current_generation();
         let policy_gen = generation
             .find_snapshot(profile_id)
-            .map(|_| generation.generation_id.as_str().len() as u64)
+            .map(|_| generation.generation)
             .unwrap_or(0);
 
         let (pin_storage_available, pin_set) = {
-            let pin_storage = profile
-                .endpoint_spec
-                .isolated_deps
-                .as_ref()
-                .map(|isolated| isolated.pin_storage.clone());
+            let pin_storage =
+                (profile.mode == AgentMode::Isolated).then(|| profile.backend.pin_storage.clone());
 
             match pin_storage {
                 Some(ps) => {
-                    let storage = ps.lock();
-                    match storage {
-                        Ok(s) => match s.load_pin_state() {
-                            Ok(state) => (true, state.is_pin_set()),
-                            Err(_) => (true, false),
-                        },
-                        Err(_) => (false, false),
+                    // Recovering: a poisoned lock must not report the PIN storage unavailable.
+                    let storage = crate::pin_storage::lock_pin_storage(&ps);
+                    match storage.load_pin_state() {
+                        Ok(state) => (true, state.is_pin_set()),
+                        Err(_) => (true, false),
                     }
                 }
                 None => (false, false),
             }
         };
 
-        let require_uv = profile.profile_config.requires_human_uv();
+        // Agent ceremonies carry no human UV evidence (ADR 0014 section 7), so no PIN is required.
+        let require_uv = false;
 
-        super::doctor::build_profile_diagnostic_report(super::doctor::ProfileDiagnosticParams {
-            profile_id,
-            enabled,
-            mode: profile.mode,
-            endpoint_has_id,
-            browser_lease_state: browser_lease_state.as_deref(),
-            policy_generation: policy_gen,
-            audit_gate: &self.audit_gate,
-            pin_storage_available,
-            pin_set,
-            require_uv,
-        })
+        let mut report = super::doctor::build_profile_diagnostic_report(
+            super::doctor::ProfileDiagnosticParams {
+                profile_id,
+                enabled,
+                mode: profile.mode,
+                browser_lease_state: browser_lease_state.as_deref(),
+                policy_generation: policy_gen,
+                audit_gate: &self.audit_gate,
+                pin_storage_available,
+                pin_set,
+                require_uv,
+            },
+        );
+        // Both deployment axes and the shared-UID `isolated` warning (ADR 0014 section 13).
+        report.checks.extend(profile.deployment_axes().checks(None));
+        // The installed relay against the daemon's build (plan V-L5).
+        report.checks.push(super::doctor::relay_version_check(
+            &super::doctor::ProductionRelayProbe,
+            &super::transport::build_version(),
+        ));
+        // The browser user's relay needs a sign socket it can reach (finding: a browser of another
+        // UID used to time out at launch with no explanation).
+        let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
+        report.checks.push(match self.sign_socket_for(browser_uid) {
+            Ok(path) => passless_core::agent::DoctorCheck {
+                name: "sign_socket".into(),
+                passed: true,
+                message: format!(
+                    "browser uid {} reaches the daemon at {}",
+                    browser_uid,
+                    path.display()
+                ),
+            },
+            Err(e) => passless_core::agent::DoctorCheck {
+                name: "sign_socket".into(),
+                passed: false,
+                message: e.message,
+            },
+        });
+        // The granted-rules store and the escalation configuration (ADR 0014 sections 8.2, 8.4).
+        report.checks.push(super::doctor::granted_rules_check(
+            self.granted_rules.profile(profile_id).as_deref(),
+            &self.granted_rules.path_for(profile_id),
+        ));
+        {
+            let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+            let config = self
+                .agent_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let profile_config = config
+                .profiles
+                .get(profile_id.as_str())
+                .unwrap_or(&profile.profile_config);
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            report.checks.push(super::doctor::escalation_check(
+                &config,
+                profile_config,
+                euid,
+            ));
+            report.checks.push(super::doctor_grants::inert_grants_check(
+                profile_config,
+                self.granted_rules.profile(profile_id).as_deref(),
+            ));
+        }
+        // Deprecated config vocabulary is accepted with a warning until the release after next (plan R8):
+        // a warning never makes the profile unhealthy, so the check passes and carries the text.
+        for warning in profile.profile_config.deprecation_warnings(profile_id) {
+            report.checks.push(passless_core::agent::DoctorCheck {
+                name: "config_deprecation".into(),
+                passed: true,
+                message: format!("warning: {warning}"),
+            });
+        }
+        report
     }
 
     fn handle_enableprofile(&self, profile_id: &ProfileId) -> Result<AdminResponse, ProtocolError> {
@@ -3932,49 +3630,6 @@ impl AgentRuntime {
                 RecommendedAction::FixRequest,
             )
         })?;
-
-        let has_endpoint = {
-            let eid_guard = profile.endpoint_id.lock().unwrap();
-            eid_guard.is_some()
-        };
-
-        if !has_endpoint {
-            match profile.mode {
-                AgentMode::SameUser => {
-                    let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                    *eid_guard = Some(EndpointId::new());
-                }
-                AgentMode::Isolated => {
-                    let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-                    match self.create_profile_endpoint(&profile.endpoint_spec) {
-                        Ok(eid) => {
-                            let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                            *eid_guard = Some(eid);
-                        }
-                        Err(e) => {
-                            return Err(ProtocolError::new(
-                                ErrorCode::Internal,
-                                format!("failed to recreate endpoint: {}", e),
-                                RecommendedAction::Abort,
-                            ));
-                        }
-                    }
-                }
-            }
-        } else {
-            let em = self.endpoint_manager.lock().unwrap();
-            let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
-            let healthy = em.snapshot().iter().any(|s| s.handle.id() == &eid);
-            drop(em);
-
-            if !healthy {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    format!("profile '{}' endpoint runtime is not healthy", profile_id),
-                    RecommendedAction::Abort,
-                ));
-            }
-        }
 
         profile.enabled.store(true, Ordering::Release);
 
@@ -4014,30 +3669,11 @@ impl AgentRuntime {
 
         profile.enabled.store(false, Ordering::Release);
 
-        {
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current {
-                let _ = self
-                    .policy_runtime
-                    .principal_cancel_pending(&pending.request_id, &pending.session_id);
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-                if let Some(ref lease_id) = pending.browser_lease_id {
-                    let mut browser_mgr = self.browser_manager.lock().unwrap();
-                    let _ = browser_mgr.revoke(lease_id);
-                    let _ = browser_mgr.terminate(lease_id);
-                    let _ = browser_mgr.cleanup(lease_id);
-                    browser_mgr.remove(lease_id);
-                }
-                *current = None;
-            }
-        }
-
-        self.cleanup_all_browsers_for_profile(profile);
+        self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
 
         if let Some(session_slot) = self.managed_sessions.get(profile_id) {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             for managed in sessions.drain(..) {
                 info!(
                     "Disabling profile '{}' terminates session {} (pid {})",
@@ -4086,7 +3722,7 @@ impl AgentRuntime {
         })?;
 
         let digest_hex = hex::encode(generation.digest.as_bytes());
-        let gen_num = generation.generation_id.as_str().len() as u64;
+        let gen_num = generation.generation;
         let _ = snapshot;
 
         Ok(AdminResponse::PolicyInfo(
@@ -4094,10 +3730,16 @@ impl AgentRuntime {
                 profile_id: profile_id.to_string(),
                 policy_generation: gen_num,
                 digest: digest_hex,
+                grants_digest: self.granted_rules.grants_digest(profile_id),
             },
         ))
     }
 
+    /// Reload the policy (ADR 0014 sections 6.4 and 9). The configuration file is re-read and
+    /// validated first; an unreadable, invalid or restart-only change keeps the old generation,
+    /// is logged and audited, and returns an error. A reload whose digest is unchanged revokes
+    /// nothing. A changed policy bumps the revocation epoch, which revokes every sign and
+    /// registration bearer (in-flight operations fail before key use) and closes their browsers.
     fn handle_reload_policy(&self, profile_id: &ProfileId) -> Result<AdminResponse, ProtocolError> {
         let _profile = self.profiles.get(profile_id).ok_or_else(|| {
             ProtocolError::new(
@@ -4107,47 +3749,192 @@ impl AgentRuntime {
             )
         })?;
 
-        let config = self.agent_config.read().unwrap().clone();
-        self.policy_runtime.reload(&config).map_err(|e| {
+        let rejected = |message: String| {
+            warn!(
+                "policy reload rejected, keeping generation {}: {}",
+                self.policy_runtime.generation_number(),
+                message
+            );
             ProtocolError::new(
-                ErrorCode::Internal,
-                format!("policy recompile failed: {}", e),
-                RecommendedAction::Abort,
+                ErrorCode::BadRequest,
+                format!("policy reload rejected: {}", message),
+                RecommendedAction::FixRequest,
             )
-        })?;
+        };
 
-        let generation = self.policy_runtime.current_generation();
+        // The configuration lock is held across the reload so concurrent reloads apply in order
+        // and the stored configuration always matches the compiled policy. It is released before
+        // browsers are closed (the browser manager ranks below it, LOCKING.md).
+        let outcome = {
+            let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
+            let mut current = self
+                .agent_config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (config, outcome) = reload_policy_from_source(
+                self.config_source.as_ref(),
+                &current,
+                &self.policy_runtime,
+                self.human_path_automatic,
+            )
+            .map_err(rejected)?;
+            self.escalation.set_cooldown(config.escalation_cooldown());
+            *current = config;
+            outcome
+        };
+
         let gen_event = super::audit_events::AdminPolicyRecompileBuilder::new(
             profile_id.clone(),
-            generation.generation_id.as_str().len() as u64,
+            outcome.generation,
         )
         .build();
         let _ = self.audit_gate.record(gen_event);
 
-        for (pid, profile) in &self.profiles {
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current {
-                let _ = self
-                    .policy_runtime
-                    .principal_cancel_pending(&pending.request_id, &pending.session_id);
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-                if let Some(ref lease_id) = pending.browser_lease_id {
-                    let mut browser_mgr = self.browser_manager.lock().unwrap();
-                    let _ = browser_mgr.revoke(lease_id);
-                    let _ = browser_mgr.terminate(lease_id);
-                    let _ = browser_mgr.cleanup(lease_id);
-                    browser_mgr.remove(lease_id);
-                }
-                *current = None;
+        if outcome.changed {
+            // Pending escalations were raised under the old policy: cancel them
+            // (`escalation.revoked`, `reason = policy_reload`). The epoch bump already makes
+            // their waiters' sessions invalid; this also withdraws the prompts at once.
+            for profile in self.profiles.keys() {
+                self.escalation.cancel_profile(profile);
             }
-            drop(current);
-            self.cleanup_all_browsers_for_profile(profile);
-            let _ = pid;
+            let revoked = self.revoke_stale_bearers_and_close_browsers(outcome.revocation_epoch);
+            info!(
+                "policy reloaded: generation {}, revocation epoch {}; {} bearer(s) revoked",
+                outcome.generation, outcome.revocation_epoch, revoked
+            );
+        } else {
+            info!(
+                "policy reloaded: unchanged (generation {}); sessions kept",
+                outcome.generation
+            );
         }
 
         Ok(AdminResponse::PolicyRecompiled)
+    }
+
+    fn require_profile(&self, profile_id: &ProfileId) -> Result<(), ProtocolError> {
+        if self.profiles.contains_key(profile_id) {
+            Ok(())
+        } else {
+            Err(ProtocolError::new(
+                ErrorCode::NotFound,
+                format!("profile '{}' not found", profile_id),
+                RecommendedAction::FixRequest,
+            ))
+        }
+    }
+
+    /// List the persistent granted rules (ADR 0014 section 8.4).
+    fn handle_list_granted_rules(
+        &self,
+        profile_filter: Option<&ProfileId>,
+    ) -> Result<AdminResponse, ProtocolError> {
+        if let Some(profile_id) = profile_filter {
+            self.require_profile(profile_id)?;
+        }
+        let profiles = self
+            .granted_rules
+            .list()
+            .into_iter()
+            .filter(|(profile_id, _)| profile_filter.is_none_or(|filter| filter == profile_id))
+            .map(
+                |(profile_id, view)| passless_core::agent::ProfileGrantedRules {
+                    profile_id: profile_id.to_string(),
+                    enabled: view.disabled_reason().is_none(),
+                    disabled_reason: view.disabled_reason().map(str::to_string),
+                    digest: self
+                        .granted_rules
+                        .grants_digest(&profile_id)
+                        .unwrap_or_default(),
+                    rules: view
+                        .rules()
+                        .iter()
+                        .map(|rule| passless_core::agent::GrantedRuleInfo {
+                            rp_id: rule.rp_id.clone(),
+                            action: rule.action.as_str().to_string(),
+                            kind: rule.kind.as_str().to_string(),
+                            granted_at: rule.granted_at.clone(),
+                            request_id: rule.request_id.clone(),
+                            origin: rule.origin.clone(),
+                            rule: rule.rule.as_str().to_string(),
+                            credential_ref: rule.credential_ref.as_ref().map(|r| r.to_hex()),
+                        })
+                        .collect(),
+                },
+            )
+            .collect();
+        Ok(AdminResponse::GrantedRuleList(
+            passless_core::agent::GrantedRuleList { profiles },
+        ))
+    }
+
+    /// Revoke the granted rule of one RP. Revocation bumps the revocation epoch, so every bearer
+    /// session is revoked and its browser closed, exactly as a policy change does.
+    fn handle_revoke_granted_rule(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        action: &passless_core::agent::GrantAction,
+    ) -> Result<AdminResponse, ProtocolError> {
+        self.require_profile(profile_id)?;
+        let rp_id = normalize_admin_rp_id(rp_id)?;
+        let rp_id = rp_id.as_str();
+        let action = match action {
+            passless_core::agent::GrantAction::Authenticate => {
+                super::granted_rules::GrantedAction::Authenticate
+            }
+            passless_core::agent::GrantAction::Register => {
+                return Err(ProtocolError::new(
+                    ErrorCode::BadRequest,
+                    "only authenticate rules are granted; registration is never granted",
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        };
+        let outcome = revoke_granted_rule(
+            &self.granted_rules,
+            &self.policy_runtime,
+            &self.escalation,
+            &self.audit_gate,
+            profile_id,
+            rp_id,
+            action,
+        )?;
+        self.revoke_sessions_after_grant_revocation(outcome);
+        Ok(AdminResponse::GrantedRulesRevoked {
+            revoked: outcome.revoked as u32,
+        })
+    }
+
+    /// Revoke every granted rule of a profile.
+    fn handle_clear_granted_rules(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<AdminResponse, ProtocolError> {
+        self.require_profile(profile_id)?;
+        let outcome = clear_granted_rules(
+            &self.granted_rules,
+            &self.policy_runtime,
+            &self.escalation,
+            &self.audit_gate,
+            profile_id,
+        )?;
+        if outcome.revoked > 0 {
+            self.revoke_sessions_after_grant_revocation(outcome);
+        }
+        Ok(AdminResponse::GrantedRulesRevoked {
+            revoked: outcome.revoked as u32,
+        })
+    }
+
+    /// The revocation epoch moved: revoke the stale bearers and close their browsers, as a reload
+    /// that changed the policy does (the epoch is global, so every profile is affected).
+    fn revoke_sessions_after_grant_revocation(&self, outcome: super::granted_rules::RevokeOutcome) {
+        let revoked = self.revoke_stale_bearers_and_close_browsers(outcome.revocation_epoch);
+        info!(
+            "granted rules revoked: {} rule(s), revocation epoch {}; {} bearer(s) revoked",
+            outcome.revoked, outcome.revocation_epoch, revoked
+        );
     }
 
     fn handle_admin_list_credentials(
@@ -4157,28 +3944,27 @@ impl AgentRuntime {
         let mut all_credentials = Vec::new();
 
         for profile in self.profiles.values() {
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let mut storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let mut storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             let filter = if let Some(rp) = rp_id {
-                if !profile
-                    .profile_config
-                    .rp_ids
-                    .iter()
-                    .any(|configured_rp| configured_rp.trim().eq_ignore_ascii_case(rp.trim()))
+                // Only RPs the profile has a rule for (exact, or through the wildcard).
+                if self
+                    .policy_runtime
+                    .resolve(
+                        &profile.profile_id,
+                        &passless_core::agent::protocol::GrantAction::Authenticate,
+                        rp,
+                    )
+                    .rule
+                    == passless_core::agent::RuleIdentity::None
                 {
                     continue;
                 }
@@ -4252,21 +4038,15 @@ impl AgentRuntime {
                 continue;
             }
 
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let mut storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let mut storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             let mut has_more = true;
             let first_result = storage.read_first(crate::storage::CredentialFilter::None);
@@ -4321,22 +4101,7 @@ impl AgentRuntime {
         }
 
         for profile in self.profiles.values() {
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current {
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-                if let Some(ref lease_id) = pending.browser_lease_id {
-                    let mut browser_mgr = self.browser_manager.lock().unwrap();
-                    let _ = browser_mgr.revoke(lease_id);
-                    let _ = browser_mgr.terminate(lease_id);
-                    let _ = browser_mgr.cleanup(lease_id);
-                    browser_mgr.remove(lease_id);
-                }
-                *current = None;
-            }
-            drop(current);
-            self.cleanup_all_browsers_for_profile(profile);
+            self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
         }
 
         let revoke_event =
@@ -4346,96 +4111,64 @@ impl AgentRuntime {
         Ok(AdminResponse::CredentialRevoked)
     }
 
+    /// Delete a credential from an isolated profile's store. Every credential there was created
+    /// by the agent path (including an orphan of an unfocused-tab registration, ADR 0014 section
+    /// 11), so the operator can delete any of them; the human store (same-user profiles) is never
+    /// touched.
     fn handle_admin_delete_credential(
         &self,
         credential_ref: &passless_core::agent::CredentialRef,
     ) -> Result<AdminResponse, ProtocolError> {
-        let mut _found_isolated = false;
-
         for profile in self.profiles.values() {
             if profile.mode != AgentMode::Isolated {
                 continue;
             }
 
-            let is_in_profile = profile
-                .profile_config
-                .credential_refs
-                .as_ref()
-                .is_some_and(|refs| refs.iter().any(|r| r == credential_ref));
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            if !is_in_profile {
+            let mut storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
+
+            let found = find_credential_by_ref(&mut **storage, credential_ref).map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "failed to read the credential store of profile '{}': {}",
+                        profile.profile_id, e
+                    ),
+                    RecommendedAction::Retry,
+                )
+            })?;
+            let Some(cred) = found else {
                 continue;
-            }
-
-            _found_isolated = true;
-
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
-
-            let mut storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
-
-            let first_result = storage.read_first(crate::storage::CredentialFilter::None);
-            let mut cred = match first_result {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::Internal,
-                        format!("storage enumeration failed: {}", e),
-                        RecommendedAction::Retry,
-                    ));
-                }
             };
+            storage.delete(&cred.id).map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to delete credential: {}", e),
+                    RecommendedAction::Retry,
+                )
+            })?;
 
-            loop {
-                let actual_ref = passless_core::agent::CredentialRef::with_default_domain(&cred.id);
-                if actual_ref == *credential_ref {
-                    storage.delete(credential_ref.as_bytes()).map_err(|e| {
-                        ProtocolError::new(
-                            ErrorCode::Internal,
-                            format!("failed to delete credential: {}", e),
-                            RecommendedAction::Retry,
-                        )
-                    })?;
+            let delete_event = super::audit_events::AdminCredentialDeleteBuilder::new(
+                profile.profile_id.clone(),
+                credential_ref.clone(),
+                &cred.rp.id,
+            )
+            .build();
+            let _ = self.audit_gate.record(delete_event);
 
-                    let delete_event = super::audit_events::AdminCredentialDeleteBuilder::new(
-                        credential_ref.clone(),
-                        &cred.rp.id,
-                    )
-                    .build();
-                    let _ = self.audit_gate.record(delete_event);
-
-                    return Ok(AdminResponse::Deleted);
-                }
-
-                match storage.read_next() {
-                    Ok(next) => cred = next,
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if !_found_isolated {
-            return Err(ProtocolError::new(
-                ErrorCode::NotFound,
-                "credential not found in any isolated profile",
-                RecommendedAction::FixRequest,
-            ));
+            return Ok(AdminResponse::Deleted);
         }
 
         Err(ProtocolError::new(
             ErrorCode::NotFound,
-            "credential not found",
+            "credential not found in any isolated profile",
             RecommendedAction::FixRequest,
         ))
     }
@@ -4463,21 +4196,15 @@ impl AgentRuntime {
                 continue;
             }
 
-            let _op = profile.operation_lock.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire operation lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _op = super::lock_order::lock(
+                &profile.operation_lock,
+                super::lock_order::LockLevel::Operation,
+            );
 
-            let _storage = profile.credential_storage.lock().map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Internal,
-                    format!("failed to acquire storage lock: {}", e),
-                    RecommendedAction::Retry,
-                )
-            })?;
+            let _storage = super::lock_order::lock(
+                &profile.credential_storage,
+                super::lock_order::LockLevel::Storage,
+            );
 
             return Err(ProtocolError::new(
                 ErrorCode::Internal,
@@ -4638,22 +4365,7 @@ impl AgentRuntime {
             if profile.profile_id != details.profile_id {
                 continue;
             }
-            let mut current = profile.current_pending.lock().unwrap();
-            if let Some(ref pending) = *current {
-                profile
-                    .preparation_slot
-                    .clear_matching(pending.prep_generation);
-                if let Some(ref lease_id) = pending.browser_lease_id {
-                    let mut browser_mgr = self.browser_manager.lock().unwrap();
-                    let _ = browser_mgr.revoke(lease_id);
-                    let _ = browser_mgr.terminate(lease_id);
-                    let _ = browser_mgr.cleanup(lease_id);
-                    browser_mgr.remove(lease_id);
-                }
-                *current = None;
-            }
-            drop(current);
-            self.cleanup_all_browsers_for_profile(profile);
+            self.cleanup_all_browsers_for_profile(profile, RevokeReason::AdminRevoked);
         }
 
         Ok(AdminResponse::GrantRevoked)
@@ -4675,7 +4387,8 @@ impl AgentRuntime {
             {
                 continue;
             }
-            let sessions = session_slot.lock().unwrap();
+            let sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             for managed in sessions.iter() {
                 let created_at = wall_now.saturating_sub(managed.created_at.elapsed().as_secs());
                 let expires_at = wall_now.saturating_add(
@@ -4713,7 +4426,8 @@ impl AgentRuntime {
             .as_secs();
 
         for (profile_id, session_slot) in &self.managed_sessions {
-            let sessions = session_slot.lock().unwrap();
+            let sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             if let Some(managed) = sessions
                 .iter()
                 .find(|managed| managed.session_id == *session_id)
@@ -4749,7 +4463,8 @@ impl AgentRuntime {
         session_id: &PrincipalSessionId,
     ) -> Result<AdminResponse, ProtocolError> {
         for (profile_id, session_slot) in &self.managed_sessions {
-            let mut sessions = session_slot.lock().unwrap();
+            let mut sessions =
+                super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
             if let Some(pos) = sessions
                 .iter()
                 .position(|managed| managed.session_id == *session_id)
@@ -4771,33 +4486,6 @@ impl AgentRuntime {
                 let _ = self.audit_gate.record(revoke_event);
 
                 if let Some(profile) = self.profiles.get(profile_id) {
-                    let pending = {
-                        let mut current = profile.current_pending.lock().unwrap();
-                        if current
-                            .as_ref()
-                            .is_some_and(|pending| pending.session_id == *session_id)
-                        {
-                            current.take()
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(pending) = pending {
-                        let _ = self
-                            .policy_runtime
-                            .principal_cancel_pending(&pending.request_id, &pending.session_id);
-                        profile
-                            .preparation_slot
-                            .clear_matching(pending.prep_generation);
-                        if let Some(ref lease_id) = pending.browser_lease_id {
-                            self.revoke_sign_context_for_lease(lease_id);
-                            let mut browser_mgr = self.browser_manager.lock().unwrap();
-                            let _ = browser_mgr.revoke(lease_id);
-                            let _ = browser_mgr.terminate(lease_id);
-                            let _ = browser_mgr.cleanup(lease_id);
-                            browser_mgr.remove(lease_id);
-                        }
-                    }
                     self.cleanup_browser_for_session(profile, session_id);
                 }
 
@@ -4879,174 +4567,6 @@ impl AgentRuntime {
         ))
     }
 
-    fn handle_admin_request_delegation(
-        &self,
-        profile_id: &ProfileId,
-        rp_id: &str,
-        credential_ref: &passless_core::agent::CredentialRef,
-        max_session_ttl: u64,
-        reason: Option<&str>,
-    ) -> Result<AdminResponse, ProtocolError> {
-        let profile = self.profiles.get(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                format!("profile '{}' not found", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-
-        let session_slot = self.managed_sessions.get(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                "no session slot for profile",
-                RecommendedAction::Abort,
-            )
-        })?;
-
-        let managed_guard = session_slot.lock().unwrap();
-        let managed = match managed_guard.as_slice() {
-            [managed] => managed,
-            [] => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "no active principal session for this profile; launch one first with `passless agent run`",
-                    RecommendedAction::FixRequest,
-                ));
-            }
-            _ => {
-                return Err(ProtocolError::new(
-                    ErrorCode::Conflict,
-                    "multiple principal sessions are active; issue this request from the target principal session",
-                    RecommendedAction::FixRequest,
-                ));
-            }
-        };
-
-        let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-        {
-            let eid_guard = profile.endpoint_id.lock().unwrap();
-            if eid_guard.is_none() {
-                drop(eid_guard);
-                let eid = passless_core::agent::EndpointId::new();
-                info!(
-                    "Profile '{}' using human-shared endpoint (no agent UHID device): {}",
-                    profile_id.as_str(),
-                    eid.as_str()
-                );
-                let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                *eid_guard = Some(eid);
-            }
-        }
-        let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
-
-        let resp = self.handle_request_delegation(RequestDelegationParams {
-            profile_id,
-            session_id: &managed.session_id,
-            endpoint_id: &eid,
-            rp_id,
-            credential_ref,
-            max_session_ttl,
-            principal_reason: reason.map(|s| s.to_string()),
-            profile,
-            session_digest: &managed.process_digest,
-        })?;
-
-        match resp {
-            PrincipalResponse::DelegationRequested { request_id } => {
-                Ok(AdminResponse::DelegationRequested { request_id })
-            }
-            _ => Err(ProtocolError::new(
-                ErrorCode::Internal,
-                "unexpected response from delegation handler",
-                RecommendedAction::Retry,
-            )),
-        }
-    }
-
-    fn handle_request_registration(
-        &self,
-        profile_id: &ProfileId,
-        rp_id: &str,
-        max_session_ttl: u64,
-        _reason: Option<&str>,
-    ) -> Result<AdminResponse, ProtocolError> {
-        let profile = self.profiles.get(profile_id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                format!("profile '{}' not found", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-        if !profile.enabled.load(Ordering::Acquire) {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                format!("profile '{}' is disabled", profile_id),
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let normalized_rp = passless_core::agent::config::validate_rp_id(rp_id).map_err(|e| {
-            ProtocolError::new(
-                ErrorCode::BadRequest,
-                format!("invalid registration RP ID: {}", e),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-        if normalized_rp == passless_core::agent::config::ANY_RP_ID {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "registration enrollment requires an exact RP ID",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let rule = profile
-            .profile_config
-            .rule_for_rp(&normalized_rp)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "registration RP has no configured rule",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-        if rule.register.authorization == passless_core::agent::AgentAuthorization::Deny {
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "registration policy denies enrollment for RP",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let profile_ttl = profile
-            .profile_config
-            .max_session_ttl
-            .map(|ttl| ttl.as_secs())
-            .unwrap_or(300);
-        let enrollment_ceiling = profile_ttl.clamp(1, 300);
-        let requested = if max_session_ttl == 0 {
-            enrollment_ceiling
-        } else {
-            max_session_ttl
-        };
-        let ttl = requested.min(enrollment_ceiling).max(1);
-
-        let reg_grant_id = self
-            .policy_runtime
-            .request_registration_grant(profile_id.clone(), normalized_rp, ttl)
-            .map_err(|e| {
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    format!("failed to create registration enrollment grant: {}", e),
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        Ok(AdminResponse::RegistrationGranted {
-            registration_grant_id: reg_grant_id,
-        })
-    }
-
     fn handle_launch_browser(
         &self,
         profile_id: &ProfileId,
@@ -5060,45 +4580,22 @@ impl AgentRuntime {
             )
         })?;
 
-        let endpoint_id = profile.endpoint_id.lock().unwrap().clone().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::NotFound,
-                format!("profile '{}' has no active endpoint", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-
         let profile_config = &profile.profile_config;
 
-        let browser_command = profile_config.browser_command.as_ref().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::BadRequest,
-                format!("profile '{}' has no browser_command configured", profile_id),
-                RecommendedAction::FixRequest,
-            )
-        })?;
-
-        let executable = PathBuf::from(&browser_command[0]);
-        let extra_args = browser_command[1..].to_vec();
+        // The same selection and refusals as the principal's `EnsureBrowser` (R14, V-H7).
+        let launch = self.resolve_browser_launch(profile, profile_config, false)?;
+        let executable = launch.executable;
+        let extra_args = launch.extra_args;
 
         let runtime_root = profile_config
             .browser_runtime_root
             .clone()
-            .unwrap_or_else(|| {
-                dirs::runtime_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("passless")
-                    .join("browser")
-            });
+            .unwrap_or_else(|| super::browser::default_runtime_root().1);
 
         let browser_uid = profile.browser_uid.unwrap_or(profile.daemon_uid);
         let browser_gid = profile.browser_gid.unwrap_or(profile.daemon_gid);
 
-        let rp_ids = if !profile_config.rp_ids.is_empty() {
-            profile_config.rp_ids.clone()
-        } else {
-            profile_config.allowed_rp_ids()
-        };
+        let rp_ids = profile_config.rule_rp_ids();
 
         let config = BrowserConfig {
             executable,
@@ -5110,6 +4607,7 @@ impl AgentRuntime {
             ttl: std::time::Duration::from_secs(3600),
             login_timeout: std::time::Duration::from_secs(300),
             rp_ids,
+            start_url_rules: profile_config.rules.clone(),
             target_uid: browser_uid,
             target_gid: browser_gid,
             daemon_uid: profile.daemon_uid,
@@ -5118,21 +4616,41 @@ impl AgentRuntime {
                 .browser_cdp_expose
                 .unwrap_or(CdpExposeMode::Pipe),
             cdp_port: profile_config.browser_cdp_port.unwrap_or(0),
-            bind_parent_death: profile_config.browser_scope != BrowserScope::Profile,
+            // Every scope: the browser is forked on the long-lived launcher thread, so its
+            // parent-death signal fires only when the daemon dies (defect B1); revocation,
+            // expiry and session end terminate it explicitly.
+            bind_parent_death: true,
         };
 
-        let mut browser_manager = self.browser_manager.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "browser manager lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
+        let mut browser_manager = super::lock_order::lock(
+            &self.browser_manager,
+            super::lock_order::LockLevel::BrowserManager,
+        );
+
+        // A live lease whose bearers were all revoked (a grant revocation or a reload is closing
+        // it) is not reusable: close it here and launch a fresh browser.
+        if let Some(stale) = browser_manager.find_live_lease_for_profile(profile_id)
+            && !self
+                .sign_registry
+                .has_live_bearer_for_lease(stale.id.as_str())
+        {
+            close_lease_audited(
+                &self.audit_gate,
+                &self.sign_registry,
+                &mut browser_manager,
+                &stale.id,
+                RevokeReason::PolicyReload,
+            );
+        }
 
         if let Some(existing_snapshot) = browser_manager.find_live_lease_for_profile(profile_id) {
             let cdp_endpoint = browser_manager
                 .lease_cdp_endpoint(&existing_snapshot.id)
                 .flatten();
+            // An admin launch reports the existing lease's interception as it is; only the
+            // principal bootstrap withholds a degraded lease's endpoint.
+            let (interception, incognito_allowed) =
+                self.lease_interception_report(&browser_manager, &existing_snapshot.id);
 
             return Ok(AdminResponse::BrowserLaunched(
                 passless_core::agent::protocol::BrowserLaunchedResponse {
@@ -5141,9 +4659,15 @@ impl AgentRuntime {
                     pid: existing_snapshot.pid,
                     start_url: existing_snapshot.start_url,
                     cdp_endpoint,
+                    interception,
+                    incognito_allowed,
                 },
             ));
         }
+
+        // The browser's relay must be able to reach a sign socket of its own UID; refuse up front
+        // rather than time out waiting for an attach that cannot happen.
+        let sign_socket = self.sign_socket_for(browser_uid)?;
 
         // Generate bearer token for this browser session
         let bearer_token = super::sign::generate_bearer_token().map_err(|e| {
@@ -5154,24 +4678,24 @@ impl AgentRuntime {
             )
         })?;
 
-        // Registration is never granted implicitly by browser launch. The operator must mint an
-        // exact-RP, short-lived enrollment grant through the admin request path.
-        let registration_grants = std::collections::HashMap::new();
-
-        // Create registration context and handler
-        let register_ctx = super::register::RegisterContext {
-            profile_id: profile_id.clone(),
-            registration_grants,
-            profile_config: profile_config.clone(),
-        };
+        // Registration authority is policy only (`register = "allow"` on an exact RP rule); the
+        // bearer is bound to the browser lease below and revoked with it.
+        // An admin-launched browser has no principal process: its session is bound to the
+        // all-zero principal digest, like its session grant.
+        let session = self.new_bearer_session(profile_id, [0u8; 32], profile_config);
+        session.bind_browser_uid(browser_uid);
+        let register_ctx =
+            super::register::RegisterContext::new(profile_id.clone(), session.clone());
 
         let register_handler = Arc::new(super::register::RegisterHandler {
-            credential_storage: profile.backend.credential_storage.clone(),
             policy_runtime: self.policy_runtime.clone(),
+            credential_storage: profile.backend.credential_storage.clone(),
             audit_gate: self.audit_gate.clone(),
             key_provider: profile.backend.key_provider.clone(),
-            security_config: profile.endpoint_spec.security_config.clone(),
+            security_config: profile.security_config.clone(),
             operation_lock: profile.backend.operation_lock.clone(),
+            escalation: self.escalation.clone(),
+            audit_deployment: profile.audit_deployment(),
         });
 
         // Register the bearer token with the sign registry for registration
@@ -5186,24 +4710,62 @@ impl AgentRuntime {
             })?;
 
         let metadata = super::browser::AgentEndpointMetadata {
-            socket_path: self.sign_socket_path.to_string_lossy().into_owned(),
+            socket_path: sign_socket.to_string_lossy().into_owned(),
             bearer_token: bearer_token.clone(),
         };
 
-        let lease_id = browser_manager
-            .launch_pending_with_agent_endpoint(
-                &config,
-                endpoint_id.clone(),
-                profile_id.clone(),
-                Some(&metadata),
-            )
-            .map_err(|e| {
-                ProtocolError::new(
+        let lease_id = match browser_manager.launch_pending_with_agent_endpoint(
+            &config,
+            profile_id.clone(),
+            Some(&metadata),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.sign_registry.revoke_registration(&bearer_token);
+                return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to launch browser: {}", e),
                     RecommendedAction::FixRequest,
-                )
-            })?;
+                ));
+            }
+        };
+        self.audit_launch(&lease_id, profile_id, &config);
+
+        // The registration bearer lives and dies with the browser lease.
+        if let Err(e) = self
+            .sign_registry
+            .bind_registration_lease(&bearer_token, lease_id.to_string())
+        {
+            self.sign_registry.revoke_registration(&bearer_token);
+            self.close_lease(&mut browser_manager, &lease_id, RevokeReason::LaunchFailed);
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to bind registration context to lease: {}", e),
+                RecommendedAction::Abort,
+            ));
+        }
+
+        // Ready means intercepted (plan D6 layer 1): the launch reports success only once the
+        // lease's worker said hello with `attached = true`. The registration bearer was registered
+        // before the spawn, so the transport accepts that hello even if it arrives before the
+        // binding above. Otherwise the launch fails closed like any other launch failure.
+        let readiness = match browser_manager.await_interception(
+            &lease_id,
+            &self.sign_readiness,
+            super::browser::INTERCEPTION_ATTACH_TIMEOUT,
+        ) {
+            Ok(readiness) => readiness,
+            Err(e) => {
+                warn!("browser launch for profile={} failed: {}", profile_id, e);
+                self.sign_registry.revoke_registration(&bearer_token);
+                self.close_lease(&mut browser_manager, &lease_id, RevokeReason::LaunchFailed);
+                return Err(ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to launch browser: {}", e),
+                    RecommendedAction::FixRequest,
+                ));
+            }
+        };
 
         let snapshot = browser_manager.snapshot(&lease_id).ok_or_else(|| {
             ProtocolError::new(
@@ -5220,9 +4782,11 @@ impl AgentRuntime {
         // credential scope. Selection for a concrete ceremony happens in the
         // sign handler using allowCredentials/discoverable semantics.
         let mut credential_refs = Vec::new();
-        if let Ok(mut storage) = profile.backend.credential_storage.lock()
-            && let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None)
-        {
+        let mut storage = super::lock_order::lock(
+            &profile.backend.credential_storage,
+            super::lock_order::LockLevel::Storage,
+        );
+        if let Ok(mut cred) = storage.read_first(crate::storage::CredentialFilter::None) {
             loop {
                 let rp_allowed = config
                     .rp_ids
@@ -5244,13 +4808,13 @@ impl AgentRuntime {
             }
         }
 
+        drop(storage);
         let dynamic_credential_scope = profile_config.credential_refs.is_none();
-        if dynamic_credential_scope || !credential_refs.is_empty() {
+        if !config.rp_ids.is_empty() && (dynamic_credential_scope || !credential_refs.is_empty()) {
             let session_id = passless_core::agent::PrincipalSessionId::new();
             let grant_params = super::grant::GrantRequestParams {
                 profile_id: profile_id.clone(),
                 session_id,
-                endpoint_id: endpoint_id.clone(),
                 principal_digest: [0u8; 32],
                 rp_ids: config.rp_ids.clone(),
                 credentials: if dynamic_credential_scope {
@@ -5264,31 +4828,33 @@ impl AgentRuntime {
                     .map(|ttl| ttl.as_secs())
                     .unwrap_or(300),
             };
-            let grant_request = if dynamic_credential_scope {
-                self.policy_runtime
-                    .admin_request_dynamic_grant(grant_params)
-            } else {
-                self.policy_runtime.admin_request_grant(grant_params)
-            };
+            let grant_request = self
+                .policy_runtime
+                .admin_request_session_grant(grant_params, dynamic_credential_scope);
             match grant_request {
                 Ok(request_id) => {
                     match self
                         .policy_runtime
-                        .admin_approve_grant(&request_id, &super::intent::admin_authority())
+                        .admin_approve_grant(&request_id, &super::identity::admin_authority())
                     {
                         Ok(grant_id) => {
+                            let _ = session.bind_grant(grant_id.clone());
                             let sign_ctx = super::sign::SignContext {
                                 profile_id: profile_id.clone(),
                                 active_grant_id: grant_id,
-                                profile_config: profile_config.clone(),
+                                session: session.clone(),
+                                // An admin-launched browser is active from the start.
+                                lease_activation: None,
                             };
                             let sign_handler = Arc::new(super::sign::SignHandler {
                                 credential_storage: profile.backend.credential_storage.clone(),
                                 policy_runtime: self.policy_runtime.clone(),
                                 audit_gate: self.audit_gate.clone(),
-                                security_config: profile.endpoint_spec.security_config.clone(),
+                                security_config: profile.security_config.clone(),
                                 key_provider: profile.backend.key_provider.clone(),
                                 operation_lock: profile.backend.operation_lock.clone(),
+                                escalation: self.escalation.clone(),
+                                audit_deployment: profile.audit_deployment(),
                             });
                             if let Err(e) = self.sign_registry.register_pending(
                                 bearer_token.clone(),
@@ -5324,6 +4890,19 @@ impl AgentRuntime {
             );
         }
 
+        // An admin-launched browser is active from the start (no principal assertion activates
+        // it): without this the lease stays authentication-pending and is expired at the login
+        // deadline, killing the browser mid-session.
+        if let Err(e) = browser_manager.activate_after_assertion(&lease_id, config.ttl) {
+            warn!(
+                "browser lease {} for profile={} could not be activated: {}",
+                lease_id, profile_id, e
+            );
+        }
+
+        // The start URL is opened only now that interception is attached and the bearer's
+        // contexts are registered (defect B2).
+        self.open_deferred_start_url(&mut browser_manager, &lease_id);
         let cdp_endpoint = browser_manager.lease_cdp_endpoint(&lease_id).flatten();
 
         Ok(AdminResponse::BrowserLaunched(
@@ -5333,6 +4912,8 @@ impl AgentRuntime {
                 pid,
                 start_url: config.start_url,
                 cdp_endpoint,
+                interception: Some(super::browser::InterceptionState::Attached.to_string()),
+                incognito_allowed: Some(readiness.incognito_allowed),
             },
         ))
     }
@@ -5372,14 +4953,13 @@ impl AdminHandler for AgentRuntime {
         match request {
             AdminRequest::Ping => Ok(AdminResponse::Pong),
             AdminRequest::Status => {
-                let em = self.endpoint_manager.lock().unwrap();
-                let credential_count = em.snapshot().len();
+                let credential_count = self.total_credential_count();
                 Ok(AdminResponse::Status(DaemonStatus {
                     daemon_version: env!("CARGO_PKG_VERSION").into(),
                     protocol_version: passless_core::agent::protocol::CURRENT_VERSION,
                     backend: "agent".into(),
                     uptime_secs: 0,
-                    credential_count: credential_count as u32,
+                    credential_count,
                 }))
             }
             AdminRequest::LaunchPrincipal {
@@ -5432,30 +5012,17 @@ impl AdminHandler for AgentRuntime {
             AdminRequest::AuditVerify => self.handle_audit_verify(),
             AdminRequest::AuditExport { format } => self.handle_audit_export(format),
             AdminRequest::ProfileCheck { profile_id } => self.handle_profile_check(profile_id),
-            AdminRequest::RequestDelegation {
+            AdminRequest::ListGrantedRules { profile_id } => {
+                self.handle_list_granted_rules(profile_id.as_ref())
+            }
+            AdminRequest::RevokeGrantedRule {
                 profile_id,
                 rp_id,
-                credential_ref,
-                max_session_ttl,
-                reason,
-            } => self.handle_admin_request_delegation(
-                profile_id,
-                rp_id,
-                credential_ref,
-                *max_session_ttl,
-                reason.as_deref(),
-            ),
-            AdminRequest::RequestRegistration {
-                profile_id,
-                rp_id,
-                max_session_ttl,
-                reason,
-            } => self.handle_request_registration(
-                profile_id,
-                rp_id,
-                *max_session_ttl,
-                reason.as_deref(),
-            ),
+                action,
+            } => self.handle_revoke_granted_rule(profile_id, rp_id, action),
+            AdminRequest::ClearGrantedRules { profile_id } => {
+                self.handle_clear_granted_rules(profile_id)
+            }
             AdminRequest::LaunchBrowser {
                 profile_id,
                 start_url,
@@ -5514,7 +5081,8 @@ impl PrincipalHandler for AgentRuntime {
             )
         })?;
 
-        let sessions = session_slot.lock().unwrap();
+        let sessions =
+            super::lock_order::lock(session_slot, super::lock_order::LockLevel::ManagedSession);
         let supplied_capability = SessionCapability::from_bytes(*capability_proof.as_bytes());
         let managed = sessions
             .iter()
@@ -5572,23 +5140,13 @@ impl PrincipalHandler for AgentRuntime {
         match request {
             PrincipalRequest::Ping => Ok(PrincipalResponse::Pong),
             PrincipalRequest::Status => {
-                let em = self.endpoint_manager.lock().unwrap();
-                let credential_count = em.snapshot().len();
+                let credential_count = self.total_credential_count();
                 Ok(PrincipalResponse::Status(DaemonStatus {
                     daemon_version: env!("CARGO_PKG_VERSION").into(),
                     protocol_version: passless_core::agent::protocol::CURRENT_VERSION,
                     backend: "agent".into(),
                     uptime_secs: 0,
-                    credential_count: credential_count as u32,
-                }))
-            }
-            PrincipalRequest::Capabilities => {
-                let mode_str = format!("{:?}", profile.mode);
-                Ok(PrincipalResponse::Capabilities(PrincipalCapabilities {
-                    profile_id: profile_id.to_string(),
-                    mode: mode_str,
-                    allowed_rp_ids: profile.profile_config.allowed_rp_ids(),
-                    registration_allowed: profile.profile_config.allows_registration(),
+                    credential_count,
                 }))
             }
             PrincipalRequest::Authority => Ok(PrincipalResponse::Authority(
@@ -5609,137 +5167,25 @@ impl PrincipalHandler for AgentRuntime {
                     checks: report.checks,
                 }))
             }
-            PrincipalRequest::CreateIntent {
-                profile_id: _req_profile_id,
-                action,
-                rp_id,
-                credential_ref,
-                reason,
-                grant_ttl_secs,
-                session_ttl_secs,
-            } => {
-                let eid = profile.endpoint_id.lock().unwrap().clone();
-                match eid {
-                    Some(ref eid) => self.handle_create_intent(CreateIntentParams {
-                        profile_id: &profile_id,
-                        session_id: &managed.session_id,
-                        endpoint_id: eid,
-                        action,
-                        rp_id,
-                        credential_ref: credential_ref.as_ref(),
-                        principal_reason: reason.clone(),
-                        clamped_grant_ttl_secs: *grant_ttl_secs,
-                        clamped_session_ttl_secs: *session_ttl_secs,
-                        profile,
-                        session_digest: &managed.process_digest,
-                    }),
-                    None => Err(ProtocolError::new(
-                        ErrorCode::Internal,
-                        "profile has no active endpoint",
-                        RecommendedAction::Abort,
-                    )),
-                }
-            }
-            PrincipalRequest::ShowIntent { request_id } => {
-                self.handle_show_intent(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::WaitIntent { request_id } => {
-                self.handle_show_intent(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::CancelIntent { request_id } => {
-                self.handle_cancel_intent(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::RequestDelegation {
-                profile_id: _req_profile_id,
-                rp_id,
-                credential_ref,
-                max_session_ttl,
-                reason,
-            } => {
-                let _lifecycle = profile.lifecycle_lock.lock().unwrap();
-                {
-                    let eid_guard = profile.endpoint_id.lock().unwrap();
-                    if eid_guard.is_none() {
-                        drop(eid_guard);
-                        match self.create_profile_endpoint(&profile.endpoint_spec) {
-                            Ok(eid) => {
-                                let mut eid_guard = profile.endpoint_id.lock().unwrap();
-                                *eid_guard = Some(eid);
-                            }
-                            Err(e) => {
-                                return Err(ProtocolError::new(
-                                    ErrorCode::Internal,
-                                    format!("failed to create endpoint for delegation: {}", e),
-                                    RecommendedAction::Retry,
-                                ));
-                            }
-                        }
-                    }
-                }
-                let eid = profile.endpoint_id.lock().unwrap().clone().unwrap();
-                self.handle_request_delegation(RequestDelegationParams {
-                    profile_id: &profile_id,
-                    session_id: &managed.session_id,
-                    endpoint_id: &eid,
-                    rp_id,
-                    credential_ref,
-                    max_session_ttl: *max_session_ttl,
-                    principal_reason: reason.clone(),
-                    profile,
-                    session_digest: &managed.process_digest,
-                })
-            }
-            PrincipalRequest::ShowDelegation { request_id } => {
-                self.handle_show_delegation(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::WaitDelegation { request_id } => {
-                self.handle_show_delegation(&profile_id, &managed.session_id, request_id, profile)
-            }
-            PrincipalRequest::CancelDelegation { request_id } => {
-                self.handle_cancel_delegation(&profile_id, &managed.session_id, request_id, profile)
-            }
             PrincipalRequest::ListCredentials {
                 profile_id: _req_profile_id,
             } => self.handle_list_credentials(&profile_id, profile),
             PrincipalRequest::BrowserStatus => {
                 self.handle_browser_status(&profile_id, &managed.session_id, profile)
             }
-            PrincipalRequest::EnsureBrowser { start_url } => self.handle_ensure_browser(
+            PrincipalRequest::EnsureBrowser {
+                start_url,
+                headed,
+                direct_cdp,
+            } => self.handle_ensure_browser(
                 &profile_id,
                 &managed.session_id,
                 &managed.process_digest,
                 start_url.as_deref(),
+                *headed,
+                *direct_cdp,
                 profile,
             ),
-            PrincipalRequest::EndpointStatus => {
-                let current_eid = profile.endpoint_id.lock().unwrap().clone();
-                match current_eid {
-                    Some(ref eid) => {
-                        let em = self.endpoint_manager.lock().unwrap();
-                        let snapshots = em.snapshot();
-                        let snapshot = snapshots.into_iter().find(|s| s.handle.id() == eid);
-                        match snapshot {
-                            Some(s) => {
-                                Ok(PrincipalResponse::EndpointStatus(EndpointStatusResponse {
-                                    endpoint_id: s.handle.id().clone(),
-                                    status: format!("{:?}", s.state),
-                                    connected: true,
-                                }))
-                            }
-                            None => Ok(PrincipalResponse::EndpointStatus(EndpointStatusResponse {
-                                endpoint_id: eid.clone(),
-                                status: "disconnected".into(),
-                                connected: false,
-                            })),
-                        }
-                    }
-                    None => Ok(PrincipalResponse::EndpointStatus(EndpointStatusResponse {
-                        endpoint_id: EndpointId::new(),
-                        status: "no_endpoint".into(),
-                        connected: false,
-                    })),
-                }
-            }
             PrincipalRequest::BrowserControl {
                 request_json,
                 timeout_ms,
@@ -5750,18 +5196,388 @@ impl PrincipalHandler for AgentRuntime {
                 *timeout_ms,
                 profile,
             ),
-            PrincipalRequest::SignAssertion(_req) => Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "sign assertions are not available; delegated mode has been removed",
-                RecommendedAction::FixRequest,
-            )),
         }
+    }
+}
+
+/// The credential of `storage` whose reference is `credential_ref`. `DoesNotExist` ends the
+/// iteration (an empty store has no first credential); any other storage error is returned, never
+/// mistaken for "not found".
+fn find_credential_by_ref(
+    storage: &mut dyn CredentialStorage,
+    credential_ref: &passless_core::agent::CredentialRef,
+) -> std::result::Result<Option<soft_fido2::Credential>, soft_fido2::Error> {
+    let mut next = storage.read_first(crate::storage::CredentialFilter::None);
+    loop {
+        match next {
+            Ok(cred) => {
+                if passless_core::agent::CredentialRef::with_default_domain(&cred.id)
+                    == *credential_ref
+                {
+                    return Ok(Some(cred));
+                }
+            }
+            Err(soft_fido2::Error::DoesNotExist) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        next = storage.read_next();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A storage that only reports a credential count.
+    struct CountOnlyStorage(usize);
+
+    impl CredentialStorage for CountOnlyStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(soft_fido2::Error::Other)
+        }
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(soft_fido2::Error::Other)
+        }
+        fn read(&mut self, _id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(soft_fido2::Error::Other)
+        }
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn delete(&mut self, _id: &[u8]) -> soft_fido2::Result<()> {
+            Ok(())
+        }
+        fn count_credentials(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// Review L4: the status counts read a poisoned storage lock with recovery instead of
+    /// skipping the backend, and count a shared storage once.
+    #[test]
+    fn the_credential_count_recovers_a_poisoned_storage_lock() {
+        let shared: Arc<Mutex<Box<dyn CredentialStorage>>> =
+            Arc::new(Mutex::new(Box::new(CountOnlyStorage(3))));
+        let other: Arc<Mutex<Box<dyn CredentialStorage>>> =
+            Arc::new(Mutex::new(Box::new(CountOnlyStorage(4))));
+        let poisoner = other.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic under the storage lock");
+        })
+        .join();
+        assert!(other.is_poisoned());
+
+        let count = distinct_credential_count([&shared, &shared, &other].into_iter());
+        assert_eq!(count, 7);
+    }
+
+    // --- audit: the backend kind of a profile ---
+
+    #[test]
+    fn a_same_user_profile_reports_the_human_backends_real_storage_kind() {
+        for human in [BackendKind::Local, BackendKind::Pass, BackendKind::Tpm] {
+            assert_eq!(
+                profile_backend_kind(AgentMode::SameUser, human, None),
+                human,
+                "same-user shares the human backend"
+            );
+            // A same-user profile has no storage of its own; a stray one is not consulted.
+            let stray = passless_core::agent::config::AgentStorageConfig::Local {
+                path: "/x".into(),
+                pin_path: "/y".into(),
+            };
+            assert_eq!(
+                profile_backend_kind(AgentMode::SameUser, human, Some(&stray)),
+                human
+            );
+        }
+    }
+
+    #[test]
+    fn an_isolated_profile_reports_its_own_storage_kind() {
+        use passless_core::agent::config::AgentStorageConfig;
+        let local = AgentStorageConfig::Local {
+            path: "/x".into(),
+            pin_path: "/y".into(),
+        };
+        let pass = AgentStorageConfig::Pass {
+            store_path: "/s".into(),
+            path: "p".to_string(),
+            gpg_backend: "gnupg-bin".to_string(),
+            pin_path: "/y".into(),
+            git_sync: false,
+            git_auto_push: false,
+        };
+        // The human backend's kind does not leak into an isolated profile.
+        assert_eq!(
+            profile_backend_kind(AgentMode::Isolated, BackendKind::Tpm, Some(&local)),
+            BackendKind::Local
+        );
+        assert_eq!(
+            profile_backend_kind(AgentMode::Isolated, BackendKind::Local, Some(&pass)),
+            BackendKind::Pass
+        );
+        #[cfg(feature = "tpm")]
+        {
+            let tpm = AgentStorageConfig::Tpm {
+                path: "/t".into(),
+                tcti: "device:/dev/tpmrm0".to_string(),
+                pin_path: "/y".into(),
+                portable: false,
+            };
+            assert_eq!(
+                profile_backend_kind(AgentMode::Isolated, BackendKind::Local, Some(&tpm)),
+                BackendKind::Tpm
+            );
+        }
+    }
+
+    #[test]
+    fn the_audit_deployment_carries_the_backend_kind_name() {
+        let deployment = AuditDeployment::new(
+            AgentMode::SameUser,
+            crate::agent::deployment::PrincipalRelationship::SharedUid,
+            BackendKind::Pass,
+            &soft_fido2::SoftwareCredentialKeyProvider,
+        );
+        assert_eq!(deployment.backend.as_deref(), Some("pass"));
+        assert_eq!(deployment.mode.as_deref(), Some("same-user"));
+        assert_eq!(deployment.key_provider.as_deref(), Some("software"));
+    }
+
+    #[test]
+    fn audit_and_doctor_report_the_same_axes_for_every_combination() {
+        use crate::agent::deployment::DeploymentAxes;
+        for mode in [AgentMode::SameUser, AgentMode::Isolated] {
+            for (principal_uid, expected) in [(1000, "shared-uid"), (1001, "distinct-uid")] {
+                let axes = DeploymentAxes::new(mode, principal_uid, 1000);
+                let audit = AuditDeployment::new(
+                    axes.mode,
+                    axes.relationship,
+                    BackendKind::Local,
+                    &soft_fido2::SoftwareCredentialKeyProvider,
+                );
+                assert_eq!(audit.mode.as_deref(), Some(mode.to_string().as_str()));
+                assert_eq!(audit.principal_relationship.as_deref(), Some(expected));
+                let doctor = axes.checks(None).remove(0).message;
+                assert!(doctor.contains(&format!("mode: {mode}")), "{doctor}");
+                assert!(
+                    doctor.contains(&format!("principal_relationship: {expected}")),
+                    "{doctor}"
+                );
+            }
+        }
+    }
+
+    // --- admin credential delete: storage errors are not "not found" ---
+
+    /// A store whose every call fails: with `DoesNotExist` when `empty`, else with `Other`.
+    struct FailingStorage {
+        empty: bool,
+    }
+
+    impl FailingStorage {
+        fn error(&self) -> soft_fido2::Error {
+            if self.empty {
+                soft_fido2::Error::DoesNotExist
+            } else {
+                soft_fido2::Error::Other
+            }
+        }
+    }
+
+    impl CredentialStorage for FailingStorage {
+        fn read_first(
+            &mut self,
+            _filter: crate::storage::CredentialFilter,
+        ) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(self.error())
+        }
+        fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(self.error())
+        }
+        fn read(&mut self, _id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
+            Err(self.error())
+        }
+        fn write(&mut self, _cred: soft_fido2::CredentialRef) -> soft_fido2::Result<()> {
+            Err(self.error())
+        }
+        fn delete(&mut self, _id: &[u8]) -> soft_fido2::Result<()> {
+            Err(self.error())
+        }
+        fn count_credentials(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn credential_lookup_reports_an_empty_store_as_not_found() {
+        let reference = passless_core::agent::CredentialRef::with_default_domain(b"abc");
+        let mut empty = FailingStorage { empty: true };
+        assert!(matches!(
+            find_credential_by_ref(&mut empty, &reference),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn credential_lookup_surfaces_a_storage_error() {
+        let reference = passless_core::agent::CredentialRef::with_default_domain(b"abc");
+        let mut broken = FailingStorage { empty: false };
+        assert!(matches!(
+            find_credential_by_ref(&mut broken, &reference),
+            Err(soft_fido2::Error::Other)
+        ));
+    }
+
+    // --- P5: reload re-reads and validates the configuration file (ADR 0014 section 6.4) ---
+
+    fn write_agent_config(path: &std::path::Path, audit: &std::path::Path, extra: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[agents]
+enabled = true
+audit_path = "{}"
+
+[agents.profiles.coding]
+mode = "same-user"
+principal_user = "alice"
+{}
+[[agents.profiles.coding.rules]]
+rp_id = "example.com"
+authenticate = "allow"
+register = "deny"
+"#,
+                audit.display(),
+                extra
+            ),
+        )
+        .unwrap();
+    }
+
+    fn reload_fixture() -> (
+        tempfile::TempDir,
+        AgentConfigSource,
+        AgentConfig,
+        PolicyRuntime,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_agent_config(&path, &dir.path().join("audit"), "");
+        let source = AgentConfigSource {
+            path,
+            human_state_path: None,
+        };
+        let config = source.load().expect("the initial configuration is valid");
+        let runtime = PolicyRuntime::new(&config, Arc::new(SystemClock), None).unwrap();
+        (dir, source, config, runtime)
+    }
+
+    /// R19 holds on reload: with the human path automatic, a configuration whose same-user
+    /// profile has an `allow` rule is rejected and the old generation kept.
+    #[test]
+    fn reload_keeps_the_automatic_human_path_guard() {
+        let (_dir, source, config, runtime) = reload_fixture();
+        let err = reload_policy_from_source(Some(&source), &config, &runtime, true).unwrap_err();
+        assert!(err.contains("allow_automatic_human_path"), "{err}");
+        assert_eq!(runtime.generation_number(), 1);
+        assert_eq!(runtime.revocation_epoch(), 1);
+    }
+
+    #[test]
+    fn reload_with_an_unchanged_file_revokes_nothing() {
+        let (_dir, source, config, runtime) = reload_fixture();
+        let (_, outcome) =
+            reload_policy_from_source(Some(&source), &config, &runtime, false).unwrap();
+        assert!(!outcome.changed);
+        assert_eq!(runtime.generation_number(), 1);
+        assert_eq!(runtime.revocation_epoch(), 1);
+    }
+
+    #[test]
+    fn reload_reads_a_changed_file_and_bumps_the_revocation_epoch() {
+        let (dir, source, config, runtime) = reload_fixture();
+        write_agent_config(
+            &source.path,
+            &dir.path().join("audit"),
+            "max_operations = 5\n",
+        );
+        let (next, outcome) =
+            reload_policy_from_source(Some(&source), &config, &runtime, false).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(next.profiles["coding"].max_operations, 5);
+        assert_eq!(runtime.generation_number(), 2);
+        assert_eq!(runtime.revocation_epoch(), 2);
+        assert_eq!(
+            runtime.max_operations(&ProfileId::new("coding").unwrap()),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn reload_of_an_invalid_file_keeps_the_old_generation() {
+        let (dir, source, config, runtime) = reload_fixture();
+        let digest = runtime.digest();
+        let rejected = |runtime: &PolicyRuntime| {
+            assert_eq!(runtime.generation_number(), 1);
+            assert_eq!(runtime.revocation_epoch(), 1);
+            assert_eq!(runtime.digest(), digest);
+        };
+
+        // Not TOML.
+        std::fs::write(&source.path, "[agents\nenabled = ").unwrap();
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
+        rejected(&runtime);
+
+        // TOML, but an unknown rule action.
+        write_agent_config(&source.path, &dir.path().join("audit"), "");
+        let text = std::fs::read_to_string(&source.path)
+            .unwrap()
+            .replace("authenticate = \"allow\"", "authenticate = \"maybe\"");
+        std::fs::write(&source.path, text).unwrap();
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
+        rejected(&runtime);
+
+        // Valid, but fails `AgentConfig::validate` (max_operations out of range).
+        write_agent_config(
+            &source.path,
+            &dir.path().join("audit"),
+            "max_operations = 0\n",
+        );
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
+        rejected(&runtime);
+
+        // A change only a restart can apply.
+        write_agent_config(
+            &source.path,
+            &dir.path().join("audit"),
+            "principal_user = \"bob\"\n",
+        );
+        let text = std::fs::read_to_string(&source.path).unwrap().replacen(
+            "principal_user = \"alice\"\n",
+            "",
+            1,
+        );
+        std::fs::write(&source.path, text).unwrap();
+        let err = reload_policy_from_source(Some(&source), &config, &runtime, false).unwrap_err();
+        assert!(err.contains("restart"), "{err}");
+        rejected(&runtime);
+
+        // A missing file.
+        std::fs::remove_file(&source.path).unwrap();
+        assert!(reload_policy_from_source(Some(&source), &config, &runtime, false).is_err());
+        rejected(&runtime);
+
+        // No configuration file at all.
+        assert!(reload_policy_from_source(None, &config, &runtime, false).is_err());
+        rejected(&runtime);
+    }
 
     #[test]
     fn worker_tracker_try_acquire_respects_limit() {
@@ -5803,12 +5619,21 @@ mod tests {
         tracker.push_handle(h2);
         tracker.push_handle(h3);
 
-        std::thread::sleep(Duration::from_millis(50));
-
-        tracker.reap_finished();
-
-        let remaining = tracker.handles.lock().unwrap().len();
-        assert_eq!(remaining, 1);
+        // The two threads that return at once finish eventually; the gated one cannot.
+        let started = Instant::now();
+        loop {
+            tracker.reap_finished();
+            let remaining = tracker.handles.lock().unwrap().len();
+            if remaining <= 1 {
+                assert_eq!(remaining, 1, "the gated worker must not be reaped");
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "finished workers were not reaped: {remaining} left"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         {
             let (lock, cvar) = &*gate;
@@ -5935,97 +5760,6 @@ mod tests {
             session_id: session_a.clone(),
         };
         assert_ne!(lease.session_id, session_b);
-    }
-
-    #[test]
-    fn pending_to_active_atomic_transition() {
-        let pending_mutex: Mutex<Option<PendingRuntime>> = Mutex::new(None);
-        let active_mutex: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>> =
-            Mutex::new(HashMap::new());
-
-        let lease_id = BrowserLeaseId::new();
-        let session_id = PrincipalSessionId::new();
-        let request_id = PendingRequestId::new();
-
-        *pending_mutex.lock().unwrap() = Some(PendingRuntime {
-            request_id: request_id.clone(),
-            prep_generation: 1,
-            session_id: session_id.clone(),
-            browser_lease_id: Some(lease_id.clone()),
-            clamped_session_ttl_secs: 300,
-        });
-
-        assert!(pending_mutex.lock().unwrap().is_some());
-        assert!(active_mutex.lock().unwrap().is_empty());
-
-        let pending = pending_mutex.lock().unwrap().take().unwrap();
-        active_mutex.lock().unwrap().insert(
-            pending.session_id.clone(),
-            ActiveBrowserLease {
-                lease_id: pending.browser_lease_id.unwrap(),
-                session_id: pending.session_id,
-            },
-        );
-
-        assert!(pending_mutex.lock().unwrap().is_none());
-        let active = active_mutex.lock().unwrap();
-        let active = active.get(&session_id).unwrap();
-        assert_eq!(active.lease_id, lease_id);
-        assert_eq!(active.session_id, session_id);
-    }
-
-    #[test]
-    fn cleanup_clears_both_pending_and_active_for_one_session() {
-        let pending_mutex: Mutex<Option<PendingRuntime>> = Mutex::new(None);
-        let active_mutex: Mutex<HashMap<PrincipalSessionId, ActiveBrowserLease>> =
-            Mutex::new(HashMap::new());
-
-        let lease_id_pending = BrowserLeaseId::new();
-        let lease_id_active = BrowserLeaseId::new();
-        let session_id = PrincipalSessionId::new();
-        let other_session_id = PrincipalSessionId::new();
-        let other_lease_id = BrowserLeaseId::new();
-
-        *pending_mutex.lock().unwrap() = Some(PendingRuntime {
-            request_id: PendingRequestId::new(),
-            prep_generation: 1,
-            session_id: session_id.clone(),
-            browser_lease_id: Some(lease_id_pending.clone()),
-            clamped_session_ttl_secs: 60,
-        });
-
-        {
-            let mut active = active_mutex.lock().unwrap();
-            active.insert(
-                session_id.clone(),
-                ActiveBrowserLease {
-                    lease_id: lease_id_active.clone(),
-                    session_id: session_id.clone(),
-                },
-            );
-            active.insert(
-                other_session_id.clone(),
-                ActiveBrowserLease {
-                    lease_id: other_lease_id.clone(),
-                    session_id: other_session_id.clone(),
-                },
-            );
-        }
-
-        assert!(pending_mutex.lock().unwrap().is_some());
-        assert_eq!(active_mutex.lock().unwrap().len(), 2);
-
-        *pending_mutex.lock().unwrap() = None;
-        active_mutex.lock().unwrap().remove(&session_id);
-
-        assert!(pending_mutex.lock().unwrap().is_none());
-        let active = active_mutex.lock().unwrap();
-        assert!(!active.contains_key(&session_id));
-        assert_eq!(
-            active.get(&other_session_id).unwrap().lease_id,
-            other_lease_id,
-            "cleaning one session must not remove another session's browser"
-        );
     }
 
     #[test]
@@ -6581,6 +6315,7 @@ mod tests {
         attached.insert(session.clone());
         let mut lease = SharedBrowserLease {
             lease_id,
+            owner_session: PrincipalSessionId::new(),
             ref_count: 1,
             attached_sessions: attached,
         };
@@ -6598,6 +6333,7 @@ mod tests {
         let lease_id = BrowserLeaseId::new();
         let mut lease = SharedBrowserLease {
             lease_id,
+            owner_session: PrincipalSessionId::new(),
             ref_count: 0,
             attached_sessions: std::collections::HashSet::new(),
         };
@@ -6618,13 +6354,15 @@ mod tests {
         attached.insert(session_b.clone());
         let lease = SharedBrowserLease {
             lease_id: lease_id.clone(),
+            owner_session: session_a.clone(),
             ref_count: 2,
             attached_sessions: attached,
         };
         let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
         shared.insert(profile_id.clone(), lease);
 
-        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session_a);
+        // The attached (non-owner) session leaves: the owner keeps the browser.
+        let outcome = detach_session_from_shared(&mut shared, &profile_id, &session_b);
         assert!(matches!(outcome, SharedDetachOutcome::Keep));
         assert!(shared.contains_key(&profile_id));
         assert_eq!(shared.get(&profile_id).unwrap().ref_count, 1);
@@ -6633,8 +6371,47 @@ mod tests {
                 .get(&profile_id)
                 .unwrap()
                 .attached_sessions
-                .contains(&session_b)
+                .contains(&session_a)
         );
+    }
+
+    /// P5 review L5: the bearer, grant and bearer session behind a shared browser are its
+    /// owner's. When the owner exits while another principal is still attached, the browser is
+    /// closed (the other principal launches its own, bound to itself) instead of staying up with
+    /// a bearer whose grant is gone.
+    #[test]
+    fn shared_owner_exit_closes_the_browser_even_when_another_session_remains() {
+        let profile_id = ProfileId::new("test-shared").unwrap();
+        let owner = PrincipalSessionId::new();
+        let second = PrincipalSessionId::new();
+        let lease_id = BrowserLeaseId::new();
+        let mut attached = std::collections::HashSet::new();
+        attached.insert(owner.clone());
+        attached.insert(second.clone());
+        let mut shared: HashMap<ProfileId, SharedBrowserLease> = HashMap::new();
+        shared.insert(
+            profile_id.clone(),
+            SharedBrowserLease {
+                lease_id: lease_id.clone(),
+                owner_session: owner.clone(),
+                ref_count: 2,
+                attached_sessions: attached,
+            },
+        );
+
+        match detach_session_from_shared(&mut shared, &profile_id, &owner) {
+            SharedDetachOutcome::Terminate(closed) => assert_eq!(closed, lease_id),
+            SharedDetachOutcome::Keep => panic!("the owner's exit must close the shared browser"),
+        }
+        assert!(
+            !shared.contains_key(&profile_id),
+            "the closed browser is no longer offered to the session that remains"
+        );
+        // The remaining session's own later exit finds nothing to close.
+        assert!(matches!(
+            detach_session_from_shared(&mut shared, &profile_id, &second),
+            SharedDetachOutcome::Keep
+        ));
     }
 
     #[test]
@@ -6647,6 +6424,7 @@ mod tests {
         attached.insert(session_a.clone());
         let lease = SharedBrowserLease {
             lease_id: lease_id.clone(),
+            owner_session: PrincipalSessionId::new(),
             ref_count: 1,
             attached_sessions: attached,
         };
@@ -6667,6 +6445,7 @@ mod tests {
         attached.insert(session.clone());
         let lease = SharedBrowserLease {
             lease_id: lease_id.clone(),
+            owner_session: PrincipalSessionId::new(),
             ref_count: 1,
             attached_sessions: attached,
         };
@@ -6692,6 +6471,7 @@ mod tests {
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: lease_id.clone(),
+                owner_session: PrincipalSessionId::new(),
                 ref_count: 2,
                 attached_sessions: attached,
             },
@@ -6712,6 +6492,7 @@ mod tests {
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: new_lease_id.clone(),
+                owner_session: PrincipalSessionId::new(),
                 ref_count: 1,
                 attached_sessions: std::collections::HashSet::new(),
             },
@@ -6744,6 +6525,7 @@ mod tests {
             profile_id.clone(),
             SharedBrowserLease {
                 lease_id: lease_id.clone(),
+                owner_session: PrincipalSessionId::new(),
                 ref_count: 1,
                 attached_sessions: std::collections::HashSet::new(),
             },
@@ -6760,5 +6542,286 @@ mod tests {
 
         assert!(cleared, "matching lease should be removed on exit");
         assert!(!shared.contains_key(&profile_id));
+    }
+
+    /// A lease of `profile` running `/bin/sleep`, known only to the browser manager.
+    fn launch_sleeping_lease(
+        dir: &std::path::Path,
+        profile: &ProfileId,
+    ) -> (BrowserProcessManager, BrowserLeaseId) {
+        let (manager, lease_id, _clock) = launch_sleeping_lease_with_clock(dir, profile);
+        (manager, lease_id)
+    }
+
+    /// [`launch_sleeping_lease`] with the manager's mock clock, to move a lease past its deadline.
+    fn launch_sleeping_lease_with_clock(
+        dir: &std::path::Path,
+        profile: &ProfileId,
+    ) -> (
+        BrowserProcessManager,
+        BrowserLeaseId,
+        Arc<super::super::browser::MockClock>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = dir.join("runtime-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = BrowserConfig {
+            executable: PathBuf::from("/bin/sleep"),
+            start_url: None,
+            extra_args: vec!["60".to_string()],
+            runtime_root: root,
+            ttl: Duration::from_secs(300),
+            login_timeout: Duration::from_secs(300),
+            rp_ids: vec!["example.com".to_string()],
+            start_url_rules: Vec::new(),
+            target_uid: unsafe { libc::getuid() },
+            target_gid: unsafe { libc::getgid() },
+            daemon_uid: 0,
+            daemon_gid: 0,
+            cdp_expose: CdpExposeMode::default(),
+            cdp_port: 9222,
+            bind_parent_death: true,
+        };
+        let clock = Arc::new(super::super::browser::MockClock::new());
+        let mut manager = BrowserProcessManager::with_spawner(
+            clock.clone(),
+            Arc::new(super::super::browser::DirectExecSpawner),
+        );
+        let lease_id = manager.launch(&config, profile.clone()).unwrap();
+        (manager, lease_id, clock)
+    }
+
+    /// An audit gate over a fresh private directory.
+    fn lease_audit_gate(dir: &std::path::Path) -> (AuditGate, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let audit_dir = dir.join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (AuditGate::open(&audit_dir).unwrap(), audit_dir)
+    }
+
+    /// The audit records of `kind`, oldest first.
+    fn lease_records(audit_dir: &std::path::Path, kind: &str) -> Vec<serde_json::Value> {
+        super::super::audit::test_support::read_audit_events(audit_dir)
+            .into_iter()
+            .filter(|e| e["kind"].as_str() == Some(kind))
+            .collect()
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[test]
+    fn admin_revoke_rp_ids_are_normalized_like_the_store_and_invalid_ones_rejected() {
+        assert_eq!(
+            normalize_admin_rp_id("  Example.COM ").unwrap(),
+            "example.com"
+        );
+        for bad in [
+            "",
+            "   ",
+            "https://example.com",
+            "example.com/path",
+            "example.com:8443",
+        ] {
+            let err = normalize_admin_rp_id(bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_bearers_lease_is_terminated_and_audited_though_only_the_manager_holds_it() {
+        use super::super::audit::test_support::read_audit_events;
+        use super::super::sign::tests::sign_handler_tests::TestFixture;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_gate = AuditGate::open(&audit_dir).unwrap();
+
+        let fixture = TestFixture::new(true);
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id) = launch_sleeping_lease(dir.path(), &profile);
+        let pid = manager.snapshot(&lease_id).unwrap().pid;
+        assert!(process_alive(pid));
+
+        // An admin-launched lease: a bearer bound to it in the registry, and nothing in any
+        // profile's bookkeeping.
+        let registry = SignContextRegistry::new();
+        let ctx = fixture.make_ctx();
+        let token = super::super::sign::generate_bearer_token().unwrap();
+        registry
+            .register_pending(token.clone(), ctx.clone(), Arc::new(fixture.make_handler()))
+            .unwrap();
+        registry.bind_lease(&token, lease_id.to_string()).unwrap();
+        assert!(registry.has_live_bearer_for_lease(lease_id.as_str()));
+
+        // The grant revocation bumped the epoch: the bearer is stale.
+        let stale = registry.revoke_stale_sessions(ctx.session.revocation_epoch() + 1);
+        assert_eq!(stale.lease_ids, vec![lease_id.to_string()]);
+        // Until the lease is closed it is live in the manager but no bearer guards it: an admin
+        // launch must not hand it out (`handle_launch_browser` checks exactly this).
+        assert!(!registry.has_live_bearer_for_lease(lease_id.as_str()));
+        assert!(manager.find_live_lease_for_profile(&profile).is_some());
+
+        close_leases_by_id(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &stale.lease_ids,
+            RevokeReason::PolicyReload,
+        );
+
+        assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
+        assert!(manager.find_live_lease_for_profile(&profile).is_none());
+        let started = Instant::now();
+        while process_alive(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "browser not terminated"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let kinds: Vec<String> = read_audit_events(&audit_dir)
+            .iter()
+            .filter_map(|e| e["kind"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            kinds.contains(&"browser_lease.revoke".to_string()),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"browser_lease.cleanup".to_string()),
+            "{kinds:?}"
+        );
+
+        // The late bearer is remembered, so its use is audited, not silently unauthorized.
+        assert!(registry.lookup_revoked_sign(&token).is_some());
+
+        // Closing a lease that is already gone, or an id that is not one, is harmless.
+        close_leases_by_id(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &[lease_id.to_string(), "not-a-lease".to_string()],
+            RevokeReason::PolicyReload,
+        );
+    }
+
+    #[test]
+    fn a_launched_lease_is_audited_once_with_its_profile_and_cdp_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let lease_id = BrowserLeaseId::new();
+
+        audit_lease_launch(&audit_gate, &lease_id, &profile, CdpExposeMode::Pipe);
+
+        let launches = lease_records(&audit_dir, "browser_lease.launch");
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        assert_eq!(launches[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(launches[0]["profile_id"].as_str(), Some("test-profile"));
+        assert_eq!(launches[0]["cdp_expose"].as_str(), Some("pipe"));
+    }
+
+    #[test]
+    fn closing_a_lease_audits_one_revoke_with_its_reason_and_one_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id) = launch_sleeping_lease(dir.path(), &profile);
+        let registry = SignContextRegistry::new();
+
+        close_lease_audited(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &lease_id,
+            RevokeReason::PrincipalExit,
+        );
+        // A second teardown path racing to the same lease writes nothing.
+        close_lease_audited(
+            &audit_gate,
+            &registry,
+            &mut manager,
+            &lease_id,
+            RevokeReason::PolicyReload,
+        );
+
+        let revokes = lease_records(&audit_dir, "browser_lease.revoke");
+        assert_eq!(revokes.len(), 1, "{revokes:?}");
+        assert_eq!(revokes[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(revokes[0]["reason"].as_str(), Some("principal_exit"));
+        let cleanups = lease_records(&audit_dir, "browser_lease.cleanup");
+        assert_eq!(cleanups.len(), 1, "{cleanups:?}");
+        assert_eq!(cleanups[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert!(manager.snapshot(&lease_id).is_none());
+    }
+
+    #[test]
+    fn a_crashed_lease_is_audited_once_with_its_exit_code_then_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id) = launch_sleeping_lease(dir.path(), &profile);
+        let pid = manager.snapshot(&lease_id).unwrap().pid;
+
+        // The browser dies on its own (a signal: no exit code).
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let started = Instant::now();
+        let exits = loop {
+            let exits = manager.check_exits();
+            if !exits.is_empty() {
+                break exits;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "exit not seen");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exits.len(), 1);
+        retire_dead_lease_audited(
+            &audit_gate,
+            &mut manager,
+            &exits[0].lease_id,
+            LeaseEnd::Crashed {
+                exit_code: exits[0].exit_code,
+            },
+        );
+
+        let crashes = lease_records(&audit_dir, "browser_lease.crash");
+        assert_eq!(crashes.len(), 1, "{crashes:?}");
+        assert_eq!(crashes[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(crashes[0]["exit_code"].as_i64(), Some(-1));
+        assert_eq!(lease_records(&audit_dir, "browser_lease.cleanup").len(), 1);
+        assert!(lease_records(&audit_dir, "browser_lease.revoke").is_empty());
+        assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
+        assert!(manager.check_exits().is_empty(), "a crash is seen once");
+    }
+
+    #[test]
+    fn an_expired_lease_is_audited_once_then_cleaned_up_even_when_only_the_manager_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit_gate, audit_dir) = lease_audit_gate(dir.path());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let (mut manager, lease_id, clock) = launch_sleeping_lease_with_clock(dir.path(), &profile);
+
+        clock.advance(Duration::from_secs(301));
+        let expired = manager.check_expired();
+        assert_eq!(expired, vec![lease_id.clone()]);
+        for id in &expired {
+            retire_dead_lease_audited(&audit_gate, &mut manager, id, LeaseEnd::Expired);
+        }
+
+        let expires = lease_records(&audit_dir, "browser_lease.expire");
+        assert_eq!(expires.len(), 1, "{expires:?}");
+        assert_eq!(expires[0]["lease_id"].as_str(), Some(lease_id.as_str()));
+        assert_eq!(lease_records(&audit_dir, "browser_lease.cleanup").len(), 1);
+        assert!(manager.snapshot(&lease_id).is_none(), "the lease is gone");
+        assert!(manager.check_expired().is_empty(), "an expiry is seen once");
     }
 }

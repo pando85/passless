@@ -1,199 +1,73 @@
-# Agent Passkey Registration Guide
+# Agent passkey registration
 
-> **EXPERIMENTAL** — Agent registration is not yet validated for production use.
+> **EXPERIMENTAL.** Agent registration is implemented but not yet validated for production use.
 
-This guide explains how to configure and use agent-driven passkey registration.
+An agent can create a passkey at a site (`navigator.credentials.create()`) through the managed
+browser, under a rule you write. The daemon creates the key and stores the credential; the agent never
+sees it. Use it to enrol an automation account once, then switch registration off.
 
-## Overview
+## How it works
 
-Agent registration allows automated processes to create passkeys without human interaction. This is useful for:
-- Initial setup of CI/CD pipelines
-- Credential rotation
-- Provisioning credentials on new services
-
-## How registration works
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                       Passless Daemon                             │
-│                                                                   │
-│  ┌─────────────────┐    ┌─────────────────────────────────────┐  │
-│  │ /register HTTP   │    │  Registration Pipeline              │  │
-│  │ endpoint         │───►│                                     │  │
-│  │ (127.0.0.1)      │    │  1. Validate bearer token           │  │
-│  └─────────────────┘    │  2. Check grant is active           │  │
-│                          │  3. Verify origin matches RP ID     │  │
-│         ▲                │  4. Evaluate policy (allow/deny)    │  │
-│         │                │  5. Reserve audit entry             │  │
-│  ┌──────┴────────────┐  │  6. Generate key (software/TPM)     │  │
-│  │ Browser Extension  │  │  7. Store credential               │  │
-│  │ intercepts         │  │  8. Write audit event              │  │
-│  │ credentials.create │  │  9. Return attestation             │  │
-│  │                    │  └─────────────────────────────────────┘  │
-│  └────────────────────┘                                           │
-└──────────────────────────────────────────────────────────────────┘
-         ▲
-         │ WebAuthn API
-         │
-┌────────┴────────┐
-│  Browser Page   │
-│  (RP website)   │
-└─────────────────┘
+```text
+page create() -> managed Chromium (webAuthenticationProxy) -> sign-proxy relay -> daemon
+daemon: bearer and session -> origin and RP check -> rule -> excludeCredentials check
+        -> audit reservation -> key generation (software or TPM) -> store -> audit terminal -> response
 ```
 
-## Prerequisites
+Registration shares the interception, transport and session model of sign-in
+([Security](agents/security.md)). Its bearer is bound to the browser lease: when the browser exits or
+the lease is revoked, the bearer stops working (`401 invalid_bearer`, audited as `policy.deny` with
+reason `bearer_revoked`). There is no HTTP `/register` endpoint, no operator-minted enrollment grant
+and no per-ceremony intent command.
 
-- Passless daemon running with agent support
-- Browser extension loaded (via `--load-extension`)
-- Agent profile configured with registration permissions
+## Allow registration
 
-## Configuration
-
-### Step 1: Define Agent Profile
-
-Create or update your agent profile in `~/.config/passless/config.toml`:
+Registration is denied unless an **exact-RP** rule opts in. A wildcard rule never permits it.
 
 ```toml
-[profiles.ci-agent]
-max_session_ttl = 3600
-registration_allowed = true
-
-[[profiles.ci-agent.rules]]
-rp_id = "gitea.example.com"
-register = { authorization = "allow", user_presence = "none", user_verification = "none" }
-authenticate = { authorization = "allow", user_presence = "none", user_verification = "none" }
+[[agents.profiles.enroll.rules]]
+rp_id = "git.example.com"
+register = "allow"          # or "request" for a one-time prompt
+authenticate = "allow"
 ```
 
-**Key fields:**
-- `registration_allowed`: Global flag to enable registration for this profile
-- `rules[].register.authorization`: Per-RP registration permission (allow/deny)
-- `rules[].register.user_presence`: UP requirement (none/human)
-- `rules[].register.user_verification`: UV requirement (none/human)
+- `register = "allow"`: the agent may create one passkey per ceremony with no prompt.
+- `register = "request"`: a notification asks you each time. Approval permits exactly one registration,
+  by the ceremony that asked; afterwards Passless stores `authenticate = allow` for that RP
+  ([Rules](agents/rules.md#request-escalation)). `authenticate` must be `allow` or `request`.
+- In `same-user` mode the new passkey goes into your own credential store, so the profile must also be
+  listed in `acknowledge_same_user_registration`. In `isolated` mode it goes into the profile's store.
 
-### Step 2: Launch Browser with Extension
+Then let the agent drive the browser ([Quick start](agents/quick-start.md)) and register through the
+site's own "add a passkey" flow. Bring the page to the front: Chrome rejects `create()` from a
+background tab.
 
-The `browser launch` command automatically requests registration grants for all allowed RP IDs in the profile:
+## After enrollment
 
-```bash
-passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/register
-```
+Set `register = "deny"` and reload the policy (`passless agent-admin policy reload <profile>`).
+Authentication keeps working. The credential is immediately usable for sign-in in the same session.
 
-This command:
-- Generates a bearer token for the session
-- Requests registration grants for all allowed RP IDs
-- Registers registration and sign contexts with the daemon
-- Launches Chromium with the agent extension loaded
+## Audit
 
-**Output:**
-```json
-{
-  "lease_id": "abc123...",
-  "profile_id": "ci-agent",
-  "pid": 12345,
-  "start_url": "https://gitea.example.com/register"
-}
-```
+Every attempt is audited with the profile, RP, origin, matched rule, decision, credential reference and
+result, and a reservation is written before the key exists
+([Audit](agents/audit.md)).
 
-### Step 3: Trigger Registration
+## Key generation
 
-The extension automatically intercepts `navigator.credentials.create()` and handles the registration flow. No additional code is needed on the agent side.
-
-### Step 4: Use the Credential
-
-After registration, the credential is stored and can be used for authentication. The same browser session can be used for authentication, or you can launch a new session:
-
-```bash
-# Launch a new browser session for authentication
-passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/login
-
-# The extension intercepts navigator.credentials.get() and handles authentication
-```
-
-## Security Considerations
-
-### Default Deny
-
-Registration is **denied by default**. You must explicitly enable it:
-1. Set `registration_allowed = true` in the profile
-2. Set `register.authorization = "allow"` for each RP
-
-### Audit Trail
-
-All registration operations are audited:
-- Grant request (profile, RP ID, timestamp)
-- Grant approval/denial
-- Registration attempt (origin, RP ID, credential ID)
-- Registration success/failure
-
-### Key Generation
-
-- **Software backend**: Keys are generated in the daemon and stored in the credential file
-- **TPM backend**: Keys are generated and sealed by the TPM; the private key never leaves the TPM
-
-### Grant Lifecycle
-
-Registration grants are:
-- **Time-bounded**: Expire after `max_session_ttl` seconds
-- **RP-scoped**: Only valid for the specified RP ID
-- **One-time use**: Consumed after successful registration
+- **Software backend**: the daemon generates the key and stores it in the credential store.
+- **TPM backend**: the key is generated and sealed by the TPM and does not leave it.
 
 ## Troubleshooting
 
-### Registration Denied
+| Symptom | Cause and fix |
+|---|---|
+| Page gets `NotAllowedError` | No exact rule with `register = "allow"` or `"request"`, a denied or timed-out prompt, or a background tab. Check the audit. |
+| Page gets `InvalidStateError` | The site's `excludeCredentials` matched an existing credential. Delete the old one or use another account. |
+| Page gets `NotSupportedError` | The request asked for an unsupported extension, enterprise attestation or only unsupported algorithms. |
+| `401 invalid_bearer` / `bearer_revoked` | The browser exited or its lease was revoked. Start a new session. |
+| Page failed but a credential exists | The tab was not in front. The audit shows the registration; delete the orphan with `passless agent-admin credential delete <ref> --confirm`. |
+| Key generation failed | TPM: check it is accessible. Software: check the daemon log. |
+| Origin errors | The page must be served over HTTPS (or `http://localhost` for an exact `localhost` rule), on the RP's own origin. |
 
-**Symptom:** Registration fails with "PolicyDenied" error
-
-**Solution:**
-1. Check that `registration_allowed = true` in the profile
-2. Check that `register.authorization = "allow"` for the RP
-3. Verify the RP ID matches exactly (case-sensitive)
-
-### Grant Not Found
-
-**Symptom:** Registration fails with "GrantNotFound" error
-
-**Solution:**
-1. Ensure you requested a registration grant before navigating to the RP
-2. Check that the grant hasn't expired (TTL)
-3. Verify the grant ID is correct
-
-### Origin Mismatch
-
-**Symptom:** Registration fails with "InvalidOrigin" error
-
-**Solution:**
-1. Ensure the RP page is served over HTTPS
-2. Check that the origin matches the RP ID
-3. Verify there are no redirects that change the origin
-
-### Key Generation Failed
-
-**Symptom:** Registration fails with "KeyGenerationFailed" error
-
-**Solution:**
-1. For TPM backend: Check that the TPM is accessible
-2. For software backend: Check that the key provider is configured
-3. Check daemon logs for detailed error messages
-
-## Examples
-
-### Example 1: CI/CD Pipeline Setup
-
-```bash
-# Launch browser with extension
-passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/user/sign_up
-
-# The extension intercepts navigator.credentials.create() when the page triggers it
-# Credential is now available for authentication
-```
-
-### Example 2: Credential Rotation
-
-```bash
-# Launch browser with extension
-passless agent-admin browser launch --profile ci-agent --url https://gitea.example.com/user/settings/security
-
-# Click "Add Passkey" on the page
-# Extension handles registration automatically
-# Old credential can be revoked if needed
-```
+Testing: [Registration testing](AGENT_REGISTRATION_TESTING.md).

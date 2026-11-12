@@ -134,7 +134,6 @@ opaque_id!(
     PrincipalSessionId,
     "Opaque identifier for a principal's session."
 );
-opaque_id!(EndpointId, "Opaque identifier for an agent endpoint.");
 opaque_id!(
     PolicyGenerationId,
     "Opaque identifier for a policy generation."
@@ -142,14 +141,6 @@ opaque_id!(
 opaque_id!(IntentId, "Opaque identifier for an agent intent.");
 opaque_id!(GrantId, "Opaque identifier for a permission grant.");
 opaque_id!(BrowserLeaseId, "Opaque identifier for a browser lease.");
-opaque_id!(
-    PendingRequestId,
-    "Opaque identifier for a pending principal request."
-);
-opaque_id!(
-    RegistrationGrantId,
-    "Opaque identifier for a registration grant."
-);
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -376,21 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_endpoint_id_creation() {
-        let id = EndpointId::new();
-        assert_eq!(id.as_str().len(), 64);
-    }
-
-    #[test]
-    fn test_endpoint_id_equality() {
-        let id1 = EndpointId::from_string_unchecked("endpoint-1".to_string());
-        let id2 = EndpointId::from_string_unchecked("endpoint-1".to_string());
-        let id3 = EndpointId::from_string_unchecked("endpoint-2".to_string());
-        assert_eq!(id1, id2);
-        assert_ne!(id1, id3);
-    }
-
-    #[test]
     fn test_policy_generation_id() {
         let id = PolicyGenerationId::new();
         assert_eq!(id.as_str().len(), 64);
@@ -613,20 +589,14 @@ mod tests {
     #[test]
     fn test_id_types_not_interchangeable() {
         let session = PrincipalSessionId::from_string_unchecked("test".to_string());
-        let endpoint = EndpointId::from_string_unchecked("test".to_string());
         let grant = GrantId::from_string_unchecked("test".to_string());
 
         assert_ne!(
             std::any::TypeId::of::<PrincipalSessionId>(),
-            std::any::TypeId::of::<EndpointId>()
-        );
-        assert_ne!(
-            std::any::TypeId::of::<EndpointId>(),
             std::any::TypeId::of::<GrantId>()
         );
 
-        assert_eq!(session.as_str(), endpoint.as_str());
-        assert_eq!(endpoint.as_str(), grant.as_str());
+        assert_eq!(session.as_str(), grant.as_str());
     }
 
     #[test]

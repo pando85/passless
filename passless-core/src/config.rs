@@ -834,45 +834,28 @@ impl BackendConfig {
 }
 
 impl AppConfig {
+    /// The configuration file [`Self::load`] reads: `--config`/`PASSLESS_CONFIG`, else the default
+    /// `~/.config/passless/config.toml`, if it exists.
+    pub fn config_file_path(args: &Args) -> Option<PathBuf> {
+        let default_config_path = dirs::config_dir().map(|p| p.join("passless/config.toml"));
+        args.config_path
+            .clone()
+            .or(default_config_path)
+            .filter(|p| p.exists())
+    }
+
     /// Load configuration with precedence: CLI > config file > defaults
     pub fn load(args: &mut Args) -> crate::error::Result<Self> {
-        let default_config_path = dirs::config_dir().map(|p| p.join("passless/config.toml"));
+        let config_file_path = Self::config_file_path(args);
 
-        let config_file_path = args
-            .config_path
-            .as_ref()
-            .or(default_config_path.as_ref())
-            .filter(|p| p.exists());
-
-        if let Some(path) = config_file_path
+        if let Some(path) = config_file_path.as_ref()
             && let Ok(f) = File::open(path)
         {
             log::info!("Loading configuration from: {}", path.display());
             let content = std::io::read_to_string(BufReader::new(f)).unwrap_or_default();
 
             #[cfg(feature = "agent")]
-            let agent_config = {
-                match toml::from_str::<toml::Table>(&content) {
-                    Ok(table) => match table.get("agents") {
-                        Some(agents_value) => serde::Deserialize::deserialize(agents_value.clone())
-                            .map_err(|e| {
-                                Error::Config(format!(
-                                    "failed to parse [agents] section in {}: {}",
-                                    path.display(),
-                                    e
-                                ))
-                            })?,
-                        None => AgentConfig::default(),
-                    },
-                    Err(e) => {
-                        return Err(Error::Config(format!(
-                            "failed to parse config file {} as TOML: {}",
-                            path.display(),
-                            e
-                        )));
-                    }
-                }
-            };
+            let agent_config = AgentConfig::from_toml_str(&content, &path.display().to_string())?;
 
             match toml::from_str::<<AppConfig as ClapSerde>::Opt>(&content) {
                 Ok(file_config) => {
@@ -1090,6 +1073,24 @@ pub enum Commands {
         #[command(subcommand)]
         action: AgentAdminAction,
     },
+    /// Check this host (does not need a running daemon)
+    #[cfg(feature = "agent")]
+    Doctor {
+        /// Check the agent browser path: a supported browser binary, the interception extension,
+        /// the native messaging host manifest, the notification bus, the state directory and the
+        /// containment of the native WebAuthn path
+        #[arg(long)]
+        agents: bool,
+
+        /// Output format: plain (default) or json
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "FORMAT",
+            default_value = "plain"
+        )]
+        output: OutputFormat,
+    },
     /// Agent principal and session commands
     #[cfg(feature = "agent")]
     Agent {
@@ -1232,20 +1233,6 @@ pub enum AgentAdminAction {
         #[arg(long)]
         force: bool,
     },
-    /// Install native messaging manifest for browser extension
-    InstallNativeMessaging {
-        /// Browser executable path (e.g., /usr/bin/chromium)
-        #[arg(long)]
-        browser: String,
-
-        /// Extension directory path
-        #[arg(long)]
-        ext_dir: PathBuf,
-
-        /// Sign proxy binary path
-        #[arg(long, default_value = "/usr/bin/sign-proxy")]
-        sign_proxy: PathBuf,
-    },
     /// Profile management
     Profile {
         #[command(subcommand)]
@@ -1261,15 +1248,22 @@ pub enum AgentAdminAction {
         #[command(subcommand)]
         action: AdminCredentialAction,
     },
-    /// Delegation management
-    Delegation {
+    /// Persistent granted rules (escalation approvals)
+    Grants {
         #[command(subcommand)]
-        action: AdminDelegationAction,
+        action: AdminGrantsAction,
     },
-    /// Session management
-    Session {
+    /// Browser bearer sessions (session grants)
+    #[command(alias = "delegation")]
+    Sessions {
         #[command(subcommand)]
-        action: AdminSessionAction,
+        action: AdminSessionsAction,
+    },
+    /// Principal sessions
+    #[command(alias = "session")]
+    Principals {
+        #[command(subcommand)]
+        action: AdminPrincipalsAction,
     },
     /// Browser session management
     Browser {
@@ -1382,23 +1376,66 @@ pub enum AdminCredentialAction {
     },
 }
 
-/// Admin delegation actions
+/// Admin granted-rule actions (ADR 0014 section 8.4)
 #[cfg(feature = "agent")]
 #[derive(Subcommand, Debug, Clone)]
-pub enum AdminDelegationAction {
-    /// Show delegation details
-    Show {
-        /// Grant identifier (hex)
-        #[arg(value_name = "GRANT_ID")]
-        grant_id: String,
-    },
-    /// List all delegations
+pub enum AdminGrantsAction {
+    /// List granted rules
     List {
         /// Filter by profile
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
-    /// Revoke a delegation
+    /// Revoke the granted rule of one RP
+    Revoke {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Relying party ID
+        #[arg(long = "rp", value_name = "RP_ID")]
+        rp_id: String,
+        /// Action of the granted rule
+        #[arg(long, value_enum, default_value_t = AdminGrantAction::Authenticate)]
+        action: AdminGrantAction,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Revoke every granted rule of a profile
+    Clear {
+        /// Profile identifier
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        /// Confirm the revocation
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Action of a granted rule (only `authenticate` is ever granted)
+#[cfg(feature = "agent")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminGrantAction {
+    Authenticate,
+}
+
+/// Admin browser bearer session actions
+#[cfg(feature = "agent")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum AdminSessionsAction {
+    /// Show session grant details
+    Show {
+        /// Grant identifier (hex)
+        #[arg(value_name = "GRANT_ID")]
+        grant_id: String,
+    },
+    /// List all session grants
+    List {
+        /// Filter by profile
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Revoke a session grant
     Revoke {
         /// Grant identifier (hex)
         #[arg(value_name = "GRANT_ID")]
@@ -1407,28 +1444,13 @@ pub enum AdminDelegationAction {
         #[arg(long)]
         confirm: bool,
     },
-    /// Create an exact-RP, short-lived, one-shot registration enrollment grant
-    RequestRegistration {
-        /// Profile identifier
-        #[arg(long, value_name = "PROFILE")]
-        profile: String,
-        /// Relying party ID
-        #[arg(long, value_name = "RP_ID")]
-        rp: String,
-        /// Enrollment grant TTL in seconds (clamped to profile TTL and 300 seconds)
-        #[arg(long, value_name = "SECONDS")]
-        session_ttl: u64,
-        /// Reason for the registration
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-    },
 }
 
-/// Admin session actions
+/// Admin principal session actions
 #[cfg(feature = "agent")]
 #[derive(Subcommand, Debug, Clone)]
-pub enum AdminSessionAction {
-    /// Show session details
+pub enum AdminPrincipalsAction {
+    /// Show principal session details
     Show {
         /// Session identifier (hex)
         #[arg(value_name = "SESSION_ID")]
@@ -1611,20 +1633,10 @@ pub enum PinAction {
 pub enum AgentCommand {
     /// Run health diagnostics
     Doctor,
-    /// Show principal capabilities
+    /// Show the profile's effective authority (per-RP rules, credential scope, session limits)
     Capabilities,
     /// Show principal instructions
     Instructions,
-    /// Intent management
-    Intent {
-        #[command(subcommand)]
-        action: AgentIntentAction,
-    },
-    /// Delegation management
-    Delegation {
-        #[command(subcommand)]
-        action: AgentDelegationAction,
-    },
     /// Credential queries
     Credential {
         #[command(subcommand)]
@@ -1632,8 +1644,6 @@ pub enum AgentCommand {
     },
     /// Show browser bridge status
     BrowserStatus,
-    /// Show endpoint status
-    EndpointStatus,
     /// Send a CDP command to the managed browser session
     ///
     /// WARNING: This is the full browser-session authority interface.
@@ -1650,7 +1660,50 @@ pub enum AgentCommand {
         #[arg(long, value_name = "MS", default_value = "5000")]
         timeout_ms: u32,
     },
+    /// Ensure the managed browser of this principal and print how to reach it
+    ///
+    /// Idempotent: the browser is started on the first call and the same endpoint is printed
+    /// while it runs (the profile's `browser_scope` decides whether sessions share it). The
+    /// endpoint is withheld until the interception extension is attached and allowed in
+    /// incognito, so a printed endpoint is always an intercepted browser. With
+    /// `browser_cdp_expose = "port"` the CDP endpoint is printed. In pipe mode (the default)
+    /// there is no endpoint: the browser is ensured and CDP goes through
+    /// `passless agent browser-control`. It must run inside a principal session of the profile
+    /// (the browser is closed when that session ends), e.g. an agent started with
+    /// `passless agent run --profile P -- <command>`.
+    Browser {
+        /// Print JSON ({endpoint, ...}) instead of the bare endpoint URL
+        #[arg(long, conflicts_with = "env")]
+        json: bool,
+        /// Print `PASSLESS_CDP_URL=<endpoint>`, for `eval` or a dotenv file
+        #[arg(long)]
+        env: bool,
+        /// Block until the browser is intercepting (attached, incognito allowed) before printing
+        #[arg(long)]
+        wait: bool,
+        /// Start a headed browser instead of the default `--headless=new`
+        #[arg(long)]
+        headed: bool,
+        /// Open this URL once interception is attached
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// MCP server adapters for the managed browser (stdio launchers)
+    #[command(args_conflicts_with_subcommands = true)]
+    Mcp {
+        /// Print a ready-to-paste MCP server entry for a client instead of running a server
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        print_config: Option<McpConfigTarget>,
+        /// The adapter the printed entry runs
+        #[arg(long, value_enum, default_value_t = McpAdapterKind::Playwright, requires = "print_config")]
+        server: McpAdapterKind,
+        #[command(subcommand)]
+        adapter: Option<McpAdapter>,
+    },
     /// Run Playwright MCP with lazy access to the profile's trusted CDP browser
+    ///
+    /// Deprecated alias of `agent mcp playwright`, kept for one release.
+    #[command(hide = true)]
     PlaywrightMcp {
         /// Profile to bind the Playwright session to
         #[arg(long, value_name = "PROFILE")]
@@ -1673,102 +1726,66 @@ pub enum AgentCommand {
     },
 }
 
-/// Agent intent actions
+/// An MCP server the adapters run against the managed browser.
 #[cfg(feature = "agent")]
 #[derive(Subcommand, Debug, Clone)]
-pub enum AgentIntentAction {
-    /// Create a new intent
-    Create {
-        /// Action type
-        #[arg(value_enum)]
-        action: AgentIntentActionType,
-        /// Relying party ID
-        #[arg(long, value_name = "RP_ID")]
-        rp: String,
-        /// Credential reference (hex)
-        #[arg(long, value_name = "CREDENTIAL_REF")]
-        credential: Option<String>,
-        /// Reason for the intent
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
+pub enum McpAdapter {
+    /// Run `npx @playwright/mcp --cdp-endpoint <url>` (the endpoint is resolved on first use)
+    Playwright {
+        /// npm package to run (default `@playwright/mcp`; pin a version here)
+        #[arg(long, value_name = "SPEC")]
+        package: Option<String>,
+        /// npx executable (default: `npx` from PATH)
+        #[arg(long, value_name = "PATH")]
+        npx: Option<std::path::PathBuf>,
+        /// Open this URL once interception is attached
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Extra arguments for @playwright/mcp (after `--`)
+        #[arg(last = true)]
+        extra: Vec<String>,
     },
-    /// Show intent status
-    Show {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
-    /// Wait for intent to reach terminal state
-    Wait {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-        /// Timeout in seconds
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<u64>,
-        /// Poll interval in milliseconds
-        #[arg(long, value_name = "MS")]
-        poll_interval: Option<u64>,
-    },
-    /// Cancel a pending intent
-    Cancel {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
+    /// Run `npx chrome-devtools-mcp --browserUrl <url>`
+    ///
+    /// The browser starts when the server starts: puppeteer asks `<browserUrl>/json/version`
+    /// at the root of the URL and cannot send the bootstrap's bearer header, so a lazy,
+    /// authenticated discovery endpoint is not possible.
+    ChromeDevtools {
+        /// npm package to run (default `chrome-devtools-mcp`; pin a version here)
+        #[arg(long, value_name = "SPEC")]
+        package: Option<String>,
+        /// npx executable (default: `npx` from PATH)
+        #[arg(long, value_name = "PATH")]
+        npx: Option<std::path::PathBuf>,
+        /// Open this URL once interception is attached
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Extra arguments for chrome-devtools-mcp (after `--`)
+        #[arg(last = true)]
+        extra: Vec<String>,
     },
 }
 
-/// Intent action type for CLI
+/// Which adapter `agent mcp --print-config` prints an entry for.
 #[cfg(feature = "agent")]
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentIntentActionType {
-    Register,
-    Authenticate,
+pub enum McpAdapterKind {
+    Playwright,
+    ChromeDevtools,
 }
 
-/// Agent delegation actions
+/// MCP clients `agent mcp --print-config` knows the configuration format of.
 #[cfg(feature = "agent")]
-#[derive(Subcommand, Debug, Clone)]
-pub enum AgentDelegationAction {
-    /// Request a new delegation
-    Request {
-        /// Relying party ID
-        #[arg(long, value_name = "RP_ID")]
-        rp: String,
-        /// Credential reference (hex)
-        #[arg(long, value_name = "CREDENTIAL_REF")]
-        credential: String,
-        /// Session TTL in seconds
-        #[arg(long, value_name = "SECONDS")]
-        session_ttl: u64,
-        /// Reason for the delegation
-        #[arg(long, value_name = "REASON")]
-        reason: Option<String>,
-    },
-    /// Show delegation status
-    Show {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
-    /// Wait for delegation to reach terminal state
-    Wait {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-        /// Timeout in seconds
-        #[arg(long, value_name = "SECONDS")]
-        timeout: Option<u64>,
-        /// Poll interval in milliseconds
-        #[arg(long, value_name = "MS")]
-        poll_interval: Option<u64>,
-    },
-    /// Cancel a pending delegation
-    Cancel {
-        /// Request identifier (hex)
-        #[arg(value_name = "REQUEST_ID")]
-        request_id: String,
-    },
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConfigTarget {
+    /// `.mcp.json` / `claude mcp add-json`
+    ClaudeCode,
+    /// `opencode.json`
+    Opencode,
+    /// `.cursor/mcp.json`
+    Cursor,
+    /// `.vscode/mcp.json`
+    Vscode,
 }
 
 /// Agent credential actions
@@ -2141,6 +2158,149 @@ mod tests {
 
     #[cfg(feature = "agent")]
     #[test]
+    fn test_agent_browser_parses() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "--profile",
+            "p",
+            "browser",
+            "--json",
+            "--wait",
+            "--headed",
+        ])
+        .unwrap();
+        let Some(Commands::Agent {
+            profile,
+            action:
+                AgentCommand::Browser {
+                    json,
+                    env,
+                    wait,
+                    headed,
+                    url,
+                },
+            ..
+        }) = args.command
+        else {
+            panic!("not agent browser");
+        };
+        assert_eq!(profile.as_deref(), Some("p"));
+        assert!(json && wait && headed && !env && url.is_none());
+        // `--profile` after the subcommand works too (it is global), and `--json` excludes `--env`.
+        let args =
+            Args::try_parse_from(["passless", "agent", "browser", "--env", "--profile", "p"])
+                .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Browser { env: true, .. },
+                ..
+            })
+        ));
+        assert!(Args::try_parse_from(["passless", "agent", "browser", "--json", "--env"]).is_err());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_mcp_parses() {
+        let args = Args::try_parse_from([
+            "passless",
+            "agent",
+            "mcp",
+            "playwright",
+            "--profile",
+            "p",
+            "--",
+            "--isolated",
+        ])
+        .unwrap();
+        let Some(Commands::Agent {
+            action:
+                AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::Playwright { extra, .. }),
+                    print_config: None,
+                    ..
+                },
+            profile,
+            ..
+        }) = args.command
+        else {
+            panic!("not agent mcp playwright");
+        };
+        assert_eq!(profile.as_deref(), Some("p"));
+        assert_eq!(extra, ["--isolated"]);
+
+        let args = Args::try_parse_from(["passless", "agent", "mcp", "chrome-devtools"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Agent {
+                action: AgentCommand::Mcp {
+                    adapter: Some(McpAdapter::ChromeDevtools { .. }),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        for (name, target) in [
+            ("claude-code", McpConfigTarget::ClaudeCode),
+            ("opencode", McpConfigTarget::Opencode),
+            ("cursor", McpConfigTarget::Cursor),
+            ("vscode", McpConfigTarget::Vscode),
+        ] {
+            let args = Args::try_parse_from([
+                "passless",
+                "agent",
+                "--profile",
+                "p",
+                "mcp",
+                "--print-config",
+                name,
+            ])
+            .unwrap();
+            assert!(matches!(
+                args.command,
+                Some(Commands::Agent {
+                    action: AgentCommand::Mcp { print_config: Some(t), adapter: None, .. },
+                    ..
+                }) if t == target
+            ));
+        }
+        assert!(
+            Args::try_parse_from(["passless", "agent", "mcp", "--print-config", "emacs"]).is_err()
+        );
+        // The old name still parses (hidden alias, one release).
+        assert!(
+            Args::try_parse_from([
+                "passless",
+                "agent",
+                "playwright-mcp",
+                "--profile",
+                "p",
+                "--",
+                "/usr/bin/npx",
+                "x",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_doctor_agents_parses() {
+        let args = Args::try_parse_from(["passless", "doctor", "--agents", "-o", "json"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::Doctor {
+                agents: true,
+                output: OutputFormat::Json
+            })
+        ));
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
     fn test_agent_run_with_command() {
         let args = Args::try_parse_from([
             "passless",
@@ -2167,29 +2327,82 @@ mod tests {
 
     #[cfg(feature = "agent")]
     #[test]
-    fn test_agent_intent_create_parses() {
+    fn test_agent_admin_grants_parse() {
         let args = Args::try_parse_from([
             "passless",
-            "agent",
-            "intent",
-            "create",
-            "register",
+            "agent-admin",
+            "grants",
+            "revoke",
+            "--profile",
+            "coding",
             "--rp",
             "example.com",
+            "--confirm",
         ])
         .unwrap();
         assert!(matches!(
             args.command,
-            Some(Commands::Agent {
-                action: AgentCommand::Intent {
-                    action: AgentIntentAction::Create {
-                        action: AgentIntentActionType::Register,
-                        ..
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Grants {
+                    action: AdminGrantsAction::Revoke {
+                        ref profile,
+                        ref rp_id,
+                        action: AdminGrantAction::Authenticate,
+                        confirm: true,
                     },
+                },
+                ..
+            }) if profile == "coding" && rp_id == "example.com"
+        ));
+        let args = Args::try_parse_from([
+            "passless",
+            "agent-admin",
+            "grants",
+            "clear",
+            "--profile",
+            "p",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Commands::AgentAdmin {
+                action: AgentAdminAction::Grants {
+                    action: AdminGrantsAction::Clear { confirm: false, .. },
                 },
                 ..
             })
         ));
+        assert!(Args::try_parse_from(["passless", "agent-admin", "grants", "list"]).is_ok());
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn test_agent_admin_renamed_session_commands_keep_hidden_aliases() {
+        for (spelling, expect_sessions) in [
+            ("sessions", true),
+            ("delegation", true),
+            ("principals", false),
+            ("session", false),
+        ] {
+            let args = Args::try_parse_from(["passless", "agent-admin", spelling, "list"]).unwrap();
+            let is_sessions = matches!(
+                args.command,
+                Some(Commands::AgentAdmin {
+                    action: AgentAdminAction::Sessions { .. },
+                    ..
+                })
+            );
+            let is_principals = matches!(
+                args.command,
+                Some(Commands::AgentAdmin {
+                    action: AgentAdminAction::Principals { .. },
+                    ..
+                })
+            );
+            assert_eq!(is_sessions, expect_sessions, "{spelling}");
+            assert_eq!(is_principals, !expect_sessions, "{spelling}");
+        }
+        assert!(Args::try_parse_from(["passless", "agent", "intent", "show", "x"]).is_err());
     }
 
     #[cfg(feature = "agent")]
@@ -2224,8 +2437,9 @@ mod tests {
             "agent",
             "install",
             "browser-control",
-            "intent",
-            "delegation",
+            "grants",
+            "sessions",
+            "principals",
             "doctor",
             "capabilities",
             "instructions",

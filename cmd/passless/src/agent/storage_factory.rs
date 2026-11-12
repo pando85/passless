@@ -3,7 +3,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use passless_core::agent::CredentialRef;
 use passless_core::agent::config::AgentStorageConfig;
 use passless_core::error::{Error, Result};
 
@@ -13,8 +12,6 @@ use passless_core::agent::config::{AgentProfileConfig, BrowserScope};
 use crate::pin_storage::PinStorage;
 use crate::storage::CredentialStorage;
 use crate::storage::pass::GpgBackend;
-
-use super::storage::{CeremonyScope, SharedDelegatedStorage};
 
 pub struct AgentStorageBundle {
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
@@ -414,38 +411,6 @@ pub fn create_storage_bundle_with_options(
     }
 }
 
-pub fn create_shared_delegated_storage<S: CredentialStorage + 'static>(
-    human: Arc<Mutex<S>>,
-    rp_ids: Vec<String>,
-    credential_refs: Vec<CredentialRef>,
-    constant_counter: bool,
-) -> Result<(SharedDelegatedStorage<S>, CeremonyScope)> {
-    create_shared_delegated_storage_with_registration(
-        human,
-        rp_ids,
-        credential_refs,
-        constant_counter,
-        false,
-    )
-}
-
-pub fn create_shared_delegated_storage_with_registration<S: CredentialStorage + 'static>(
-    human: Arc<Mutex<S>>,
-    rp_ids: Vec<String>,
-    credential_refs: Vec<CredentialRef>,
-    constant_counter: bool,
-    registration_allowed: bool,
-) -> Result<(SharedDelegatedStorage<S>, CeremonyScope)> {
-    let mut delegated = SharedDelegatedStorage::new(human, rp_ids, credential_refs)
-        .with_constant_counter_mode(constant_counter)
-        .with_registration_allowed(registration_allowed);
-    delegated
-        .build_index()
-        .map_err(|e| Error::Storage(format!("failed to build delegated index: {}", e)))?;
-    let scope = delegated.scope();
-    Ok((delegated, scope))
-}
-
 #[cfg(test)]
 pub fn config_from_profile(profile: &AgentProfileConfig) -> Result<AgentStorageConfig> {
     profile
@@ -662,19 +627,16 @@ mod tests {
 
     #[test]
     fn test_config_from_profile() {
-        use passless_core::agent::{AgentMode, DeviceIdentity};
+        use passless_core::agent::AgentMode;
 
         let profile = AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
             credential_selection: passless_core::agent::config::CredentialSelection::Single,
-            human_verification_prompt:
-                passless_core::agent::config::HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: "test-user".to_string(),
-            rp_ids: vec!["example.com".to_string()],
-            require_uv: true,
             credential_refs: None,
             max_grant_ttl: None,
             max_session_ttl: None,
@@ -682,15 +644,9 @@ mod tests {
                 path: PathBuf::from("/tmp/test/creds"),
                 pin_path: PathBuf::from("/tmp/test/pin"),
             }),
-            registration_allowed: false,
             rules: vec![],
-            device: DeviceIdentity {
-                name: "test".to_string(),
-                phys: "test".to_string(),
-                uniq: "test".to_string(),
-                vendor_id: 1,
-                product_id: 1,
-            },
+            legacy: Default::default(),
+            device: None,
             start_url: None,
             browser_command: None,
             browser_user: None,
@@ -712,32 +668,23 @@ mod tests {
 
     #[test]
     fn test_config_from_profile_missing_storage() {
-        use passless_core::agent::{AgentMode, DeviceIdentity};
+        use passless_core::agent::AgentMode;
 
         let profile = AgentProfileConfig {
+            max_granted_rules: 64,
             max_operations: 64,
             max_concurrent_sessions: 1,
             browser_scope: BrowserScope::Session,
             credential_selection: passless_core::agent::config::CredentialSelection::Single,
-            human_verification_prompt:
-                passless_core::agent::config::HumanVerificationPrompt::Always,
             mode: AgentMode::Isolated,
             principal_user: "test-user".to_string(),
-            rp_ids: vec!["example.com".to_string()],
-            require_uv: true,
             credential_refs: None,
             max_grant_ttl: None,
             max_session_ttl: None,
             storage: None,
-            registration_allowed: false,
             rules: vec![],
-            device: DeviceIdentity {
-                name: "test".to_string(),
-                phys: "test".to_string(),
-                uniq: "test".to_string(),
-                vendor_id: 1,
-                product_id: 1,
-            },
+            legacy: Default::default(),
+            device: None,
             start_url: None,
             browser_command: None,
             browser_user: None,

@@ -2,8 +2,12 @@
 pub mod agent;
 #[cfg(feature = "agent")]
 pub mod agent_admin;
+#[cfg(feature = "agent")]
+pub mod agent_browser;
 pub mod client;
 pub mod custom;
+#[cfg(feature = "agent")]
+pub mod doctor;
 #[cfg(feature = "agent")]
 pub mod playwright_mcp;
 #[cfg(feature = "tpm")]

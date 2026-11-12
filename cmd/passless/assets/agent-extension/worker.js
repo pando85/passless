@@ -1,224 +1,518 @@
-(function(socketPath, bearer) {
+// Passless agent extension: service worker (ADR 0014 §4.4, §11; wire protocol v2).
+//
+// The worker is the only part of the extension. It intercepts WebAuthn through
+// chrome.webAuthenticationProxy and relays every request to the Passless daemon over one
+// chrome.runtime.connectNative port. It never builds or edits a response: the daemon's responseJson
+// is passed to complete*Request verbatim. It registers no runtime message listeners, so the bearer is
+// never reachable from a page or another extension.
+//
+// The daemon templates the three constants below with JSON string literals when it writes the file.
+(function (bearer, socketPath, buildVersion) {
   "use strict";
 
-  var MAX_REQUEST_BYTES = 16384;
-  var MAX_RP_ID_LEN = 253;
-  var MAX_CHALLENGE_B64U_LEN = 2048;
-  var MAX_ALLOW_CREDENTIALS = 64;
-  var MAX_EXCLUDE_CREDENTIALS = 64;
-  var MAX_CREDENTIAL_ID_B64U_LEN = 512;
-  var MAX_ORIGIN_LEN = 512;
-  var MAX_USER_NAME_LEN = 256;
-  var MAX_USER_ID_B64U_LEN = 128;
-  var MAX_ALGORITHMS = 16;
-
   var NATIVE_HOST = "rs.passless.sign_proxy";
-  var MAX_COMPLETED_REQUESTS = 128;
-  var scope = typeof globalThis !== "undefined" ? globalThis : (typeof self !== "undefined" ? self : this);
-  if (!scope.__passlessPendingRequests) scope.__passlessPendingRequests = new Map();
-  if (!scope.__passlessCompletedRequests) scope.__passlessCompletedRequests = new Map();
-  var pendingRequests = scope.__passlessPendingRequests;
-  var completedRequests = scope.__passlessCompletedRequests;
+  var PROTOCOL_VERSION = 2;
+  var KEEPALIVE_MS = 20000;
+  var BACKOFF_INITIAL_MS = 250;
+  var BACKOFF_MAX_MS = 10000;
+  var STATE_PROBE_TIMEOUT_MS = 2000;
+  // Wire frames are capped at 1 MiB (UTF-8 JSON). A larger request would make the relay close the
+  // port and fail every other in-flight request, so it is refused locally.
+  var MAX_FRAME_BYTES = 1048576;
+  var MAX_WIRE_ID = 0xffffffff;
+  var PENDING_PREFIX = "pending:";
+  var DOM_NAMES = ["NotAllowedError", "NotSupportedError", "InvalidStateError", "SecurityError", "AbortError"];
+  var ERROR_MESSAGE = "The operation either timed out or was not allowed.";
 
-  function parseHttpsOrigin(url) {
-    if (typeof url !== "string") return null;
-    var parsed;
+  var proxy = {};
+  try {
+    proxy = chrome.webAuthenticationProxy || {};
+  } catch (e) {
+    proxy = {};
+  }
+  var instance = randomNonce();
+
+  var attached = false;
+  var incognitoAllowed = false;
+  var stateKnown = false;
+  var attachDone = false;
+  var incognitoDone = false;
+  var stateTimer = null;
+
+  var conn = null; // {port, helloSent, outbox, keepaliveTimer, reported}
+  var reconnectTimer = null;
+  var backoffMs = BACKOFF_INITIAL_MS;
+
+  var nextWireId = 1;
+  var byWireId = new Map(); // wire id -> entry
+  var byRequestId = new Map(); // proxy requestId -> entry
+
+  // ---- helpers ----------------------------------------------------------------------------------
+
+  function randomNonce() {
     try {
-      parsed = new URL(url);
-    } catch (error) {
+      if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+      var bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      var hex = "";
+      for (var i = 0; i < bytes.length; i++) hex += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+      return hex;
+    } catch (e) {
+      // No CSPRNG: the nonce only separates worker instances, it is not a secret.
+      return String(Date.now()) + "-" + String(Math.random()).slice(2);
+    }
+  }
+
+  // Reads (and thereby consumes) chrome.runtime.lastError inside a callback.
+  function lastErrorMessage() {
+    try {
+      var le = chrome.runtime && chrome.runtime.lastError;
+      if (!le) return null;
+      return typeof le.message === "string" ? le.message : String(le);
+    } catch (e) {
+      return "lastError unreadable";
+    }
+  }
+
+  function utf8Length(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) n += 1;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+        var d = s.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d <= 0xdfff) {
+          n += 4;
+          i++;
+        } else n += 3;
+      } else n += 3;
+    }
+    return n;
+  }
+
+  function isPlainObject(v) {
+    return v !== null && typeof v === "object" && !Array.isArray(v);
+  }
+
+  // ---- completion -------------------------------------------------------------------------------
+
+  function callComplete(op, arg) {
+    var fn = op === "create" ? "completeCreateRequest" : "completeGetRequest";
+    try {
+      proxy[fn](arg, function () {
+        lastErrorMessage(); // "Invalid requestId" after a cancel or a browser-side timeout is expected
+      });
+    } catch (e) {
+      // The request may already be gone; nothing else to do.
+    }
+  }
+
+  function completeError(op, requestId, name) {
+    var dom = DOM_NAMES.indexOf(name) !== -1 ? name : "NotAllowedError";
+    callComplete(op, { requestId: requestId, error: { name: dom, message: ERROR_MESSAGE } });
+  }
+
+  function completeOk(op, requestId, responseJson) {
+    callComplete(op, { requestId: requestId, responseJson: responseJson });
+  }
+
+  // ---- pending ids in storage.session (V-M4) ----------------------------------------------------
+
+  function storageArea() {
+    try {
+      return chrome.storage && chrome.storage.session ? chrome.storage.session : null;
+    } catch (e) {
       return null;
     }
-    if (parsed.protocol !== "https:") return null;
-    if (parsed.origin.length > MAX_ORIGIN_LEN) return null;
-    return parsed.origin;
   }
 
-  function validateOrigins(sender) {
-    var origin = parseHttpsOrigin(sender.url);
-    if (!origin) return null;
-
-    var topOrigin = origin;
-    if (sender.tab && typeof sender.tab.url === "string") {
-      topOrigin = parseHttpsOrigin(sender.tab.url);
-      if (!topOrigin) return null;
-    }
-
-    var crossOrigin = sender.frameId !== 0 && origin !== topOrigin;
-    return {
-      origin: origin,
-      top_origin: topOrigin,
-      cross_origin: crossOrigin
-    };
-  }
-
-  function validateGetRequest(req) {
-    if (typeof req.rp_id !== "string" || req.rp_id.length === 0 || req.rp_id.length > MAX_RP_ID_LEN) return false;
-    if (typeof req.challenge_b64u !== "string" || req.challenge_b64u.length === 0 || req.challenge_b64u.length > MAX_CHALLENGE_B64U_LEN) return false;
-    if (!Array.isArray(req.allow_credentials) || req.allow_credentials.length > MAX_ALLOW_CREDENTIALS) return false;
-    for (var i = 0; i < req.allow_credentials.length; i++) {
-      var c = req.allow_credentials[i];
-      if (typeof c !== "string" || c.length === 0 || c.length > MAX_CREDENTIAL_ID_B64U_LEN) return false;
-    }
-    return typeof req.user_verification === "boolean";
-  }
-
-  function validateCreateRequest(req) {
-    if (typeof req.rp_id !== "string" || req.rp_id.length === 0 || req.rp_id.length > MAX_RP_ID_LEN) return false;
-    if (typeof req.challenge_b64u !== "string" || req.challenge_b64u.length === 0 || req.challenge_b64u.length > MAX_CHALLENGE_B64U_LEN) return false;
-    if (typeof req.user_id_b64u !== "string" || req.user_id_b64u.length === 0 || req.user_id_b64u.length > MAX_USER_ID_B64U_LEN) return false;
-    if (typeof req.user_name !== "string" || req.user_name.length === 0 || req.user_name.length > MAX_USER_NAME_LEN) return false;
-    if (!Array.isArray(req.exclude_credentials) || req.exclude_credentials.length > MAX_EXCLUDE_CREDENTIALS) return false;
-    for (var i = 0; i < req.exclude_credentials.length; i++) {
-      var c = req.exclude_credentials[i];
-      if (typeof c !== "string" || c.length === 0 || c.length > MAX_CREDENTIAL_ID_B64U_LEN) return false;
-    }
-    if (!Array.isArray(req.pub_key_cred_params) || req.pub_key_cred_params.length === 0 || req.pub_key_cred_params.length > MAX_ALGORITHMS) return false;
-    for (var j = 0; j < req.pub_key_cred_params.length; j++) {
-      if (!Number.isInteger(req.pub_key_cred_params[j])) return false;
-    }
-    return typeof req.user_verification === "boolean";
-  }
-
-  function rememberCompletedRequest(requestId, response) {
-    completedRequests.set(requestId, response);
-    if (completedRequests.size > MAX_COMPLETED_REQUESTS) {
-      completedRequests.delete(completedRequests.keys().next().value);
-    }
-  }
-
-  function completeRequest(requestId, response) {
-    var callbacks = pendingRequests.get(requestId) || [];
-    pendingRequests.delete(requestId);
-    rememberCompletedRequest(requestId, response);
-    for (var i = 0; i < callbacks.length; i++) callbacks[i](response);
-  }
-
-  function daemonRequest(requestId, path, request, sendResponse, responseField, type) {
-    var body;
+  function recordPending(requestId, op) {
+    var area = storageArea();
+    if (!area) return;
+    var item = {};
+    item[PENDING_PREFIX + requestId] = { op: op, instance: instance };
     try {
-      body = JSON.stringify(request);
-    } catch (error) {
-      sendResponse({ ok: false, type: type, error: "invalid_request" });
-      return false;
+      area.set(item, function () {
+        lastErrorMessage();
+      });
+    } catch (e) {
+      // Best effort: losing the record only loses the restart cleanup for this id.
     }
-    if (body.length > MAX_REQUEST_BYTES) {
-      sendResponse({ ok: false, type: type, error: "request_too_large" });
-      return false;
-    }
+  }
 
-    if (completedRequests.has(requestId)) {
-      sendResponse(completedRequests.get(requestId));
-      return false;
+  function forgetPending(keys) {
+    var area = storageArea();
+    if (!area || keys.length === 0) return;
+    try {
+      area.remove(keys, function () {
+        lastErrorMessage();
+      });
+    } catch (e) {
+      // Best effort.
     }
-    if (pendingRequests.has(requestId)) {
-      pendingRequests.get(requestId).push(sendResponse);
-      return true;
-    }
-    pendingRequests.set(requestId, [sendResponse]);
+  }
 
-    var message = {
-      path: path,
-      bearer: bearer,
-      socket_path: socketPath,
-      body: body
-    };
-
-    chrome.runtime.sendNativeMessage(NATIVE_HOST, message, function(response) {
-      if (chrome.runtime.lastError) {
-        completeRequest(requestId, { ok: false, type: type, error: "transport_error" });
-        return;
-      }
-      if (!response || typeof response !== "object") {
-        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
-        return;
-      }
-      if (response.error) {
-        completeRequest(requestId, {
-          ok: false,
-          type: type,
-          error: response.error,
-          fallback: response.error === "human_interaction_required"
+  // Fails the requests a previous worker instance left in flight. Entries of this instance are kept:
+  // the request that woke this worker may already be recorded.
+  function failStaleRequests() {
+    var area = storageArea();
+    if (!area) return;
+    try {
+      area.get(null, function (items) {
+        if (lastErrorMessage() || !isPlainObject(items)) return;
+        var stale = [];
+        Object.keys(items).forEach(function (key) {
+          if (key.indexOf(PENDING_PREFIX) !== 0) return;
+          var value = items[key];
+          if (isPlainObject(value) && value.instance === instance) return;
+          var requestId = Number(key.slice(PENDING_PREFIX.length));
+          // A live request of this instance may reuse the key; its record now belongs to us.
+          if (byRequestId.has(requestId)) return;
+          stale.push(key);
+          if (!Number.isInteger(requestId)) return;
+          var op = isPlainObject(value) && value.op === "create" ? "create" : "get";
+          completeError(op, requestId, "NotAllowedError");
         });
-        return;
-      }
-      var payload;
-      try {
-        payload = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
-      } catch (error) {
-        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
-        return;
-      }
-      if (!payload || typeof payload !== "object" || !payload[responseField]) {
-        completeRequest(requestId, { ok: false, type: type, error: "invalid_daemon_response" });
-        return;
-      }
-      completeRequest(requestId, { ok: true, response: payload[responseField], type: type });
+        forgetPending(stale);
+      });
+    } catch (e) {
+      // Best effort.
+    }
+  }
+
+  // ---- in-flight bookkeeping --------------------------------------------------------------------
+
+  function forget(entry) {
+    if (byWireId.get(entry.wireId) === entry) byWireId.delete(entry.wireId);
+    if (byRequestId.get(entry.requestId) === entry) byRequestId.delete(entry.requestId);
+    forgetPending([PENDING_PREFIX + entry.requestId]);
+  }
+
+  function failEntry(entry) {
+    forget(entry);
+    completeError(entry.op, entry.requestId, "NotAllowedError");
+  }
+
+  // ---- native port ------------------------------------------------------------------------------
+
+  function helloFrame() {
+    return {
+      type: "hello",
+      v: PROTOCOL_VERSION,
+      build_version: buildVersion,
+      bearer: bearer,
+      attached: attached,
+      incognito_allowed: incognitoAllowed,
+      socket: socketPath
+    };
+  }
+
+  function post(c, frame) {
+    try {
+      c.port.postMessage(frame);
+      return true;
+    } catch (e) {
+      handleDisconnect(c);
+      return false;
+    }
+  }
+
+  function sendHello(c) {
+    c.reported = { attached: attached, incognitoAllowed: incognitoAllowed };
+    if (!post(c, helloFrame())) return;
+    c.helloSent = true;
+    var queued = c.outbox;
+    c.outbox = [];
+    for (var i = 0; i < queued.length; i++) {
+      if (conn !== c) return;
+      if (!post(c, queued[i])) return;
+    }
+  }
+
+  // Frames posted before the hello are queued and flushed right after it.
+  function send(c, frame) {
+    if (!c.helloSent) {
+      c.outbox.push(frame);
+      return;
+    }
+    post(c, frame);
+  }
+
+  function connect() {
+    if (conn) return conn;
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    var port;
+    try {
+      port = chrome.runtime.connectNative(NATIVE_HOST);
+    } catch (e) {
+      port = null;
+    }
+    if (!port) {
+      scheduleReconnect();
+      return null;
+    }
+    var c = { port: port, helloSent: false, outbox: [], keepaliveTimer: null, reported: null };
+    conn = c;
+    try {
+      port.onMessage.addListener(function (msg) {
+        handleMessage(c, msg);
+      });
+      port.onDisconnect.addListener(function () {
+        lastErrorMessage();
+        handleDisconnect(c);
+      });
+    } catch (e) {
+      handleDisconnect(c);
+      return null;
+    }
+    c.keepaliveTimer = setInterval(function () {
+      if (conn === c && c.helloSent) post(c, { type: "keepalive" });
+    }, KEEPALIVE_MS);
+    if (stateKnown) sendHello(c);
+    return conn === c ? c : null;
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer !== null || conn) return;
+    var delay = backoffMs;
+    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+  }
+
+  // Port closed by the browser or the relay, a failed post, or a fatal daemon error. Every in-flight
+  // request fails with NotAllowedError; nothing is resumed (the daemon consumed their replay keys).
+  function handleDisconnect(c) {
+    if (conn !== c) return;
+    conn = null;
+    if (c.keepaliveTimer !== null) clearInterval(c.keepaliveTimer);
+    c.keepaliveTimer = null;
+    c.outbox = [];
+    try {
+      c.port.disconnect();
+    } catch (e) {
+      // Already disconnected.
+    }
+    var entries = [];
+    byWireId.forEach(function (entry) {
+      if (entry.conn === c) entries.push(entry);
     });
-    return true;
+    entries.forEach(failEntry);
+    scheduleReconnect();
   }
 
-  function handleGetRequest(requestId, req, origins, sendResponse) {
-    return daemonRequest(requestId, "/sign", {
-      origin: origins.origin,
-      top_origin: origins.top_origin,
-      rp_id: req.rp_id,
-      challenge_b64u: req.challenge_b64u,
-      allow_credentials: req.allow_credentials,
-      user_verification: req.user_verification,
-      cross_origin: origins.cross_origin
-    }, sendResponse, "sign_assertion_result", "get");
+  function handleMessage(c, msg) {
+    if (conn !== c || !isPlainObject(msg) || typeof msg.type !== "string") return;
+    switch (msg.type) {
+      case "hello":
+        if (msg.v === PROTOCOL_VERSION) backoffMs = BACKOFF_INITIAL_MS;
+        return;
+      case "keepalive":
+        return;
+      case "error":
+        handleDisconnect(c);
+        return;
+      case "result":
+        handleResult(c, msg);
+        return;
+      default:
+        return;
+    }
   }
 
-  function handleCreateRequest(requestId, req, origins, sendResponse) {
-    return daemonRequest(requestId, "/register", {
-      origin: origins.origin,
-      top_origin: origins.top_origin,
-      rp_id: req.rp_id,
-      rp_name: req.rp_name || null,
-      challenge_b64u: req.challenge_b64u,
-      user_id_b64u: req.user_id_b64u,
-      user_name: req.user_name,
-      user_display_name: req.user_display_name || null,
-      exclude_credentials: req.exclude_credentials,
-      pub_key_cred_params: req.pub_key_cred_params,
-      user_verification: req.user_verification,
-      cross_origin: origins.cross_origin
-    }, sendResponse, "create_attestation_result", "create");
+  function handleResult(c, msg) {
+    if (typeof msg.id !== "number") return;
+    var entry = byWireId.get(msg.id);
+    if (!entry || entry.conn !== c) return;
+    forget(entry);
+    if (msg.ok === true && typeof msg.body === "string") {
+      completeOk(entry.op, entry.requestId, msg.body);
+      return;
+    }
+    if (msg.ok === false && isPlainObject(msg.error)) {
+      completeError(entry.op, entry.requestId, msg.error.dom);
+      return;
+    }
+    completeError(entry.op, entry.requestId, "NotAllowedError");
   }
 
-  chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
-    if (!message || message.source !== "passless-agent-broker" || !message.request) return false;
+  // ---- attach and incognito state ---------------------------------------------------------------
 
-    if (typeof sender.id === "string" && sender.id !== chrome.runtime.id) {
-      sendResponse({ ok: false, error: "invalid_sender" });
-      return false;
+  function isAlreadyAttached(message) {
+    return typeof message === "string" && /already attached/i.test(message) && !/another/i.test(message);
+  }
+
+  function markStateKnown() {
+    if (stateTimer !== null) {
+      clearTimeout(stateTimer);
+      stateTimer = null;
+    }
+    if (!stateKnown) {
+      stateKnown = true;
+      if (conn && !conn.helloSent) sendHello(conn);
+      return;
+    }
+    // A state change after the hello is reported with a repeated hello on the same port.
+    if (conn && conn.helloSent && conn.reported &&
+        (conn.reported.attached !== attached || conn.reported.incognitoAllowed !== incognitoAllowed)) {
+      sendHello(conn);
+    }
+  }
+
+  function probeDone() {
+    if ((attachDone && incognitoDone) || stateKnown) markStateKnown();
+  }
+
+  function probeState() {
+    stateTimer = setTimeout(function () {
+      stateTimer = null;
+      markStateKnown();
+    }, STATE_PROBE_TIMEOUT_MS);
+
+    try {
+      proxy.attach(function (error) {
+        var le = lastErrorMessage();
+        if (le) attached = isAlreadyAttached(le);
+        else attached = error === undefined || error === null || error === "" || isAlreadyAttached(error);
+        attachDone = true;
+        probeDone();
+      });
+    } catch (e) {
+      attached = false;
+      attachDone = true;
+      probeDone();
     }
 
-    var origins = validateOrigins(sender);
-    if (!origins) {
-      sendResponse({ ok: false, error: "invalid_origin" });
-      return false;
+    try {
+      chrome.extension.isAllowedIncognitoAccess(function (allowed) {
+        incognitoAllowed = !lastErrorMessage() && allowed === true;
+        incognitoDone = true;
+        probeDone();
+      });
+    } catch (e) {
+      incognitoAllowed = false;
+      incognitoDone = true;
+      probeDone();
     }
+  }
 
-    if (typeof message.request_id !== "string" || message.request_id.length === 0 || message.request_id.length > 128) {
-      sendResponse({ ok: false, error: "invalid_request" });
-      return false;
-    }
+  // ---- proxy events -----------------------------------------------------------------------------
 
-    var req = message.request;
-    var messageType = message.type === "create" ? "create" : "get";
-    if (messageType === "create") {
-      if (!validateCreateRequest(req)) {
-        sendResponse({ ok: false, type: "create", error: "invalid_request" });
-        return false;
-      }
-      return handleCreateRequest(message.request_id, req, origins, sendResponse);
+  // Extracts only what the request frame carries besides the verbatim body. The origin comes from
+  // the browser-supplied remoteDesktopClientOverride and nowhere else.
+  function extract(op, json) {
+    var details;
+    try {
+      details = JSON.parse(json);
+    } catch (e) {
+      return null;
     }
+    if (!isPlainObject(details) || !isPlainObject(details.extensions)) return null;
+    var override = details.extensions.remoteDesktopClientOverride;
+    if (!isPlainObject(override)) return null;
+    if (typeof override.origin !== "string" || override.origin.length === 0) return null;
+    if (typeof override.sameOriginWithAncestors !== "boolean") return null;
+    if (op === "get" && details.mediation === "conditional") return null;
+    var timeout = details.timeout;
+    return {
+      origin: override.origin,
+      crossOrigin: !override.sameOriginWithAncestors,
+      timeoutMs: Number.isSafeInteger(timeout) && timeout >= 0 ? timeout : null
+    };
+  }
 
-    if (!validateGetRequest(req)) {
-      sendResponse({ ok: false, type: "get", error: "invalid_request" });
-      return false;
+  function handleRequest(op, info) {
+    if (!isPlainObject(info) || !Number.isInteger(info.requestId)) return;
+    var requestId = info.requestId;
+    if (byRequestId.has(requestId)) return; // duplicate delivery of a request already in flight
+    if (typeof info.requestDetailsJson !== "string") {
+      completeError(op, requestId, "NotAllowedError");
+      return;
     }
-    return handleGetRequest(message.request_id, req, origins, sendResponse);
+    var fields = extract(op, info.requestDetailsJson);
+    if (!fields || nextWireId > MAX_WIRE_ID) {
+      completeError(op, requestId, "NotAllowedError");
+      return;
+    }
+    var frame = {
+      type: "request",
+      id: nextWireId,
+      op: op,
+      timeout_ms: fields.timeoutMs,
+      origin: fields.origin,
+      cross_origin: fields.crossOrigin,
+      body: info.requestDetailsJson
+    };
+    if (utf8Length(JSON.stringify(frame)) > MAX_FRAME_BYTES) {
+      completeError(op, requestId, "NotAllowedError");
+      return;
+    }
+    nextWireId++;
+
+    var c = connect();
+    if (!c) {
+      completeError(op, requestId, "NotAllowedError");
+      return;
+    }
+    var entry = { wireId: frame.id, requestId: requestId, op: op, conn: c };
+    byWireId.set(entry.wireId, entry);
+    byRequestId.set(requestId, entry);
+    recordPending(requestId, op);
+    send(c, frame);
+  }
+
+  function handleCanceled(requestId) {
+    var entry = byRequestId.get(requestId);
+    if (!entry) return;
+    forget(entry);
+    var c = entry.conn;
+    if (conn !== c) return;
+    if (!c.helloSent) {
+      // Not sent yet: drop it instead of sending a request followed by its abort.
+      c.outbox = c.outbox.filter(function (frame) {
+        return !(frame.type === "request" && frame.id === entry.wireId);
+      });
+      return;
+    }
+    post(c, { type: "abort", id: entry.wireId });
+  }
+
+  function handleIsUvpaa(info) {
+    if (!isPlainObject(info) || !Number.isInteger(info.requestId)) return;
+    try {
+      proxy.completeIsUvpaaRequest({ requestId: info.requestId, isUvpaa: false }, function () {
+        lastErrorMessage();
+      });
+    } catch (e) {
+      // Nothing else to do.
+    }
+  }
+
+  // Listeners are registered synchronously at top level, so a request wakes a stopped worker.
+  function addListener(name, fn) {
+    try {
+      proxy[name].addListener(fn);
+    } catch (e) {
+      // The event is missing in this browser; the request it carries cannot reach us.
+    }
+  }
+
+  addListener("onCreateRequest", function (info) {
+    handleRequest("create", info);
   });
-})(__PASSLESS_SOCKET_PATH__, __PASSLESS_BEARER__);
+  addListener("onGetRequest", function (info) {
+    handleRequest("get", info);
+  });
+  addListener("onRequestCanceled", handleCanceled);
+  addListener("onIsUvpaaRequest", handleIsUvpaa);
+
+  failStaleRequests();
+  probeState();
+  connect();
+})(__PASSLESS_BEARER__, __PASSLESS_SOCKET_PATH__, __PASSLESS_BUILD_VERSION__);

@@ -4,13 +4,180 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use passless_core::agent::{
-    BrowserLeaseId, CredentialRef, EndpointId, GrantId, IntentId, PrincipalSessionId, ProfileId,
+    BrowserLeaseId, CredentialRef, GrantId, IntentId, PrincipalSessionId, ProfileId,
 };
 
 use super::grant::{CeremonyId, GrantRequestId};
+use super::granted_rules::{GrantKind, PermittingRule};
 use super::prompt::{PromptAction, PromptErrorKind, PromptMode};
 
-pub const AUDIT_SCHEMA_VERSION: u32 = 2;
+/// The audit event schema version, written as `v` in every record.
+///
+/// - 1: the original records.
+/// - 2: `policy.*` records carry the origin context (`origin`, `top_origin`, `cross_origin`).
+/// - 3 (ADR 0014 section 12, P8): every operation record (`policy.allow`, `policy.deny`,
+///   `policy.replay_served`, `operation.terminal`) carries the full field set of
+///   [`OperationRecord`], with every key always present (null when it does not apply yet); a
+///   reservation (`policy.allow`) is followed by exactly one `operation.terminal`; escalation
+///   records carry `origin` and `rule`; `rule` is the matched rule everywhere (`exact` or `*`, as in
+///   the granted-rules store), with `grant_source` on operation records; session grant records
+///   carry `principal`, the RP scope and the TTL.
+///
+/// Readers accept every version: fields added in a later version default when absent.
+pub const AUDIT_SCHEMA_VERSION: u32 = 3;
+
+/// ADR 0014 section 12: the fields every operation record carries. This is the single canonical
+/// list: `OperationRecord` serializes exactly these keys, and the field-presence tests check
+/// every operation record type against it.
+#[cfg(test)]
+const SECTION_12_OPERATION_FIELDS: &[&str] = &[
+    "session_id_hash",
+    "request_id",
+    "escalation_id",
+    "profile_id",
+    "mode",
+    "principal_relationship",
+    "revocation_epoch",
+    "grant_epoch",
+    "action",
+    "rp_id",
+    "origin",
+    "top_origin",
+    "cross_origin",
+    "rule",
+    "grant_source",
+    "decision",
+    "evidence_source",
+    "credential_ref",
+    "selection_rule",
+    "backend",
+    "key_provider",
+    "counter_before",
+    "counter_after",
+    "result",
+    "failure_class",
+];
+
+/// The record kinds that carry [`SECTION_12_OPERATION_FIELDS`].
+#[cfg(test)]
+const SECTION_12_OPERATION_KINDS: &[&str] = &[
+    "policy.allow",
+    "policy.deny",
+    "policy.replay_served",
+    "operation.terminal",
+];
+
+/// The kind-specific fields of the operation records, besides the common set.
+#[cfg(test)]
+const SECTION_12_OPERATION_EXTRAS: &[(&str, &[&str])] = &[
+    (
+        "policy.allow",
+        &["authorization", "user_presence", "user_verification"],
+    ),
+    ("policy.deny", &["reason", "suppressed"]),
+    ("policy.replay_served", &["reason", "suppressed"]),
+    ("operation.terminal", &[]),
+];
+
+/// ADR 0014 section 12, "also recorded": the fields of the escalation, session grant and
+/// browser-lease records, per kind. The kind-specific outcome fields (`latency_ms`, `cause`,
+/// `reason`) are listed too, so a field added to a record without being listed here fails.
+#[cfg(test)]
+const SECTION_12_OTHER_RECORD_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "escalation.requested",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+        ],
+    ),
+    (
+        "escalation.approved",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "latency_ms",
+        ],
+    ),
+    (
+        "escalation.denied",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "cause",
+        ],
+    ),
+    (
+        "escalation.expired",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "reason",
+        ],
+    ),
+    (
+        "escalation.revoked",
+        &[
+            "escalation_id",
+            "profile_id",
+            "action",
+            "rp_id",
+            "origin",
+            "rule",
+            "reason",
+        ],
+    ),
+    (
+        "granted_rule.add",
+        &[
+            "profile_id",
+            "rp_id",
+            "grant_kind",
+            "escalation_id",
+            "rule",
+            "credential_ref",
+        ],
+    ),
+    ("granted_rule.revoke", &["profile_id", "rp_id", "revoked"]),
+    (
+        "grant.request",
+        &[
+            "request_id",
+            "profile_id",
+            "principal",
+            "rp_ids",
+            "ttl_secs",
+        ],
+    ),
+    (
+        "grant.approve",
+        &["grant_id", "profile_id", "principal", "rp_ids", "ttl_secs"],
+    ),
+    (
+        "browser_lease.launch",
+        &["lease_id", "profile_id", "cdp_expose"],
+    ),
+    ("browser_lease.revoke", &["lease_id", "reason"]),
+    ("browser_lease.expire", &["lease_id"]),
+    ("browser_lease.crash", &["lease_id", "exit_code"]),
+    ("browser_lease.cleanup", &["lease_id"]),
+];
 
 // The closed-schema tests apply these deny lists to every constructible event.
 #[cfg(test)]
@@ -104,6 +271,38 @@ impl AuditEvent {
     pub fn kind_name(&self) -> &'static str {
         self.payload.kind_name()
     }
+
+    /// The request ID of an operation reservation (`policy.allow`), if this is one.
+    pub fn reservation_request_id(&self) -> Option<&str> {
+        match &self.payload {
+            AuditPayload::PolicyAllow(meta) => meta.op.request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The request ID of the reservation an `operation.terminal` record closes, if this is one.
+    pub fn terminal_request_id(&self) -> Option<&str> {
+        match &self.payload {
+            AuditPayload::OperationTerminal(meta) => meta.op.request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// For a reservation (`policy.allow`): the terminal record that closes it as abandoned (a
+    /// restart found it open). The reservation's fields are copied; the result is `error` and the
+    /// failure class `abandoned`.
+    pub fn abandoned_terminal(&self) -> Option<AuditEvent> {
+        match &self.payload {
+            AuditPayload::PolicyAllow(meta) if meta.op.request_id.is_some() => Some(
+                OperationTerminalBuilder::new(
+                    (*meta.op).clone(),
+                    Some(PolicyDenyReason::Abandoned),
+                )
+                .build(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +350,10 @@ pub enum AuditPayload {
     BrowserLeaseCleanup(BrowserLeaseCleanupMeta),
     #[serde(rename = "browser_lease.quarantine")]
     BrowserLeaseQuarantine(BrowserLeaseQuarantineMeta),
+    /// A launched lease's WebAuthn interception became degraded (its extension worker stayed
+    /// detached past the grace period) or re-attached (plan D6 layer 1). One record per change.
+    #[serde(rename = "browser_lease.interception")]
+    BrowserLeaseInterception(BrowserLeaseInterceptionMeta),
 
     #[serde(rename = "browser_control.request")]
     BrowserControlRequest(BrowserControlRequestMeta),
@@ -187,6 +390,23 @@ pub enum AuditPayload {
     PolicyAllow(PolicyAllowMeta),
     #[serde(rename = "policy.deny")]
     PolicyDeny(PolicyDenyMeta),
+    /// A duplicate request was served the original outcome without a new key use (ADR 0014
+    /// section 9). The `reason` is always `replay_served`.
+    #[serde(rename = "policy.replay_served")]
+    PolicyReplayServed(PolicyDenyMeta),
+    /// The terminal record of an operation reservation (`policy.allow`): exactly one follows
+    /// every reservation, on every exit path (ADR 0014 section 12).
+    #[serde(rename = "operation.terminal")]
+    OperationTerminal(OperationTerminalMeta),
+
+    /// A sign-transport connection said hello with a build or relay version that differs from the
+    /// daemon's (plan V-L5). Not fatal; recorded once per connection.
+    #[serde(rename = "transport.version_skew")]
+    TransportVersionSkew(TransportVersionSkewMeta),
+    /// A sign-transport hello with a valid bearer came from a peer whose UID is not the lease's
+    /// browser UID (`SO_PEERCRED`); it was refused.
+    #[serde(rename = "transport.peer_refused")]
+    TransportPeerRefused(TransportPeerRefusedMeta),
 
     #[serde(rename = "ceremony.start")]
     CeremonyStart(CeremonyStartMeta),
@@ -223,6 +443,33 @@ pub enum AuditPayload {
     PromptTimeout(PromptTimeoutMeta),
     #[serde(rename = "prompt.error")]
     PromptError(PromptErrorMeta),
+
+    /// An operator revoked persistent granted rules (ADR 0014 section 8.4).
+    #[serde(rename = "granted_rule.revoke")]
+    GrantedRuleRevoke(GrantedRuleRevokeMeta),
+    /// An approved escalation (or a registration after one) persisted a granted rule (ADR 0014
+    /// section 8.4).
+    #[serde(rename = "granted_rule.add")]
+    GrantedRuleAdd(GrantedRuleAddMeta),
+
+    /// A ceremony that resolved to `request` raised an escalation (ADR 0014 section 8.1). A failed
+    /// write of this record fails the escalation.
+    #[serde(rename = "escalation.requested")]
+    EscalationRequested(EscalationRequestedMeta),
+    /// The human chose "Allow always" on the escalation prompt.
+    #[serde(rename = "escalation.approved")]
+    EscalationApproved(EscalationApprovedMeta),
+    /// The escalation was denied: by the human, by a dismissal or an early approval, or because the
+    /// prompt, the audit or the grant write failed.
+    #[serde(rename = "escalation.denied")]
+    EscalationDenied(EscalationDeniedMeta),
+    /// The escalation ended without a decision: its last waiter timed out or aborted, or the
+    /// notification server went away.
+    #[serde(rename = "escalation.expired")]
+    EscalationExpired(EscalationExpiredMeta),
+    /// A pending escalation was cancelled by a policy reload.
+    #[serde(rename = "escalation.revoked")]
+    EscalationRevoked(EscalationRevokedMeta),
 
     #[serde(rename = "admin.profile_enable")]
     AdminProfileEnable(AdminProfileEnableMeta),
@@ -270,6 +517,7 @@ impl AuditPayload {
             Self::BrowserLeaseCrash(_) => "browser_lease.crash",
             Self::BrowserLeaseCleanup(_) => "browser_lease.cleanup",
             Self::BrowserLeaseQuarantine(_) => "browser_lease.quarantine",
+            Self::BrowserLeaseInterception(_) => "browser_lease.interception",
             Self::BrowserControlRequest(_) => "browser_control.request",
             Self::IntentCreate(_) => "intent.create",
             Self::IntentApprove(_) => "intent.approve",
@@ -286,6 +534,10 @@ impl AuditPayload {
             Self::GrantConsume(_) => "grant.consume",
             Self::PolicyAllow(_) => "policy.allow",
             Self::PolicyDeny(_) => "policy.deny",
+            Self::PolicyReplayServed(_) => "policy.replay_served",
+            Self::OperationTerminal(_) => "operation.terminal",
+            Self::TransportVersionSkew(_) => "transport.version_skew",
+            Self::TransportPeerRefused(_) => "transport.peer_refused",
             Self::CeremonyStart(_) => "ceremony.start",
             Self::CeremonySuccess(_) => "ceremony.success",
             Self::CeremonyFailure(_) => "ceremony.failure",
@@ -302,6 +554,13 @@ impl AuditPayload {
             Self::PromptDeny(_) => "prompt.deny",
             Self::PromptTimeout(_) => "prompt.timeout",
             Self::PromptError(_) => "prompt.error",
+            Self::GrantedRuleRevoke(_) => "granted_rule.revoke",
+            Self::GrantedRuleAdd(_) => "granted_rule.add",
+            Self::EscalationRequested(_) => "escalation.requested",
+            Self::EscalationApproved(_) => "escalation.approved",
+            Self::EscalationDenied(_) => "escalation.denied",
+            Self::EscalationExpired(_) => "escalation.expired",
+            Self::EscalationRevoked(_) => "escalation.revoked",
             Self::AdminProfileEnable(_) => "admin.profile_enable",
             Self::AdminProfileDisable(_) => "admin.profile_disable",
             Self::AdminProfileDisableRequest(_) => "admin.profile_disable_request",
@@ -325,7 +584,18 @@ pub enum BackendKind {
     Tpm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl BackendKind {
+    /// The name audit records carry (`local`, `pass` or `tpm`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Pass => "pass",
+            Self::Tpm => "tpm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
     Register,
@@ -378,6 +648,10 @@ pub enum RevokeReason {
     PrincipalExit,
     PolicyReload,
     DaemonShutdown,
+    /// A launch that failed after the lease was recorded (attach timeout, binding failure).
+    LaunchFailed,
+    /// A lease whose profile bookkeeping was stale, replaced by a new launch.
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,21 +760,23 @@ pub struct ProfileFailMeta {
     reason: FailReason,
 }
 
+/// Payload of an `endpoint.*` record written before the isolated UHID route was removed (ADR 0014
+/// section 5). Nothing emits these any more; the variants stay so that old logs still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointCreateMeta {
-    endpoint_id: EndpointId,
+    endpoint_id: String,
     profile_id: ProfileId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointDestroyMeta {
-    endpoint_id: EndpointId,
+    endpoint_id: String,
     profile_id: ProfileId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointFailMeta {
-    endpoint_id: EndpointId,
+    endpoint_id: String,
     profile_id: ProfileId,
     reason: FailReason,
 }
@@ -530,7 +806,6 @@ pub struct PrincipalExitMeta {
 pub struct BrowserLeaseLaunchMeta {
     lease_id: BrowserLeaseId,
     profile_id: ProfileId,
-    endpoint_id: EndpointId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cdp_expose: Option<String>,
 }
@@ -555,6 +830,21 @@ pub struct BrowserLeaseCrashMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserLeaseCleanupMeta {
     lease_id: BrowserLeaseId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserLeaseInterceptionMeta {
+    lease_id: BrowserLeaseId,
+    profile_id: ProfileId,
+    state: InterceptionAuditState,
+}
+
+/// The interception state a `browser_lease.interception` record reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptionAuditState {
+    Degraded,
+    Attached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,13 +913,25 @@ pub struct IntentExpireMeta {
 pub struct GrantRequestMeta {
     request_id: String,
     profile_id: ProfileId,
+    /// Hex digest of the principal process the session grant is for.
+    #[serde(default)]
+    principal: String,
+    /// The RP scope of the requested grant.
     rp_ids: Vec<String>,
+    #[serde(default)]
+    ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantApproveMeta {
     grant_id: GrantId,
     profile_id: ProfileId,
+    /// Hex digest of the principal process the session grant is bound to.
+    #[serde(default)]
+    principal: String,
+    /// The RP scope of the approved grant.
+    #[serde(default)]
+    rp_ids: Vec<String>,
     ttl_secs: u64,
 }
 
@@ -657,9 +959,8 @@ pub struct GrantConsumeMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyAllowMeta {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    #[serde(flatten)]
+    op: Box<OperationRecord>,
     authorization: String,
     user_presence: String,
     user_verification: String,
@@ -667,13 +968,328 @@ pub struct PolicyAllowMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyDenyMeta {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    #[serde(flatten)]
+    op: Box<OperationRecord>,
     reason: PolicyDenyReason,
+    /// Null on an ordinary record. On a coalesced `policy.deny` summary (ADR 0014 section 12) it
+    /// is the number of further refusals of the same session, RP, action and reason that were
+    /// not written individually since the last record of that key. Always null on
+    /// `policy.replay_served`.
+    #[serde(default)]
+    suppressed: Option<u64>,
 }
 
+/// The terminal record of a reservation: the common operation fields with the final result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationTerminalMeta {
+    #[serde(flatten)]
+    op: Box<OperationRecord>,
+}
+
+/// Which source granted the matched rule its `allow` (ADR 0014 section 12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleGrantSource {
+    /// The configured rule itself decided.
+    Config,
+    /// A persisted granted rule upgraded a configured `request` to `allow` (section 8.4).
+    Granted,
+}
+
+/// How an operation ended (ADR 0014 section 12, "terminal result").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationResult {
+    /// The key was used and the outcome returned.
+    Success,
+    /// A duplicate was served the original outcome; no new key use.
+    ReplayServed,
+    /// Refused by policy, validation or a human decision.
+    Denied,
+    /// The browser cancelled the request.
+    Aborted,
+    /// Authority was revoked, expired or changed before the operation finished.
+    Revoked,
+    /// An escalation expired without a decision.
+    Timeout,
+    /// Refused because a capacity limit was reached.
+    Busy,
+    /// An internal failure: audit, storage, key provider or lease activation.
+    Error,
+}
+
+impl OperationResult {
+    /// The result a failure class implies.
+    pub fn of_failure(failure: PolicyDenyReason) -> Self {
+        use PolicyDenyReason as R;
+        match failure {
+            R::Aborted => Self::Aborted,
+            R::PolicyRevoked
+            | R::GrantRevoked
+            | R::GrantExpired
+            | R::BearerRevoked
+            | R::SessionExpired
+            | R::StaleGeneration => Self::Revoked,
+            R::EscalationExpired | R::JoinTimeout => Self::Timeout,
+            R::EscalationBusy
+            | R::EscalationQueueFull
+            | R::EscalationWaiterCap
+            | R::EscalationTrackingFull
+            | R::ReplayTableFull => Self::Busy,
+            R::ReplayServed => Self::ReplayServed,
+            R::AuditFailure
+            | R::CounterPersistenceFailure
+            | R::LeaseActivationFailed
+            | R::SigningFailed
+            | R::KeyGenerationFailed
+            | R::CredentialWriteFailed
+            | R::CredentialUnavailable
+            | R::InternalFailure
+            | R::Abandoned => Self::Error,
+            R::DefaultDeny
+            | R::ActionNotAllowed
+            | R::RpIdNotMatch
+            | R::CredentialNotMatch
+            | R::GrantNotFound
+            | R::SessionMismatch
+            | R::UvRequired
+            | R::OriginInvalid
+            | R::OriginMismatch
+            | R::AllowCredentialsMismatch
+            | R::EscalationUnavailable
+            | R::EscalationCooldown
+            | R::GrantCapReached
+            | R::GrantsUnavailable
+            | R::EscalationDenied
+            | R::CrossOriginDenied
+            | R::AlgorithmUnsupported
+            | R::PrincipalMismatch
+            | R::Replayed
+            | R::ChallengeReused
+            | R::BudgetExhausted
+            | R::UnsupportedOption
+            | R::CredentialExcluded => Self::Denied,
+        }
+    }
+}
+
+/// The fields every operation record carries (ADR 0014 section 12). Every key is always
+/// serialized; a value that does not apply yet (the credential of a refusal, the counter after a
+/// reservation) is null. Records written before schema version 3 deserialize with the new fields
+/// null.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationRecord {
+    /// Hash of the bearer session's random identifier (never the bearer itself).
+    #[serde(default)]
+    session_id_hash: Option<String>,
+    /// The daemon-assigned ID of the ceremony; a reservation and its terminal record share it.
+    #[serde(default)]
+    request_id: Option<String>,
+    /// The escalation the ceremony waited on, if any.
+    #[serde(default)]
+    escalation_id: Option<String>,
+    profile_id: ProfileId,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    principal_relationship: Option<String>,
+    /// The live revocation epoch when the record was written.
+    #[serde(default)]
+    revocation_epoch: Option<u64>,
+    /// The live grant epoch when the record was written.
+    #[serde(default)]
+    grant_epoch: Option<u64>,
+    action: AuditAction,
+    rp_id: String,
+    #[serde(flatten)]
+    origin: OriginContextMeta,
+    /// The matched rule: `exact` (the RP's own rule; `rp_id` names it) or `*` (the wildcard).
+    /// Null when no rule matched or resolution had not happened.
+    #[serde(default)]
+    rule: Option<String>,
+    #[serde(default)]
+    grant_source: Option<RuleGrantSource>,
+    #[serde(default)]
+    decision: Option<PolicyDecision>,
+    /// `agent` when the validated agent session was the UP/UV evidence; null when none was used.
+    #[serde(default)]
+    evidence_source: Option<String>,
+    #[serde(default)]
+    credential_ref: Option<CredentialRef>,
+    #[serde(default)]
+    selection_rule: Option<String>,
+    /// The storage backend the operation used (`local`, `pass` or `tpm`): the human backend's
+    /// kind for a same-user profile, the profile's own storage kind for an isolated one.
+    #[serde(default)]
+    backend: Option<String>,
+    /// The key provider type (`software` or `tpm`).
+    #[serde(default)]
+    key_provider: Option<String>,
+    #[serde(default)]
+    counter_before: Option<u32>,
+    #[serde(default)]
+    counter_after: Option<u32>,
+    #[serde(default)]
+    result: Option<OperationResult>,
+    #[serde(default)]
+    failure_class: Option<PolicyDenyReason>,
+}
+
+impl OperationRecord {
+    pub fn new(profile_id: ProfileId, action: AuditAction, rp_id: &str) -> Self {
+        Self {
+            session_id_hash: None,
+            request_id: None,
+            escalation_id: None,
+            profile_id,
+            mode: None,
+            principal_relationship: None,
+            revocation_epoch: None,
+            grant_epoch: None,
+            action,
+            rp_id: rp_id.to_string(),
+            origin: OriginContextMeta::default(),
+            rule: None,
+            grant_source: None,
+            decision: None,
+            evidence_source: None,
+            credential_ref: None,
+            selection_rule: None,
+            backend: None,
+            key_provider: None,
+            counter_before: None,
+            counter_after: None,
+            result: None,
+            failure_class: None,
+        }
+    }
+
+    /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
+    pub fn origin_context(
+        mut self,
+        origin: Option<&str>,
+        top_origin: Option<&str>,
+        cross_origin: Option<bool>,
+    ) -> Self {
+        self.origin = OriginContextMeta::new(origin, top_origin, cross_origin);
+        self
+    }
+
+    /// Name another RP ID (a coalesced summary that covers refusals of several RPs names
+    /// `unknown`).
+    pub fn with_rp_id(mut self, rp_id: &str) -> Self {
+        self.rp_id = rp_id.to_string();
+        self
+    }
+
+    pub fn session(mut self, session_id_hash: Option<String>, request_id: Option<String>) -> Self {
+        self.session_id_hash = session_id_hash;
+        self.request_id = request_id;
+        self
+    }
+
+    pub fn escalation(mut self, escalation_id: Option<String>) -> Self {
+        self.escalation_id = escalation_id;
+        self
+    }
+
+    pub fn deployment(
+        mut self,
+        mode: Option<String>,
+        principal_relationship: Option<String>,
+        backend: Option<String>,
+        key_provider: Option<String>,
+    ) -> Self {
+        self.mode = mode;
+        self.principal_relationship = principal_relationship;
+        self.backend = backend;
+        self.key_provider = key_provider;
+        self
+    }
+
+    pub fn epochs(mut self, revocation_epoch: u64, grant_epoch: u64) -> Self {
+        self.revocation_epoch = Some(revocation_epoch);
+        self.grant_epoch = Some(grant_epoch);
+        self
+    }
+
+    pub fn matched(mut self, rule: Option<String>, grant_source: Option<RuleGrantSource>) -> Self {
+        self.rule = rule;
+        self.grant_source = grant_source;
+        self
+    }
+
+    pub fn credential(
+        mut self,
+        credential_ref: Option<CredentialRef>,
+        selection_rule: Option<String>,
+    ) -> Self {
+        self.credential_ref = credential_ref;
+        self.selection_rule = selection_rule;
+        self
+    }
+
+    pub fn counters(mut self, before: Option<u32>, after: Option<u32>) -> Self {
+        self.counter_before = before;
+        self.counter_after = after;
+        self
+    }
+
+    pub fn decision(mut self, decision: PolicyDecision, evidence_source: Option<&str>) -> Self {
+        self.decision = Some(decision);
+        self.evidence_source = evidence_source.map(str::to_string);
+        self
+    }
+
+    /// The final result and its failure class (`None` for a success).
+    pub fn outcome(mut self, result: OperationResult, failure: Option<PolicyDenyReason>) -> Self {
+        self.result = Some(result);
+        self.failure_class = failure;
+        self
+    }
+}
+
+/// The origin context of a ceremony record (ADR 0014 section 12). Every key is always written:
+/// `top_origin` is null on the proxy path, where the browser never supplies it (section 11), and
+/// all three are null in a record about an RP only (a refused request whose origin is unknown).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OriginContextMeta {
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    top_origin: Option<String>,
+    #[serde(default)]
+    cross_origin: Option<bool>,
+}
+
+impl OriginContextMeta {
+    fn new(origin: Option<&str>, top_origin: Option<&str>, cross_origin: Option<bool>) -> Self {
+        Self {
+            origin: origin.map(str::to_string),
+            top_origin: top_origin.map(str::to_string),
+            cross_origin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportPeerRefusedMeta {
+    profile_id: ProfileId,
+    expected_uid: u32,
+    peer_uid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportVersionSkewMeta {
+    profile_id: ProfileId,
+    daemon_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyDenyReason {
     DefaultDeny,
@@ -691,6 +1307,88 @@ pub enum PolicyDenyReason {
     AuditFailure,
     CounterPersistenceFailure,
     GrantRevoked,
+    /// A ceremony needed a human decision but no escalation prompt can be shown: no session bus
+    /// can be resolved, or the notification server was rejected by the capability gate. The
+    /// ceremony is denied and never reaches a prompt or the native path.
+    EscalationUnavailable,
+    /// The escalation key is in its cooldown after a deny, a timeout or repeated withdrawals
+    /// (ADR 0014 section 8.1); denied without a prompt.
+    EscalationCooldown,
+    /// The profile's escalation queue is full (one active prompt plus a bounded FIFO).
+    EscalationQueueFull,
+    /// A waiter cap was reached: per session, per profile or global (ADR 0014 section 8.2).
+    EscalationWaiterCap,
+    /// The escalation cooldown table is full of live cooldowns, so no new escalation is admitted
+    /// until one expires; no live cooldown is evicted (review L1).
+    EscalationTrackingFull,
+    /// The session's replay table is full of entries that are in flight or still inside the
+    /// outcome window, so the request is refused as busy rather than evicting an entry (ADR 0014
+    /// section 9).
+    ReplayTableFull,
+    /// A registration escalation for the same profile and RP is already pending; registration
+    /// escalations are not joinable (ADR 0014 section 8.3).
+    EscalationBusy,
+    /// The profile holds `max_granted_rules` granted rules already.
+    GrantCapReached,
+    /// The profile's granted-rules store is disabled (unreadable, wrongly owned or corrupt), so no
+    /// grant can be persisted.
+    GrantsUnavailable,
+    /// The human denied the escalation the ceremony waited on (Deny, a dismissal or an approval
+    /// before the minimum review delay); the escalation itself is recorded as
+    /// `escalation.denied`.
+    EscalationDenied,
+    /// The escalation the ceremony waited on expired: the ceremony deadline passed, or the
+    /// notification server went away (`escalation.expired`).
+    EscalationExpired,
+    /// The request came from a frame whose origin differs from its ancestors; cross-origin fails closed.
+    CrossOriginDenied,
+    /// The request used a bearer whose browser lease was revoked or whose browser exited.
+    BearerRevoked,
+    /// None of the requested public-key algorithms is supported by the selected backend.
+    AlgorithmUnsupported,
+    /// The session is not bound to the principal the session grant was issued to (ADR 0014 section 7).
+    PrincipalMismatch,
+    /// The revocation epoch moved, or the rule no longer resolves to `allow`, after the session was
+    /// created or while the operation was in flight (ADR 0014 sections 6.4 and 9).
+    PolicyRevoked,
+    /// The bearer session's TTL passed.
+    SessionExpired,
+    /// The replay key was already used in this session and its outcome is no longer returned.
+    Replayed,
+    /// The challenge was already used by a request with a different action, RP or origin.
+    ChallengeReused,
+    /// The session's operation budget is used up.
+    BudgetExhausted,
+    /// The RP asked for an option or extension the agent authenticator cannot honor.
+    UnsupportedOption,
+    /// A credential in `excludeCredentials` already exists.
+    CredentialExcluded,
+    /// Not a denial of the RP request: a duplicate of a completed or in-flight request was served
+    /// the original outcome without a new key use (ADR 0014 section 9).
+    ReplayServed,
+    /// The assertion was made but the browser lease could not be activated; it was withheld.
+    LeaseActivationFailed,
+    /// The browser cancelled the request (`onRequestCanceled`, or its connection closed) before
+    /// key use. Nothing was signed or created.
+    Aborted,
+    /// The key provider failed to sign, after the reservation.
+    SigningFailed,
+    /// The key provider failed to generate a key, or returned an unusable one, after the
+    /// reservation.
+    KeyGenerationFailed,
+    /// The new credential could not be written to storage, after the reservation.
+    CredentialWriteFailed,
+    /// The selected credential could not be read back from storage.
+    CredentialUnavailable,
+    /// An internal failure after the reservation that no other class names.
+    InternalFailure,
+    /// The ceremony ended without recording an outcome (a panic, or a daemon exit or kill that
+    /// recovery found at the next start); the terminal record comes from the drop guard or from
+    /// recovery.
+    Abandoned,
+    /// A duplicate's own ceremony deadline passed while it waited for the identical request that
+    /// is still in flight (ADR 0014 section 9). Nothing was signed or created for the duplicate.
+    JoinTimeout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -807,6 +1505,130 @@ pub struct PromptErrorMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantedRuleRevokeMeta {
+    profile_id: ProfileId,
+    /// The revoked RP; null when every granted rule of the profile was cleared.
+    #[serde(default)]
+    rp_id: Option<String>,
+    revoked: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantedRuleAddMeta {
+    profile_id: ProfileId,
+    rp_id: String,
+    /// `escalation` or `registration` (`kind` is the record's own tag).
+    grant_kind: GrantKind,
+    /// The approving escalation's ID.
+    escalation_id: String,
+    /// The permitting rule: `exact` or `*`.
+    rule: String,
+    /// The credential a registration grant pins; null for an authentication grant.
+    #[serde(default)]
+    credential_ref: Option<CredentialRef>,
+}
+
+/// Why an escalation was denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationDenyCause {
+    /// The human chose "Deny".
+    User,
+    /// "Allow always" arrived before the minimum review delay; treated as a deny.
+    EarlyApproval,
+    /// The human dismissed the notification.
+    Dismissed,
+    /// The prompt could not be shown (no bus, rejected server, prompt child failure).
+    PromptUnavailable,
+    /// The approval could not be audited.
+    AuditFailure,
+    /// The approval could not be persisted as a granted rule.
+    GrantWriteFailed,
+}
+
+/// Why an escalation expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationExpireReason {
+    /// The last waiter's ceremony deadline passed.
+    Timeout,
+    /// The last waiter left (the ceremony was aborted, or its session became invalid).
+    Aborted,
+    /// The notification server went away while the prompt was shown.
+    ServerLost,
+}
+
+/// Why a pending escalation was revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationRevokeReason {
+    PolicyReload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationRequestedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    origin: String,
+    /// The matched rule: `exact` or `*`.
+    rule: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationApprovedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
+    latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationDeniedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
+    cause: EscalationDenyCause,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationExpiredMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
+    reason: EscalationExpireReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationRevokedMeta {
+    escalation_id: String,
+    profile_id: ProfileId,
+    action: AuditAction,
+    rp_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    rule: String,
+    reason: EscalationRevokeReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminProfileEnableMeta {
     profile_id: ProfileId,
 }
@@ -851,6 +1673,7 @@ pub struct AdminCredentialRevokeMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminCredentialDeleteMeta {
+    profile_id: ProfileId,
     credential: CredentialRef,
     rp_id: String,
 }
@@ -1029,72 +1852,6 @@ impl ProfileFailBuilder {
     }
 }
 
-pub struct EndpointCreateBuilder {
-    endpoint_id: EndpointId,
-    profile_id: ProfileId,
-}
-
-impl EndpointCreateBuilder {
-    pub fn new(endpoint_id: EndpointId, profile_id: ProfileId) -> Self {
-        Self {
-            endpoint_id,
-            profile_id,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::EndpointCreate(EndpointCreateMeta {
-            endpoint_id: self.endpoint_id,
-            profile_id: self.profile_id,
-        }))
-    }
-}
-
-pub struct EndpointDestroyBuilder {
-    endpoint_id: EndpointId,
-    profile_id: ProfileId,
-}
-
-impl EndpointDestroyBuilder {
-    pub fn new(endpoint_id: EndpointId, profile_id: ProfileId) -> Self {
-        Self {
-            endpoint_id,
-            profile_id,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::EndpointDestroy(EndpointDestroyMeta {
-            endpoint_id: self.endpoint_id,
-            profile_id: self.profile_id,
-        }))
-    }
-}
-
-pub struct EndpointFailBuilder {
-    endpoint_id: EndpointId,
-    profile_id: ProfileId,
-    reason: FailReason,
-}
-
-impl EndpointFailBuilder {
-    pub fn new(endpoint_id: EndpointId, profile_id: ProfileId, reason: FailReason) -> Self {
-        Self {
-            endpoint_id,
-            profile_id,
-            reason,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::EndpointFail(EndpointFailMeta {
-            endpoint_id: self.endpoint_id,
-            profile_id: self.profile_id,
-            reason: self.reason,
-        }))
-    }
-}
-
 pub struct PrincipalLaunchBuilder {
     session_id: PrincipalSessionId,
     profile_id: ProfileId,
@@ -1170,16 +1927,14 @@ impl PrincipalExitBuilder {
 pub struct BrowserLeaseLaunchBuilder {
     lease_id: BrowserLeaseId,
     profile_id: ProfileId,
-    endpoint_id: EndpointId,
     cdp_expose: Option<String>,
 }
 
 impl BrowserLeaseLaunchBuilder {
-    pub fn new(lease_id: BrowserLeaseId, profile_id: ProfileId, endpoint_id: EndpointId) -> Self {
+    pub fn new(lease_id: BrowserLeaseId, profile_id: ProfileId) -> Self {
         Self {
             lease_id,
             profile_id,
-            endpoint_id,
             cdp_expose: None,
         }
     }
@@ -1193,7 +1948,6 @@ impl BrowserLeaseLaunchBuilder {
         AuditEvent::new(AuditPayload::BrowserLeaseLaunch(BrowserLeaseLaunchMeta {
             lease_id: self.lease_id,
             profile_id: self.profile_id,
-            endpoint_id: self.endpoint_id,
             cdp_expose: self.cdp_expose,
         }))
     }
@@ -1290,6 +2044,36 @@ impl BrowserLeaseQuarantineBuilder {
     }
 }
 
+pub struct BrowserLeaseInterceptionBuilder {
+    lease_id: BrowserLeaseId,
+    profile_id: ProfileId,
+    state: InterceptionAuditState,
+}
+
+impl BrowserLeaseInterceptionBuilder {
+    pub fn new(
+        lease_id: BrowserLeaseId,
+        profile_id: ProfileId,
+        state: InterceptionAuditState,
+    ) -> Self {
+        Self {
+            lease_id,
+            profile_id,
+            state,
+        }
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::BrowserLeaseInterception(
+            BrowserLeaseInterceptionMeta {
+                lease_id: self.lease_id,
+                profile_id: self.profile_id,
+                state: self.state,
+            },
+        ))
+    }
+}
+
 pub struct BrowserControlRequestBuilder {
     profile_id: ProfileId,
     lease_id: BrowserLeaseId,
@@ -1324,138 +2108,28 @@ impl BrowserControlRequestBuilder {
     }
 }
 
-pub struct IntentCreateBuilder {
-    intent_id: IntentId,
-    profile_id: ProfileId,
-    action: AuditAction,
-}
-
-impl IntentCreateBuilder {
-    pub fn new(intent_id: IntentId, profile_id: ProfileId, action: AuditAction) -> Self {
-        Self {
-            intent_id,
-            profile_id,
-            action,
-        }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentCreate(IntentCreateMeta {
-            intent_id: self.intent_id,
-            profile_id: self.profile_id,
-            action: self.action,
-        }))
-    }
-}
-
-pub struct IntentApproveBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentApproveBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentApprove(IntentApproveMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentDenyBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentDenyBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentDeny(IntentDenyMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentCancelBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentCancelBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentCancel(IntentCancelMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentClaimBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentClaimBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentClaim(IntentClaimMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentConsumeBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentConsumeBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentConsume(IntentConsumeMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
-pub struct IntentExpireBuilder {
-    intent_id: IntentId,
-}
-
-impl IntentExpireBuilder {
-    pub fn new(intent_id: IntentId) -> Self {
-        Self { intent_id }
-    }
-
-    pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::IntentExpire(IntentExpireMeta {
-            intent_id: self.intent_id,
-        }))
-    }
-}
-
 pub struct GrantRequestBuilder {
     request_id: String,
     profile_id: ProfileId,
+    principal: String,
     rp_ids: Vec<String>,
+    ttl_secs: u64,
 }
 
 impl GrantRequestBuilder {
-    pub fn new(request_id: &GrantRequestId, profile_id: ProfileId, rp_ids: Vec<String>) -> Self {
+    pub fn new(
+        request_id: &GrantRequestId,
+        profile_id: ProfileId,
+        principal_digest: &[u8; 32],
+        rp_ids: Vec<String>,
+        ttl_secs: u64,
+    ) -> Self {
         Self {
             request_id: request_id.as_str().to_string(),
             profile_id,
+            principal: hex::encode(principal_digest),
             rp_ids,
+            ttl_secs,
         }
     }
 
@@ -1463,7 +2137,9 @@ impl GrantRequestBuilder {
         AuditEvent::new(AuditPayload::GrantRequest(GrantRequestMeta {
             request_id: self.request_id,
             profile_id: self.profile_id,
+            principal: self.principal,
             rp_ids: self.rp_ids,
+            ttl_secs: self.ttl_secs,
         }))
     }
 }
@@ -1471,14 +2147,24 @@ impl GrantRequestBuilder {
 pub struct GrantApproveBuilder {
     grant_id: GrantId,
     profile_id: ProfileId,
+    principal: String,
+    rp_ids: Vec<String>,
     ttl_secs: u64,
 }
 
 impl GrantApproveBuilder {
-    pub fn new(grant_id: GrantId, profile_id: ProfileId, ttl_secs: u64) -> Self {
+    pub fn new(
+        grant_id: GrantId,
+        profile_id: ProfileId,
+        principal_digest: &[u8; 32],
+        rp_ids: Vec<String>,
+        ttl_secs: u64,
+    ) -> Self {
         Self {
             grant_id,
             profile_id,
+            principal: hex::encode(principal_digest),
+            rp_ids,
             ttl_secs,
         }
     }
@@ -1487,6 +2173,8 @@ impl GrantApproveBuilder {
         AuditEvent::new(AuditPayload::GrantApprove(GrantApproveMeta {
             grant_id: self.grant_id,
             profile_id: self.profile_id,
+            principal: self.principal,
+            rp_ids: self.rp_ids,
             ttl_secs: self.ttl_secs,
         }))
     }
@@ -1567,9 +2255,7 @@ impl GrantConsumeBuilder {
 }
 
 pub struct PolicyAllowBuilder {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    op: OperationRecord,
     authorization: String,
     user_presence: String,
     user_verification: String,
@@ -1578,13 +2264,22 @@ pub struct PolicyAllowBuilder {
 impl PolicyAllowBuilder {
     pub fn new(profile_id: ProfileId, action: AuditAction, rp_id: &str) -> Self {
         Self {
-            profile_id,
-            action,
-            rp_id: rp_id.to_string(),
+            op: OperationRecord::new(profile_id, action, rp_id),
             authorization: "confirm".to_string(),
             user_presence: "human".to_string(),
             user_verification: "none".to_string(),
         }
+    }
+
+    /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
+    pub fn origin_context(
+        mut self,
+        origin: Option<&str>,
+        top_origin: Option<&str>,
+        cross_origin: Option<bool>,
+    ) -> Self {
+        self.op = self.op.origin_context(origin, top_origin, cross_origin);
+        self
     }
 
     pub fn evidence_sources(
@@ -1599,11 +2294,19 @@ impl PolicyAllowBuilder {
         self
     }
 
+    /// The section 12 operation fields (session, rule, credential, backend, counters and so on).
+    /// The decision is `allow`, and the evidence source `agent` when the agent session supplied
+    /// UP and UV.
+    pub fn operation(mut self, op: OperationRecord) -> Self {
+        self.op = op;
+        self
+    }
+
     pub fn build(self) -> AuditEvent {
+        let evidence =
+            (self.user_presence == "agent" && self.user_verification == "agent").then_some("agent");
         AuditEvent::new(AuditPayload::PolicyAllow(PolicyAllowMeta {
-            profile_id: self.profile_id,
-            action: self.action,
-            rp_id: self.rp_id,
+            op: Box::new(self.op.decision(PolicyDecision::Allow, evidence)),
             authorization: self.authorization,
             user_presence: self.user_presence,
             user_verification: self.user_verification,
@@ -1612,10 +2315,9 @@ impl PolicyAllowBuilder {
 }
 
 pub struct PolicyDenyBuilder {
-    profile_id: ProfileId,
-    action: AuditAction,
-    rp_id: String,
+    op: OperationRecord,
     reason: PolicyDenyReason,
+    suppressed: Option<u64>,
 }
 
 impl PolicyDenyBuilder {
@@ -1626,20 +2328,156 @@ impl PolicyDenyBuilder {
         reason: PolicyDenyReason,
     ) -> Self {
         Self {
-            profile_id,
-            action,
-            rp_id: rp_id.to_string(),
+            op: OperationRecord::new(profile_id, action, rp_id),
             reason,
+            suppressed: None,
         }
     }
 
+    /// Make this a coalesced summary: `count` further refusals of its key were not written
+    /// individually (ADR 0014 section 12).
+    pub fn suppressed(mut self, count: u64) -> Self {
+        self.suppressed = Some(count);
+        self
+    }
+
+    /// The request's origin, top origin (null on the proxy path) and cross-origin flag.
+    pub fn origin_context(
+        mut self,
+        origin: Option<&str>,
+        top_origin: Option<&str>,
+        cross_origin: Option<bool>,
+    ) -> Self {
+        self.op = self.op.origin_context(origin, top_origin, cross_origin);
+        self
+    }
+
+    /// The section 12 operation fields. The decision, result and failure class are set from the
+    /// reason.
+    pub fn operation(mut self, op: OperationRecord) -> Self {
+        self.op = op;
+        self
+    }
+
     pub fn build(self) -> AuditEvent {
-        AuditEvent::new(AuditPayload::PolicyDeny(PolicyDenyMeta {
-            profile_id: self.profile_id,
-            action: self.action,
-            rp_id: self.rp_id,
+        let replay = self.reason == PolicyDenyReason::ReplayServed;
+        let op = if replay {
+            // Not a refusal: a duplicate served the original outcome.
+            self.op
+                .decision(PolicyDecision::Allow, Some("agent"))
+                .outcome(OperationResult::ReplayServed, None)
+        } else {
+            self.op
+                .decision(PolicyDecision::Deny, None)
+                .outcome(OperationResult::of_failure(self.reason), Some(self.reason))
+        };
+        let meta = PolicyDenyMeta {
+            op: Box::new(op),
             reason: self.reason,
+            suppressed: if replay { None } else { self.suppressed },
+        };
+        if replay {
+            AuditEvent::new(AuditPayload::PolicyReplayServed(meta))
+        } else {
+            AuditEvent::new(AuditPayload::PolicyDeny(meta))
+        }
+    }
+}
+
+/// The terminal record of an operation reservation: the same operation fields as the
+/// reservation, with the final result, the failure class (`None` on success) and the counter
+/// after.
+pub struct OperationTerminalBuilder {
+    op: OperationRecord,
+    failure: Option<PolicyDenyReason>,
+}
+
+impl OperationTerminalBuilder {
+    pub fn new(op: OperationRecord, failure: Option<PolicyDenyReason>) -> Self {
+        Self { op, failure }
+    }
+
+    pub fn build(self) -> AuditEvent {
+        let result = self
+            .failure
+            .map_or(OperationResult::Success, OperationResult::of_failure);
+        AuditEvent::new(AuditPayload::OperationTerminal(OperationTerminalMeta {
+            op: Box::new(
+                self.op
+                    .decision(PolicyDecision::Allow, Some("agent"))
+                    .outcome(result, self.failure),
+            ),
         }))
+    }
+}
+
+/// A sign-transport hello refused because its peer UID is not the lease's browser UID.
+pub struct TransportPeerRefusedBuilder {
+    profile_id: ProfileId,
+    expected_uid: u32,
+    peer_uid: Option<u32>,
+}
+
+impl TransportPeerRefusedBuilder {
+    pub fn new(profile_id: ProfileId, expected_uid: u32) -> Self {
+        Self {
+            profile_id,
+            expected_uid,
+            peer_uid: None,
+        }
+    }
+
+    /// The peer's UID, if the kernel reported one.
+    pub fn peer_uid(mut self, peer_uid: Option<u32>) -> Self {
+        self.peer_uid = peer_uid;
+        self
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::TransportPeerRefused(
+            TransportPeerRefusedMeta {
+                profile_id: self.profile_id,
+                expected_uid: self.expected_uid,
+                peer_uid: self.peer_uid,
+            },
+        ))
+    }
+}
+
+/// A sign-transport hello whose build or relay version differs from the daemon's (plan V-L5).
+pub struct TransportVersionSkewBuilder {
+    profile_id: ProfileId,
+    daemon_version: String,
+    build_version: Option<String>,
+    relay_version: Option<String>,
+}
+
+impl TransportVersionSkewBuilder {
+    pub fn new(profile_id: ProfileId, daemon_version: &str) -> Self {
+        Self {
+            profile_id,
+            daemon_version: daemon_version.to_string(),
+            build_version: None,
+            relay_version: None,
+        }
+    }
+
+    /// The versions the hello reported (bounded and stripped of control characters by the caller).
+    pub fn reported(mut self, build_version: Option<&str>, relay_version: Option<&str>) -> Self {
+        self.build_version = build_version.map(str::to_string);
+        self.relay_version = relay_version.map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::TransportVersionSkew(
+            TransportVersionSkewMeta {
+                profile_id: self.profile_id,
+                daemon_version: self.daemon_version,
+                build_version: self.build_version,
+                relay_version: self.relay_version,
+            },
+        ))
     }
 }
 
@@ -2064,6 +2902,141 @@ impl PromptErrorBuilder {
     }
 }
 
+pub struct GrantedRuleRevokeBuilder {
+    profile_id: ProfileId,
+    rp_id: Option<String>,
+    revoked: u32,
+}
+
+impl GrantedRuleRevokeBuilder {
+    pub fn new(profile_id: ProfileId, rp_id: Option<String>, revoked: usize) -> Self {
+        Self {
+            profile_id,
+            rp_id,
+            revoked: u32::try_from(revoked).unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::GrantedRuleRevoke(GrantedRuleRevokeMeta {
+            profile_id: self.profile_id,
+            rp_id: self.rp_id,
+            revoked: self.revoked,
+        }))
+    }
+}
+
+pub struct GrantedRuleAddBuilder {
+    meta: GrantedRuleAddMeta,
+}
+
+impl GrantedRuleAddBuilder {
+    pub fn new(
+        profile_id: ProfileId,
+        rp_id: &str,
+        kind: GrantKind,
+        escalation_id: &str,
+        rule: PermittingRule,
+    ) -> Self {
+        Self {
+            meta: GrantedRuleAddMeta {
+                profile_id,
+                rp_id: rp_id.to_string(),
+                grant_kind: kind,
+                escalation_id: escalation_id.to_string(),
+                rule: rule.as_str().to_string(),
+                credential_ref: None,
+            },
+        }
+    }
+
+    pub fn credential_ref(mut self, credential_ref: Option<CredentialRef>) -> Self {
+        self.meta.credential_ref = credential_ref;
+        self
+    }
+
+    pub fn build(self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::GrantedRuleAdd(self.meta))
+    }
+}
+
+/// The fields every `escalation.*` record carries.
+#[derive(Debug, Clone)]
+pub struct EscalationAuditContext {
+    pub escalation_id: String,
+    pub profile_id: ProfileId,
+    pub action: AuditAction,
+    pub rp_id: String,
+    /// The origin of the ceremony that raised the escalation.
+    pub origin: String,
+    pub rule: PermittingRule,
+}
+
+impl EscalationAuditContext {
+    fn rule_name(&self) -> String {
+        self.rule.as_str().to_string()
+    }
+
+    pub fn requested(&self) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationRequested(EscalationRequestedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
+        }))
+    }
+
+    pub fn approved(&self, latency_ms: u64) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationApproved(EscalationApprovedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
+            latency_ms,
+        }))
+    }
+
+    pub fn denied(&self, cause: EscalationDenyCause) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationDenied(EscalationDeniedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
+            cause,
+        }))
+    }
+
+    pub fn expired(&self, reason: EscalationExpireReason) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationExpired(EscalationExpiredMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
+            reason,
+        }))
+    }
+
+    pub fn revoked(&self, reason: EscalationRevokeReason) -> AuditEvent {
+        AuditEvent::new(AuditPayload::EscalationRevoked(EscalationRevokedMeta {
+            escalation_id: self.escalation_id.clone(),
+            profile_id: self.profile_id.clone(),
+            action: self.action,
+            rp_id: self.rp_id.clone(),
+            origin: self.origin.clone(),
+            rule: self.rule_name(),
+            reason,
+        }))
+    }
+}
+
 pub struct AdminProfileEnableBuilder {
     profile_id: ProfileId,
 }
@@ -2184,13 +3157,15 @@ impl AdminCredentialRevokeBuilder {
 }
 
 pub struct AdminCredentialDeleteBuilder {
+    profile_id: ProfileId,
     credential: CredentialRef,
     rp_id: String,
 }
 
 impl AdminCredentialDeleteBuilder {
-    pub fn new(credential: CredentialRef, rp_id: &str) -> Self {
+    pub fn new(profile_id: ProfileId, credential: CredentialRef, rp_id: &str) -> Self {
         Self {
+            profile_id,
             credential,
             rp_id: rp_id.to_string(),
         }
@@ -2199,6 +3174,7 @@ impl AdminCredentialDeleteBuilder {
     pub fn build(self) -> AuditEvent {
         AuditEvent::new(AuditPayload::AdminCredentialDelete(
             AdminCredentialDeleteMeta {
+                profile_id: self.profile_id,
                 credential: self.credential,
                 rp_id: self.rp_id,
             },
@@ -2279,16 +3255,12 @@ impl AdminShutdownRequestBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::*;
 
     fn test_profile_id() -> ProfileId {
         ProfileId::new("test-profile").unwrap()
-    }
-
-    fn test_endpoint_id() -> EndpointId {
-        EndpointId::new()
     }
 
     fn test_session_id() -> PrincipalSessionId {
@@ -2311,9 +3283,63 @@ mod tests {
         CredentialRef::with_default_domain(b"test-credential-id")
     }
 
+    /// An `intent.*` record as written before the intent protocol was removed (P7). Nothing
+    /// emits these any more; the payload variants stay so that old logs still deserialize.
+    fn historic_intent_event(kind: &str, iid: &IntentId, pid: Option<&ProfileId>) -> AuditEvent {
+        let mut payload = serde_json::json!({ "kind": kind, "intent_id": iid });
+        if let Some(pid) = pid {
+            payload["profile_id"] = serde_json::to_value(pid).unwrap();
+            payload["action"] = serde_json::json!("register");
+        }
+        AuditEvent::new(serde_json::from_value(payload).unwrap())
+    }
+
+    /// An `endpoint.*` record as written before the isolated UHID route was removed (ADR 0014
+    /// section 5). Nothing emits these any more; the payload variants stay so that old logs still
+    /// deserialize.
+    fn historic_endpoint_event(kind: &str, pid: &ProfileId) -> AuditEvent {
+        let mut payload = serde_json::json!({
+            "kind": kind,
+            "endpoint_id": "ep-historic",
+            "profile_id": pid,
+        });
+        if kind == "endpoint.fail" {
+            payload["reason"] = serde_json::json!("timeout");
+        }
+        AuditEvent::new(serde_json::from_value(payload).unwrap())
+    }
+
+    fn escalation_context(pid: &ProfileId) -> EscalationAuditContext {
+        EscalationAuditContext {
+            escalation_id: "esc-1".to_string(),
+            profile_id: pid.clone(),
+            action: AuditAction::Authenticate,
+            rp_id: "example.com".to_string(),
+            origin: "https://example.com".to_string(),
+            rule: PermittingRule::Exact,
+        }
+    }
+
+    /// An operation record with every field set.
+    fn full_operation_record(pid: &ProfileId, cred: &CredentialRef) -> OperationRecord {
+        OperationRecord::new(pid.clone(), AuditAction::Authenticate, "example.com")
+            .origin_context(Some("https://example.com"), None, Some(false))
+            .session(Some("ab".repeat(32)), Some("req-1".to_string()))
+            .escalation(Some("esc-1".to_string()))
+            .deployment(
+                Some("same-user".to_string()),
+                Some("shared-uid".to_string()),
+                Some("local".to_string()),
+                Some("software".to_string()),
+            )
+            .epochs(3, 2)
+            .matched(Some("*".to_string()), Some(RuleGrantSource::Granted))
+            .credential(Some(cred.clone()), Some("single".to_string()))
+            .counters(Some(4), Some(5))
+    }
+
     fn all_test_events() -> Vec<AuditEvent> {
         let pid = test_profile_id();
-        let eid = test_endpoint_id();
         let sid = test_session_id();
         let iid = test_intent_id();
         let gid = test_grant_id();
@@ -2330,40 +3356,96 @@ mod tests {
             ProfileCreateBuilder::new(pid.clone()).build(),
             ProfileDestroyBuilder::new(pid.clone()).build(),
             ProfileFailBuilder::new(pid.clone(), FailReason::InternalError).build(),
-            EndpointCreateBuilder::new(eid.clone(), pid.clone()).build(),
-            EndpointDestroyBuilder::new(eid.clone(), pid.clone()).build(),
-            EndpointFailBuilder::new(eid.clone(), pid.clone(), FailReason::Timeout).build(),
+            historic_endpoint_event("endpoint.create", &pid),
+            historic_endpoint_event("endpoint.destroy", &pid),
+            historic_endpoint_event("endpoint.fail", &pid),
             PrincipalLaunchBuilder::new(sid.clone(), pid.clone(), 1000).build(),
             PrincipalDenyBuilder::new(sid.clone(), pid.clone(), DenyReason::PolicyDenied).build(),
             PrincipalExitBuilder::new(sid.clone(), pid.clone(), ExitReason::Normal).build(),
-            BrowserLeaseLaunchBuilder::new(lid.clone(), pid.clone(), eid.clone()).build(),
+            BrowserLeaseLaunchBuilder::new(lid.clone(), pid.clone())
+                .with_cdp_expose("pipe".to_string())
+                .build(),
             BrowserLeaseRevokeBuilder::new(lid.clone(), RevokeReason::AdminRevoked).build(),
             BrowserLeaseExpireBuilder::new(lid.clone()).build(),
             BrowserLeaseCrashBuilder::new(lid.clone(), -11).build(),
             BrowserLeaseCleanupBuilder::new(lid.clone()).build(),
             BrowserLeaseQuarantineBuilder::new(lid.clone(), QuarantineReason::SymlinkEscape)
                 .build(),
-            IntentCreateBuilder::new(iid.clone(), pid.clone(), AuditAction::Register).build(),
-            IntentApproveBuilder::new(iid.clone()).build(),
-            IntentDenyBuilder::new(iid.clone()).build(),
-            IntentCancelBuilder::new(iid.clone()).build(),
-            IntentClaimBuilder::new(iid.clone()).build(),
-            IntentConsumeBuilder::new(iid.clone()).build(),
-            IntentExpireBuilder::new(iid.clone()).build(),
-            GrantRequestBuilder::new(&req_id, pid.clone(), vec!["example.com".to_string()]).build(),
-            GrantApproveBuilder::new(gid.clone(), pid.clone(), 300).build(),
+            BrowserLeaseInterceptionBuilder::new(
+                lid.clone(),
+                pid.clone(),
+                InterceptionAuditState::Degraded,
+            )
+            .build(),
+            historic_intent_event("intent.create", &iid, Some(&pid)),
+            historic_intent_event("intent.approve", &iid, None),
+            historic_intent_event("intent.deny", &iid, None),
+            historic_intent_event("intent.cancel", &iid, None),
+            historic_intent_event("intent.claim", &iid, None),
+            historic_intent_event("intent.consume", &iid, None),
+            historic_intent_event("intent.expire", &iid, None),
+            GrantRequestBuilder::new(
+                &req_id,
+                pid.clone(),
+                &[7u8; 32],
+                vec!["example.com".to_string()],
+                300,
+            )
+            .build(),
+            GrantApproveBuilder::new(
+                gid.clone(),
+                pid.clone(),
+                &[7u8; 32],
+                vec!["example.com".to_string()],
+                300,
+            )
+            .build(),
             GrantRevokeBuilder::new(gid.clone()).build(),
             GrantExpireBuilder::new(gid.clone()).build(),
             GrantClaimBuilder::new(gid.clone(), &cer_id).build(),
             GrantConsumeBuilder::new(gid.clone(), &cer_id).build(),
-            PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com").build(),
+            GrantedRuleRevokeBuilder::new(pid.clone(), Some("example.com".to_string()), 1).build(),
+            GrantedRuleAddBuilder::new(
+                pid.clone(),
+                "example.com",
+                GrantKind::Registration,
+                "esc-1",
+                PermittingRule::Wildcard,
+            )
+            .credential_ref(Some(cred.clone()))
+            .build(),
+            escalation_context(&pid).requested(),
+            escalation_context(&pid).approved(1500),
+            escalation_context(&pid).denied(EscalationDenyCause::User),
+            escalation_context(&pid).expired(EscalationExpireReason::Aborted),
+            escalation_context(&pid).revoked(EscalationRevokeReason::PolicyReload),
+            PolicyAllowBuilder::new(pid.clone(), AuditAction::Authenticate, "example.com")
+                .evidence_sources("allow", "agent", "agent")
+                .operation(full_operation_record(&pid, &cred))
+                .build(),
             PolicyDenyBuilder::new(
                 pid.clone(),
-                AuditAction::Register,
-                "evil.com",
-                PolicyDenyReason::DefaultDeny,
+                AuditAction::Authenticate,
+                "example.com",
+                PolicyDenyReason::EscalationDenied,
             )
+            .operation(full_operation_record(&pid, &cred))
             .build(),
+            PolicyDenyBuilder::new(
+                pid.clone(),
+                AuditAction::Authenticate,
+                "example.com",
+                PolicyDenyReason::ReplayServed,
+            )
+            .operation(full_operation_record(&pid, &cred))
+            .build(),
+            OperationTerminalBuilder::new(full_operation_record(&pid, &cred), None).build(),
+            TransportVersionSkewBuilder::new(pid.clone(), "0.21.0+abc")
+                .reported(Some("0.20.0+def"), None)
+                .build(),
+            TransportPeerRefusedBuilder::new(pid.clone(), 1001)
+                .peer_uid(Some(1000))
+                .build(),
             CeremonyStartBuilder::new(
                 &cer_id,
                 Some(gid.clone()),
@@ -2514,6 +3596,232 @@ mod tests {
         }
     }
 
+    fn envelope_free_keys(json: &serde_json::Value) -> BTreeSet<String> {
+        json.as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "v" | "ts" | "kind"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn test_schema_version_is_bumped_for_the_section_12_records() {
+        assert_eq!(
+            AUDIT_SCHEMA_VERSION, 3,
+            "operation records changed shape in P8: the version must stay above 2"
+        );
+    }
+
+    #[test]
+    fn test_section_12_field_list_has_no_duplicates() {
+        let unique: BTreeSet<_> = SECTION_12_OPERATION_FIELDS.iter().collect();
+        assert_eq!(unique.len(), SECTION_12_OPERATION_FIELDS.len());
+    }
+
+    #[test]
+    fn test_every_operation_record_carries_exactly_the_canonical_section_12_fields() {
+        let events = all_test_events();
+        for kind in SECTION_12_OPERATION_KINDS {
+            let extras = SECTION_12_OPERATION_EXTRAS
+                .iter()
+                .find(|(extras_kind, _)| extras_kind == kind)
+                .unwrap_or_else(|| panic!("no extras row for {kind}"))
+                .1;
+            let expected: BTreeSet<String> = SECTION_12_OPERATION_FIELDS
+                .iter()
+                .chain(extras)
+                .map(|field| field.to_string())
+                .collect();
+            let samples: Vec<_> = events.iter().filter(|e| e.kind_name() == *kind).collect();
+            assert!(!samples.is_empty(), "no sample record of kind {kind}");
+            for event in samples {
+                let keys = envelope_free_keys(&serde_json::to_value(event).unwrap());
+                let missing: Vec<_> = expected.difference(&keys).collect();
+                let unlisted: Vec<_> = keys.difference(&expected).collect();
+                assert!(
+                    missing.is_empty(),
+                    "{kind} lacks the section 12 field(s) {missing:?}"
+                );
+                assert!(
+                    unlisted.is_empty(),
+                    "{kind} carries field(s) {unlisted:?} that the section 12 list does not name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_other_record_claims_the_operation_fields_without_being_listed() {
+        // A record kind that carries the operation record's fields must be in the kinds list.
+        for event in all_test_events() {
+            let json = serde_json::to_value(&event).unwrap();
+            if json.get("session_id_hash").is_some() {
+                assert!(
+                    SECTION_12_OPERATION_KINDS.contains(&event.kind_name()),
+                    "{} carries operation fields but is not in SECTION_12_OPERATION_KINDS",
+                    event.kind_name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_escalation_session_grant_and_lease_records_carry_exactly_their_listed_fields() {
+        let events = all_test_events();
+        for (kind, fields) in SECTION_12_OTHER_RECORD_FIELDS {
+            let expected: BTreeSet<String> = fields.iter().map(|field| field.to_string()).collect();
+            let event = events
+                .iter()
+                .find(|e| e.kind_name() == *kind)
+                .unwrap_or_else(|| panic!("no sample record of kind {kind}"));
+            let keys = envelope_free_keys(&serde_json::to_value(event).unwrap());
+            let missing: Vec<_> = expected.difference(&keys).collect();
+            let unlisted: Vec<_> = keys.difference(&expected).collect();
+            assert!(
+                missing.is_empty(),
+                "{kind} lacks the section 12 field(s) {missing:?}"
+            );
+            assert!(
+                unlisted.is_empty(),
+                "{kind} carries field(s) {unlisted:?} that the section 12 list does not name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_section_12_lists_cover_every_escalation_kind() {
+        for kind in [
+            "escalation.requested",
+            "escalation.approved",
+            "escalation.denied",
+            "escalation.expired",
+            "escalation.revoked",
+            "granted_rule.add",
+            "granted_rule.revoke",
+        ] {
+            assert!(
+                SECTION_12_OTHER_RECORD_FIELDS
+                    .iter()
+                    .any(|(listed, _)| *listed == kind),
+                "{kind} is not in the section 12 list"
+            );
+        }
+    }
+
+    #[test]
+    fn test_operation_record_values() {
+        let pid = test_profile_id();
+        let cred = test_cred();
+        let terminal = [
+            OperationTerminalBuilder::new(full_operation_record(&pid, &cred), None).build(),
+            OperationTerminalBuilder::new(
+                full_operation_record(&pid, &cred),
+                Some(PolicyDenyReason::SigningFailed),
+            )
+            .build(),
+        ]
+        .map(|event| serde_json::to_value(event).unwrap());
+        assert_eq!(terminal[0]["result"], "success");
+        assert!(terminal[0]["failure_class"].is_null());
+        assert_eq!(terminal[0]["decision"], "allow");
+        assert_eq!(terminal[0]["evidence_source"], "agent");
+        assert_eq!(terminal[0]["counter_before"], 4);
+        assert_eq!(terminal[0]["counter_after"], 5);
+        assert_eq!(terminal[0]["rule"], "*");
+        assert_eq!(terminal[0]["grant_source"], "granted");
+        assert_eq!(terminal[1]["result"], "error");
+        assert_eq!(terminal[1]["failure_class"], "signing_failed");
+    }
+
+    #[test]
+    fn test_failure_classes_map_to_results() {
+        use PolicyDenyReason as R;
+        for (failure, result) in [
+            (R::Aborted, OperationResult::Aborted),
+            (R::PolicyRevoked, OperationResult::Revoked),
+            (R::GrantRevoked, OperationResult::Revoked),
+            (R::BearerRevoked, OperationResult::Revoked),
+            (R::SessionExpired, OperationResult::Revoked),
+            (R::EscalationExpired, OperationResult::Timeout),
+            (R::EscalationQueueFull, OperationResult::Busy),
+            (R::EscalationWaiterCap, OperationResult::Busy),
+            (R::EscalationTrackingFull, OperationResult::Busy),
+            (R::ReplayTableFull, OperationResult::Busy),
+            (R::EscalationDenied, OperationResult::Denied),
+            (R::ActionNotAllowed, OperationResult::Denied),
+            (R::OriginInvalid, OperationResult::Denied),
+            (R::SigningFailed, OperationResult::Error),
+            (R::CounterPersistenceFailure, OperationResult::Error),
+            (R::Abandoned, OperationResult::Error),
+        ] {
+            assert_eq!(OperationResult::of_failure(failure), result, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn test_records_of_an_older_schema_still_deserialize() {
+        let old_records = [
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "policy.allow", "profile_id": "test-profile",
+                "action": "authenticate", "rp_id": "example.com", "authorization": "allow",
+                "user_presence": "agent", "user_verification": "agent",
+                "origin": "https://example.com", "top_origin": null, "cross_origin": false
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "policy.deny", "profile_id": "test-profile",
+                "action": "authenticate", "rp_id": "example.com", "reason": "default_deny"
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "escalation.approved", "escalation_id": "esc-1",
+                "profile_id": "test-profile", "action": "authenticate", "rp_id": "example.com",
+                "latency_ms": 5
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "escalation.requested", "escalation_id": "esc-1",
+                "profile_id": "test-profile", "action": "authenticate", "rp_id": "example.com",
+                "origin": "https://example.com", "rule": "exact"
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "grant.request", "request_id": "r",
+                "profile_id": "test-profile", "rp_ids": ["example.com"]
+            }),
+            serde_json::json!({
+                "v": 2, "ts": 1, "kind": "grant.approve", "grant_id": test_grant_id(),
+                "profile_id": "test-profile", "ttl_secs": 300
+            }),
+        ];
+        for old in old_records {
+            let kind = old["kind"].as_str().unwrap().to_string();
+            let event: AuditEvent = serde_json::from_value(old)
+                .unwrap_or_else(|e| panic!("a version 2 {kind} record no longer parses: {e}"));
+            assert_eq!(event.schema_version(), 2);
+            assert_eq!(event.kind_name(), kind);
+        }
+    }
+
+    #[test]
+    fn test_escalation_records_name_the_rule_as_exact_or_star() {
+        let pid = test_profile_id();
+        for (rule, name) in [
+            (PermittingRule::Exact, "exact"),
+            (PermittingRule::Wildcard, "*"),
+        ] {
+            let mut context = escalation_context(&pid);
+            context.rule = rule;
+            for event in [
+                context.requested(),
+                context.approved(1),
+                context.denied(EscalationDenyCause::User),
+                context.expired(EscalationExpireReason::Timeout),
+                context.revoked(EscalationRevokeReason::PolicyReload),
+            ] {
+                let json = serde_json::to_value(&event).unwrap();
+                assert_eq!(json["rule"], name, "{}", event.kind_name());
+            }
+        }
+    }
+
     #[test]
     fn test_schema_version_present_in_all_events() {
         for event in all_test_events() {
@@ -2580,12 +3888,12 @@ mod tests {
     #[test]
     fn test_all_event_kinds_constructible() {
         let events = all_test_events();
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 62);
         let mut kinds = HashSet::new();
         for event in &events {
             kinds.insert(event.kind_name().to_string());
         }
-        assert_eq!(kinds.len(), 50, "duplicate kind names detected");
+        assert_eq!(kinds.len(), 62, "duplicate kind names detected");
     }
 
     #[test]
@@ -2676,6 +3984,48 @@ mod tests {
     }
 
     #[test]
+    fn test_escalation_reason_codes_serialize_stably() {
+        for (reason, expected) in [
+            (PolicyDenyReason::EscalationCooldown, "escalation_cooldown"),
+            (
+                PolicyDenyReason::EscalationQueueFull,
+                "escalation_queue_full",
+            ),
+            (
+                PolicyDenyReason::EscalationWaiterCap,
+                "escalation_waiter_cap",
+            ),
+            (PolicyDenyReason::EscalationBusy, "escalation_busy"),
+            (PolicyDenyReason::GrantCapReached, "grant_cap_reached"),
+            (PolicyDenyReason::GrantsUnavailable, "grants_unavailable"),
+            (PolicyDenyReason::EscalationDenied, "escalation_denied"),
+            (PolicyDenyReason::EscalationExpired, "escalation_expired"),
+            (
+                PolicyDenyReason::EscalationUnavailable,
+                "escalation_unavailable",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+        }
+        for (reason, expected) in [
+            (EscalationExpireReason::Timeout, "timeout"),
+            (EscalationExpireReason::Aborted, "aborted"),
+            (EscalationExpireReason::ServerLost, "server_lost"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(EscalationRevokeReason::PolicyReload).unwrap(),
+            "policy_reload"
+        );
+        let event = escalation_context(&test_profile_id()).expired(EscalationExpireReason::Timeout);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "escalation.expired");
+        assert_eq!(json["reason"], "timeout");
+        assert_eq!(json["escalation_id"], "esc-1");
+    }
+
+    #[test]
     fn test_credential_ref_serializes_as_hex_not_bytes() {
         let cred = test_cred();
         let json = serde_json::to_value(&cred).unwrap();
@@ -2742,6 +4092,7 @@ mod tests {
             "browser_lease.crash",
             "browser_lease.cleanup",
             "browser_lease.quarantine",
+            "browser_lease.interception",
             "intent.create",
             "intent.approve",
             "intent.deny",
@@ -2755,8 +4106,19 @@ mod tests {
             "grant.expire",
             "grant.claim",
             "grant.consume",
+            "granted_rule.revoke",
+            "granted_rule.add",
+            "escalation.requested",
+            "escalation.approved",
+            "escalation.denied",
+            "escalation.expired",
+            "escalation.revoked",
             "policy.allow",
             "policy.deny",
+            "policy.replay_served",
+            "operation.terminal",
+            "transport.version_skew",
+            "transport.peer_refused",
             "ceremony.start",
             "ceremony.success",
             "ceremony.failure",

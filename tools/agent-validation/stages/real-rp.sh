@@ -236,14 +236,22 @@ stage_real_rp() {
     _add_gc_scenario "expired_grant" "$eg_status" "$(echo "$expired_grant" | jq -r '.reason // "not feasible"' 2>/dev/null || echo "not feasible")"
 
     local revoke_result="not_attempted"
-    if "${AV_PASSLESS_BIN:-passless}" agent-admin --output json delegation revoke --help &>/dev/null 2>&1; then
-        if "${AV_PASSLESS_BIN:-passless}" agent-admin --output json delegation revoke --all 2>/dev/null; then
-            revoke_result="revoked"
-        else
-            revoke_result="failed"
-        fi
+    local passless_bin="${AV_PASSLESS_BIN:-passless}"
+    local grants_json principals_json
+    if grants_json=$("$passless_bin" agent-admin --output json sessions list 2>/dev/null) &&
+        principals_json=$("$passless_bin" agent-admin --output json principals list 2>/dev/null); then
+        revoke_result="revoked"
+        local gid sid
+        while IFS= read -r gid; do
+            [[ -z "$gid" ]] && continue
+            "$passless_bin" agent-admin --output json sessions revoke "$gid" --confirm >/dev/null 2>&1 || revoke_result="failed"
+        done < <(printf '%s' "$grants_json" | jq -r '.grants[]?.grant_id // empty' 2>/dev/null)
+        while IFS= read -r sid; do
+            [[ -z "$sid" ]] && continue
+            "$passless_bin" agent-admin --output json principals revoke "$sid" --confirm >/dev/null 2>&1 || revoke_result="failed"
+        done < <(printf '%s' "$principals_json" | jq -r '.sessions[]?.session_id // empty' 2>/dev/null)
     fi
-    _add_gc_scenario "cleanup_revoke" "pass" "delegation revoke: $revoke_result"
+    _add_gc_scenario "cleanup_revoke" "pass" "sessions/principals revoke: $revoke_result"
 
     local overall="pass"
     if [[ $failed -gt 0 ]]; then

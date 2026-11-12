@@ -8,7 +8,7 @@ use passless_core::agent::{
     RequestFrame, ResponseFrame, Role, SeqpacketCodec, Validate,
 };
 
-use passless_core::agent::{IntentAction, PrincipalSessionId, ProfileId};
+use passless_core::agent::{PrincipalSessionId, ProfileId};
 
 fn valid_proof() -> PrincipalCapabilityProof {
     PrincipalCapabilityProof::from_bytes([0xAB; 32])
@@ -66,15 +66,7 @@ fn admin_ping_round_trip_through_codec() {
 
 #[test]
 fn principal_frame_round_trip_through_codec() {
-    let action = PrincipalRequest::CreateIntent {
-        profile_id: valid_profile_id(),
-        action: IntentAction::Register,
-        rp_id: "example.com".into(),
-        credential_ref: None,
-        reason: None,
-        grant_ttl_secs: None,
-        session_ttl_secs: None,
-    };
+    let action = PrincipalRequest::Authority;
     let frame = RequestFrame::Principal(PrincipalRequestFrame::new(42, action, valid_proof()));
     let encoded = SeqpacketCodec::encode(&frame).unwrap();
     let decoded: RequestFrame = SeqpacketCodec::decode(&encoded).unwrap();
@@ -207,20 +199,6 @@ fn admin_validate_wait_principal_timeout_capped() {
     };
     let errors = req.validate().unwrap_err();
     assert!(errors.0.iter().any(|e| e.contains("timeout_ms")));
-}
-
-#[test]
-fn principal_validate_create_intent_valid() {
-    let req = PrincipalRequest::CreateIntent {
-        profile_id: valid_profile_id(),
-        action: IntentAction::Authenticate,
-        rp_id: "example.com".into(),
-        credential_ref: None,
-        reason: Some("testing".into()),
-        grant_ttl_secs: None,
-        session_ttl_secs: None,
-    };
-    assert!(req.validate().is_ok());
 }
 
 #[test]

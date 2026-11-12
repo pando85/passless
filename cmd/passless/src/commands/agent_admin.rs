@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -6,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use passless_core::{
     AdminAuditAction, AdminAuditExportFormat, AdminBrowserAction, AdminCredentialAction,
-    AdminDelegationAction, AdminPolicyAction, AdminProfileAction, AdminSessionAction,
-    AgentAdminAction, AgentSkillScope, AgentSkillTarget, CredentialRef, Error, GrantId,
-    OutputFormat, ProfileId, Result,
+    AdminGrantAction, AdminGrantsAction, AdminPolicyAction, AdminPrincipalsAction,
+    AdminProfileAction, AdminSessionsAction, AgentAdminAction, AgentSkillScope, AgentSkillTarget,
+    CredentialRef, Error, GrantId, OutputFormat, ProfileId, Result,
 };
 
 use passless_core::agent::PrincipalSessionId;
@@ -85,7 +86,8 @@ pub fn install(target: AgentSkillTarget, scope: AgentSkillScope, force: bool) ->
     let home = dirs::home_dir().ok_or_else(|| {
         Error::Other("Could not determine the home directory for skill installation".to_string())
     })?;
-    let agents = selected_agents(target, &home, &project)?;
+    let path = env::var_os("PATH");
+    let agents = selected_agents(target, &home, &project, path.as_deref())?;
 
     for agent in agents {
         let path = agent.skill_path(scope, &home, &project);
@@ -110,31 +112,6 @@ pub fn install(target: AgentSkillTarget, scope: AgentSkillScope, force: bool) ->
             }
         }
     }
-
-    Ok(())
-}
-
-pub fn install_native_messaging(browser: &str, ext_dir: &Path, sign_proxy: &Path) -> Result<()> {
-    use crate::agent::browser::{
-        NATIVE_MESSAGING_HOST_NAME, compute_extension_id, install_native_messaging_manifest,
-    };
-
-    let browser_exec = PathBuf::from(browser);
-    let manifest_path = install_native_messaging_manifest(ext_dir, &browser_exec, sign_proxy, None)
-        .map_err(|e| Error::Other(e.to_string()))?;
-
-    let ext_id = compute_extension_id(ext_dir);
-    println!(
-        "Installed native messaging manifest at {}",
-        manifest_path.display()
-    );
-    println!("  Host name: {}", NATIVE_MESSAGING_HOST_NAME);
-    println!("  Extension ID: {}", ext_id);
-    println!("  Sign proxy: {}", sign_proxy.display());
-    println!(
-        "\nNote: Ensure the extension is loaded with --load-extension={}",
-        ext_dir.display()
-    );
 
     Ok(())
 }
@@ -189,16 +166,12 @@ pub fn dispatch_admin(output: OutputFormat, action: &AgentAdminAction) -> Result
             scope,
             force,
         } => install(*target, *scope, *force),
-        AgentAdminAction::InstallNativeMessaging {
-            browser,
-            ext_dir,
-            sign_proxy,
-        } => install_native_messaging(browser, ext_dir, sign_proxy),
         AgentAdminAction::Profile { action } => dispatch_profile(output, action),
         AgentAdminAction::Policy { action } => dispatch_policy(output, action),
         AgentAdminAction::Credential { action } => dispatch_admin_credential(output, action),
-        AgentAdminAction::Delegation { action } => dispatch_admin_delegation(output, action),
-        AgentAdminAction::Session { action } => dispatch_admin_session(output, action),
+        AgentAdminAction::Grants { action } => dispatch_admin_grants(output, action),
+        AgentAdminAction::Sessions { action } => dispatch_admin_sessions(output, action),
+        AgentAdminAction::Principals { action } => dispatch_admin_principals(output, action),
         AgentAdminAction::Browser { action } => dispatch_browser(output, action),
         AgentAdminAction::Audit { action } => dispatch_audit(output, action),
         AgentAdminAction::Shutdown { confirm } => dispatch_shutdown(output, *confirm),
@@ -222,7 +195,6 @@ fn dispatch_profile(output: OutputFormat, action: &AdminProfileAction) -> Result
                         println!("profile_id: {}", report.profile_id);
                         println!("enabled: {}", report.enabled);
                         println!("mode: {}", report.mode);
-                        println!("endpoint_state: {}", report.endpoint_state);
                         if let Some(ref lease) = report.browser_lease_state {
                             println!("browser_lease_state: {}", lease);
                         }
@@ -255,7 +227,6 @@ fn dispatch_profile(output: OutputFormat, action: &AdminProfileAction) -> Result
                         println!("policy_generation: {}", info.policy_generation);
                         println!("active_grants: {}", info.active_grants);
                         println!("active_sessions: {}", info.active_sessions);
-                        println!("pending_intents: {}", info.pending_intents);
                         Ok(())
                     }
                 },
@@ -571,10 +542,108 @@ fn dispatch_admin_credential(output: OutputFormat, action: &AdminCredentialActio
     }
 }
 
-fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationAction) -> Result<()> {
+/// `agent-admin grants`: the persistent granted rules (ADR 0014 section 8.4).
+fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Result<()> {
+    let request = match action {
+        AdminGrantsAction::List { profile } => AdminRequest::ListGrantedRules {
+            profile_id: profile.as_deref().map(parse_profile_id).transpose()?,
+        },
+        AdminGrantsAction::Revoke {
+            profile,
+            rp_id,
+            action,
+            confirm,
+        } => {
+            require_confirm(*confirm)?;
+            AdminRequest::RevokeGrantedRule {
+                profile_id: parse_profile_id(profile)?,
+                rp_id: rp_id.clone(),
+                action: match action {
+                    AdminGrantAction::Authenticate => {
+                        passless_core::agent::GrantAction::Authenticate
+                    }
+                },
+            }
+        }
+        AdminGrantsAction::Clear { profile, confirm } => {
+            require_confirm(*confirm)?;
+            AdminRequest::ClearGrantedRules {
+                profile_id: parse_profile_id(profile)?,
+            }
+        }
+    };
+    let mut client = connect_admin_client()?;
+    let resp = client
+        .request(request)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    match resp {
+        passless_core::agent::AdminResponse::GrantedRuleList(list) => match output {
+            OutputFormat::Json => admin_output_json(&list),
+            OutputFormat::Plain => {
+                for profile in &list.profiles {
+                    match &profile.disabled_reason {
+                        Some(reason) => {
+                            println!("{}: DISABLED ({})", profile.profile_id, reason)
+                        }
+                        None => println!(
+                            "{}: {} rule(s), digest {}",
+                            profile.profile_id,
+                            profile.rules.len(),
+                            profile.digest
+                        ),
+                    }
+                    for rule in &profile.rules {
+                        print!(
+                            "  {} {} kind={} rule={} granted_at={} request={} origin={}",
+                            rule.rp_id,
+                            rule.action,
+                            rule.kind,
+                            rule.rule,
+                            rule.granted_at,
+                            rule.request_id,
+                            rule.origin
+                        );
+                        if let Some(credential_ref) = &rule.credential_ref {
+                            print!(" credential={}", credential_ref);
+                        }
+                        println!();
+                    }
+                }
+                Ok(())
+            }
+        },
+        passless_core::agent::AdminResponse::GrantedRulesRevoked { revoked } => {
+            #[derive(Serialize)]
+            struct RevokedOut {
+                revoked: u32,
+            }
+            match output {
+                OutputFormat::Json => admin_output_json(&RevokedOut { revoked }),
+                OutputFormat::Plain => {
+                    println!("revoked: {}", revoked);
+                    Ok(())
+                }
+            }
+        }
+        _ => Err(Error::Other("unexpected response".to_string())),
+    }
+}
+
+fn require_confirm(confirm: bool) -> Result<()> {
+    if confirm {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "destructive action requires --confirm flag".to_string(),
+        ))
+    }
+}
+
+/// `agent-admin sessions` (formerly `delegation`): browser bearer session grants.
+fn dispatch_admin_sessions(output: OutputFormat, action: &AdminSessionsAction) -> Result<()> {
     let mut client = connect_admin_client()?;
     match action {
-        AdminDelegationAction::Show { grant_id } => {
+        AdminSessionsAction::Show { grant_id } => {
             let req = AdminRequest::ShowDelegation {
                 grant_id: parse_grant_id(grant_id)?,
             };
@@ -598,7 +667,7 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminDelegationAction::List { profile } => {
+        AdminSessionsAction::List { profile } => {
             let profile_id = profile.as_deref().map(parse_profile_id).transpose()?;
             let req = AdminRequest::ListDelegations { profile_id };
             let resp = client
@@ -621,7 +690,7 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminDelegationAction::Revoke { grant_id, confirm } => {
+        AdminSessionsAction::Revoke { grant_id, confirm } => {
             if !confirm {
                 return Err(Error::Other(
                     "destructive action requires --confirm flag".to_string(),
@@ -655,58 +724,14 @@ fn dispatch_admin_delegation(output: OutputFormat, action: &AdminDelegationActio
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminDelegationAction::RequestRegistration {
-            profile,
-            rp,
-            session_ttl,
-            reason,
-        } => {
-            let req = AdminRequest::RequestRegistration {
-                profile_id: parse_profile_id(profile)?,
-                rp_id: rp.clone(),
-                max_session_ttl: *session_ttl,
-                reason: reason.clone(),
-            };
-            let resp = client
-                .request(req)
-                .map_err(|e| Error::Other(e.to_string()))?;
-            match resp {
-                passless_core::agent::AdminResponse::RegistrationGranted {
-                    registration_grant_id,
-                } => {
-                    #[derive(Serialize)]
-                    struct RegistrationGrantedOut {
-                        registration_grant_id: String,
-                        rp_id: String,
-                        session_ttl: u64,
-                    }
-                    let out = RegistrationGrantedOut {
-                        registration_grant_id: registration_grant_id.to_string(),
-                        rp_id: rp.clone(),
-                        session_ttl: *session_ttl,
-                    };
-                    match output {
-                        OutputFormat::Json => admin_output_json(&out),
-                        OutputFormat::Plain => {
-                            println!("registration_grant_id: {}", out.registration_grant_id);
-                            println!("rp_id: {}", out.rp_id);
-                            println!("session_ttl: {}", out.session_ttl);
-                            Ok(())
-                        }
-                    }
-                }
-                _ => Err(Error::Other(
-                    "unexpected response for registration request".to_string(),
-                )),
-            }
-        }
     }
 }
 
-fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> Result<()> {
+/// `agent-admin principals` (formerly `session`): principal sessions.
+fn dispatch_admin_principals(output: OutputFormat, action: &AdminPrincipalsAction) -> Result<()> {
     let mut client = connect_admin_client()?;
     match action {
-        AdminSessionAction::Show { session_id } => {
+        AdminPrincipalsAction::Show { session_id } => {
             let req = AdminRequest::ShowSession {
                 session_id: parse_session_id(session_id)?,
             };
@@ -728,7 +753,7 @@ fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> 
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminSessionAction::List { profile } => {
+        AdminPrincipalsAction::List { profile } => {
             let profile_id = profile.as_deref().map(parse_profile_id).transpose()?;
             let req = AdminRequest::ListSessions { profile_id };
             let resp = client
@@ -748,7 +773,7 @@ fn dispatch_admin_session(output: OutputFormat, action: &AdminSessionAction) -> 
                 _ => Err(Error::Other("unexpected response".to_string())),
             }
         }
-        AdminSessionAction::Revoke {
+        AdminPrincipalsAction::Revoke {
             session_id,
             confirm,
         } => {
@@ -812,6 +837,12 @@ fn dispatch_browser(output: OutputFormat, action: &AdminBrowserAction) -> Result
                         }
                         if let Some(ref endpoint) = info.cdp_endpoint {
                             println!("cdp_endpoint: {}", endpoint);
+                        }
+                        if let Some(ref interception) = info.interception {
+                            println!("interception: {}", interception);
+                        }
+                        if let Some(incognito_allowed) = info.incognito_allowed {
+                            println!("incognito_allowed: {}", incognito_allowed);
                         }
                         Ok(())
                     }
@@ -920,6 +951,7 @@ fn selected_agents(
     target: AgentSkillTarget,
     home: &Path,
     project: &Path,
+    path: Option<&OsStr>,
 ) -> Result<Vec<AgentKind>> {
     let explicit = match target {
         AgentSkillTarget::Auto => None,
@@ -933,7 +965,7 @@ fn selected_agents(
 
     let agents: Vec<_> = AgentKind::ALL
         .into_iter()
-        .filter(|agent| agent_is_detected(*agent, home, project))
+        .filter(|agent| agent_is_detected(*agent, home, project, path))
         .collect();
     if agents.is_empty() {
         return Err(Error::Other(
@@ -944,19 +976,23 @@ fn selected_agents(
     Ok(agents)
 }
 
-fn agent_is_detected(agent: AgentKind, home: &Path, project: &Path) -> bool {
+fn agent_is_detected(agent: AgentKind, home: &Path, project: &Path, path: Option<&OsStr>) -> bool {
     agent.user_config_path(home).is_dir()
         || match agent {
             AgentKind::Opencode => project.join(".opencode").is_dir(),
             AgentKind::Claude => project.join(".claude").is_dir(),
             AgentKind::Pi => project.join(".pi").is_dir(),
         }
-        || command_exists(agent.command())
+        || command_exists(agent.command(), path)
 }
 
-fn command_exists(command: &str) -> bool {
-    env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|directory| {
+/// Whether `command` is an executable file in one of the `path` directories.
+///
+/// `path` is the value of `PATH`, passed in so callers (and tests) never need
+/// to read or rewrite the process environment.
+fn command_exists(command: &str, path: Option<&OsStr>) -> bool {
+    path.is_some_and(|path| {
+        env::split_paths(path).any(|directory| {
             let candidate = directory.join(command);
             fs::metadata(candidate).is_ok_and(|metadata| {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
@@ -1191,24 +1227,31 @@ mod tests {
         assert_eq!(paths.len(), 6);
     }
 
+    /// A `PATH` value that contains no agent executables.
+    fn empty_path() -> &'static OsStr {
+        OsStr::new("/nonexistent-passless-test-path")
+    }
+
     #[test]
     fn explicit_selection_does_not_require_detection() {
         let dir = tempdir().unwrap();
-        let selected = selected_agents(AgentSkillTarget::Claude, dir.path(), dir.path()).unwrap();
+        let selected =
+            selected_agents(AgentSkillTarget::Claude, dir.path(), dir.path(), None).unwrap();
         assert_eq!(selected, vec![AgentKind::Claude]);
     }
 
     #[test]
     fn explicit_opencode_does_not_require_detection() {
         let dir = tempdir().unwrap();
-        let selected = selected_agents(AgentSkillTarget::Opencode, dir.path(), dir.path()).unwrap();
+        let selected =
+            selected_agents(AgentSkillTarget::Opencode, dir.path(), dir.path(), None).unwrap();
         assert_eq!(selected, vec![AgentKind::Opencode]);
     }
 
     #[test]
     fn explicit_pi_does_not_require_detection() {
         let dir = tempdir().unwrap();
-        let selected = selected_agents(AgentSkillTarget::Pi, dir.path(), dir.path()).unwrap();
+        let selected = selected_agents(AgentSkillTarget::Pi, dir.path(), dir.path(), None).unwrap();
         assert_eq!(selected, vec![AgentKind::Pi]);
     }
 
@@ -1219,8 +1262,13 @@ mod tests {
         fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
         fs::create_dir_all(home.path().join(".claude")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Opencode));
         assert!(selected.contains(&AgentKind::Claude));
     }
@@ -1231,8 +1279,13 @@ mod tests {
         let project = tempdir().unwrap();
         fs::create_dir_all(project.path().join(".opencode")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Opencode));
     }
 
@@ -1242,8 +1295,13 @@ mod tests {
         let project = tempdir().unwrap();
         fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Pi));
     }
 
@@ -1253,8 +1311,13 @@ mod tests {
         let project = tempdir().unwrap();
         fs::create_dir_all(project.path().join(".pi")).unwrap();
 
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_path()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Pi));
     }
 
@@ -1268,13 +1331,13 @@ mod tests {
         fs::write(&fake_opencode, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&fake_opencode, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", bin_dir.path()) };
-        let selected =
-            selected_agents(AgentSkillTarget::Auto, home.path(), project.path()).unwrap();
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        let selected = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(bin_dir.path().as_os_str()),
+        )
+        .unwrap();
         assert!(selected.contains(&AgentKind::Opencode));
     }
 
@@ -1283,12 +1346,13 @@ mod tests {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", tempdir().unwrap().path()) };
-        let result = selected_agents(AgentSkillTarget::Auto, home.path(), project.path());
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        let empty_bin_dir = tempdir().unwrap();
+        let result = selected_agents(
+            AgentSkillTarget::Auto,
+            home.path(),
+            project.path(),
+            Some(empty_bin_dir.path().as_os_str()),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -1498,12 +1562,10 @@ mod tests {
         fs::write(&fake, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", bin_dir.path()) };
-        assert!(command_exists("test-cmd-exists"));
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        assert!(command_exists(
+            "test-cmd-exists",
+            Some(bin_dir.path().as_os_str())
+        ));
     }
 
     #[test]
@@ -1513,12 +1575,11 @@ mod tests {
         fs::write(&fake, "not executable").unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let old_path = env::var("PATH").ok();
-        unsafe { env::set_var("PATH", bin_dir.path()) };
-        assert!(!command_exists("test-cmd-noexec"));
-        if let Some(old) = old_path {
-            unsafe { env::set_var("PATH", old) };
-        }
+        assert!(!command_exists(
+            "test-cmd-noexec",
+            Some(bin_dir.path().as_os_str())
+        ));
+        assert!(!command_exists("test-cmd-noexec", None));
     }
 
     #[test]
@@ -1557,13 +1618,12 @@ mod tests {
     #[test]
     fn profile_diagnostic_report_serializes_to_json() {
         use passless_core::agent::ProfileDiagnosticReport;
-        use passless_core::agent::protocol::{DoctorCheck, EndpointDiagnosticState};
+        use passless_core::agent::protocol::DoctorCheck;
 
         let report = ProfileDiagnosticReport {
             profile_id: "test".into(),
             enabled: true,
             mode: "Isolated".into(),
-            endpoint_state: EndpointDiagnosticState::Ready,
             browser_lease_state: None,
             policy_generation: 42,
             audit_gate_healthy: true,

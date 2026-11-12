@@ -33,12 +33,11 @@ required-features = ["agent"]
 default = []
 tpm = ["passless-core/tpm", "tss-esapi", "p256", "hkdf", "aes", "cipher"]
 face = ["dep:nokhwa", "dep:face_id", "dep:image", "dep:ort"]
-agent = ["passless-core/agent", "passless-uhid"]
+agent = ["passless-core/agent"]
 agent-validation = ["agent"]
 
 [dependencies]
 passless-core.workspace = true
-passless-uhid = { workspace = true, optional = true }
 soft-fido2.workspace = true
 soft-fido2-transport.workspace = true
 soft-fido2-ctap.workspace = true
@@ -68,6 +67,7 @@ thiserror.workspace = true
 ciborium = "0.2"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 hmac = "0.13"
+url = "2"
 rpassword = "7.3"
 atty = "0.2"
 serde_bytes = "0.11.19"
@@ -77,8 +77,6 @@ p256 = { version = "0.14", features = ["ecdh", "arithmetic"], optional = true }
 hkdf = { version = "0.13", optional = true }
 aes = { version = "0.9", optional = true }
 cipher = { version = "0.5", optional = true }
-rsa = { version = "0.10", default-features = false, features = ["std", "encoding"] }
-getrandom = "0.4"
 toml.workspace = true
 
 # UV provider dependencies
@@ -95,16 +93,19 @@ ort = { version = "=2.0.0-rc.13", default-features = false, optional = true }
 
 [dev-dependencies]
 base64 = "0.23"
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 ciborium = "0.2"
 tempfile = "3.14"
 hex = "0.4"
 soft-fido2-ctap.workspace = true
+soft-fido2-crypto.workspace = true
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 passless-config-doc.workspace = true
 zbus = { workspace = true, features = ["tokio"] }
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+notify-double = { path = "../../tools/notify-double" }
 
 [build-dependencies]
 passless-core.workspace = true

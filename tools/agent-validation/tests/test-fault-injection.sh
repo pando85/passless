@@ -130,37 +130,38 @@ test_fault_category_includes_audit_enospc() {
     fi
 }
 
-test_fault_category_includes_intent_races() {
-    log_test "fault categories include intent/grant race tests"
+test_fault_category_includes_grant_races() {
+    log_test "fault categories include grant race tests"
     setup_env
     local found=false
     for spec in "${AV_FAULT_RUST_CATEGORIES[@]}"; do
-        if [[ "$spec" == *"intent"* ]] && [[ "$spec" == *"race"* ]]; then
+        if [[ "$spec" == *"grant"* ]] && [[ "$spec" == *"race"* ]]; then
             found=true
             break
         fi
     done
     if [[ "$found" == "true" ]]; then
-        log_pass "intent/grant race category present"
+        log_pass "grant race category present"
     else
-        log_fail "intent/grant race category missing"
+        log_fail "grant race category missing"
     fi
 }
 
-test_fault_category_includes_endpoint_capacity() {
-    log_test "fault categories include endpoint capacity tests"
+test_fault_categories_exclude_agent_endpoints() {
+    log_test "fault categories reference no removed agent UHID endpoint/ceremony modules"
     setup_env
     local found=false
     for spec in "${AV_FAULT_RUST_CATEGORIES[@]}"; do
-        if [[ "$spec" == *"endpoint"* ]] && [[ "$spec" == *"capacity"* ]]; then
+        if [[ "$spec" == *"endpoint_manager"* ]] || [[ "$spec" == *"agent::ceremony"* ]] \
+            || [[ "$spec" == *"ceremony_observer"* ]] || [[ "$spec" == *"agent::interaction"* ]]; then
             found=true
             break
         fi
     done
-    if [[ "$found" == "true" ]]; then
-        log_pass "endpoint capacity category present"
+    if [[ "$found" == "false" ]]; then
+        log_pass "no removed-module fault categories present"
     else
-        log_fail "endpoint capacity category missing"
+        log_fail "fault categories still reference removed agent modules"
     fi
 }
 
@@ -181,20 +182,20 @@ test_fault_category_includes_browser_cleanup() {
     fi
 }
 
-test_fault_category_includes_malformed_cbor() {
-    log_test "fault categories include malformed CBOR tests"
+test_fault_category_includes_malformed_ipc() {
+    log_test "fault categories include malformed IPC message tests"
     setup_env
     local found=false
     for spec in "${AV_FAULT_RUST_CATEGORIES[@]}"; do
-        if [[ "$spec" == *"malformed"* ]] || [[ "$spec" == *"cbor"* ]]; then
+        if [[ "$spec" == *"ipc"* ]] && [[ "$spec" == *"malformed"* ]]; then
             found=true
             break
         fi
     done
     if [[ "$found" == "true" ]]; then
-        log_pass "malformed CBOR category present"
+        log_pass "malformed IPC category present"
     else
-        log_fail "malformed CBOR category missing"
+        log_fail "malformed IPC category missing"
     fi
 }
 
@@ -261,7 +262,27 @@ test_process_kill_check_cleans_up() {
     if [[ "$status" == "pass" ]]; then
         log_pass "process kill check passed"
     else
-        log_pass "process kill check completed (status=$status)"
+        log_fail "process kill check did not pass (status=$status result=$result)"
+    fi
+}
+
+test_process_kill_check_is_race_free() {
+    log_test "process kill check is deterministic with an EXIT trap installed (spawn/SIGTERM race)"
+    setup_env
+    local status result failures=0
+    # This script already has an EXIT trap, which makes bash catch SIGTERM and
+    # is what exposed the original fork-before-exec race.
+    for _ in $(seq 1 25); do
+        result=$(av_run_process_kill_check "$EVIDENCE_DIR" 10) || true
+        status=$(printf '%s' "$result" | jq -r '.status' 2>/dev/null || echo "unknown")
+        if [[ "$status" != "pass" ]]; then
+            ((failures++)) || true
+        fi
+    done
+    if [[ $failures -eq 0 ]]; then
+        log_pass "25/25 process kill checks passed"
+    else
+        log_fail "$failures/25 process kill checks failed"
     fi
 }
 
@@ -308,14 +329,15 @@ main() {
     test_fault_categories_defined
     test_fault_category_names_unique
     test_fault_category_includes_audit_enospc
-    test_fault_category_includes_intent_races
-    test_fault_category_includes_endpoint_capacity
+    test_fault_category_includes_grant_races
+    test_fault_categories_exclude_agent_endpoints
     test_fault_category_includes_browser_cleanup
-    test_fault_category_includes_malformed_cbor
+    test_fault_category_includes_malformed_ipc
     test_fault_category_includes_monotonic_clocks
     test_fault_category_includes_circuit_breaker
     test_resource_ceiling_check_cleans_up
     test_process_kill_check_cleans_up
+    test_process_kill_check_is_race_free
     test_fault_wired_in_run_sh
     test_fault_no_skip_stage_in_tier1
     test_fault_stage_function_exists

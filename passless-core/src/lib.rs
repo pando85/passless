@@ -6,15 +6,15 @@ pub mod error;
 #[cfg(feature = "agent")]
 pub use agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentStorageConfig, BoundedDuration, CredentialRef,
-    DeviceIdentity, GrantId, IdError, PendingRequestId, Policy, PolicyDigest, PolicyError,
-    PolicyParams, PrincipalSessionId, ProfileId, validate_rp_id,
+    DeviceIdentity, GrantId, IdError, Policy, PolicyDigest, PolicyError, PolicyParams,
+    PrincipalSessionId, ProfileId, validate_rp_id,
 };
 #[cfg(feature = "agent")]
 pub use config::{
     AdminAuditAction, AdminAuditExportFormat, AdminBrowserAction, AdminCredentialAction,
-    AdminDelegationAction, AdminPolicyAction, AdminProfileAction, AdminSessionAction,
-    AgentAdminAction, AgentCommand, AgentCredentialAction, AgentDelegationAction,
-    AgentIntentAction, AgentIntentActionType,
+    AdminGrantAction, AdminGrantsAction, AdminPolicyAction, AdminPrincipalsAction,
+    AdminProfileAction, AdminSessionsAction, AgentAdminAction, AgentCommand, AgentCredentialAction,
+    McpAdapter, McpAdapterKind, McpConfigTarget,
 };
 pub use config::{
     AgentSkillScope, AgentSkillTarget, AppConfig, Args, BackendConfig, ClientAction, Commands,

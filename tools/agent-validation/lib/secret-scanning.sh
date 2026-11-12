@@ -62,9 +62,7 @@ AV_ALLOWED_METADATA_KEYS=(
     user_name
     user_display_name
     session_id
-    endpoint_id
     profile_id
-    intent_id
     grant_id
     device_name
     timestamp

@@ -4,15 +4,16 @@ mod e2e_tests {
     #[ignore]
     fn test_e2e_registration_via_extension() {
         // E2E flow for registration via browser extension:
-        // 1. Start daemon with agent profile:
-        //    cargo run -- --agent --agent-profile <profile>
-        // 2. Launch browser with extension pointing to daemon endpoint
+        // 1. Start the daemon with an agent profile that has an exact-RP `register = "allow"` rule
+        // 2. Launch the managed browser (`passless agent browser`, or an MCP adapter)
         // 3. Navigate to a WebAuthn registration test page (e.g. webauthn.io)
-        // 4. Trigger navigator.credentials.create() via the extension
-        // 5. Extension sends POST /register to daemon sign server
-        // 6. Daemon validates grant, generates keypair, writes credential
-        // 7. Extension receives response and returns PublicKeyCredential to RP
-        // 8. Verify credential appears in `passless agent admin grants` output
+        // 4. Trigger navigator.credentials.create(); the extension's webAuthenticationProxy hands it
+        //    to the daemon over the native-messaging relay
+        // 5. Daemon checks the lease-bound bearer and the rule, generates the keypair, writes the
+        //    credential
+        // 6. Extension completes the request and the page receives a PublicKeyCredential
+        // 7. Verify the credential is in the profile's backend
+        // (automated in tests/agent-e2e, E2E-02 and E2E-27)
     }
 
     #[test]
@@ -40,11 +41,12 @@ mod e2e_tests {
 
     #[test]
     #[ignore]
-    fn test_e2e_registration_grant_expiry() {
-        // E2E flow verifying grant expiry:
-        // 1. Request a registration grant with a short TTL
-        // 2. Wait for the grant to expire
-        // 3. Attempt registration
-        // 4. Verify the registration is rejected with a forbidden error
+    fn test_e2e_registration_bearer_revoked_with_lease() {
+        // E2E flow verifying that registration bearers die with the browser lease
+        // (tests/agent-e2e E2E-11):
+        // 1. Register with the live bearer
+        // 2. Exit the browser (or revoke the lease)
+        // 3. Attempt registration with the old bearer
+        // 4. Verify the request is refused and an audited policy.deny(bearer_revoked) is recorded
     }
 }

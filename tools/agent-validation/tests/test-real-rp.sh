@@ -103,8 +103,16 @@ MOCK
         printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
-    *"delegation revoke"*)
-        printf '{"status":"ok"}\n'
+    *"agent-admin --output json sessions list"*)
+        printf '{"grants":[{"grant_id":"grant-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json principals list"*)
+        printf '{"sessions":[{"session_id":"sess-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json sessions revoke"* | *"agent-admin --output json principals revoke"*)
+        printf '{"revoked":true}\n'
         exit 0
         ;;
     *)
@@ -843,8 +851,16 @@ case "$received" in
         printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
-    *"delegation revoke"*)
-        printf '{"status":"ok"}\n'
+    *"agent-admin --output json sessions list"*)
+        printf '{"grants":[{"grant_id":"grant-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json principals list"*)
+        printf '{"sessions":[{"session_id":"sess-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json sessions revoke"* | *"agent-admin --output json principals revoke"*)
+        printf '{"revoked":true}\n'
         exit 0
         ;;
     *)
@@ -912,8 +928,16 @@ case "$received" in
         printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
-    *"delegation revoke"*)
-        printf '{"status":"ok"}\n'
+    *"agent-admin --output json sessions list"*)
+        printf '{"grants":[{"grant_id":"grant-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json principals list"*)
+        printf '{"sessions":[{"session_id":"sess-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json sessions revoke"* | *"agent-admin --output json principals revoke"*)
+        printf '{"revoked":true}\n'
         exit 0
         ;;
     *)
@@ -980,8 +1004,16 @@ case "$received" in
         printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
-    *"delegation revoke"*)
-        printf '{"status":"ok"}\n'
+    *"agent-admin --output json sessions list"*)
+        printf '{"grants":[{"grant_id":"grant-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json principals list"*)
+        printf '{"sessions":[{"session_id":"sess-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json sessions revoke"* | *"agent-admin --output json principals revoke"*)
+        printf '{"revoked":true}\n'
         exit 0
         ;;
     *)
@@ -1058,8 +1090,16 @@ case "$received" in
         printf '{"entries":[{"action":"authenticate","rp_id":"rp.example.net","timestamp":"2024-01-01T00:00:00Z","status":"approved"}]}\n'
         exit 0
         ;;
-    *"delegation revoke"*)
-        printf '{"status":"ok"}\n'
+    *"agent-admin --output json sessions list"*)
+        printf '{"grants":[{"grant_id":"grant-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json principals list"*)
+        printf '{"sessions":[{"session_id":"sess-001"}]}\n'
+        exit 0
+        ;;
+    *"agent-admin --output json sessions revoke"* | *"agent-admin --output json principals revoke"*)
+        printf '{"revoked":true}\n'
         exit 0
         ;;
     *)

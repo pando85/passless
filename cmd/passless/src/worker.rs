@@ -1,11 +1,7 @@
 use soft_fido2_transport::{CommandHandler, CtapHidHandler, Packet, UhidDevice};
 
-#[cfg(feature = "agent")]
-use passless_uhid::{RawUhidDevice, UhidEvent};
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -32,12 +28,6 @@ pub enum WorkerOutcome {
     Clean,
     Error(WorkerError),
     Panicked,
-}
-
-#[cfg(feature = "agent")]
-pub enum JoinOutcome {
-    Finished(WorkerOutcome),
-    TimedOut,
 }
 
 pub trait HidEndpoint: Send {
@@ -77,47 +67,6 @@ impl HidEndpoint for UhidEndpoint {
     }
 }
 
-#[cfg(feature = "agent")]
-pub struct RawUhidEndpoint(RawUhidDevice);
-
-#[cfg(feature = "agent")]
-impl RawUhidEndpoint {
-    pub fn new_nonblocking(device: RawUhidDevice) -> Self {
-        let _ = device.set_nonblocking(true);
-        Self(device)
-    }
-}
-
-#[cfg(feature = "agent")]
-impl HidEndpoint for RawUhidEndpoint {
-    fn read_packet(&mut self, buffer: &mut [u8; 64]) -> Result<Option<usize>, WorkerError> {
-        loop {
-            match self.0.read_event() {
-                Ok(Some(UhidEvent::Output { data, .. })) => {
-                    if data.len() == 65 && data[0] == 0x00 {
-                        buffer[..64].copy_from_slice(&data[1..65]);
-                        return Ok(Some(64));
-                    } else if data.len() <= 64 {
-                        let len = data.len();
-                        buffer[..len].copy_from_slice(&data[..len]);
-                        return Ok(Some(len));
-                    }
-                    continue;
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(None),
-                Err(e) => return Err(WorkerError::Read(format!("{:?}", e))),
-            }
-        }
-    }
-
-    fn write_packet(&mut self, data: &[u8; 64]) -> Result<(), WorkerError> {
-        self.0
-            .write_packet(data)
-            .map_err(|e| WorkerError::Write(format!("{:?}", e)))
-    }
-}
-
 #[derive(Clone)]
 pub struct WorkerConfig {
     pub poll_interval: Duration,
@@ -136,7 +85,6 @@ impl Default for WorkerConfig {
 pub struct WorkerHandle {
     cancel: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), WorkerError>>>,
-    pending_rx: Option<mpsc::Receiver<WorkerOutcome>>,
 }
 
 impl WorkerHandle {
@@ -144,96 +92,7 @@ impl WorkerHandle {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "agent")]
-    pub fn join_timeout(&mut self, timeout: Duration) -> JoinOutcome {
-        if let Some(rx) = self.pending_rx.take() {
-            return match rx.recv_timeout(timeout) {
-                Ok(outcome) => JoinOutcome::Finished(outcome),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.pending_rx = Some(rx);
-                    JoinOutcome::TimedOut
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    JoinOutcome::Finished(WorkerOutcome::Clean)
-                }
-            };
-        }
-
-        let thread = match self.thread.take() {
-            Some(t) => t,
-            None => return JoinOutcome::Finished(WorkerOutcome::Clean),
-        };
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = match thread.join() {
-                Ok(Ok(())) => WorkerOutcome::Clean,
-                Ok(Err(e)) => WorkerOutcome::Error(e),
-                Err(_) => WorkerOutcome::Panicked,
-            };
-            let _ = tx.send(result);
-        });
-
-        match rx.recv_timeout(timeout) {
-            Ok(outcome) => JoinOutcome::Finished(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending_rx = Some(rx);
-                JoinOutcome::TimedOut
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                JoinOutcome::Finished(WorkerOutcome::Clean)
-            }
-        }
-    }
-
-    #[cfg(feature = "agent")]
-    pub fn try_join(&mut self) -> Option<WorkerOutcome> {
-        if let Some(rx) = self.pending_rx.take() {
-            return match rx.try_recv() {
-                Ok(outcome) => Some(outcome),
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.pending_rx = Some(rx);
-                    None
-                }
-                Err(mpsc::TryRecvError::Disconnected) => Some(WorkerOutcome::Clean),
-            };
-        }
-
-        let thread = match self.thread.take() {
-            Some(t) => t,
-            None => return Some(WorkerOutcome::Clean),
-        };
-
-        if !thread.is_finished() {
-            self.thread = Some(thread);
-            return None;
-        }
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = match thread.join() {
-                Ok(Ok(())) => WorkerOutcome::Clean,
-                Ok(Err(e)) => WorkerOutcome::Error(e),
-                Err(_) => WorkerOutcome::Panicked,
-            };
-            let _ = tx.send(result);
-        });
-
-        match rx.try_recv() {
-            Ok(outcome) => Some(outcome),
-            Err(mpsc::TryRecvError::Empty) => {
-                self.pending_rx = Some(rx);
-                None
-            }
-            Err(mpsc::TryRecvError::Disconnected) => Some(WorkerOutcome::Clean),
-        }
-    }
-
     pub fn join(mut self) -> WorkerOutcome {
-        if let Some(rx) = self.pending_rx.take() {
-            return rx.recv().unwrap_or(WorkerOutcome::Clean);
-        }
-
         let thread = match self.thread.take() {
             Some(t) => t,
             None => return WorkerOutcome::Clean,
@@ -251,9 +110,6 @@ impl Drop for WorkerHandle {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
-        }
-        if let Some(rx) = self.pending_rx.take() {
-            let _ = rx.recv();
         }
     }
 }
@@ -318,7 +174,6 @@ where
     WorkerHandle {
         cancel,
         thread: Some(thread),
-        pending_rx: None,
     }
 }
 

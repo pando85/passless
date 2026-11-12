@@ -234,7 +234,7 @@ test_cc_event_capture_exists() {
 
 test_cc_iframe_fixtures_exist() {
     log_test "cross-origin iframe fixtures exist"
-    local rp_dir="${VALIDATION_DIR}/../agent-uhid-feasibility/controlled-rp/static"
+    local rp_dir="${VALIDATION_DIR}/controlled-rp/static"
     local all_ok=true
     for f in iframe-host.html iframe-sender.html; do
         if [[ ! -f "${rp_dir}/${f}" ]]; then

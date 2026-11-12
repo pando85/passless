@@ -10,7 +10,7 @@ VALIDATION_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LIB_DIR="${VALIDATION_DIR}/lib"
 STAGES_DIR="${VALIDATION_DIR}/stages"
 # shellcheck disable=SC2034
-PHASE0_DIR="${VALIDATION_DIR}/../agent-uhid-feasibility"
+PHASE0_DIR="${VALIDATION_DIR}"
 
 TEST_TMP_DIR="/tmp/passless-av-tier3-test-$$"
 RED='\033[0;31m'

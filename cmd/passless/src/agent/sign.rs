@@ -1,28 +1,35 @@
-use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
 
-use passless_core::agent::config::{ANY_RP_ID, CredentialSelection};
+use passless_core::agent::config::{ANY_RP_ID, CredentialSelection, LOCALHOST_RP_ID};
 use passless_core::agent::protocol::{
-    ErrorCode, PrincipalResponse, ProtocolError, RecommendedAction, RegisterCredentialRequest,
+    ErrorCode, GrantAction, PrincipalResponse, ProtocolError, RecommendedAction,
     SignAssertionRequest, SignAssertionResponse,
 };
-use passless_core::agent::{AgentProfileConfig, CredentialRef, ProfileId};
+use passless_core::agent::{CredentialRef, ProfileId, RuleAction, RuleIdentity};
 use passless_core::config::SecurityConfig;
 
 use super::audit::AuditGate;
-use super::audit_events::{AuditAction, PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason};
+use super::audit_events::{AuditAction, PolicyDenyReason};
+use super::escalation::{
+    EscalationOutcome, EscalationRefusal, EscalationRequest, EscalationService, NoPark, ParkHook,
+    WaiterSession,
+};
+use super::granted_rules::PermittingRule;
+use super::lock_order::{self, LockLevel, Tracked};
+use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
 use super::policy_engine::PolicyRuntime;
 use super::register::{RegisterContext, RegisterHandler};
+use super::session::{
+    AgentSession, CeremonyAction, CeremonyOutcome, CeremonyResult, ChallengeDigest, Claim,
+    ClaimGuard, ClaimRejection, JoinResult, ReplayKey, SessionInvalid, ceremony_deadline,
+};
 
 use crate::storage::CredentialStorage;
 
@@ -146,13 +153,28 @@ pub fn build_authenticator_data(
     auth_data
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginScheme {
+    Https,
+    /// Accepted only for exactly `localhost` (ADR 0014 section 6.1, plan R15).
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedOrigin {
+    pub scheme: OriginScheme,
     pub host: String,
     pub port: Option<u16>,
 }
 
+/// Parse a web origin. `https://host[:port]` is accepted for any host; `http://` is accepted only
+/// for exactly `localhost[:port]`, never for `*.localhost` or any other host.
 pub fn parse_origin(origin: &str) -> Option<ParsedOrigin> {
-    let rest = origin.strip_prefix("https://")?;
+    let (scheme, rest) = if let Some(rest) = origin.strip_prefix("https://") {
+        (OriginScheme::Https, rest)
+    } else {
+        (OriginScheme::Http, origin.strip_prefix("http://")?)
+    };
     if rest.is_empty() {
         return None;
     }
@@ -166,22 +188,23 @@ pub fn parse_origin(origin: &str) -> Option<ParsedOrigin> {
     if host_part.contains('?') || host_part.contains('#') || host_part.contains('@') {
         return None;
     }
-    if host_part.contains(':') {
-        let (host, port_str) = host_part.rsplit_once(':').unwrap();
+    let (host, port) = if let Some((host, port_str)) = host_part.rsplit_once(':') {
         if host.is_empty() {
             return None;
         }
-        let port: u16 = port_str.parse().ok()?;
-        Some(ParsedOrigin {
-            host: host.to_ascii_lowercase(),
-            port: Some(port),
-        })
+        // ASCII digits only (`u16::from_str` also accepts a leading `+`), and port 0 is not a port.
+        if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let port: u16 = port_str.parse().ok().filter(|port| *port != 0)?;
+        (host.to_ascii_lowercase(), Some(port))
     } else {
-        Some(ParsedOrigin {
-            host: host_part.to_ascii_lowercase(),
-            port: None,
-        })
+        (host_part.to_ascii_lowercase(), None)
+    };
+    if scheme == OriginScheme::Http && host != LOCALHOST_RP_ID {
+        return None;
     }
+    Some(ParsedOrigin { scheme, host, port })
 }
 
 pub fn verify_origin_structural(origin: &str, rp_id: &str) -> bool {
@@ -192,6 +215,10 @@ pub fn verify_origin_structural(origin: &str, rp_id: &str) -> bool {
     let normalized_rp = rp_id.trim().trim_end_matches('.').to_ascii_lowercase();
     if normalized_rp.is_empty() {
         return false;
+    }
+    // `localhost` is an exact-match RP: `foo.localhost` is never a valid origin for it.
+    if normalized_rp == LOCALHOST_RP_ID {
+        return parsed.host == LOCALHOST_RP_ID;
     }
     parsed.host == normalized_rp || parsed.host.ends_with(&format!(".{normalized_rp}"))
 }
@@ -205,13 +232,17 @@ pub fn verify_origin_context(
     if !verify_origin_structural(origin, rp_id) {
         return false;
     }
+    // Cross-origin frames fail closed (ADR 0014 §11, `sameOriginWithAncestors = false`): never allowed.
     if cross_origin {
-        return top_origin.and_then(parse_origin).is_some();
+        return false;
     }
     match top_origin {
         Some(top) => parse_origin(top).is_some_and(|parsed| {
-            parse_origin(origin)
-                .is_some_and(|frame| parsed.host == frame.host && parsed.port == frame.port)
+            parse_origin(origin).is_some_and(|frame| {
+                parsed.scheme == frame.scheme
+                    && parsed.host == frame.host
+                    && parsed.port == frame.port
+            })
         }),
         None => true,
     }
@@ -221,7 +252,7 @@ fn normalize_rp_id(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max_len = if a.len() > b.len() { a.len() } else { b.len() };
     let mut diff: usize = a.len() ^ b.len();
     for i in 0..max_len {
@@ -240,239 +271,184 @@ pub fn generate_bearer_token() -> Result<String, String> {
     Ok(b64u_encode(&bytes))
 }
 
-#[derive(Debug, Clone)]
-struct InFlightOutcome {
-    status: &'static str,
-    body: Vec<u8>,
-}
-
-#[derive(Debug)]
-enum InFlightState {
-    Pending,
-    Resolved(InFlightOutcome),
-}
-
-#[derive(Debug)]
-struct InFlightEntry {
-    state: Mutex<InFlightState>,
-    done: Condvar,
-}
-
-impl InFlightEntry {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(InFlightState::Pending),
-            done: Condvar::new(),
-        }
-    }
-
-    fn resolve(&self, outcome: InFlightOutcome) {
-        let mut s = match self.state.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        *s = InFlightState::Resolved(outcome);
-        self.done.notify_all();
-    }
-
-    fn wait(&self, timeout: Duration) -> Option<InFlightOutcome> {
-        let guard = match self.state.lock() {
-            Ok(g) => g,
-            Err(_) => return None,
-        };
-        let (guard, timed_out) = match self
-            .done
-            .wait_timeout_while(guard, timeout, |s| matches!(s, InFlightState::Pending))
-        {
-            Ok(pair) => pair,
-            Err(_) => return None,
-        };
-        if timed_out.timed_out() {
-            return None;
-        }
-        match &*guard {
-            InFlightState::Resolved(o) => Some(o.clone()),
-            InFlightState::Pending => None,
-        }
-    }
-}
-
-// Completed-outcome cache: some relying parties (e.g. Kanidm) submit the same
-// WebAuthn request body more than once for a single user gesture. The first
-// request is signed; an identical follow-up must receive the SAME outcome rather
-// than a `replayed_operation` rejection, otherwise the user-facing ceremony fails.
-//
-// Safety: a cached outcome is returned without re-signing, so the sign counter is
-// incremented exactly once and no new signature is produced. The real replay
-// defence remains the relying party's one-time challenge. After the TTL elapses an
-// identical body is rejected as `Replayed` as before.
-const COMPLETED_OUTCOME_TTL: Duration = Duration::from_secs(120);
-const MAX_COMPLETED_OUTCOMES: usize = 256;
-
-struct CompletedOutcome {
-    outcome: InFlightOutcome,
-    at: Instant,
-}
-
-struct RequestBudgetInner {
-    used: HashSet<[u8; 32]>,
-    in_flight: HashMap<[u8; 32], Arc<InFlightEntry>>,
-    completed: HashMap<[u8; 32], CompletedOutcome>,
-}
-
-#[derive(Clone)]
-struct RequestBudget {
-    inner: Arc<Mutex<RequestBudgetInner>>,
-    max_requests: usize,
-}
-
-impl RequestBudget {
-    fn claim(&self, body: &[u8]) -> RequestClaim {
-        let hash = Sha256::digest(body);
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(&hash);
-
-        let mut inner = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return RequestClaim::Unavailable,
-        };
-
-        if inner.used.contains(&digest) {
-            if let Some(entry) = inner.in_flight.get(&digest) {
-                return RequestClaim::WaitFor(entry.clone());
-            }
-            let now = Instant::now();
-            if let Some(completed) = inner.completed.get(&digest)
-                && now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL
-            {
-                return RequestClaim::Cached {
-                    outcome: completed.outcome.clone(),
-                };
-            }
-            return RequestClaim::Replayed;
-        }
-
-        if inner.used.len() >= self.max_requests {
-            return RequestClaim::Exhausted;
-        }
-
-        inner.used.insert(digest);
-        let entry = Arc::new(InFlightEntry::new());
-        inner.in_flight.insert(digest, entry);
-        RequestClaim::Claimed { digest }
-    }
-
-    fn resolve(&self, digest: [u8; 32], outcome: InFlightOutcome) {
-        let entry = {
-            let mut inner = match self.inner.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            let entry = inner.in_flight.remove(&digest);
-            let now = Instant::now();
-            inner
-                .completed
-                .retain(|_, completed| now.duration_since(completed.at) <= COMPLETED_OUTCOME_TTL);
-            if inner.completed.len() >= MAX_COMPLETED_OUTCOMES
-                && let Some(oldest) = inner
-                    .completed
-                    .iter()
-                    .min_by_key(|(_, completed)| completed.at)
-                    .map(|(digest, _)| *digest)
-            {
-                inner.completed.remove(&oldest);
-            }
-            inner.completed.insert(
-                digest,
-                CompletedOutcome {
-                    outcome: outcome.clone(),
-                    at: now,
-                },
-            );
-            entry
-        };
-        if let Some(entry) = entry {
-            entry.resolve(outcome);
-        }
-    }
-}
-
-struct InFlightGuard {
-    budget: RequestBudget,
-    digest: [u8; 32],
-    resolved: bool,
-}
-
-impl InFlightGuard {
-    fn new(budget: RequestBudget, digest: [u8; 32]) -> Self {
-        Self {
-            budget,
-            digest,
-            resolved: false,
-        }
-    }
-
-    fn resolve(&mut self, outcome: InFlightOutcome) {
-        self.budget.resolve(self.digest, outcome);
-        self.resolved = true;
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if !self.resolved {
-            self.budget.resolve(
-                self.digest,
-                InFlightOutcome {
-                    status: "500 Internal Server Error",
-                    body: b"{\"error\":\"internal_error\"}".to_vec(),
-                },
-            );
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct LeaseEntry {
     pub context: SignContext,
     pub handler: Arc<SignHandler>,
     pub lease_id: Option<String>,
-    request_budget: RequestBudget,
-}
-
-impl LeaseEntry {
-    fn claim_request(&self, body: &[u8]) -> RequestClaim {
-        self.request_budget.claim(body)
-    }
 }
 
 pub struct SignContextRegistry {
     entries: Mutex<HashMap<String, LeaseEntry>>,
     registration_entries: Mutex<HashMap<String, RegistrationLeaseEntry>>,
-    request_budgets: Mutex<HashMap<String, RequestBudget>>,
+    revoked_registrations: Mutex<RevokedRegistrations>,
+    revoked_signs: Mutex<RevokedSigns>,
+    /// When the registry was created; the base of [`REFUSAL_SWEEP_INTERVAL`] throttling.
+    created: Instant,
+    /// Milliseconds after `created` of the last tombstone sweep.
+    last_refusal_sweep_ms: AtomicU64,
 }
 
+/// A registration bearer is bound to the browser lease it was issued for, like a sign bearer, and is
+/// revoked with it (ADR 0014 section 9). It shares the sign bearer's session (replay table, budget,
+/// revocation).
 #[derive(Clone)]
 pub struct RegistrationLeaseEntry {
     pub context: RegisterContext,
     pub handler: Arc<RegisterHandler>,
-    request_budget: RequestBudget,
+    pub lease_id: Option<String>,
 }
 
-impl RegistrationLeaseEntry {
-    fn claim_request(&self, body: &[u8]) -> RequestClaim {
-        self.request_budget.claim(body)
+/// How often the runtime loop sweeps the revoked bearers' refusal ledgers.
+const REFUSAL_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Most revoked bearers of each kind remembered so a late use can be refused and audited.
+const MAX_REVOKED_REGISTRATIONS: usize = 256;
+
+/// What is kept of a revoked registration bearer: enough to audit a late use, never to serve it.
+#[derive(Clone)]
+pub struct RevokedRegistration {
+    context: RegisterContext,
+    handler: Arc<RegisterHandler>,
+}
+
+impl RevokedRegistration {
+    /// Audit a refused registration. The session's refusal ledger coalesces a flood into a
+    /// bounded number of records plus a `suppressed` count (review M2), so a browser holding an
+    /// old bearer cannot flood the audit log and no refusal is lost. `rp_id` is the untrusted RP
+    /// ID of the refused request, if it named one.
+    pub fn refuse(&self, rp_id: Option<&str>) {
+        self.handler.refuse_revoked_bearer(&self.context, rp_id);
     }
 }
 
-#[derive(Debug, Clone)]
-enum RequestClaim {
-    Claimed { digest: [u8; 32] },
-    Replayed,
-    Exhausted,
-    Unavailable,
-    WaitFor(Arc<InFlightEntry>),
-    Cached { outcome: InFlightOutcome },
+/// What is kept of a revoked sign bearer: enough to audit a late use, never to serve it.
+#[derive(Clone)]
+pub struct RevokedSign {
+    context: SignContext,
+    handler: Arc<SignHandler>,
+}
+
+impl RevokedSign {
+    /// Audit a refused authentication. The session's refusal ledger coalesces a flood into a
+    /// bounded number of records plus a `suppressed` count (review M2), so a browser holding an
+    /// old bearer cannot flood the audit log and no refusal is lost. `rp_id` is the untrusted RP
+    /// ID of the refused request, if it named one.
+    pub fn refuse(&self, rp_id: Option<&str>) {
+        self.handler.refuse_revoked_bearer(&self.context, rp_id);
+    }
+}
+
+/// The most recently revoked bearers of one kind, oldest evicted first.
+struct RevokedRing<T> {
+    order: std::collections::VecDeque<String>,
+    entries: HashMap<String, T>,
+}
+
+impl<T> Default for RevokedRing<T> {
+    fn default() -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+}
+
+type RevokedRegistrations = RevokedRing<RevokedRegistration>;
+type RevokedSigns = RevokedRing<RevokedSign>;
+
+impl<T> RevokedRing<T> {
+    fn remember(&mut self, token: String, entry: T) {
+        if self.entries.contains_key(&token) {
+            return;
+        }
+        while self.order.len() >= MAX_REVOKED_REGISTRATIONS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(token.clone());
+        self.entries.insert(token, entry);
+    }
+
+    fn find(&self, token: &str) -> Option<&T> {
+        let mut found = None;
+        for (k, v) in self.entries.iter() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                found = Some(v);
+            }
+        }
+        found
+    }
+}
+
+impl RevokedRegistrations {
+    fn remember_registration(&mut self, token: String, entry: &RegistrationLeaseEntry) {
+        self.remember(
+            token,
+            RevokedRegistration {
+                context: entry.context.clone(),
+                handler: entry.handler.clone(),
+            },
+        );
+    }
+}
+
+impl RevokedSigns {
+    fn remember_sign(&mut self, token: String, entry: &LeaseEntry) {
+        self.remember(
+            token,
+            RevokedSign {
+                context: entry.context.clone(),
+                handler: entry.handler.clone(),
+            },
+        );
+    }
+}
+
+/// The bearers a stale-session revocation removed: how many, and the browser leases they were
+/// bound to (each of which the caller must terminate).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StaleRevocation {
+    pub revoked: usize,
+    pub lease_ids: Vec<String>,
+}
+
+/// A bearer looked up for a request: the sign or the registration context behind it.
+#[derive(Clone)]
+pub enum BearerEntry {
+    Sign(LeaseEntry),
+    Register(RegistrationLeaseEntry),
+}
+
+impl BearerEntry {
+    pub fn session(&self) -> &Arc<AgentSession> {
+        match self {
+            Self::Sign(entry) => &entry.context.session,
+            Self::Register(entry) => &entry.context.session,
+        }
+    }
+
+    pub fn profile_id(&self) -> &ProfileId {
+        match self {
+            Self::Sign(entry) => &entry.context.profile_id,
+            Self::Register(entry) => &entry.context.profile_id,
+        }
+    }
+
+    pub fn audit_gate(&self) -> &Arc<AuditGate> {
+        match self {
+            Self::Sign(entry) => &entry.handler.audit_gate,
+            Self::Register(entry) => &entry.handler.audit_gate,
+        }
+    }
+
+    pub fn policy_runtime(&self) -> &Arc<PolicyRuntime> {
+        match self {
+            Self::Sign(entry) => &entry.handler.policy_runtime,
+            Self::Register(entry) => &entry.handler.policy_runtime,
+        }
+    }
 }
 
 impl SignContextRegistry {
@@ -480,31 +456,49 @@ impl SignContextRegistry {
         Self {
             entries: Mutex::new(HashMap::new()),
             registration_entries: Mutex::new(HashMap::new()),
-            request_budgets: Mutex::new(HashMap::new()),
+            revoked_registrations: Mutex::new(RevokedRegistrations::default()),
+            revoked_signs: Mutex::new(RevokedSigns::default()),
+            created: Instant::now(),
+            last_refusal_sweep_ms: AtomicU64::new(0),
         }
     }
 
-    fn request_budget(&self, token: &str, max_requests: usize) -> Result<RequestBudget, String> {
-        let mut budgets = self
-            .request_budgets
-            .lock()
-            .map_err(|_| "registry lock poisoned")?;
-        if let Some(existing) = budgets.get(token) {
-            if existing.max_requests != max_requests {
-                return Err("operation budget mismatch".into());
-            }
-            return Ok(existing.clone());
+    fn lock_entries(&self) -> Tracked<MutexGuard<'_, HashMap<String, LeaseEntry>>> {
+        lock_order::lock(&self.entries, LockLevel::SignRegistry)
+    }
+
+    fn lock_registration_entries(
+        &self,
+    ) -> Tracked<MutexGuard<'_, HashMap<String, RegistrationLeaseEntry>>> {
+        lock_order::lock(&self.registration_entries, LockLevel::SignRegistry)
+    }
+
+    fn lock_revoked_registrations(&self) -> Tracked<MutexGuard<'_, RevokedRegistrations>> {
+        lock_order::lock(&self.revoked_registrations, LockLevel::SignRegistry)
+    }
+
+    fn lock_revoked_signs(&self) -> Tracked<MutexGuard<'_, RevokedSigns>> {
+        lock_order::lock(&self.revoked_signs, LockLevel::SignRegistry)
+    }
+
+    /// The session already registered for `token` by the other context kind, if any.
+    fn existing_session(&self, token: &str) -> Option<Arc<AgentSession>> {
+        if let Some(entry) = self.lock_entries().get(token) {
+            return Some(entry.context.session.clone());
         }
-        let budget = RequestBudget {
-            inner: Arc::new(Mutex::new(RequestBudgetInner {
-                used: HashSet::new(),
-                in_flight: HashMap::new(),
-                completed: HashMap::new(),
-            })),
-            max_requests,
-        };
-        budgets.insert(token.to_string(), budget.clone());
-        Ok(budget)
+        self.lock_registration_entries()
+            .get(token)
+            .map(|entry| entry.context.session.clone())
+    }
+
+    /// One bearer has one session: a sign and a registration context of the same token must share it.
+    fn check_same_session(&self, token: &str, session: &Arc<AgentSession>) -> Result<(), String> {
+        match self.existing_session(token) {
+            Some(existing) if !Arc::ptr_eq(&existing, session) => {
+                Err("bearer session mismatch".into())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn register_pending_registration(
@@ -513,12 +507,8 @@ impl SignContextRegistry {
         context: RegisterContext,
         handler: Arc<RegisterHandler>,
     ) -> Result<(), String> {
-        let max_requests = usize::from(context.profile_config.max_operations);
-        let request_budget = self.request_budget(&token, max_requests)?;
-        let mut map = self
-            .registration_entries
-            .lock()
-            .map_err(|_| "registry lock poisoned")?;
+        self.check_same_session(&token, &context.session)?;
+        let mut map = self.lock_registration_entries();
         if map.contains_key(&token) {
             return Err("duplicate token".into());
         }
@@ -527,33 +517,139 @@ impl SignContextRegistry {
             RegistrationLeaseEntry {
                 context,
                 handler,
-                request_budget,
+                lease_id: None,
             },
         );
         Ok(())
     }
 
+    /// Bind a registration bearer to its browser lease. Until it is bound the bearer is unusable,
+    /// exactly like a sign bearer.
+    pub fn bind_registration_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
+        let mut map = self.lock_registration_entries();
+        let entry = map.get_mut(token).ok_or("token not found")?;
+        if entry.lease_id.is_some() {
+            return Err("already bound".into());
+        }
+        entry.lease_id = Some(lease_id);
+        Ok(())
+    }
+
+    /// A live (bound, not revoked) registration bearer.
     pub fn lookup_registration(&self, token: &str) -> Option<RegistrationLeaseEntry> {
-        let map = match self.registration_entries.lock() {
-            Ok(m) => m,
-            Err(_) => return None,
-        };
+        let map = self.lock_registration_entries();
+        let mut found = None;
         for (k, v) in map.iter() {
             if constant_time_eq(token.as_bytes(), k.as_bytes()) {
-                return Some(v.clone());
+                found = Some(v);
             }
         }
-        None
+        found.filter(|entry| entry.lease_id.is_some()).cloned()
+    }
+
+    /// A bearer the transport may accept at `hello` (ADR 0014 section 11, plan D6.1): a sign or a
+    /// registration bearer, bound to its lease or not yet bound (the browser's worker says hello
+    /// while the browser is still launching). Requests still require the binding, and re-validate
+    /// the bearer from scratch ([`Self::lookup_bound`], [`Self::lookup_registration`]).
+    pub fn lookup_for_hello(&self, token: &str) -> Option<BearerEntry> {
+        let sign = {
+            let map = self.lock_entries();
+            let mut found = None;
+            for (k, v) in map.iter() {
+                if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                    found = Some(v.clone());
+                }
+            }
+            found
+        };
+        if let Some(entry) = sign {
+            return Some(BearerEntry::Sign(entry));
+        }
+        let map = self.lock_registration_entries();
+        let mut found = None;
+        for (k, v) in map.iter() {
+            if constant_time_eq(token.as_bytes(), k.as_bytes()) {
+                found = Some(v.clone());
+            }
+        }
+        found.map(BearerEntry::Register)
+    }
+
+    /// A registration bearer that was revoked; used only to refuse and audit a late registration.
+    pub fn lookup_revoked_registration(&self, token: &str) -> Option<RevokedRegistration> {
+        self.lock_revoked_registrations().find(token).cloned()
+    }
+
+    /// A sign bearer that was revoked; used only to refuse and audit a late authentication.
+    pub fn lookup_revoked_sign(&self, token: &str) -> Option<RevokedSign> {
+        self.lock_revoked_signs().find(token).cloned()
+    }
+
+    /// Write the pending refusal counts of revoked bearers whose window has ended (review L5).
+    ///
+    /// `AgentSession::revoke` flushes a session's ledger once, but the tombstone keeps the
+    /// session alive to audit a late use of its bearer, and those late refusals are counted after
+    /// the flush. Without this sweep their summary would wait for another refusal of the same key
+    /// or for the tombstone's eviction. The runtime loop calls it; it does its work at most once
+    /// per [`REFUSAL_SWEEP_INTERVAL`].
+    pub fn flush_due_revoked_refusals(&self) {
+        let now = Instant::now();
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.created).as_millis())
+            .unwrap_or(u64::MAX);
+        let interval_ms = u64::try_from(REFUSAL_SWEEP_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_refusal_sweep_ms.load(Ordering::Acquire);
+        if elapsed_ms < last.saturating_add(interval_ms) {
+            return;
+        }
+        self.last_refusal_sweep_ms
+            .store(elapsed_ms, Ordering::Release);
+        self.flush_due_revoked_refusals_at(now);
+    }
+
+    /// The sweep itself. The ledgers are collected under each tombstone map's lock and written
+    /// after it is released: the audit gate is never reached under a registry lock.
+    fn flush_due_revoked_refusals_at(&self, now: Instant) {
+        let mut ledgers: Vec<Arc<super::refusal_ledger::RefusalLedger>> = Vec::new();
+        ledgers.extend(
+            self.lock_revoked_signs()
+                .entries
+                .values()
+                .map(|revoked| revoked.context.session.refusals().clone()),
+        );
+        ledgers.extend(
+            self.lock_revoked_registrations()
+                .entries
+                .values()
+                .map(|revoked| revoked.context.session.refusals().clone()),
+        );
+        for ledger in ledgers {
+            ledger.flush_due(now);
+        }
+    }
+
+    /// Whether a live (bound, not revoked) sign or registration bearer exists for `lease_id`.
+    pub fn has_live_bearer_for_lease(&self, lease_id: &str) -> bool {
+        let signed = self
+            .lock_entries()
+            .values()
+            .any(|e| e.lease_id.as_deref() == Some(lease_id));
+        signed
+            || self
+                .lock_registration_entries()
+                .values()
+                .any(|e| e.lease_id.as_deref() == Some(lease_id))
     }
 
     pub fn revoke_registration(&self, token: &str) -> bool {
-        let removed = self
-            .registration_entries
-            .lock()
-            .map(|mut map| map.remove(token).is_some())
-            .unwrap_or(false);
-        self.cleanup_request_budget(token);
-        removed
+        let removed = self.lock_registration_entries().remove(token);
+        let Some(entry) = removed else {
+            return false;
+        };
+        // Fail any request of this bearer that is already past authentication.
+        entry.context.session.revoke();
+        self.lock_revoked_registrations()
+            .remember_registration(token.to_string(), &entry);
+        true
     }
 
     pub fn register_pending(
@@ -562,9 +658,8 @@ impl SignContextRegistry {
         context: SignContext,
         handler: Arc<SignHandler>,
     ) -> Result<(), String> {
-        let max_requests = usize::from(context.profile_config.max_operations);
-        let request_budget = self.request_budget(&token, max_requests)?;
-        let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
+        self.check_same_session(&token, &context.session)?;
+        let mut map = self.lock_entries();
         if map.contains_key(&token) {
             return Err("duplicate token".into());
         }
@@ -574,133 +669,169 @@ impl SignContextRegistry {
                 context,
                 handler,
                 lease_id: None,
-                request_budget,
             },
         );
         Ok(())
     }
 
-    fn cleanup_request_budget(&self, token: &str) {
-        let sign_active = self
-            .entries
-            .lock()
-            .map(|map| map.contains_key(token))
-            .unwrap_or(true);
-        let registration_active = self
-            .registration_entries
-            .lock()
-            .map(|map| map.contains_key(token))
-            .unwrap_or(true);
-        if !sign_active
-            && !registration_active
-            && let Ok(mut budgets) = self.request_budgets.lock()
-        {
-            budgets.remove(token);
-        }
-    }
-
     pub fn bind_lease(&self, token: &str, lease_id: String) -> Result<(), String> {
-        let mut map = self.entries.lock().map_err(|_| "registry lock poisoned")?;
-        if !map.contains_key(token) {
-            return Err("token not found".into());
-        }
-        if map.get(token).unwrap().lease_id.is_some() {
+        let mut map = self.lock_entries();
+        let entry = map.get_mut(token).ok_or("token not found")?;
+        if entry.lease_id.is_some() {
             return Err("already bound".into());
         }
-        map.get_mut(token).unwrap().lease_id = Some(lease_id);
+        entry.lease_id = Some(lease_id);
         Ok(())
     }
 
     pub fn lookup_bound(&self, token: &str) -> Option<LeaseEntry> {
-        let map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return None,
-        };
-        let mut found_key: Option<String> = None;
-        for k in map.keys() {
+        let map = self.lock_entries();
+        let mut found = None;
+        for (k, v) in map.iter() {
             if constant_time_eq(token.as_bytes(), k.as_bytes()) {
-                found_key = Some(k.clone());
+                found = Some(v);
             }
         }
-        match found_key {
-            Some(key) => {
-                let entry = map.get(&key)?;
-                entry.lease_id.is_some().then(|| entry.clone())
-            }
-            None => None,
-        }
+        found.filter(|entry| entry.lease_id.is_some()).cloned()
     }
 
     pub fn revoke(&self, token: &str) -> bool {
-        let removed = self
-            .entries
-            .lock()
-            .map(|mut map| map.remove(token).is_some())
-            .unwrap_or(false);
-        self.cleanup_request_budget(token);
-        removed
+        let removed = self.lock_entries().remove(token);
+        match removed {
+            Some(entry) => {
+                entry.context.session.revoke();
+                self.lock_revoked_signs()
+                    .remember_sign(token.to_string(), &entry);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn revoke_by_lease(&self, lease_id: &str) -> usize {
-        let mut map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return 0,
+        let removed: Vec<(String, LeaseEntry)> = {
+            let mut map = self.lock_entries();
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| map.remove(&k).map(|entry| (k, entry)))
+                .collect()
         };
-        let keys: Vec<String> = map
+        let mut count = removed.len();
+        for (_, entry) in &removed {
+            entry.context.session.revoke();
+        }
+        self.remember_revoked_signs(removed);
+
+        // Registration bearers die with the lease too.
+        let registration_keys: Vec<String> = self
+            .lock_registration_entries()
             .iter()
             .filter(|(_, e)| e.lease_id.as_deref() == Some(lease_id))
             .map(|(k, _)| k.clone())
             .collect();
-        let count = keys.len();
-        for k in &keys {
-            map.remove(k);
-        }
-        drop(map);
-        for key in keys {
-            self.cleanup_request_budget(&key);
+        for key in registration_keys {
+            if self.revoke_registration(&key) {
+                count += 1;
+            }
         }
         count
     }
 
-    pub fn revoke_all(&self) {
-        if let Ok(mut map) = self.entries.lock() {
-            map.clear();
+    /// Remember revoked sign bearers so a late use is refused and audited. Takes the tombstone
+    /// map after the entries guard is released (the registry maps never nest).
+    fn remember_revoked_signs(&self, removed: Vec<(String, LeaseEntry)>) {
+        if removed.is_empty() {
+            return;
         }
-        if let Ok(mut map) = self.registration_entries.lock() {
-            map.clear();
-        }
-        if let Ok(mut budgets) = self.request_budgets.lock() {
-            budgets.clear();
+        let mut revoked = self.lock_revoked_signs();
+        for (token, entry) in &removed {
+            revoked.remember_sign(token.clone(), entry);
         }
     }
 
+    /// Revoke every bearer whose session was created before `current_epoch` (a policy reload or a
+    /// revocation bumped it). In-flight requests of those bearers fail before key use because they
+    /// re-check the epoch; this also drops the entries so the bearers are refused up front, and
+    /// remembers them so a late use is audited as `bearer_revoked`. The caller must terminate the
+    /// returned leases: the bearers no longer guard them.
+    pub fn revoke_stale_sessions(&self, current_epoch: u64) -> StaleRevocation {
+        let stale_sign: Vec<(String, LeaseEntry)> = {
+            let mut map = self.lock_entries();
+            let keys: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| e.context.session.revocation_epoch() != current_epoch)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| map.remove(&k).map(|entry| (k, entry)))
+                .collect()
+        };
+        let mut lease_ids: Vec<String> = Vec::new();
+        for (_, entry) in &stale_sign {
+            entry.context.session.revoke();
+            lease_ids.extend(entry.lease_id.clone());
+        }
+        let revoked_signs = stale_sign.len();
+        self.remember_revoked_signs(stale_sign);
+        let stale_registration: Vec<(String, Option<String>)> = self
+            .lock_registration_entries()
+            .iter()
+            .filter(|(_, e)| e.context.session.revocation_epoch() != current_epoch)
+            .map(|(k, e)| (k.clone(), e.lease_id.clone()))
+            .collect();
+        let mut revoked = revoked_signs;
+        for (key, lease_id) in stale_registration {
+            if self.revoke_registration(&key) {
+                revoked += 1;
+                lease_ids.extend(lease_id);
+            }
+        }
+        lease_ids.sort();
+        lease_ids.dedup();
+        StaleRevocation { revoked, lease_ids }
+    }
+
+    pub fn revoke_all(&self) {
+        for entry in self.lock_entries().drain() {
+            entry.1.context.session.revoke();
+        }
+        for entry in self.lock_registration_entries().drain() {
+            entry.1.context.session.revoke();
+        }
+        *self.lock_revoked_registrations() = RevokedRegistrations::default();
+        *self.lock_revoked_signs() = RevokedSigns::default();
+    }
+
     pub fn len(&self) -> usize {
-        self.entries.lock().map(|m| m.len()).unwrap_or(0)
+        self.lock_entries().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// `(used, max)` operations of the session bound to `lease_id`; `max` is the live budget.
     pub fn budget_snapshot_for_lease(&self, lease_id: &str) -> Option<(usize, usize)> {
-        let budget = {
-            let map = self.entries.lock().ok()?;
-            let entry = map
-                .values()
-                .find(|entry| entry.lease_id.as_deref() == Some(lease_id))?;
-            entry.request_budget.clone()
-        };
-        let used = budget.inner.lock().ok()?.used.len();
-        Some((used, budget.max_requests))
+        let entry = self
+            .lock_entries()
+            .values()
+            .find(|entry| entry.lease_id.as_deref() == Some(lease_id))
+            .cloned()?;
+        let max = entry
+            .handler
+            .policy_runtime
+            .max_operations(&entry.context.profile_id)?;
+        let used = entry.context.session.operations_used();
+        Some((used as usize, usize::from(max)))
     }
 
     #[cfg(test)]
     pub fn all_entries(&self) -> Vec<LeaseEntry> {
-        let map = match self.entries.lock() {
-            Ok(m) => m,
-            Err(_) => return Vec::new(),
-        };
-        map.values().cloned().collect()
+        self.lock_entries().values().cloned().collect()
     }
 }
 
@@ -710,509 +841,31 @@ impl Default for SignContextRegistry {
     }
 }
 
-pub struct SignHttpServer {
-    listener: Option<UnixListener>,
-    socket_path: PathBuf,
-    shutdown: Arc<AtomicBool>,
-}
-
-const MAX_HTTP_BODY_SIZE: usize = 16_384;
-const MAX_HTTP_HEADER_SIZE: usize = 8192;
-const MAX_CONNECTIONS: usize = 8;
-
-impl SignHttpServer {
-    pub fn bind(socket_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self, String> {
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create socket directory: {}", e))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("set socket dir permissions: {}", e))?;
-        }
-        let _ = std::fs::remove_file(&socket_path);
-        let listener =
-            UnixListener::bind(&socket_path).map_err(|e| format!("bind failed: {}", e))?;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set socket permissions: {}", e))?;
-        Ok(Self {
-            listener: Some(listener),
-            socket_path,
-            shutdown,
-        })
-    }
-
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-    }
-
-    pub fn serve(mut self, registry: Arc<SignContextRegistry>) -> thread::JoinHandle<()> {
-        let shutdown = self.shutdown.clone();
-        let listener = self.listener.take().expect("listener already taken");
-        let socket_path = self.socket_path.clone();
-        thread::spawn(move || {
-            listener.set_nonblocking(true).expect("set_nonblocking");
-            let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let current = active_count.load(Ordering::Acquire);
-                        if current >= MAX_CONNECTIONS {
-                            continue;
-                        }
-                        active_count.fetch_add(1, Ordering::AcqRel);
-                        let registry = registry.clone();
-                        let count = active_count.clone();
-                        thread::spawn(move || {
-                            if let Err(e) = handle_http_connection(stream, &registry) {
-                                debug!("sign http connection error: {}", e);
-                            }
-                            count.fetch_sub(1, Ordering::AcqRel);
-                        });
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        warn!("sign http accept error: {}", e);
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            }
-            let _ = std::fs::remove_file(&socket_path);
-        })
-    }
-}
-
-impl Drop for SignHttpServer {
-    fn drop(&mut self) {
-        if self.listener.is_some() {
-            let _ = std::fs::remove_file(&self.socket_path);
-        }
-    }
-}
-
-fn send_http_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
-    let content_length = body.map(|b| b.len()).unwrap_or(0);
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        status, content_length
-    );
-    let _ = stream.write_all(header.as_bytes());
-    if let Some(body) = body {
-        let _ = stream.write_all(body);
-    }
-}
-
-fn send_http_error(stream: &mut UnixStream, status: &str, code: &str) {
-    let body = format!("{{\"error\":\"{}\"}}", code);
-    send_http_response(stream, status, Some(body.as_bytes()));
-}
-
-fn send_sign_response(stream: &mut UnixStream, status: &str, body: Option<&[u8]>) {
-    let content_length = body.map(|b| b.len()).unwrap_or(0);
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        status, content_length
-    );
-    let _ = stream.write_all(header.as_bytes());
-    if let Some(body) = body {
-        let _ = stream.write_all(body);
-    }
-}
-
-fn send_sign_error(stream: &mut UnixStream, status: &str, code: &str) {
-    let body = format!("{{\"error\":\"{}\"}}", code);
-    send_sign_response(stream, status, Some(body.as_bytes()));
-}
-
-fn handle_http_connection(
-    mut stream: UnixStream,
-    registry: &SignContextRegistry,
-) -> Result<(), String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let mut buf = [0u8; MAX_HTTP_HEADER_SIZE + MAX_HTTP_BODY_SIZE];
-    let mut total = 0;
-    loop {
-        let n = stream
-            .read(&mut buf[total..])
-            .map_err(|e| format!("read: {}", e))?;
-        if n == 0 {
-            return Err("connection closed before headers complete".into());
-        }
-        total += n;
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if total >= MAX_HTTP_HEADER_SIZE {
-            send_http_error(&mut stream, "413 Payload Too Large", "request_too_large");
-            return Ok(());
-        }
-    }
-    let header_end = buf[..total]
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("no header terminator")?;
-    let header_str = std::str::from_utf8(&buf[..header_end]).map_err(|_| "invalid utf-8")?;
-    let mut lines = header_str.split("\r\n");
-    let request_line = lines.next().ok_or("no request line")?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or("no method")?;
-    let path = parts.next().ok_or("no path")?;
-    if method != "POST" || (path != "/sign" && path != "/register") {
-        send_http_error(&mut stream, "404 Not Found", "not_found");
-        return Ok(());
-    }
-    let mut auth_header = None;
-    let mut content_type_header = None;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("authorization:") {
-            auth_header = Some(
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
-        } else if lower.starts_with("content-type:") {
-            content_type_header = Some(
-                line.split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
-    let auth = match auth_header {
-        Some(a) => a,
-        None => {
-            send_sign_error(&mut stream, "401 Unauthorized", "missing_authorization");
-            return Ok(());
-        }
-    };
-    let token = match auth.strip_prefix("Bearer ") {
-        Some(t) => t,
-        None => {
-            send_sign_error(
-                &mut stream,
-                "401 Unauthorized",
-                "invalid_authorization_scheme",
-            );
-            return Ok(());
-        }
-    };
-    let is_register = path == "/register";
-    let entry = match if is_register {
-        None
-    } else {
-        registry.lookup_bound(token)
-    } {
-        Some(e) => e,
-        None => {
-            if is_register {
-                let reg_entry = match registry.lookup_registration(token) {
-                    Some(e) => e,
-                    None => {
-                        send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
-                        return Ok(());
-                    }
-                };
-                if let Some(ct) = content_type_header
-                    && !ct.to_ascii_lowercase().starts_with("application/json")
-                {
-                    send_sign_error(
-                        &mut stream,
-                        "415 Unsupported Media Type",
-                        "unsupported_content_type",
-                    );
-                    return Ok(());
-                }
-                let body_start = header_end + 4;
-                let content_length: usize = header_str
-                    .lines()
-                    .find_map(|l| {
-                        let lower = l.to_ascii_lowercase();
-                        lower
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse().ok())
-                    })
-                    .unwrap_or(0);
-                if content_length > MAX_HTTP_BODY_SIZE {
-                    send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-                    return Ok(());
-                }
-                let mut body = Vec::new();
-                body.extend_from_slice(&buf[body_start..total]);
-                let remaining = content_length.saturating_sub(total - body_start);
-                if remaining > 0 {
-                    if remaining > MAX_HTTP_BODY_SIZE {
-                        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-                        return Ok(());
-                    }
-                    let mut extra = vec![0u8; remaining];
-                    stream
-                        .read_exact(&mut extra)
-                        .map_err(|e| format!("read body: {}", e))?;
-                    body.extend_from_slice(&extra);
-                }
-                if body.len() > MAX_HTTP_BODY_SIZE {
-                    send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-                    return Ok(());
-                }
-                match reg_entry.claim_request(&body) {
-                    RequestClaim::Claimed { digest } => {
-                        let mut guard =
-                            InFlightGuard::new(reg_entry.request_budget.clone(), digest);
-                        let outcome = handle_register_body(&mut stream, &reg_entry, &body)?;
-                        guard.resolve(outcome);
-                    }
-                    RequestClaim::WaitFor(in_flight) => {
-                        match in_flight.wait(Duration::from_secs(30)) {
-                            Some(outcome) => {
-                                send_sign_response(
-                                    &mut stream,
-                                    outcome.status,
-                                    Some(&outcome.body),
-                                );
-                            }
-                            None => {
-                                send_sign_error(
-                                    &mut stream,
-                                    "500 Internal Server Error",
-                                    "operation_timeout",
-                                );
-                            }
-                        }
-                        return Ok(());
-                    }
-                    RequestClaim::Cached { outcome } => {
-                        send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
-                        return Ok(());
-                    }
-                    RequestClaim::Replayed => {
-                        send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
-                        return Ok(());
-                    }
-                    RequestClaim::Exhausted => {
-                        send_sign_error(
-                            &mut stream,
-                            "429 Too Many Requests",
-                            "operation_budget_exhausted",
-                        );
-                        return Ok(());
-                    }
-                    RequestClaim::Unavailable => {
-                        send_sign_error(
-                            &mut stream,
-                            "500 Internal Server Error",
-                            "operation_registry_unavailable",
-                        );
-                        return Ok(());
-                    }
-                }
-                return Ok(());
-            }
-            send_sign_error(&mut stream, "401 Unauthorized", "invalid_bearer");
-            return Ok(());
-        }
-    };
-    if is_register {
-        send_sign_error(
-            &mut stream,
-            "400 Bad Request",
-            "sign_token_not_for_register",
-        );
-        return Ok(());
-    }
-    if let Some(ct) = content_type_header
-        && !ct.to_ascii_lowercase().starts_with("application/json")
-    {
-        send_sign_error(
-            &mut stream,
-            "415 Unsupported Media Type",
-            "unsupported_content_type",
-        );
-        return Ok(());
-    }
-    let body_start = header_end + 4;
-    let content_length: usize = header_str
-        .lines()
-        .find_map(|l| {
-            let lower = l.to_ascii_lowercase();
-            lower
-                .strip_prefix("content-length:")
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0);
-    if content_length > MAX_HTTP_BODY_SIZE {
-        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-        return Ok(());
-    }
-    let mut body = Vec::new();
-    body.extend_from_slice(&buf[body_start..total]);
-    let remaining = content_length.saturating_sub(total - body_start);
-    if remaining > 0 {
-        if remaining > MAX_HTTP_BODY_SIZE {
-            send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-            return Ok(());
-        }
-        let mut extra = vec![0u8; remaining];
-        stream
-            .read_exact(&mut extra)
-            .map_err(|e| format!("read body: {}", e))?;
-        body.extend_from_slice(&extra);
-    }
-    if body.len() > MAX_HTTP_BODY_SIZE {
-        send_sign_error(&mut stream, "413 Payload Too Large", "body_too_large");
-        return Ok(());
-    }
-    match entry.claim_request(&body) {
-        RequestClaim::Claimed { digest } => {
-            let mut guard = InFlightGuard::new(entry.request_budget.clone(), digest);
-            let outcome = handle_sign_body(&mut stream, &entry, &body)?;
-            guard.resolve(outcome);
-        }
-        RequestClaim::WaitFor(in_flight) => {
-            match in_flight.wait(Duration::from_secs(30)) {
-                Some(outcome) => {
-                    send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
-                }
-                None => {
-                    send_sign_error(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "operation_timeout",
-                    );
-                }
-            }
-            return Ok(());
-        }
-        RequestClaim::Cached { outcome } => {
-            send_sign_response(&mut stream, outcome.status, Some(&outcome.body));
-            return Ok(());
-        }
-        RequestClaim::Replayed => {
-            send_sign_error(&mut stream, "409 Conflict", "replayed_operation");
-            return Ok(());
-        }
-        RequestClaim::Exhausted => {
-            send_sign_error(
-                &mut stream,
-                "429 Too Many Requests",
-                "operation_budget_exhausted",
-            );
-            return Ok(());
-        }
-        RequestClaim::Unavailable => {
-            send_sign_error(
-                &mut stream,
-                "500 Internal Server Error",
-                "operation_registry_unavailable",
-            );
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
-fn handle_sign_body(
-    stream: &mut UnixStream,
-    entry: &LeaseEntry,
-    body: &[u8],
-) -> Result<InFlightOutcome, String> {
-    let req: SignAssertionRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(_) => {
-            let outcome = InFlightOutcome {
-                status: "400 Bad Request",
-                body: b"{\"error\":\"invalid_json\"}".to_vec(),
-            };
-            send_sign_response(stream, outcome.status, Some(&outcome.body));
-            return Ok(outcome);
-        }
-    };
-    let outcome = match entry.handler.sign(&entry.context, &req) {
-        Ok(resp) => {
-            let resp_body =
-                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
-            send_sign_response(stream, "200 OK", Some(&resp_body));
-            InFlightOutcome {
-                status: "200 OK",
-                body: resp_body,
-            }
-        }
-        Err(e) => {
-            let (status, code) = error_status_code(e.code);
-            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
-            send_sign_response(stream, status, Some(&err_body));
-            InFlightOutcome {
-                status,
-                body: err_body,
-            }
-        }
-    };
-    Ok(outcome)
-}
-
-fn handle_register_body(
-    stream: &mut UnixStream,
-    reg_entry: &RegistrationLeaseEntry,
-    body: &[u8],
-) -> Result<InFlightOutcome, String> {
-    let req: RegisterCredentialRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(_) => {
-            let outcome = InFlightOutcome {
-                status: "400 Bad Request",
-                body: b"{\"error\":\"invalid_json\"}".to_vec(),
-            };
-            send_sign_response(stream, outcome.status, Some(&outcome.body));
-            return Ok(outcome);
-        }
-    };
-    let outcome = match reg_entry.handler.register(&reg_entry.context, &req) {
-        Ok(resp) => {
-            let resp_body =
-                serde_json::to_vec(&resp).map_err(|e| format!("json serialize: {}", e))?;
-            send_sign_response(stream, "200 OK", Some(&resp_body));
-            InFlightOutcome {
-                status: "200 OK",
-                body: resp_body,
-            }
-        }
-        Err(e) => {
-            let (status, code) = error_status_code(e.code);
-            let err_body = format!("{{\"error\":\"{}\"}}", code).into_bytes();
-            send_sign_response(stream, status, Some(&err_body));
-            InFlightOutcome {
-                status,
-                body: err_body,
-            }
-        }
-    };
-    Ok(outcome)
-}
-
-fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
+/// The WebAuthn DOMException name the page receives for a daemon error (ADR 0014 sections
+/// 10.2-10.3 and 11). The extension passes it to `complete*Request` and never invents one.
+pub fn dom_exception_name(code: ErrorCode) -> &'static str {
     match code {
-        ErrorCode::BadRequest => ("400 Bad Request", "bad_request"),
-        ErrorCode::Unauthorized => ("401 Unauthorized", "unauthorized"),
-        ErrorCode::Forbidden => ("403 Forbidden", "forbidden"),
-        ErrorCode::NotFound => ("404 Not Found", "not_found"),
-        ErrorCode::Conflict => ("409 Conflict", "conflict"),
-        ErrorCode::InteractionRequired => ("409 Conflict", "human_interaction_required"),
-        _ => ("500 Internal Server Error", "internal_error"),
+        ErrorCode::NotSupported => "NotSupportedError",
+        ErrorCode::InvalidState => "InvalidStateError",
+        ErrorCode::OriginInvalid => "SecurityError",
+        ErrorCode::Aborted => "AbortError",
+        // Policy denials, revocation, replay, budget, `busy`, timeouts and internal failures all
+        // look the same to the page (ADR 0014 section 7).
+        _ => "NotAllowedError",
+    }
+}
+
+/// The assertion inside a replayed or joined outcome. The replay key includes the action, so an
+/// authentication key never holds an attestation.
+fn assertion_outcome(outcome: CeremonyOutcome) -> Result<PrincipalResponse, ProtocolError> {
+    match outcome {
+        Ok(CeremonyResult::Assertion(response)) => Ok(*response),
+        Ok(CeremonyResult::Attestation(_)) => Err(ProtocolError::new(
+            ErrorCode::Internal,
+            "replay outcome has the wrong ceremony type",
+            RecommendedAction::Abort,
+        )),
+        Err(e) => Err(e),
     }
 }
 
@@ -1220,7 +873,76 @@ fn error_status_code(code: ErrorCode) -> (&'static str, &'static str) {
 pub struct SignContext {
     pub profile_id: ProfileId,
     pub active_grant_id: passless_core::agent::GrantId,
-    pub profile_config: AgentProfileConfig,
+    /// The bearer session: principal binding, revocation epoch at creation, TTL, replay table and
+    /// budget usage. The budget limit itself (`max_operations`) is read from the live policy on
+    /// every request, never copied here (plan R16).
+    pub session: Arc<AgentSession>,
+    /// Activates the browser lease after an assertion, outside every backend lock (review H1).
+    /// `None` when the lease needs no activation.
+    pub lease_activation: Option<Arc<dyn LeaseActivation>>,
+}
+
+/// Activation of a browser lease by its first assertion.
+pub trait LeaseActivation: Send + Sync {
+    /// Activate the lease, or confirm it is active. Called with no backend lock held; the
+    /// assertion is released to the page only if this succeeds.
+    fn activate(&self) -> Result<(), String>;
+}
+
+/// Activates a managed browser's lease (`AuthenticationPending` to `Active`) after its first
+/// assertion. Once it has succeeded it never touches the browser manager again, so later
+/// ceremonies never wait on another profile's launch or termination.
+pub struct BrowserLeaseActivation {
+    browser_manager: Arc<Mutex<super::browser::BrowserProcessManager>>,
+    lease_id: passless_core::agent::BrowserLeaseId,
+    active_ttl: Duration,
+    activated: AtomicBool,
+}
+
+impl BrowserLeaseActivation {
+    pub fn new(
+        browser_manager: Arc<Mutex<super::browser::BrowserProcessManager>>,
+        lease_id: passless_core::agent::BrowserLeaseId,
+        active_ttl: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            browser_manager,
+            lease_id,
+            active_ttl,
+            activated: AtomicBool::new(false),
+        })
+    }
+}
+
+impl LeaseActivation for BrowserLeaseActivation {
+    fn activate(&self) -> Result<(), String> {
+        if self.activated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut browser_manager =
+            lock_order::lock(&self.browser_manager, LockLevel::BrowserManager);
+        let state = browser_manager
+            .snapshot(&self.lease_id)
+            .ok_or_else(|| "browser lease not found".to_string())?
+            .state;
+        match state {
+            super::browser::LeaseState::AuthenticationPending => {
+                browser_manager
+                    .activate_after_assertion(&self.lease_id, self.active_ttl)
+                    .map_err(|e| {
+                        format!("failed to activate browser lease after assertion: {e}")
+                    })?;
+            }
+            super::browser::LeaseState::Active => {}
+            current => {
+                return Err(format!(
+                    "browser lease cannot activate after assertion from state {current}"
+                ));
+            }
+        }
+        self.activated.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1231,216 +953,886 @@ pub struct SignHandler {
     pub security_config: SecurityConfig,
     pub key_provider: Arc<dyn CredentialKeyProvider + Send + Sync>,
     pub operation_lock: Arc<Mutex<()>>,
+    /// The escalation coordinator a `request` resolution waits on (ADR 0014 section 8).
+    pub escalation: Arc<EscalationService>,
+    /// The deployment axes and backend that every operation record of this handler reports
+    /// (ADR 0014 section 12).
+    pub audit_deployment: AuditDeployment,
+}
+
+/// Client extensions an authentication request may name. `appid` is honored by never matching a
+/// U2F AppID credential (its output is `false`). `remoteDesktopClientOverride` is browser metadata,
+/// not an RP extension (ADR 0014 section 10.2): the transport strips it while it parses the
+/// request, so it never reaches this list.
+const SUPPORTED_GET_EXTENSIONS: &[&str] = &["appid"];
+/// Most extension identifiers a request may name, and their longest accepted length.
+pub(crate) const MAX_EXTENSIONS: usize = 32;
+pub(crate) const MAX_EXTENSION_ID_LEN: usize = 64;
+
+/// Check the extension identifiers of a request against `supported`. `Ok(false)` means an
+/// unsupported extension was requested (`NotSupportedError`); `Err` means the list is malformed.
+pub(crate) fn extensions_supported(
+    requested: &[String],
+    supported: &[&str],
+) -> Result<bool, ProtocolError> {
+    if requested.len() > MAX_EXTENSIONS
+        || requested
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_EXTENSION_ID_LEN)
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::BadRequest,
+            "malformed extension list",
+            RecommendedAction::FixRequest,
+        ));
+    }
+    Ok(requested.iter().all(|id| supported.contains(&id.as_str())))
+}
+
+/// Map a session that can no longer be used to its audit reason and error.
+pub(crate) fn session_invalid_error(invalid: SessionInvalid) -> (PolicyDenyReason, ProtocolError) {
+    match invalid {
+        SessionInvalid::Revoked => (
+            PolicyDenyReason::BearerRevoked,
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "bearer session was revoked",
+                RecommendedAction::Abort,
+            ),
+        ),
+        SessionInvalid::EpochChanged => (
+            PolicyDenyReason::PolicyRevoked,
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "bearer session was revoked by a policy change",
+                RecommendedAction::Abort,
+            ),
+        ),
+        SessionInvalid::Expired => (
+            PolicyDenyReason::SessionExpired,
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "bearer session expired",
+                RecommendedAction::Abort,
+            ),
+        ),
+    }
+}
+
+/// Map a refused claim to its audit reason and error. None of these consumed budget.
+pub(crate) fn claim_rejection_error(
+    rejection: ClaimRejection,
+) -> (PolicyDenyReason, ProtocolError) {
+    match rejection {
+        ClaimRejection::Replayed => (
+            PolicyDenyReason::Replayed,
+            ProtocolError::new(
+                ErrorCode::Replayed,
+                "this request was already processed in this session",
+                RecommendedAction::Abort,
+            ),
+        ),
+        ClaimRejection::ChallengeReused => (
+            PolicyDenyReason::ChallengeReused,
+            ProtocolError::new(
+                ErrorCode::Replayed,
+                "this challenge was already used by a different request",
+                RecommendedAction::Abort,
+            ),
+        ),
+        ClaimRejection::BudgetExhausted => (
+            PolicyDenyReason::BudgetExhausted,
+            ProtocolError::new(
+                ErrorCode::BudgetExhausted,
+                "session operation budget exhausted",
+                RecommendedAction::Abort,
+            ),
+        ),
+        ClaimRejection::TableFull => (
+            PolicyDenyReason::ReplayTableFull,
+            ProtocolError::new(
+                ErrorCode::Busy,
+                "too many recent requests in this session; retry later",
+                RecommendedAction::RetryWithBackoff,
+            ),
+        ),
+    }
+}
+
+/// A duplicate whose own ceremony deadline passed while it waited for the identical in-flight
+/// request: audited as a refusal with the `join_timeout` failure class (ADR 0014 section 12).
+pub(crate) fn join_timeout_error() -> (PolicyDenyReason, ProtocolError) {
+    (
+        PolicyDenyReason::JoinTimeout,
+        ProtocolError::new(
+            ErrorCode::Timeout,
+            "ceremony deadline passed while waiting for an identical request",
+            RecommendedAction::Abort,
+        ),
+    )
+}
+
+/// The browser cancelled the request before key use (ADR 0014 section 11: `onRequestCanceled`).
+pub(crate) fn aborted_error() -> (PolicyDenyReason, ProtocolError) {
+    (
+        PolicyDenyReason::Aborted,
+        ProtocolError::new(
+            ErrorCode::Aborted,
+            "the request was cancelled before key use",
+            RecommendedAction::Abort,
+        ),
+    )
+}
+
+/// The audit reason and error of a refused escalation (nothing was prompted).
+pub(crate) fn escalation_refusal_error(
+    refusal: EscalationRefusal,
+) -> (PolicyDenyReason, ProtocolError) {
+    let reason = refusal.deny_reason();
+    let error = match refusal {
+        EscalationRefusal::AuditFailure => ProtocolError::new(
+            ErrorCode::Internal,
+            "the escalation request could not be audited",
+            RecommendedAction::Retry,
+        ),
+        EscalationRefusal::Unavailable => ProtocolError::new(
+            ErrorCode::Forbidden,
+            "escalation is unavailable: policy requires approval and no prompt can be shown",
+            RecommendedAction::FixRequest,
+        ),
+        _ => ProtocolError::new(
+            ErrorCode::Forbidden,
+            format!(
+                "escalation refused: {}",
+                serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            ),
+            RecommendedAction::Abort,
+        ),
+    };
+    (reason, error)
+}
+
+/// One ceremony's escalation (ADR 0014 section 8.1): what it is for and where it waits.
+pub(crate) struct Escalation<'a> {
+    pub service: &'a Arc<EscalationService>,
+    pub policy_runtime: &'a PolicyRuntime,
+    pub session: &'a Arc<AgentSession>,
+    pub profile_id: &'a ProfileId,
+    pub action: CeremonyAction,
+    /// The normalized RP ID.
+    pub rp_id: &'a str,
+    pub origin: &'a str,
+    /// The configured rule that resolved to `request`.
+    pub rule: &'a RuleIdentity,
+    /// The ceremony's audit: told which escalation the ceremony waits on.
+    pub audit: &'a CeremonyAudit,
+}
+
+/// An escalation request that passed the pre-checks (cooldown, grant cap and store, bus, queue,
+/// waiter caps, a pending registration), before the replay key is taken.
+pub(crate) struct PreparedEscalation {
+    request: EscalationRequest,
+    /// `agents.escalation_timeout`, when set.
+    timeout: Option<Duration>,
+}
+
+impl Escalation<'_> {
+    /// Build the request from the live policy and run the coordinator's pre-checks. A refusal
+    /// is returned before the replay key is consumed and before anything is prompted (plan P7
+    /// section 2).
+    pub fn prepare(&self) -> Result<PreparedEscalation, (PolicyDenyReason, ProtocolError)> {
+        let profile = self
+            .policy_runtime
+            .escalation_profile(self.profile_id)
+            .ok_or_else(|| {
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "the profile no longer exists",
+                        RecommendedAction::Abort,
+                    ),
+                )
+            })?;
+        let rule = match self.rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => {
+                return Err((
+                    PolicyDenyReason::ActionNotAllowed,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "no rule permits an escalation",
+                        RecommendedAction::FixRequest,
+                    ),
+                ));
+            }
+        };
+        let request = EscalationRequest {
+            profile: self.profile_id.clone(),
+            rp_id: self.rp_id.to_string(),
+            action: self.action,
+            origin: self.origin.to_string(),
+            rule,
+            session: WaiterSession::of(self.session),
+            mode: profile.mode,
+            principal_user: profile.principal_user.clone(),
+            max_granted_rules: profile.max_granted_rules,
+        };
+        self.service
+            .precheck(&request)
+            .map_err(escalation_refusal_error)?;
+        Ok(PreparedEscalation {
+            request,
+            timeout: profile.escalation_timeout,
+        })
+    }
+
+    /// Create or join the escalation and park until it ends (a fresh replay key only; a
+    /// duplicate joins the in-flight slot instead, so it never adds a second waiter). Returns
+    /// the approval ([`EscalationOutcome::Approved`] or
+    /// [`EscalationOutcome::RegistrationApproved`]), or the audit reason and error that end the
+    /// ceremony. No lock is held while parked (LOCKING.md rule 3); `park` suspends the
+    /// ceremony's capacity permit for the wait.
+    ///
+    /// The wait ends at the earliest of `deadline` (the transport's Chromium-clamped ceremony
+    /// deadline) and `agents.escalation_timeout`. The session's expiry is not a deadline: the
+    /// waiter notices it through `still_valid` and reports `SessionInvalid` (`session_expired`,
+    /// no cooldown), not a timeout. An abort within
+    /// [`super::escalation::DEADLINE_ABORT_GRACE`] of that point counts as a timeout (plan P7
+    /// gap 8).
+    pub fn wait(
+        &self,
+        prepared: PreparedEscalation,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+    ) -> Result<EscalationOutcome, (PolicyDenyReason, ProtocolError)> {
+        let PreparedEscalation { request, timeout } = prepared;
+        let waiter = self
+            .service
+            .join_or_create(request)
+            .map_err(escalation_refusal_error)?;
+        self.audit.escalation(waiter.escalation_id().as_str());
+
+        let now = Instant::now();
+        let mut wait_deadline = deadline;
+        if let Some(timeout) = timeout {
+            wait_deadline = wait_deadline.min(now + timeout);
+        }
+        let still_valid = || {
+            self.session
+                .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+                .is_ok()
+        };
+        let escalation_id = waiter.escalation_id().clone();
+        let outcome = waiter.wait(wait_deadline, cancelled, &still_valid, park);
+        debug!("escalation {}: wait ended: {:?}", escalation_id, outcome);
+        match outcome {
+            EscalationOutcome::Approved { .. } | EscalationOutcome::RegistrationApproved(_) => {
+                Ok(outcome)
+            }
+            EscalationOutcome::Denied { reason, .. } => Err((
+                reason.unwrap_or(PolicyDenyReason::EscalationDenied),
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "the escalation was denied",
+                    RecommendedAction::Abort,
+                ),
+            )),
+            EscalationOutcome::ServerLost { .. } => Err((
+                PolicyDenyReason::EscalationExpired,
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "the notification server went away before a decision",
+                    RecommendedAction::Retry,
+                ),
+            )),
+            EscalationOutcome::TimedOut => Err((
+                PolicyDenyReason::EscalationExpired,
+                ProtocolError::new(
+                    ErrorCode::Timeout,
+                    "no escalation decision before the ceremony deadline",
+                    RecommendedAction::Abort,
+                ),
+            )),
+            EscalationOutcome::Revoked { .. } => Err((
+                PolicyDenyReason::PolicyRevoked,
+                ProtocolError::new(
+                    ErrorCode::Forbidden,
+                    "a policy reload cancelled the escalation",
+                    RecommendedAction::Abort,
+                ),
+            )),
+            EscalationOutcome::Aborted => Err(aborted_error()),
+            EscalationOutcome::SessionInvalid => Err(session_invalid_error(
+                self.session
+                    .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+                    .err()
+                    .unwrap_or(SessionInvalid::Revoked),
+            )),
+        }
+    }
+}
+
+/// Decode the request challenge; a malformed one is rejected before the replay key (no budget).
+pub(crate) fn decode_challenge(challenge_b64u: &str) -> Result<Vec<u8>, ProtocolError> {
+    match b64u_decode(challenge_b64u) {
+        Ok(challenge) if !challenge.is_empty() => Ok(challenge),
+        _ => Err(ProtocolError::new(
+            ErrorCode::BadRequest,
+            "invalid challenge_b64u encoding",
+            RecommendedAction::FixRequest,
+        )),
+    }
 }
 
 impl SignHandler {
-    fn record_policy_deny(&self, ctx: &SignContext, rp_id: &str, reason: PolicyDenyReason) {
-        let deny_event = PolicyDenyBuilder::new(
-            ctx.profile_id.clone(),
+    /// A new audit for one ceremony of `ctx` (ADR 0014 section 12).
+    fn ceremony_audit(&self, ctx: &SignContext) -> CeremonyAudit {
+        CeremonyAudit::new(
+            &self.audit_gate,
+            &self.policy_runtime,
+            &self.audit_deployment,
+            &ctx.session,
+            &ctx.profile_id,
             AuditAction::Authenticate,
-            rp_id,
-            reason,
         )
-        .build();
-        let _ = self.audit_gate.record(deny_event);
     }
 
+    /// A refusal: a `policy.deny` record before the reservation, a noted failure after it.
+    fn record_policy_deny(&self, target: &AuditTarget, reason: PolicyDenyReason) {
+        target.audit.deny(target, reason);
+    }
+
+    fn deny(
+        &self,
+        target: &AuditTarget,
+        (reason, error): (PolicyDenyReason, ProtocolError),
+    ) -> ProtocolError {
+        self.record_policy_deny(target, reason);
+        error
+    }
+
+    /// Refuse and audit an authentication made with a bearer that was revoked (browser exit,
+    /// lease revocation or a policy change). The request never reaches policy or key use.
+    /// `rp_id` is the RP ID the refused request named, if any.
+    pub fn refuse_revoked_bearer(&self, ctx: &SignContext, rp_id: Option<&str>) {
+        // The request is untrusted: only a syntactically valid RP ID is recorded.
+        let rp_id = rp_id
+            .map(normalize_rp_id)
+            .filter(|rp| passless_core::agent::config::validate_rp_id(rp).is_ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        let audit = self.ceremony_audit(ctx);
+        self.record_policy_deny(
+            &AuditTarget::rp_only(&audit, &rp_id),
+            PolicyDenyReason::BearerRevoked,
+        );
+    }
+
+    /// Authenticate with the default ceremony deadline and no cancellation (tests and direct use).
     pub fn sign(
         &self,
         ctx: &SignContext,
         req: &SignAssertionRequest,
     ) -> Result<PrincipalResponse, ProtocolError> {
-        let normalized_rp = normalize_rp_id(&req.rp_id);
+        let deadline = ceremony_deadline(req.timeout_ms, Instant::now());
+        self.sign_with(ctx, req, deadline, &|| false)
+    }
 
+    /// The bearer session is usable and bound to this context's profile.
+    fn check_session(&self, ctx: &SignContext, target: &AuditTarget) -> Result<(), ProtocolError> {
+        if ctx.session.profile_id() != &ctx.profile_id {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::SessionMismatch,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "bearer session belongs to another profile",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        ctx.session
+            .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))
+    }
+
+    /// The session grant is active, was issued to this session's principal, and covers `rp_id`.
+    fn check_grant(
+        &self,
+        ctx: &SignContext,
+        target: &AuditTarget,
+    ) -> Result<super::policy_engine::GrantSignSnapshot, ProtocolError> {
+        let rp_id = target.rp_id;
+        let grant = self
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
+            .ok_or_else(|| {
+                self.deny(
+                    target,
+                    (
+                        PolicyDenyReason::GrantNotFound,
+                        ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            "active grant not valid",
+                            RecommendedAction::FixRequest,
+                        ),
+                    ),
+                )
+            })?;
+        if grant.is_revoked {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::GrantRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "grant revoked",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        if grant.state != super::grant::GrantState::Active {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::GrantExpired,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "grant expired",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        // The session is bound to the principal it was created for (ADR 0014 sections 7 and 9).
+        if grant.profile_id != ctx.profile_id
+            || !constant_time_eq(&grant.principal_digest, ctx.session.principal_digest())
+        {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::PrincipalMismatch,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "bearer session is not bound to the grant's principal",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        if !grant.rp_ids.iter().any(|id| {
+            let scope_rp = normalize_rp_id(id);
+            scope_rp == rp_id || (scope_rp == ANY_RP_ID && rp_id != LOCALHOST_RP_ID)
+        }) {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::RpIdNotMatch,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "RP ID not in active grant",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        Ok(grant)
+    }
+
+    /// Authenticate. The checks run in the order of ADR 0014 section 9 and plan R4; each step
+    /// that rejects returns before any later step, so a rejected request never reaches the replay
+    /// table, the budget, the audit reservation or the key:
+    ///
+    /// 1. bearer session: not revoked, revocation epoch unchanged, TTL not passed, same profile;
+    /// 2. origin and RP validation;
+    /// 3. session grant: active, bound to the session's principal digest, RP in scope;
+    /// 4. resolve the rule against the live policy and granted rules (`deny`, `request`, `allow`);
+    /// 5. options the authenticator cannot honor (`NotSupportedError`) and a malformed challenge;
+    /// 6. replay key, then budget ([`AgentSession::claim`]); for `request`, the escalation
+    ///    pre-checks (cooldown, grant cap, bus, queue, waiter caps), then the replay key only
+    ///    ([`AgentSession::claim_key`]), then the escalation wait with no lock held, and after
+    ///    approval a re-resolve to a granted `allow` and the budget ([`Self::sign_escalated`]);
+    /// 7. backend operation lock and credential selection ([`Self::sign_fresh`]);
+    /// 8. durable audit reservation;
+    /// 9. immediately before key use: revocation epoch, live re-resolve, session and grant validity;
+    /// 10. key use: counter update, then the signature.
+    pub fn sign_with(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        self.sign_parked(ctx, req, deadline, cancelled, &mut NoPark)
+    }
+
+    /// [`Self::sign_with`] for a transport-carried ceremony: `park` suspends the request's
+    /// capacity permit while the ceremony waits on an escalation.
+    pub fn sign_parked(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        // The audit is the ceremony's single exit point: whatever way `sign_audited` ends, the
+        // reservation it may have made is closed by exactly one terminal record (a panic is
+        // covered by the audit's drop guard).
+        let audit = self.ceremony_audit(ctx);
+        let outcome = self.sign_audited(ctx, req, deadline, cancelled, park, &audit);
+        audit.conclude(&outcome);
+        outcome
+    }
+
+    fn sign_audited(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+        audit: &CeremonyAudit,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        let normalized_rp = normalize_rp_id(&req.rp_id);
+        let target = AuditTarget::of_request(
+            audit,
+            &normalized_rp,
+            &req.origin,
+            req.top_origin.as_deref(),
+            req.cross_origin,
+        );
+        let target = &target;
+
+        // 1. Bearer session.
+        self.check_session(ctx, target)?;
+
+        // 2. Origin and RP validation.
         if !verify_origin_context(
             &req.origin,
             req.top_origin.as_deref(),
             req.cross_origin,
             &normalized_rp,
         ) {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::OriginInvalid,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "origin not valid for RP",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let _op_lock = self.operation_lock.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "operation lock poisoned",
-                RecommendedAction::Abort,
-            )
-        })?;
-
-        let grant_snapshot = self
-            .policy_runtime
-            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
-            .ok_or_else(|| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
-                    PolicyDenyReason::GrantNotFound,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
-                ProtocolError::new(
+            let (reason, code, message) = if req.cross_origin {
+                (
+                    PolicyDenyReason::CrossOriginDenied,
                     ErrorCode::Forbidden,
-                    "active grant not valid",
-                    RecommendedAction::FixRequest,
+                    "cross-origin frames are not permitted",
                 )
-            })?;
-
-        if grant_snapshot.is_revoked {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::GrantRevoked,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "grant revoked",
-                RecommendedAction::FixRequest,
+            } else {
+                (
+                    PolicyDenyReason::OriginInvalid,
+                    ErrorCode::OriginInvalid,
+                    "origin not valid for RP",
+                )
+            };
+            return Err(self.deny(
+                target,
+                (
+                    reason,
+                    ProtocolError::new(code, message, RecommendedAction::FixRequest),
+                ),
             ));
         }
 
-        if grant_snapshot.state != super::grant::GrantState::Active {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::GrantExpired,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "grant expired",
-                RecommendedAction::FixRequest,
-            ));
-        }
+        // 3. Session grant and principal binding.
+        let grant = self.check_grant(ctx, target)?;
 
-        if !grant_snapshot.rp_ids.iter().any(|id| {
-            let scope_rp = normalize_rp_id(id);
-            scope_rp == normalized_rp || scope_rp == ANY_RP_ID
-        }) {
-            let deny_event = PolicyDenyBuilder::new(
-                ctx.profile_id.clone(),
-                AuditAction::Authenticate,
-                &normalized_rp,
-                PolicyDenyReason::RpIdNotMatch,
-            )
-            .build();
-            let _ = self.audit_gate.record(deny_event);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "RP ID not in active grant",
-                RecommendedAction::FixRequest,
-            ));
-        }
-
-        let ceremony_policy = ctx
-            .profile_config
-            .rule_for_rp(&normalized_rp)
-            .map(|rule| rule.authenticate)
-            .ok_or_else(|| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
-                    PolicyDenyReason::ActionNotAllowed,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
-                ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "RP policy does not allow signing",
-                    RecommendedAction::FixRequest,
-                )
-            })?;
-
-        match ceremony_policy.authorization {
-            passless_core::agent::AgentAuthorization::Deny => {
-                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
-                return Err(ProtocolError::new(
-                    ErrorCode::Forbidden,
-                    "RP policy denies signing",
-                    RecommendedAction::FixRequest,
+        // 4. Resolve against the live policy and granted rules on every request, never against a
+        //    copy of the profile configuration frozen into the session (plan R16).
+        let matched = self.policy_runtime.resolve(
+            &ctx.profile_id,
+            &GrantAction::Authenticate,
+            &normalized_rp,
+        );
+        audit.matched(&matched);
+        match matched.action {
+            RuleAction::Deny => {
+                return Err(self.deny(
+                    target,
+                    (
+                        PolicyDenyReason::ActionNotAllowed,
+                        ProtocolError::new(
+                            ErrorCode::Forbidden,
+                            if matched.rule == RuleIdentity::None {
+                                "RP policy does not allow signing"
+                            } else {
+                                "RP policy denies signing"
+                            },
+                            RecommendedAction::FixRequest,
+                        ),
+                    ),
                 ));
             }
-            passless_core::agent::AgentAuthorization::Confirm => {
-                self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::ActionNotAllowed);
-                return Err(ProtocolError::new(
-                    ErrorCode::InteractionRequired,
-                    "human confirmation is required by policy",
-                    RecommendedAction::Retry,
-                ));
-            }
-            passless_core::agent::AgentAuthorization::Allow => {}
+            // `request` (ADR 0014 section 8.1): steps 5 and 6 run unchanged; the replay key is
+            // taken without budget, then the ceremony escalates (`Self::sign_escalated`).
+            RuleAction::Request => {}
+            RuleAction::Allow => {}
         }
 
-        let human_uv_required = ceremony_policy.user_verification
-            == passless_core::agent::UserVerificationSource::Human
-            && (req.user_verification
-                || self.security_config.always_uv
-                || ctx.profile_config.human_verification_prompt
-                    == passless_core::agent::HumanVerificationPrompt::Always);
-        if ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Human
-            || human_uv_required
-        {
-            self.record_policy_deny(
-                ctx,
-                &normalized_rp,
-                if human_uv_required {
-                    PolicyDenyReason::UvRequired
+        // 5. Unsupported options fail with `NotSupportedError` before any budget is claimed.
+        if !extensions_supported(&req.extensions, SUPPORTED_GET_EXTENSIONS)? {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::UnsupportedOption,
+                    ProtocolError::new(
+                        ErrorCode::NotSupported,
+                        "a requested extension is not supported",
+                        RecommendedAction::FixRequest,
+                    ),
+                ),
+            ));
+        }
+        let challenge = decode_challenge(&req.challenge_b64u)?;
+
+        // The browser already cancelled the request: stop before the replay key is consumed.
+        if cancelled() {
+            return Err(self.deny(target, aborted_error()));
+        }
+
+        // 6. Replay key, then budget (R1, R4). The budget limit is the live `max_operations`. A
+        //    `request` resolution runs the escalation pre-checks first (a refusal consumes
+        //    nothing), then takes the replay key only: its budget is claimed after approval
+        //    (V-H2), and a duplicate joins the in-flight slot instead of prompting again.
+        let key = ReplayKey::derive(
+            CeremonyAction::Authenticate,
+            &normalized_rp,
+            &req.origin,
+            req.top_origin.as_deref(),
+            &challenge,
+        );
+        let escalation = Escalation {
+            service: &self.escalation,
+            policy_runtime: &self.policy_runtime,
+            session: &ctx.session,
+            profile_id: &ctx.profile_id,
+            action: CeremonyAction::Authenticate,
+            rp_id: target.rp_id,
+            origin: &req.origin,
+            rule: &matched.rule,
+            audit,
+        };
+        let prepared = if matched.action == RuleAction::Request {
+            Some(
+                escalation
+                    .prepare()
+                    .map_err(|refused| self.deny(target, refused))?,
+            )
+        } else {
+            None
+        };
+        let claim = if prepared.is_some() {
+            ctx.session
+                .claim_key(key, ChallengeDigest::of(&challenge), Instant::now())
+        } else {
+            let max_operations = self
+                .policy_runtime
+                .max_operations(&ctx.profile_id)
+                .unwrap_or(0);
+            ctx.session.claim(
+                key,
+                ChallengeDigest::of(&challenge),
+                u32::from(max_operations),
+                Instant::now(),
+            )
+        };
+        match claim {
+            Claim::Fresh(mut guard) => {
+                let mut key_used = false;
+                let outcome = if let Some(prepared) = prepared {
+                    self.sign_escalated(
+                        ctx,
+                        req,
+                        target,
+                        &grant,
+                        (&escalation, prepared),
+                        &mut guard,
+                        deadline,
+                        cancelled,
+                        park,
+                        &mut key_used,
+                    )
                 } else {
-                    PolicyDenyReason::ActionNotAllowed
-                },
-            );
-            return Err(ProtocolError::new(
-                ErrorCode::InteractionRequired,
-                "human WebAuthn verification is required by policy",
-                RecommendedAction::Retry,
-            ));
+                    self.sign_fresh(ctx, req, target, &grant, &matched, cancelled, &mut key_used)
+                };
+                // The operation lock is released: activate the browser lease now (review H1).
+                // The assertion is released only if activation succeeds.
+                let outcome = outcome
+                    .and_then(|response| self.activate_lease(ctx, target).map(|()| response));
+                let ceremony = outcome
+                    .clone()
+                    .map(|response| CeremonyResult::Assertion(Box::new(response)));
+                if key_used {
+                    guard.complete(&ceremony);
+                } else {
+                    // Ended before key use: the key stays consumed, a claimed budget is given
+                    // back (none was claimed for an escalation that did not end in approval).
+                    guard.complete_without_key_use(&ceremony);
+                }
+                outcome
+            }
+            Claim::Join(in_flight, audit) => match in_flight.join(deadline, cancelled, park) {
+                JoinResult::Completed(outcome) => {
+                    self.serve_duplicate(ctx, target, audit)?;
+                    assertion_outcome(outcome)
+                }
+                // The browser cancelled the duplicate while it waited: audited like any abort.
+                JoinResult::Detached => Err(self.deny(target, aborted_error())),
+                JoinResult::DeadlineExceeded => Err(self.deny(target, join_timeout_error())),
+            },
+            Claim::Completed(outcome, audit) => {
+                self.serve_duplicate(ctx, target, audit)?;
+                assertion_outcome(outcome)
+            }
+            Claim::Rejected(rejection) => Err(self.deny(target, claim_rejection_error(rejection))),
+        }
+    }
+
+    /// The escalated path of a fresh replay key (ADR 0014 section 8.1): create or join the
+    /// escalation and wait for it holding no lock; on approval re-resolve (the result must be a
+    /// granted `allow`), claim the budget, and continue as [`Self::sign_fresh`], whose pre-key-use
+    /// re-check is unchanged. A deny, expiry or abort ends the ceremony with no budget claimed.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_escalated(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        target: &AuditTarget,
+        grant: &super::policy_engine::GrantSignSnapshot,
+        (escalation, prepared): (&Escalation<'_>, PreparedEscalation),
+        guard: &mut ClaimGuard,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        park: &mut dyn ParkHook,
+        key_used: &mut bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        match escalation.wait(prepared, deadline, cancelled, park) {
+            Ok(EscalationOutcome::Approved { .. }) => {}
+            Ok(_) => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "an authentication escalation ended with a registration approval",
+                    RecommendedAction::Abort,
+                ));
+            }
+            Err(denied) => return Err(self.deny(target, denied)),
         }
 
-        let up = ceremony_policy.user_presence == passless_core::agent::UserPresenceSource::Agent;
-        let uv = ceremony_policy.user_verification
-            == passless_core::agent::UserVerificationSource::Agent;
-        if (req.user_verification || self.security_config.always_uv) && !uv {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
-            return Err(ProtocolError::new(
-                ErrorCode::Forbidden,
-                "user verification is required but the configured evidence source is none",
-                RecommendedAction::FixRequest,
+        // The approval persisted a grant: the live resolution must now be a granted `allow`.
+        let approved =
+            self.policy_runtime
+                .resolve(&ctx.profile_id, &GrantAction::Authenticate, target.rp_id);
+        if approved.action != RuleAction::Allow || !approved.granted {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "policy no longer permits this operation after approval",
+                        RecommendedAction::Abort,
+                    ),
+                ),
             ));
         }
+        let max_operations = self
+            .policy_runtime
+            .max_operations(&ctx.profile_id)
+            .unwrap_or(0);
+        guard
+            .claim_budget(u32::from(max_operations))
+            .map_err(|rejection| self.deny(target, claim_rejection_error(rejection)))?;
+        self.sign_fresh(ctx, req, target, grant, &approved, cancelled, key_used)
+    }
 
-        let mut storage = self.credential_storage.lock().map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "storage lock poisoned",
-                RecommendedAction::Abort,
+    /// Before a duplicate gets the stored outcome, its session must still be valid (review L3):
+    /// a revoked or re-epoched session is not served. Served duplicates are audited, at most
+    /// `MAX_AUDITED_SERVES_PER_KEY` per key.
+    fn serve_duplicate(
+        &self,
+        ctx: &SignContext,
+        target: &AuditTarget,
+        audit: bool,
+    ) -> Result<(), ProtocolError> {
+        ctx.session
+            .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))?;
+        if audit {
+            self.record_policy_deny(target, PolicyDenyReason::ReplayServed);
+        }
+        Ok(())
+    }
+
+    /// Activate the browser lease after key use, with no backend lock held (review H1).
+    fn activate_lease(&self, ctx: &SignContext, target: &AuditTarget) -> Result<(), ProtocolError> {
+        let Some(activation) = &ctx.lease_activation else {
+            return Ok(());
+        };
+        activation.activate().map_err(|e| {
+            warn!("agent sign: {}", e);
+            self.deny(
+                target,
+                (
+                    PolicyDenyReason::LeaseActivationFailed,
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        "browser lease activation failed",
+                        RecommendedAction::Retry,
+                    ),
+                ),
             )
-        })?;
+        })
+    }
 
-        let credential_scope = if grant_snapshot.credential_refs.is_empty() {
+    /// Steps 7-10 for a fresh replay key. The backend operation lock is held only here: never
+    /// across a join, an escalation wait, the browser manager or a policy guard (LOCKING.md).
+    /// `key_used` is set right before the key provider signs.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_fresh(
+        &self,
+        ctx: &SignContext,
+        req: &SignAssertionRequest,
+        target: &AuditTarget,
+        grant: &super::policy_engine::GrantSignSnapshot,
+        matched: &passless_core::agent::MatchedRule,
+        cancelled: &dyn Fn() -> bool,
+        key_used: &mut bool,
+    ) -> Result<PrincipalResponse, ProtocolError> {
+        let normalized_rp = target.rp_id;
+        // The rule that permits this key use (after an escalation: the granted rule).
+        target.audit.matched(matched);
+        // `allow` is the only agent evidence: UP and UV come from the validated agent session,
+        // never from a rule field or the RP's `userVerification` request (ADR 0014 section 7).
+        let up = true;
+        let uv = true;
+
+        // 7. Backend operation lock, then storage, for selection, reservation and key use.
+        let _op_lock = lock_order::lock(&self.operation_lock, LockLevel::Operation);
+        let mut storage = lock_order::lock(&self.credential_storage, LockLevel::Storage);
+
+        let credential_scope = if grant.credential_refs.is_empty() {
             let mut discovered = Vec::new();
-            if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::None) {
+            // Only this RP's credentials are read (review M-f): `ByRp` is how
+            // `resolve_credential_id` looks them up too. The storage indexes are keyed by the RP
+            // ID as stored, which is what the browser sent (a lowercase hostname), and
+            // `normalized_rp` is trimmed and lowercased, so a credential this finds is one
+            // `resolve_credential_id` finds. A whole-store walk would decrypt every credential
+            // under the human locks (a GPG operation or a TPM unseal each).
+            if let Ok(mut credential) = storage.read_first(crate::storage::CredentialFilter::ByRp(
+                normalized_rp.to_string(),
+            )) {
                 loop {
-                    if credential.rp.id.eq_ignore_ascii_case(&normalized_rp) {
+                    if credential.rp.id.eq_ignore_ascii_case(normalized_rp) {
                         discovered.push(CredentialRef::with_default_domain(&credential.id));
                     }
                     match storage.read_next() {
@@ -1451,37 +1843,41 @@ impl SignHandler {
             }
             discovered
         } else {
-            grant_snapshot.credential_refs.clone()
+            // Configured pins (a frozen session snapshot) plus the credentials registration
+            // grants pinned for this RP (live; ADR 0014 section 8.3). With no configured pins,
+            // discovery above already finds a registered credential.
+            let mut pinned = grant.credential_refs.clone();
+            for granted in self
+                .policy_runtime
+                .granted_credential_refs(&ctx.profile_id, normalized_rp)
+            {
+                if !pinned.contains(&granted) {
+                    pinned.push(granted);
+                }
+            }
+            pinned
         };
 
         let mut candidates = Vec::new();
+        // The counter of every candidate as this selection read it (the operation lock is held, so
+        // it cannot change before key use): the reservation's `counter_before` needs no second read.
+        let mut counters_before = HashMap::new();
         for credential_ref in &credential_scope {
             if let Ok(credential_id) =
-                Self::resolve_credential_id(&mut storage, credential_ref, &normalized_rp)
+                Self::resolve_credential_id(&mut storage, credential_ref, normalized_rp)
+                && let Ok(credential) = storage.read(&credential_id)
             {
-                let encoded_id = b64u_encode(&credential_id);
-                if !req.allow_credentials.is_empty() && !req.allow_credentials.contains(&encoded_id)
-                {
-                    continue;
-                }
-                if let Ok(credential) = storage.read(&credential_id) {
-                    if credential.extensions.cred_protect == Some(2)
-                        && !uv
-                        && req.allow_credentials.is_empty()
-                    {
-                        continue;
-                    }
-                    candidates.push((credential_id, credential_ref.clone(), credential.created));
-                }
+                counters_before.insert(credential_id.clone(), credential.sign_count);
+                candidates.push((credential_id, credential_ref.clone(), credential.created));
             }
         }
 
+        // ADR 0014 section 10.1: pinning (`credential_refs`, then `credential:<ref>`) narrows the
+        // candidate set first, and a non-empty `allowCredentials` chooses within that pinned set.
+        let candidates =
+            Self::narrow_candidates(candidates, &req.allow_credentials, &matched.selection);
         if candidates.is_empty() && !req.allow_credentials.is_empty() {
-            self.record_policy_deny(
-                ctx,
-                &normalized_rp,
-                PolicyDenyReason::AllowCredentialsMismatch,
-            );
+            self.record_policy_deny(target, PolicyDenyReason::AllowCredentialsMismatch);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "allowCredentials does not contain a permitted credential",
@@ -1489,47 +1885,38 @@ impl SignHandler {
             ));
         }
 
-        let credential_selection = ctx
-            .profile_config
-            .credential_selection_for_rp(&normalized_rp);
         let cred_id =
-            Self::select_credential(candidates, &req.allow_credentials, &credential_selection)
-                .inspect_err(|_| {
-                    self.record_policy_deny(
-                        ctx,
-                        &normalized_rp,
-                        PolicyDenyReason::CredentialNotMatch,
-                    );
-                })?;
+            Self::select_credential(candidates, &matched.selection).inspect_err(|_| {
+                self.record_policy_deny(target, PolicyDenyReason::CredentialNotMatch);
+            })?;
 
-        let allow_event = PolicyAllowBuilder::new(
-            ctx.profile_id.clone(),
-            AuditAction::Authenticate,
-            &normalized_rp,
-        )
-        .evidence_sources(
-            &ceremony_policy.authorization.to_string(),
-            &ceremony_policy.user_presence.to_string(),
-            &ceremony_policy.user_verification.to_string(),
-        )
-        .build();
-        self.audit_gate.record(allow_event).map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "audit record failed",
-                RecommendedAction::Retry,
-            )
-        })?;
+        // 8. Durable audit reservation before key use (invariant 16). From here every exit path
+        //    ends in the ceremony's terminal record (`CeremonyAudit::conclude`), carrying the
+        //    credential, how it was selected and the counter before. The credential is read for
+        //    key use only after the reservation, as before P8.
+        target.audit.selected(
+            Some(CredentialRef::with_default_domain(&cred_id)),
+            Some(&matched.selection),
+            counters_before.get(&cred_id).copied(),
+        );
+        target.audit.reserve(target)?;
 
         let cred = storage.read(&cred_id).map_err(|_| {
+            target.audit.fail(PolicyDenyReason::CredentialUnavailable);
             ProtocolError::new(
                 ErrorCode::NotFound,
                 "credential not found in storage",
                 RecommendedAction::FixRequest,
             )
         })?;
-        if cred.extensions.cred_protect == Some(3) && !uv {
-            self.record_policy_deny(ctx, &normalized_rp, PolicyDenyReason::UvRequired);
+
+        // credProtect against the agent evidence (ADR 0014 sections 7 and 10.2, invariant 15).
+        if !super::cred_protect::satisfied(
+            cred.extensions.cred_protect,
+            uv,
+            !req.allow_credentials.is_empty(),
+        ) {
+            self.record_policy_deny(target, PolicyDenyReason::UvRequired);
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "credential protection policy requires user verification",
@@ -1537,6 +1924,19 @@ impl SignHandler {
             ));
         }
 
+        // 9. Immediately before key use (invariant 13): the revocation epoch, the rule re-resolved
+        //    against the live policy and grants, and the session and its grant. A failure here
+        //    is the terminal record of the reservation above. The key-use gates are held from
+        //    here to the end of key use, so a revocation (session revoke or epoch bump) either
+        //    happens before this check or waits for the signature (review M1).
+        #[cfg(test)]
+        super::session::test_hooks::before_key_use();
+        let _session_gate = ctx.session.key_use_guard();
+        let _epoch_gate = self.policy_runtime.key_use_guard();
+        self.recheck_before_key_use(ctx, target, cancelled)?;
+
+        // 10. Key use: persist the counter, release storage, then sign. The browser lease is
+        //     activated by the caller after the operation lock is released (review H1).
         let new_sign_count =
             if self.security_config.constant_signature_counter || !cred.discoverable {
                 0
@@ -1565,14 +1965,7 @@ impl SignHandler {
                 cred_random: updated_cred.extensions.cred_random.as_ref(),
             };
             storage.write(cred_ref).map_err(|_| {
-                let deny_event = PolicyDenyBuilder::new(
-                    ctx.profile_id.clone(),
-                    AuditAction::Authenticate,
-                    &normalized_rp,
-                    PolicyDenyReason::CounterPersistenceFailure,
-                )
-                .build();
-                let _ = self.audit_gate.record(deny_event);
+                self.record_policy_deny(target, PolicyDenyReason::CounterPersistenceFailure);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "failed to write updated credential",
@@ -1580,11 +1973,13 @@ impl SignHandler {
                 )
             })?;
         }
+        target.audit.counter_after(new_sign_count);
+        drop(storage);
 
         let backup_flags = cred.backup_state.flags();
 
         let authenticator_data =
-            build_authenticator_data(&normalized_rp, up, uv, backup_flags, new_sign_count);
+            build_authenticator_data(normalized_rp, up, uv, backup_flags, new_sign_count);
 
         let client_data_json = build_client_data_json(
             &req.origin,
@@ -1595,10 +1990,12 @@ impl SignHandler {
         let client_data_hash = Sha256::digest(&client_data_json);
 
         let sig_input = [&authenticator_data[..], &client_data_hash[..]].concat();
+        *key_used = true;
         let signature = self
             .key_provider
             .sign(&cred.key, cred.alg, &sig_input)
             .map_err(|_| {
+                target.audit.fail(PolicyDenyReason::SigningFailed);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     "signing failed",
@@ -1617,9 +2014,78 @@ impl SignHandler {
         ))
     }
 
-    fn select_credential(
+    /// Invariant 13: re-check the revocation epoch and the session, re-resolve the rule against
+    /// the live policy and grants, and re-check the grant, immediately before key use. A request
+    /// the browser cancelled meanwhile stops here too; this is the terminal record of its
+    /// reservation.
+    fn recheck_before_key_use(
+        &self,
+        ctx: &SignContext,
+        target: &AuditTarget,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ProtocolError> {
+        let rp_id = target.rp_id;
+        if cancelled() {
+            return Err(self.deny(target, aborted_error()));
+        }
+        ctx.session
+            .validity(self.policy_runtime.revocation_epoch(), Instant::now())
+            .map_err(|invalid| self.deny(target, session_invalid_error(invalid)))?;
+        let matched =
+            self.policy_runtime
+                .resolve(&ctx.profile_id, &GrantAction::Authenticate, rp_id);
+        if matched.action != RuleAction::Allow {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::PolicyRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "policy no longer allows this operation",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        let grant_active = self
+            .policy_runtime
+            .resolve_grant_for_sign(&ctx.profile_id, &ctx.active_grant_id)
+            .is_some_and(|grant| grant.state == super::grant::GrantState::Active);
+        if !grant_active {
+            return Err(self.deny(
+                target,
+                (
+                    PolicyDenyReason::GrantRevoked,
+                    ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "grant is no longer active",
+                        RecommendedAction::Abort,
+                    ),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Narrow the candidate set (ADR 0014 section 10.1): a `credential:<ref>` selection pins
+    /// first, then a non-empty `allowCredentials` keeps only the listed credentials. The pin is
+    /// applied before `allowCredentials`, so an `allowCredentials` entry never overrides it.
+    fn narrow_candidates(
         mut candidates: Vec<(Vec<u8>, CredentialRef, i64)>,
         allow_credentials: &[String],
+        selection: &CredentialSelection,
+    ) -> Vec<(Vec<u8>, CredentialRef, i64)> {
+        if let CredentialSelection::Credential(pinned) = selection {
+            candidates.retain(|(_, candidate_ref, _)| candidate_ref == pinned);
+        }
+        if !allow_credentials.is_empty() {
+            candidates.retain(|(id, _, _)| allow_credentials.contains(&b64u_encode(id)));
+        }
+        candidates
+    }
+
+    fn select_credential(
+        mut candidates: Vec<(Vec<u8>, CredentialRef, i64)>,
         selection: &CredentialSelection,
     ) -> Result<Vec<u8>, ProtocolError> {
         if candidates.is_empty() {
@@ -1630,35 +2096,19 @@ impl SignHandler {
             ));
         }
 
-        if !allow_credentials.is_empty() {
-            for allowed in allow_credentials {
-                if let Some(index) = candidates
-                    .iter()
-                    .position(|(id, _, _)| b64u_encode(id) == *allowed)
-                {
-                    return Ok(candidates.swap_remove(index).0);
-                }
-            }
+        // Exactly one permitted credential remains: use it.
+        if candidates.len() == 1 {
+            return Ok(candidates.remove(0).0);
         }
 
         match selection {
-            CredentialSelection::Credential(reference) => candidates
-                .into_iter()
-                .find(|(_, candidate_ref, _)| candidate_ref == reference)
-                .map(|(id, _, _)| id)
-                .ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::NotFound,
-                        "configured credential does not match this WebAuthn request",
-                        RecommendedAction::FixRequest,
-                    )
-                }),
-            CredentialSelection::Single if candidates.len() != 1 => Err(ProtocolError::new(
-                ErrorCode::Conflict,
-                "multiple discoverable credentials match; configure credential_selection",
-                RecommendedAction::FixRequest,
-            )),
-            CredentialSelection::Single => Ok(candidates.remove(0).0),
+            CredentialSelection::Credential(_) | CredentialSelection::Single => {
+                Err(ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "multiple discoverable credentials match; configure credential_selection",
+                    RecommendedAction::FixRequest,
+                ))
+            }
             CredentialSelection::FirstMatching => {
                 candidates.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(candidates.remove(0).0)
@@ -1703,8 +2153,30 @@ impl SignHandler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::thread;
+
+    use passless_core::agent::protocol::RegisterCredentialRequest;
+
+    /// A bearer session for `profile_id`, bound like a session issued with an all-zero principal
+    /// digest at revocation epoch 1 (a fresh `PolicyRuntime`).
+    fn test_session(profile_id: &ProfileId) -> Arc<AgentSession> {
+        test_session_at(profile_id, 1)
+    }
+
+    /// A bearer session created at revocation epoch `epoch`.
+    fn test_session_at(profile_id: &ProfileId, epoch: u64) -> Arc<AgentSession> {
+        AgentSession::new(super::super::session::SessionBinding {
+            profile_id: profile_id.clone(),
+            principal_digest: [0u8; 32],
+            revocation_epoch: epoch,
+            ttl: Duration::from_secs(600),
+        })
+    }
 
     #[test]
     fn test_client_data_json_no_cross_origin() {
@@ -1780,8 +2252,13 @@ mod tests {
 
     #[test]
     fn test_origin_verification_rejects_http() {
+        // Plain `http://` is rejected for every host except exactly `localhost`.
         assert!(!verify_origin_structural(
             "http://example.com",
+            "example.com"
+        ));
+        assert!(!verify_origin_structural(
+            "http://login.example.com",
             "example.com"
         ));
     }
@@ -1803,17 +2280,23 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_origin_requires_top_origin() {
+    fn test_cross_origin_always_fails_closed() {
         assert!(!verify_origin_context(
             "https://login.example.com",
             None,
             true,
             "example.com"
         ));
-        assert!(verify_origin_context(
+        assert!(!verify_origin_context(
             "https://login.example.com",
             Some("https://portal.example.net"),
             true,
+            "example.com"
+        ));
+        assert!(verify_origin_context(
+            "https://login.example.com",
+            Some("https://login.example.com"),
+            false,
             "example.com"
         ));
     }
@@ -1873,8 +2356,145 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_origin_rejects_bad_ports_and_confusable_origins() {
+        for origin in [
+            "http://localhost:0",
+            "https://example.com:0",
+            "http://localhost:+80",
+            "https://example.com:+443",
+            "http://localhost:",
+            "http://localhost:-1",
+            "http://localhost:65536",
+            "http://localhost:80a",
+            "ws://localhost",
+            "wss://localhost",
+            "http://a@localhost",
+            "http://localhost@evil.com",
+            "http://localhost.",
+            "http://localhost.evil.com",
+            "http://foo.localhost",
+            "http://LOCALHOST.",
+        ] {
+            assert!(parse_origin(origin).is_none(), "{origin} must be rejected");
+        }
+        assert_eq!(
+            parse_origin("http://localhost:65535").unwrap().port,
+            Some(65535)
+        );
+        assert_eq!(
+            parse_origin("http://LOCALHOST:8080").unwrap().host,
+            "localhost"
+        );
+        // A trailing-dot localhost never satisfies the exact `localhost` RP.
+        assert!(!verify_origin_structural("https://localhost.", "localhost"));
+        assert!(!verify_origin_structural("http://localhost:0", "localhost"));
+    }
+
+    #[test]
     fn test_parse_origin_invalid_scheme() {
         assert!(parse_origin("http://example.com").is_none());
+        assert!(parse_origin("ftp://example.com").is_none());
+        assert!(parse_origin("example.com").is_none());
+    }
+
+    #[test]
+    fn test_parse_origin_accepts_http_localhost_only() {
+        let plain = parse_origin("http://localhost").unwrap();
+        assert_eq!(plain.scheme, OriginScheme::Http);
+        assert_eq!(plain.host, "localhost");
+        assert_eq!(plain.port, None);
+
+        let with_port = parse_origin("http://localhost:8080").unwrap();
+        assert_eq!(with_port.scheme, OriginScheme::Http);
+        assert_eq!(with_port.port, Some(8080));
+
+        let https = parse_origin("https://localhost").unwrap();
+        assert_eq!(https.scheme, OriginScheme::Https);
+        assert_eq!(parse_origin("http://LOCALHOST").unwrap().host, "localhost");
+
+        // `http://` is never accepted for another host, including subdomains of localhost.
+        for rejected in [
+            "http://example.com",
+            "http://foo.localhost",
+            "http://localhost.evil.com",
+            "http://127.0.0.1",
+            "http://[::1]",
+            "http://localhost@evil.com",
+            "http://localhost/path",
+            "http://localhost?x=1",
+        ] {
+            assert!(parse_origin(rejected).is_none(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn test_origin_verification_localhost_is_exact() {
+        for accepted in [
+            "http://localhost",
+            "http://localhost:8080",
+            "https://localhost",
+            "https://localhost:8443",
+        ] {
+            assert!(
+                verify_origin_structural(accepted, "localhost"),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "http://example.com",
+            "http://foo.localhost",
+            "http://localhost.evil.com",
+            "https://foo.localhost",
+            "https://localhost.evil.com",
+            "http://127.0.0.1",
+            "https://127.0.0.1",
+        ] {
+            assert!(
+                !verify_origin_structural(rejected, "localhost"),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_http_localhost_origin_is_not_valid_for_other_rps() {
+        assert!(!verify_origin_structural("http://localhost", "example.com"));
+        assert!(!verify_origin_structural(
+            "http://localhost:8080",
+            "example.com"
+        ));
+        assert!(!verify_origin_structural(
+            "https://example.com",
+            "localhost"
+        ));
+    }
+
+    #[test]
+    fn test_verify_origin_context_rejects_scheme_mismatch_with_top_origin() {
+        assert!(!verify_origin_context(
+            "http://localhost",
+            Some("https://localhost"),
+            false,
+            "localhost"
+        ));
+        assert!(!verify_origin_context(
+            "https://localhost",
+            Some("http://localhost"),
+            false,
+            "localhost"
+        ));
+        assert!(verify_origin_context(
+            "http://localhost:8080",
+            Some("http://localhost:8080"),
+            false,
+            "localhost"
+        ));
+        assert!(!verify_origin_context(
+            "http://localhost:8080",
+            Some("http://localhost:9090"),
+            false,
+            "localhost"
+        ));
     }
 
     #[test]
@@ -1930,20 +2550,6 @@ mod tests {
         assert!(!constant_time_eq(b"", b"x"));
         assert!(!constant_time_eq(b"x", b""));
         assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn test_http_server_binds_unix_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        assert!(server.socket_path().exists());
-        let meta = std::fs::metadata(server.socket_path()).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        drop(server);
-        shutdown.store(true, Ordering::Release);
     }
 
     #[test]
@@ -2051,230 +2657,6 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_request_budget_is_shared_for_one_bearer() {
-        let registry = SignContextRegistry::new();
-        let token = generate_bearer_token().unwrap();
-        let first = registry.request_budget(&token, 2).unwrap();
-        let second = registry.request_budget(&token, 2).unwrap();
-
-        assert!(matches!(
-            first.claim(b"register-operation"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(
-            second.claim(b"register-operation"),
-            RequestClaim::WaitFor(_)
-        ));
-        assert!(matches!(
-            second.claim(b"sign-operation"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(
-            first.claim(b"third-operation"),
-            RequestClaim::Exhausted
-        ));
-        assert!(registry.request_budget(&token, 3).is_err());
-    }
-
-    fn make_budget(max_requests: usize) -> RequestBudget {
-        RequestBudget {
-            inner: Arc::new(Mutex::new(RequestBudgetInner {
-                used: HashSet::new(),
-                in_flight: HashMap::new(),
-                completed: HashMap::new(),
-            })),
-            max_requests,
-        }
-    }
-
-    #[test]
-    fn test_claim_duplicate_in_flight_returns_wait_for() {
-        let budget = make_budget(5);
-        let body = b"identical-request-body";
-        let first = budget.claim(body);
-        assert!(matches!(first, RequestClaim::Claimed { .. }));
-        let second = budget.claim(body);
-        assert!(matches!(second, RequestClaim::WaitFor(_)));
-
-        let RequestClaim::Claimed { digest } = first else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"result".to_vec(),
-            },
-        );
-
-        let third = budget.claim(body);
-        assert!(matches!(third, RequestClaim::Cached { .. }));
-    }
-
-    #[test]
-    fn test_completed_expired_returns_replayed() {
-        let budget = make_budget(5);
-        let body = b"expired-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"ok".to_vec(),
-            },
-        );
-        {
-            let mut inner = budget.inner.lock().unwrap();
-            if let Some(completed) = inner.completed.get_mut(&digest) {
-                completed.at = Instant::now() - COMPLETED_OUTCOME_TTL - Duration::from_secs(1);
-            }
-        }
-        assert!(matches!(budget.claim(body), RequestClaim::Replayed));
-    }
-
-    #[test]
-    fn test_claim_different_bodies_both_claimed() {
-        let budget = make_budget(5);
-        assert!(matches!(
-            budget.claim(b"body-a"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(
-            budget.claim(b"body-b"),
-            RequestClaim::Claimed { .. }
-        ));
-    }
-
-    #[test]
-    fn test_claim_budget_exhausted() {
-        let budget = make_budget(2);
-        assert!(matches!(budget.claim(b"one"), RequestClaim::Claimed { .. }));
-        assert!(matches!(budget.claim(b"two"), RequestClaim::Claimed { .. }));
-        assert!(matches!(budget.claim(b"three"), RequestClaim::Exhausted));
-    }
-
-    #[test]
-    fn test_in_flight_waiter_receives_resolved_outcome() {
-        let budget = make_budget(5);
-        let body = b"shared-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
-            panic!("expected WaitFor");
-        };
-
-        let waiter = std::thread::spawn(move || entry.wait(Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(50));
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "403 Forbidden",
-                body: b"{\"error\":\"forbidden\"}".to_vec(),
-            },
-        );
-        let outcome = waiter.join().unwrap().expect("waiter should resolve");
-        assert_eq!(outcome.status, "403 Forbidden");
-        assert_eq!(outcome.body, b"{\"error\":\"forbidden\"}");
-    }
-
-    #[test]
-    fn test_in_flight_waiter_timeout_returns_none() {
-        let budget = make_budget(5);
-        let body = b"timeout-body";
-        assert!(matches!(budget.claim(body), RequestClaim::Claimed { .. }));
-        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
-            panic!("expected WaitFor");
-        };
-        assert!(entry.wait(Duration::from_millis(50)).is_none());
-    }
-
-    #[test]
-    fn test_in_flight_guard_drop_resolves_waiters() {
-        let budget = make_budget(5);
-        let body = b"guard-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        let RequestClaim::WaitFor(entry) = budget.claim(body) else {
-            panic!("expected WaitFor");
-        };
-        {
-            let guard = InFlightGuard::new(budget.clone(), digest);
-            drop(guard);
-        }
-        let outcome = entry
-            .wait(Duration::from_secs(5))
-            .expect("resolved by drop");
-        assert_eq!(outcome.status, "500 Internal Server Error");
-    }
-
-    #[test]
-    fn test_completed_duplicate_within_ttl_returns_cached() {
-        let budget = make_budget(5);
-        let body = b"cached-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"cached-result".to_vec(),
-            },
-        );
-        let RequestClaim::Cached { outcome } = budget.claim(body) else {
-            panic!("expected Cached");
-        };
-        assert_eq!(outcome.status, "200 OK");
-        assert_eq!(outcome.body, b"cached-result");
-    }
-
-    #[test]
-    fn test_completed_cache_does_not_consume_extra_budget() {
-        let budget = make_budget(2);
-        let body = b"budget-body";
-        let RequestClaim::Claimed { digest } = budget.claim(body) else {
-            panic!("expected Claimed");
-        };
-        budget.resolve(
-            digest,
-            InFlightOutcome {
-                status: "200 OK",
-                body: b"ok".to_vec(),
-            },
-        );
-        assert!(matches!(budget.claim(body), RequestClaim::Cached { .. }));
-        assert!(matches!(
-            budget.claim(b"other"),
-            RequestClaim::Claimed { .. }
-        ));
-        assert!(matches!(budget.claim(b"third"), RequestClaim::Exhausted));
-    }
-
-    #[test]
-    fn test_completed_cache_bounded_size() {
-        let budget = make_budget(MAX_COMPLETED_OUTCOMES + 8);
-        for i in 0..MAX_COMPLETED_OUTCOMES + 4 {
-            let body = format!("body-{}", i);
-            let RequestClaim::Claimed { digest } = budget.claim(body.as_bytes()) else {
-                panic!("expected Claimed");
-            };
-            budget.resolve(
-                digest,
-                InFlightOutcome {
-                    status: "200 OK",
-                    body: b"ok".to_vec(),
-                },
-            );
-        }
-        let used = budget.inner.lock().unwrap().completed.len();
-        assert!(used <= MAX_COMPLETED_OUTCOMES);
-    }
-
-    #[test]
     fn test_registry_unknown_token() {
         let registry = SignContextRegistry::new();
         assert!(registry.lookup_bound("nonexistent").is_none());
@@ -2336,6 +2718,42 @@ mod tests {
         assert_eq!(registry.len(), 3);
         registry.revoke_all();
         assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn test_registry_revoke_stale_sessions_keeps_current_ones() {
+        let registry = SignContextRegistry::new();
+        let f = sign_handler_tests::TestFixture::new(true);
+        let handler = Arc::new(f.make_handler());
+        let profile = ProfileId::new("test-profile").unwrap();
+        let mut stale_ctx = f.make_ctx();
+        stale_ctx.session = test_session_at(&profile, 1);
+        let mut current_ctx = f.make_ctx();
+        current_ctx.session = test_session_at(&profile, 2);
+        let stale = generate_bearer_token().unwrap();
+        let current = generate_bearer_token().unwrap();
+        for (token, ctx) in [(&stale, &stale_ctx), (&current, &current_ctx)] {
+            registry
+                .register_pending(token.clone(), ctx.clone(), handler.clone())
+                .unwrap();
+            registry
+                .bind_lease(token, format!("lease-{token}"))
+                .unwrap();
+        }
+        let revoked = registry.revoke_stale_sessions(2);
+        assert_eq!(revoked.revoked, 1);
+        assert_eq!(revoked.lease_ids, vec![format!("lease-{stale}")]);
+        assert!(registry.has_live_bearer_for_lease(&format!("lease-{current}")));
+        assert!(!registry.has_live_bearer_for_lease(&format!("lease-{stale}")));
+        assert!(
+            registry.lookup_revoked_sign(&stale).is_some(),
+            "a stale bearer is remembered so a late use is audited"
+        );
+        assert!(registry.lookup_revoked_sign(&current).is_none());
+        assert!(registry.lookup_bound(&stale).is_none());
+        assert!(stale_ctx.session.is_revoked());
+        assert!(registry.lookup_bound(&current).is_some());
+        assert!(!current_ctx.session.is_revoked());
     }
 
     #[test]
@@ -2415,267 +2833,6 @@ mod tests {
     }
 
     #[test]
-    fn test_http_valid_bound_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry.bind_lease(&token, "lease-rt".to_string()).unwrap();
-        let handle = server.serve(registry);
-        let body = serde_json::to_vec(&SignAssertionRequest {
-            origin: "https://example.com".to_string(),
-            top_origin: None,
-            rp_id: "example.com".to_string(),
-            challenge_b64u: "dGVzdA".to_string(),
-            allow_credentials: vec![],
-            user_verification: false,
-            cross_origin: false,
-        })
-        .unwrap();
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(&body).unwrap();
-        let mut resp_buf = vec![0u8; 8192];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("200 OK"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_unknown_bearer_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer unknown_token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_unbound_bearer_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_revoked_bearer_401() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry
-            .bind_lease(&token, "lease-rev".to_string())
-            .unwrap();
-        registry.revoke(&token);
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_missing_bearer() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_wrong_method() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry.bind_lease(&token, "lease-m".to_string()).unwrap();
-        let handle = server.serve(registry);
-        let request = format!(
-            "GET /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n\r\n",
-            token
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("404"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_wrong_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry.bind_lease(&token, "lease-p".to_string()).unwrap();
-        let handle = server.serve(registry);
-        let request = format!(
-            "POST /other HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
-            token
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("404"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_listener_loopback_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        assert!(server.socket_path().starts_with(dir.path()));
-        shutdown.store(true, Ordering::Release);
-    }
-
-    #[test]
-    fn test_shutdown_join() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path, shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
     fn test_p256_sign_verify_through_provider() {
         let provider = soft_fido2::SoftwareCredentialKeyProvider;
         let generated = provider.generate(-7).unwrap();
@@ -2684,179 +2841,17 @@ mod tests {
         assert!(!signature.is_empty());
     }
 
-    #[test]
-    fn test_http_options_returns_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let request = "OPTIONS /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: Authorization\r\n\r\n";
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("404"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_post_error_no_cors_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("401"));
-        assert!(!resp_str.contains("Access-Control"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_success_no_cors_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        registry
-            .bind_lease(&token, "lease-cors".to_string())
-            .unwrap();
-        let handle = server.serve(registry);
-        let body = serde_json::to_vec(&SignAssertionRequest {
-            origin: "https://example.com".to_string(),
-            top_origin: None,
-            rp_id: "example.com".to_string(),
-            challenge_b64u: "dGVzdA".to_string(),
-            allow_credentials: vec![],
-            user_verification: false,
-            cross_origin: false,
-        })
-        .unwrap();
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(&body).unwrap();
-        let mut resp_buf = vec![0u8; 8192];
-        let n = stream.read(&mut resp_buf).unwrap();
-        let resp_str = std::str::from_utf8(&resp_buf[..n]).unwrap();
-        assert!(resp_str.contains("200 OK"));
-        assert!(!resp_str.contains("Access-Control"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_http_unbound_bearer_same_401_as_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("sock");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-        let registry = Arc::new(SignContextRegistry::new());
-        let token = generate_bearer_token().unwrap();
-        let f = sign_handler_tests::TestFixture::new(true);
-        let handler = Arc::new(f.make_handler());
-        let ctx = f.make_ctx();
-        registry
-            .register_pending(token.clone(), ctx, handler)
-            .unwrap();
-        let handle = server.serve(registry);
-        let body = b"{}";
-        let request = format!(
-            "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            token,
-            body.len()
-        );
-        let mut stream = UnixStream::connect(&sock_path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
-        let mut resp_buf = vec![0u8; 4096];
-        let mut total = 0;
-        loop {
-            let n = stream.read(&mut resp_buf[total..]).unwrap();
-            if n == 0 {
-                break;
-            }
-            total += n;
-            if resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                let header_end = resp_buf[..total]
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .unwrap();
-                let header_str = std::str::from_utf8(&resp_buf[..header_end]).unwrap();
-                if let Some(cl) = header_str.lines().find_map(|l| {
-                    l.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                }) {
-                    let body_start = header_end + 4;
-                    let body_len = total.saturating_sub(body_start);
-                    if body_len >= cl {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-        let resp_str = std::str::from_utf8(&resp_buf[..total]).unwrap();
-        assert!(resp_str.contains("401"));
-        assert!(resp_str.contains("invalid_bearer"));
-        assert!(!resp_str.contains("unbound_bearer"));
-        shutdown.store(true, Ordering::Release);
-        handle.join().unwrap();
-    }
-
-    pub(super) mod sign_handler_tests {
+    pub(crate) mod sign_handler_tests {
         use super::*;
         use crate::agent::audit::AuditGate;
         use crate::agent::browser;
         use crate::agent::grant::GrantRequestParams;
-        use crate::agent::intent;
+        use crate::agent::identity;
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::{CredentialFilter, CredentialStorage};
         use passless_core::agent::{
-            AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+            AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, BrowserScope,
+            CredentialSelection, GrantSource,
         };
         use passless_core::config::SecurityConfig;
         use soft_fido2::{
@@ -2897,40 +2892,31 @@ mod tests {
             }
         }
 
-        pub struct MockMonoClock {
-            inner: Mutex<MockClockInner>,
-        }
-        impl MockMonoClock {
-            pub fn new() -> Self {
-                Self {
-                    inner: Mutex::new(MockClockInner {
-                        base: Instant::now(),
-                        offset: Duration::ZERO,
-                    }),
-                }
-            }
-        }
-        impl intent::MonotonicClock for MockMonoClock {
-            fn now(&self) -> intent::MonotonicTime {
-                let inner = self.inner.lock().unwrap();
-                let elapsed = inner.offset;
-                intent::MonotonicTime::from_millis(elapsed.as_millis() as u64)
-            }
-        }
-
         pub struct RecordingKeyProvider {
             inner: SoftwareCredentialKeyProvider,
             sign_count: AtomicUsize,
+            /// Runs inside `sign`, before the signature, on whatever thread signs.
+            on_sign: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+            /// Makes `sign` fail after it ran the hook.
+            fail_sign: std::sync::atomic::AtomicBool,
         }
         impl RecordingKeyProvider {
             pub fn new() -> Self {
                 Self {
                     inner: SoftwareCredentialKeyProvider,
                     sign_count: AtomicUsize::new(0),
+                    on_sign: Mutex::new(None),
+                    fail_sign: std::sync::atomic::AtomicBool::new(false),
                 }
             }
-            fn sign_calls(&self) -> usize {
+            pub fn set_fail_sign(&self, fail: bool) {
+                self.fail_sign.store(fail, Ordering::Release);
+            }
+            pub fn sign_calls(&self) -> usize {
                 self.sign_count.load(Ordering::Acquire)
+            }
+            pub fn set_on_sign(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+                *self.on_sign.lock().unwrap() = hook;
             }
         }
         impl soft_fido2::CredentialKeyProvider for RecordingKeyProvider {
@@ -2952,7 +2938,16 @@ mod tests {
                 algorithm: i32,
                 data: &[u8],
             ) -> core::result::Result<Vec<u8>, CredentialKeyError> {
+                let hook = self.on_sign.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
                 self.sign_count.fetch_add(1, Ordering::AcqRel);
+                if self.fail_sign.load(Ordering::Acquire) {
+                    return Err(CredentialKeyError::PermanentFailure(
+                        "test failure".to_string(),
+                    ));
+                }
                 self.inner.sign(key, algorithm, data)
             }
         }
@@ -2960,15 +2955,31 @@ mod tests {
         pub struct WriteCountingStorage {
             creds: Mutex<Vec<soft_fido2::Credential>>,
             write_count: AtomicU64,
+            /// Remaining matches of the iteration started by the last `read_first`.
+            queue: std::collections::VecDeque<soft_fido2::Credential>,
+            /// The RP ID of every credential `read_first` and `read_next` handed out (a backend
+            /// reads, and for `pass` decrypts, each of them).
+            iterated_rps: Mutex<Vec<String>>,
         }
         impl WriteCountingStorage {
             pub fn new() -> Self {
                 Self {
                     creds: Mutex::new(Vec::new()),
                     write_count: AtomicU64::new(0),
+                    queue: std::collections::VecDeque::new(),
+                    iterated_rps: Mutex::new(Vec::new()),
                 }
             }
-            fn writes(&self) -> u64 {
+            pub fn iterated_rps(&self) -> Vec<String> {
+                self.iterated_rps.lock().unwrap().clone()
+            }
+            pub fn clear_iterated(&self) {
+                self.iterated_rps.lock().unwrap().clear();
+            }
+            fn note_iterated(&self, cred: &soft_fido2::Credential) {
+                self.iterated_rps.lock().unwrap().push(cred.rp.id.clone());
+            }
+            pub fn writes(&self) -> u64 {
                 self.write_count.load(Ordering::Acquire)
             }
             pub fn add_cred(&self, cred: soft_fido2::Credential) {
@@ -2980,26 +2991,28 @@ mod tests {
                 &mut self,
                 filter: CredentialFilter,
             ) -> soft_fido2::Result<soft_fido2::Credential> {
-                let creds = self.creds.lock().unwrap();
-                match filter {
-                    CredentialFilter::ByRp(rp_id) => creds
-                        .iter()
-                        .find(|c| c.rp.id == rp_id)
-                        .cloned()
-                        .ok_or(soft_fido2::Error::Other),
-                    CredentialFilter::None => {
-                        creds.first().cloned().ok_or(soft_fido2::Error::Other)
+                let matches: Vec<soft_fido2::Credential> = {
+                    let creds = self.creds.lock().unwrap();
+                    match filter {
+                        CredentialFilter::ByRp(rp_id) => {
+                            creds.iter().filter(|c| c.rp.id == rp_id).cloned().collect()
+                        }
+                        CredentialFilter::None => creds.clone(),
+                        CredentialFilter::ById(id) => {
+                            creds.iter().filter(|c| c.id == id).cloned().collect()
+                        }
+                        CredentialFilter::ByHash(_) => Vec::new(),
                     }
-                    CredentialFilter::ById(id) => creds
-                        .iter()
-                        .find(|c| c.id == id)
-                        .cloned()
-                        .ok_or(soft_fido2::Error::Other),
-                    CredentialFilter::ByHash(_) => Err(soft_fido2::Error::Other),
-                }
+                };
+                self.queue = matches.into();
+                let first = self.queue.pop_front().ok_or(soft_fido2::Error::Other)?;
+                self.note_iterated(&first);
+                Ok(first)
             }
             fn read_next(&mut self) -> soft_fido2::Result<soft_fido2::Credential> {
-                Err(soft_fido2::Error::Other)
+                let next = self.queue.pop_front().ok_or(soft_fido2::Error::Other)?;
+                self.note_iterated(&next);
+                Ok(next)
             }
             fn read(&mut self, id: &[u8]) -> soft_fido2::Result<soft_fido2::Credential> {
                 self.creds
@@ -3030,6 +3043,90 @@ mod tests {
             }
         }
 
+        /// A granted-rules store whose answer a test flips at runtime (plan R16: ceremonies resolve
+        /// live, never against state copied at session creation).
+        #[derive(Default)]
+        pub struct ToggleGrants(pub std::sync::atomic::AtomicBool);
+        impl ToggleGrants {
+            pub fn set(&self, granted: bool) {
+                self.0.store(granted, Ordering::Release);
+            }
+        }
+        impl GrantSource for ToggleGrants {
+            fn is_granted(&self, _profile_id: &ProfileId, _rp_id: &str) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+
+        pub fn rule(rp_id: &str, authenticate: RuleAction, register: RuleAction) -> AgentRpRule {
+            AgentRpRule {
+                rp_id: rp_id.to_string(),
+                register,
+                authenticate,
+                credential_selection: None,
+            }
+        }
+
+        pub fn allow_rule(rp_id: &str) -> AgentRpRule {
+            rule(rp_id, RuleAction::Allow, RuleAction::Deny)
+        }
+
+        pub fn request_rule(rp_id: &str) -> AgentRpRule {
+            rule(rp_id, RuleAction::Request, RuleAction::Deny)
+        }
+
+        pub fn deny_rule(rp_id: &str) -> AgentRpRule {
+            rule(rp_id, RuleAction::Deny, RuleAction::Deny)
+        }
+
+        pub fn test_profile_config(
+            rules: Vec<AgentRpRule>,
+            credential_refs: Option<Vec<passless_core::agent::CredentialRef>>,
+            selection: CredentialSelection,
+        ) -> AgentProfileConfig {
+            AgentProfileConfig {
+                max_granted_rules: 64,
+                max_operations: 64,
+                max_concurrent_sessions: 1,
+                browser_scope: BrowserScope::Session,
+                credential_selection: selection,
+                mode: AgentMode::SameUser,
+                principal_user: String::new(),
+                credential_refs,
+                max_grant_ttl: None,
+                max_session_ttl: None,
+                storage: None,
+                rules,
+                legacy: Default::default(),
+                device: None,
+                start_url: None,
+                browser_command: None,
+                browser_user: None,
+                browser_runtime_root: None,
+                browser_cdp_expose: None,
+                browser_cdp_port: None,
+            }
+        }
+
+        pub fn test_agent_config(profile_config: AgentProfileConfig) -> AgentConfig {
+            let mut profiles = BTreeMap::new();
+            profiles.insert("test-profile".to_string(), profile_config);
+            AgentConfig {
+                notify_user: None,
+                state_dir: None,
+                escalation_timeout: None,
+                escalation_cooldown: 600,
+                allow_automatic_human_path: false,
+                browser_path: None,
+                limits: Default::default(),
+                enabled: true,
+                profiles,
+                audit_path: Some(std::path::PathBuf::from("/tmp/test-audit")),
+                acknowledge_global_same_user: vec!["test-profile".to_string()],
+                acknowledge_same_user_registration: vec!["test-profile".to_string()],
+            }
+        }
+
         pub struct TestFixture {
             profile_id: ProfileId,
             grant_id: passless_core::agent::GrantId,
@@ -3040,7 +3137,6 @@ mod tests {
             audit_gate: Arc<AuditGate>,
             operation_lock: Arc<Mutex<()>>,
             security_config: SecurityConfig,
-            profile_config: AgentProfileConfig,
         }
 
         impl TestFixture {
@@ -3084,73 +3180,24 @@ mod tests {
                 })
                     as Box<dyn CredentialStorage>));
 
-                let profile_config = AgentProfileConfig {
-                    max_operations: 64,
-                    max_concurrent_sessions: 1,
-                    browser_scope: BrowserScope::Session,
-                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
-                    human_verification_prompt:
-                        passless_core::agent::config::HumanVerificationPrompt::Always,
-                    mode: AgentMode::Isolated,
-                    principal_user: String::new(),
-                    rp_ids: vec!["example.com".to_string()],
-                    require_uv: false,
-                    credential_refs: Some(vec![cred_ref.clone()]),
-                    max_grant_ttl: None,
-                    max_session_ttl: None,
-                    storage: None,
-                    registration_allowed: false,
-                    rules: vec![AgentRpRule {
-                        credential_selection: None,
-                        rp_id: "example.com".to_string(),
-                        register: AgentCeremonyPolicy::deny(),
-                        authenticate: AgentCeremonyPolicy {
-                            authorization: AgentAuthorization::Allow,
-                            user_presence: UserPresenceSource::Agent,
-                            user_verification: UserVerificationSource::Agent,
-                        },
-                    }],
-                    device: DeviceIdentity {
-                        name: "test-device".to_string(),
-                        phys: "test-phys".to_string(),
-                        uniq: "test-uniq".to_string(),
-                        vendor_id: 0x1234,
-                        product_id: 0x5678,
-                    },
-                    start_url: None,
-                    browser_command: None,
-                    browser_user: None,
-                    browser_runtime_root: None,
-                    browser_cdp_expose: None,
-                    browser_cdp_port: None,
-                };
-
-                let mut profiles = BTreeMap::new();
-                profiles.insert("test-profile".to_string(), profile_config.clone());
-                let agent_config = AgentConfig {
-                    enabled: true,
-                    profiles,
-                    audit_path: Some(audit_path),
-                    acknowledge_global_same_user: vec![],
-                    acknowledge_same_user_registration: vec![],
-                };
+                let profile_config = test_profile_config(
+                    vec![allow_rule("example.com")],
+                    Some(vec![cred_ref.clone()]),
+                    CredentialSelection::Single,
+                );
+                let agent_config = test_agent_config(profile_config);
 
                 let clock = Arc::new(MockClock::new());
-                let mono_clock = Arc::new(MockMonoClock::new());
 
-                let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
-                        .unwrap(),
-                );
+                let policy_runtime =
+                    Arc::new(PolicyRuntime::new(&agent_config, clock.clone(), None).unwrap());
 
                 let session_id = passless_core::agent::PrincipalSessionId::new();
-                let endpoint_id = passless_core::agent::EndpointId::new();
 
                 let grant_req_id = policy_runtime
                     .admin_request_grant(GrantRequestParams {
                         profile_id: profile_id.clone(),
                         session_id: session_id.clone(),
-                        endpoint_id: endpoint_id.clone(),
                         principal_digest: [0u8; 32],
                         rp_ids: vec!["example.com".to_string()],
                         credentials: vec![cred_ref.clone()],
@@ -3158,7 +3205,7 @@ mod tests {
                     })
                     .unwrap();
 
-                let authority = intent::admin_authority();
+                let authority = identity::admin_authority();
                 let grant_id = policy_runtime
                     .admin_approve_grant(&grant_req_id, &authority)
                     .unwrap();
@@ -3186,7 +3233,6 @@ mod tests {
                     audit_gate,
                     operation_lock,
                     security_config,
-                    profile_config,
                 }
             }
 
@@ -3198,19 +3244,29 @@ mod tests {
                     security_config: self.security_config.clone(),
                     key_provider: self.key_provider.clone(),
                     operation_lock: self.operation_lock.clone(),
+                    escalation: crate::agent::escalation::test_support::idle_service(
+                        self.audit_gate.clone(),
+                    ),
+                    audit_deployment: Default::default(),
                 }
             }
 
             pub fn make_ctx(&self) -> SignContext {
                 SignContext {
+                    lease_activation: None,
                     profile_id: self.profile_id.clone(),
                     active_grant_id: self.grant_id.clone(),
-                    profile_config: self.profile_config.clone(),
+                    session: test_session_at(
+                        &self.profile_id,
+                        self.policy_runtime.revocation_epoch(),
+                    ),
                 }
             }
 
             fn make_req(&self) -> SignAssertionRequest {
                 SignAssertionRequest {
+                    extensions: Vec::new(),
+                    timeout_ms: None,
                     origin: "https://example.com".to_string(),
                     top_origin: None,
                     rp_id: "example.com".to_string(),
@@ -3233,7 +3289,7 @@ mod tests {
             assert_eq!(storage.writes(), storage_writes_before);
         }
 
-        fn get_write_counting_storage(
+        pub fn get_write_counting_storage(
             storage: &Arc<Mutex<Box<dyn CredentialStorage>>>,
         ) -> &WriteCountingStorage {
             let boxed = storage.lock().unwrap();
@@ -3263,7 +3319,6 @@ mod tests {
                 .admin_request_dynamic_grant(GrantRequestParams {
                     profile_id: f.profile_id.clone(),
                     session_id: passless_core::agent::PrincipalSessionId::new(),
-                    endpoint_id: passless_core::agent::EndpointId::new(),
                     principal_digest: [0u8; 32],
                     rp_ids: vec!["example.com".to_string()],
                     credentials: vec![],
@@ -3272,7 +3327,7 @@ mod tests {
                 .unwrap();
             let dynamic_grant_id = f
                 .policy_runtime
-                .admin_approve_grant(&grant_request, &intent::admin_authority())
+                .admin_approve_grant(&grant_request, &identity::admin_authority())
                 .unwrap();
 
             let new_credential_id = vec![2u8; 32];
@@ -3290,12 +3345,11 @@ mod tests {
                 extensions: soft_fido2::Extensions::default(),
             });
 
-            let mut profile_config = f.profile_config.clone();
-            profile_config.credential_refs = None;
             let ctx = SignContext {
+                lease_activation: None,
                 profile_id: f.profile_id.clone(),
                 active_grant_id: dynamic_grant_id,
-                profile_config,
+                session: test_session(&f.profile_id),
             };
             let mut req = f.make_req();
             req.allow_credentials = vec![b64u_encode(&new_credential_id)];
@@ -3363,9 +3417,10 @@ mod tests {
             let handler = f.make_handler();
             let fake_grant_id = passless_core::agent::GrantId::new();
             let ctx = SignContext {
+                lease_activation: None,
                 profile_id: f.profile_id.clone(),
                 active_grant_id: fake_grant_id,
-                profile_config: f.profile_config.clone(),
+                session: test_session(&f.profile_id),
             };
             let req = f.make_req();
             let writes_before = get_write_counting_storage(&f.storage).writes();
@@ -3384,9 +3439,10 @@ mod tests {
             let handler = f.make_handler();
             let wrong_profile = ProfileId::new("wrong-profile").unwrap();
             let ctx = SignContext {
+                lease_activation: None,
+                session: test_session(&wrong_profile),
                 profile_id: wrong_profile,
                 active_grant_id: f.grant_id.clone(),
-                profile_config: f.profile_config.clone(),
             };
             let req = f.make_req();
             let writes_before = get_write_counting_storage(&f.storage).writes();
@@ -3470,15 +3526,18 @@ mod tests {
             let handler = Arc::new(f.make_handler());
             let ctx = Arc::new(f.make_ctx());
             let mut handles = Vec::new();
-            for _ in 0..4 {
+            for i in 0..4u8 {
                 let h = handler.clone();
                 let c = ctx.clone();
                 handles.push(std::thread::spawn(move || {
+                    // Distinct challenges: four distinct operations, serialized on the counter.
                     let req = SignAssertionRequest {
+                        extensions: Vec::new(),
+                        timeout_ms: None,
                         origin: "https://example.com".to_string(),
                         top_origin: None,
                         rp_id: "example.com".to_string(),
-                        challenge_b64u: "dGVzdA".to_string(),
+                        challenge_b64u: b64u_encode(&[b't', i]),
                         allow_credentials: vec![],
                         user_verification: false,
                         cross_origin: false,
@@ -3548,14 +3607,16 @@ mod tests {
         use super::*;
 
         use crate::agent::audit::AuditGate;
+        use crate::agent::escalation::test_support::{self, ScriptedPrompter};
+        use crate::agent::escalation::{EscalationService, PromptEvent};
         use crate::agent::grant::GrantRequestParams;
-        use crate::agent::intent;
+        use crate::agent::granted_rules::GrantedRulesStore;
+        use crate::agent::identity;
         use crate::agent::policy_engine::PolicyRuntime;
         use crate::storage::CredentialStorage;
 
         use passless_core::agent::{
-            AgentAuthorization, AgentCeremonyPolicy, AgentConfig, AgentMode, AgentProfileConfig,
-            AgentRpRule, BrowserScope, DeviceIdentity, UserPresenceSource, UserVerificationSource,
+            AgentProfileConfig, AgentRpRule, CredentialSelection, GrantSource,
         };
         use passless_core::config::SecurityConfig;
 
@@ -3564,7 +3625,6 @@ mod tests {
             SoftwareCredentialKeyProvider, User,
         };
 
-        use std::collections::BTreeMap;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
@@ -3622,29 +3682,108 @@ mod tests {
             events
                 .iter()
                 .filter(|e| {
-                    e.get("kind")
-                        .and_then(|k| k.as_str())
-                        .is_some_and(|k| k == "policy.allow" || k == "policy.deny")
+                    e.get("kind").and_then(|k| k.as_str()).is_some_and(|k| {
+                        k == "policy.allow"
+                            || k == "policy.deny"
+                            || k == "policy.replay_served"
+                            // The terminal record of a reservation that failed: its failure
+                            // class is what a `policy.deny` reason was before the terminal
+                            // records existed.
+                            || (k == "operation.terminal" && e["failure_class"].is_string())
+                    })
                 })
                 .collect()
         }
 
+        /// One credential held by the fixture's storage.
+        #[derive(Clone)]
+        struct StoredCred {
+            id: Vec<u8>,
+            rp_id: &'static str,
+            created: i64,
+        }
+
+        fn stored(id: u8, rp_id: &'static str, created: i64) -> StoredCred {
+            StoredCred {
+                id: vec![id; 32],
+                rp_id,
+                created,
+            }
+        }
+
+        fn cred_ref_of(id: &[u8]) -> passless_core::agent::CredentialRef {
+            passless_core::agent::CredentialRef::with_default_domain(id)
+        }
+
+        /// How a fixture is built. The default is one credential for `example.com`, an explicit
+        /// grant naming that credential, and profile selection `single`.
+        #[derive(Clone)]
+        struct FixtureSpec {
+            rules: Vec<AgentRpRule>,
+            grant_rp_ids: Vec<&'static str>,
+            selection: CredentialSelection,
+            credentials: Vec<StoredCred>,
+            /// A dynamic grant (empty credential list: discover per request) instead of an
+            /// explicit grant naming every stored credential.
+            dynamic_grant: bool,
+            /// Escalate through a real coordinator, granted-rules store and scripted prompter
+            /// (the store is then the policy's grant source); otherwise no prompt can be shown
+            /// and `ToggleGrants` is the grant source.
+            escalation: bool,
+        }
+
+        impl FixtureSpec {
+            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&'static str>) -> Self {
+                Self {
+                    rules,
+                    grant_rp_ids,
+                    selection: CredentialSelection::Single,
+                    credentials: vec![stored(1, "example.com", 0)],
+                    dynamic_grant: false,
+                    escalation: false,
+                }
+            }
+        }
+
         struct AuditTestFixture {
+            spec: FixtureSpec,
             profile_id: ProfileId,
             grant_id: passless_core::agent::GrantId,
             clock: Arc<MockClock>,
             policy_runtime: Arc<PolicyRuntime>,
+            granted_rules: Arc<ToggleGrants>,
             storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
             key_provider: Arc<RecordingKeyProvider>,
             audit_gate: Arc<AuditGate>,
             operation_lock: Arc<Mutex<()>>,
             security_config: SecurityConfig,
-            profile_config: AgentProfileConfig,
             audit_dir: std::path::PathBuf,
+            escalation: Arc<EscalationService>,
+            prompter: Arc<ScriptedPrompter>,
+            store: Arc<GrantedRulesStore>,
+            _state_dir: tempfile::TempDir,
         }
 
         impl AuditTestFixture {
-            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&str>) -> Self {
+            fn new(rules: Vec<AgentRpRule>, grant_rp_ids: Vec<&'static str>) -> Self {
+                Self::from_spec(FixtureSpec::new(rules, grant_rp_ids))
+            }
+
+            fn profile_config(spec: &FixtureSpec) -> AgentProfileConfig {
+                let credential_refs = if spec.dynamic_grant {
+                    None
+                } else {
+                    Some(
+                        spec.credentials
+                            .iter()
+                            .map(|c| cred_ref_of(&c.id))
+                            .collect(),
+                    )
+                };
+                test_profile_config(spec.rules.clone(), credential_refs, spec.selection.clone())
+            }
+
+            fn from_spec(spec: FixtureSpec) -> Self {
                 let tmp = tempfile::tempdir().unwrap();
                 let audit_path = tmp.path().to_path_buf();
                 drop(tmp);
@@ -3657,105 +3796,61 @@ mod tests {
                 let audit_gate = Arc::new(AuditGate::open(&audit_path).unwrap());
 
                 let profile_id = ProfileId::new("test-profile").unwrap();
-                let cred_id = vec![1u8; 32];
-                let cred_ref = passless_core::agent::CredentialRef::with_default_domain(&cred_id);
-
                 let provider = SoftwareCredentialKeyProvider;
-                let generated = provider.generate(-7).unwrap();
-                let key = generated.key;
 
-                let cred = soft_fido2::Credential {
-                    id: cred_id.clone(),
-                    rp: RelyingParty::new("example.com".into()),
-                    user: User::new(vec![1, 2, 3]),
-                    sign_count: 0,
-                    alg: -7,
-                    key: key.clone(),
-                    created: 0,
-                    discoverable: true,
-                    backup_state: CredentialBackupState::NotEligible,
-                    extensions: soft_fido2::Extensions::default(),
-                };
+                let storage_impl = WriteCountingStorage::new();
+                for stored in &spec.credentials {
+                    storage_impl.add_cred(soft_fido2::Credential {
+                        id: stored.id.clone(),
+                        rp: RelyingParty::new(stored.rp_id.into()),
+                        user: User::new(vec![1, 2, 3, stored.id[0]]),
+                        sign_count: 0,
+                        alg: -7,
+                        key: provider.generate(-7).unwrap().key,
+                        created: stored.created,
+                        discoverable: true,
+                        backup_state: CredentialBackupState::NotEligible,
+                        extensions: soft_fido2::Extensions::default(),
+                    });
+                }
+                let storage = Arc::new(Mutex::new(
+                    Box::new(storage_impl) as Box<dyn CredentialStorage>
+                ));
 
-                let storage = Arc::new(Mutex::new(Box::new({
-                    let s = WriteCountingStorage::new();
-                    s.add_cred(cred);
-                    s
-                })
-                    as Box<dyn CredentialStorage>));
-
-                let rp_id_strings: Vec<String> =
-                    grant_rp_ids.iter().map(|s| s.to_string()).collect();
-
-                let profile_config = AgentProfileConfig {
-                    max_operations: 64,
-                    max_concurrent_sessions: 1,
-                    browser_scope: BrowserScope::Session,
-                    credential_selection: passless_core::agent::config::CredentialSelection::Single,
-                    human_verification_prompt:
-                        passless_core::agent::config::HumanVerificationPrompt::Always,
-                    mode: AgentMode::Isolated,
-                    principal_user: String::new(),
-                    rp_ids: rp_id_strings.clone(),
-                    require_uv: false,
-                    credential_refs: Some(vec![cred_ref.clone()]),
-                    max_grant_ttl: None,
-                    max_session_ttl: None,
-                    storage: None,
-                    registration_allowed: false,
-                    rules,
-                    device: DeviceIdentity {
-                        name: "test-device".to_string(),
-                        phys: "test-phys".to_string(),
-                        uniq: "test-uniq".to_string(),
-                        vendor_id: 0x1234,
-                        product_id: 0x5678,
-                    },
-                    start_url: None,
-                    browser_command: None,
-                    browser_user: None,
-                    browser_runtime_root: None,
-                    browser_cdp_expose: None,
-                    browser_cdp_port: None,
-                };
-
-                let mut profiles = BTreeMap::new();
-                profiles.insert("test-profile".to_string(), profile_config.clone());
-                let agent_config = AgentConfig {
-                    enabled: true,
-                    profiles,
-                    audit_path: Some(audit_path.clone()),
-                    acknowledge_global_same_user: vec![],
-                    acknowledge_same_user_registration: vec![],
-                };
+                let agent_config = test_agent_config(Self::profile_config(&spec));
 
                 let clock = Arc::new(MockClock::new());
-                let mono_clock = Arc::new(MockMonoClock::new());
+                let granted_rules = Arc::new(ToggleGrants::default());
+                let state_dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(GrantedRulesStore::open(
+                    state_dir.path(),
+                    [profile_id.clone()],
+                ));
+                let grant_source: Arc<dyn GrantSource> = if spec.escalation {
+                    store.clone()
+                } else {
+                    granted_rules.clone()
+                };
 
                 let policy_runtime = Arc::new(
-                    PolicyRuntime::new(&agent_config, clock.clone(), mono_clock.clone(), None)
-                        .unwrap(),
+                    PolicyRuntime::new(&agent_config, clock.clone(), None)
+                        .unwrap()
+                        .with_grant_source(grant_source),
                 );
+                let prompter = Arc::new(ScriptedPrompter::default());
+                let escalation = if spec.escalation {
+                    test_support::service(
+                        audit_gate.clone(),
+                        store.clone(),
+                        policy_runtime.clone(),
+                        prompter.clone(),
+                        Duration::from_secs(600),
+                    )
+                } else {
+                    test_support::idle_service(audit_gate.clone())
+                };
 
-                let session_id = passless_core::agent::PrincipalSessionId::new();
-                let endpoint_id = passless_core::agent::EndpointId::new();
-
-                let grant_req_id = policy_runtime
-                    .admin_request_grant(GrantRequestParams {
-                        profile_id: profile_id.clone(),
-                        session_id: session_id.clone(),
-                        endpoint_id: endpoint_id.clone(),
-                        principal_digest: [0u8; 32],
-                        rp_ids: grant_rp_ids.iter().map(|s| s.to_string()).collect(),
-                        credentials: vec![cred_ref.clone()],
-                        requested_ttl_secs: 300,
-                    })
-                    .unwrap();
-
-                let authority = intent::admin_authority();
-                let grant_id = policy_runtime
-                    .admin_approve_grant(&grant_req_id, &authority)
-                    .unwrap();
+                let grant_id = Self::approve_grant(&policy_runtime, &profile_id, &spec);
 
                 let key_provider = Arc::new(RecordingKeyProvider::new());
                 let operation_lock = Arc::new(Mutex::new(()));
@@ -3764,6 +3859,7 @@ mod tests {
                     disable_core_dumps: false,
                     constant_signature_counter: true,
                     enable_credential_backup: false,
+                    // The RP-facing UV knobs must not matter under `allow`.
                     always_uv: false,
                     user_verification_registration: false,
                     user_verification_authentication: false,
@@ -3771,32 +3867,69 @@ mod tests {
                 };
 
                 Self {
+                    spec,
                     profile_id,
                     grant_id,
                     clock,
                     policy_runtime,
+                    granted_rules,
                     storage,
                     key_provider,
                     audit_gate,
                     operation_lock,
                     security_config,
-                    profile_config,
                     audit_dir: audit_path,
+                    escalation,
+                    prompter,
+                    store,
+                    _state_dir: state_dir,
                 }
             }
 
-            fn default_allow() -> Self {
-                let rule = AgentRpRule {
-                    credential_selection: None,
-                    rp_id: "example.com".to_string(),
-                    register: AgentCeremonyPolicy::deny(),
-                    authenticate: AgentCeremonyPolicy {
-                        authorization: AgentAuthorization::Allow,
-                        user_presence: UserPresenceSource::Agent,
-                        user_verification: UserVerificationSource::Agent,
+            fn approve_grant(
+                policy_runtime: &PolicyRuntime,
+                profile_id: &ProfileId,
+                spec: &FixtureSpec,
+            ) -> passless_core::agent::GrantId {
+                let params = GrantRequestParams {
+                    profile_id: profile_id.clone(),
+                    session_id: passless_core::agent::PrincipalSessionId::new(),
+                    principal_digest: [0u8; 32],
+                    rp_ids: spec.grant_rp_ids.iter().map(|s| s.to_string()).collect(),
+                    credentials: if spec.dynamic_grant {
+                        vec![]
+                    } else {
+                        spec.credentials
+                            .iter()
+                            .map(|c| cred_ref_of(&c.id))
+                            .collect()
                     },
+                    requested_ttl_secs: 300,
                 };
-                Self::new(vec![rule], vec!["example.com"])
+                let request_id = if spec.dynamic_grant {
+                    policy_runtime.admin_request_dynamic_grant(params).unwrap()
+                } else {
+                    policy_runtime.admin_request_grant(params).unwrap()
+                };
+                policy_runtime
+                    .admin_approve_grant(&request_id, &identity::admin_authority())
+                    .unwrap()
+            }
+
+            /// Replace the live policy with `rules`. A reload revokes every grant (ADR 0014
+            /// section 6.4: the revocation epoch), so a fresh grant is approved on the new
+            /// generation; the handler is untouched and the context carries nothing but the new
+            /// grant id, so only the live policy can explain the next result.
+            fn reload_rules(&mut self, rules: Vec<AgentRpRule>) {
+                self.spec.rules = rules;
+                let config = test_agent_config(Self::profile_config(&self.spec));
+                self.policy_runtime.reload(&config).unwrap();
+                self.grant_id =
+                    Self::approve_grant(&self.policy_runtime, &self.profile_id, &self.spec);
+            }
+
+            fn default_allow() -> Self {
+                Self::new(vec![allow_rule("example.com")], vec!["example.com"])
             }
 
             fn make_handler(&self) -> SignHandler {
@@ -3807,19 +3940,27 @@ mod tests {
                     security_config: self.security_config.clone(),
                     key_provider: self.key_provider.clone(),
                     operation_lock: self.operation_lock.clone(),
+                    escalation: self.escalation.clone(),
+                    audit_deployment: Default::default(),
                 }
             }
 
             fn make_ctx(&self) -> SignContext {
                 SignContext {
+                    lease_activation: None,
                     profile_id: self.profile_id.clone(),
                     active_grant_id: self.grant_id.clone(),
-                    profile_config: self.profile_config.clone(),
+                    session: test_session_at(
+                        &self.profile_id,
+                        self.policy_runtime.revocation_epoch(),
+                    ),
                 }
             }
 
             fn make_req(&self) -> SignAssertionRequest {
                 SignAssertionRequest {
+                    extensions: Vec::new(),
+                    timeout_ms: None,
                     origin: "https://example.com".to_string(),
                     top_origin: None,
                     rp_id: "example.com".to_string(),
@@ -3829,44 +3970,39 @@ mod tests {
                     cross_origin: false,
                 }
             }
-        }
 
-        fn allow_rule(rp_id: &str) -> AgentRpRule {
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
+            /// A request for `localhost` (an `http://` origin, as a local dev server would send).
+            fn make_localhost_req(&self) -> SignAssertionRequest {
+                SignAssertionRequest {
+                    origin: "http://localhost:8080".to_string(),
+                    rp_id: "localhost".to_string(),
+                    ..self.make_req()
+                }
+            }
+
+            /// The `(kind, reason)` of every policy record, oldest first.
+            fn policy_records(&self) -> Vec<(String, Option<String>)> {
+                find_policy_events(&read_audit_events(&self.audit_dir))
+                    .iter()
+                    .map(|e| {
+                        (
+                            e["kind"].as_str().unwrap().to_string(),
+                            e["reason"]
+                                .as_str()
+                                .or_else(|| e["failure_class"].as_str())
+                                .map(str::to_string),
+                        )
+                    })
+                    .collect()
             }
         }
 
-        fn confirm_rule(rp_id: &str) -> AgentRpRule {
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Confirm,
-                    user_presence: UserPresenceSource::Human,
-                    user_verification: UserVerificationSource::None,
-                },
-            }
-        }
-
-        fn deny_rule(rp_id: &str) -> AgentRpRule {
-            AgentRpRule {
-                credential_selection: None,
-                rp_id: rp_id.to_string(),
-                register: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Confirm,
-                    user_presence: UserPresenceSource::Human,
-                    user_verification: UserVerificationSource::None,
-                },
-                authenticate: AgentCeremonyPolicy::deny(),
+        fn signed_credential(result: Result<PrincipalResponse, ProtocolError>) -> Vec<u8> {
+            match result.expect("sign should succeed") {
+                PrincipalResponse::SignAssertionResult(resp) => {
+                    super::b64u_decode(&resp.credential_id_b64u).unwrap()
+                }
+                _ => panic!("expected SignAssertionResult"),
             }
         }
 
@@ -3962,6 +4098,135 @@ mod tests {
             assert_eq!(last["reason"], "rp_id_not_match");
         }
 
+        /// The policy.deny records of the fixture's audit log, oldest first.
+        fn deny_records(f: &AuditTestFixture) -> Vec<serde_json::Value> {
+            read_audit_events(&f.audit_dir)
+                .into_iter()
+                .filter(|e| e["kind"] == "policy.deny")
+                .collect()
+        }
+
+        /// Review M2: a page that loops a refused request writes a bounded number of records, and
+        /// every refusal stays accounted for.
+        #[test]
+        fn a_flood_of_refusals_is_coalesced_and_still_accounted_for() {
+            use crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW;
+
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let flood = 200usize;
+            for n in 0..flood {
+                let mut req = f.make_req();
+                req.rp_id = "unlisted.example".to_string();
+                req.origin = "https://unlisted.example".to_string();
+                req.challenge_b64u = b64u_encode(format!("challenge-{n}").as_bytes());
+                assert!(handler.sign(&ctx, &req).is_err());
+            }
+            let written = deny_records(&f);
+            assert_eq!(
+                written.len(),
+                FULL_RECORDS_PER_WINDOW as usize,
+                "{written:#?}"
+            );
+            assert!(written.iter().all(|r| r["suppressed"].is_null()));
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // Another RP is a key of its own: it still gets its full records.
+            let mut other = f.make_req();
+            other.rp_id = "other.example".to_string();
+            other.origin = "https://other.example".to_string();
+            assert!(handler.sign(&ctx, &other).is_err());
+            assert_eq!(deny_records(&f).len(), FULL_RECORDS_PER_WINDOW as usize + 1);
+
+            // Revoking the session writes the pending count: nothing is lost.
+            ctx.session.revoke();
+            let written = deny_records(&f);
+            let accounted: u64 = written
+                .iter()
+                .map(|r| r["suppressed"].as_u64().unwrap_or(1))
+                .sum();
+            assert_eq!(accounted, flood as u64 + 1, "{written:#?}");
+            let summary = written
+                .iter()
+                .find(|r| !r["suppressed"].is_null())
+                .expect("a summary record");
+            assert_eq!(
+                summary["suppressed"],
+                flood as u64 - u64::from(FULL_RECORDS_PER_WINDOW)
+            );
+            assert_eq!(summary["rp_id"], "unlisted.example");
+            assert_eq!(summary["profile_id"], "test-profile");
+            assert_eq!(summary["action"], "authenticate");
+            assert!(summary["session_id_hash"].is_string());
+        }
+
+        /// Review M2: refusals of a session are coalesced per session, so another session of the
+        /// same profile is not silenced by a flooding one.
+        #[test]
+        fn refusal_coalescing_is_per_session() {
+            use crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW;
+
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let (flooder, quiet) = (f.make_ctx(), f.make_ctx());
+            for n in 0..(FULL_RECORDS_PER_WINDOW as usize + 10) {
+                let mut req = f.make_req();
+                req.rp_id = "unlisted.example".to_string();
+                req.origin = "https://unlisted.example".to_string();
+                req.challenge_b64u = b64u_encode(format!("flood-{n}").as_bytes());
+                assert!(handler.sign(&flooder, &req).is_err());
+            }
+            let before = deny_records(&f).len();
+            assert_eq!(before, FULL_RECORDS_PER_WINDOW as usize);
+            let mut req = f.make_req();
+            req.rp_id = "unlisted.example".to_string();
+            req.origin = "https://unlisted.example".to_string();
+            assert!(handler.sign(&quiet, &req).is_err());
+            assert_eq!(deny_records(&f).len(), before + 1);
+        }
+
+        /// Review M2: for an RP that is allowed but has no matching credential, each fresh
+        /// challenge used to leave a replay entry for the session's lifetime. The table is
+        /// bounded, and a request that finds it full of entries it may not evict is refused as
+        /// busy, with an audit record and without key use.
+        #[test]
+        fn the_replay_table_is_bounded_and_refuses_when_full() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            ctx.session.set_replay_capacity(8);
+            for n in 0..8 {
+                let mut req = f.make_req();
+                req.allow_credentials = vec!["d3Jvbmc".to_string()];
+                req.challenge_b64u = b64u_encode(format!("c-{n}").as_bytes());
+                let err = handler.sign(&ctx, &req).unwrap_err();
+                assert_eq!(err.code, ErrorCode::Forbidden, "request {n}");
+            }
+            assert_eq!(ctx.session.replay_entries(), 8);
+            assert_eq!(ctx.session.challenge_entries(), 8);
+
+            // All eight completed within the 120 s outcome window: nothing may be evicted.
+            let mut req = f.make_req();
+            req.allow_credentials = vec!["d3Jvbmc".to_string()];
+            req.challenge_b64u = b64u_encode(b"one-too-many");
+            let err = handler.sign(&ctx, &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Busy);
+            assert_eq!(ctx.session.replay_entries(), 8);
+            assert_eq!(ctx.session.challenge_entries(), 8);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            let last = deny_records(&f).pop().unwrap();
+            assert_eq!(last["reason"], "replay_table_full");
+            assert_eq!(last["result"], "busy");
+
+            // A duplicate of a completed request still gets its original outcome.
+            let mut dup = f.make_req();
+            dup.allow_credentials = vec!["d3Jvbmc".to_string()];
+            dup.challenge_b64u = b64u_encode(b"c-0");
+            let err = handler.sign(&ctx, &dup).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+        }
+
         #[test]
         fn audit_deny_event_on_credential_mismatch() {
             let f = AuditTestFixture::default_allow();
@@ -4012,17 +4277,7 @@ mod tests {
 
         #[test]
         fn counter_increments_in_monotonic_mode_response() {
-            let rule = AgentRpRule {
-                credential_selection: None,
-                rp_id: "example.com".to_string(),
-                register: AgentCeremonyPolicy::deny(),
-                authenticate: AgentCeremonyPolicy {
-                    authorization: AgentAuthorization::Allow,
-                    user_presence: UserPresenceSource::Agent,
-                    user_verification: UserVerificationSource::Agent,
-                },
-            };
-            let mut f = AuditTestFixture::new(vec![rule], vec!["example.com"]);
+            let mut f = AuditTestFixture::new(vec![allow_rule("example.com")], vec!["example.com"]);
             f.security_config.constant_signature_counter = false;
 
             let handler = f.make_handler();
@@ -4057,30 +4312,631 @@ mod tests {
         }
 
         #[test]
-        fn confirm_policy_blocks_autonomous_sign() {
-            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
-            let handler = f.make_handler();
-            let ctx = f.make_ctx();
-            let req = f.make_req();
-            let result = handler.sign(&ctx, &req);
-            assert!(result.is_err());
+        fn request_rule_without_a_prompt_denies_with_escalation_unavailable_and_signs_nothing() {
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
+            let writes_before = get_write_counting_storage(&f.storage).writes();
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert!(err.message.contains("escalation is unavailable"));
+            assert_eq!(f.key_provider.sign_calls(), 0, "no signature");
+            assert_eq!(
+                get_write_counting_storage(&f.storage).writes(),
+                writes_before
+            );
+            assert_eq!(
+                f.policy_records(),
+                vec![(
+                    "policy.deny".to_string(),
+                    Some("escalation_unavailable".into())
+                )]
+            );
         }
 
         #[test]
-        fn confirm_policy_deny_audit_event() {
-            let f = AuditTestFixture::new(vec![confirm_rule("example.com")], vec!["example.com"]);
+        fn deny_rule_denies_with_action_not_allowed_and_signs_nothing() {
+            let f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0, "no signature");
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        #[test]
+        fn unmatched_rp_denies_with_action_not_allowed() {
+            // The grant covers the RP, but no rule does: default deny.
+            let f = AuditTestFixture::new(vec![allow_rule("other.com")], vec!["example.com"]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        // Without a notification bus `request` is denied: `forbidden`, an audited deny, no allow
+        // record, no prompt and no human or native path.
+        #[test]
+        fn request_rule_is_denied_as_forbidden_and_audited_without_human_path() {
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
             let handler = f.make_handler();
             let ctx = f.make_ctx();
-            let req = f.make_req();
-            let result = handler.sign(&ctx, &req);
-            assert!(result.is_err());
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(
+                crate::agent::transport::wire_error_code(err.code),
+                "forbidden"
+            );
+            assert_eq!(dom_exception_name(err.code), "NotAllowedError");
 
             let events = read_audit_events(&f.audit_dir);
             let policy_events = find_policy_events(&events);
-            assert!(!policy_events.is_empty());
-            let last = policy_events.last().unwrap();
-            assert_eq!(last["kind"], "policy.deny");
-            assert_eq!(last["reason"], "action_not_allowed");
+            assert_eq!(
+                policy_events.len(),
+                1,
+                "exactly one policy record: {policy_events:?}"
+            );
+            assert_eq!(policy_events[0]["kind"], "policy.deny");
+            assert_eq!(policy_events[0]["action"], "authenticate");
+            assert_eq!(policy_events[0]["reason"], "escalation_unavailable");
+        }
+
+        #[test]
+        fn allow_signs_with_agent_evidence_and_up_uv_flags_even_without_rp_uv_request() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            // The RP does not ask for UV, and `always_uv` is off: UP and UV are still set because
+            // `allow` is agent-session evidence (ADR 0014 section 7).
+            req.user_verification = false;
+            assert!(!f.security_config.always_uv);
+
+            let result = f.make_handler().sign(&f.make_ctx(), &req);
+            let resp = match result.unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => resp,
+                _ => panic!("expected SignAssertionResult"),
+            };
+            let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+            assert_eq!(auth_data[32] & 0x05, 0x05, "UP and UV flags");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            let events = read_audit_events(&f.audit_dir);
+            let allow = find_policy_events(&events)
+                .into_iter()
+                .find(|e| e["kind"] == "policy.allow")
+                .expect("allow event");
+            assert_eq!(
+                (
+                    allow["authorization"].as_str(),
+                    allow["user_presence"].as_str(),
+                    allow["user_verification"].as_str(),
+                ),
+                (Some("allow"), Some("agent"), Some("agent")),
+                "{allow}"
+            );
+        }
+
+        #[test]
+        fn allow_sets_up_and_uv_when_the_rp_requests_uv_too() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.user_verification = true;
+            let resp = match f.make_handler().sign(&f.make_ctx(), &req).unwrap() {
+                PrincipalResponse::SignAssertionResult(resp) => resp,
+                _ => panic!("expected SignAssertionResult"),
+            };
+            let auth_data = super::b64u_decode(&resp.authenticator_data_b64u).unwrap();
+            assert_eq!(auth_data[32] & 0x05, 0x05);
+        }
+
+        // --- live resolution (plan R16) ---
+
+        #[test]
+        fn granted_rule_upgrades_request_live_through_the_same_context() {
+            // The granted-rules store changes while the handler and context stay as they were:
+            // `request` is denied, then allowed once the store grants it, then denied again when
+            // the grant is withdrawn.
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert!(err.message.contains("escalation is unavailable"));
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            f.granted_rules.set(true);
+            handler
+                .sign(&ctx, &f.make_req())
+                .expect("a granted request rule is an allow");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            f.granted_rules.set(false);
+            assert!(handler.sign(&ctx, &f.make_req()).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 1, "no further signature");
+        }
+
+        #[test]
+        fn orphaned_grant_is_inert_when_the_rule_is_deny() {
+            let f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            f.granted_rules.set(true);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        #[test]
+        fn reload_to_deny_is_enforced_by_the_unchanged_handler() {
+            let mut f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            handler
+                .sign(&f.make_ctx(), &f.make_req())
+                .expect("allowed before the reload");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            f.reload_rules(vec![deny_rule("example.com")]);
+            let err = handler.sign(&f.make_ctx(), &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                1,
+                "no signature after the reload"
+            );
+            assert_eq!(
+                f.policy_records().last().unwrap(),
+                &("policy.deny".to_string(), Some("action_not_allowed".into()))
+            );
+
+            // Removing the rule entirely is the same default deny.
+            f.reload_rules(vec![]);
+            assert!(handler.sign(&f.make_ctx(), &f.make_req()).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn reload_from_deny_to_allow_is_enforced_by_the_unchanged_handler() {
+            let mut f = AuditTestFixture::new(vec![deny_rule("example.com")], vec!["example.com"]);
+            let handler = f.make_handler();
+            assert!(handler.sign(&f.make_ctx(), &f.make_req()).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            f.reload_rules(vec![allow_rule("example.com")]);
+            handler
+                .sign(&f.make_ctx(), &f.make_req())
+                .expect("allowed after the reload");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            f.reload_rules(vec![request_rule("example.com")]);
+            let err = handler.sign(&f.make_ctx(), &f.make_req()).unwrap_err();
+            assert!(err.message.contains("escalation is unavailable"));
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn session_from_before_a_changed_reload_is_revoked() {
+            // A reload that changes the policy bumps the revocation epoch: a session created before
+            // it is revoked, whatever the new rules say (ADR 0014 sections 6.4 and 9).
+            let mut f = AuditTestFixture::default_allow();
+            let stale_ctx = f.make_ctx();
+            f.reload_rules(vec![allow_rule("example.com"), allow_rule("other.example")]);
+            let err = f
+                .make_handler()
+                .sign(&stale_ctx, &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records().last().unwrap().1.as_deref(),
+                Some("policy_revoked")
+            );
+            assert_eq!(stale_ctx.session.operations_used(), 0, "no budget consumed");
+        }
+
+        // --- selection (ADR 0014 section 10.1) ---
+
+        fn two_credentials_spec(
+            rules: Vec<AgentRpRule>,
+            selection: CredentialSelection,
+        ) -> FixtureSpec {
+            FixtureSpec {
+                selection,
+                // A is older than B.
+                credentials: vec![
+                    stored(0xA1, "example.com", 10),
+                    stored(0xB2, "example.com", 20),
+                ],
+                dynamic_grant: true,
+                ..FixtureSpec::new(rules, vec!["example.com"])
+            }
+        }
+
+        fn id_a() -> Vec<u8> {
+            vec![0xA1; 32]
+        }
+
+        fn id_b() -> Vec<u8> {
+            vec![0xB2; 32]
+        }
+
+        #[test]
+        fn pinned_credential_wins_over_allow_credentials() {
+            let mut rule = allow_rule("example.com");
+            rule.credential_selection = Some(CredentialSelection::Credential(cred_ref_of(&id_a())));
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![rule],
+                CredentialSelection::Single,
+            ));
+
+            // allowCredentials names only B, but the rule pins A: denied, and B never signs.
+            let mut only_b = f.make_req();
+            only_b.allow_credentials = vec![b64u_encode(&id_b())];
+            let err = f.make_handler().sign(&f.make_ctx(), &only_b).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0, "B must never sign");
+            assert_eq!(
+                f.policy_records(),
+                vec![(
+                    "policy.deny".to_string(),
+                    Some("allow_credentials_mismatch".into())
+                )]
+            );
+
+            // allowCredentials [A, B]: the pinned set is [A], so A signs.
+            let mut both = f.make_req();
+            both.allow_credentials = vec![b64u_encode(&id_b()), b64u_encode(&id_a())];
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &both));
+            assert_eq!(signed, id_a());
+
+            // No allowCredentials at all: still A.
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_a());
+        }
+
+        #[test]
+        fn allow_credentials_chooses_within_the_set_and_beats_single() {
+            // Two candidates, selection `single`: an allowCredentials entry that leaves exactly one
+            // permitted credential is used (step 3), and none at all is a conflict (step 4).
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Single,
+            ));
+            let mut only_b = f.make_req();
+            only_b.allow_credentials = vec![b64u_encode(&id_b())];
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &only_b));
+            assert_eq!(signed, id_b());
+
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict);
+            assert_eq!(f.key_provider.sign_calls(), 1, "the conflict signs nothing");
+        }
+
+        #[test]
+        fn first_allow_credentials_entry_no_longer_wins_with_several_candidates() {
+            // Both credentials are listed and the selection is `single`: the old "first
+            // allowCredentials entry wins" behaviour is gone, so this is a conflict.
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Single,
+            ));
+            let mut both = f.make_req();
+            both.allow_credentials = vec![b64u_encode(&id_b()), b64u_encode(&id_a())];
+            let err = f.make_handler().sign(&f.make_ctx(), &both).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records().last().unwrap().1.as_deref(),
+                Some("credential_not_match")
+            );
+        }
+
+        #[test]
+        fn exact_rule_applies_profile_selection_newest_and_first_matching() {
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Newest,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_b(), "newest picks the credential created last");
+
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::FirstMatching,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_a(), "first-matching is stable by credential id");
+        }
+
+        #[test]
+        fn rule_selection_overrides_profile_selection() {
+            let mut rule = allow_rule("example.com");
+            rule.credential_selection = Some(CredentialSelection::FirstMatching);
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![rule],
+                CredentialSelection::Newest,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_a());
+        }
+
+        #[test]
+        fn wildcard_forces_single_even_when_the_profile_default_is_newest() {
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule(ANY_RP_ID)],
+                CredentialSelection::Newest,
+            ));
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::Conflict,
+                "a wildcard never picks an account"
+            );
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // Control: the same profile with an exact rule does pick the newest credential.
+            let f = AuditTestFixture::from_spec(two_credentials_spec(
+                vec![allow_rule("example.com")],
+                CredentialSelection::Newest,
+            ));
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, id_b());
+        }
+
+        #[test]
+        fn wildcard_with_a_single_credential_signs_it() {
+            let f = AuditTestFixture::from_spec(FixtureSpec {
+                dynamic_grant: true,
+                ..FixtureSpec::new(vec![allow_rule(ANY_RP_ID)], vec!["*"])
+            });
+            let signed = signed_credential(f.make_handler().sign(&f.make_ctx(), &f.make_req()));
+            assert_eq!(signed, vec![1u8; 32]);
+            let events = read_audit_events(&f.audit_dir);
+            let allow = find_policy_events(&events)
+                .into_iter()
+                .find(|e| e["kind"] == "policy.allow")
+                .unwrap();
+            assert_eq!(allow["rp_id"], "example.com");
+        }
+
+        // --- pure selection functions ---
+
+        fn cand(id: u8, created: i64) -> (Vec<u8>, passless_core::agent::CredentialRef, i64) {
+            let id = vec![id; 32];
+            let reference = cred_ref_of(&id);
+            (id, reference, created)
+        }
+
+        #[test]
+        fn narrow_candidates_pins_before_allow_credentials() {
+            let candidates = vec![cand(1, 0), cand(2, 0), cand(3, 0)];
+            let pin = CredentialSelection::Credential(cred_ref_of(&[1u8; 32]));
+
+            let ids = |v: Vec<(Vec<u8>, _, i64)>| v.into_iter().map(|c| c.0[0]).collect::<Vec<_>>();
+
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[],
+                    &pin
+                )),
+                vec![1]
+            );
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[b64u_encode(&[2u8; 32])],
+                    &pin
+                )),
+                Vec::<u8>::new(),
+                "allowCredentials cannot widen a pin"
+            );
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[b64u_encode(&[2u8; 32]), b64u_encode(&[1u8; 32])],
+                    &pin
+                )),
+                vec![1]
+            );
+            // Without a pin, allowCredentials narrows.
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates.clone(),
+                    &[b64u_encode(&[3u8; 32])],
+                    &CredentialSelection::Single
+                )),
+                vec![3]
+            );
+            assert_eq!(
+                ids(SignHandler::narrow_candidates(
+                    candidates,
+                    &[],
+                    &CredentialSelection::Newest
+                )),
+                vec![1, 2, 3]
+            );
+        }
+
+        #[test]
+        fn select_credential_follows_the_selection_rules() {
+            let one = vec![cand(9, 5)];
+            // Exactly one candidate is used whatever the selection says.
+            for selection in [
+                CredentialSelection::Single,
+                CredentialSelection::FirstMatching,
+                CredentialSelection::Newest,
+            ] {
+                assert_eq!(
+                    SignHandler::select_credential(one.clone(), &selection).unwrap(),
+                    vec![9; 32]
+                );
+            }
+
+            let several = vec![cand(3, 1), cand(1, 7), cand(2, 7)];
+            assert_eq!(
+                SignHandler::select_credential(several.clone(), &CredentialSelection::Single)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Conflict
+            );
+            assert_eq!(
+                SignHandler::select_credential(
+                    several.clone(),
+                    &CredentialSelection::FirstMatching
+                )
+                .unwrap(),
+                vec![1; 32]
+            );
+            // Newest, ties broken by credential id.
+            assert_eq!(
+                SignHandler::select_credential(several, &CredentialSelection::Newest).unwrap(),
+                vec![1; 32]
+            );
+            assert_eq!(
+                SignHandler::select_credential(vec![], &CredentialSelection::Newest)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::NotFound
+            );
+        }
+
+        // --- localhost (ADR 0014 section 6.1) ---
+
+        fn localhost_spec(rules: Vec<AgentRpRule>, grant: Vec<&'static str>) -> FixtureSpec {
+            FixtureSpec {
+                credentials: vec![stored(7, "localhost", 0)],
+                dynamic_grant: true,
+                ..FixtureSpec::new(rules, grant)
+            }
+        }
+
+        #[test]
+        fn localhost_signs_through_an_exact_allow_rule() {
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule("localhost")],
+                vec!["localhost"],
+            ));
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &f.make_localhost_req()),
+            );
+            assert_eq!(signed, vec![7; 32]);
+            let events = read_audit_events(&f.audit_dir);
+            let last = find_policy_events(&events).last().cloned().unwrap().clone();
+            assert_eq!(last["kind"], "policy.allow");
+            assert_eq!(last["rp_id"], "localhost");
+        }
+
+        #[test]
+        fn localhost_also_accepts_an_https_origin() {
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule("localhost")],
+                vec!["localhost"],
+            ));
+            let mut req = f.make_localhost_req();
+            req.origin = "https://localhost:8443".to_string();
+            signed_credential(f.make_handler().sign(&f.make_ctx(), &req));
+        }
+
+        #[test]
+        fn localhost_is_denied_through_a_wildcard_only_rule() {
+            // Resolution: the grant names `localhost`, but only the wildcard rule exists, and the
+            // wildcard never matches `localhost`.
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule(ANY_RP_ID)],
+                vec!["localhost"],
+            ));
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_localhost_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("action_not_allowed".into()))]
+            );
+        }
+
+        #[test]
+        fn localhost_is_excluded_from_a_wildcard_grant_scope() {
+            // The grant scope `*` does not cover `localhost` either (checked before resolution).
+            let f = AuditTestFixture::from_spec(localhost_spec(
+                vec![allow_rule(ANY_RP_ID), allow_rule("localhost")],
+                vec!["*"],
+            ));
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.make_localhost_req())
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("rp_id_not_match".into()))]
+            );
+        }
+
+        #[test]
+        fn localhost_http_origin_is_rejected_for_another_rp() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "http://localhost:8080".to_string();
+            let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::OriginInvalid);
+            assert_eq!(
+                f.policy_records(),
+                vec![("policy.deny".to_string(), Some("origin_invalid".into()))]
+            );
+        }
+
+        #[test]
+        fn cross_origin_request_is_denied_and_audited() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "https://example.com".to_string();
+            req.top_origin = Some("https://top.example".to_string());
+            req.cross_origin = true;
+            let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(dom_exception_name(err.code), "NotAllowedError");
+
+            let events = read_audit_events(&f.audit_dir);
+            let policy_events = find_policy_events(&events);
+            assert_eq!(policy_events.len(), 1, "{policy_events:?}");
+            assert_eq!(policy_events[0]["kind"], "policy.deny");
+            assert_eq!(policy_events[0]["reason"], "cross_origin_denied");
+        }
+
+        #[test]
+        fn cross_origin_is_denied_even_without_a_top_origin() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.cross_origin = true;
+            let err = f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
         }
 
         #[test]
@@ -4135,443 +4991,2044 @@ mod tests {
             let result_denied = handler2.sign(&ctx2, &req_denied);
             assert!(result_denied.is_err());
         }
-    }
 
-    mod integration_tests {
-        use super::sign_handler_tests::TestFixture;
-        use super::*;
+        // --- P5: check order, replay, budget, binding and revocation (ADR 0014 section 9) ---
 
-        use std::io::{Read, Write};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
+        impl AuditTestFixture {
+            /// Set the live budget. The reload changes the policy, so it revokes every session; the
+            /// fixture approves a fresh grant and `make_ctx` binds new sessions at the new epoch.
+            fn set_budget(&mut self, max_operations: u16) {
+                let mut profile_config = Self::profile_config(&self.spec);
+                profile_config.max_operations = max_operations;
+                self.policy_runtime
+                    .reload(&test_agent_config(profile_config))
+                    .unwrap();
+                self.grant_id =
+                    Self::approve_grant(&self.policy_runtime, &self.profile_id, &self.spec);
+            }
 
-        fn http_request(sock_path: &Path, request: &str, body: &[u8]) -> String {
-            let mut stream = UnixStream::connect(sock_path).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
-            stream.write_all(body).unwrap();
-            let mut resp_buf = vec![0u8; 32768];
-            let mut total = 0;
-            loop {
-                match stream.read(&mut resp_buf[total..]) {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(_) => break,
+            fn req_with_challenge(&self, challenge: &[u8]) -> SignAssertionRequest {
+                SignAssertionRequest {
+                    challenge_b64u: b64u_encode(challenge),
+                    ..self.make_req()
                 }
             }
-            String::from_utf8_lossy(&resp_buf[..total]).to_string()
+
+            fn register_handler(&self) -> RegisterHandler {
+                RegisterHandler {
+                    policy_runtime: self.policy_runtime.clone(),
+                    credential_storage: self.storage.clone(),
+                    audit_gate: self.audit_gate.clone(),
+                    key_provider: self.key_provider.clone(),
+                    security_config: self.security_config.clone(),
+                    operation_lock: self.operation_lock.clone(),
+                    escalation: crate::agent::escalation::test_support::idle_service(
+                        self.audit_gate.clone(),
+                    ),
+                    audit_deployment: Default::default(),
+                }
+            }
+
+            fn reasons(&self) -> Vec<String> {
+                self.policy_records()
+                    .into_iter()
+                    .filter_map(|(_, reason)| reason)
+                    .collect()
+            }
         }
 
-        fn http_body(resp: &str) -> &str {
-            resp.split("\r\n\r\n").nth(1).unwrap_or("")
+        fn signature_of(result: &Result<PrincipalResponse, ProtocolError>) -> String {
+            match result.as_ref().expect("sign should succeed") {
+                PrincipalResponse::SignAssertionResult(resp) => resp.signature_b64u.clone(),
+                _ => panic!("expected SignAssertionResult"),
+            }
         }
 
-        fn setup_bound(
-            constant_counter: bool,
-        ) -> (
-            Arc<AtomicBool>,
-            tempfile::TempDir,
-            std::path::PathBuf,
-            Arc<SignContextRegistry>,
-            String,
-            TestFixture,
-            thread::JoinHandle<()>,
-        ) {
-            let dir = tempfile::tempdir().unwrap();
-            let sock_path = dir.path().join("sock");
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let server = SignHttpServer::bind(sock_path.clone(), shutdown.clone()).unwrap();
-            let registry = Arc::new(SignContextRegistry::new());
-            let token = generate_bearer_token().unwrap();
-            let f = TestFixture::new(constant_counter);
-            let handler = Arc::new(f.make_handler());
+        fn two_rp_fixture() -> AuditTestFixture {
+            let mut spec = FixtureSpec::new(
+                vec![
+                    rule("example.com", RuleAction::Allow, RuleAction::Allow),
+                    allow_rule("other.example"),
+                    deny_rule("denied.example"),
+                ],
+                vec!["example.com", "other.example", "denied.example"],
+            );
+            spec.dynamic_grant = true;
+            AuditTestFixture::from_spec(spec)
+        }
+
+        #[test]
+        fn rejected_requests_never_consume_budget() {
+            let mut f = two_rp_fixture();
+            f.set_budget(1);
+            let handler = f.make_handler();
             let ctx = f.make_ctx();
-            registry
-                .register_pending(token.clone(), ctx, handler)
-                .unwrap();
-            registry
-                .bind_lease(&token, "lease-integ".to_string())
-                .unwrap();
-            let handle = server.serve(registry.clone());
-            (shutdown, dir, sock_path, registry, token, f, handle)
+
+            for i in 0..5u8 {
+                // Origin mismatch.
+                let mut req = f.req_with_challenge(&[1, i]);
+                req.origin = "https://evil.test".to_string();
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::OriginInvalid
+                );
+                // A `deny` rule.
+                let mut req = f.req_with_challenge(&[2, i]);
+                req.rp_id = "denied.example".to_string();
+                req.origin = "https://denied.example".to_string();
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::Forbidden
+                );
+                // An RP outside the session grant.
+                let mut req = f.req_with_challenge(&[3, i]);
+                req.rp_id = "evil.test".to_string();
+                req.origin = "https://evil.test".to_string();
+                assert!(handler.sign(&ctx, &req).is_err());
+                // A malformed challenge.
+                let mut req = f.make_req();
+                req.challenge_b64u = "!!".to_string();
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::BadRequest
+                );
+            }
+            assert_eq!(
+                ctx.session.operations_used(),
+                0,
+                "no rejection claimed budget"
+            );
+            assert_eq!(f.key_provider.sign_calls(), 0);
+
+            // The whole budget is still available to a legitimate request ...
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"good"))
+                .expect("budget intact");
+            assert_eq!(ctx.session.operations_used(), 1);
+            // ... and then it is used up.
+            let err = handler
+                .sign(&ctx, &f.req_with_challenge(b"next"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::BudgetExhausted);
+            assert_eq!(f.reasons().last().unwrap(), "budget_exhausted");
+            assert_eq!(f.key_provider.sign_calls(), 1);
         }
 
-        fn sign_request_body(
-            origin: &str,
-            rp_id: &str,
-            challenge: &str,
-            allow_credentials: Vec<String>,
-            cross_origin: bool,
-        ) -> Vec<u8> {
-            serde_json::to_vec(&SignAssertionRequest {
-                origin: origin.to_string(),
+        #[test]
+        fn budget_limit_is_read_from_the_live_policy() {
+            let mut f = AuditTestFixture::default_allow();
+            f.set_budget(1);
+            let ctx = f.make_ctx();
+            let handler = f.make_handler();
+            handler.sign(&ctx, &f.req_with_challenge(b"a")).unwrap();
+            assert_eq!(
+                handler
+                    .sign(&ctx, &f.req_with_challenge(b"b"))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::BudgetExhausted
+            );
+            assert_eq!(
+                f.policy_runtime.max_operations(&f.profile_id),
+                Some(1),
+                "the context carries no copy of the budget"
+            );
+        }
+
+        #[test]
+        fn completed_duplicate_gets_the_original_result_and_is_never_signed_twice() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let first = handler.sign(&ctx, &f.make_req());
+            let second = handler.sign(&ctx, &f.make_req());
+            assert_eq!(signature_of(&first), signature_of(&second));
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                1,
+                "one signature for one replay key"
+            );
+            assert_eq!(
+                ctx.session.operations_used(),
+                1,
+                "a duplicate claims no budget"
+            );
+            let allows = f
+                .policy_records()
+                .iter()
+                .filter(|(kind, _)| kind == "policy.allow")
+                .count();
+            assert_eq!(allows, 1, "one reservation for one replay key");
+        }
+
+        #[test]
+        fn in_flight_duplicate_joins_and_is_never_signed_twice() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    // Park the original between its audit reservation and key use.
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                let (joined_tx, joined_rx) = std::sync::mpsc::channel::<()>();
+                let duplicate = scope.spawn(|| {
+                    // Proves the duplicate took the join path (not the completed cache).
+                    let _join = super::super::super::session::test_hooks::set_on_join(move || {
+                        joined_tx.send(()).unwrap();
+                    });
+                    handler.sign(&ctx, &req)
+                });
+                joined_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the duplicate joined the in-flight original");
+                assert!(
+                    !duplicate.is_finished(),
+                    "the duplicate waits for the original"
+                );
+                release_tx.send(()).unwrap();
+                let original = original.join().unwrap();
+                let duplicate = duplicate.join().unwrap();
+                assert_eq!(signature_of(&original), signature_of(&duplicate));
+            });
+            assert_eq!(f.key_provider.sign_calls(), 1);
+            assert_eq!(ctx.session.operations_used(), 1);
+            assert!(
+                f.policy_records().contains(&(
+                    "policy.replay_served".to_string(),
+                    Some("replay_served".into())
+                )),
+                "a served duplicate is audited"
+            );
+        }
+
+        #[test]
+        fn a_detached_duplicate_does_not_affect_the_original() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                // The duplicate's client goes away while it waits: it detaches at once. (The
+                // first poll is the check before the replay key, which it passes.)
+                let polls = std::sync::atomic::AtomicUsize::new(0);
+                let detached = handler.sign_with(
+                    &ctx,
+                    &req,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| polls.fetch_add(1, Ordering::AcqRel) > 0,
+                );
+                assert_eq!(detached.unwrap_err().code, ErrorCode::Aborted);
+                // A duplicate already cancelled when it arrives stops before the replay key.
+                let cancelled = handler.sign_with(
+                    &ctx,
+                    &req,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| true,
+                );
+                assert_eq!(cancelled.unwrap_err().code, ErrorCode::Aborted);
+                // A duplicate whose deadline passes detaches too.
+                let late = handler.sign_with(&ctx, &req, Instant::now(), &|| false);
+                assert_eq!(late.unwrap_err().code, ErrorCode::Timeout);
+                release_tx.send(()).unwrap();
+                original.join().unwrap().expect("the original completes");
+            });
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn a_failure_consumes_the_key_and_is_returned_to_the_duplicate() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.allow_credentials = vec![b64u_encode(&[9u8; 32])];
+            let first = handler.sign(&ctx, &req).unwrap_err();
+            let records_after_first = f.policy_records().len();
+            let second = handler.sign(&ctx, &req).unwrap_err();
+            assert_eq!(first, second, "the duplicate receives the same failure");
+            // The duplicate is not re-evaluated: its only record is the served duplicate.
+            let records = f.policy_records();
+            assert_eq!(records.len(), records_after_first + 1);
+            assert_eq!(records.last().unwrap().0, "policy.replay_served");
+            // `allowCredentials` is not part of the replay key: the same action, RP, origin and
+            // challenge without it is the same key, and gets the same failure without key use.
+            let third = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(third, first);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            // The failure ended before key use: the budget was given back (review M2).
+            assert_eq!(ctx.session.operations_used(), 0);
+        }
+
+        #[test]
+        fn same_challenge_with_another_rp_or_action_is_rejected_not_joined() {
+            let f = two_rp_fixture();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).expect("first use");
+
+            let mut other_rp = f.make_req();
+            other_rp.rp_id = "other.example".to_string();
+            other_rp.origin = "https://other.example".to_string();
+            assert_eq!(
+                handler.sign(&ctx, &other_rp).unwrap_err().code,
+                ErrorCode::Replayed
+            );
+            assert_eq!(f.reasons().last().unwrap(), "challenge_reused");
+
+            // A registration on the same bearer session with the same challenge.
+            let register_ctx = RegisterContext::new(f.profile_id.clone(), ctx.session.clone());
+            let register_req = RegisterCredentialRequest {
+                origin: "https://example.com".to_string(),
                 top_origin: None,
-                rp_id: rp_id.to_string(),
-                challenge_b64u: challenge.to_string(),
-                allow_credentials,
-                user_verification: false,
-                cross_origin,
-            })
-            .unwrap()
+                rp_id: "example.com".to_string(),
+                challenge_b64u: f.make_req().challenge_b64u,
+                user_id_b64u: b64u_encode(b"user"),
+                user_name: "user".to_string(),
+                user_display_name: None,
+                rp_name: None,
+                exclude_credentials: vec![],
+                pub_key_cred_params: vec![-7],
+                user_verification: true,
+                cross_origin: false,
+                extensions: vec![],
+                attestation: None,
+                timeout_ms: None,
+                authenticator_attachment: None,
+            };
+            assert_eq!(
+                f.register_handler()
+                    .register(&register_ctx, &register_req)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Replayed
+            );
+            assert_eq!(f.key_provider.sign_calls(), 1);
+            assert_eq!(ctx.session.operations_used(), 1);
         }
 
-        fn format_sign_request(token: &str, body: &[u8]) -> String {
-            format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
+        #[test]
+        fn principal_digest_mismatch_is_denied_and_audited() {
+            let f = AuditTestFixture::default_allow();
+            let mut ctx = f.make_ctx();
+            ctx.session = AgentSession::new(super::super::super::session::SessionBinding {
+                profile_id: f.profile_id.clone(),
+                principal_digest: [9u8; 32],
+                revocation_epoch: f.policy_runtime.revocation_epoch(),
+                ttl: Duration::from_secs(600),
+            });
+            let err = f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["principal_mismatch".to_string()]);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(ctx.session.operations_used(), 0);
+        }
+
+        #[test]
+        fn changed_reload_revokes_an_in_flight_operation_before_key_use() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let runtime = f.policy_runtime.clone();
+            let changed = test_agent_config(AuditTestFixture::profile_config(&FixtureSpec::new(
+                vec![allow_rule("example.com"), allow_rule("other.example")],
+                vec!["example.com"],
+            )));
+            let _hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                assert!(runtime.reload(&changed).unwrap().changed);
+            });
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                0,
+                "no key use after the reload"
+            );
+            // The reservation is followed by an audited terminal record.
+            assert_eq!(
+                f.policy_records(),
+                vec![
+                    ("policy.allow".to_string(), None),
+                    (
+                        "operation.terminal".to_string(),
+                        Some("policy_revoked".into())
+                    ),
+                ]
+            );
+            // The bearer stays revoked.
+            drop(_hook);
+            let err = handler
+                .sign(&ctx, &f.req_with_challenge(b"again"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+        }
+
+        #[test]
+        fn unchanged_reload_keeps_sessions_and_in_flight_operations() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let runtime = f.policy_runtime.clone();
+            let same = test_agent_config(AuditTestFixture::profile_config(&f.spec));
+            let hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                assert!(!runtime.reload(&same).unwrap().changed);
+            });
+            handler
+                .sign(&ctx, &f.make_req())
+                .expect("an unchanged reload revokes nothing");
+            drop(hook);
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"later"))
+                .expect("the session survives an unchanged reload");
+            assert_eq!(f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn unsupported_extension_is_not_supported_and_claims_no_budget() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let mut req = f.make_req();
+            req.extensions = vec!["prf".to_string()];
+            assert_eq!(
+                handler.sign(&ctx, &req).unwrap_err().code,
+                ErrorCode::NotSupported
+            );
+            assert_eq!(f.reasons(), vec!["unsupported_option".to_string()]);
+            assert_eq!(ctx.session.operations_used(), 0);
+            // The browser's `remoteDesktopClientOverride` is stripped by the transport's parse; named
+            // as an RP extension it is not supported.
+            req.extensions = vec!["remoteDesktopClientOverride".to_string()];
+            assert_eq!(
+                handler.sign(&ctx, &req).unwrap_err().code,
+                ErrorCode::NotSupported
+            );
+            // `appid` is supported.
+            req.extensions = vec!["appid".to_string()];
+            handler.sign(&ctx, &req).expect("supported extensions");
+            assert_eq!(
+                dom_exception_name(ErrorCode::NotSupported),
+                "NotSupportedError"
+            );
+        }
+
+        #[test]
+        fn expired_session_is_denied_before_anything_else() {
+            let f = AuditTestFixture::default_allow();
+            let mut ctx = f.make_ctx();
+            ctx.session = AgentSession::new(super::super::super::session::SessionBinding {
+                profile_id: f.profile_id.clone(),
+                principal_digest: [0u8; 32],
+                revocation_epoch: f.policy_runtime.revocation_epoch(),
+                ttl: Duration::ZERO,
+            });
+            let err = f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.reasons(), vec!["session_expired".to_string()]);
+        }
+
+        #[test]
+        fn sign_path_follows_the_lock_order() {
+            // Debug builds panic on any out-of-order acquisition (lock_order.rs). A successful
+            // ceremony, a reload before key use and a revocation exercise every tracked lock of
+            // the sign path; none may be left held.
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            assert!(super::super::super::lock_order::held_levels().is_empty());
+            let runtime = f.policy_runtime.clone();
+            let changed = test_agent_config(AuditTestFixture::profile_config(&FixtureSpec::new(
+                vec![deny_rule("example.com")],
+                vec!["example.com"],
+            )));
+            let hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                runtime.reload(&changed).unwrap();
+            });
+            assert!(handler.sign(&ctx, &f.req_with_challenge(b"x")).is_err());
+            drop(hook);
+            assert!(super::super::super::lock_order::held_levels().is_empty());
+        }
+
+        /// Review M-f: with no pins the sign path reads only the target RP's credentials. A
+        /// whole-store walk would decrypt every unrelated credential (`pass`) or unseal it (TPM)
+        /// under the human operation and storage locks.
+        #[test]
+        fn sign_path_reads_only_the_target_rps_credentials() {
+            let f = AuditTestFixture::default_allow();
+            let storage = get_write_counting_storage(&f.storage);
+            for (index, rp) in ["other.example", "third.example", "fourth.example"]
+                .iter()
+                .enumerate()
+            {
+                for extra in 0..2u8 {
+                    storage.add_cred(soft_fido2::Credential {
+                        id: vec![0xC0 + index as u8, extra, 7],
+                        rp: RelyingParty::new((*rp).into()),
+                        user: User::new(vec![extra]),
+                        sign_count: 0,
+                        alg: -7,
+                        key: SoftwareCredentialKeyProvider.generate(-7).unwrap().key,
+                        created: 1,
+                        discoverable: true,
+                        backup_state: CredentialBackupState::NotEligible,
+                        extensions: soft_fido2::Extensions::default(),
+                    });
+                }
+            }
+            assert!(storage.count_credentials() >= 7);
+            storage.clear_iterated();
+
+            f.make_handler().sign(&f.make_ctx(), &f.make_req()).unwrap();
+
+            let read = storage.iterated_rps();
+            assert!(!read.is_empty(), "the target RP's credentials are read");
+            assert!(
+                read.iter().all(|rp| rp == "example.com"),
+                "only the target RP's credentials may be iterated, got {read:?}"
+            );
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        // --- P5 review: H1, M1, M2, L3 and negatives ---
+
+        /// Signals that activation was reached, then waits for the release.
+        type ActivationGate = (
+            Mutex<std::sync::mpsc::Sender<()>>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        );
+
+        /// A lease activation that records calls and can be made to block or fail.
+        struct TestActivation {
+            calls: std::sync::atomic::AtomicUsize,
+            fail: bool,
+            gate: Option<ActivationGate>,
+        }
+
+        impl LeaseActivation for TestActivation {
+            fn activate(&self) -> Result<(), String> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                if let Some((reached, release)) = &self.gate {
+                    reached.lock().unwrap().send(()).unwrap();
+                    release.lock().unwrap().recv().unwrap();
+                }
+                if self.fail {
+                    Err("lease gone".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        #[test]
+        fn lease_activation_runs_after_the_operation_lock_is_released() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let activation = Arc::new(TestActivation {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: false,
+                gate: Some((Mutex::new(reached_tx), Mutex::new(release_rx))),
+            });
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(activation.clone());
+            std::thread::scope(|scope| {
+                let signer = scope.spawn(|| handler.sign(&ctx, &f.make_req()));
+                // The slow browser-manager holder (the activation) is now blocking the ceremony.
+                reached_rx.recv().unwrap();
+                // A human CTAP operation gets the operation lock at once.
+                let started = Instant::now();
+                let human = crate::lock_operation(&f.operation_lock);
+                assert!(started.elapsed() < Duration::from_secs(1));
+                drop(human);
+                assert!(!signer.is_finished(), "no assertion before activation");
+                release_tx.send(()).unwrap();
+                signer.join().unwrap().expect("signed after activation");
+            });
+            assert_eq!(activation.calls.load(Ordering::Acquire), 1);
+        }
+
+        #[test]
+        fn failed_lease_activation_withholds_the_assertion() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(Arc::new(TestActivation {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: true,
+                gate: None,
+            }));
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert_eq!(f.reasons().last().unwrap(), "lease_activation_failed");
+            // The key was used, so the operation counts; a duplicate gets the same failure.
+            assert_eq!(ctx.session.operations_used(), 1);
+            assert_eq!(handler.sign(&ctx, &f.make_req()).unwrap_err(), err);
+        }
+
+        #[test]
+        fn sign_path_with_the_real_lease_activation_follows_the_lock_order() {
+            // `BrowserLeaseActivation` takes the real (tracked) browser manager after the
+            // operation lock is released. Here the lease does not exist, so activation fails
+            // and the assertion is withheld; the lock-order checker must not fire.
+            let f = AuditTestFixture::default_allow();
+            let manager = Arc::new(Mutex::new(
+                super::super::super::browser::BrowserProcessManager::new(f.clock.clone()),
+            ));
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(BrowserLeaseActivation::new(
+                manager,
+                passless_core::agent::BrowserLeaseId::new(),
+                Duration::from_secs(60),
+            ));
+            let err = f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert!(super::super::super::lock_order::held_levels().is_empty());
+        }
+
+        #[test]
+        fn a_revocation_after_the_recheck_waits_for_key_use_and_then_holds() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let reached_tx = Mutex::new(reached_tx);
+            let release_rx = Mutex::new(release_rx);
+            let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                reached_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            });
+            f.key_provider.set_on_sign(Some(hook));
+            std::thread::scope(|scope| {
+                let signer = scope.spawn(|| handler.sign(&ctx, &f.make_req()));
+                // The signer is inside key use, past its re-check.
+                reached_rx.recv().unwrap();
+                let session_revoke = scope.spawn(|| ctx.session.revoke());
+                let epoch_bump = scope.spawn(|| f.policy_runtime.bump_revocation_epoch());
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!session_revoke.is_finished(), "revoke waits for key use");
+                assert!(!epoch_bump.is_finished(), "an epoch bump waits for key use");
+                release_tx.send(()).unwrap();
+                signer
+                    .join()
+                    .unwrap()
+                    .expect("the signature that was past its re-check");
+                session_revoke.join().unwrap();
+                epoch_bump.join().unwrap();
+            });
+            f.key_provider.set_on_sign(None);
+            // Once revoke has returned, no later key use by this session.
+            let err = handler
+                .sign(&ctx, &f.req_with_challenge(b"after"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        #[test]
+        fn failures_before_key_use_never_exhaust_the_budget() {
+            let mut f = AuditTestFixture::default_allow();
+            f.set_budget(2);
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            for i in 0..6u8 {
+                let mut req = f.req_with_challenge(&[b'g', i]);
+                req.allow_credentials = vec![b64u_encode(&[0xEE; 32])];
+                assert_eq!(
+                    handler.sign(&ctx, &req).unwrap_err().code,
+                    ErrorCode::Forbidden
+                );
+            }
+            assert_eq!(ctx.session.operations_used(), 0);
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"ok1"))
+                .expect("budget intact");
+            handler
+                .sign(&ctx, &f.req_with_challenge(b"ok2"))
+                .expect("budget intact");
+            assert_eq!(f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn a_completed_duplicate_is_not_served_to_a_revoked_session() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            ctx.session.revoke();
+            let err = handler.sign(&ctx, &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+        }
+
+        #[test]
+        fn a_joined_duplicate_of_a_revoked_session_gets_no_signature() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                let (joined_tx, joined_rx) = std::sync::mpsc::channel::<()>();
+                let duplicate = scope.spawn(|| {
+                    let _join = super::super::super::session::test_hooks::set_on_join(move || {
+                        joined_tx.send(()).unwrap();
+                    });
+                    handler.sign(&ctx, &req)
+                });
+                joined_rx.recv().unwrap();
+                ctx.session.revoke();
+                release_tx.send(()).unwrap();
+                assert_eq!(
+                    original.join().unwrap().unwrap_err().code,
+                    ErrorCode::Unauthorized
+                );
+                assert_eq!(
+                    duplicate.join().unwrap().unwrap_err().code,
+                    ErrorCode::Unauthorized
+                );
+            });
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn an_origin_spelled_differently_with_the_same_challenge_is_rejected() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            let mut variant = f.make_req();
+            variant.origin = "https://EXAMPLE.com".to_string();
+            assert_eq!(
+                handler.sign(&ctx, &variant).unwrap_err().code,
+                ErrorCode::Replayed
+            );
+            assert_eq!(f.reasons().last().unwrap(), "challenge_reused");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        // --- P7: escalation (ADR 0014 section 8) ---
+
+        fn escalation_fixture() -> AuditTestFixture {
+            let mut spec = FixtureSpec::new(vec![request_rule("example.com")], vec!["example.com"]);
+            spec.escalation = true;
+            AuditTestFixture::from_spec(spec)
+        }
+
+        type SignResult = Result<PrincipalResponse, ProtocolError>;
+
+        /// Sign on a thread (the ceremony parks until the test decides the prompt).
+        fn sign_on_thread(
+            f: &AuditTestFixture,
+            ctx: &SignContext,
+            req: SignAssertionRequest,
+        ) -> std::thread::JoinHandle<SignResult> {
+            let handler = f.make_handler();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || handler.sign(&ctx, &req))
+        }
+
+        fn kinds(f: &AuditTestFixture) -> Vec<String> {
+            read_audit_events(&f.audit_dir)
+                .iter()
+                .filter_map(|e| e["kind"].as_str().map(str::to_string))
+                .filter(|k| k.starts_with("escalation.") || k.starts_with("granted_rule."))
+                .collect()
+        }
+
+        fn granted(f: &AuditTestFixture) -> usize {
+            f.store
+                .profile(&f.profile_id)
+                .map_or(0, |grants| grants.rules().len())
+        }
+
+        #[test]
+        fn approved_escalation_persists_the_grant_and_signs_once() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            // The prompt carries only daemon-derived fields.
+            let fields = f.prompter.last_fields();
+            assert_eq!(fields.rp_id, "example.com");
+            assert_eq!(fields.origin, "https://example.com");
+            assert_eq!(fields.profile, "test-profile");
+            f.prompter.decide(PromptEvent::Approved);
+            ceremony.join().unwrap().expect("approved ceremony signs");
+            assert_eq!(f.key_provider.sign_calls(), 1);
+            assert_eq!(ctx.session.operations_used(), 1, "one budget claim");
+            assert_eq!(granted(&f), 1);
+            assert_eq!(
+                kinds(&f),
+                vec![
+                    "escalation.requested",
+                    "escalation.approved",
+                    "granted_rule.add"
+                ]
+            );
+            assert_eq!(f.policy_records(), vec![("policy.allow".to_string(), None)]);
+
+            // The grant now upgrades `request` to `allow`: no further prompt.
+            f.make_handler()
+                .sign(&ctx, &f.req_with_challenge(b"second"))
+                .expect("granted allow");
+            assert_eq!(f.prompter.shown(), 1);
+            assert_eq!(f.key_provider.sign_calls(), 2);
+        }
+
+        #[test]
+        fn no_budget_is_claimed_unless_the_escalation_is_approved() {
+            // Denied.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            f.prompter.decide(PromptEvent::Denied(
+                crate::agent::audit_events::EscalationDenyCause::User,
+            ));
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.reasons(), vec!["escalation_denied"]);
+
+            // Timed out: the ceremony deadline passes while parked.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let handler = f.make_handler();
+            let err = handler
+                .sign_with(
+                    &ctx,
+                    &f.make_req(),
+                    Instant::now() + Duration::from_millis(300),
+                    &|| false,
+                )
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Timeout);
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.reasons(), vec!["escalation_expired"]);
+            assert!(kinds(&f).contains(&"escalation.expired".to_string()));
+
+            // Aborted by the browser well before the deadline.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ceremony = {
+                let handler = f.make_handler();
+                let ctx = ctx.clone();
+                let req = f.make_req();
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    handler.sign_with(
+                        &ctx,
+                        &req,
+                        Instant::now() + Duration::from_secs(60),
+                        &|| cancel.load(Ordering::Acquire),
+                    )
+                })
+            };
+            f.prompter.wait_shown(1);
+            cancel.store(true, Ordering::Release);
+            assert_eq!(
+                ceremony.join().unwrap().unwrap_err().code,
+                ErrorCode::Aborted
+            );
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.prompter.withdrawn(), 1, "the prompt is withdrawn");
+            // The replay key stays consumed with the abort's outcome.
+            assert_eq!(
+                f.make_handler().sign(&ctx, &f.make_req()).unwrap_err().code,
+                ErrorCode::Aborted
+            );
+            assert_eq!(f.prompter.shown(), 1);
+        }
+
+        #[test]
+        fn a_replay_duplicate_joins_the_pending_escalation() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let joined = Arc::new(std::sync::Barrier::new(2));
+            let original = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let duplicate = {
+                let handler = f.make_handler();
+                let ctx = ctx.clone();
+                let req = f.make_req();
+                let joined = joined.clone();
+                std::thread::spawn(move || {
+                    let _hook = super::super::super::session::test_hooks::set_on_join(move || {
+                        joined.wait();
+                    });
+                    handler.sign(&ctx, &req)
+                })
+            };
+            joined.wait();
+            f.prompter.decide(PromptEvent::Approved);
+            let first = original.join().unwrap().expect("original signs");
+            let second = duplicate
+                .join()
+                .unwrap()
+                .expect("duplicate gets the outcome");
+            assert_eq!(signature_of(&Ok(first)), signature_of(&Ok(second)));
+            assert_eq!(f.prompter.shown(), 1, "one prompt");
+            assert_eq!(f.key_provider.sign_calls(), 1, "signed once");
+            assert_eq!(ctx.session.operations_used(), 1);
+            assert_eq!(
+                kinds(&f)
+                    .iter()
+                    .filter(|k| *k == "escalation.requested")
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn a_reload_cancels_the_waiter() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            // What `handle_reload_policy` does for a changed reload.
+            f.escalation.cancel_profile(&f.profile_id);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.prompter.withdrawn(), 1);
+            assert_eq!(ctx.session.operations_used(), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+            assert_eq!(granted(&f), 0);
+
+            // A changed reload also invalidates the waiting session on its own.
+            let mut f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            f.reload_rules(vec![
+                request_rule("example.com"),
+                allow_rule("other.example"),
+            ]);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn session_expiry_while_parked_is_session_expired_and_sets_no_cooldown() {
+            let f = escalation_fixture();
+            let mut ctx = f.make_ctx();
+            ctx.session = AgentSession::new(super::super::super::session::SessionBinding {
+                profile_id: f.profile_id.clone(),
+                principal_digest: [0u8; 32],
+                revocation_epoch: f.policy_runtime.revocation_epoch(),
+                ttl: Duration::from_secs(600),
+            });
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            // The session expires only once the ceremony is parked on its shown prompt.
+            f.prompter.wait_shown(1);
+            ctx.session.expire_now();
+            let err = ceremony.join().unwrap().unwrap_err();
+            // The session expired: not a timeout (`escalation_expired`, which starts a cooldown).
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(f.reasons(), vec!["session_expired".to_string()]);
+            assert_eq!(ctx.session.operations_used(), 0);
+            // No cooldown: a new session asks the same question and is prompted again.
+            let fresh = f.make_ctx();
+            let second = sign_on_thread(&f, &fresh, f.req_with_challenge(b"after-expiry"));
+            f.prompter.wait_shown(2);
+            f.prompter.decide(PromptEvent::Approved);
+            second
+                .join()
+                .unwrap()
+                .expect("the new session is prompted and signs");
+        }
+
+        #[test]
+        fn a_revoked_sign_bearer_is_remembered_and_its_late_use_is_audited_boundedly() {
+            let f = AuditTestFixture::default_allow();
+            let registry = SignContextRegistry::new();
+            let ctx = f.make_ctx();
+            let token = generate_bearer_token().unwrap();
+            registry
+                .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                .unwrap();
+            registry
+                .bind_lease(&token, "lease-sign".to_string())
+                .unwrap();
+            assert!(registry.lookup_revoked_sign(&token).is_none());
+
+            let epoch = f.policy_runtime.bump_revocation_epoch();
+            let stale = registry.revoke_stale_sessions(epoch);
+            assert_eq!(stale.revoked, 1);
+            assert_eq!(stale.lease_ids, vec!["lease-sign".to_string()]);
+            assert!(registry.lookup_bound(&token).is_none());
+
+            let revoked = registry.lookup_revoked_sign(&token).expect("remembered");
+            let full = crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW as usize;
+            for _ in 0..full + 4 {
+                revoked.refuse(Some(" Example.COM "));
+            }
+            let reasons = f.reasons();
+            assert_eq!(reasons.len(), full, "{reasons:?}");
+            assert!(reasons.iter().all(|r| r == "bearer_revoked"));
+            // The four refusals past the bound are counted, not lost: the count is written when
+            // the session's ledger is flushed (at the latest when the session is dropped).
+            ctx.session.refusals().flush();
+            let summaries: Vec<_> = read_audit_events(&f.audit_dir)
+                .into_iter()
+                .filter(|e| e["kind"] == "policy.deny" && !e["suppressed"].is_null())
+                .collect();
+            assert_eq!(summaries.len(), 1, "{summaries:?}");
+            assert_eq!(summaries[0]["suppressed"], 4);
+            assert_eq!(summaries[0]["reason"], "bearer_revoked");
+            assert_eq!(summaries[0]["rp_id"], "example.com");
+            let events = read_audit_events(&f.audit_dir);
+            let deny = find_policy_events(&events);
+            assert_eq!(deny[0]["action"], "authenticate");
+            assert_eq!(deny[0]["rp_id"], "example.com");
+        }
+
+        /// Review L5: late refusals counted after the revocation's flush are written by the
+        /// registry's sweep once their window ends, without another refusal.
+        #[test]
+        fn the_sweep_writes_the_pending_count_of_a_revoked_bearer_without_a_further_refusal() {
+            let f = AuditTestFixture::default_allow();
+            let registry = SignContextRegistry::new();
+            let ctx = f.make_ctx();
+            let token = generate_bearer_token().unwrap();
+            registry
+                .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                .unwrap();
+            registry
+                .bind_lease(&token, "lease-sign".to_string())
+                .unwrap();
+            let epoch = f.policy_runtime.bump_revocation_epoch();
+            registry.revoke_stale_sessions(epoch);
+            let revoked = registry.lookup_revoked_sign(&token).expect("remembered");
+
+            let full = crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW as usize;
+            for _ in 0..full + 4 {
+                revoked.refuse(Some("example.com"));
+            }
+            let suppressed = |f: &AuditTestFixture| -> Vec<serde_json::Value> {
+                read_audit_events(&f.audit_dir)
+                    .into_iter()
+                    .filter(|e| e["kind"] == "policy.deny" && !e["suppressed"].is_null())
+                    .collect()
+            };
+            assert!(suppressed(&f).is_empty(), "counted, not yet written");
+
+            // Inside the window the sweep writes nothing.
+            registry.flush_due_revoked_refusals_at(Instant::now());
+            assert!(suppressed(&f).is_empty());
+
+            // Once the window has ended the summary is written, and only once.
+            let after = Instant::now() + crate::agent::refusal_ledger::REFUSAL_WINDOW;
+            registry.flush_due_revoked_refusals_at(after);
+            registry.flush_due_revoked_refusals_at(after + Duration::from_secs(60));
+            let written = suppressed(&f);
+            assert_eq!(written.len(), 1, "{written:?}");
+            assert_eq!(written[0]["suppressed"], 4);
+            assert_eq!(written[0]["reason"], "bearer_revoked");
+        }
+
+        #[test]
+        fn a_grants_clear_cancels_the_waiting_escalation() {
+            // What `handle_clear_granted_rules` does: clear the store, then cancel the profile's
+            // escalations, so an approval in flight cannot persist a grant after the clear.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let outcome = crate::agent::runtime::clear_granted_rules(
+                &f.store,
+                &f.policy_runtime,
+                &f.escalation,
+                &f.audit_gate,
+                &f.profile_id,
             )
-        }
-
-        fn extract_counter(auth_data_b64u: &str) -> u32 {
-            let auth_data = b64u_decode(auth_data_b64u).unwrap();
-            assert!(auth_data.len() >= 37);
-            u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]])
+            .expect("clear succeeds on an empty store");
+            assert_eq!(outcome.revoked, 0);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.prompter.withdrawn(), 1);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
         }
 
         #[test]
-        fn http_sign_full_response_structure() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
+        fn a_grants_revoke_cancels_the_waiting_escalation_for_that_rp() {
+            // Review L2. What `handle_revoke_granted_rule` does: revoke the RP's grant, then cancel
+            // the RP's escalations, so an approval in flight cannot persist the grant again. The
+            // store holds no grant yet (the approval has not written it): the revoke reports
+            // nothing to revoke, and the escalation is cancelled all the same.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            let revoked = crate::agent::runtime::revoke_granted_rule(
+                &f.store,
+                &f.policy_runtime,
+                &f.escalation,
+                &f.audit_gate,
+                &f.profile_id,
                 "example.com",
-                "dGVzdA",
-                vec![],
-                false,
+                crate::agent::granted_rules::GrantedAction::Authenticate,
             );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("200 OK"));
-            let body_str = http_body(&resp);
-            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
-            let inner = parsed.get("sign_assertion_result").unwrap();
-            assert!(inner.get("credential_id_b64u").is_some());
-            assert!(inner.get("authenticator_data_b64u").is_some());
-            assert!(inner.get("signature_b64u").is_some());
-            assert!(inner.get("user_handle_b64u").is_some());
-            assert!(inner.get("client_data_json_b64u").is_some());
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+            assert_eq!(revoked.unwrap_err().code, ErrorCode::NotFound);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons(), vec!["policy_revoked"]);
+            assert_eq!(f.prompter.withdrawn(), 1);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
         }
 
         #[test]
-        fn http_auth_preflight_then_sign() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
+        fn an_approval_after_the_store_revoke_and_before_its_cancel_persists_nothing() {
+            // Review M-d, with the real store: `grants revoke` has revoked the store but its
+            // `cancel_rp` has not run when the human approves. The approval's grant write is
+            // refused (the RP's revocation generation moved), so the ceremony is not signed and
+            // no grant survives.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            assert_eq!(
+                f.store.revoke(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    "example.com",
+                    crate::agent::granted_rules::GrantedAction::Authenticate,
+                ),
+                Err(crate::agent::granted_rules::GrantStoreError::NotFound)
             );
-            let req = format_sign_request(&token, &body);
-            let sign_resp = http_request(&sock_path, &req, &body);
-            assert!(sign_resp.contains("200 OK"));
-            assert!(!sign_resp.contains("Access-Control"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+            f.prompter.decide(PromptEvent::Approved);
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(granted(&f), 0);
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert!(kinds(&f).contains(&"escalation.revoked".to_string()));
         }
 
         #[test]
-        fn http_policy_deny_returns_403() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+        fn an_added_grant_bumps_only_the_grant_epoch() {
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let revocation = f.policy_runtime.revocation_epoch();
+            let grant_epoch = f.policy_runtime.grant_epoch();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.approve(1);
+            ceremony.join().unwrap().unwrap();
+            assert_eq!(f.policy_runtime.grant_epoch(), grant_epoch + 1);
+            assert_eq!(f.policy_runtime.revocation_epoch(), revocation);
+            // Active sessions stay valid.
+            assert!(
+                ctx.session
+                    .validity(f.policy_runtime.revocation_epoch(), Instant::now())
+                    .is_ok()
+            );
         }
 
         #[test]
-        fn http_grant_ttl_enforced() {
-            let (shutdown, _dir, sock_path, _registry, token, f, handle) = setup_bound(true);
-            f.clock.advance(Duration::from_secs(301));
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
+        fn a_grant_is_inert_once_its_rule_is_removed() {
+            let mut f = escalation_fixture();
+            let ceremony = sign_on_thread(&f, &f.make_ctx(), f.make_req());
+            f.prompter.approve(1);
+            ceremony.join().unwrap().unwrap();
+            assert_eq!(granted(&f), 1);
+
+            // The rule is gone: the grant stays stored but permits nothing (ADR 0014 section
+            // 6.2), and nothing is prompted.
+            f.reload_rules(vec![]);
+            let err = f
+                .make_handler()
+                .sign(&f.make_ctx(), &f.req_with_challenge(b"after removal"))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.reasons().last().unwrap(), "action_not_allowed");
+            f.reload_rules(vec![deny_rule("example.com")]);
+            assert!(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &f.req_with_challenge(b"after deny"))
+                    .is_err()
             );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+            assert_eq!(granted(&f), 1);
+            assert_eq!(f.prompter.shown(), 1);
+            assert_eq!(f.key_provider.sign_calls(), 1);
+
+            // Restoring the `request` rule revives it without a prompt.
+            f.reload_rules(vec![request_rule("example.com")]);
+            f.make_handler()
+                .sign(&f.make_ctx(), &f.req_with_challenge(b"restored"))
+                .expect("the stored grant applies again");
+            assert_eq!(f.prompter.shown(), 1);
         }
 
         #[test]
-        fn http_credential_ref_enforced() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("200 OK"));
-            let body_str = http_body(&resp);
-            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
-            let inner = parsed.get("sign_assertion_result").unwrap();
-            let cred_id = inner.get("credential_id_b64u").unwrap().as_str().unwrap();
-            let expected = b64u_encode(&[1u8; 32]);
-            assert_eq!(cred_id, expected);
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+        fn automatic_interaction_mode_does_not_affect_escalation() {
+            // `PASSLESS_INTERACTION_MODE=automatic` auto-approves the human path's prompts only;
+            // an escalation still prompts and a deny is still a deny (ADR 0014 section 7, E2E-44).
+            // SAFETY: only this test sets the variable; nothing else in the test binary reads it
+            // concurrently (the human notification path is never exercised by unit tests).
+            unsafe { std::env::set_var("PASSLESS_INTERACTION_MODE", "automatic") };
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            f.prompter.decide(PromptEvent::Denied(
+                crate::agent::audit_events::EscalationDenyCause::User,
+            ));
+            let result = ceremony.join().unwrap();
+            unsafe { std::env::remove_var("PASSLESS_INTERACTION_MODE") };
+            assert_eq!(result.unwrap_err().code, ErrorCode::Forbidden);
+            assert_eq!(f.prompter.shown(), 1, "prompted, never auto-approved");
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(granted(&f), 0);
         }
 
         #[test]
-        fn http_counter_increment_monotonic() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
-            let body1 = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req1 = format_sign_request(&token, &body1);
-            let resp1 = http_request(&sock_path, &req1, &body1);
-            assert!(resp1.contains("200 OK"));
-            let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
-            let inner1 = parsed1.get("sign_assertion_result").unwrap();
-            let auth1 = inner1
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
+        fn registration_grant_credentials_join_the_configured_pins() {
+            // The profile pins the stored credential 1; credential B exists but is not pinned.
+            // A registration grant for B adds it to the pinned set (ADR 0014 section 8.3).
+            let f = escalation_fixture();
+            let id_b = vec![0xB2u8; 32];
+            get_write_counting_storage(&f.storage).add_cred(soft_fido2::Credential {
+                id: id_b.clone(),
+                rp: RelyingParty::new("example.com".into()),
+                user: User::new(vec![9]),
+                sign_count: 0,
+                alg: -7,
+                key: SoftwareCredentialKeyProvider.generate(-7).unwrap().key,
+                created: 5,
+                discoverable: true,
+                backup_state: CredentialBackupState::NotEligible,
+                extensions: soft_fido2::Extensions::default(),
+            });
+            let mut req = f.make_req();
+            req.allow_credentials = vec![b64u_encode(&id_b)];
+
+            // An escalation grant for the RP alone does not widen the pins.
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.com",
+                        crate::agent::granted_rules::GrantKind::Escalation,
+                        "esc-1",
+                        "https://example.com",
+                        crate::agent::granted_rules::PermittingRule::Exact,
+                        None,
+                    ),
+                    64,
+                )
                 .unwrap();
-            let counter1 = extract_counter(auth1);
-            let body2 = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "Y2hhbA",
-                vec![],
-                false,
+            assert_eq!(
+                f.make_handler().sign(&f.make_ctx(), &req).unwrap_err().code,
+                ErrorCode::Forbidden
             );
-            let req2 = format_sign_request(&token, &body2);
-            let resp2 = http_request(&sock_path, &req2, &body2);
-            assert!(resp2.contains("200 OK"));
-            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
-            let inner2 = parsed2.get("sign_assertion_result").unwrap();
-            let auth2 = inner2
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
+            assert_eq!(f.reasons(), vec!["allow_credentials_mismatch"]);
+
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.com",
+                        crate::agent::granted_rules::GrantKind::Registration,
+                        "esc-2",
+                        "https://example.com",
+                        crate::agent::granted_rules::PermittingRule::Exact,
+                        Some(cred_ref_of(&id_b)),
+                    ),
+                    64,
+                )
                 .unwrap();
-            let counter2 = extract_counter(auth2);
-            assert_eq!(counter1, 1);
-            assert_eq!(counter2, 2);
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_content_type_validation() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = b"{}";
-            let req = format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
+            let mut req = f.req_with_challenge(b"pinned");
+            req.allow_credentials = vec![b64u_encode(&id_b)];
+            assert_eq!(
+                signed_credential(f.make_handler().sign(&f.make_ctx(), &req)),
+                id_b,
+                "the registration grant's credential is in the pinned set"
             );
-            let resp = http_request(&sock_path, &req, body);
-            assert!(resp.contains("415"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("unsupported_content_type"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+            assert_eq!(f.prompter.shown(), 0);
         }
 
         #[test]
-        fn http_origin_mismatch_denied() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body =
-                sign_request_body("https://evil.com", "example.com", "dGVzdA", vec![], false);
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+        fn the_human_operation_lock_is_free_while_a_waiter_is_parked() {
+            // LOCKING.md rule 3: a parked escalation waiter holds no lock, so the human CTAP path
+            // (which takes the shared operation lock) runs while it waits. The debug lock-order
+            // checks run on both threads.
+            let f = escalation_fixture();
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, f.make_req());
+            f.prompter.wait_shown(1);
+            {
+                let _human = lock_order::lock(&f.operation_lock, LockLevel::Operation);
+                let _storage = lock_order::lock(&f.storage, LockLevel::Storage);
+                assert!(!ceremony.is_finished());
+            }
+            assert!(lock_order::held_levels().is_empty());
+            f.prompter.decide(PromptEvent::Approved);
+            ceremony.join().unwrap().expect("signs after approval");
+        }
+
+        // --- operation records and terminal records (ADR 0014 section 12) ---
+
+        fn records_of_kind<'a>(
+            events: &'a [serde_json::Value],
+            kind: &str,
+        ) -> Vec<&'a serde_json::Value> {
+            events.iter().filter(|e| e["kind"] == kind).collect()
+        }
+
+        /// Every reservation (`policy.allow`) is closed by exactly one `operation.terminal` record
+        /// with the same request ID, written after it. Returns the terminal records.
+        fn assert_one_terminal_per_reservation(
+            events: &[serde_json::Value],
+        ) -> Vec<&serde_json::Value> {
+            let allows = records_of_kind(events, "policy.allow");
+            let terminals = records_of_kind(events, "operation.terminal");
+            assert_eq!(allows.len(), terminals.len(), "{events:#?}");
+            for allow in &allows {
+                let request_id = &allow["request_id"];
+                assert!(
+                    request_id.is_string(),
+                    "a reservation carries its request ID"
+                );
+                let closing = terminals
+                    .iter()
+                    .filter(|t| t["request_id"] == *request_id)
+                    .count();
+                assert_eq!(closing, 1, "exactly one terminal record for {request_id}");
+            }
+            terminals
+        }
+
+        fn test_deployment() -> AuditDeployment {
+            AuditDeployment {
+                mode: Some("same-user".to_string()),
+                principal_relationship: Some("shared-uid".to_string()),
+                backend: Some("local".to_string()),
+                key_provider: Some("software".to_string()),
+            }
         }
 
         #[test]
-        fn http_wrong_rp_id_denied() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body("https://other.com", "other.com", "dGVzdA", vec![], false);
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
-        }
-
-        #[test]
-        fn http_unauthorized_credential_denied() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let wrong_cred = b64u_encode(b"wrong_credential_id_bytes_1234567");
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![wrong_cred],
-                false,
+        fn a_successful_sign_is_one_reservation_and_one_terminal_record_with_every_field() {
+            let mut f = AuditTestFixture::default_allow();
+            // A real counter, so counter_before and counter_after differ.
+            f.security_config.constant_signature_counter = false;
+            let mut handler = f.make_handler();
+            handler.audit_deployment = test_deployment();
+            handler.sign(&f.make_ctx(), &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            let allow = records_of_kind(&events, "policy.allow")[0];
+            let terminal = terminals[0];
+            let credential = serde_json::to_value(cred_ref_of(&[1u8; 32])).unwrap();
+            for record in [allow, terminal] {
+                assert_eq!(record["profile_id"], "test-profile");
+                assert_eq!(record["mode"], "same-user");
+                assert_eq!(record["principal_relationship"], "shared-uid");
+                assert_eq!(record["backend"], "local");
+                assert_eq!(record["key_provider"], "software");
+                assert_eq!(record["action"], "authenticate");
+                assert_eq!(record["rp_id"], "example.com");
+                assert_eq!(record["origin"], "https://example.com");
+                assert!(
+                    record.get("top_origin").is_some_and(|v| v.is_null()),
+                    "top_origin is always written, null on the proxy path"
+                );
+                assert_eq!(record["cross_origin"], false);
+                assert_eq!(record["rule"], "exact", "the matched exact rule");
+                assert_eq!(record["grant_source"], "config");
+                assert_eq!(record["decision"], "allow");
+                assert_eq!(record["evidence_source"], "agent");
+                assert_eq!(record["selection_rule"], "single");
+                assert_eq!(record["credential_ref"], credential);
+                assert_eq!(record["counter_before"], 0);
+                assert!(record["revocation_epoch"].is_u64());
+                assert!(record["grant_epoch"].is_u64());
+                assert_eq!(record["session_id_hash"].as_str().unwrap().len(), 64);
+                assert!(record["escalation_id"].is_null());
+            }
+            assert_eq!(allow["request_id"], terminal["request_id"]);
+            assert_eq!(allow["session_id_hash"], terminal["session_id_hash"]);
+            assert!(allow["result"].is_null() && allow["failure_class"].is_null());
+            assert!(allow["counter_after"].is_null(), "not known at reservation");
+            assert_eq!(terminal["result"], "success");
+            assert!(terminal["failure_class"].is_null());
+            assert_eq!(terminal["counter_after"], 1);
+            assert!(
+                records_of_kind(&events, "policy.deny").is_empty(),
+                "a success writes no refusal"
             );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
         }
 
         #[test]
-        fn http_duplicate_request_within_ttl_returns_cached_assertion() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(false);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
+        fn a_wildcard_match_is_audited_as_rule_star() {
+            let f = AuditTestFixture::from_spec(FixtureSpec {
+                dynamic_grant: true,
+                ..FixtureSpec::new(vec![allow_rule(ANY_RP_ID)], vec!["*"])
+            });
+            f.make_handler().sign(&f.make_ctx(), &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(records_of_kind(&events, "policy.allow")[0]["rule"], "*");
+            assert_eq!(terminals[0]["rule"], "*");
+            assert_eq!(terminals[0]["grant_source"], "config");
+        }
+
+        #[test]
+        fn a_refused_wildcard_request_is_audited_as_rule_star() {
+            // The E2E-12 shape: a wildcard `request` rule with no prompt available is denied.
+            let f = AuditTestFixture::from_spec(FixtureSpec {
+                dynamic_grant: true,
+                ..FixtureSpec::new(vec![request_rule(ANY_RP_ID)], vec!["*"])
+            });
+            f.make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            let events = read_audit_events(&f.audit_dir);
+            let denies = records_of_kind(&events, "policy.deny");
+            assert_eq!(denies.len(), 1, "{events:#?}");
+            assert_eq!(denies[0]["rule"], "*");
+            assert_eq!(denies[0]["decision"], "deny");
+            assert_eq!(denies[0]["result"], "denied");
+            assert_eq!(denies[0]["failure_class"], "escalation_unavailable");
+            assert_eq!(denies[0]["reason"], "escalation_unavailable");
+            assert!(denies[0]["request_id"].is_string());
+            assert!(
+                records_of_kind(&events, "policy.allow").is_empty()
+                    && records_of_kind(&events, "operation.terminal").is_empty(),
+                "a refusal before the reservation owes no terminal record"
             );
-            let req = format_sign_request(&token, &body);
-            let resp1 = http_request(&sock_path, &req, &body);
-            assert!(resp1.contains("200 OK"));
-            let parsed1: serde_json::Value = serde_json::from_str(http_body(&resp1)).unwrap();
-            let auth1 = parsed1
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string();
-            assert_eq!(extract_counter(&auth1), 1);
-
-            // An identical request within the completed-outcome TTL returns the
-            // same cached assertion instead of being re-signed. The counter is not
-            // incremented again, so no new signature is produced (idempotent).
-            let resp2 = http_request(&sock_path, &req, &body);
-            assert!(resp2.contains("200 OK"));
-            let parsed2: serde_json::Value = serde_json::from_str(http_body(&resp2)).unwrap();
-            let auth2 = parsed2
-                .get("sign_assertion_result")
-                .unwrap()
-                .get("authenticator_data_b64u")
-                .unwrap()
-                .as_str()
-                .unwrap();
-            assert_eq!(auth2, auth1);
-            assert_eq!(extract_counter(auth2), 1);
-
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
         }
 
         #[test]
-        fn http_invalid_json_body() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = b"{invalid json!!";
-            let req = format_sign_request(&token, body);
-            let resp = http_request(&sock_path, &req, body);
-            assert!(resp.contains("400"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("invalid_json"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+        fn a_granted_rule_is_audited_with_its_grant_source() {
+            let f = AuditTestFixture::new(vec![request_rule("example.com")], vec!["example.com"]);
+            f.granted_rules.set(true);
+            f.make_handler().sign(&f.make_ctx(), &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(terminals[0]["rule"], "exact");
+            assert_eq!(terminals[0]["grant_source"], "granted");
         }
 
         #[test]
-        fn http_body_too_large() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let req = format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 99999\r\n\r\n",
+        fn a_refusal_before_the_reservation_carries_the_operation_fields_without_a_terminal() {
+            let f = AuditTestFixture::default_allow();
+            let mut req = f.make_req();
+            req.origin = "https://evil.example".to_string();
+            f.make_handler().sign(&f.make_ctx(), &req).unwrap_err();
+            let events = read_audit_events(&f.audit_dir);
+            let denies = records_of_kind(&events, "policy.deny");
+            assert_eq!(denies.len(), 1);
+            let deny = denies[0];
+            assert_eq!(deny["failure_class"], "origin_invalid");
+            assert_eq!(deny["result"], "denied");
+            assert_eq!(deny["origin"], "https://evil.example");
+            assert!(
+                deny["rule"].is_null(),
+                "origin validation precedes resolution"
+            );
+            assert!(deny["credential_ref"].is_null());
+            assert!(deny["session_id_hash"].is_string());
+            assert!(deny["revocation_epoch"].is_u64());
+            assert!(assert_one_terminal_per_reservation(&events).is_empty());
+        }
+
+        /// The single terminal record of the one reservation in `f`'s audit log.
+        fn only_terminal(f: &AuditTestFixture) -> serde_json::Value {
+            let events = read_audit_events(&f.audit_dir);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(terminals.len(), 1, "{events:#?}");
+            assert!(
+                records_of_kind(&events, "policy.deny").is_empty(),
+                "after the reservation a failure is the terminal record, not a second refusal"
+            );
+            terminals[0].clone()
+        }
+
+        #[test]
+        fn a_revocation_before_key_use_ends_in_a_revoked_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let runtime = f.policy_runtime.clone();
+            let changed = test_agent_config(AuditTestFixture::profile_config(&FixtureSpec::new(
+                vec![allow_rule("example.com"), allow_rule("other.example")],
+                vec!["example.com"],
+            )));
+            let _hook = super::super::super::session::test_hooks::set_before_key_use(move || {
+                assert!(runtime.reload(&changed).unwrap().changed);
+            });
+            handler.sign(&ctx, &f.make_req()).unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "revoked");
+            assert_eq!(terminal["failure_class"], "policy_revoked");
+            assert!(terminal["counter_after"].is_null(), "no key use");
+        }
+
+        #[test]
+        fn an_abort_after_the_reservation_ends_in_an_aborted_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            // The first check (before the replay key) passes; the re-check before key use sees it.
+            let cancelled = || calls.fetch_add(1, Ordering::AcqRel) >= 1;
+            let deadline = ceremony_deadline(None, Instant::now());
+            f.make_handler()
+                .sign_with(&f.make_ctx(), &f.make_req(), deadline, &cancelled)
+                .unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "aborted");
+            assert_eq!(terminal["failure_class"], "aborted");
+            assert_eq!(f.key_provider.sign_calls(), 0);
+        }
+
+        #[test]
+        fn a_signing_failure_ends_in_an_error_terminal_record() {
+            let mut f = AuditTestFixture::default_allow();
+            f.security_config.constant_signature_counter = false;
+            f.key_provider.set_fail_sign(true);
+            f.make_handler()
+                .sign(&f.make_ctx(), &f.make_req())
+                .unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "error");
+            assert_eq!(terminal["failure_class"], "signing_failed");
+            assert_eq!(terminal["counter_after"], 1, "the counter was persisted");
+        }
+
+        #[test]
+        fn a_withheld_assertion_ends_in_an_error_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            let mut ctx = f.make_ctx();
+            ctx.lease_activation = Some(Arc::new(TestActivation {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: true,
+                gate: None,
+            }));
+            f.make_handler().sign(&ctx, &f.make_req()).unwrap_err();
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "error");
+            assert_eq!(terminal["failure_class"], "lease_activation_failed");
+        }
+
+        #[test]
+        fn a_ceremony_that_panics_still_gets_its_terminal_record() {
+            let f = AuditTestFixture::default_allow();
+            f.key_provider
+                .set_on_sign(Some(Arc::new(|| panic!("the key provider panicked"))));
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = handler.sign(&ctx, &req);
+            }));
+            assert!(unwound.is_err());
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["result"], "error");
+            assert_eq!(terminal["failure_class"], "abandoned");
+        }
+
+        #[test]
+        fn a_durable_but_unacknowledged_reservation_blocks_key_use_and_is_closed_at_restart() {
+            use crate::agent::audit::{FailAt, FaultPoint};
+            let mut f = AuditTestFixture::default_allow();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit");
+            // The reservation's frame is synced, then the directory fsync fails: the gate breaks
+            // its circuit although the record is on disk.
+            f.audit_gate = Arc::new(
+                AuditGate::open_with_faults(
+                    &path,
+                    8 * 1024 * 1024,
+                    Box::new(FailAt(FaultPoint::FsyncDir)),
+                )
+                .unwrap(),
+            );
+            f.audit_dir = path.clone();
+            let handler = f.make_handler();
+            let err = handler.sign(&f.make_ctx(), &f.make_req()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Internal);
+            assert_eq!(
+                f.key_provider.sign_calls(),
+                0,
+                "no key use without a reservation ack"
+            );
+            let events = read_audit_events(&path);
+            assert_eq!(
+                records_of_kind(&events, "policy.allow").len(),
+                1,
+                "it is durable"
+            );
+            assert!(
+                records_of_kind(&events, "operation.terminal").is_empty(),
+                "the broken circuit refuses the terminal record"
+            );
+            // The next start closes it.
+            drop(handler);
+            let other = tempfile::tempdir().unwrap();
+            f.audit_gate = Arc::new(AuditGate::open(other.path().join("audit")).unwrap());
+            let gate = AuditGate::open(&path).unwrap();
+            assert_eq!(
+                crate::agent::operation_audit::recover_orphan_reservations(&gate),
+                1
+            );
+            let events = read_audit_events(&path);
+            let terminals = assert_one_terminal_per_reservation(&events);
+            assert_eq!(terminals[0]["failure_class"], "abandoned");
+        }
+
+        #[test]
+        fn a_duplicate_whose_deadline_passes_while_it_waits_is_audited_as_a_join_timeout() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            std::thread::scope(|scope| {
+                let original = scope.spawn(|| {
+                    // Park the original between its audit reservation and key use.
+                    let _hook =
+                        super::super::super::session::test_hooks::set_before_key_use(move || {
+                            reached_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        });
+                    handler.sign(&ctx, &req)
+                });
+                reached_rx.recv().unwrap();
+                let deadline = Instant::now() + Duration::from_millis(100);
+                let err = handler
+                    .sign_with(&ctx, &req, deadline, &|| false)
+                    .unwrap_err();
+                assert_eq!(err.code, ErrorCode::Timeout);
+                release_tx.send(()).unwrap();
+                original.join().unwrap().expect("the original signs");
+            });
+            let events = read_audit_events(&f.audit_dir);
+            let denies = records_of_kind(&events, "policy.deny");
+            assert_eq!(denies.len(), 1, "{events:#?}");
+            assert_eq!(denies[0]["failure_class"], "join_timeout");
+            assert_eq!(denies[0]["result"], "timeout");
+            assert_eq!(denies[0]["reason"], "join_timeout");
+            assert_eq!(assert_one_terminal_per_reservation(&events).len(), 1);
+        }
+
+        #[test]
+        fn a_served_duplicate_is_not_a_second_reservation() {
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            handler.sign(&ctx, &f.make_req()).unwrap();
+            let events = read_audit_events(&f.audit_dir);
+            assert_eq!(assert_one_terminal_per_reservation(&events).len(), 1);
+            let served = records_of_kind(&events, "policy.replay_served");
+            assert_eq!(served.len(), 1);
+            assert_eq!(served[0]["result"], "replay_served");
+            assert_eq!(served[0]["decision"], "allow");
+        }
+
+        #[test]
+        fn an_agent_panic_under_the_shared_locks_leaves_the_human_path_working() {
+            // ADR 0014 invariant 23 (review M1). A same-user ceremony panics while it holds the
+            // human operation lock and the shared credential storage (test builds unwind); both
+            // locks are poisoned. The human CTAP path then still runs a command and reads storage.
+            use crate::authenticator::{AuthenticatorService, PasslessCallbacks};
+            use passless_core::config::PinConfig;
+            use soft_fido2::AuthenticatorCallbacks;
+            use soft_fido2_transport::{Cmd, CommandHandler};
+
+            let f = AuditTestFixture::default_allow();
+            let handler = f.make_handler();
+            let ctx = f.make_ctx();
+            let req = f.make_req();
+            let ceremony = std::thread::spawn(move || {
+                let _hook = super::super::super::session::test_hooks::set_before_key_use(|| {
+                    assert_eq!(
+                        lock_order::held_levels(),
+                        vec![LockLevel::Operation, LockLevel::Storage],
+                        "the hook runs under the shared locks"
+                    );
+                    panic!("an agent ceremony panicked under the human locks");
+                });
+                handler.sign(&ctx, &req)
+            });
+            assert!(ceremony.join().is_err(), "the ceremony panicked");
+            assert!(f.operation_lock.is_poisoned());
+            assert!(f.storage.is_poisoned());
+            // The panic closed the reservation (P8 drop guard): the audit is consistent.
+            let terminal = only_terminal(&f);
+            assert_eq!(terminal["failure_class"], "abandoned");
+
+            // A human CTAP command (authenticatorGetInfo) through the same locks.
+            let service =
+                AuthenticatorService::<Box<dyn CredentialStorage>, ()>::with_shared_storage(
+                    f.storage.clone(),
+                    None,
+                    SecurityConfig::default(),
+                    PinConfig::default(),
+                )
+                .expect("the human service builds over the shared storage");
+            let mut human =
+                crate::ServiceHandler::with_operation_lock(service, f.operation_lock.clone());
+            let info = human
+                .handle_command(Cmd::Cbor, &[0x04])
+                .expect("the human path answers after an agent panic");
+            assert_eq!(info.first(), Some(&0x00), "CTAP2_OK");
+            assert!(!f.operation_lock.is_poisoned(), "the poison was cleared");
+            assert!(!f.storage.is_poisoned(), "the poison was cleared");
+
+            // And a human storage read finds the shared credential.
+            let callbacks = PasslessCallbacks::<Box<dyn CredentialStorage>, ()>::new(
+                f.storage.clone(),
+                None,
+                SecurityConfig::default(),
+                PinConfig::default(),
+            );
+            let listed = callbacks
+                .list_credentials("example.com", None)
+                .expect("the human path reads storage after an agent panic");
+            assert_eq!(listed.len(), 1);
+        }
+    }
+
+    mod registration_lease_tests {
+        use super::*;
+        use crate::agent::audit::test_support::read_audit_events;
+        use crate::agent::transport::tests::{TestServer, create_body};
+        use passless_core::agent::protocol::RegisterCredentialRequest;
+        use soft_fido2::SoftwareCredentialKeyProvider;
+
+        struct Rig {
+            registry: Arc<SignContextRegistry>,
+            handler: Arc<RegisterHandler>,
+            ctx: RegisterContext,
+            storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
+            audit_dir: PathBuf,
+            _dirs: Vec<tempfile::TempDir>,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                let audit_tmp = tempfile::tempdir().unwrap();
+                let audit_dir = audit_tmp.path().join("audit");
+                std::fs::create_dir_all(&audit_dir).unwrap();
+                std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let store_tmp = tempfile::tempdir().unwrap();
+
+                let profile_config = sign_handler_tests::test_profile_config(
+                    vec![sign_handler_tests::rule(
+                        "example.com",
+                        RuleAction::Deny,
+                        RuleAction::Allow,
+                    )],
+                    None,
+                    CredentialSelection::Single,
+                );
+                let clock = Arc::new(sign_handler_tests::MockClock::new());
+                let policy_runtime = Arc::new(
+                    PolicyRuntime::new(
+                        &sign_handler_tests::test_agent_config(profile_config),
+                        clock,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                let storage: Arc<Mutex<Box<dyn CredentialStorage>>> =
+                    Arc::new(Mutex::new(Box::new(
+                        crate::storage::LocalStorageAdapter::new(store_tmp.path().into()).unwrap(),
+                    )));
+                let audit_gate = Arc::new(AuditGate::open(&audit_dir).unwrap());
+                let handler = Arc::new(RegisterHandler {
+                    policy_runtime,
+                    credential_storage: storage.clone(),
+                    audit_gate: audit_gate.clone(),
+                    key_provider: Arc::new(SoftwareCredentialKeyProvider),
+                    security_config: SecurityConfig::default(),
+                    operation_lock: Arc::new(Mutex::new(())),
+                    escalation: crate::agent::escalation::test_support::idle_service(
+                        audit_gate.clone(),
+                    ),
+                    audit_deployment: Default::default(),
+                });
+                let profile_id = ProfileId::new("test-profile").unwrap();
+                let ctx = RegisterContext::new(profile_id.clone(), test_session(&profile_id));
+                Self {
+                    registry: Arc::new(SignContextRegistry::new()),
+                    handler,
+                    ctx,
+                    storage,
+                    audit_dir,
+                    _dirs: vec![audit_tmp, store_tmp],
+                }
+            }
+
+            /// Register a bearer, optionally bound to `lease`.
+            /// A registration bearer with its own session (one bearer, one session).
+            fn bearer(&self, lease: Option<&str>) -> String {
+                let token = generate_bearer_token().unwrap();
+                let ctx = RegisterContext::new(
+                    self.ctx.profile_id.clone(),
+                    test_session(&self.ctx.profile_id),
+                );
+                self.registry
+                    .register_pending_registration(token.clone(), ctx, self.handler.clone())
+                    .unwrap();
+                if let Some(lease) = lease {
+                    self.registry
+                        .bind_registration_lease(&token, lease.to_string())
+                        .unwrap();
+                }
                 token
-            );
-            let resp = http_request(&sock_path, &req, b"");
-            assert!(resp.contains("413"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("body_too_large"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+            }
+
+            fn credential_count(&self) -> usize {
+                self.storage.lock().unwrap().count_credentials()
+            }
+
+            fn registration_body(&self, challenge: &str) -> Vec<u8> {
+                serde_json::to_vec(&RegisterCredentialRequest {
+                    extensions: Vec::new(),
+                    attestation: None,
+                    timeout_ms: None,
+                    authenticator_attachment: None,
+                    origin: "https://example.com".to_string(),
+                    top_origin: None,
+                    rp_id: "example.com".to_string(),
+                    challenge_b64u: challenge.to_string(),
+                    user_id_b64u: "dXNlcg".to_string(),
+                    user_name: "testuser".to_string(),
+                    user_display_name: None,
+                    rp_name: None,
+                    exclude_credentials: vec![],
+                    pub_key_cred_params: vec![-7],
+                    user_verification: false,
+                    cross_origin: false,
+                })
+                .unwrap()
+            }
+
+            fn policy_denies(&self) -> Vec<serde_json::Value> {
+                read_audit_events(&self.audit_dir)
+                    .into_iter()
+                    .filter(|e| e["kind"] == "policy.deny")
+                    .collect()
+            }
         }
 
         #[test]
-        fn http_bearer_not_prefix_match() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let prefix = &token[..10];
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
+        fn unbound_registration_bearer_is_unusable() {
+            let rig = Rig::new();
+            let token = rig.bearer(None);
+            assert!(rig.registry.lookup_registration(&token).is_none());
+            rig.registry
+                .bind_registration_lease(&token, "lease-1".into())
+                .unwrap();
+            assert!(rig.registry.lookup_registration(&token).is_some());
+            assert!(
+                rig.registry
+                    .bind_registration_lease(&token, "lease-2".into())
+                    .is_err(),
+                "a bearer binds to one lease only"
             );
-            let req = format_sign_request(prefix, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("401"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("invalid_bearer"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
         }
 
         #[test]
-        fn http_wrong_auth_scheme() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://example.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                false,
-            );
-            let req = format!(
-                "POST /sign HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                token,
-                body.len()
-            );
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("401"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("invalid_authorization_scheme"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+        fn revoke_by_lease_revokes_registration_bearers_only_for_that_lease() {
+            let rig = Rig::new();
+            let a = rig.bearer(Some("lease-a"));
+            let b = rig.bearer(Some("lease-b"));
+
+            assert_eq!(rig.registry.revoke_by_lease("lease-a"), 1);
+
+            assert!(rig.registry.lookup_registration(&a).is_none());
+            assert!(rig.registry.lookup_revoked_registration(&a).is_some());
+            assert!(rig.registry.lookup_registration(&b).is_some());
+            assert!(rig.registry.lookup_revoked_registration(&b).is_none());
         }
 
         #[test]
-        fn http_cross_origin_theft_attempt() {
-            let (shutdown, _dir, sock_path, _registry, token, _f, handle) = setup_bound(true);
-            let body = sign_request_body(
-                "https://attacker.com",
-                "example.com",
-                "dGVzdA",
-                vec![],
-                true,
+        fn revoke_by_lease_covers_sign_and_registration_bearers_of_one_token() {
+            let rig = Rig::new();
+            let token = rig.bearer(Some("lease-x"));
+            let f = sign_handler_tests::TestFixture::new(true);
+            // One bearer, one session: the sign context must share the registration's session.
+            let mut ctx = f.make_ctx();
+            assert!(
+                rig.registry
+                    .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                    .is_err(),
+                "a second session for one bearer is refused"
             );
-            let req = format_sign_request(&token, &body);
-            let resp = http_request(&sock_path, &req, &body);
-            assert!(resp.contains("403"));
-            let body_str = http_body(&resp);
-            assert!(body_str.contains("forbidden"));
-            shutdown.store(true, Ordering::Release);
-            handle.join().unwrap();
+            ctx.session = rig
+                .registry
+                .lookup_registration(&token)
+                .unwrap()
+                .context
+                .session;
+            rig.registry
+                .register_pending(token.clone(), ctx.clone(), Arc::new(f.make_handler()))
+                .unwrap();
+            rig.registry.bind_lease(&token, "lease-x".into()).unwrap();
+
+            assert_eq!(rig.registry.revoke_by_lease("lease-x"), 2);
+            assert!(ctx.session.is_revoked());
+            assert!(rig.registry.lookup_bound(&token).is_none());
+            assert!(rig.registry.lookup_registration(&token).is_none());
+        }
+
+        #[test]
+        fn registration_after_lease_revocation_is_refused_and_audited() {
+            let rig = Rig::new();
+            let server = TestServer::start(rig.registry.clone());
+            let token = rig.bearer(Some("lease-1"));
+            let mut client = server.connect();
+            client.hello(&token);
+
+            // While the lease is alive, registration works.
+            client.request(1, "create", &create_body(b"challenge1"));
+            let ok = client.result();
+            assert_eq!(ok["ok"], true, "{ok:?}");
+            assert_eq!(rig.credential_count(), 1);
+            assert!(rig.policy_denies().is_empty());
+
+            // The browser exits / the lease is revoked: the old bearer no longer registers.
+            rig.registry.revoke_by_lease("lease-1");
+            client.request(2, "create", &create_body(b"challenge2"));
+            let refused = client.result();
+            assert_eq!(refused["error"]["code"], "unauthorized", "{refused:?}");
+            assert_eq!(rig.credential_count(), 1, "no credential may be created");
+
+            let denies = rig.policy_denies();
+            assert_eq!(denies.len(), 1, "{denies:?}");
+            assert_eq!(denies[0]["action"], "register");
+            assert_eq!(denies[0]["reason"], "bearer_revoked");
+            assert_eq!(denies[0]["profile_id"], "test-profile");
+            assert_eq!(denies[0]["rp_id"], "example.com");
+        }
+
+        #[test]
+        fn request_in_flight_when_the_lease_is_revoked_creates_no_credential() {
+            let rig = Rig::new();
+            let token = rig.bearer(Some("lease-inflight"));
+            // The request has passed authentication (the entry is in hand) ...
+            let entry = rig.registry.lookup_registration(&token).unwrap();
+            // ... when the browser exits.
+            rig.registry.revoke_by_lease("lease-inflight");
+
+            let req: RegisterCredentialRequest =
+                serde_json::from_slice(&rig.registration_body("Y2hhbGxlbmdl")).unwrap();
+            let err = entry.handler.register(&entry.context, &req).unwrap_err();
+
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert_eq!(rig.credential_count(), 0);
+            let denies = rig.policy_denies();
+            assert_eq!(denies.len(), 1, "{denies:?}");
+            assert_eq!(denies[0]["reason"], "bearer_revoked");
+        }
+
+        #[test]
+        fn unknown_registration_bearer_is_refused_without_audit() {
+            let rig = Rig::new();
+            let server = TestServer::start(rig.registry.clone());
+            let token = generate_bearer_token().unwrap();
+            let mut client = server.connect();
+            let refused = client.hello_with(&token, true);
+            assert_eq!(refused["code"], "unauthorized", "{refused:?}");
+            assert!(client.closed());
+            assert!(rig.policy_denies().is_empty());
+        }
+
+        #[test]
+        fn refusals_of_a_revoked_bearer_are_coalesced_into_a_bounded_number_of_records() {
+            let rig = Rig::new();
+            let server = TestServer::start(rig.registry.clone());
+            let token = rig.bearer(Some("lease-flood"));
+            let mut client = server.connect();
+            client.hello(&token);
+            rig.registry.revoke_by_lease("lease-flood");
+
+            let full = crate::agent::refusal_ledger::FULL_RECORDS_PER_WINDOW as usize;
+            let attempts = full + 4;
+            for i in 0..attempts {
+                client.request(
+                    i as u32 + 1,
+                    "create",
+                    &create_body(format!("challenge{i}").as_bytes()),
+                );
+                let refused = client.result();
+                assert_eq!(refused["error"]["code"], "unauthorized", "{refused:?}");
+            }
+            // The rest are counted and written as one summary when the session ends.
+            assert_eq!(rig.policy_denies().len(), full);
+            assert_eq!(rig.credential_count(), 0);
+        }
+
+        #[test]
+        fn revoked_registration_memory_is_bounded() {
+            let rig = Rig::new();
+            let mut first = None;
+            for i in 0..(MAX_REVOKED_REGISTRATIONS + 8) {
+                let token = rig.bearer(Some(&format!("lease-{i}")));
+                rig.registry.revoke_registration(&token);
+                first.get_or_insert(token);
+            }
+            let remembered = rig.registry.revoked_registrations.lock().unwrap();
+            assert_eq!(remembered.entries.len(), MAX_REVOKED_REGISTRATIONS);
+            let first = first.unwrap();
+            assert!(!remembered.entries.contains_key(&first));
+            drop(remembered);
+            // The evicted bearer is gone from the live map as well, so it is still refused (as unknown).
+            assert!(rig.registry.lookup_registration(&first).is_none());
         }
     }
 }
