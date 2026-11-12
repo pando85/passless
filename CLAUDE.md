@@ -28,7 +28,7 @@ make release
 ```
 
 **Shell Completions:**
-Shell completions for bash, zsh, fish, and elvish are automatically generated during build time via `build.rs`. The completions are placed in `target/*/build/passless-rs-*/out/completions/` and are installed by the PKGBUILD to the appropriate system directories:
+Shell completions for bash, zsh, fish, and elvish are automatically generated during build time via `build.rs`. The completions are placed in `target/*/build/passless-rs/<hash>/out/completions/` (`passless-rs-<hash>` instead of `passless-rs/<hash>` before Cargo 1.100) and are installed by the PKGBUILD to the appropriate system directories:
 - Bash: `/usr/share/bash-completion/completions/passless`
 - Zsh: `/usr/share/zsh/site-functions/_passless`
 - Fish: `/usr/share/fish/vendor_completions.d/passless.fish`
