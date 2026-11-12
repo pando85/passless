@@ -63,6 +63,9 @@ function assertPrivateBus() {
   if (process.env[PRIVATE_BUS_MARKER] !== '1' || !addr) {
     throw new Error('refusing to run: no private D-Bus session bus (use tests/agent-e2e/run.sh, which wraps dbus-run-session)');
   }
+  if (addr.includes('/run/user/') || addr.includes('nonexistent')) {
+    throw new Error(`refusing to run: DBUS_SESSION_BUS_ADDRESS is a per-user or placeholder bus, not run.sh's private bus (${addr})`);
+  }
   const real = process.env.AGENT_E2E_REAL_BUS;
   if (real && (addr === real || addr.includes(real) || real.includes(addr))) {
     throw new Error(`refusing to run: DBUS_SESSION_BUS_ADDRESS is the real session bus (${addr})`);
@@ -124,7 +127,7 @@ function installExitHandlers() {
 }
 
 const ENV_PASSTHROUGH = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS',
-  PRIVATE_BUS_MARKER, 'AGENT_E2E_REAL_BUS', 'CARGO_TARGET_DIR'];
+  PRIVATE_BUS_MARKER, 'AGENT_E2E_REAL_BUS', 'CARGO_TARGET_DIR', 'AGENT_E2E_NPX_MODULES'];
 
 /**
  * Create a hermetic environment. Returns an object with the temp `root`, the child env (`env`),

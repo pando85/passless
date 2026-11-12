@@ -72,6 +72,10 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
             profile: run_profile,
             command,
         } => dispatch_run(output, run_profile, command),
+        AgentCommand::McpSessionBroker {
+            profile: broker_profile,
+            url,
+        } => super::mcp_session::serve_broker(broker_profile, url.as_deref()),
         AgentCommand::Browser {
             json,
             env,
@@ -116,6 +120,7 @@ pub fn dispatch(profile: Option<&str>, output: OutputFormat, action: &AgentComma
                 } => dispatch_browser_control(output, profile, request, request_file, *timeout_ms),
                 AgentCommand::PlaywrightMcp { .. }
                 | AgentCommand::Run { .. }
+                | AgentCommand::McpSessionBroker { .. }
                 | AgentCommand::Browser { .. }
                 | AgentCommand::Mcp { .. } => unreachable!(),
             }

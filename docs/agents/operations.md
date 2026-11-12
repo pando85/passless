@@ -137,7 +137,9 @@ Disabling agent support does not delete your credentials.
 - **Audit discontinuity**: stop relying on the trail, preserve the files, find the gap and repair the
   audit storage before more agent use.
 - **Daemon restart**: sessions, budgets and browser bindings are in memory. Re-run the pre-flight and
-  start fresh sessions. The granted-rules store persists.
+  start fresh sessions. The granted-rules store persists. A running `passless agent mcp playwright`
+  starts its new session by itself on its next browser tool call
+  ([Browser tools](browser-tools.md#playwright-mcp)).
 - **Orphan credential** after a registration the page reported as failed (unfocused tab): find it in the
   audit and delete it with `passless agent-admin credential delete <ref> --confirm`.
 

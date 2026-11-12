@@ -63,6 +63,10 @@ first time instead; see [Rules](rules.md). `browser_cdp_expose = "port"` is what
 uses: it makes the managed browser's debugging port reachable on loopback, which is full control of
 that browser for any local process that finds it (see [Containment](containment.md#cdp-port-mode)).
 
+The profile leaves `browser_cdp_port` unset on purpose: the browser picks a free port and the MCP
+wrappers and `agent browser --env` find it, so it cannot collide with another browser you run with
+`--remote-debugging-port`. `agent mcp install` and `doctor --agents` note a pinned port.
+
 ## 2. Restart the daemon, then check the host
 
 The daemon reads the config only at start, so a changed config needs a restart:
@@ -96,6 +100,19 @@ Paste the printed entry into the client's MCP configuration (for Claude Code, `.
 command also prints a `claude mcp add-json` one-liner). Other clients: `opencode`, `cursor`,
 `vscode`. The entry runs `passless agent mcp playwright --profile coding`, which starts a
 Passless-managed Chromium on the first browser tool call and points Playwright MCP at it.
+
+Already have a plain Playwright MCP in your opencode or Claude Code config? Switch it with one
+command instead of pasting: preview the change first (the default is a dry run that prints a diff),
+then write it. `--skill` also refreshes the bundled agent skill.
+
+```bash
+passless agent mcp install --client claude-code --project . --profile coding            # dry run
+passless agent mcp install --client claude-code --project . --profile coding --yes      # write
+passless agent mcp install --client opencode --user --profile coding --yes --skill
+```
+
+It keeps each entry's name, version pin and other keys, and saves `<file>.passless-backup-<UTC
+timestamp>` first. See [Browser tools](browser-tools.md#switching-from-a-plain-playwright-mcp).
 
 The entry's `command` is the absolute path of the `passless` you ran (for a `cargo install`,
 `~/.cargo/bin/passless`), so the client needs nothing on its `PATH`. If you move or reinstall the

@@ -45,14 +45,15 @@ struct BrowserOutput<'a> {
 }
 
 /// `http://127.0.0.1:<port>` from the browser's `ws://127.0.0.1:<port>/devtools/browser/<id>`.
-/// `None` unless it is a loopback websocket URL.
+/// `None` unless it is a `ws://127.0.0.1` URL: the only endpoint the daemon hands out, once it
+/// verified that the listener is the managed browser's (an `[::1]` one never is).
 pub fn http_endpoint(ws_endpoint: &str) -> Option<String> {
     let url = url::Url::parse(ws_endpoint).ok()?;
     if url.scheme() != "ws" {
         return None;
     }
     let host = url.host_str()?;
-    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+    if host != "127.0.0.1" {
         return None;
     }
     Some(format!("http://{host}:{}", url.port()?))
@@ -475,7 +476,7 @@ pub fn render_client_config(
 /// name `passless` (found through the client's `PATH`) when the path is unknown, no longer exists
 /// (a replaced binary reads as `... (deleted)`), is not valid UTF-8 or holds a quote that would
 /// break the shell one-liner printed next to it.
-fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
+pub(super) fn mcp_entry_command(current_exe: std::io::Result<PathBuf>) -> String {
     current_exe
         .and_then(std::fs::canonicalize)
         .ok()
@@ -519,6 +520,26 @@ pub fn dispatch_mcp(
     if let Some(target) = print {
         return print_config(profile, target, server);
     }
+    if let Some(McpAdapter::Install {
+        client,
+        project,
+        yes,
+        skill,
+        passless_path,
+        ..
+    }) = adapter
+    {
+        return super::agent_mcp_install::run(
+            profile,
+            &super::agent_mcp_install::InstallRequest {
+                client: *client,
+                project: project.as_deref(),
+                yes: *yes,
+                skill: *skill,
+                passless_path: passless_path.as_deref(),
+            },
+        );
+    }
     let Some(adapter) = adapter else {
         return Err(Error::Other(
             "choose an adapter (`agent mcp playwright` or `agent mcp chrome-devtools`) or pass \
@@ -540,12 +561,23 @@ pub fn dispatch_mcp(
             url,
             extra,
         } => (McpAdapterKind::ChromeDevtools, package, npx, url, extra),
+        McpAdapter::Install { .. } => unreachable!("handled above"),
     };
     let adapter_name = entry_parts(profile, kind).1[2].clone();
     if !in_principal_session(profile)? {
         // Resolve npx here: the principal session runs with the daemon's environment, whose PATH
         // need not have it.
         let npx = resolve_npx(npx.as_deref())?;
+        if kind == McpAdapterKind::Playwright {
+            // This process keeps the MCP stdio and runs the server; a principal session of its
+            // own (re-established after a daemon restart) answers the discovery requests.
+            let package = package.as_deref().unwrap_or(PLAYWRIGHT_PACKAGE);
+            let command = npx_command(&npx, package, extra);
+            if let Some(()) = super::mcp_session::run_playwright(profile, url.as_deref(), &command)?
+            {
+                return Ok(());
+            }
+        }
         let mut args = vec![
             "agent".to_string(),
             "mcp".to_string(),
@@ -667,6 +699,21 @@ pub(super) fn spawn_without_capability(command: &mut Command) {
     }
 }
 
+/// Tie the child's life to this process's, outside a principal session: there is no capability
+/// descriptor to close (descriptor 3 is whatever this process opened, possibly the pipe through
+/// which `spawn` learns that `exec` failed).
+pub(super) fn spawn_bound_to_wrapper(command: &mut Command) {
+    // SAFETY: the closure only calls async-signal-safe `prctl`.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +751,8 @@ mod tests {
             "wss://127.0.0.1:9222/devtools/browser/abc",
             "http://127.0.0.1:9222",
             "ws://127.0.0.1/devtools/browser/abc",
+            "ws://[::1]:9333/devtools/browser/abc",
+            "ws://localhost:9333/devtools/browser/abc",
             "not a url",
         ] {
             assert_eq!(http_endpoint(bad), None, "{bad}");

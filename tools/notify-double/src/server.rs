@@ -9,8 +9,8 @@ use zbus::message::Header;
 use zbus::{Connection, Variant, interface};
 
 use crate::{
-    Event, LogWriter, OBJECT_PATH, REASON_CLOSED_BY_CALL, REASON_DISMISSED, Script, StepAction,
-    WELL_KNOWN_NAME, value_to_json,
+    Emulation, Event, LogWriter, NOTIFY_OSD_SERVER_INFORMATION, OBJECT_PATH, REASON_CLOSED_BY_CALL,
+    REASON_DISMISSED, Script, StepAction, WELL_KNOWN_NAME, resolve_action_key, value_to_json,
 };
 
 /// Delayed steps wait at least this long so signals follow the `Notify` reply.
@@ -20,6 +20,7 @@ pub struct Config {
     pub script: Script,
     pub capabilities: Vec<String>,
     pub server_name: String,
+    pub emulation: Emulation,
 }
 
 #[derive(Default)]
@@ -27,7 +28,10 @@ struct State {
     next_id: u32,
     known: HashSet<u32>,
     new_count: usize,
-    pending: HashSet<u32>,
+    /// Scripted steps not yet run, by notification serial (ids are not unique under
+    /// [`Emulation::NotifyOsd`]), with the id each was shown under.
+    pending: HashMap<u64, u32>,
+    next_serial: u64,
 }
 
 struct Shared {
@@ -102,15 +106,22 @@ async fn emit_closed(
 async fn run_step(
     shared: Arc<Shared>,
     conn: Connection,
+    serial: u64,
     id: u32,
     action: StepAction,
     delay_ms: u64,
 ) {
     sleep(Duration::from_millis(delay_ms.max(MIN_SIGNAL_DELAY_MS))).await;
     // Claim the step; CloseNotification removes it first when it wins the race.
-    if !shared.state().pending.remove(&id) {
+    if shared.state().pending.remove(&serial).is_none() {
         return;
     }
+    // notify-osd's fallback dialog reports its close with reason 3 (observed: `ActionInvoked(0,
+    // key)` then `NotificationClosed(0, 3)`).
+    let close_reason = match shared.config.emulation {
+        Emulation::Spec => REASON_DISMISSED,
+        Emulation::NotifyOsd => REASON_CLOSED_BY_CALL,
+    };
     match action {
         StepAction::Ignore => {}
         StepAction::Invoke(key) => {
@@ -125,10 +136,10 @@ async fn run_step(
                     return;
                 }
             }
-            emit_closed(&shared, &conn, id, REASON_DISMISSED, "script").await;
+            emit_closed(&shared, &conn, id, close_reason, "script").await;
         }
         StepAction::Close => {
-            emit_closed(&shared, &conn, id, REASON_DISMISSED, "script").await;
+            emit_closed(&shared, &conn, id, close_reason, "script").await;
         }
     }
 }
@@ -157,10 +168,17 @@ impl NotificationDouble {
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
         let shared = &self.shared;
-        let (id, step) = {
+        // notify-osd shows a notification with actions as a fallback dialog and returns id 0 for
+        // every one of them.
+        let dialog = shared.config.emulation == Emulation::NotifyOsd && !actions.is_empty();
+        let (serial, id, step) = {
             let mut st = shared.state();
-            let is_new = replaces_id == 0 || !st.known.contains(&replaces_id);
-            let id = if replaces_id == 0 {
+            let serial = st.next_serial;
+            st.next_serial += 1;
+            let is_new = dialog || replaces_id == 0 || !st.known.contains(&replaces_id);
+            let id = if dialog {
+                0
+            } else if replaces_id == 0 {
                 let id = st.next_id;
                 st.next_id += 1;
                 id
@@ -180,9 +198,9 @@ impl NotificationDouble {
                 .as_ref()
                 .is_some_and(|s| s.action != StepAction::Ignore)
             {
-                st.pending.insert(id);
+                st.pending.insert(serial, id);
             }
-            (id, step)
+            (serial, id, step)
         };
 
         let hints_json = hints
@@ -196,7 +214,7 @@ impl NotificationDouble {
             app_icon: app_icon.to_string(),
             summary: summary.to_string(),
             body: body.to_string(),
-            actions,
+            actions: actions.clone(),
             hints: serde_json::Value::Object(hints_json),
             expire_timeout,
             id,
@@ -208,11 +226,16 @@ impl NotificationDouble {
         if let Some(step) = step
             && step.action != StepAction::Ignore
         {
+            let action = match step.action {
+                StepAction::Invoke(key) => StepAction::Invoke(resolve_action_key(&key, &actions)),
+                other => other,
+            };
             tokio::spawn(run_step(
                 Arc::clone(shared),
                 conn.clone(),
+                serial,
                 id,
-                step.action.clone(),
+                action,
                 step.delay_ms,
             ));
         }
@@ -230,7 +253,18 @@ impl NotificationDouble {
             sender: sender_of(&header),
             id,
         });
-        if shared.state().pending.remove(&id) {
+        // notify-osd cannot close its fallback dialogs: the dialog stays, and a later click still
+        // emits its action (the worst case a client must tolerate).
+        if shared.config.emulation == Emulation::NotifyOsd {
+            return Ok(());
+        }
+        let cancelled = {
+            let mut st = shared.state();
+            let before = st.pending.len();
+            st.pending.retain(|_, pending_id| *pending_id != id);
+            st.pending.len() != before
+        };
+        if cancelled {
             shared.log(&Event::Cancelled {
                 id,
                 reason: "CloseNotification",
@@ -247,11 +281,22 @@ impl NotificationDouble {
         self.shared.log(&Event::GetServerInformation {
             sender: sender_of(&header),
         });
-        (
-            self.shared.config.server_name.clone(),
-            "passless".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-            "1.2".to_string(),
-        )
+        match self.shared.config.emulation {
+            Emulation::Spec => (
+                self.shared.config.server_name.clone(),
+                "passless".to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+                "1.2".to_string(),
+            ),
+            Emulation::NotifyOsd => {
+                let (name, vendor, version, spec) = NOTIFY_OSD_SERVER_INFORMATION;
+                (
+                    name.to_string(),
+                    vendor.to_string(),
+                    version.to_string(),
+                    spec.to_string(),
+                )
+            }
+        }
     }
 }

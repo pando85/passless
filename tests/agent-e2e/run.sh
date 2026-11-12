@@ -43,6 +43,12 @@ if [[ -z "${AGENT_E2E_INNER:-}" ]]; then
   [[ -r /dev/uhid && -w /dev/uhid ]] || { echo "/dev/uhid is not accessible (modprobe uhid; join the fido group, see README.md)" >&2; exit 2; }
   node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' || { echo "Node 20+ required" >&2; exit 2; }
 
+  # Nothing in the outer phase (builds, downloads, the guard) may use the session bus this run was started
+  # with. Keep its address only so the harness can refuse it, then point everything at a dead bus until
+  # the private one exists.
+  REAL_BUS="${DBUS_SESSION_BUS_ADDRESS:-}"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent/passless-agent-e2e-outer-bus"
+
   CACHE="$REPO/target/agent-e2e-cache"
   mkdir -p "$CACHE" "$REPO/target"
   export npm_config_cache="$CACHE/npm"
@@ -108,7 +114,7 @@ CONF
   while IFS= read -r name; do fwd+=("$name=${!name}"); done < <(compgen -e | grep -E '^(AGENT_E2E_|npm_config_cache$)' || true)
   clean_env=(env -i "PATH=$PATH" "LANG=${LANG:-C.UTF-8}" "HOME=$RUN_ROOT/home" "XDG_CONFIG_HOME=$RUN_ROOT/config"
     "XDG_STATE_HOME=$RUN_ROOT/state" "XDG_DATA_HOME=$RUN_ROOT/data" "XDG_DATA_DIRS=$RUN_ROOT/data" "XDG_CACHE_HOME=$RUN_ROOT/cache"
-    "XDG_RUNTIME_DIR=$RUN_ROOT/run" "AGENT_E2E_REAL_BUS=${DBUS_SESSION_BUS_ADDRESS:-}" "${fwd[@]}")
+    "XDG_RUNTIME_DIR=$RUN_ROOT/run" "AGENT_E2E_REAL_BUS=$REAL_BUS" "${fwd[@]}")
 
   # The overall limit is a bash-native watchdog (lib/limit.sh): no `timeout` process for a stray `pkill -x timeout` to
   # hit, and no renamed coreutils binary (uutils refuses to run under a name that is not a utility name). It covers the
@@ -126,5 +132,11 @@ CONF
 fi
 
 # ---- inner phase: private bus, scrubbed env (and Xvfb when headed) ----
+# Defensive: never run a scenario on the session bus the run was started with, a per-user bus socket or no bus.
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" || "$DBUS_SESSION_BUS_ADDRESS" == "${AGENT_E2E_REAL_BUS:-__none__}" \
+  || "$DBUS_SESSION_BUS_ADDRESS" == */run/user/* || "$DBUS_SESSION_BUS_ADDRESS" == *nonexistent* ]]; then
+  echo "refusing to run: DBUS_SESSION_BUS_ADDRESS is not a private bus (${DBUS_SESSION_BUS_ADDRESS:-unset})" >&2
+  exit 2
+fi
 node lib/preflight.js || exit 1
 exec node --test --test-concurrency=1 --test-reporter=spec scenarios/*.test.js smoke/*.test.js

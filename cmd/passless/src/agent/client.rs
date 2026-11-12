@@ -353,12 +353,60 @@ pub struct AdminClient {
     seq: u64,
 }
 
+/// One daemon process: its pid and its start time (clock ticks since boot), which together tell a
+/// restarted daemon from the one before it even if the pid were reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonInstance {
+    pub pid: i32,
+    pub start_time: u64,
+}
+
 impl AdminClient {
     pub fn connect(base: &Path) -> Result<Self, ClientError> {
         let sock = admin_socket_path(base);
         validate_socket_path_safe(&sock, ADMIN_SOCK_MODE)?;
         let fd = connect_seqpacket(&sock)?;
         Ok(Self { fd, seq: 0 })
+    }
+
+    /// The daemon instance at the other end of this connection, from the kernel's `SO_PEERCRED`
+    /// (taken when the daemon created its listening socket) and `/proc/<pid>/stat`. `None` when
+    /// the kernel does not say.
+    pub fn daemon_instance(&self) -> Option<DaemonInstance> {
+        let cred = passless_core::agent::PeerCred::from_fd(self.fd.as_raw_fd()).ok()?;
+        if cred.pid <= 0 {
+            return None;
+        }
+        let start_time = launcher::read_proc_start_time(cred.pid, Path::new("/proc")).ok()?;
+        Some(DaemonInstance {
+            pid: cred.pid,
+            start_time,
+        })
+    }
+
+    /// Bound every send and receive on this connection: a daemon that accepted the connection but
+    /// never answers (one that is shutting down) fails the request with an I/O timeout.
+    pub fn set_timeout(&self, timeout: std::time::Duration) -> Result<(), ClientError> {
+        let tv = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: `tv` is a valid timeval and the length matches it.
+            let ret = unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    &tv as *const libc::timeval as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if ret < 0 {
+                return Err(ClientError::Io(io::Error::last_os_error()));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]

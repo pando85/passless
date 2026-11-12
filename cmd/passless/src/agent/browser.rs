@@ -517,7 +517,23 @@ pub enum LaunchError {
     /// The browser's user could open a hidraw device and no private `/dev` is available (ADR 0014
     /// section 7, invariant 25). The message says how to fix it.
     ContainmentRefused(String),
+    /// The profile's fixed `browser_cdp_port` is already held on `127.0.0.1` (by `holder`), so
+    /// whatever answered there would not be the managed browser. Nothing was started.
+    CdpPortInUse {
+        port: u16,
+        holder: String,
+    },
+    /// The CDP listener on `127.0.0.1:<port>` could not be proven to belong to the launched
+    /// browser; the browser was stopped and no endpoint was handed out.
+    CdpEndpointNotOwned {
+        port: u16,
+        reason: String,
+    },
 }
+
+/// The fix for a fixed `browser_cdp_port` that someone else holds.
+const CDP_PORT_FIX: &str = "remove browser_cdp_port from the profile to use an ephemeral port \
+                            (recommended), or choose a free one";
 
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -543,11 +559,13 @@ impl fmt::Display for LaunchError {
                 write!(
                     f,
                     "timed out waiting for browser CDP endpoint: the browser never opened its \
-                     debugging port and was stopped. A browser that could not load the passless \
-                     agent extension is a likely cause (headed Chromium shows a blocking \"Error \
-                     Loading Extension\" dialog before it opens the port), or it failed to \
-                     start; check that the browser is Chromium 116 or later, that its display \
-                     is usable, and the daemon log"
+                     debugging port and was stopped. Likely causes: a browser that could not \
+                     load the passless agent extension (headed Chromium shows a blocking \"Error \
+                     Loading Extension\" dialog before it opens the port), a fixed \
+                     browser_cdp_port the browser could not bind (remove browser_cdp_port to use \
+                     an ephemeral port), or a browser that failed to start; check that the \
+                     browser is Chromium 116 or later, that its display is usable, and the \
+                     daemon log"
                 )
             }
             LaunchError::BrowserExitedBeforeCdp(status) => {
@@ -585,6 +603,18 @@ impl fmt::Display for LaunchError {
                 msg
             ),
             LaunchError::ContainmentRefused(msg) => f.write_str(msg),
+            LaunchError::CdpPortInUse { port, holder } => write!(
+                f,
+                "browser_cdp_port {port} on 127.0.0.1 is already in use ({holder}); the managed \
+                 browser was not started, because the endpoint on that port would not be its. \
+                 {CDP_PORT_FIX}"
+            ),
+            LaunchError::CdpEndpointNotOwned { port, reason } => write!(
+                f,
+                "the CDP endpoint on 127.0.0.1:{port} does not belong to the launched browser \
+                 ({reason}); the browser was stopped and no endpoint was handed out. If \
+                 browser_cdp_port is set, {CDP_PORT_FIX}"
+            ),
         }
     }
 }
@@ -1045,6 +1075,20 @@ impl BrowserProcessManager {
             .validate()
             .map_err(|e| LaunchError::HardeningFailed(e.to_string()))?;
 
+        // A fixed CDP port that something already holds is refused before anything is created:
+        // Chromium would not fail but listen on `[::1]` instead, and the holder would answer on
+        // `127.0.0.1`. A holder that appears after this probe is caught by the ownership check
+        // after the launch (`await_owned_cdp_endpoint`).
+        if config.cdp_expose == CdpExposeMode::Port && config.cdp_port > 0 && !skip_cdp_port_probe()
+        {
+            super::cdp_owner::ensure_port_free(config.cdp_port).map_err(|holder| {
+                LaunchError::CdpPortInUse {
+                    port: config.cdp_port,
+                    holder,
+                }
+            })?;
+        }
+
         let lease_id = BrowserLeaseId::new();
         let now = self.clock.now();
         let monotonic_secs = self.clock.monotonic_secs();
@@ -1192,8 +1236,17 @@ impl BrowserProcessManager {
 
         let (cdp_pipes, mut child, cdp_endpoint_url) = if is_port_mode {
             let mut child = spawn_browser_port_mode(config, &profile_dir, &containment)?;
+            // Never an endpoint the launched browser is not proven to own: a fixed port is
+            // verified through the socket tables alone (Chromium writes no `DevToolsActivePort`
+            // for it), an ephemeral one also against the browser's own `DevToolsActivePort`.
             let discovered = if config.cdp_port > 0 {
-                wait_for_cdp_port(&mut child, config.cdp_port, Duration::from_secs(30))
+                await_owned_cdp_endpoint(
+                    &mut child,
+                    config.cdp_port,
+                    config.target_uid,
+                    None,
+                    Duration::from_secs(30),
+                )
             } else {
                 discover_cdp_endpoint_with_child(
                     &mut child,
@@ -1201,6 +1254,15 @@ impl BrowserProcessManager {
                     config.target_uid,
                     Duration::from_secs(30),
                 )
+                .and_then(|(port, path)| {
+                    await_owned_cdp_endpoint(
+                        &mut child,
+                        port,
+                        config.target_uid,
+                        Some(&path),
+                        Duration::from_secs(10),
+                    )
+                })
             };
             let discovered = match discovered {
                 Ok(discovered) => discovered,
@@ -3320,13 +3382,14 @@ pub(crate) fn discover_cdp_endpoint(
 /// Waits for Chromium's `DevToolsActivePort` in the profile, read through the pinned profile
 /// handle: a regular file owned by the browser user, opened without following a symlink and read
 /// up to a bound, so a file planted there cannot make the daemon read anything else (review H1).
-/// Its content is never echoed into an error.
+/// Its content is never echoed into an error. Returns the port and the `/devtools/browser/<id>`
+/// path it names; the caller verifies that the listener there is the browser's.
 fn discover_cdp_endpoint_with_child(
     child: &mut Child,
     profile: &Dir,
     owner: u32,
     timeout: Duration,
-) -> Result<String, LaunchError> {
+) -> Result<(u16, String), LaunchError> {
     let deadline = Instant::now() + timeout;
     loop {
         ensure_browser_running(child)?;
@@ -3355,7 +3418,7 @@ fn discover_cdp_endpoint_with_child(
                 }
                 let url = format!("ws://127.0.0.1:{}{}", port_num, ws_path);
                 validate_loopback_ws_url(&url)?;
-                return Ok(url);
+                return Ok((port_num, ws_path.to_string()));
             }
         }
         if Instant::now() >= deadline {
@@ -3365,58 +3428,168 @@ fn discover_cdp_endpoint_with_child(
     }
 }
 
-fn wait_for_cdp_port(
+/// Debug and test builds only: lets the E2E suite skip the pre-launch probe of a fixed CDP port,
+/// so that the ownership check after the launch meets a real Chromium that fell back to `[::1]`.
+/// Release builds have no such hook.
+fn skip_cdp_port_probe() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PASSLESS_E2E_SKIP_CDP_PORT_PROBE").is_some() {
+        return true;
+    }
+    false
+}
+
+/// How long an unverifiable listener (one this daemon cannot attribute either way) is waited on
+/// before the launch is refused.
+const CDP_OWNERSHIP_GRACE: Duration = Duration::from_secs(5);
+
+/// Waits until the launched browser (the process tree rooted at `child`, running as
+/// `browser_uid`) listens on `127.0.0.1:<port>` and returns its `ws://` endpoint, or refuses as
+/// soon as anything else is found there (ADR 0014 section 4.3).
+///
+/// Proof of ownership, in layers:
+/// 1. Every listener a connection to `127.0.0.1:<port>` can reach must be held by the browser's
+///    process tree (`/proc/net/tcp{,6}` inode among its `/proc/<pid>/fd`; a different socket UID
+///    is foreign at once). A foreign listener, or the browser listening on `[::1]:<port>` only
+///    (Chromium's silent fallback when its `127.0.0.1` bind fails), refuses the launch at once.
+/// 2. `/json/version` on that listener must name `ws://127.0.0.1:<port>/devtools/browser/<id>`,
+///    and, when the browser reported its endpoint itself (`reported_path`, from its
+///    `DevToolsActivePort`), exactly that path: its random browser GUID.
+/// 3. After that request the same listener must still be the browser's: a listener cannot change
+///    hands while the browser holds it, so the endpoint stays the browser's for the lease.
+///
+/// A listener the daemon cannot attribute (part of the tree's descriptors unreadable) counts only
+/// when the browser's own report matches it (layer 2 with `reported_path`); a fixed port has no
+/// such report, so it is refused after [`CDP_OWNERSHIP_GRACE`].
+fn await_owned_cdp_endpoint(
     child: &mut Child,
     port: u16,
+    browser_uid: u32,
+    reported_path: Option<&str>,
     timeout: Duration,
 ) -> Result<String, LaunchError> {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use super::cdp_owner::{Ownership, ownership};
 
+    let not_owned = |reason: String| LaunchError::CdpEndpointNotOwned { port, reason };
     let deadline = Instant::now() + timeout;
-    let addr = format!("127.0.0.1:{}", port);
+    let mut unverifiable_since: Option<(Instant, String)> = None;
     loop {
         ensure_browser_running(child)?;
-        if let Ok(mut stream) =
-            TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
-        {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let request = format!(
-                "GET /json/version HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                addr
-            );
-            if stream.write_all(request.as_bytes()).is_ok() {
-                let mut response = String::new();
-                let mut buf = [0u8; 4096];
-                let read_deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            response.push_str(&String::from_utf8_lossy(&buf[..n]));
-                            if let Some(ws_url) = extract_web_socket_debugger_url(&response) {
-                                return Ok(ws_url);
-                            }
-                        }
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                        {
-                            if Instant::now() >= read_deadline {
-                                break;
-                            }
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
+        match ownership(child.id(), port, browser_uid) {
+            Ownership::NotListening => unverifiable_since = None,
+            Ownership::Ipv6Fallback => {
+                return Err(not_owned(
+                    "the browser could not bind 127.0.0.1 and fell back to [::1]: another \
+                     process holds the port"
+                        .into(),
+                ));
+            }
+            Ownership::Foreign(holder) => {
+                return Err(not_owned(format!("it is held by {holder}")));
+            }
+            Ownership::Owned(inodes) => {
+                if let Some(url) = fetch_ws_debugger_url(port) {
+                    check_served_endpoint(&url, port, reported_path).map_err(not_owned)?;
+                    return match ownership(child.id(), port, browser_uid) {
+                        Ownership::Owned(after) if after == inodes => Ok(url),
+                        other => Err(not_owned(format!(
+                            "the listener changed while it was queried ({other:?})"
+                        ))),
+                    };
+                }
+            }
+            Ownership::Unverifiable(why) => {
+                if let Some(path) = reported_path
+                    && let Some(url) = fetch_ws_debugger_url(port)
+                {
+                    check_served_endpoint(&url, port, Some(path)).map_err(not_owned)?;
+                    log::warn!(
+                        "CDP listener on 127.0.0.1:{port}: {why}; accepted because it serves the \
+                         browser GUID of the launched browser's DevToolsActivePort"
+                    );
+                    return Ok(url);
+                }
+                let since = unverifiable_since.get_or_insert_with(|| (Instant::now(), why.clone()));
+                since.1 = why;
+                if since.0.elapsed() >= CDP_OWNERSHIP_GRACE {
+                    return Err(not_owned(format!(
+                        "its owner cannot be verified: {}",
+                        since.1
+                    )));
                 }
             }
         }
         if Instant::now() >= deadline {
-            return Err(LaunchError::CdpDiscoveryTimeout);
+            return Err(match unverifiable_since {
+                Some((_, why)) => not_owned(format!("its owner cannot be verified: {why}")),
+                None => LaunchError::CdpDiscoveryTimeout,
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The served `webSocketDebuggerUrl` must be `ws://127.0.0.1:<port>/devtools/browser/<id>` (never
+/// another host or port, such as `[::1]`), and its path the one the browser reported, if any.
+fn check_served_endpoint(url: &str, port: u16, reported_path: Option<&str>) -> Result<(), String> {
+    let prefix = format!("ws://127.0.0.1:{port}");
+    let path = url
+        .strip_prefix(&prefix)
+        .filter(|path| {
+            path.strip_prefix("/devtools/browser/").is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        })
+        .ok_or_else(|| {
+            format!("it serves an endpoint that is not ws://127.0.0.1:{port}/devtools/browser/<id>")
+        })?;
+    match reported_path {
+        Some(reported) if reported != path => Err(
+            "it serves a browser GUID other than the one in the launched browser's \
+             DevToolsActivePort"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// `GET /json/version` on `127.0.0.1:<port>`: its `webSocketDebuggerUrl`, or `None` when nothing
+/// usable answered (yet). The response is bounded and parsed as JSON.
+fn fetch_ws_debugger_url(port: u16) -> Option<String> {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+
+    const LIMIT: usize = 64 * 1024;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
+    let request =
+        format!("GET /json/version HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    let _ = (&mut stream).take(LIMIT as u64).read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    // A complete body, if the length is declared (the read may have stopped at the timeout).
+    let body = match head.lines().find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) {
+        Some(len) => body.get(..len)?,
+        None => body,
+    };
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    json.get("webSocketDebuggerUrl")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 fn validate_loopback_ws_url(url: &str) -> Result<(), LaunchError> {
@@ -3464,18 +3637,6 @@ fn validate_loopback_ws_url(url: &str) -> Result<(), LaunchError> {
     }
 
     Ok(())
-}
-
-fn extract_web_socket_debugger_url(http_response: &str) -> Option<String> {
-    let key = "webSocketDebuggerUrl";
-    let key_pos = http_response.find(key)?;
-    let after_key = &http_response[key_pos + key.len()..];
-    let ws_start = after_key.find("ws://")?;
-    let value = &after_key[ws_start..];
-    let end = value.find('"').unwrap_or(value.len());
-    let url = &value[..end];
-    validate_loopback_ws_url(url).ok()?;
-    Some(url.to_string())
 }
 
 /// Keeps an intercepted port-mode lease's `cdp-endpoint` file in step with its interception: it
@@ -7522,15 +7683,324 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_for_cdp_port_detects_browser_exit() {
+    fn test_await_owned_cdp_endpoint_detects_browser_exit() {
         let mut child = Command::new("/bin/false").spawn().unwrap();
         let started = Instant::now();
-        let result = wait_for_cdp_port(&mut child, 0, Duration::from_secs(5));
+        let uid = unsafe { libc::geteuid() };
+        let result = await_owned_cdp_endpoint(&mut child, 1, uid, None, Duration::from_secs(5));
         assert!(matches!(
             result,
             Err(LaunchError::BrowserExitedBeforeCdp(_))
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A loopback listener that answers every request with a `/json/version` naming
+    /// `ws_url`. It accepts until the test ends.
+    fn serve_json_version(listener: std::net::TcpListener, ws_url: String) {
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({
+                    "Browser": "Chrome/156.0.0.0",
+                    "Protocol-Version": "1.3",
+                    "webSocketDebuggerUrl": ws_url,
+                })
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+    }
+
+    /// A stand-in "browser" that holds the listening socket `listener` (as its fd 3, the way a
+    /// browser holds its DevTools listener), while the test keeps serving on its own copy.
+    fn browser_holding(listener: &std::net::TcpListener) -> Child {
+        let fd = listener.as_raw_fd();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        unsafe {
+            cmd.pre_exec(move || {
+                // `dup2(3, 3)` is a no-op that leaves FD_CLOEXEC set, so a listener that is
+                // already fd 3 (a test run alone) would vanish at exec: clear the flag then.
+                let rc = if fd == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().unwrap()
+    }
+
+    fn stop(mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    const GUID_A: &str = "/devtools/browser/0b4d6ad2-5d1e-4f1a-9a0e-1f2a3b4c5d6e";
+    const GUID_B: &str = "/devtools/browser/c0ffee00-1111-2222-3333-444455556666";
+
+    /// The finding: another process holds the fixed port and answers `/json/version` with a
+    /// well-formed endpoint. The launched browser does not hold that listener, so the launch is
+    /// refused at once (not after the 30 s discovery timeout) and the endpoint never returned.
+    #[test]
+    fn test_a_foreign_listener_on_the_cdp_port_is_refused() {
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = foreign.local_addr().unwrap().port();
+        serve_json_version(foreign, format!("ws://127.0.0.1:{port}{GUID_A}"));
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let started = Instant::now();
+        let result = await_owned_cdp_endpoint(&mut child, port, uid, None, Duration::from_secs(30));
+        stop(child);
+        match result {
+            Err(LaunchError::CdpEndpointNotOwned { port: p, reason }) => {
+                assert_eq!(p, port);
+                assert!(
+                    reason.contains(&format!("pid {}", std::process::id())),
+                    "the holder is named: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        // The same with the browser's own report (the ephemeral path): its GUID being served
+        // does not make someone else's listener the browser's.
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = foreign.local_addr().unwrap().port();
+        serve_json_version(foreign, format!("ws://127.0.0.1:{port}{GUID_A}"));
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let result =
+            await_owned_cdp_endpoint(&mut child, port, uid, Some(GUID_A), Duration::from_secs(5));
+        stop(child);
+        assert!(
+            matches!(result, Err(LaunchError::CdpEndpointNotOwned { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// The pre-launch probe: a held fixed port refuses the launch before anything is created or
+    /// started, and names the holder.
+    #[test]
+    fn test_launch_with_a_held_fixed_cdp_port_is_refused_before_spawning() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.cdp_expose = CdpExposeMode::Port;
+        config.cdp_port = port;
+        let runtime_root = config.runtime_root.clone();
+        let mut mgr = BrowserProcessManager::with_spawner(test_clock(), Arc::new(TestSpawner));
+        let err = mgr.launch(&config, test_profile_id()).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            matches!(err, LaunchError::CdpPortInUse { port: p, .. } if p == port),
+            "{err:?}"
+        );
+        assert!(
+            text.contains(&format!(
+                "browser_cdp_port {port} on 127.0.0.1 is already in use"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("pid {}", std::process::id())),
+            "{text}"
+        );
+        assert!(text.contains("remove browser_cdp_port"), "{text}");
+        assert_eq!(
+            fs::read_dir(&runtime_root).unwrap().count(),
+            0,
+            "no lease directory was created"
+        );
+        assert_eq!(mgr.lease_count(), 0);
+    }
+
+    /// The listener is the browser's, but it serves a GUID other than the one the browser wrote
+    /// to `DevToolsActivePort`: refused.
+    #[test]
+    fn test_a_guid_mismatch_is_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut child = browser_holding(&listener);
+        serve_json_version(listener, format!("ws://127.0.0.1:{port}{GUID_B}"));
+        let uid = unsafe { libc::geteuid() };
+        let result =
+            await_owned_cdp_endpoint(&mut child, port, uid, Some(GUID_A), Duration::from_secs(5));
+        stop(child);
+        match result {
+            Err(LaunchError::CdpEndpointNotOwned { reason, .. }) => {
+                assert!(reason.contains("GUID"), "{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The served endpoint names another port (or host) than the one that was verified:
+    /// refused, whether or not the browser reported a path.
+    #[test]
+    fn test_a_served_endpoint_on_another_port_or_host_is_refused() {
+        let uid = unsafe { libc::geteuid() };
+        for (served, reported) in [
+            ("ws://127.0.0.1:{other}{GUID_A}", None),
+            ("ws://127.0.0.1:{other}{GUID_A}", Some(GUID_A)),
+            ("ws://[::1]:{port}{GUID_A}", None),
+            ("ws://localhost:{port}{GUID_A}", Some(GUID_A)),
+            ("ws://127.0.0.1:{port}/devtools/page/x", None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let served = served
+                .replace("{other}", &(port.wrapping_add(1)).to_string())
+                .replace("{port}", &port.to_string())
+                .replace("{GUID_A}", GUID_A);
+            let mut child = browser_holding(&listener);
+            serve_json_version(listener, served.clone());
+            let result =
+                await_owned_cdp_endpoint(&mut child, port, uid, reported, Duration::from_secs(5));
+            stop(child);
+            assert!(
+                matches!(result, Err(LaunchError::CdpEndpointNotOwned { .. })),
+                "{served}: {result:?}"
+            );
+        }
+    }
+
+    /// `DevToolsActivePort` names a port whose listener is not the browser's (here: someone
+    /// else's, serving the browser's GUID as a relay would): refused.
+    #[test]
+    fn test_a_devtools_active_port_naming_a_foreign_port_is_refused() {
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let foreign_port = foreign.local_addr().unwrap().port();
+        serve_json_version(foreign, format!("ws://127.0.0.1:{foreign_port}{GUID_A}"));
+        let own = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut child = browser_holding(&own);
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("DevToolsActivePort"),
+            format!("{foreign_port}\n{GUID_A}\n"),
+        )
+        .unwrap();
+        let profile = Dir::open_path(dir.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let (port, path) =
+            discover_cdp_endpoint_with_child(&mut child, &profile, uid, Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(port, foreign_port);
+        let result =
+            await_owned_cdp_endpoint(&mut child, port, uid, Some(&path), Duration::from_secs(5));
+        stop(child);
+        drop(own);
+        assert!(
+            matches!(result, Err(LaunchError::CdpEndpointNotOwned { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// Happy path, fixed port: the browser holds the listener and serves its endpoint.
+    #[test]
+    fn test_the_browser_own_fixed_port_endpoint_is_accepted() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut child = browser_holding(&listener);
+        let url = format!("ws://127.0.0.1:{port}{GUID_A}");
+        serve_json_version(listener, url.clone());
+        let uid = unsafe { libc::geteuid() };
+        let result = await_owned_cdp_endpoint(&mut child, port, uid, None, Duration::from_secs(5));
+        stop(child);
+        assert_eq!(result.unwrap(), url);
+    }
+
+    /// Happy path, ephemeral port: `DevToolsActivePort` names the browser's own listener and the
+    /// GUID it serves.
+    #[test]
+    fn test_the_browser_own_ephemeral_endpoint_is_accepted() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut child = browser_holding(&listener);
+        let url = format!("ws://127.0.0.1:{port}{GUID_A}");
+        serve_json_version(listener, url.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("DevToolsActivePort"),
+            format!("{port}\n{GUID_A}\n"),
+        )
+        .unwrap();
+        let profile = Dir::open_path(dir.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let result =
+            discover_cdp_endpoint_with_child(&mut child, &profile, uid, Duration::from_secs(2))
+                .and_then(|(p, path)| {
+                    await_owned_cdp_endpoint(
+                        &mut child,
+                        p,
+                        uid,
+                        Some(&path),
+                        Duration::from_secs(5),
+                    )
+                });
+        stop(child);
+        assert_eq!(result.unwrap(), url);
+    }
+
+    /// Chromium's silent fallback: its `127.0.0.1` bind failed and it listens on `[::1]` only.
+    /// Refused at once, before anything could take `127.0.0.1:<port>`.
+    #[test]
+    fn test_a_browser_that_fell_back_to_ipv6_loopback_is_refused() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("no IPv6 loopback; skipped");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            eprintln!("127.0.0.1:{port} is taken; skipped");
+            return;
+        }
+        let mut child = browser_holding(&listener);
+        let uid = unsafe { libc::geteuid() };
+        let started = Instant::now();
+        let result = await_owned_cdp_endpoint(&mut child, port, uid, None, Duration::from_secs(30));
+        stop(child);
+        match result {
+            Err(LaunchError::CdpEndpointNotOwned { reason, .. }) => {
+                assert!(reason.contains("[::1]"), "{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_the_cdp_port_errors_say_how_to_fix_it() {
+        for err in [
+            LaunchError::CdpPortInUse {
+                port: 9333,
+                holder: "firefox, pid 64598".into(),
+            },
+            LaunchError::CdpEndpointNotOwned {
+                port: 9333,
+                reason: "it is held by firefox, pid 64598".into(),
+            },
+        ] {
+            let text = err.to_string();
+            assert!(text.contains("firefox, pid 64598"), "{text}");
+            assert!(text.contains("remove browser_cdp_port"), "{text}");
+            assert!(!text.contains("extension"), "not the extension: {text}");
+        }
     }
 
     #[test]

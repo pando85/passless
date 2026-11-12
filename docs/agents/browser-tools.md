@@ -32,8 +32,21 @@ passless agent mcp --print-config claude-code     # or opencode, cursor, vscode
 ```
 
 The entry runs `passless agent mcp playwright --profile <name>`, which runs `npx --yes
-@playwright/mcp --cdp-endpoint <endpoint>` inside a principal session. The browser starts on the
-first discovery request from Playwright MCP, not when the server starts.
+@playwright/mcp --cdp-endpoint <endpoint>` as its own child and starts a principal session for the
+profile, which answers Playwright MCP's discovery requests. The browser starts on the first
+discovery request from Playwright MCP, not when the server starts.
+
+The server survives a daemon restart or upgrade: the process your MCP client started keeps the stdio
+connection and the Playwright MCP server. While the daemon is down, browser tool calls fail at once
+with `passless daemon unavailable, retrying ...`; the first browser tool call after it is back starts
+a new principal session, with the new daemon's policy and grants, and a new browser. The pages of the
+old browser are gone, as after any restart. The same happens when the session reaches the profile's
+`max_session_ttl`: the next browser tool call starts a new session and browser, once per expiry (a
+renewed session that expires before it is used is not renewed again: the TTL is too short). A
+session that the running daemon ends on purpose (`agent-admin principals revoke`, or its profile
+disabled or removed) is not renewed: the server exits and the client must restart it. This needs the
+session to run as your own Unix user; for a profile whose sessions run as another user the server runs
+inside the session, as that user, and exits with the daemon or when the session expires.
 
 - `--profile` may be left out when exactly one profile is configured.
 - Pass options through to Playwright MCP after `--`. For contexts that Playwright creates over CDP
@@ -54,6 +67,49 @@ so it needs Node and network. The managed browser is headless by default; for a 
 profile's `browser_command` to the browser's absolute path with no arguments
 ([Containment](containment.md#supported-browsers)).
 
+### Switching from a plain Playwright MCP
+
+A plain `npx @playwright/mcp` entry starts a browser of its own: passkeys in it reach your human
+authenticator, not the agent policy (`passless doctor --agents` warns about it). One command rewrites
+such entries, and chrome-devtools-mcp entries, to the wrapper; the agent keeps the same tools.
+
+```bash
+passless agent mcp install --client opencode --user --profile coding          # dry run: prints a diff
+passless agent mcp install --client opencode --user --profile coding --yes    # write, after a backup
+```
+
+- `--client opencode|claude-code`; `--user` (the default) or `--project <DIR>`. Files: opencode
+  `$XDG_CONFIG_HOME/opencode/opencode.json` (`~/.config/opencode/opencode.json`) or
+  `<DIR>/opencode.json`; Claude Code `$CLAUDE_CONFIG_DIR/.claude.json` (else `~/.claude.json`) or
+  `<DIR>/.mcp.json`.
+- Found: `@playwright/mcp` and `chrome-devtools-mcp` started with `npx`, `pnpm dlx`, `bunx`, `yarn dlx`
+  or a local `playwright-mcp` binary. Each is rewritten in place; its other keys (`env`,
+  `enabled`, `timeout`) stay, and so does the version pin (as `--package`).
+- `--profile` is needed unless exactly one profile uses `browser_cdp_expose = "port"`. The profile
+  must exist and use port mode: the adapters refuse pipe mode.
+- The wrapper runs `npx`, so `pnpm dlx`, `bunx` and `yarn dlx` entries become the same package through
+  `npx` (an absolute `npx` path is kept as `--npx`).
+- Flags that suit an attached browser pass through after `--` (`--isolated`, `--viewport-size`,
+  `--caps`, `--output-dir`, ...). Dropped, with a note each: `--browser`, `--executable-path`,
+  `--user-data-dir`, `--cdp-endpoint`, `--cdp-header`, `--extension`, `--endpoint`, `--device`,
+  `--mobile`, `--no-sandbox`, `--headless` and `--headed` (headed or headless comes from the Passless
+  profile). For chrome-devtools-mcp the launch flags (`--browserUrl`, `--executablePath`,
+  `--headless`, `--isolated`, ...) are dropped.
+- The entries run the first `passless` on `PATH` (so a dev build can install entries for the packaged
+  one), else the running executable; `--passless-path <ABS>` overrides. The command notes a differing
+  choice, warns about a path inside a cargo `target/` directory, and refuses a `passless` without
+  `agent mcp playwright`.
+- `--yes` backs up to `<file>.passless-backup-<UTC timestamp>`, then replaces the file atomically with
+  the same permissions. Running it again reports `already uses Passless`. Only the two values of each
+  entry change; the rest of the file stays byte for byte.
+- A file with comments or trailing commas (JSONC) is never rewritten: the command prints the entries
+  to paste instead and refuses `--yes`.
+- `--skill` installs or refreshes the bundled `passless-agent` skill for the client (a differing copy
+  is backed up first).
+
+Restart the client afterwards. `passless doctor --agents` should now report the entry as running
+through Passless.
+
 ## chrome-devtools-mcp
 
 ```bash
@@ -63,8 +119,10 @@ passless agent mcp --print-config claude-code --server chrome-devtools
 Runs `npx --yes chrome-devtools-mcp --browserUrl <endpoint>`. Unlike the Playwright adapter the
 browser starts when the server starts: puppeteer asks for `<browserUrl>/json/version` and cannot send
 the bootstrap's bearer header. The server exits when the browser's debugging port stops answering,
-and the MCP client restarts it. The same `--package`, `--npx` and `--url` options apply; extra
-arguments for `chrome-devtools-mcp` go after `--`.
+and the MCP client restarts it. Unlike the Playwright adapter it does not survive a daemon restart:
+it is bound to the browser's own endpoint, which a new daemon replaces. A client that does not restart
+MCP servers (opencode) needs a restart after the daemon's. The same `--package`, `--npx` and `--url`
+options apply; extra arguments for `chrome-devtools-mcp` go after `--`.
 
 ## Playwright library with connectOverCDP
 

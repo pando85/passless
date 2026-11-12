@@ -120,14 +120,20 @@ Debug-build daemon hooks (set through `daemonEnv`): `PASSLESS_E2E_HOLD_REQUEST_M
 ceremony (an abort or disconnect then lands before key use), `PASSLESS_E2E_HOLD_RESULT_MS` holds each successful
 result after key use, `PASSLESS_E2E_OMIT_AGENT_EXTENSION` drops the generated extension directory (E2E-47),
 `PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` writes a service worker that loads but never connects (E2E-47/unloadable; a manifest the browser refuses to load blocks headed Chromium on a modal dialog before it opens its debugging port) and
-`PASSLESS_E2E_DISABLE_BWRAP` makes the launcher treat bwrap as unavailable (E2E-46/refused).
+`PASSLESS_E2E_DISABLE_BWRAP` makes the launcher treat bwrap as unavailable (E2E-46/refused);
+`PASSLESS_E2E_SKIP_CDP_PORT_PROBE` skips the pre-launch probe of a fixed `browser_cdp_port`, so that E2E-56 meets the ownership
+check after the launch (profile key `cdpPort` sets the fixed port).
 
 ## Agent-browser easy path (P10b)
 
 E2E-34/35 (Playwright MCP, `--isolated`), 36 (chrome-devtools-mcp), 37 (`connectOverCDP(PASSLESS_CDP_URL)`) and 41 (refused
 browsers) run the real `passless agent mcp ...` / `agent browser` against the scenario's daemon (`lib/adapters.js`). `npx` is
 `bin/npx`, a stand-in that runs the copies `package.json` pins (`@playwright/mcp`, `chrome-devtools-mcp`), so no scenario needs
-the network. `agent browser` only works inside a principal session, so E2E-37 starts an agent as the product does
+the network. `AGENT_E2E_NPX_MODULES=<abs node_modules>` makes it run the copies installed there instead (another
+`@playwright/mcp` version: `npm install --prefix <dir> @playwright/mcp@<version>`). E2E-57 stops and restarts the scenario's
+daemon under a running `agent mcp playwright` (SIGTERM, then SIGINT for the graceful shutdown) and signs in again over the
+same MCP stdio session; `daemon.stop(signal)` takes the signal. E2E-57/ttl lets the wrapper's session expire (profile key
+`max_session_ttl`), signs in again (a renewed session and lease), then revokes it and checks that the wrapper exits. `agent browser` only works inside a principal session, so E2E-37 starts an agent as the product does
 (`passless agent run -- /bin/bash <script>`). E2E-41 writes no `browser_command` (`noBrowserCommand`) and sets `agents.browser_path`
 to stand-ins for branded Chrome and `chrome-headless-shell` (and to the real ones when installed).
 

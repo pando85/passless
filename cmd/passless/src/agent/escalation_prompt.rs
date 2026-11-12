@@ -9,21 +9,36 @@
 //!
 //! 1. connect to the bus;
 //! 2. resolve the unique name of `org.freedesktop.Notifications` (`GetNameOwner`);
-//! 3. capability gate: the server must advertise `actions` and must not be a known
-//!    single-action server;
+//! 3. capability gate ([`server_support`]): the server must advertise `actions`, or be notify-osd
+//!    1.0, which shows distinct buttons in a fallback dialog; known single-action servers are
+//!    rejected;
 //! 4. subscribe to `ActionInvoked`/`NotificationClosed` filtered on that unique sender, and to
 //!    `NameOwnerChanged` for the well-known name, all before `Notify`;
-//! 5. `Notify` with `expire_timeout = 0`, critical urgency and exactly the actions
-//!    `allow_always` ("Allow always") and `deny` ("Deny");
+//! 5. `Notify` with `expire_timeout = 0`, critical urgency and exactly two actions, labelled
+//!    "Allow always" and "Deny", whose keys are `allow_always:<nonce>` and `deny:<nonce>` with a
+//!    fresh 128-bit nonce per prompt (the labels never show it);
 //! 6. report `shown`, then exactly one of `decision`, `closed` or `server_lost` and exit. A
 //!    `{"withdraw":true}` line or EOF on stdin closes the notification (`CloseNotification`) and
 //!    exits. The child has no prompt timeout of its own: the daemon withdraws it.
+//!
+//! Attribution. Only `ActionInvoked` decides, and only when its sender is the server's unique name,
+//! its id is this prompt's id and its key is exactly one of this prompt's two keys. notify-osd
+//! returns id 0 for every fallback dialog, so the id alone cannot tell concurrent prompts (other
+//! RPs, other profiles) apart, nor a stale dialog of a withdrawn prompt from a live one; the
+//! per-prompt keys do. A click on a dialog whose child has exited (withdrawn, timed out, denied
+//! into cooldown, daemon restarted) matches no live prompt and grants nothing. With a shared id 0
+//! a `NotificationClosed` cannot be attributed either: it is ignored, and the prompt waits for its
+//! action or the daemon's withdrawal; `CloseNotification(0)` is not sent, so a withdrawn dialog may
+//! stay visible (inert).
 //!
 //! Protocol (JSON lines). Daemon to child: first
 //! `{"v":1,"summary":…,"body":…,"actions":[["allow_always","Allow always"],["deny","Deny"]],"min_review_delay_ms":…}`,
 //! later `{"withdraw":true}` or EOF. Child to daemon: `{"event":"shown","id":…,"server":…}`,
 //! `{"event":"decision","action":…}`, `{"event":"closed","reason":…}`, `{"event":"server_lost"}`,
 //! `{"event":"error","kind":…}`.
+//!
+//! The request and the `decision` event carry the bare keys `allow_always` and `deny`: the nonce
+//! never leaves the child.
 //!
 //! An "Allow always" that arrives before `min_review_delay_ms` has passed since `Notify` returned
 //! is reported as a `deny` decision. The daemon applies the same rule against its own clock.
@@ -42,6 +57,8 @@ use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
 use log::{debug, warn};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use zbus::message::Type as MessageType;
 use zbus::{Connection, MatchRule, Message, MessageStream};
@@ -68,6 +85,12 @@ const APP_NAME: &str = "Passless";
 const APP_ICON: &str = "security-high";
 const URGENCY_CRITICAL: u8 = 2;
 const MAX_QUEUED_SIGNALS: usize = 64;
+/// The id notify-osd returns for every fallback dialog. The specification never assigns 0, so a
+/// notification with this id is not addressable: its closes cannot be attributed and
+/// `CloseNotification` cannot target it.
+const SHARED_NOTIFICATION_ID: u32 = 0;
+/// Bytes of randomness in a prompt's action-key nonce.
+const NONCE_BYTES: usize = 16;
 
 /// The prompt the daemon asks the child to show.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,11 +190,98 @@ pub enum ChildEvent {
 
 /// Whether a notification server must be rejected because it is known to collapse distinct
 /// actions into one default action (the capability heuristic kept from the P0 prompt).
+///
+/// notify-osd is not on this list any more. It was listed because it lacks the `actions`
+/// capability, but on Ubuntu notify-osd 1.0 ("Canonical Ltd", spec 1.1) a `Notify` with the
+/// actions `allow_always`/"Allow always" and `deny`/"Deny", urgency 2 and timeout 0 showed a
+/// fallback dialog with both buttons, and clicking "Deny" emitted `ActionInvoked(0, "deny")` then
+/// `NotificationClosed(0, 3)` from notify-osd's unique name: the keys stay distinct. It is accepted
+/// by [`notify_osd_fallback_dialog`]. No such evidence exists for mako 0.0.0 and quickshell, so
+/// they stay rejected.
 pub fn server_rejected(name: &str, version: &str) -> bool {
     matches!(
         (name.to_lowercase().as_str(), version),
-        ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "")
+        ("mako", "0.0.0") | ("quickshell", "")
     )
+}
+
+/// Whether the server is the notify-osd whose fallback dialog was verified to deliver the distinct
+/// action keys (see [`server_rejected`]). Matched on name and exact version: another notify-osd
+/// version without `actions` is not assumed to behave the same.
+pub fn notify_osd_fallback_dialog(name: &str, version: &str) -> bool {
+    name.eq_ignore_ascii_case("notify-osd") && version == "1.0"
+}
+
+/// How a notification server can show an escalation prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSupport {
+    /// It advertises `actions`.
+    Actions,
+    /// notify-osd 1.0: no `actions` capability, but a fallback dialog with distinct buttons whose
+    /// `Notify` returns the shared id 0.
+    FallbackDialog,
+}
+
+/// The capability gate, shared by the prompt child and `passless doctor --agents`: whether the
+/// server named `name` `version` with `capabilities` can show an escalation prompt with two
+/// distinct actions. `Err` says why not.
+pub fn server_support(
+    name: &str,
+    version: &str,
+    capabilities: &[String],
+) -> Result<ServerSupport, &'static str> {
+    if server_rejected(name, version) {
+        return Err("the notification server collapses actions into one default action");
+    }
+    if capabilities
+        .iter()
+        .any(|capability| capability == "actions")
+    {
+        return Ok(ServerSupport::Actions);
+    }
+    if notify_osd_fallback_dialog(name, version) {
+        return Ok(ServerSupport::FallbackDialog);
+    }
+    Err("the notification server does not support actions")
+}
+
+/// This prompt's action keys: `<key>:<nonce>` for each allowed key.
+struct PromptKeys {
+    allow_always: String,
+    deny: String,
+}
+
+impl PromptKeys {
+    /// Fresh keys from the OS random source. `None` if it fails.
+    fn generate() -> Option<Self> {
+        let mut bytes = [0u8; NONCE_BYTES];
+        OsRng.try_fill_bytes(&mut bytes).ok()?;
+        let nonce: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        Some(Self {
+            allow_always: format!("{ACTION_ALLOW_ALWAYS}:{nonce}"),
+            deny: format!("{ACTION_DENY}:{nonce}"),
+        })
+    }
+
+    /// The key sent to the server for the bare request key `key`.
+    fn wire(&self, key: &str) -> Option<&str> {
+        match key {
+            ACTION_ALLOW_ALWAYS => Some(&self.allow_always),
+            ACTION_DENY => Some(&self.deny),
+            _ => None,
+        }
+    }
+
+    /// The bare action of a received key: only an exact match of this prompt's keys.
+    fn decode(&self, key: &str) -> Option<&'static str> {
+        if key == self.allow_always {
+            Some(ACTION_ALLOW_ALWAYS)
+        } else if key == self.deny {
+            Some(ACTION_DENY)
+        } else {
+            None
+        }
+    }
 }
 
 /// The verb of the prompt.
@@ -459,13 +569,6 @@ async fn capability_gate(conn: &Connection, owner: &str) -> Result<String, Child
         warn!("escalation prompt: GetCapabilities failed: {}", e);
         ChildErrorKind::NoServer
     })?;
-    if !capabilities
-        .iter()
-        .any(|capability| capability == "actions")
-    {
-        warn!("escalation prompt: the notification server does not support actions");
-        return Err(ChildErrorKind::CapabilityRejected);
-    }
     let (name, _vendor, version, _spec): (String, String, String, String) = call(
         conn,
         owner,
@@ -480,14 +583,23 @@ async fn capability_gate(conn: &Connection, owner: &str) -> Result<String, Child
         warn!("escalation prompt: GetServerInformation failed: {}", e);
         ChildErrorKind::NoServer
     })?;
-    if server_rejected(&name, &version) {
-        warn!(
-            "escalation prompt: rejecting notification server '{}' {} (single default action)",
-            name, version
-        );
-        return Err(ChildErrorKind::CapabilityRejected);
+    match server_support(&name, &version, &capabilities) {
+        Ok(ServerSupport::Actions) => Ok(name),
+        Ok(ServerSupport::FallbackDialog) => {
+            debug!(
+                "escalation prompt: '{}' {} has no actions capability; using its fallback dialog",
+                name, version
+            );
+            Ok(name)
+        }
+        Err(why) => {
+            warn!(
+                "escalation prompt: rejecting notification server '{}' {}: {}",
+                name, version, why
+            );
+            Err(ChildErrorKind::CapabilityRejected)
+        }
     }
-    Ok(name)
 }
 
 async fn subscribe(conn: &Connection, owner: &str) -> zbus::Result<(MessageStream, MessageStream)> {
@@ -511,7 +623,9 @@ async fn subscribe(conn: &Connection, owner: &str) -> zbus::Result<(MessageStrea
 }
 
 /// Classify a received message. Signals from any sender but the server's unique name (or, for
-/// `NameOwnerChanged`, the bus itself) are ignored.
+/// `NameOwnerChanged`, the bus itself) are ignored. The action key is checked by the caller.
+/// A `NotificationClosed` for the shared id 0 is ignored: it may be any dialog's (a stale one of a
+/// withdrawn prompt, another profile's), so it cannot end this prompt.
 fn classify(message: &Message, owner: &str, id: u32) -> Option<Signal> {
     let header = message.header();
     if header.message_type() != MessageType::Signal {
@@ -527,6 +641,13 @@ fn classify(message: &Message, owner: &str, id: u32) -> Option<Signal> {
         }
         (NOTIFICATIONS_IFACE, "NotificationClosed") if sender == owner => {
             let (signal_id, reason): (u32, u32) = message.body().deserialize().ok()?;
+            if id == SHARED_NOTIFICATION_ID {
+                debug!(
+                    "escalation prompt: ignoring NotificationClosed for the shared id (reason {})",
+                    reason
+                );
+                return None;
+            }
             (signal_id == id).then_some(Signal::Closed(reason))
         }
         (DBUS_NAME, "NameOwnerChanged") if sender == DBUS_NAME => {
@@ -543,7 +664,14 @@ fn classify(message: &Message, owner: &str, id: u32) -> Option<Signal> {
     }
 }
 
+/// Close the notification. Not for the shared id 0, which addresses no notification of ours (and
+/// on notify-osd closes no dialog): that dialog stays visible but inert, since no live prompt
+/// holds its keys.
 async fn close_notification(conn: &Connection, owner: &str, id: u32) {
+    if id == SHARED_NOTIFICATION_ID {
+        debug!("escalation prompt: the shared-id dialog cannot be closed; it stays inert");
+        return;
+    }
     if let Err(e) = call(
         conn,
         owner,
@@ -622,12 +750,18 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
         return fail(output, ChildErrorKind::NoServer);
     }
 
-    // 5. Notify.
-    let actions: Vec<&str> = request
-        .actions
-        .iter()
-        .flat_map(|(key, label)| [key.as_str(), label.as_str()])
-        .collect();
+    // 5. Notify, with this prompt's own action keys.
+    let Some(keys) = PromptKeys::generate() else {
+        warn!("escalation prompt: no randomness for the action keys");
+        return fail(output, ChildErrorKind::Internal);
+    };
+    let mut actions: Vec<&str> = Vec::with_capacity(request.actions.len() * 2);
+    for (key, label) in &request.actions {
+        let Some(wire) = keys.wire(key) else {
+            return fail(output, ChildErrorKind::BadRequest);
+        };
+        actions.extend([wire, label.as_str()]);
+    }
     let mut hints: HashMap<&str, zbus::Variant<'_>> = HashMap::new();
     hints.insert("urgency", zbus::Variant::U8(URGENCY_CRITICAL));
     let id = match call(
@@ -678,7 +812,14 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
             Wake::Bus(Some(Err(e))) => debug!("escalation prompt: stream error: {}", e),
             Wake::Bus(Some(Ok(message))) => match classify(&message, &owner, id) {
                 Some(Signal::Action(key)) => {
-                    let action = match key.as_str() {
+                    // Only this prompt's exact keys decide: a bare, foreign or stale key (another
+                    // prompt's dialog sharing id 0, a dialog left from a withdrawn prompt) is
+                    // ignored, and the prompt keeps waiting.
+                    let Some(action) = keys.decode(&key) else {
+                        debug!("escalation prompt: ignoring an action key of another prompt");
+                        continue;
+                    };
+                    let action = match action {
                         ACTION_ALLOW_ALWAYS if shown_at.elapsed() < min_review_delay => {
                             warn!(
                                 "escalation prompt: approval after {} ms, before the {} ms review \
@@ -688,12 +829,7 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
                             );
                             ACTION_DENY
                         }
-                        ACTION_ALLOW_ALWAYS => ACTION_ALLOW_ALWAYS,
-                        ACTION_DENY => ACTION_DENY,
-                        other => {
-                            debug!("escalation prompt: ignoring action '{}'", other);
-                            continue;
-                        }
+                        other => other,
                     };
                     emit(
                         output,
@@ -862,10 +998,82 @@ mod tests {
 
     #[test]
     fn single_action_servers_are_rejected() {
-        assert!(server_rejected("notify-osd", "1.0"));
+        assert!(!server_rejected("notify-osd", "1.0"));
         assert!(server_rejected("Mako", "0.0.0"));
         assert!(server_rejected("quickshell", ""));
         assert!(!server_rejected("dunst", "1.11.0"));
         assert!(!server_rejected("notify-double", "0.21.0"));
+    }
+
+    fn caps(list: &[&str]) -> Vec<String> {
+        list.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn server_support_accepts_actions_and_the_notify_osd_dialog_only() {
+        let notify_osd = caps(&[
+            "body",
+            "body-markup",
+            "icon-static",
+            "image/svg+xml",
+            "x-canonical-private-synchronous",
+            "x-canonical-append",
+            "x-canonical-private-icon-only",
+            "x-canonical-truncation",
+            "private-synchronous",
+            "append",
+            "private-icon-only",
+            "truncation",
+        ]);
+        assert_eq!(
+            server_support("notify-osd", "1.0", &notify_osd),
+            Ok(ServerSupport::FallbackDialog)
+        );
+        assert_eq!(
+            server_support("Notify-OSD", "1.0", &notify_osd),
+            Ok(ServerSupport::FallbackDialog)
+        );
+        // Another version, or another server, without `actions` is not assumed to have the dialog.
+        assert!(server_support("notify-osd", "0.9.35", &notify_osd).is_err());
+        assert!(server_support("notify-double", "1.0", &notify_osd).is_err());
+        assert!(server_support("dunst", "1.11.0", &caps(&["body"])).is_err());
+        assert_eq!(
+            server_support("dunst", "1.11.0", &caps(&["actions", "body"])),
+            Ok(ServerSupport::Actions)
+        );
+        // Known single-action servers stay rejected even when they advertise `actions`.
+        assert!(server_support("mako", "0.0.0", &caps(&["actions"])).is_err());
+        assert!(server_support("quickshell", "", &caps(&["actions"])).is_err());
+    }
+
+    #[test]
+    fn prompt_keys_are_unique_per_prompt_and_match_exactly() {
+        let a = PromptKeys::generate().unwrap();
+        let b = PromptKeys::generate().unwrap();
+        let allow = a.wire(ACTION_ALLOW_ALWAYS).unwrap();
+        let deny = a.wire(ACTION_DENY).unwrap();
+        let nonce = allow.strip_prefix("allow_always:").unwrap();
+        assert_eq!(nonce.len(), NONCE_BYTES * 2);
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(deny, format!("deny:{nonce}"));
+        assert_ne!(allow, b.wire(ACTION_ALLOW_ALWAYS).unwrap());
+        assert_eq!(a.wire("default"), None);
+
+        assert_eq!(a.decode(allow), Some(ACTION_ALLOW_ALWAYS));
+        assert_eq!(a.decode(deny), Some(ACTION_DENY));
+        // Bare keys, another prompt's keys and near misses decide nothing.
+        let misses: [String; 8] = [
+            ACTION_ALLOW_ALWAYS.to_string(),
+            ACTION_DENY.to_string(),
+            b.wire(ACTION_ALLOW_ALWAYS).unwrap().to_string(),
+            b.wire(ACTION_DENY).unwrap().to_string(),
+            format!("{allow} "),
+            allow[..allow.len() - 1].to_string(),
+            format!("deny:{nonce}:"),
+            "Allow always".to_string(),
+        ];
+        for key in &misses {
+            assert_eq!(a.decode(key), None, "{key}");
+        }
     }
 }

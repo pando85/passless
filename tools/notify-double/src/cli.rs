@@ -2,12 +2,15 @@
 
 use std::path::PathBuf;
 
-use crate::Script;
 use crate::server::Config;
+use crate::{Emulation, NOTIFY_OSD_CAPABILITIES, Script};
 
 pub const USAGE: &str = "usage: notify-double --log <path> [--script <spec>]... \
-[--ready-file <path>] [--capabilities a,b,c] [--server-name <name>]\n\
+[--ready-file <path>] [--capabilities a,b,c] [--server-name <name>] [--emulate spec|notify-osd]\n\
 script steps: approve[:ms] (invokes allow_always) | deny[:ms] | ignore | close[:ms] | invoke=<key>[:ms]\n\
+(an invoked key resolves to the notification's own key that equals it or extends it as <key>:<suffix>)\n\
+--emulate notify-osd: id 0 for every notification with actions, notify-osd's server information \
+and (unless --capabilities is given) capabilities, CloseNotification closes nothing\n\
 env NOTIFY_DOUBLE_SCRIPT: comma-separated steps (used when no --script is given)";
 
 pub struct Cli {
@@ -23,8 +26,9 @@ where
     let mut log = None;
     let mut ready_file = None;
     let mut specs: Vec<String> = Vec::new();
-    let mut capabilities = "actions,body,body-markup".to_string();
+    let mut capabilities = None;
     let mut server_name = "notify-double".to_string();
+    let mut emulation = Emulation::Spec;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -42,8 +46,15 @@ where
             "--log" => log = Some(PathBuf::from(value("--log")?)),
             "--ready-file" => ready_file = Some(PathBuf::from(value("--ready-file")?)),
             "--script" => specs.push(value("--script")?),
-            "--capabilities" => capabilities = value("--capabilities")?,
+            "--capabilities" => capabilities = Some(value("--capabilities")?),
             "--server-name" => server_name = value("--server-name")?,
+            "--emulate" => {
+                emulation = match value("--emulate")?.as_str() {
+                    "spec" => Emulation::Spec,
+                    "notify-osd" => Emulation::NotifyOsd,
+                    other => return Err(format!("unknown --emulate '{other}'\n{USAGE}")),
+                }
+            }
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
@@ -59,19 +70,30 @@ where
         Script::parse_specs(specs)
     }
     .map_err(|e| e.to_string())?;
+    let capabilities = match (capabilities, emulation) {
+        (Some(list), _) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        (None, Emulation::Spec) => ["actions", "body", "body-markup"]
+            .map(String::from)
+            .to_vec(),
+        (None, Emulation::NotifyOsd) => NOTIFY_OSD_CAPABILITIES
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+    };
 
     Ok(Cli {
         log,
         ready_file,
         config: Config {
             script,
-            capabilities: capabilities
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
+            capabilities,
             server_name,
+            emulation,
         },
     })
 }
@@ -105,6 +127,15 @@ mod tests {
         let cli = parse(args(&["--log", "/x"]), Some("deny,approve".into())).unwrap();
         assert_eq!(cli.config.script.len(), 2);
         assert_eq!(cli.config.capabilities, ["actions", "body", "body-markup"]);
+    }
+
+    #[test]
+    fn emulate_notify_osd_uses_its_capabilities() {
+        let cli = parse(args(&["--log", "/x", "--emulate", "notify-osd"]), None).unwrap();
+        assert_eq!(cli.config.emulation, Emulation::NotifyOsd);
+        assert!(!cli.config.capabilities.iter().any(|c| c == "actions"));
+        assert!(cli.config.capabilities.iter().any(|c| c == "body"));
+        assert!(parse(args(&["--log", "/x", "--emulate", "bogus"]), None).is_err());
     }
 
     #[test]
