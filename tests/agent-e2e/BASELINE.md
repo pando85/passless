@@ -27,13 +27,15 @@ Playwright connection.
 - Port-only scenarios keep a one-line comment with the reason: the Playwright, chrome-devtools, browser-use and agent-browser tools need
   a CDP endpoint, and E2E-06, 11, 18, 19, 20, 31, 45 read or stop the extension worker, which the filter hides in pipe mode (E2E-52).
   Not ported yet (driver is page-level): E2E-08, 10 (frames and popups), 22 (20 tabs), 21 (3 minute timeout).
-- Finding (not a safety issue; the refusal is enforced): `agent mcp playwright` against a pipe-mode profile fails its first tool call
-  with Playwright's `Unexpected status 503 when connecting to .../json/version/ ... does not look like a DevTools server`, and the
-  wrapper prints nothing. `cdp_bootstrap.rs` says the full refusal text goes to "the wrapper's stderr (and the daemon's log)", but
-  the `agent` client subcommands run before logging is initialised in `main.rs`, so `log::warn!` is dropped and the daemon never
-  sees the refusal. The documented text ("requires browser_cdp_expose = 'port' ...; in pipe mode run `passless agent browser`")
-  reaches the user only through `agent mcp chrome-devtools`, which exits with it on stderr. E2E-53 asserts the 503, the absence of
-  any browser or lease, and the port-mode control for Playwright MCP, and the documented text for chrome-devtools.
+- Finding, fixed (not a safety issue; the refusal was always enforced): `agent mcp playwright` against a pipe-mode profile fails its
+  first tool call with Playwright's `Unexpected status 503 when connecting to .../json/version/ ... does not look like a DevTools
+  server`. The wrapper printed nothing: `cdp_bootstrap.rs` logged the full refusal with `log::warn!`, but the `agent` client
+  subcommands run before logging is initialised in `main.rs`, so the record was dropped. Fixed: the bootstrap now also writes the
+  line ("passless: failed to ensure managed browser for CDP bootstrap (refused): ... requires browser_cdp_expose = 'port' ...; in
+  pipe mode run `passless agent browser` ...") to the wrapper's stderr, never stdout (the MCP channel), and the refusal is
+  classified `refused` in the 503 body. E2E-53 now asserts the documented text, the `passless agent browser` pointer and the
+  `(refused)` class on the Playwright wrapper's stderr, as it already did for `agent mcp chrome-devtools`, which ensures the browser
+  up front and exits with the text.
 
 ## P12 (final gate), 2026-11-12
 

@@ -17,7 +17,7 @@ const PIPE_RULES = [{ rp: 'rp-a.test', authenticate: 'allow', register: 'deny' }
 // - `agent mcp chrome-devtools` ensures the browser up front, so the adapter itself exits with the error on stderr;
 // - `agent mcp playwright` is lazy: the MCP server starts, and its first browser tool call fails because the bootstrap's
 //   discovery request is answered `503 {"class": "refused"}` (the bootstrap never repeats the daemon's text to the page-side
-//   client; the wrapper's stderr and the daemon's log carry it).
+//   client; the wrapper prints it on its stderr, which the MCP client keeps as the server's log).
 // Then a positive control: the same profile is served by `agent browser` and browser-control, so the refusal is about the
 // endpoint, not the profile.
 // `pinsExpose: 'pipe'`: this scenario writes its own pipe-mode profile, whatever attach mode the run's axis selects.
@@ -58,10 +58,16 @@ scenario({
     refusal = (nav.content || []).map(c => c.text || '').join('\n');
   } catch (e) { refusal = String(e.message || e); }
   // Playwright reports only the bootstrap's `503` ("does not look like a DevTools server"): the bootstrap answers a refused launch
-  // with a class and a fixed hint, never the daemon's text, and the wrapper has no logger for the full text (see the
-  // finding in BASELINE.md). So the tool error alone does not say WHY; the control below (a port-mode profile of the same daemon
+  // with a class and a fixed hint, never the daemon's text. The full documented text goes to the wrapper's stderr, so the tool
+  // error alone does not say WHY but the MCP server's stderr does; the control below (a port-mode profile of the same daemon
   // and adapter navigates fine) shows the refusal is specific to the pipe-mode profile.
   assert.match(refusal, /503/, `the discovery request was answered 503: ${refusal.slice(0, 400)}`);
+  const stderrOf = () => playwright.client.stderr;
+  await waitFor('the wrapper to print the refusal on stderr', () => (documented.test(stderrOf()) ? true : null), { timeoutMs: 15000, intervalMs: 100 })
+    .catch(() => {});
+  assert.match(stderrOf(), documented, `the documented refusal on the Playwright wrapper's stderr: ${stderrOf()}`);
+  assert.match(stderrOf(), redirect, `it points at \`passless agent browser\`: ${stderrOf()}`);
+  assert.match(stderrOf(), /\(refused\)/, `the refusal is classified: ${stderrOf()}`);
   assert.deepEqual(browserProcesses(stack, processesMentioning), [], 'a browser was started for a refused Playwright MCP adapter');
 
   // Control: the same adapter against a port-mode profile of this daemon works, so the 503 above is the pipe-mode refusal.

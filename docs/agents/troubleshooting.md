@@ -57,7 +57,9 @@ Run `passless agent-admin profile check <profile>`.
   (`{"error":"managed browser unavailable","class":"runtime_root_invalid",...}`; other classes are
   `launch_failed`, `daemon_unreachable`, `refused` and `unavailable`) and the MCP server's stderr
   (the client's MCP log) has the full text; the daemon's log has the launch error:
-  `journalctl --user -u passless`.
+  `journalctl --user -u passless`. A pipe-mode profile is refused this way (`class` `refused`); the
+  stderr line then reads `Playwright browser discovery requires browser_cdp_expose = 'port' ...`
+  (see below).
   - `class` `runtime_root_invalid` (`failed to launch browser: invalid runtime root: ...`): the
     browser runtime root, by default `$XDG_RUNTIME_DIR/passless/browser`, cannot be used. Current
     versions create it (mode 0700, yours) when it is missing; an older build fails with `No such file

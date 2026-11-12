@@ -87,7 +87,9 @@ impl CdpBootstrap {
                                 })
                             {
                                 active.fetch_sub(1, Ordering::AcqRel);
-                                log::warn!("failed to spawn CDP bootstrap request worker: {e}");
+                                report_to_wrapper_stderr(&format!(
+                                    "failed to spawn CDP bootstrap request worker: {e}"
+                                ));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -209,7 +211,9 @@ where
                     write_json(&mut stream, 200, "OK", &body, &[])
                 }
                 Ok(_) => {
-                    log::error!("agent returned a non-loopback or invalid CDP websocket endpoint");
+                    report_to_wrapper_stderr(
+                        "agent returned a non-loopback or invalid CDP websocket endpoint",
+                    );
                     write_json(
                         &mut stream,
                         503,
@@ -221,9 +225,11 @@ where
                 Err(e) => {
                     // The response carries the failure's class and a fixed hint, never the
                     // daemon's message: that may hold paths or policy details. The wrapper's
-                    // stderr (and the daemon's log) get the full text.
+                    // stderr gets the full text (the `agent` client subcommands run before
+                    // logging is initialised, so a `log::` call would be dropped there); the
+                    // daemon's own log has the refusal or the launch error from its side.
                     let (class, hint) = classify_ensure_error(&e);
-                    log::warn!("failed to ensure managed browser for CDP bootstrap ({class}): {e}");
+                    report_to_wrapper_stderr(&bootstrap_failure_message(class, &e));
                     let body = serde_json::json!({
                         "error": "managed browser unavailable",
                         "class": class,
@@ -242,6 +248,20 @@ where
             &[],
         ),
     }
+}
+
+/// The line the wrapper prints when a discovery request could not be served.
+fn bootstrap_failure_message(class: &str, error: &str) -> String {
+    format!("failed to ensure managed browser for CDP bootstrap ({class}): {error}")
+}
+
+/// Tell the wrapper's user, on stderr. The `agent` client subcommands (`agent mcp playwright`)
+/// run before `logging::init`, so a `log::warn!` there goes nowhere; stdout is the MCP stdio
+/// channel and must stay clean, so this writes to stderr only. The record is also sent to the
+/// `log` facade for the case where a logger is installed.
+fn report_to_wrapper_stderr(message: &str) {
+    log::warn!("{message}");
+    let _ = writeln!(std::io::stderr().lock(), "passless: {message}");
 }
 
 /// The class of a failed `EnsureBrowser` and a fixed, secret-free hint saying where to look, from
@@ -267,7 +287,11 @@ fn classify_ensure_error(error: &str) -> (&'static str, &'static str) {
             "the daemon could not start the browser: see the passless daemon's log \
              (journalctl --user -u passless) and run `passless doctor --agents`",
         )
-    } else if has("denied") || has("not allowed") || has("refused") {
+    } else if has("denied")
+        || has("not allowed")
+        || has("refused")
+        || has("requires browser_cdp_expose")
+    {
         ("refused", LOG)
     } else {
         ("unavailable", LOG)
@@ -559,7 +583,34 @@ mod tests {
             "launch_failed"
         );
         assert_eq!(class("policy denied"), "refused");
+        assert_eq!(
+            class(
+                "protocol error: Playwright browser discovery requires browser_cdp_expose = \
+                 'port' (trusted agents only); in pipe mode run `passless agent browser`"
+            ),
+            "refused"
+        );
         assert_eq!(class("something else"), "unavailable");
+    }
+
+    /// The line written to the wrapper's stderr keeps the daemon's full refusal text, which the
+    /// 503 body deliberately does not carry.
+    #[test]
+    fn the_wrapper_stderr_line_carries_the_documented_refusal() {
+        let refusal = "protocol error: Playwright browser discovery requires browser_cdp_expose = \
+                       'port' (trusted agents only); in pipe mode run `passless agent browser` \
+                       and drive the browser with `passless agent browser-control`";
+        let (class, _hint) = classify_ensure_error(refusal);
+        let line = bootstrap_failure_message(class, refusal);
+        assert!(
+            line.contains("requires browser_cdp_expose = 'port'"),
+            "{line}"
+        );
+        assert!(
+            line.contains("in pipe mode run `passless agent browser`"),
+            "{line}"
+        );
+        assert!(line.contains("(refused)"), "{line}");
     }
 
     #[test]
