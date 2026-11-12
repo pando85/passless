@@ -2648,11 +2648,7 @@ fn simulate_missing_extension() -> bool {
     if tests::OMIT_EXTENSION.with(|c| c.get()) {
         return true;
     }
-    #[cfg(debug_assertions)]
-    if std::env::var_os("PASSLESS_E2E_OMIT_AGENT_EXTENSION").is_some() {
-        return true;
-    }
-    false
+    cfg!(debug_assertions) && std::env::var_os("PASSLESS_E2E_OMIT_AGENT_EXTENSION").is_some()
 }
 
 pub const NATIVE_MESSAGING_HOST_NAME: &str = "rs.passless.sign_proxy";
@@ -3432,11 +3428,7 @@ fn discover_cdp_endpoint_with_child(
 /// so that the ownership check after the launch meets a real Chromium that fell back to `[::1]`.
 /// Release builds have no such hook.
 fn skip_cdp_port_probe() -> bool {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("PASSLESS_E2E_SKIP_CDP_PORT_PROBE").is_some() {
-        return true;
-    }
-    false
+    cfg!(debug_assertions) && std::env::var_os("PASSLESS_E2E_SKIP_CDP_PORT_PROBE").is_some()
 }
 
 /// How long an unverifiable listener (one this daemon cannot attribute either way) is waited on
