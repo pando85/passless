@@ -45,14 +45,15 @@ struct BrowserOutput<'a> {
 }
 
 /// `http://127.0.0.1:<port>` from the browser's `ws://127.0.0.1:<port>/devtools/browser/<id>`.
-/// `None` unless it is a loopback websocket URL.
+/// `None` unless it is a `ws://127.0.0.1` URL: the only endpoint the daemon hands out, once it
+/// verified that the listener is the managed browser's (an `[::1]` one never is).
 pub fn http_endpoint(ws_endpoint: &str) -> Option<String> {
     let url = url::Url::parse(ws_endpoint).ok()?;
     if url.scheme() != "ws" {
         return None;
     }
     let host = url.host_str()?;
-    if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+    if host != "127.0.0.1" {
         return None;
     }
     Some(format!("http://{host}:{}", url.port()?))
@@ -725,6 +726,8 @@ mod tests {
             "wss://127.0.0.1:9222/devtools/browser/abc",
             "http://127.0.0.1:9222",
             "ws://127.0.0.1/devtools/browser/abc",
+            "ws://[::1]:9333/devtools/browser/abc",
+            "ws://localhost:9333/devtools/browser/abc",
             "not a url",
         ] {
             assert_eq!(http_endpoint(bad), None, "{bad}");

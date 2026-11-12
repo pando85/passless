@@ -11,6 +11,7 @@
 //! guard (R19). The daemon-side checks stay in `passless agent-admin profile check`.
 
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -455,6 +456,69 @@ pub fn containment_check(profile: &str, report: &ContainmentReport) -> DoctorChe
     }
 }
 
+/// A profile's fixed `browser_cdp_port` (ADR 0014 section 4.3): a warning when another process
+/// holds it on `127.0.0.1` now, as launches are then refused. A managed browser of passless
+/// holding it (`managed`) is fine.
+pub fn cdp_port_check(
+    profile: &str,
+    port: u16,
+    holder: Option<&super::cdp_owner::PortHolder>,
+    managed: bool,
+) -> DoctorCheck {
+    let name = format!("{profile}: browser_cdp_port");
+    match holder {
+        None => check(
+            name,
+            true,
+            format!(
+                "{port} is free on 127.0.0.1 (leaving browser_cdp_port unset, for an ephemeral \
+                 port, is recommended)"
+            ),
+        ),
+        Some(holder) if managed => check(
+            name,
+            true,
+            format!(
+                "{port} is held by a passless managed browser ({})",
+                holder.description
+            ),
+        ),
+        Some(holder) => check(
+            name,
+            true,
+            format!(
+                "warning: browser_cdp_port {port} on 127.0.0.1 is in use by {}; launches of \
+                 this profile are refused while it is. Remove browser_cdp_port to use an \
+                 ephemeral port (recommended), or choose a free one",
+                holder.description
+            ),
+        ),
+    }
+}
+
+/// Whether `pid` is a passless managed browser listening on `port`: started with that
+/// `--remote-debugging-port` and a lease profile (`.../lease-<id>/profile`) as its user data dir.
+fn is_managed_browser(pid: u32, port: u16) -> bool {
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+    let port_flag = format!("--remote-debugging-port={port}");
+    args.contains(&port_flag.as_bytes())
+        && args.iter().any(|a| {
+            a.strip_prefix(b"--user-data-dir=".as_slice())
+                .map(|dir| Path::new(std::ffi::OsStr::from_bytes(dir)))
+                .is_some_and(|dir| {
+                    dir.file_name().is_some_and(|n| n == "profile")
+                        && dir
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("lease-"))
+                })
+        })
+}
+
 /// The notification server on the escalation bus (ADR 0014 section 8.2): the bus the daemon's
 /// prompt child would use answers, and a server owns `org.freedesktop.Notifications` with the
 /// `actions` capability (or is notify-osd 1.0, whose fallback dialogs have distinct buttons). Only
@@ -779,6 +843,16 @@ pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
         let trusted_same_user = identity.uid == euid && identity.gid == egid;
         let report = containment::assess(&ContainmentPolicy::Auto, &setup, trusted_same_user);
         checks.push(containment_check(name, &report));
+        if profile.browser_cdp_expose == Some(passless_core::agent::config::CdpExposeMode::Port)
+            && let Some(port) = profile.browser_cdp_port.filter(|port| *port > 0)
+        {
+            let holder = super::cdp_owner::port_holder(port);
+            let managed = holder
+                .as_ref()
+                .and_then(|h| h.pid)
+                .is_some_and(|pid| is_managed_browser(pid, port));
+            checks.push(cdp_port_check(name, port, holder.as_ref(), managed));
+        }
     }
 
     checks.push(extension);
@@ -867,6 +941,37 @@ mod tests {
             unknown.passed && unknown.message.starts_with("warning:"),
             "{unknown:?}"
         );
+    }
+
+    /// A fixed CDP port held by another process is a warning that names the holder and the fix;
+    /// a free one, or one held by a managed browser, is fine.
+    #[test]
+    fn the_cdp_port_check_warns_about_a_held_fixed_port() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let holder = crate::agent::cdp_owner::port_holder(port).expect("held");
+        assert!(!is_managed_browser(std::process::id(), port));
+        let warn = cdp_port_check("coding", port, Some(&holder), false);
+        assert!(
+            warn.passed && warn.message.starts_with("warning:"),
+            "{warn:?}"
+        );
+        assert!(
+            warn.message
+                .contains(&format!("pid {}", std::process::id())),
+            "{warn:?}"
+        );
+        assert!(warn.message.contains("Remove browser_cdp_port"), "{warn:?}");
+        let ours = cdp_port_check("coding", port, Some(&holder), true);
+        assert!(!ours.message.starts_with("warning:"), "{ours:?}");
+        drop(held);
+        let free = cdp_port_check(
+            "coding",
+            port,
+            crate::agent::cdp_owner::port_holder(port).as_ref(),
+            false,
+        );
+        assert!(free.passed && free.message.contains("is free"), "{free:?}");
     }
 
     #[test]

@@ -120,7 +120,9 @@ Debug-build daemon hooks (set through `daemonEnv`): `PASSLESS_E2E_HOLD_REQUEST_M
 ceremony (an abort or disconnect then lands before key use), `PASSLESS_E2E_HOLD_RESULT_MS` holds each successful
 result after key use, `PASSLESS_E2E_OMIT_AGENT_EXTENSION` drops the generated extension directory (E2E-47),
 `PASSLESS_E2E_UNLOADABLE_AGENT_EXTENSION` writes a service worker that loads but never connects (E2E-47/unloadable; a manifest the browser refuses to load blocks headed Chromium on a modal dialog before it opens its debugging port) and
-`PASSLESS_E2E_DISABLE_BWRAP` makes the launcher treat bwrap as unavailable (E2E-46/refused).
+`PASSLESS_E2E_DISABLE_BWRAP` makes the launcher treat bwrap as unavailable (E2E-46/refused);
+`PASSLESS_E2E_SKIP_CDP_PORT_PROBE` skips the pre-launch probe of a fixed `browser_cdp_port`, so that E2E-56 meets the ownership
+check after the launch (profile key `cdpPort` sets the fixed port).
 
 ## Agent-browser easy path (P10b)
 

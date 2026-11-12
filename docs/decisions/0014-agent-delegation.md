@@ -178,6 +178,11 @@ With `browser_scope = "session"` and `max_concurrent_sessions > 1`, `browser_cdp
 each session gets its own browser and two of them cannot bind one fixed port. With
 `browser_scope = "profile"` there is a single shared browser per profile, so a fixed port is
 allowed whatever `max_concurrent_sessions` is. `browser-control` is unavailable in port mode.
+*Amendment (CDP endpoint ownership):* the daemon hands out or stores a port-mode endpoint only after
+proving that every listener reachable at `127.0.0.1:<port>` is held by the launched browser's own
+process tree (`/proc/net/tcp{,6}` inode in its `/proc/<pid>/fd`; for an ephemeral port also the GUID
+of its `DevToolsActivePort`), and refuses a fixed `browser_cdp_port` that another process holds,
+before launch and again after it (`cdp_owner.rs`, E2E-56).
 
 Playwright MCP uses a Passless HTTP bootstrap on an ephemeral loopback port: `GET /json/version`
 authenticates an ephemeral bearer, runs the principal-scoped `EnsureBrowser` after full principal

@@ -6,6 +6,7 @@ pub mod browser_select;
 pub mod capacity;
 pub mod cdp_bootstrap;
 pub mod cdp_filter;
+pub mod cdp_owner;
 pub mod client;
 pub mod containment;
 pub mod cred_protect;

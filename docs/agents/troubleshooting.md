@@ -71,6 +71,11 @@ Run `passless agent-admin profile check <profile>`.
     root is only created for the daemon's own user).
   - `class` `daemon_unreachable`: the daemon is not running, or runs without agents (see above).
   - `class` `launch_failed`: see `passless doctor --agents` and the daemon log.
+- `browser_cdp_port <port> on 127.0.0.1 is already in use (<process>, pid <pid>)`, or `the CDP endpoint on
+  127.0.0.1:<port> does not belong to the launched browser`: another process (often a browser you started
+  with `--remote-debugging-port`) holds the profile's fixed port, so whatever answered there would not be
+  the managed browser. Remove `browser_cdp_port` to use an ephemeral port (recommended), or choose a free
+  one. `passless doctor --agents` warns while the port is held.
 - The extension is not intercepting: the launch fails and no endpoint is printed. Check
   `passless doctor --agents` for the extension and native host, and the daemon log.
 - `agent browser ... must run inside a principal session`: start your agent with

@@ -29,6 +29,27 @@ status of each item is:
 | H-3 No seccomp-BPF on spawned processes | **Open, distinct-UID deployment only** | Not implemented. A principal-process deny-list is the first step; browser seccomp needs per-version profiling. |
 | C-3 Self-approval of authentication grants | **Accepted (design); audit done** | Autonomous operation within the operator's rules is the designed behaviour. Session grant request and approval are audited (P8 schema). Approval of a `request` rule comes from a notification click, not from the agent; a same-UID agent can still drive the notification server (residual risk, [ADR §15](../decisions/0014-agent-delegation.md#15-threats-and-residual-risk)). |
 | H-1 D-Bus notification action injection | **Done for sender validation; same-UID residual remains** | `ActionInvoked` is accepted only from the notification server's verified unique bus name, in the prompt child (P7). A same-UID process can still use the real server's own tools (`dunstctl`, `makoctl`). Shipping a D-Bus policy file is not planned. |
+| H-4 Port-mode CDP endpoint not tied to the launched browser | **Fixed** | See [H-4](#h-4-port-mode-cdp-endpoint-not-tied-to-the-launched-browser). |
+
+### H-4: Port-mode CDP endpoint not tied to the launched browser
+
+**Finding (released in 0.22.0).** With a fixed `browser_cdp_port`, the daemon took the endpoint from whatever answered
+`GET /json/version` on `127.0.0.1:<port>`, checking only that the URL was loopback with a `/devtools/browser/` path. When
+another local process of any UID held that port first (an attacker's listener, or the user's own Chromium or Firefox started
+with `--remote-debugging-port`), the managed Chromium silently fell back to `[::1]:<port>` and the daemon stored and handed out
+the other process's endpoint: the agent then drove a browser without WebAuthn interception or policy, possibly the user's
+logged-in one. The ephemeral-port path read the browser's `DevToolsActivePort` but never checked who listened there.
+
+**Fix.** `cmd/passless/src/agent/cdp_owner.rs` and `await_owned_cdp_endpoint` in `browser.rs`: an endpoint is stored or handed
+out only when every listener a connection to `127.0.0.1:<port>` can reach is held by the launched browser's process tree
+(socket inode from `/proc/net/tcp{,6}` among its `/proc/<pid>/fd`; a socket of another UID is foreign at once), the served
+`webSocketDebuggerUrl` is exactly `ws://127.0.0.1:<port>/devtools/browser/<id>` (for an ephemeral port, the GUID of the
+browser's `DevToolsActivePort`), and the same listener is still the browser's afterwards. A listener the daemon cannot attribute
+is accepted only for an ephemeral port whose served GUID matches the browser's own `DevToolsActivePort`; a fixed port is then
+refused (Chromium writes no `DevToolsActivePort` for a fixed port). A fixed port held by anyone is refused before launch, naming
+the holder, and a browser that fell back to `[::1]` is refused at once. The wrappers relay only `ws://127.0.0.1` endpoints, and
+`passless doctor --agents` warns about a held fixed port. Unit tests in `browser.rs` and `cdp_owner.rs`; E2E-56 (a fake listener
+and a real Chromium on the port, with and without the pre-launch probe).
 
 ---
 

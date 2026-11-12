@@ -41,7 +41,8 @@ function tomlValue(v) {
  * @param {boolean} [o.noBrowserCommand]  write no `browser_command` (the daemon chooses the browser)
  * @param {string} [o.browserScope]  `browser_scope` of every profile (default "profile", see below)
  * @param {'port'|'pipe'} [o.expose]  the attach mode of every profile that does not pin one (default `port`)
- * Per profile: `max_granted_rules`, `cdpExpose` (`'pipe'` or `'port'`; default `o.expose`).
+ * Per profile: `max_granted_rules`, `cdpExpose` (`'pipe'` or `'port'`; default `o.expose`), `cdpPort` (a fixed
+ * `browser_cdp_port` in port mode; default 0, ephemeral).
  */
 function renderConfig(env, o) {
   const user = os.userInfo().username;
@@ -70,7 +71,7 @@ function renderConfig(env, o) {
     // Pipe mode (the ADR's default): CDP only through the daemon's `browser-control` (lib/pipe-driver.js drives it). Port
     // mode is what the Playwright-driven scenarios connect to. A profile may pin its own (E2E-52); else the run's axis.
     if ((p.cdpExpose || o.expose) === 'pipe') b.push('browser_cdp_expose = "pipe"');
-    else b.push('browser_cdp_expose = "port"', 'browser_cdp_port = 0');
+    else b.push('browser_cdp_expose = "port"', `browser_cdp_port = ${Number(p.cdpPort || 0)}`); // `cdpPort`: a fixed port (E2E-56)
     if (mode === 'isolated') {
       const base = path.join(env.dirs.work, 'iso', name);
       fs.mkdirSync(path.join(base, 'credentials'), { recursive: true, mode: 0o700 });

@@ -436,6 +436,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// The daemon hands out only `ws://127.0.0.1:<port>/devtools/browser/<id>`, after verifying that
+/// the listener there is the managed browser's (ADR 0014 section 4.3). Anything else, such as an
+/// `[::1]` endpoint, is not relayed.
 fn valid_loopback_ws_endpoint(endpoint: &str) -> bool {
     let Some(rest) = endpoint.strip_prefix("ws://") else {
         return false;
@@ -446,17 +449,9 @@ fn valid_loopback_ws_endpoint(endpoint: &str) -> bool {
     if !path.starts_with("devtools/browser/") || path.len() <= "devtools/browser/".len() {
         return false;
     }
-
-    if let Some(port) = authority.strip_prefix("127.0.0.1:") {
-        return port.parse::<u16>().is_ok_and(|port| port != 0);
-    }
-    if let Some(port) = authority.strip_prefix("localhost:") {
-        return port.parse::<u16>().is_ok_and(|port| port != 0);
-    }
-    if let Some(port) = authority.strip_prefix("[::1]:") {
-        return port.parse::<u16>().is_ok_and(|port| port != 0);
-    }
-    false
+    authority
+        .strip_prefix("127.0.0.1:")
+        .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
 }
 
 #[cfg(test)]
@@ -539,6 +534,24 @@ mod tests {
             "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 503"));
+    }
+
+    /// Only the `127.0.0.1` endpoint the daemon verified is relayed: an `[::1]` or `localhost`
+    /// one (where a browser that lost its `127.0.0.1` bind would listen) is not.
+    #[test]
+    fn relays_only_ipv4_loopback_endpoints() {
+        assert!(valid_loopback_ws_endpoint(
+            "ws://127.0.0.1:43871/devtools/browser/uuid"
+        ));
+        for bad in [
+            "ws://[::1]:9333/devtools/browser/uuid",
+            "ws://localhost:9333/devtools/browser/uuid",
+            "ws://127.0.0.1:0/devtools/browser/uuid",
+            "ws://127.0.0.1:9333/devtools/page/uuid",
+            "ws://127.0.0.1:9333/devtools/browser/",
+        ] {
+            assert!(!valid_loopback_ws_endpoint(bad), "{bad}");
+        }
     }
 
     /// The 503 for a failed launch says why (the class and a fixed hint), and never echoes the
