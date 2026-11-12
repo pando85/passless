@@ -297,3 +297,133 @@ fn client_show_parses_credential_id() {
         _ => panic!("expected Show command"),
     }
 }
+
+/// Fields of a parsed `client set-cred-protect`.
+struct SetCredProtectArgs {
+    credential_id: Option<String>,
+    rp_id: Option<String>,
+    level: u8,
+    yes: bool,
+    device: Option<String>,
+}
+
+fn parse_set_cred_protect(extra: &[&str]) -> Result<SetCredProtectArgs, clap::Error> {
+    let mut argv = vec!["passless", "client"];
+    argv.extend_from_slice(extra);
+    let args = Args::try_parse_from(argv)?;
+    match args.command {
+        Some(Commands::Client {
+            device,
+            action:
+                passless_core::ClientAction::SetCredProtect {
+                    credential_id,
+                    rp_id,
+                    level,
+                    yes,
+                },
+            ..
+        }) => Ok(SetCredProtectArgs {
+            credential_id,
+            rp_id,
+            level,
+            yes,
+            device,
+        }),
+        other => panic!("expected SetCredProtect command, got {other:?}"),
+    }
+}
+
+#[test]
+fn client_set_cred_protect_parses_id_and_level() {
+    let parsed =
+        parse_set_cred_protect(&["set-cred-protect", "--id", "aabbccdd", "--level", "1"]).unwrap();
+    assert_eq!(parsed.credential_id.as_deref(), Some("aabbccdd"));
+    assert_eq!(parsed.rp_id, None);
+    assert_eq!(parsed.level, 1);
+    assert!(!parsed.yes);
+    assert_eq!(parsed.device, None);
+}
+
+#[test]
+fn client_set_cred_protect_parses_rp_yes_device_and_json() {
+    let parsed = parse_set_cred_protect(&[
+        "-D",
+        "1",
+        "set-cred-protect",
+        "--rp",
+        "ssh:",
+        "--level",
+        "3",
+        "--yes",
+        "-o",
+        "json",
+    ])
+    .unwrap();
+    assert_eq!(parsed.credential_id, None);
+    assert_eq!(parsed.rp_id.as_deref(), Some("ssh:"));
+    assert_eq!(parsed.level, 3);
+    assert!(parsed.yes);
+    assert_eq!(parsed.device.as_deref(), Some("1"));
+}
+
+#[test]
+fn client_set_cred_protect_accepts_each_level_and_rejects_others() {
+    for level in ["1", "2", "3"] {
+        assert!(
+            parse_set_cred_protect(&["set-cred-protect", "--rp", "ssh:", "--level", level]).is_ok()
+        );
+    }
+    for level in ["0", "4", "255", "-1", "abc", ""] {
+        assert!(
+            parse_set_cred_protect(&["set-cred-protect", "--rp", "ssh:", "--level", level])
+                .is_err(),
+            "level {level:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn client_set_cred_protect_requires_exactly_one_target_and_a_level() {
+    // No target.
+    assert!(parse_set_cred_protect(&["set-cred-protect", "--level", "1"]).is_err());
+    // Both targets.
+    assert!(
+        parse_set_cred_protect(&[
+            "set-cred-protect",
+            "--id",
+            "aabb",
+            "--rp",
+            "ssh:",
+            "--level",
+            "1"
+        ])
+        .is_err()
+    );
+    // No level.
+    assert!(parse_set_cred_protect(&["set-cred-protect", "--rp", "ssh:"]).is_err());
+    assert!(parse_set_cred_protect(&["set-cred-protect", "--id", "aabb"]).is_err());
+}
+
+#[test]
+fn client_set_cred_protect_appears_in_client_help() {
+    let (stdout, _, code) = run_cli(&["client", "--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("set-cred-protect"));
+    let (stdout, _, code) = run_cli(&["client", "set-cred-protect", "--help"]);
+    assert_eq!(code, 0);
+    for flag in ["--id", "--rp", "--level", "--yes"] {
+        assert!(stdout.contains(flag), "{flag} missing from help");
+    }
+    // The help states the risk plainly.
+    for text in [
+        "hidraw",
+        "silent signing",
+        "always_uv = true",
+        "passless client list",
+    ] {
+        assert!(
+            stdout.contains(text),
+            "{text:?} missing from help:\n{stdout}"
+        );
+    }
+}

@@ -1320,6 +1320,37 @@ pub enum ClientAction {
         #[arg(short = 'n', long = "display-name", value_name = "NAME")]
         display_name: Option<String>,
     },
+    /// Change the stored credProtect level of credentials (requires user verification)
+    ///
+    /// Levels: 1 = user verification optional (presence only), 2 = optional with a credential
+    /// ID list, 3 = user verification required. The credentials are shown first; lowering asks
+    /// for confirmation unless --yes is given, and the authenticator asks for the PIN or, with
+    /// no PIN set, shows its own prompt naming what is lowered.
+    ///
+    /// WARNING: lowering weakens the credentials. With
+    /// security.user_verification_authentication = false, level 1 means silent signing by any
+    /// process that can reach the authenticator's hidraw device. Lowering has no effect while
+    /// security.always_uv = true, because the authenticator then forces user verification
+    /// whatever the level. After an error, check the result with `passless client list`.
+    SetCredProtect {
+        /// Credential ID in hexadecimal format
+        #[arg(
+            long = "id",
+            value_name = "CREDENTIAL_ID",
+            conflicts_with = "rp_id",
+            required_unless_present = "rp_id"
+        )]
+        credential_id: Option<String>,
+        /// Apply to every credential of this relying party ID (e.g. `ssh:`)
+        #[arg(long = "rp", value_name = "RP_ID")]
+        rp_id: Option<String>,
+        /// New credProtect level (1, 2 or 3)
+        #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(1..=3))]
+        level: u8,
+        /// Do not ask for confirmation before changing every credential of --rp
+        #[arg(long)]
+        yes: bool,
+    },
     /// Export one software-backed credential as an opaque encrypted bundle.
     Backup {
         /// Credential ID in hexadecimal format
