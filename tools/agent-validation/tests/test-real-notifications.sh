@@ -30,7 +30,22 @@ trap cleanup EXIT
 
 mkdir -p "$TEST_TMP_DIR"
 
+# The address every test here sees instead of the inherited session bus: no socket exists there, so
+# nothing the stage starts can reach (and pop a prompt on) the developer's real notification server.
+TEST_DEAD_BUS="unix:path=/nonexistent/passless-av-test-bus"
+
+# A stand-in for the probe: prints a decision and never touches a bus.
+write_stub_probe() {
+    local path="$1"
+    cat > "$path" << 'EOF'
+#!/bin/bash
+echo '{"decision":"error","error_kind":"stub","latency_class":"fast"}'
+EOF
+    chmod +x "$path"
+}
+
 setup_stage_env() {
+    export DBUS_SESSION_BUS_ADDRESS="$TEST_DEAD_BUS"
     export EVIDENCE_DIR="${TEST_TMP_DIR}/evidence"
     export TEMP_ROOT="${TEST_TMP_DIR}/tmp"
     export RUN_ID="test-rn-001"
@@ -51,9 +66,9 @@ setup_stage_env() {
 }
 
 setup_mock_bin_dir() {
-    local mock_dir="${TEST_TMP_DIR}/mock-bin-$$"
-    mkdir -p "$mock_dir"
-    echo "$mock_dir"
+    # A fresh directory per test: a mock one test writes (dbus-run-session) must never leak into
+    # the PATH of a later test.
+    mktemp -d "${TEST_TMP_DIR}/mock-bin-XXXXXX"
 }
 
 test_rn_skip_without_dunst() {
@@ -129,9 +144,10 @@ wait
 EOF
     chmod +x "$mock_dir/Xvfb"
 
-    cat > "$mock_dir/dbus-run-session" << 'EOF'
+    cat > "$mock_dir/dbus-run-session" << EOF
 #!/bin/bash
-exec "$@"
+# Never run a command on the inherited bus: this mock is not a private bus.
+exec env DBUS_SESSION_BUS_ADDRESS="$TEST_DEAD_BUS" "\$@"
 EOF
     chmod +x "$mock_dir/dbus-run-session"
 
@@ -174,6 +190,9 @@ exit 1
 EOF
     chmod +x "$mock_dir/dunst"
 
+    write_stub_probe "$mock_dir/stub-probe"
+    export PASSLESS_PROMPT_PROBE_BIN="$mock_dir/stub-probe"
+
     local old_path="$PATH"
     export PATH="$mock_dir:/usr/bin:/bin"
 
@@ -206,6 +225,9 @@ test_rn_results_contain_scenarios() {
 exit 1
 EOF
     chmod +x "$mock_dir/dunst"
+
+    write_stub_probe "$mock_dir/stub-probe"
+    export PASSLESS_PROMPT_PROBE_BIN="$mock_dir/stub-probe"
 
     local old_path="$PATH"
     export PATH="$mock_dir:/usr/bin:/bin"

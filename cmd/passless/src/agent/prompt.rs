@@ -130,6 +130,28 @@ impl SocketProbe for FsSockets {
     }
 }
 
+/// The session bus address every unit test of this crate sees instead of the inherited one: no
+/// socket exists there, so nothing a test starts can reach a real session bus (and an empty
+/// address, which would fall back to `/run/user/<euid>/bus`, never happens).
+#[cfg(test)]
+pub(crate) const TEST_SESSION_BUS_ADDRESS: &str =
+    "unix:path=/nonexistent/passless-test-session-bus";
+
+/// The session bus address this process inherited, which the daemon's prompt child and
+/// `doctor --agents` use (ADR 0014 section 8.2). In unit tests it is always
+/// [`TEST_SESSION_BUS_ADDRESS`], never the developer's real session bus: a test that needs a bus
+/// starts a private one and passes its address explicitly.
+pub(crate) fn inherited_session_bus_address() -> Option<String> {
+    #[cfg(test)]
+    {
+        Some(TEST_SESSION_BUS_ADDRESS.to_string())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()
+    }
+}
+
 /// `/run/user/<uid>/bus`.
 pub fn user_bus_path(uid: u32) -> PathBuf {
     PathBuf::from(format!("/run/user/{}/bus", uid))
@@ -268,7 +290,7 @@ impl ProcessSpawner {
     pub fn new(notify_user: Option<String>) -> Self {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        let own_bus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        let own_bus_address = inherited_session_bus_address();
         Self::with_planner(
             PathBuf::from("/proc/self/exe"),
             vec![HIDDEN_ARG.to_string()],
@@ -865,6 +887,27 @@ mod tests {
                 &sockets(&[(1000, true, 1001)])
             )
             .is_err()
+        );
+    }
+
+    /// The guard behind every test that builds a real `ProcessSpawner` or runs the doctor: the
+    /// inherited `DBUS_SESSION_BUS_ADDRESS` (the developer's real session bus) is never used.
+    #[test]
+    fn unit_tests_never_see_the_inherited_session_bus() {
+        assert_eq!(
+            inherited_session_bus_address().as_deref(),
+            Some(TEST_SESSION_BUS_ADDRESS)
+        );
+        let spawner = ProcessSpawner::new(None);
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            let plan = (spawner.planner)().unwrap();
+            assert_eq!(plan.bus_address, TEST_SESSION_BUS_ADDRESS);
+        }
+        assert!(
+            !std::path::Path::new("/nonexistent").exists(),
+            "the guard address must stay unreachable"
         );
     }
 

@@ -466,7 +466,7 @@ pub fn notification_bus_check(config: &AgentConfig, euid: u32) -> DoctorCheck {
                 || rule.register == passless_core::agent::RuleAction::Request
         })
     });
-    let own_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+    let own_bus = prompt::inherited_session_bus_address();
     let plan = prompt::plan_prompt_child(
         euid,
         config.notify_user.as_deref(),
