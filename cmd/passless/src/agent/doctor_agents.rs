@@ -1120,13 +1120,26 @@ mod tests {
         let ours = cdp_port_check("coding", port, Some(&holder), true);
         assert!(!ours.message.starts_with("warning:"), "{ours:?}");
         drop(held);
-        let free = cdp_port_check(
-            "coding",
-            port,
-            crate::agent::cdp_owner::port_holder(port).as_ref(),
-            false,
-        );
-        assert!(free.passed && free.message.contains("is free"), "{free:?}");
+        // Another test may bind the freed ephemeral port at once: retry with fresh ports.
+        let freed = std::iter::once(port)
+            .chain((0..20).map(|_| {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                probe.local_addr().unwrap().port()
+            }))
+            .find_map(|p| {
+                let free = cdp_port_check(
+                    "coding",
+                    p,
+                    crate::agent::cdp_owner::port_holder(p).as_ref(),
+                    false,
+                );
+                if free.passed && free.message.contains("is free") {
+                    Some(free)
+                } else {
+                    None
+                }
+            });
+        assert!(freed.is_some(), "a released port is reported free");
     }
 
     /// A fixed port gets one informational line; it passes (so it cannot make the status
@@ -1190,12 +1203,22 @@ mod tests {
 
         // A free port: the plain check plus the hint, no warning.
         drop(held);
-        let free = fixed_port_checks("coding", &profile_with(Some(port)));
+        // Another test may bind the freed ephemeral port at once: retry with fresh ports.
+        let free = std::iter::once(port)
+            .chain((0..20).map(|_| {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                probe.local_addr().unwrap().port()
+            }))
+            .find_map(|p| {
+                let checks = fixed_port_checks("coding", &profile_with(Some(p)));
+                if checks.iter().all(|c| !c.message.starts_with("warning:")) {
+                    Some(checks)
+                } else {
+                    None
+                }
+            })
+            .expect("a released port is reported free");
         assert_eq!(hinted(&free), 1, "{free:?}");
-        assert!(
-            free.iter().all(|c| !c.message.starts_with("warning:")),
-            "{free:?}"
-        );
         assert!(healthy(&free), "{free:?}");
     }
 
