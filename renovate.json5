@@ -53,5 +53,12 @@
       ],
       enabled: true,
     },
+    {
+      groupName: 'soft-fido2',
+      matchPackageNames: [
+        'soft-fido2',
+        'soft-fido2-*',
+      ],
+    },
   ],
 }
