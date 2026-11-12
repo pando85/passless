@@ -385,6 +385,41 @@ fn absolute_dir(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The daemon configuration file: `PASSLESS_CONFIG`, else `<config dir>/passless/config.toml`
+/// (the resolution of `playwright_mcp::load_agent_config`).
+pub fn daemon_config_path(
+    env: Option<std::ffi::OsString>,
+    config_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    env.map(PathBuf::from)
+        .or_else(|| config_dir.map(|dir| dir.join("passless/config.toml")))
+}
+
+/// The hint printed when the selected profile pins `browser_cdp_port`: a fixed port is not
+/// needed (the MCP wrapper and `agent browser --env` find the endpoint themselves) and can
+/// collide with another browser. Only a note: it never changes the exit code or the config.
+pub fn cdp_port_note(
+    config: Option<&AgentConfig>,
+    profile: &str,
+    config_path: Option<&Path>,
+) -> Option<String> {
+    let port = config?
+        .profiles
+        .get(profile)?
+        .browser_cdp_port
+        .filter(|port| *port > 0)?;
+    let location = config_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "the passless config".to_owned());
+    Some(format!(
+        "note: profile '{profile}' pins browser_cdp_port = {port}; the MCP wrapper finds the \
+         browser's endpoint itself, so a fixed port is not needed and can collide with other \
+         browsers (e.g. a Firefox or Chrome started with --remote-debugging-port). Remove \
+         `browser_cdp_port` from [agents.profiles.{profile}] in {location} unless another tool \
+         needs that exact port."
+    ))
+}
+
 /// `passless agent mcp install`.
 pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
     let roots = Roots::from_process();
@@ -404,6 +439,11 @@ pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
         eprintln!("{note}");
     }
     let passless = resolved.path;
+    let note = cdp_port_note(
+        config.as_ref(),
+        &profile,
+        daemon_config_path(std::env::var_os("PASSLESS_CONFIG"), dirs::config_dir()).as_deref(),
+    );
     let mut failure = None;
 
     let file = config_path(request.client, &scope, &roots).ok_or_else(|| {
@@ -413,7 +453,15 @@ pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
         Ok(bytes) => {
             let text = String::from_utf8(bytes)
                 .map_err(|_| Error::Other(format!("{} is not valid UTF-8", file.display())))?;
-            if let Err(e) = install_file(&file, &text, request, &scope, &passless, &profile) {
+            if let Err(e) = install_file(
+                &file,
+                &text,
+                request,
+                &scope,
+                &passless,
+                &profile,
+                note.as_deref(),
+            ) {
                 failure = Some(e);
             }
         }
@@ -431,7 +479,25 @@ pub fn run(profile: Option<&str>, request: &InstallRequest) -> Result<()> {
     failure.map_or(Ok(()), Err)
 }
 
+/// Plan (and with `--yes` write) one file, then print `note` after it, in a dry run and with
+/// `--yes` alike. The note never changes the result.
 fn install_file(
+    file: &Path,
+    text: &str,
+    request: &InstallRequest,
+    scope: &Scope,
+    passless: &str,
+    profile: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    let result = install_plan(file, text, request, scope, passless, profile);
+    if let Some(note) = note {
+        println!("\n{note}");
+    }
+    result
+}
+
+fn install_plan(
     file: &Path,
     text: &str,
     request: &InstallRequest,

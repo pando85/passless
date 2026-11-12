@@ -63,6 +63,10 @@ first time instead; see [Rules](rules.md). `browser_cdp_expose = "port"` is what
 uses: it makes the managed browser's debugging port reachable on loopback, which is full control of
 that browser for any local process that finds it (see [Containment](containment.md#cdp-port-mode)).
 
+The profile leaves `browser_cdp_port` unset on purpose: the browser picks a free port and the MCP
+wrappers and `agent browser --env` find it, so it cannot collide with another browser you run with
+`--remote-debugging-port`. `agent mcp install` and `doctor --agents` note a pinned port.
+
 ## 2. Restart the daemon, then check the host
 
 The daemon reads the config only at start, so a changed config needs a restart:

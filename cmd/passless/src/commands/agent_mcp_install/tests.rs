@@ -236,6 +236,7 @@ fn install(file: &Path, text: &str, yes: bool) -> Result<()> {
         &Scope::Project(file.parent().unwrap().to_owned()),
         PASSLESS,
         "agent",
+        None,
     )
 }
 
@@ -657,4 +658,105 @@ fn a_passless_without_the_wrapper_is_refused() {
         "{err}"
     );
     assert!(verify_wrapper("/nonexistent/passless").is_err());
+}
+
+// ---- the browser_cdp_port hint ----------------------------------------------------------------
+
+fn pinned(port: Option<u16>) -> AgentConfig {
+    let port = port
+        .map(|port| format!("browser_cdp_port = {port}\n"))
+        .unwrap_or_default();
+    config(&format!(
+        "[profiles.coding]\nmode = \"same-user\"\nprincipal_user = \"agent\"\nbrowser_cdp_expose = \"port\"\n{port}"
+    ))
+}
+
+#[test]
+fn a_pinned_browser_cdp_port_gets_a_note_naming_the_profile_and_config() {
+    let path = Path::new("/home/alice/.config/passless/config.toml");
+    let note = cdp_port_note(Some(&pinned(Some(9222))), "coding", Some(path)).unwrap();
+    assert_eq!(
+        note,
+        "note: profile 'coding' pins browser_cdp_port = 9222; the MCP wrapper finds the \
+         browser's endpoint itself, so a fixed port is not needed and can collide with other \
+         browsers (e.g. a Firefox or Chrome started with --remote-debugging-port). Remove \
+         `browser_cdp_port` from [agents.profiles.coding] in \
+         /home/alice/.config/passless/config.toml unless another tool needs that exact port."
+    );
+}
+
+#[test]
+fn no_note_without_a_pinned_port() {
+    let path = Path::new("/c.toml");
+    assert_eq!(
+        cdp_port_note(Some(&pinned(None)), "coding", Some(path)),
+        None
+    );
+    assert_eq!(
+        cdp_port_note(Some(&pinned(Some(0))), "coding", Some(path)),
+        None
+    );
+    assert_eq!(
+        cdp_port_note(Some(&pinned(Some(9222))), "other", Some(path)),
+        None
+    );
+    assert_eq!(cdp_port_note(None, "coding", Some(path)), None);
+}
+
+#[test]
+fn the_note_follows_passless_config_then_the_default() {
+    assert_eq!(
+        daemon_config_path(Some("/etc/p.toml".into()), Some("/home/a/.config".into())),
+        Some(PathBuf::from("/etc/p.toml"))
+    );
+    assert_eq!(
+        daemon_config_path(None, Some("/home/a/.config".into())),
+        Some(PathBuf::from("/home/a/.config/passless/config.toml"))
+    );
+    assert_eq!(daemon_config_path(None, None), None);
+    let note = cdp_port_note(Some(&pinned(Some(9222))), "coding", None).unwrap();
+    assert!(note.contains("in the passless config unless"), "{note}");
+}
+
+#[test]
+fn the_note_changes_neither_the_result_nor_any_file() {
+    let note = cdp_port_note(
+        Some(&pinned(Some(9222))),
+        "coding",
+        Some(Path::new("/c.toml")),
+    );
+    assert!(note.is_some());
+    let with_note = |file: &Path, text: &str, yes: bool, note: Option<&str>| {
+        install_file(
+            file,
+            text,
+            &request(McpInstallClient::ClaudeCode, yes),
+            &Scope::Project(file.parent().unwrap().to_owned()),
+            PASSLESS,
+            "agent",
+            note,
+        )
+    };
+
+    // A dry run: Ok with and without the note, nothing written.
+    let (dir, file) = project_with(CALYPSO, 0o644);
+    with_note(&file, CALYPSO, false, note.as_deref()).unwrap();
+    with_note(&file, CALYPSO, false, None).unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), CALYPSO);
+    assert_eq!(entries(dir.path()), [".mcp.json"]);
+
+    // --yes: the same rewrite with the note as without.
+    let (_plain_dir, plain) = project_with(CALYPSO, 0o644);
+    with_note(&plain, CALYPSO, true, None).unwrap();
+    with_note(&file, CALYPSO, true, note.as_deref()).unwrap();
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        fs::read_to_string(&plain).unwrap()
+    );
+
+    // A failure stays a failure: JSONC with --yes is refused with the note too.
+    let jsonc = "{\n  // mine\n  \"mcpServers\": {\"p\": {\"command\": \"npx\", \"args\": [\"@playwright/mcp\"]}}\n}\n";
+    let (_dir, file) = project_with(jsonc, 0o600);
+    assert!(with_note(&file, jsonc, true, note.as_deref()).is_err());
+    assert!(with_note(&file, jsonc, true, None).is_err());
 }

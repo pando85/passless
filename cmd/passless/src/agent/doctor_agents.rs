@@ -467,14 +467,7 @@ pub fn cdp_port_check(
 ) -> DoctorCheck {
     let name = format!("{profile}: browser_cdp_port");
     match holder {
-        None => check(
-            name,
-            true,
-            format!(
-                "{port} is free on 127.0.0.1 (leaving browser_cdp_port unset, for an ephemeral \
-                 port, is recommended)"
-            ),
-        ),
+        None => check(name, true, format!("{port} is free on 127.0.0.1")),
         Some(holder) if managed => check(
             name,
             true,
@@ -494,6 +487,40 @@ pub fn cdp_port_check(
             ),
         ),
     }
+}
+
+/// The informational line for a profile that sets a fixed `browser_cdp_port`: no supported
+/// integration needs one. Always passing, so it never makes the report unhealthy, and separate
+/// from the occupied-port warning of [`cdp_port_check`].
+pub fn cdp_port_hint_check(profile: &str, port: u16) -> DoctorCheck {
+    check(
+        format!("{profile}: fixed browser_cdp_port"),
+        true,
+        format!(
+            "note: browser_cdp_port = {port} is not needed by any supported integration (the MCP \
+             wrappers and `passless agent browser --env` find the endpoint themselves); leave it \
+             unset so the browser picks an ephemeral port that cannot collide with other browsers"
+        ),
+    )
+}
+
+/// The checks for a profile's fixed `browser_cdp_port`, none when it sets none (or 0): the
+/// informational hint, and in port mode the occupied-port check.
+fn fixed_port_checks(profile_name: &str, profile: &AgentProfileConfig) -> Vec<DoctorCheck> {
+    let Some(port) = profile.browser_cdp_port.filter(|port| *port > 0) else {
+        return Vec::new();
+    };
+    let mut checks = Vec::new();
+    if profile.browser_cdp_expose == Some(passless_core::agent::config::CdpExposeMode::Port) {
+        let holder = super::cdp_owner::port_holder(port);
+        let managed = holder
+            .as_ref()
+            .and_then(|h| h.pid)
+            .is_some_and(|pid| is_managed_browser(pid, port));
+        checks.push(cdp_port_check(profile_name, port, holder.as_ref(), managed));
+    }
+    checks.push(cdp_port_hint_check(profile_name, port));
+    checks
 }
 
 /// Whether `pid` is a passless managed browser listening on `port`: started with that
@@ -843,16 +870,7 @@ pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
         let trusted_same_user = identity.uid == euid && identity.gid == egid;
         let report = containment::assess(&ContainmentPolicy::Auto, &setup, trusted_same_user);
         checks.push(containment_check(name, &report));
-        if profile.browser_cdp_expose == Some(passless_core::agent::config::CdpExposeMode::Port)
-            && let Some(port) = profile.browser_cdp_port.filter(|port| *port > 0)
-        {
-            let holder = super::cdp_owner::port_holder(port);
-            let managed = holder
-                .as_ref()
-                .and_then(|h| h.pid)
-                .is_some_and(|pid| is_managed_browser(pid, port));
-            checks.push(cdp_port_check(name, port, holder.as_ref(), managed));
-        }
+        checks.extend(fixed_port_checks(name, profile));
     }
 
     checks.push(extension);
@@ -972,6 +990,76 @@ mod tests {
             false,
         );
         assert!(free.passed && free.message.contains("is free"), "{free:?}");
+    }
+
+    /// A fixed port gets one informational line; it passes (so it cannot make the status
+    /// unhealthy) and is not the warning.
+    #[test]
+    fn the_cdp_port_hint_is_informational_and_never_unhealthy() {
+        let hint = cdp_port_hint_check("coding", 9222);
+        assert_eq!(hint.name, "coding: fixed browser_cdp_port");
+        assert!(hint.passed, "{hint:?}");
+        assert!(hint.message.starts_with("note:"), "{hint:?}");
+        assert!(!hint.message.starts_with("warning:"), "{hint:?}");
+        assert!(hint.message.contains("9222"), "{hint:?}");
+        assert!(hint.message.contains("agent browser --env"), "{hint:?}");
+        assert!(hint.message.contains("leave it unset"), "{hint:?}");
+        // The held-port warning stays a distinct line.
+        let free = cdp_port_check("coding", 9222, None, false);
+        assert!(!free.message.contains("unset"), "{free:?}");
+    }
+
+    fn profile_with(port: Option<u16>) -> AgentProfileConfig {
+        let port = port
+            .map(|port| format!("browser_cdp_port = {port}\n"))
+            .unwrap_or_default();
+        toml::from_str(&format!(
+            "mode = \"same-user\"\nprincipal_user = \"agent\"\nbrowser_cdp_expose = \"port\"\n{port}"
+        ))
+        .unwrap()
+    }
+
+    /// The hint is there when a port is set, absent when it is not, and the report's status
+    /// (every check passes) is the same either way.
+    #[test]
+    fn the_cdp_port_hint_appears_only_for_a_fixed_port_and_keeps_the_status() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let hinted = |checks: &[DoctorCheck]| {
+            checks
+                .iter()
+                .filter(|c| c.name == "coding: fixed browser_cdp_port")
+                .count()
+        };
+        let healthy = |checks: &[DoctorCheck]| checks.iter().all(|c| c.passed);
+
+        let unset = fixed_port_checks("coding", &profile_with(None));
+        assert!(unset.is_empty(), "{unset:?}");
+        assert!(healthy(&unset));
+        let zero = fixed_port_checks("coding", &profile_with(Some(0)));
+        assert!(zero.is_empty(), "{zero:?}");
+
+        // A port another process holds: the warning and, separately, the hint. Both pass.
+        let set = fixed_port_checks("coding", &profile_with(Some(port)));
+        assert_eq!(hinted(&set), 1, "{set:?}");
+        assert_eq!(set.len(), 2, "{set:?}");
+        assert!(
+            set.iter().any(|c| c.message.starts_with("warning:")),
+            "{set:?}"
+        );
+        assert!(healthy(&set), "{set:?}");
+        let hint = set.iter().find(|c| c.message.starts_with("note:")).unwrap();
+        assert!(!hint.message.starts_with("warning:"), "{hint:?}");
+
+        // A free port: the plain check plus the hint, no warning.
+        drop(held);
+        let free = fixed_port_checks("coding", &profile_with(Some(port)));
+        assert_eq!(hinted(&free), 1, "{free:?}");
+        assert!(
+            free.iter().all(|c| !c.message.starts_with("warning:")),
+            "{free:?}"
+        );
+        assert!(healthy(&free), "{free:?}");
     }
 
     #[test]
