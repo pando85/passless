@@ -2,6 +2,8 @@
 // Shared pieces of the P7 escalation scenarios (E2E-20/escalation, 21, 23 to 31, 43, 44, 48 to 50).
 
 const { execFile } = require('node:child_process');
+const os = require('node:os');
+const assert = require('node:assert/strict');
 
 const { waitFor, auditEvents, escalationEvents } = require('./helpers');
 
@@ -51,4 +53,32 @@ function dbusSendSignal(stack, args) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-module.exports = { requestProfile, start, settle, peek, abort, run, waitForAudit, waitForEscalation, dbusSendSignal, sleep };
+/** The registration prompt's summary (ADR 0014 amendment section 5.1): it says this is not a sign-in. */
+const REGISTER_SUMMARY = 'Passless: CREATE A NEW PASSKEY? (not a sign-in)';
+
+/**
+ * The registration prompt's body, every line daemon-derived. `siteRule` is `exact` ("your rule for this site") or
+ * `wildcard` ("NOT on your list; matched by the * rule"); `stored` is the "Stored in" line including the store-count clause.
+ */
+function registrationBody({ site, origin = `https://${site}`, siteRule = 'exact', stored, principal = os.userInfo().username }) {
+  const rule = siteRule === 'wildcard' ? 'NOT on your list; matched by the * rule' : 'your rule for this site';
+  return `Action: create a new passkey and register it at this site\nSite: ${site} (${rule})\nOrigin: ${origin}\nStored in: ${stored}\n` +
+    `Approving allows this one registration, then lets the agent sign in here without asking.\nRequested by: a page now, principal user ${principal}`;
+}
+
+/** "Stored in" of a same-user profile (the human's own store) with `count` passkeys already held for the site. */
+const humanStoreLine = (profile, count) =>
+  `YOUR passkey store (same-user profile "${profile}"), ${count === 0 ? 'which holds no passkey for this site yet' : `which already holds ${count} passkey${count === 1 ? '' : 's'} for this site`}`;
+
+/** A registration prompt's actions: exactly "Register once" and "Deny" (`register_once:<nonce>`, `deny:<nonce>`), never "Allow always". Returns the nonce. */
+function assertRegistrationActions(n) {
+  assert.equal(n.actions.length, 4, `actions: ${JSON.stringify(n.actions)}`);
+  assert.deepEqual(n.actions.filter((_, j) => j % 2 === 1), ['Register once', 'Deny'], `actions: ${JSON.stringify(n.actions)}`);
+  const nonce = (/^register_once:([0-9a-f]{32})$/.exec(n.actions[0]) || [])[1];
+  assert.ok(nonce, `register key: ${n.actions[0]}`);
+  assert.equal(n.actions[2], `deny:${nonce}`);
+  assert.equal(n.expire_timeout, 0, 'the notification does not expire by itself');
+  return nonce;
+}
+
+module.exports = { REGISTER_SUMMARY, registrationBody, humanStoreLine, assertRegistrationActions, requestProfile, start, settle, peek, abort, run, waitForAudit, waitForEscalation, dbusSendSignal, sleep };

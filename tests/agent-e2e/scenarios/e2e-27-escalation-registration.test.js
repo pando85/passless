@@ -3,26 +3,9 @@ const os = require('node:os');
 
 const { scenario, assert } = require('../lib/scenario');
 const { policyEvents, escalationEvents, grantedRuleEvents, denyReasons, grantsStore, assertInterceptionActive } = require('../lib/helpers');
-const { requestProfile } = require('../lib/escalation');
+const { requestProfile, REGISTER_SUMMARY, registrationBody, humanStoreLine, assertRegistrationActions } = require('../lib/escalation');
 
 const REGISTRATION = { rps: { a: { host: 'rp-a.test' } }, profiles: { iso: requestProfile(['rp-a.test'], { register: 'request', mode: 'isolated' }) } };
-
-const user = os.userInfo().username;
-/** The registration prompt's body (ADR 0014 amendment section 5.1) for an exact rule; `stored` is the "Stored in" line. */
-const registrationBody = ({ site, origin, stored }) =>
-  `Action: create a new passkey and register it at this site\nSite: ${site} (your rule for this site)\nOrigin: ${origin}\nStored in: ${stored}\n` +
-  `Approving allows this one registration, then lets the agent sign in here without asking.\nRequested by: a page now, principal user ${user}`;
-const REGISTER_SUMMARY = 'Passless: CREATE A NEW PASSKEY? (not a sign-in)';
-/** A registration prompt's actions: exactly "Register once" and "Deny", keys `register_once:<nonce>` and `deny:<nonce>`. Returns the nonce. */
-function assertRegistrationActions(n) {
-  assert.equal(n.actions.length, 4, `actions: ${JSON.stringify(n.actions)}`);
-  assert.deepEqual(n.actions.filter((_, j) => j % 2 === 1), ['Register once', 'Deny'], `actions: ${JSON.stringify(n.actions)}`);
-  const nonce = (/^register_once:([0-9a-f]{32})$/.exec(n.actions[0]) || [])[1];
-  assert.ok(nonce, `register key: ${n.actions[0]}`);
-  assert.equal(n.actions[2], `deny:${nonce}`);
-  assert.equal(n.expire_timeout, 0, 'the notification does not expire by itself');
-  return nonce;
-}
 
 // ADR 0014 section 8.3: an approved registration persists `authenticate = allow` for the RP with `kind = registration` and
 // the new credential's reference, but not `register = allow`: the next registration prompts again. The prompt is the
@@ -43,7 +26,7 @@ scenario({ id: 'E2E-27', exposeModes: ['port', 'pipe'], title: 'registration esc
   const prompt1 = stack.notify.notifications()[0];
   assert.equal(prompt1.summary, REGISTER_SUMMARY);
   assert.equal(prompt1.body, registrationBody({
-    site: 'rp-a.test', origin: 'https://rp-a.test',
+    site: 'rp-a.test',
     stored: 'the agent\'s own store (isolated profile "iso"), which holds no passkey for this site yet',
   }));
   const nonce1 = assertRegistrationActions(prompt1);
@@ -66,7 +49,7 @@ scenario({ id: 'E2E-27', exposeModes: ['port', 'pipe'], title: 'registration esc
   const prompt2 = stack.notify.notifications()[1];
   assert.equal(prompt2.summary, REGISTER_SUMMARY);
   assert.equal(prompt2.body, registrationBody({
-    site: 'rp-a.test', origin: 'https://rp-a.test',
+    site: 'rp-a.test',
     stored: 'the agent\'s own store (isolated profile "iso"), which already holds 1 passkey for this site',
   }), 'the store count follows the credential the first approval created');
   assert.notEqual(assertRegistrationActions(prompt2), nonce1, 'each prompt has its own nonce');
@@ -108,7 +91,7 @@ scenario({ id: 'E2E-28', exposeModes: ['port', 'pipe'], title: 'the notification
   const expected = [
     {
       summary: REGISTER_SUMMARY,
-      body: registrationBody({ site: 'rp-a.test', origin: 'https://rp-a.test', stored: `YOUR passkey store (same-user profile "agent"), which already holds 1 passkey for this site` }),
+      body: registrationBody({ site: 'rp-a.test', stored: humanStoreLine('agent', 1) }),
       key: 'register_once', label: 'Register once',
     },
     {
