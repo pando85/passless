@@ -15,6 +15,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use passless_core::McpAdapterKind;
 use passless_core::agent::protocol::{AdminRequest, AdminResponse, DoctorCheck, ProtocolError};
 use passless_core::agent::{AgentConfig, AgentProfileConfig};
 
@@ -23,6 +24,7 @@ use super::browser_select::{self, BrowserLaunch};
 use super::client::{AdminClient, ClientError, resolve_runtime_base};
 use super::containment::{self, ContainmentCase, ContainmentPolicy, ContainmentReport};
 use super::launcher::HardenedChildSetup;
+use super::mcp_clients::{self, Kind, Roots, Scope, Target};
 use super::prompt;
 
 fn check(name: impl Into<String>, passed: bool, message: impl Into<String>) -> DoctorCheck {
@@ -269,6 +271,161 @@ pub fn interaction_mode_check(config: &AgentConfig, automatic: bool) -> DoctorCh
         ),
         Err(e) => check("interaction_mode", false, e.to_string()),
     }
+}
+
+/// The profile `agent mcp install` is suggested with: the only profile that exposes a CDP port.
+fn suggested_profile(config: &AgentConfig) -> String {
+    let ports: Vec<&String> = config
+        .profiles
+        .iter()
+        .filter(|(_, profile)| {
+            profile.browser_cdp_expose == Some(passless_core::agent::config::CdpExposeMode::Port)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    match ports.as_slice() {
+        [only] => (*only).clone(),
+        _ => "<profile>".to_string(),
+    }
+}
+
+fn scope_name(scope: &Scope) -> &'static str {
+    match scope {
+        Scope::User => "user",
+        Scope::Project(_) => "project",
+    }
+}
+
+fn adapter_package(adapter: McpAdapterKind) -> &'static str {
+    match adapter {
+        McpAdapterKind::Playwright => "@playwright/mcp",
+        McpAdapterKind::ChromeDevtools => "chrome-devtools-mcp",
+    }
+}
+
+/// MCP clients whose browser MCP server starts a browser of its own: passkeys in it reach the
+/// human's authenticator and the agent policy never applies. A WARNING, not a failure: the
+/// configuration is valid, it just bypasses Passless. Entries that run through
+/// `passless agent mcp ...` are reported ok.
+pub fn mcp_client_checks(config: &AgentConfig, roots: &Roots) -> Vec<DoctorCheck> {
+    let targets = mcp_clients::doctor_targets(roots);
+    let profile = suggested_profile(config);
+    let mut checks = Vec::new();
+    for target in &targets {
+        checks.extend(mcp_target_checks(config, target, &profile));
+    }
+    if checks.is_empty() {
+        checks.push(check(
+            "mcp_clients",
+            true,
+            format!(
+                "no Playwright or chrome-devtools MCP entry in {} opencode / Claude Code \
+                 configuration file(s) (user scope and the current directory)",
+                targets.len()
+            ),
+        ));
+    }
+    checks
+}
+
+fn mcp_target_checks(config: &AgentConfig, target: &Target, profile: &str) -> Vec<DoctorCheck> {
+    let client = mcp_clients::client_name(target.client);
+    let path = target.path.display();
+    let Ok(text) = fs::read_to_string(&target.path) else {
+        return vec![check(
+            format!("mcp_client: {client}/{}", scope_name(&target.scope)),
+            true,
+            format!("warning: cannot read {path}; its MCP entries were not checked"),
+        )];
+    };
+    let root = match mcp_clients::parse_config(&text) {
+        Ok((root, _)) => root,
+        Err(e) => {
+            return vec![check(
+                format!("mcp_client: {client}/{}", scope_name(&target.scope)),
+                true,
+                format!("warning: {path} is {e}; its MCP entries were not checked"),
+            )];
+        }
+    };
+    let fix = if target.installable {
+        format!(
+            "Fix: {} (leave out --yes to preview the diff)",
+            mcp_clients::install_command(target, profile)
+        )
+    } else {
+        format!(
+            "Fix: edit it by hand (`passless agent mcp --print-config {client}` prints the entry; \
+             docs/agents/migration.md)"
+        )
+    };
+    mcp_clients::find_entries(target.client, &root)
+        .into_iter()
+        .map(|found| {
+            let name = format!(
+                "mcp_client: {client}/{}/{}",
+                scope_name(&target.scope),
+                found.entry.name
+            );
+            let entry = &found.entry.name;
+            match found.kind {
+                Kind::Plain(launch) => check(
+                    name,
+                    true,
+                    format!(
+                        "warning: {path}: entry '{entry}' starts its own browser ({} via {}): \
+                         passkeys from this MCP reach your human authenticator, not the agent \
+                         policy. {fix}",
+                        adapter_package(launch.adapter),
+                        launch.runner.label()
+                    ),
+                ),
+                Kind::Unsupported { adapter, why } => check(
+                    name,
+                    true,
+                    format!(
+                        "warning: {path}: entry '{entry}' starts its own {} browser ({why}): \
+                         passkeys from this MCP reach your human authenticator, not the agent \
+                         policy. Fix: edit it by hand (docs/agents/migration.md)",
+                        adapter_package(adapter)
+                    ),
+                ),
+                Kind::Wrapped { profile, .. } => {
+                    let problem = profile.as_deref().and_then(|p| match config.profiles.get(p) {
+                        None => Some(format!("profile '{p}' is not configured")),
+                        Some(cfg)
+                            if cfg.browser_cdp_expose
+                                != Some(passless_core::agent::config::CdpExposeMode::Port) =>
+                        {
+                            Some(format!(
+                                "profile '{p}' is not browser_cdp_expose = \"port\", which the adapters need"
+                            ))
+                        }
+                        Some(_) => None,
+                    });
+                    match problem {
+                        Some(problem) => check(
+                            name,
+                            true,
+                            format!("warning: {path}: entry '{entry}' runs through Passless, but {problem}"),
+                        ),
+                        None => check(
+                            name,
+                            true,
+                            format!(
+                                "{path}: entry '{entry}' runs through Passless{}",
+                                profile
+                                    .as_deref()
+                                    .map(|p| format!(" (profile {p})"))
+                                    .unwrap_or_default()
+                            ),
+                        ),
+                    }
+                }
+                Kind::Other => unreachable!("find_entries drops other servers"),
+            }
+        })
+        .collect()
 }
 
 /// The containment case of a profile's browser user (D6 layer 3).
@@ -629,6 +786,8 @@ pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
         std::env::var("PASSLESS_INTERACTION_MODE")
             .is_ok_and(|mode| mode.eq_ignore_ascii_case("automatic")),
     ));
+    // MCP clients that start a browser of their own bypass the agent policy.
+    checks.extend(mcp_client_checks(config, &Roots::from_process()));
     checks
 }
 
@@ -849,6 +1008,170 @@ mod tests {
         let silent = agent_subsystem_check(probe_agent_subsystem(&base));
         assert!(!silent.passed, "{silent:?}");
         assert!(silent.message.contains("did not answer"), "{silent:?}");
+    }
+
+    fn mcp_roots(cwd: &Path, claude: Option<&Path>) -> Roots {
+        Roots {
+            home: Some(cwd.join("no-home")),
+            claude_config_dir: claude.map(Path::to_path_buf),
+            cwd: Some(cwd.to_path_buf()),
+            ..Roots::default()
+        }
+    }
+
+    fn port_config() -> AgentConfig {
+        toml::from_str(
+            r#"
+            enabled = true
+            [profiles.agent]
+            mode = "same-user"
+            principal_user = "agent"
+            browser_cdp_expose = "port"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_plain_playwright_mcp_is_a_warning_with_the_exact_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"playwright": {"command": "pnpm", "args": ["dlx", "@playwright/mcp@0.0.83", "--isolated"]}, "other": {"command": "bash", "args": ["x.sh"]}}}"#,
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), None));
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        let check = &checks[0];
+        assert!(check.passed, "a warning is not a failure: {check:?}");
+        assert!(check.message.starts_with("warning:"), "{check:?}");
+        assert!(
+            check.message.contains(
+                "passkeys from this MCP reach your human authenticator, not the agent policy"
+            ),
+            "{check:?}"
+        );
+        assert!(check.message.contains("pnpm dlx"), "{check:?}");
+        let fix = format!(
+            "passless agent mcp install --client claude-code --project {} --profile agent --yes",
+            dir.path().display()
+        );
+        assert!(check.message.contains(&fix), "{check:?}");
+    }
+
+    #[test]
+    fn opencode_and_the_claude_config_dir_are_scanned_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("opencode.json"),
+            r#"{"mcp": {"servers": {"pw": {"type": "local", "command": ["/usr/bin/npx", "-y", "@playwright/mcp@latest"]}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            claude.path().join(".claude.json"),
+            r#"{"mcpServers": {"devtools": {"command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"]}}}"#,
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), Some(claude.path())));
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        let by_name = |name: &str| checks.iter().find(|c| c.name.contains(name)).unwrap();
+        assert!(
+            by_name("claude-code/user/devtools")
+                .message
+                .contains("chrome-devtools-mcp")
+        );
+        assert!(
+            by_name("claude-code/user/devtools")
+                .message
+                .contains("--client claude-code --user --profile agent --yes")
+        );
+        assert!(
+            by_name("opencode/project/pw")
+                .message
+                .contains("@playwright/mcp via npx")
+        );
+    }
+
+    #[test]
+    fn wrapped_entries_are_ok_and_a_missing_profile_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {
+                "playwright": {"command": "/usr/bin/passless", "args": ["agent", "mcp", "playwright", "--profile", "agent"]},
+                "devtools": {"command": "/usr/bin/passless", "args": ["agent", "mcp", "chrome-devtools", "--profile", "gone"]}
+            }}"#,
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), None));
+        let ok = checks
+            .iter()
+            .find(|c| c.name.ends_with("/playwright"))
+            .unwrap();
+        assert!(ok.passed && !ok.message.starts_with("warning:"), "{ok:?}");
+        assert!(
+            ok.message.contains("runs through Passless (profile agent)"),
+            "{ok:?}"
+        );
+        let gone = checks
+            .iter()
+            .find(|c| c.name.ends_with("/devtools"))
+            .unwrap();
+        assert!(
+            gone.passed
+                && gone.message.starts_with("warning:")
+                && gone.message.contains("'gone' is not configured"),
+            "{gone:?}"
+        );
+    }
+
+    #[test]
+    fn without_browser_entries_one_ok_check_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), None));
+        assert_eq!(checks.len(), 1);
+        assert!(
+            checks[0].passed
+                && checks[0].name == "mcp_clients"
+                && !checks[0].message.starts_with("warning:")
+        );
+        // An unparseable file is reported, not fatal.
+        fs::write(dir.path().join(".mcp.json"), "{ nope").unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), None));
+        assert!(
+            checks[0].passed && checks[0].message.starts_with("warning:"),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn the_fix_names_a_placeholder_when_the_profile_is_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"pw": {"command": "npx", "args": ["@playwright/mcp"]}}}"#,
+        )
+        .unwrap();
+        let two: AgentConfig = toml::from_str(
+            r#"
+            enabled = true
+            [profiles.a]
+            mode = "same-user"
+            principal_user = "agent"
+            browser_cdp_expose = "port"
+            [profiles.b]
+            mode = "same-user"
+            principal_user = "agent"
+            browser_cdp_expose = "port"
+            "#,
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&two, &mcp_roots(dir.path(), None));
+        assert!(
+            checks[0].message.contains("--profile <profile> --yes"),
+            "{checks:?}"
+        );
     }
 
     #[test]
