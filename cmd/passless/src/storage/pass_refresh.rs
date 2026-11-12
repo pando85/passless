@@ -263,6 +263,23 @@ impl CredentialStorage for PassStorageAdapter {
         self.current_count_for_rp(rp_id)
     }
 
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        let generation = repository_generation(&self.store_path, &self.path);
+        if generation == self.indexed_generation {
+            return self.inner.indexed_credentials();
+        }
+        match load_credential_paths(&self.store_path.join(&self.path), "gpg") {
+            Ok(indexes) => Some(indexes.credentials()),
+            Err(error) => {
+                warn!(
+                    "Failed to list credentials from changed repository state: {}",
+                    error
+                );
+                None
+            }
+        }
+    }
+
     fn disable_user_verification(&self) -> bool {
         self.inner.disable_user_verification()
     }

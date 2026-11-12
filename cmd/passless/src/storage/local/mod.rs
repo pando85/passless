@@ -193,6 +193,11 @@ impl CredentialStorage for LocalStorageAdapter {
     fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
         Some(self.indexes.count_for_rp(rp_id))
     }
+
+    /// From the path index: nothing is read, decrypted or unsealed.
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        Some(self.indexes.credentials())
+    }
 }
 
 #[cfg(test)]

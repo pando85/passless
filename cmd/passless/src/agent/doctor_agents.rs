@@ -275,7 +275,8 @@ pub fn interaction_mode_check(config: &AgentConfig, automatic: bool) -> DoctorCh
 }
 
 /// The result of the daemon's own configuration validation (`passless config check`) as checks:
-/// a configuration the daemon would refuse to start with is a FAIL, a deprecation is a warning.
+/// a configuration the daemon would refuse to start with is a FAIL, a deprecation or an advisory
+/// (a key without effect, a stale acknowledgement) is a warning.
 pub fn config_checks(
     checked: passless_core::Result<crate::commands::config_check::Checked>,
 ) -> Vec<DoctorCheck> {
@@ -292,9 +293,10 @@ pub fn config_checks(
         Ok(checked) => {
             let mut checks = vec![check("config", true, "the configuration validates")];
             checks.extend(
-                checked.warnings.into_iter().map(|warning| {
-                    check("config: deprecation", true, format!("warning: {warning}"))
-                }),
+                checked
+                    .warnings
+                    .into_iter()
+                    .map(|warning| check("config: warning", true, format!("warning: {warning}"))),
             );
             checks
         }
@@ -935,7 +937,11 @@ fn browser_identity(profile: &AgentProfileConfig, daemon: (u32, u32)) -> Browser
 }
 
 /// All the `--agents` checks for `config`, in order: the global ones, then each profile's.
-pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
+/// `human` locates the human credential store for the pin checks of same-user profiles.
+pub fn run(
+    config: &AgentConfig,
+    human: Option<&super::doctor_pins::HumanStore>,
+) -> Vec<DoctorCheck> {
     // SAFETY: no preconditions.
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     let mut checks = Vec::new();
@@ -1018,7 +1024,7 @@ pub fn run(config: &AgentConfig) -> Vec<DoctorCheck> {
         euid,
     ));
     // Granted rules no rule can reach any more, and stores of profiles that are gone.
-    checks.extend(super::doctor_grants::run(config, euid));
+    checks.extend(super::doctor_grants::run(config, euid, human));
     checks.push(interaction_mode_check(
         config,
         std::env::var("PASSLESS_INTERACTION_MODE")

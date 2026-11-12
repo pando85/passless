@@ -161,10 +161,16 @@ pub fn unknown_profile_stores_check(dir: &Path, configured: &BTreeSet<String>) -
     }
 }
 
-/// The offline `doctor --agents` checks: per profile, inert grants; once, stores of profiles that
-/// no longer exist. Reads the stores through the daemon's own loader (fail-closed checks and all),
-/// writes nothing.
-pub fn run(config: &AgentConfig, euid: u32) -> Vec<DoctorCheck> {
+/// The offline `doctor --agents` checks: per profile, inert grants, then the pin, wildcard
+/// registration and advisory checks of [`super::doctor_pins`] (`human` locates the human
+/// credential store for same-user profiles); once, stores of profiles that no longer exist. Reads
+/// the stores through the daemon's own loader (fail-closed checks and all) and the credential
+/// stores through their path indexes only, writes nothing.
+pub fn run(
+    config: &AgentConfig,
+    euid: u32,
+    human: Option<&super::doctor_pins::HumanStore>,
+) -> Vec<DoctorCheck> {
     let Some(state_dir) = config.effective_state_dir(euid) else {
         return Vec::new();
     };
@@ -184,6 +190,9 @@ pub fn run(config: &AgentConfig, euid: u32) -> Vec<DoctorCheck> {
         check.message = format!("profile '{name}': {}", check.message);
         checks.push(check);
     }
+    checks.extend(super::doctor_pins::run(config, human, &|name| {
+        ProfileId::new(name).ok().and_then(|id| store.profile(&id))
+    }));
     let configured: BTreeSet<String> = config.profiles.keys().cloned().collect();
     checks.push(unknown_profile_stores_check(
         &state_dir.join(GRANTED_RULES_DIR),
@@ -402,7 +411,7 @@ mod tests {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
 
-        let checks = run(&config, euid);
+        let checks = run(&config, euid, None);
         let message_of = |needle: &str| {
             checks
                 .iter()

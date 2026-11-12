@@ -131,6 +131,20 @@ impl CredentialIndexes {
                 .count()
         })
     }
+
+    /// Every indexed credential as `(RP ID, credential ID)`, read from the path index alone: no
+    /// credential file is opened, decrypted or unsealed. Sorted for stable reports.
+    // Read by the agent doctor checks only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub fn credentials(&self) -> Vec<(String, Vec<u8>)> {
+        let mut all: Vec<(String, Vec<u8>)> = self
+            .id
+            .values()
+            .map(|info| (info.rp_id.to_string(), info.cred_id.clone()))
+            .collect();
+        all.sort();
+        all
+    }
 }
 
 pub struct CachedCredential {
@@ -402,6 +416,21 @@ mod tests {
             assert_eq!(indexes.count_for_rp("unlisted.example"), 0, "{extension}");
             assert_eq!(indexes.count_for_rp(""), 0, "{extension}");
         }
+    }
+
+    #[test]
+    fn credentials_lists_rp_and_id_pairs_from_the_path_index() {
+        let dir = unreadable_store("gpg");
+        let indexes = load_credential_paths(dir.path(), "gpg").unwrap();
+        assert_eq!(
+            indexes.credentials(),
+            vec![
+                ("example.com".to_string(), vec![0xaa]),
+                ("example.com".to_string(), vec![0xbb]),
+                ("example.org".to_string(), vec![0xcc]),
+                ("login.example.com".to_string(), vec![0xdd]),
+            ]
+        );
     }
 
     #[test]

@@ -3017,6 +3017,20 @@ impl AgentRuntime {
             self.granted_rules.profile(profile_id).as_deref(),
             &self.granted_rules.path_for(profile_id),
         ));
+        // The profile's credential store as its path index shows it, for the pin checks. Read
+        // before the configuration lock and under the storage lock alone: no credential is
+        // decrypted or unsealed.
+        let indexed = super::lock_order::lock(
+            &profile.credential_storage,
+            super::lock_order::LockLevel::Storage,
+        )
+        .indexed_credentials();
+        let store_view = match indexed {
+            Some(credentials) => super::doctor_pins::StoreView::from_indexed(credentials),
+            None => super::doctor_pins::StoreView::Unknown(
+                "the backend cannot list its credentials without decrypting them".into(),
+            ),
+        };
         {
             let _level = super::lock_order::enter(super::lock_order::LockLevel::AgentConfig);
             let config = self
@@ -3034,9 +3048,19 @@ impl AgentRuntime {
                 profile_config,
                 euid,
             ));
+            let grants = self.granted_rules.profile(profile_id);
             report.checks.push(super::doctor_grants::inert_grants_check(
                 profile_config,
-                self.granted_rules.profile(profile_id).as_deref(),
+                grants.as_deref(),
+            ));
+            // What the pins cover, inert or missing pins, the wildcard registration count and
+            // the configuration advice that names this profile (ADR 0014 amendment 2.1, 2.2).
+            report.checks.extend(super::doctor_pins::profile_checks(
+                &config,
+                profile_id.as_str(),
+                profile_config,
+                grants.as_deref(),
+                &store_view,
             ));
         }
         // Deprecated config vocabulary is accepted with a warning until the release after next (plan R8):

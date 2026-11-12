@@ -990,6 +990,11 @@ impl CredentialStorage for PassStorageAdapter {
         Some(self.indexes.count_for_rp(rp_id))
     }
 
+    /// From the path index: nothing is read, decrypted or unsealed.
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        Some(self.indexes.credentials())
+    }
+
     fn disable_user_verification(&self) -> bool {
         // Pass backend doesn't support user verification
         true

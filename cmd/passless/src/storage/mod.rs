@@ -155,6 +155,16 @@ pub trait CredentialStorage: Send + Sync {
         None
     }
 
+    /// Every credential the store holds as `(RP ID, credential ID)`, when the backend can tell
+    /// without decrypting or unsealing anything. The agent doctor checks locate profile pins
+    /// (`credential_refs`) with it. Like [`Self::count_for_rp`] it must come from the path index
+    /// only; a backend that cannot list that way keeps the default `None`.
+    // Read by the agent doctor checks only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        None
+    }
+
     /// Check if user verification should be disabled for this backend
     ///
     /// Some backends (like pass) don't support user verification.
@@ -225,6 +235,10 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
         (**self).count_for_rp(rp_id)
+    }
+
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        (**self).indexed_credentials()
     }
 
     fn disable_user_verification(&self) -> bool {
