@@ -2141,7 +2141,7 @@ pub fn install_command(target: &Target, profile: &str) -> String {
     )
 }
 
-fn shell_word(word: &str) -> String {
+pub fn shell_word(word: &str) -> String {
     if !word.is_empty()
         && word
             .chars()

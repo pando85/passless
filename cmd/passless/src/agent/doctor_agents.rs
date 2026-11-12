@@ -16,9 +16,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use passless_core::McpAdapterKind;
 use passless_core::agent::protocol::{AdminRequest, AdminResponse, DoctorCheck, ProtocolError};
 use passless_core::agent::{AgentConfig, AgentProfileConfig};
+use passless_core::{McpAdapterKind, McpInstallClient};
 
 use super::browser::{self, ExtensionSelfCheck};
 use super::browser_select::{self, BrowserLaunch};
@@ -274,6 +274,33 @@ pub fn interaction_mode_check(config: &AgentConfig, automatic: bool) -> DoctorCh
     }
 }
 
+/// The result of the daemon's own configuration validation (`passless config check`) as checks:
+/// a configuration the daemon would refuse to start with is a FAIL, a deprecation is a warning.
+pub fn config_checks(
+    checked: passless_core::Result<crate::commands::config_check::Checked>,
+) -> Vec<DoctorCheck> {
+    match checked {
+        Err(e) => vec![check(
+            "config",
+            false,
+            format!(
+                "the daemon would refuse to start: {}. Fix the configuration and run \
+                 `passless config check` before restarting passless",
+                e.format_cli()
+            ),
+        )],
+        Ok(checked) => {
+            let mut checks = vec![check("config", true, "the configuration validates")];
+            checks.extend(
+                checked.warnings.into_iter().map(|warning| {
+                    check("config: deprecation", true, format!("warning: {warning}"))
+                }),
+            );
+            checks
+        }
+    }
+}
+
 /// The profile `agent mcp install` is suggested with: the only profile that exposes a CDP port.
 fn suggested_profile(config: &AgentConfig) -> String {
     let ports: Vec<&String> = config
@@ -313,9 +340,11 @@ pub fn mcp_client_checks(config: &AgentConfig, roots: &Roots) -> Vec<DoctorCheck
     let profile = suggested_profile(config);
     let mut checks = Vec::new();
     for target in &targets {
-        checks.extend(mcp_target_checks(config, target, &profile));
+        checks.extend(mcp_target_checks(config, target, &profile, roots));
     }
-    if checks.is_empty() {
+    let no_entries = checks.is_empty();
+    checks.extend(mcp_shadow_checks(roots, &profile));
+    if no_entries {
         checks.push(check(
             "mcp_clients",
             true,
@@ -329,7 +358,20 @@ pub fn mcp_client_checks(config: &AgentConfig, roots: &Roots) -> Vec<DoctorCheck
     checks
 }
 
-fn mcp_target_checks(config: &AgentConfig, target: &Target, profile: &str) -> Vec<DoctorCheck> {
+/// Whether a Claude Code local-scope project key is the working directory.
+fn is_cwd(project: &str, roots: &Roots) -> bool {
+    roots.cwd.as_deref().is_some_and(|cwd| {
+        Path::new(project) == cwd
+            || fs::canonicalize(cwd).is_ok_and(|real| real == Path::new(project))
+    })
+}
+
+fn mcp_target_checks(
+    config: &AgentConfig,
+    target: &Target,
+    profile: &str,
+    roots: &Roots,
+) -> Vec<DoctorCheck> {
     let client = mcp_clients::client_name(target.client);
     let path = target.path.display();
     let Ok(text) = fs::read_to_string(&target.path) else {
@@ -363,18 +405,35 @@ fn mcp_target_checks(config: &AgentConfig, target: &Target, profile: &str) -> Ve
     mcp_clients::find_entries(target.client, &root)
         .into_iter()
         .map(|found| {
-            let name = format!(
-                "mcp_client: {client}/{}/{}",
-                scope_name(&target.scope),
-                found.entry.name
-            );
-            let entry = &found.entry.name;
+            // A local-scope entry (`claude mcp add` without --scope) lives in the user-level file,
+            // under the project it belongs to, and only applies in that project.
+            let local = found.entry.local_project().map(|project| {
+                format!(
+                    " (local scope of project {project}, {})",
+                    if is_cwd(project, roots) {
+                        "which is the current directory: it applies here"
+                    } else {
+                        "not the current directory"
+                    }
+                )
+            });
+            let name = match found.entry.local_project() {
+                Some(project) => {
+                    format!("mcp_client: {client}/local[{project}]/{}", found.entry.name)
+                }
+                None => format!(
+                    "mcp_client: {client}/{}/{}",
+                    scope_name(&target.scope),
+                    found.entry.name
+                ),
+            };
+            let entry = &format!("'{}'{}", found.entry.name, local.unwrap_or_default());
             match found.kind {
                 Kind::Plain(launch) => check(
                     name,
                     true,
                     format!(
-                        "warning: {path}: entry '{entry}' starts its own browser ({} via {}): \
+                        "warning: {path}: entry {entry} starts its own browser ({} via {}): \
                          passkeys from this MCP reach your human authenticator, not the agent \
                          policy. {fix}",
                         adapter_package(launch.adapter),
@@ -385,7 +444,7 @@ fn mcp_target_checks(config: &AgentConfig, target: &Target, profile: &str) -> Ve
                     name,
                     true,
                     format!(
-                        "warning: {path}: entry '{entry}' starts its own {} browser ({why}): \
+                        "warning: {path}: entry {entry} starts its own {} browser ({why}): \
                          passkeys from this MCP reach your human authenticator, not the agent \
                          policy. Fix: edit it by hand (docs/agents/migration.md)",
                         adapter_package(adapter)
@@ -408,13 +467,13 @@ fn mcp_target_checks(config: &AgentConfig, target: &Target, profile: &str) -> Ve
                         Some(problem) => check(
                             name,
                             true,
-                            format!("warning: {path}: entry '{entry}' runs through Passless, but {problem}"),
+                            format!("warning: {path}: entry {entry} runs through Passless, but {problem}"),
                         ),
                         None => check(
                             name,
                             true,
                             format!(
-                                "{path}: entry '{entry}' runs through Passless{}",
+                                "{path}: entry {entry} runs through Passless{}",
                                 profile
                                     .as_deref()
                                     .map(|p| format!(" (profile {p})"))
@@ -425,6 +484,84 @@ fn mcp_target_checks(config: &AgentConfig, target: &Target, profile: &str) -> Ve
                 }
                 Kind::Other => unreachable!("find_entries drops other servers"),
             }
+        })
+        .collect()
+}
+
+/// A plain `playwright` server that overrides the user-level Passless one: Claude Code lets a
+/// local-scope entry beat a project `.mcp.json` entry, which beats a user-scope one of the same
+/// name; opencode merges a project `opencode.json` over the global one. The agent's tools then
+/// start a browser of their own and the Passless entry is never used. A warning, not a failure.
+fn mcp_shadow_checks(roots: &Roots, profile: &str) -> Vec<DoctorCheck> {
+    use mcp_clients::{Shadow, ShadowScope, shell_word};
+
+    let message = |shadow: &Shadow| {
+        let (verb, what) = if shadow.certain {
+            ("overrides", "")
+        } else {
+            (
+                "may override",
+                " (the precedence here is not certain: check which file your client reads)",
+            )
+        };
+        let place = match shadow.scope {
+            ShadowScope::Local => format!(
+                "the local-scope entry of this project in {} ({})",
+                shadow.file.display(),
+                shadow.what
+            ),
+            ShadowScope::Project => format!("{} ({})", shadow.file.display(), shadow.what),
+        };
+        let mut entry = shadow.user_entry.clone();
+        if let Some(map) = entry.as_object_mut() {
+            map.entry("type").or_insert_with(|| "stdio".into());
+        }
+        let json = shell_word(&serde_json::to_string(&entry).unwrap_or_default());
+        let fixes = match (shadow.client, shadow.scope) {
+            (McpInstallClient::ClaudeCode, ShadowScope::Project) => format!(
+                "Fix, one of: remove `playwright` from {file} (your own repo); override it for \
+                 you only: `claude mcp add-json playwright --scope local {json}` (a shared repo \
+                 you cannot change); or `passless agent mcp install --client claude-code \
+                 --project . --profile {profile} --yes` (rewrites {file}; it writes your passless \
+                 path and profile into the repo's file). Restart the Claude Code session \
+                 afterwards (docs/agents/browser-tools.md)",
+                file = shadow.file.display()
+            ),
+            (McpInstallClient::ClaudeCode, ShadowScope::Local) => format!(
+                "Fix, one of: `claude mcp remove playwright --scope local` in this project; \
+                 `claude mcp add-json playwright --scope local {json}` (replaces it); or \
+                 `passless agent mcp install --client claude-code --user --profile {profile} \
+                 --yes` (rewrites the local-scope entries too). Restart the Claude Code session \
+                 afterwards (docs/agents/browser-tools.md)"
+            ),
+            (McpInstallClient::Opencode, _) => format!(
+                "Fix, one of: remove `playwright` from {file}; or `passless agent mcp install \
+                 --client opencode --project . --profile {profile} --yes`. Restart opencode \
+                 afterwards (docs/agents/browser-tools.md)",
+                file = shadow.file.display()
+            ),
+        };
+        format!(
+            "warning: {user} runs `playwright` through Passless, but {place} {verb} it{what}: \
+             the agent gets a plain Playwright browser, not the managed one. {fixes}",
+            user = shadow.user_file.display()
+        )
+    };
+    mcp_clients::find_shadows(roots)
+        .iter()
+        .map(|shadow| {
+            check(
+                format!(
+                    "mcp_shadow: {}/{}/playwright",
+                    mcp_clients::client_name(shadow.client),
+                    match shadow.scope {
+                        ShadowScope::Local => "local",
+                        ShadowScope::Project => "project",
+                    }
+                ),
+                true,
+                message(shadow),
+            )
         })
         .collect()
 }
@@ -1452,5 +1589,154 @@ mod tests {
         if !check.passed {
             panic!("no request rule: must not fail: {check:?}");
         }
+    }
+
+    #[test]
+    fn a_plain_local_scope_entry_is_reported_with_its_project() {
+        // `claude mcp add playwright ...` without --scope: `projects.<path>.mcpServers`, in the
+        // user-level file. `install --user` rewrites it; the doctor says whether it applies here.
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let here = dir.path().to_string_lossy().into_owned();
+        fs::write(
+            claude.join(".claude.json"),
+            format!(
+                r#"{{"projects": {{
+                    "{here}": {{"mcpServers": {{"playwright": {{"type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"]}}}}}},
+                    "/elsewhere": {{"mcpServers": {{"playwright": {{"type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"]}}}}}}
+                }}}}"#
+            ),
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), Some(&claude)));
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        let here_check = checks
+            .iter()
+            .find(|c| c.name == format!("mcp_client: claude-code/local[{here}]/playwright"))
+            .unwrap();
+        assert!(here_check.passed && here_check.message.starts_with("warning: "));
+        assert!(
+            here_check.message.contains("applies here"),
+            "{here_check:?}"
+        );
+        assert!(
+            here_check
+                .message
+                .contains("passless agent mcp install --client claude-code --user"),
+            "{here_check:?}"
+        );
+        let other = checks
+            .iter()
+            .find(|c| c.name.contains("/elsewhere"))
+            .unwrap();
+        assert!(
+            other.message.contains("not the current directory"),
+            "{other:?}"
+        );
+    }
+
+    const USER_PASSLESS: &str = r#"{"mcpServers": {"playwright": {"type": "stdio", "command": "/usr/bin/passless", "args": ["agent", "mcp", "playwright", "--profile", "agent"]}}}"#;
+
+    #[test]
+    fn a_plain_project_entry_that_shadows_the_user_level_passless_one_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join(".claude.json"), USER_PASSLESS).unwrap();
+        fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"playwright": {"command": "npx", "args": ["@playwright/mcp@latest", "--headless"]}}}"#,
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), Some(&claude)));
+        let shadow = checks
+            .iter()
+            .find(|c| c.name == "mcp_shadow: claude-code/project/playwright")
+            .unwrap_or_else(|| panic!("{checks:?}"));
+        assert!(shadow.passed, "a warning, not a failure");
+        let message = &shadow.message;
+        assert!(message.starts_with("warning: "), "{message}");
+        assert!(
+            message.contains("overrides it") && !message.contains("may override"),
+            "{message}"
+        );
+        // The three fixes.
+        assert!(message.contains("remove `playwright` from"), "{message}");
+        assert!(
+            message.contains("claude mcp add-json playwright --scope local '{"),
+            "{message}"
+        );
+        assert!(
+            message.contains("\"command\":\"/usr/bin/passless\""),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "passless agent mcp install --client claude-code --project . --profile agent --yes"
+            ),
+            "{message}"
+        );
+        // The same repo seen from another account (no Passless entry there): nothing to warn about.
+        let other = dir.path().join("claude-other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(".claude.json"), "{}").unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), Some(&other)));
+        assert!(
+            !checks.iter().any(|c| c.name.starts_with("mcp_shadow")),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_entry_shadows_with_its_own_fixes_and_a_project_opencode_json_only_softly() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let here = dir.path().to_string_lossy().into_owned();
+        fs::write(
+            claude.join(".claude.json"),
+            format!(
+                r#"{{"mcpServers": {{"playwright": {{"command": "/usr/bin/passless", "args": ["agent", "mcp", "playwright", "--profile", "agent"]}}}},
+                    "projects": {{"{here}": {{"mcpServers": {{"playwright": {{"command": "npx", "args": ["@playwright/mcp"]}}}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let checks = mcp_client_checks(&port_config(), &mcp_roots(dir.path(), Some(&claude)));
+        let local = checks
+            .iter()
+            .find(|c| c.name == "mcp_shadow: claude-code/local/playwright")
+            .unwrap();
+        assert!(
+            local
+                .message
+                .contains("claude mcp remove playwright --scope local"),
+            "{local:?}"
+        );
+
+        // opencode: a project file is merged over the global one; only a soft warning.
+        let home = dir.path().join("home");
+        fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        fs::write(
+            home.join(".config/opencode/opencode.json"),
+            r#"{"mcp": {"servers": {"playwright": {"type": "local", "command": ["/usr/bin/passless", "agent", "mcp", "playwright", "--profile", "agent"]}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("opencode.json"),
+            r#"{"mcp": {"playwright": {"type": "local", "command": ["npx", "@playwright/mcp"]}}}"#,
+        )
+        .unwrap();
+        let roots = Roots {
+            home: Some(home),
+            cwd: Some(dir.path().to_path_buf()),
+            ..Roots::default()
+        };
+        let checks = mcp_client_checks(&port_config(), &roots);
+        let soft = checks
+            .iter()
+            .find(|c| c.name == "mcp_shadow: opencode/project/playwright")
+            .unwrap();
+        assert!(soft.message.contains("may override it"), "{soft:?}");
     }
 }

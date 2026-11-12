@@ -719,6 +719,14 @@ impl AppConfig {
         self.pin.clone()
     }
 
+    /// Everything the daemon checks of the configuration before it starts serving: [`Self::validate`]
+    /// and the backend's own validation (`main.rs` runs the same steps one by one, with its own
+    /// log messages). Used by `passless config check` and `passless doctor`.
+    pub fn check_startup(&self) -> crate::error::Result<()> {
+        self.validate()?;
+        self.backend()?.validate()
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> crate::error::Result<()> {
         self.pin.validate()?;
@@ -947,6 +955,18 @@ pub enum TpmAction {
 pub enum ConfigAction {
     /// Print the default configuration in TOML format
     Print,
+    /// Validate the configuration offline, as the daemon would at startup
+    ///
+    /// Loads the file like the daemon does (CLI flags and file merged, agent profiles parsed) and
+    /// runs the daemon's validation, including the agent profile rules and deprecation warnings.
+    /// Prints the warnings and exits non-zero on an error. It needs no running daemon, D-Bus or
+    /// UHID: run it before restarting the service.
+    Check {
+        /// Configuration file to check (default: `PASSLESS_CONFIG`, else
+        /// `~/.config/passless/config.toml`)
+        #[arg(short = 'c', long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
 }
 
 /// Agent administration actions
