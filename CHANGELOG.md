@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.27.2](https://github.com/pando85/passless/tree/v0.27.2) - 2026-11-13
+
+### Fixed
+
+- Stop pin policy denials consuming uv retries (#610) ([0060c53](https://github.com/pando85/passless/commit/0060c53c696bd114eae4891372ebd917d0444c1f))
+
 ## [v0.27.1](https://github.com/pando85/passless/tree/v0.27.1) - 2026-11-13
 
 ### Fixed
