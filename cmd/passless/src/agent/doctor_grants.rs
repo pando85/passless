@@ -307,7 +307,7 @@ mod tests {
             PermittingRule::Wildcard,
             None,
         );
-        let inert = inert_grants(&profile, &[wildcard.clone()]);
+        let inert = inert_grants(&profile, std::slice::from_ref(&wildcard));
         assert_eq!(
             inert,
             vec![InertGrant {
