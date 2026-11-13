@@ -920,7 +920,7 @@ impl AgentProfileConfig {
             &self.credential_selection,
             action,
             rp_id,
-            |_| false,
+            |_, _| false,
         )
     }
 
@@ -937,7 +937,7 @@ impl AgentProfileConfig {
             &self.credential_selection,
             action,
             rp_id,
-            |rp_id| grants.is_granted(profile_id, rp_id),
+            |rp_id, rule| grants.is_granted(profile_id, rp_id, rule),
         )
     }
 

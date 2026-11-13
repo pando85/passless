@@ -156,7 +156,7 @@ pub fn pin_findings(profile: &AgentProfileConfig, view: &StoreView) -> Vec<PinFi
                 &profile.credential_selection,
                 PolicyAction::Authenticate,
                 rp_id,
-                |_| false,
+                |_, _| false,
             );
             match (&matched.rule, matched.configured) {
                 (RuleIdentity::Exact(_), RuleAction::Deny) => Some(PinFinding::RuleDenies {

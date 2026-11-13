@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
-use passless_core::agent::{CredentialRef, GrantSource, ProfileId, validate_rp_id};
+use passless_core::agent::{CredentialRef, GrantSource, ProfileId, RuleIdentity, validate_rp_id};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -137,12 +137,15 @@ impl GrantedRule {
     }
 
     /// Two entries with the same key are duplicates. A registration grant per credential may sit
-    /// next to the RP's escalation grant.
-    fn key(&self) -> (String, GrantedAction, Option<String>) {
+    /// next to the RP's escalation grant, and a grant approved through `*` is a different grant
+    /// from one approved through the exact rule: each upgrades only its own rule, so an approval
+    /// under a new rule must not be swallowed as already granted.
+    fn key(&self) -> (String, GrantedAction, Option<String>, PermittingRule) {
         (
             self.rp_id.clone(),
             self.action,
             self.credential_ref.as_ref().map(CredentialRef::to_hex),
+            self.rule,
         )
     }
 }
@@ -634,29 +637,71 @@ impl GrantedRulesStore {
 }
 
 impl GrantSource for GrantedRulesStore {
-    fn is_granted(&self, profile_id: &ProfileId, rp_id: &str) -> bool {
-        let Ok(normalized) = validate_rp_id(rp_id) else {
-            return false;
-        };
-        self.profile(profile_id).is_some_and(|view| {
-            view.rules()
-                .iter()
-                .any(|rule| rule.rp_id == normalized && rule.action == GrantedAction::Authenticate)
-        })
+    fn is_granted(&self, profile_id: &ProfileId, rp_id: &str, rule: &RuleIdentity) -> bool {
+        self.matching(profile_id, rp_id, rule, |_| true)
+            .next()
+            .is_some()
     }
 
-    fn granted_credential_refs(&self, profile_id: &ProfileId, rp_id: &str) -> Vec<CredentialRef> {
+    fn granted_credential_refs(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+    ) -> Vec<CredentialRef> {
+        self.matching(profile_id, rp_id, rule, |_| true)
+            .filter_map(|grant| grant.credential_ref)
+            .collect()
+    }
+
+    fn has_escalation_grant(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+    ) -> bool {
+        self.matching(profile_id, rp_id, rule, |grant| {
+            grant.kind == GrantKind::Escalation
+        })
+        .next()
+        .is_some()
+    }
+}
+
+impl GrantedRulesStore {
+    /// The `authenticate` grants of `profile_id` for exactly `rp_id` that were approved through
+    /// the configured rule `rule` and satisfy `keep`. A grant made through `*` never matches an
+    /// exact rule and the reverse; `RuleIdentity::None` matches nothing.
+    fn matching(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+        keep: impl Fn(&GrantedRule) -> bool,
+    ) -> std::vec::IntoIter<GrantedRule> {
+        let permitting = match rule {
+            RuleIdentity::Exact(_) => PermittingRule::Exact,
+            RuleIdentity::Wildcard => PermittingRule::Wildcard,
+            RuleIdentity::None => return Vec::new().into_iter(),
+        };
         let Ok(normalized) = validate_rp_id(rp_id) else {
-            return Vec::new();
+            return Vec::new().into_iter();
         };
         let Some(view) = self.profile(profile_id) else {
-            return Vec::new();
+            return Vec::new().into_iter();
         };
-        view.rules()
+        let found: Vec<GrantedRule> = view
+            .rules()
             .iter()
-            .filter(|rule| rule.rp_id == normalized && rule.action == GrantedAction::Authenticate)
-            .filter_map(|rule| rule.credential_ref.clone())
-            .collect()
+            .filter(|grant| {
+                grant.rp_id == normalized
+                    && grant.action == GrantedAction::Authenticate
+                    && grant.rule == permitting
+                    && keep(grant)
+            })
+            .cloned()
+            .collect();
+        found.into_iter()
     }
 }
 
@@ -1001,6 +1046,10 @@ mod tests {
         ProfileId::new(PROFILE).unwrap()
     }
 
+    fn exact(rp_id: &str) -> RuleIdentity {
+        RuleIdentity::Exact(rp_id.to_string())
+    }
+
     fn config() -> AgentConfig {
         AgentConfig::from_toml_str(
             r#"
@@ -1088,7 +1137,7 @@ rule = "exact"
             reason.contains(needle),
             "reason {reason:?} does not mention {needle:?}"
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1131,10 +1180,10 @@ rule = "exact"
             store.profile(&profile()).unwrap().as_ref()
         );
         assert_eq!(reopened.profile(&profile()).unwrap().rules().len(), 2);
-        assert!(reopened.is_granted(&profile(), "example.com"));
-        assert!(!reopened.is_granted(&profile(), "other.example"));
+        assert!(reopened.is_granted(&profile(), "example.com", &exact("example.com")));
+        assert!(!reopened.is_granted(&profile(), "other.example", &exact("other.example")));
         assert_eq!(
-            reopened.granted_credential_refs(&profile(), "example.com"),
+            reopened.granted_credential_refs(&profile(), "example.com", &exact("example.com")),
             vec![credential]
         );
         assert_eq!(
@@ -1144,6 +1193,91 @@ rule = "exact"
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.starts_with("version = 1\n"), "{content}");
         assert!(content.contains("[[grant]]"), "{content}");
+    }
+
+    fn grant_of(
+        rp_id: &str,
+        kind: GrantKind,
+        rule: PermittingRule,
+        credential: Option<&CredentialRef>,
+    ) -> GrantedRule {
+        GrantedRule::new(
+            rp_id,
+            kind,
+            "req",
+            "https://example.org",
+            rule,
+            credential.cloned(),
+        )
+    }
+
+    /// Review M1: a grant answers only for the rule it was approved through.
+    #[test]
+    fn grants_match_by_the_rule_they_were_approved_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = policy();
+        let store = open(tmp.path());
+        let credential = CredentialRef::with_default_domain(&[7; 32]);
+        store
+            .add(
+                &policy,
+                &profile(),
+                grant_of(
+                    "example.org",
+                    GrantKind::Registration,
+                    PermittingRule::Wildcard,
+                    Some(&credential),
+                ),
+                64,
+            )
+            .unwrap();
+        let wildcard = RuleIdentity::Wildcard;
+        let exact_rule = exact("example.org");
+        assert!(store.is_granted(&profile(), "example.org", &wildcard));
+        assert!(!store.is_granted(&profile(), "example.org", &exact_rule));
+        assert!(!store.is_granted(&profile(), "example.org", &RuleIdentity::None));
+        assert_eq!(
+            store.granted_credential_refs(&profile(), "example.org", &wildcard),
+            vec![credential.clone()]
+        );
+        assert!(
+            store
+                .granted_credential_refs(&profile(), "example.org", &exact_rule)
+                .is_empty()
+        );
+        // Registration grants alone are not an escalation grant.
+        assert!(!store.has_escalation_grant(&profile(), "example.org", &wildcard));
+
+        // An approval through the exact rule is its own grant, not swallowed as a duplicate of
+        // the `*` one, and it does not widen the `*` rule.
+        let escalated = grant_of(
+            "example.org",
+            GrantKind::Escalation,
+            PermittingRule::Exact,
+            None,
+        );
+        assert!(matches!(
+            store.add(&policy, &profile(), escalated.clone(), 64),
+            Ok(AddOutcome::Added { .. })
+        ));
+        assert_eq!(
+            store.add(&policy, &profile(), escalated, 64),
+            Ok(AddOutcome::AlreadyGranted)
+        );
+        assert!(store.is_granted(&profile(), "example.org", &exact_rule));
+        assert!(store.has_escalation_grant(&profile(), "example.org", &exact_rule));
+        assert!(!store.has_escalation_grant(&profile(), "example.org", &wildcard));
+        assert!(
+            store
+                .granted_credential_refs(&profile(), "example.org", &exact_rule)
+                .is_empty(),
+            "the exact escalation grant records no credential"
+        );
+        // Both grants survive a reload.
+        let reopened = open(tmp.path());
+        assert_eq!(reopened.profile(&profile()).unwrap().rules().len(), 2);
+        assert!(reopened.is_granted(&profile(), "example.org", &wildcard));
+        assert!(reopened.is_granted(&profile(), "example.org", &exact_rule));
     }
 
     #[test]
@@ -1199,12 +1333,12 @@ rule = "exact"
         fs::write(&leftover, "garbage from a crash").unwrap();
 
         let store = open(tmp.path());
-        assert!(store.is_granted(&profile(), "example.com"));
+        assert!(store.is_granted(&profile(), "example.com", &exact("example.com")));
         store
             .add(&policy(), &profile(), escalation("other.example"), 64)
             .unwrap();
         assert!(!leftover.exists());
-        assert!(open(tmp.path()).is_granted(&profile(), "other.example"));
+        assert!(open(tmp.path()).is_granted(&profile(), "other.example", &exact("other.example")));
     }
 
     #[test]
@@ -1256,7 +1390,7 @@ rule = "exact"
             .unwrap()
             .to_string();
         assert!(reason.contains("owned by uid"), "{reason}");
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1286,7 +1420,7 @@ rule = "exact"
                 .unwrap()
                 .is_some()
         );
-        assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     /// Review L4: a store directory that is a symlink is refused, for reads and for writes, and
@@ -1307,7 +1441,7 @@ rule = "exact"
 
         assert_disabled(tmp.path(), "symlink");
         let store = open(tmp.path());
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
 
         // Writes refuse as well, and the link target is untouched.
         let err = write_atomically(
@@ -1355,7 +1489,7 @@ rule = "exact"
             .add(&policy(), &profile(), escalation("other.example"), 64)
             .unwrap();
         assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
-        assert!(open(tmp.path()).is_granted(&profile(), "other.example"));
+        assert!(open(tmp.path()).is_granted(&profile(), "other.example", &exact("other.example")));
         assert!(!dir.join(".agent.toml.tmp").exists());
     }
 
@@ -1381,7 +1515,7 @@ rule = "exact"
                 .file_type()
                 .is_symlink()
         );
-        assert!(open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1408,7 +1542,7 @@ rule = "exact"
             .unwrap();
         let dir = state.join(GRANTED_RULES_DIR);
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
-        assert!(open(&state).is_granted(&profile(), "example.com"));
+        assert!(open(&state).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1423,7 +1557,7 @@ rule = "exact"
             .add(&policy(), &profile(), escalation("example.com"), 64)
             .unwrap();
         assert!(real.join(GRANTED_RULES_DIR).join("agent.toml").is_file());
-        assert!(open(&link).is_granted(&profile(), "example.com"));
+        assert!(open(&link).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1555,8 +1689,8 @@ rule = "exact"
             live.validity(policy.revocation_epoch(), Instant::now()),
             Err(SessionInvalid::EpochChanged)
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
-        assert!(!open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
+        assert!(!open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
 
         let outcome = store.clear(&policy, &profile()).unwrap();
         assert_eq!(outcome.revoked, 1);
@@ -1596,9 +1730,9 @@ rule = "exact"
         let outcome = store.revoke_request(&policy, &profile(), "esc-1").unwrap();
         assert_eq!(outcome.revoked, 1);
         assert_eq!(policy.revocation_epoch(), revocation_epoch + 1);
-        assert!(!store.is_granted(&profile(), "example.com"));
-        assert!(store.is_granted(&profile(), "other.example"));
-        assert!(!open(tmp.path()).is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
+        assert!(store.is_granted(&profile(), "other.example", &exact("other.example")));
+        assert!(!open(tmp.path()).is_granted(&profile(), "example.com", &exact("example.com")));
     }
 
     #[test]
@@ -1642,7 +1776,7 @@ rule = "exact"
             store.profile(&profile()).unwrap().disabled_reason(),
             Some("no state dir")
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
         assert!(matches!(
             store.add(&policy(), &profile(), escalation("example.com"), 64),
             Err(GrantStoreError::Unavailable(_))
@@ -1676,7 +1810,7 @@ rule = "exact"
             ),
             Err(GrantStoreError::Revoked)
         );
-        assert!(!store.is_granted(&profile(), "example.com"));
+        assert!(!store.is_granted(&profile(), "example.com", &exact("example.com")));
 
         // Another RP's token is unaffected by that revoke.
         let other = store.revoke_token(&profile(), "other.example").unwrap();
@@ -1689,7 +1823,7 @@ rule = "exact"
                 Some(other),
             )
             .unwrap();
-        assert!(store.is_granted(&profile(), "other.example"));
+        assert!(store.is_granted(&profile(), "other.example", &exact("other.example")));
 
         // A fresh token works; a clear makes every token of the profile stale.
         let fresh = store.revoke_token(&profile(), "example.com").unwrap();

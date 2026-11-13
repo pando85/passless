@@ -3088,8 +3088,11 @@ mod tests {
             Some(CredentialRef::with_default_domain(&credential_id))
         );
         assert_eq!(
-            f.policy_runtime
-                .granted_credential_refs(&f.profile_id, "example.org"),
+            f.policy_runtime.granted_credential_refs(
+                &f.profile_id,
+                "example.org",
+                &RuleIdentity::Wildcard
+            ),
             vec![CredentialRef::with_default_domain(&credential_id)]
         );
         // The `*` sign-in at that RP is now a granted allow; other unlisted RPs still escalate.

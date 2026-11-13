@@ -9,7 +9,8 @@ use passless_core::agent::protocol::GrantAction;
 use passless_core::agent::{
     AgentConfig, AgentMode, AgentProfileConfig, AgentRpRule, CredentialRef, CredentialSelection,
     GrantId, GrantSource, MatchedRule, NoGrantedRules, Policy, PolicyAction, PolicyDigest,
-    PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId, RuleAction, resolve_rules,
+    PolicyGenerationId, PolicyParams, PrincipalSessionId, ProfileId, RuleAction, RuleIdentity,
+    resolve_rules,
 };
 
 use super::audit::AuditGate;
@@ -100,7 +101,7 @@ impl PolicySnapshot {
             &self.credential_selection,
             policy_action(action),
             rp_id,
-            |rp_id| grants.is_granted(&self.profile_id, rp_id),
+            |rp_id, rule| grants.is_granted(&self.profile_id, rp_id, rule),
         )
     }
 }
@@ -549,9 +550,23 @@ impl PolicyRuntime {
         &self,
         profile_id: &ProfileId,
         rp_id: &str,
+        rule: &RuleIdentity,
     ) -> Vec<CredentialRef> {
         self.granted_rules
-            .granted_credential_refs(profile_id, rp_id)
+            .granted_credential_refs(profile_id, rp_id, rule)
+    }
+
+    /// Whether the grants through `rule` at exactly `rp_id` include an approved `authenticate`
+    /// escalation, as opposed to registration grants only (see
+    /// [`GrantSource::has_escalation_grant`]).
+    pub fn has_escalation_grant(
+        &self,
+        profile_id: &ProfileId,
+        rp_id: &str,
+        rule: &RuleIdentity,
+    ) -> bool {
+        self.granted_rules
+            .has_escalation_grant(profile_id, rp_id, rule)
     }
 
     /// Resolve `(action, rp_id)` for `profile_id` against the LIVE compiled policy (the current
@@ -573,7 +588,7 @@ impl PolicyRuntime {
                 &CredentialSelection::default(),
                 policy_action(action),
                 rp_id,
-                |_| false,
+                |_, _| false,
             ),
         }
     }
@@ -1000,7 +1015,7 @@ mod tests {
     }
 
     impl GrantSource for TestGrants {
-        fn is_granted(&self, profile_id: &ProfileId, rp_id: &str) -> bool {
+        fn is_granted(&self, profile_id: &ProfileId, rp_id: &str, _rule: &RuleIdentity) -> bool {
             self.0
                 .iter()
                 .any(|(p, r)| p == profile_id.as_str() && r == rp_id)

@@ -1,9 +1,11 @@
 //! Orphaned and inert granted rules (ADR 0014 section 6.2).
 //!
 //! A granted rule only ever upgrades a configured `authenticate = "request"` to `allow` for its
-//! exact RP. It does nothing when no rule of the profile reaches the RP, when the reaching rule is
-//! now `deny`, or when it is `allow` (the grant is redundant), and nothing remains to consult it
-//! when the profile itself is gone from the configuration. None of these is a security problem
+//! exact RP, and only through the rule it was approved through (`exact` or `*`). It does nothing
+//! when no rule of the profile reaches the RP, when the reaching rule is now `deny`, when it is
+//! `allow` (the grant is redundant), or when a different rule reaches the RP now (a grant made
+//! through `*` at an RP an exact rule now governs, or the reverse), and nothing remains to consult
+//! it when the profile itself is gone from the configuration. None of these is a security problem
 //! (resolution never consults an inert grant), but the operator should know, because the entry
 //! will silently start working again if the rule goes back to `request`.
 //!
@@ -20,7 +22,9 @@ use passless_core::agent::{
     resolve_rules,
 };
 
-use super::granted_rules::{GRANTED_RULES_DIR, GrantedRule, GrantedRulesStore, ProfileGrants};
+use super::granted_rules::{
+    GRANTED_RULES_DIR, GrantedRule, GrantedRulesStore, PermittingRule, ProfileGrants,
+};
 
 /// Why a granted rule does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +35,9 @@ pub enum InertReason {
     RuleDenies,
     /// The reaching rule is `allow`: the grant is redundant.
     RuleAllows,
+    /// The grant was approved through a different rule than the one that reaches the RP now: a
+    /// `*` grant at an RP with an exact rule, or an exact grant whose rule was removed.
+    OtherRule,
 }
 
 impl InertReason {
@@ -39,6 +46,9 @@ impl InertReason {
             Self::NoRule => "no rule of the profile reaches this RP",
             Self::RuleDenies => "its rule is now deny",
             Self::RuleAllows => "its rule is now allow, so the grant is redundant",
+            Self::OtherRule => {
+                "it was approved through another rule than the one that governs this RP now"
+            }
         }
     }
 }
@@ -53,8 +63,9 @@ pub struct InertGrant {
 /// The granted rules of `profile` that the configuration no longer lets act.
 ///
 /// A grant is live exactly when resolving its RP over the profile's rules, with the grant
-/// present, gives a configured `request` that the grant upgrades (the resolver's own rule, so the
-/// wildcard `request` and exact `request` cases agree with the runtime).
+/// present, gives a configured `request` that the grant upgrades: the resolver's own rule, so the
+/// wildcard `request` and exact `request` cases agree with the runtime, including that a grant
+/// upgrades only the rule (`exact` or `*`) it was approved through.
 pub fn inert_grants(profile: &AgentProfileConfig, grants: &[GrantedRule]) -> Vec<InertGrant> {
     grants
         .iter()
@@ -64,7 +75,7 @@ pub fn inert_grants(profile: &AgentProfileConfig, grants: &[GrantedRule]) -> Vec
                 &profile.credential_selection,
                 PolicyAction::Authenticate,
                 &grant.rp_id,
-                |_| true,
+                |_, rule| permitting_rule_of(rule) == Some(grant.rule),
             );
             if matched.granted {
                 return None;
@@ -72,6 +83,7 @@ pub fn inert_grants(profile: &AgentProfileConfig, grants: &[GrantedRule]) -> Vec
             let reason = match (&matched.rule, matched.configured) {
                 (RuleIdentity::None, _) => InertReason::NoRule,
                 (_, RuleAction::Allow) => InertReason::RuleAllows,
+                (_, RuleAction::Request) => InertReason::OtherRule,
                 _ => InertReason::RuleDenies,
             };
             Some(InertGrant {
@@ -80,6 +92,15 @@ pub fn inert_grants(profile: &AgentProfileConfig, grants: &[GrantedRule]) -> Vec
             })
         })
         .collect()
+}
+
+/// The permitting-rule kind a resolved rule corresponds to (what a grant records).
+fn permitting_rule_of(rule: &RuleIdentity) -> Option<PermittingRule> {
+    match rule {
+        RuleIdentity::Exact(_) => Some(PermittingRule::Exact),
+        RuleIdentity::Wildcard => Some(PermittingRule::Wildcard),
+        RuleIdentity::None => None,
+    }
 }
 
 /// The `granted_rules_inert` check of one profile: passes with a `warning:` when grants are inert
@@ -96,12 +117,20 @@ pub fn inert_grants_check(
             message: "no granted-rules store for this profile".into(),
         };
     };
-    let inert = inert_grants(profile, view.rules());
+    let grants = view.rules();
+    let inert = inert_grants(profile, grants);
     if inert.is_empty() {
+        let message = match grants.len() {
+            0 => "no granted rules".to_string(),
+            n => format!(
+                "all {n} granted rule(s) are live: each upgrades the request rule it was \
+                 approved through"
+            ),
+        };
         return DoctorCheck {
             name,
             passed: true,
-            message: "every granted rule is backed by a request rule".into(),
+            message,
         };
     }
     let list = inert
@@ -230,12 +259,16 @@ mod tests {
     }
 
     fn grant(rp_id: &str) -> GrantedRule {
+        grant_through(rp_id, PermittingRule::Exact)
+    }
+
+    fn grant_through(rp_id: &str, rule: PermittingRule) -> GrantedRule {
         GrantedRule::new(
             rp_id,
             GrantKind::Escalation,
             "req",
             "https://example.com",
-            PermittingRule::Exact,
+            rule,
             None,
         )
     }
@@ -249,7 +282,67 @@ mod tests {
     #[test]
     fn a_grant_under_the_wildcard_request_rule_is_live() {
         let profile = profile(vec![rule("*", RuleAction::Request)]);
-        assert!(inert_grants(&profile, &[grant("github.com")]).is_empty());
+        assert!(
+            inert_grants(
+                &profile,
+                &[grant_through("github.com", PermittingRule::Wildcard)]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_wildcard_grant_at_an_rp_with_an_exact_request_rule_is_inert() {
+        // A registration approved through `*`, then the operator adds an exact rule for the RP:
+        // the grant no longer upgrades anything (review M1).
+        let profile = profile(vec![
+            rule("*", RuleAction::Request),
+            rule("example.org", RuleAction::Request),
+        ]);
+        let wildcard = GrantedRule::new(
+            "example.org",
+            GrantKind::Registration,
+            "req",
+            "https://example.org",
+            PermittingRule::Wildcard,
+            None,
+        );
+        let inert = inert_grants(&profile, &[wildcard.clone()]);
+        assert_eq!(
+            inert,
+            vec![InertGrant {
+                rp_id: "example.org".into(),
+                reason: InertReason::OtherRule
+            }]
+        );
+        let view = ProfileGrants::Enabled(vec![wildcard]);
+        let check = inert_grants_check(&profile, Some(&view));
+        assert!(check.passed);
+        assert!(
+            check.message.starts_with("warning:") && check.message.contains("example.org"),
+            "{check:?}"
+        );
+        assert!(check.message.contains("another rule"), "{check:?}");
+        // Other RPs stay live under `*`, and an exact grant under the exact rule is live.
+        assert!(
+            inert_grants(
+                &profile,
+                &[
+                    grant_through("other.example", PermittingRule::Wildcard),
+                    grant("example.org"),
+                ]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_exact_grant_whose_rule_was_removed_is_inert_under_the_wildcard() {
+        let profile = profile(vec![rule("*", RuleAction::Request)]);
+        assert_eq!(
+            inert_grants(&profile, &[grant("example.org")])[0].reason,
+            InertReason::OtherRule
+        );
     }
 
     #[test]
@@ -328,6 +421,25 @@ mod tests {
         assert!(check.message.starts_with("warning:"), "{check:?}");
         assert!(check.message.contains("github.com"), "{check:?}");
         assert!(check.message.contains("orphaned"), "{check:?}");
+    }
+
+    #[test]
+    fn the_check_message_is_accurate_with_and_without_grants() {
+        let profile = profile(vec![rule("github.com", RuleAction::Request)]);
+        let none = inert_grants_check(&profile, Some(&ProfileGrants::Enabled(Vec::new())));
+        assert_eq!(none.message, "no granted rules");
+        let live = inert_grants_check(
+            &profile,
+            Some(&ProfileGrants::Enabled(vec![grant("github.com")])),
+        );
+        assert!(
+            live.message.contains("all 1 granted rule(s) are live"),
+            "{live:?}"
+        );
+        assert!(
+            !live.message.contains("backed by a request rule"),
+            "{live:?}"
+        );
     }
 
     #[test]

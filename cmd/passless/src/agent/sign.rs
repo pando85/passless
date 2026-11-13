@@ -1314,41 +1314,69 @@ pub(crate) fn decode_challenge(challenge_b64u: &str) -> Result<Vec<u8>, Protocol
 /// Where the candidate credentials of one authentication come from (ADR 0014 section 10.1,
 /// first step, as amended by section 2.1 of the amendment):
 ///
-/// | matched rule | profile `credential_refs` | candidates |
-/// |---|---|---|
-/// | exact | set | the pins plus the registration-granted credentials of this RP |
-/// | exact | unset | discovery within this RP |
-/// | `*` | either | discovery within this RP, unless the RP has registration-granted credentials: then only those |
+/// | matched rule | grant upgrade | profile `credential_refs` | candidates |
+/// |---|---|---|---|
+/// | exact | registration grants only | either | only the credentials those grants recorded |
+/// | exact | none, or an escalation grant | set | the pins plus the registration-granted credentials of this RP |
+/// | exact | none, or an escalation grant | unset | discovery within this RP |
+/// | `*` | any | either | discovery within this RP, unless the RP has registration-granted credentials: then only those |
 ///
-/// The profile pins never apply to a `*` match, and an RP with an exact rule never resolves
-/// through `*` (resolution order), so a pinned RP never falls through to discovery.
+/// Grants count only when they were approved through the rule that matches now (resolution
+/// guarantees it for the upgrade; the credential lookups filter on the same identity). The profile
+/// pins never apply to a `*` match, and an RP with an exact rule never resolves through `*`
+/// (resolution order), so a pinned RP never falls through to discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CandidateSource {
     /// An exact rule with pins configured.
     Pinned(Vec<CredentialRef>),
     /// Every credential of the RP.
     Discovered,
-    /// A `*` match at an RP where the agent registered a credential (amendment section 2.2
-    /// item 3): it signs in there only with credentials it created, never with the human's.
+    /// The agent registered a credential here and the sign-in is permitted by that registration
+    /// (a `*` match, or an exact `request` upgraded by registration grants only): it signs in
+    /// only with credentials it created, never with the human's (amendment section 2.2 item 3).
+    /// Empty when the grant no longer lists a credential: nothing may be used.
     RegistrationPinned(Vec<CredentialRef>),
+}
+
+/// What the granted-rules store says about the rule that matched, read live next to the match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrantEvidence {
+    /// The effective action is `allow` because a grant upgraded a configured `request`.
+    pub(crate) upgraded: bool,
+    /// The credentials registration grants through this rule recorded for the RP.
+    pub(crate) registration_refs: Vec<CredentialRef>,
+    /// An approved `authenticate` escalation exists through this rule ("Allow always").
+    pub(crate) escalation: bool,
 }
 
 impl CandidateSource {
     /// The source for a match on `rule`, given the live profile pins (`None`: the profile is
-    /// gone) and the RP's registration-granted credentials. `None` when no rule matched or the
-    /// profile is unknown: nothing may be used (fail closed).
+    /// gone) and the grant evidence for that rule. `None` when no rule matched or the profile is
+    /// unknown: nothing may be used (fail closed).
     pub(crate) fn choose(
         rule: &RuleIdentity,
         pins: Option<&ProfilePins>,
-        registration_granted: Vec<CredentialRef>,
+        evidence: GrantEvidence,
     ) -> Option<Self> {
         let pins = pins?;
+        let GrantEvidence {
+            upgraded,
+            registration_refs,
+            escalation,
+        } = evidence;
         match rule {
             RuleIdentity::None => None,
+            // The human approved one registration, and the prompt promised that the agent signs
+            // in there only with the new passkey: an upgrade that rests on registration grants
+            // alone never reaches discovery or the profile pins. If the refs are gone the set is
+            // empty and the sign-in fails closed (a revoke between resolution and here).
+            RuleIdentity::Exact(_) if upgraded && !escalation => {
+                Some(Self::RegistrationPinned(registration_refs))
+            }
             RuleIdentity::Exact(_) => Some(match pins {
                 ProfilePins::Configured(pinned) => {
                     let mut refs = pinned.clone();
-                    for granted in registration_granted {
+                    for granted in registration_refs {
                         if !refs.contains(&granted) {
                             refs.push(granted);
                         }
@@ -1357,10 +1385,10 @@ impl CandidateSource {
                 }
                 ProfilePins::Unset => Self::Discovered,
             }),
-            RuleIdentity::Wildcard => Some(if registration_granted.is_empty() {
+            RuleIdentity::Wildcard => Some(if registration_refs.is_empty() {
                 Self::Discovered
             } else {
-                Self::RegistrationPinned(registration_granted)
+                Self::RegistrationPinned(registration_refs)
             }),
         }
     }
@@ -1903,8 +1931,19 @@ impl SignHandler {
         let source = CandidateSource::choose(
             &matched.rule,
             self.policy_runtime.profile_pins(&ctx.profile_id).as_ref(),
-            self.policy_runtime
-                .granted_credential_refs(&ctx.profile_id, normalized_rp),
+            GrantEvidence {
+                upgraded: matched.granted,
+                registration_refs: self.policy_runtime.granted_credential_refs(
+                    &ctx.profile_id,
+                    normalized_rp,
+                    &matched.rule,
+                ),
+                escalation: self.policy_runtime.has_escalation_grant(
+                    &ctx.profile_id,
+                    normalized_rp,
+                    &matched.rule,
+                ),
+            },
         )
         .ok_or_else(|| {
             self.deny(
@@ -3153,7 +3192,12 @@ pub(crate) mod tests {
             }
         }
         impl GrantSource for ToggleGrants {
-            fn is_granted(&self, _profile_id: &ProfileId, _rp_id: &str) -> bool {
+            fn is_granted(
+                &self,
+                _profile_id: &ProfileId,
+                _rp_id: &str,
+                _rule: &RuleIdentity,
+            ) -> bool {
                 self.0.load(Ordering::Acquire)
             }
         }
@@ -6901,6 +6945,14 @@ pub(crate) mod tests {
                 .expect("an operation record")
         }
 
+        fn evidence(upgraded: bool, escalation: bool, refs: &[&CredentialRef]) -> GrantEvidence {
+            GrantEvidence {
+                upgraded,
+                registration_refs: refs.iter().map(|r| (*r).clone()).collect(),
+                escalation,
+            }
+        }
+
         #[test]
         fn candidate_source_table() {
             let pinned = cred_ref_of(&[1; 32]);
@@ -6909,49 +6961,89 @@ pub(crate) mod tests {
             let pins = ProfilePins::Configured(vec![pinned.clone()]);
             let unset = ProfilePins::Unset;
 
-            // exact, pins set: pins plus registration-granted refs.
+            // exact, pins set, no upgrade: pins plus registration-granted refs.
             assert_eq!(
-                CandidateSource::choose(&exact, Some(&pins), vec![granted.clone()]),
+                CandidateSource::choose(&exact, Some(&pins), evidence(false, false, &[&granted])),
                 Some(CandidateSource::Pinned(vec![
                     pinned.clone(),
                     granted.clone()
                 ]))
             );
             assert_eq!(
-                CandidateSource::choose(&exact, Some(&pins), vec![pinned.clone()]),
+                CandidateSource::choose(&exact, Some(&pins), evidence(false, false, &[&pinned])),
                 Some(CandidateSource::Pinned(vec![pinned.clone()]))
             );
             // An empty pin list pins to nothing but the registration-granted refs.
             assert_eq!(
-                CandidateSource::choose(&exact, Some(&ProfilePins::Configured(vec![])), vec![]),
+                CandidateSource::choose(
+                    &exact,
+                    Some(&ProfilePins::Configured(vec![])),
+                    GrantEvidence::default()
+                ),
                 Some(CandidateSource::Pinned(vec![]))
             );
-            // exact, pins unset: discovery, also with registration-granted refs (as before).
+            // exact, pins unset, no upgrade: discovery, also with registration-granted refs.
             assert_eq!(
-                CandidateSource::choose(&exact, Some(&unset), vec![granted.clone()]),
+                CandidateSource::choose(&exact, Some(&unset), evidence(false, false, &[&granted])),
                 Some(CandidateSource::Discovered)
+            );
+            // exact, upgraded by registration grants only (review M1): only the credential those
+            // grants recorded, never discovery and never the profile pins.
+            for pins in [&pins, &unset] {
+                assert_eq!(
+                    CandidateSource::choose(&exact, Some(pins), evidence(true, false, &[&granted])),
+                    Some(CandidateSource::RegistrationPinned(vec![granted.clone()]))
+                );
+                // The refs are gone (a revoke between resolution and here): nothing may be used.
+                assert_eq!(
+                    CandidateSource::choose(&exact, Some(pins), evidence(true, false, &[])),
+                    Some(CandidateSource::RegistrationPinned(vec![]))
+                );
+            }
+            // exact, upgraded by an escalation grant ("Allow always"): today's behaviour.
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&unset), evidence(true, true, &[])),
+                Some(CandidateSource::Discovered)
+            );
+            assert_eq!(
+                CandidateSource::choose(&exact, Some(&pins), evidence(true, true, &[&granted])),
+                Some(CandidateSource::Pinned(vec![
+                    pinned.clone(),
+                    granted.clone()
+                ]))
             );
             // `*`, either: discovery, unless the RP has registration-granted refs; never the pins.
             for pins in [&pins, &unset] {
                 assert_eq!(
-                    CandidateSource::choose(&RuleIdentity::Wildcard, Some(pins), vec![]),
+                    CandidateSource::choose(
+                        &RuleIdentity::Wildcard,
+                        Some(pins),
+                        GrantEvidence::default()
+                    ),
                     Some(CandidateSource::Discovered)
                 );
                 assert_eq!(
                     CandidateSource::choose(
                         &RuleIdentity::Wildcard,
                         Some(pins),
-                        vec![granted.clone()]
+                        evidence(true, false, &[&granted])
                     ),
                     Some(CandidateSource::RegistrationPinned(vec![granted.clone()]))
                 );
             }
             // No rule, or an unknown profile: nothing (fail closed).
             assert_eq!(
-                CandidateSource::choose(&RuleIdentity::None, Some(&unset), vec![]),
+                CandidateSource::choose(
+                    &RuleIdentity::None,
+                    Some(&unset),
+                    GrantEvidence::default()
+                ),
                 None
             );
-            assert_eq!(CandidateSource::choose(&exact, None, vec![]), None);
+            assert_eq!(
+                CandidateSource::choose(&exact, None, GrantEvidence::default()),
+                None
+            );
             assert_eq!(
                 CandidateSource::Pinned(vec![]).scope(),
                 crate::agent::audit_events::CredentialScope::Pinned
@@ -7098,6 +7190,151 @@ pub(crate) mod tests {
             asked.allow_credentials = vec![b64u_encode(&[1; 32])];
             assert!(f.make_handler().sign(&f.make_ctx(), &asked).is_err());
             assert_eq!(f.key_provider.sign_calls(), 1);
+        }
+
+        fn registration_grant(
+            rp_id: &str,
+            rule: PermittingRule,
+            credential: u8,
+        ) -> crate::agent::granted_rules::GrantedRule {
+            crate::agent::granted_rules::GrantedRule::new(
+                rp_id,
+                crate::agent::granted_rules::GrantKind::Registration,
+                "esc-registered",
+                "https://example.org",
+                rule,
+                Some(cred_ref_of(&[credential; 32])),
+            )
+        }
+
+        /// Review M1: a registration approved through `*` is a grant for the `*` rule only. When
+        /// the operator later lists the site with an exact `authenticate = "request"` rule, the
+        /// old grant must not upgrade it, and above all must not switch candidate selection to
+        /// discovery, which would let a page that names the human's passkey sign without a prompt.
+        #[test]
+        fn a_wildcard_registration_grant_does_not_upgrade_a_later_exact_request() {
+            let mut spec = FixtureSpec::new(
+                vec![rule("*", RuleAction::Request, RuleAction::Request)],
+                vec!["*"],
+            );
+            spec.credentials = vec![stored(1, "example.org", 0), stored(2, "example.org", 1)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let mut f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    registration_grant("example.org", PermittingRule::Wildcard, 2),
+                    64,
+                )
+                .unwrap();
+            // Operator later lists the site with an exact rule that ASKS (request), no pins.
+            f.reload_rules(vec![
+                rule("*", RuleAction::Request, RuleAction::Request),
+                rule("example.org", RuleAction::Request, RuleAction::Deny),
+            ]);
+            let matched =
+                f.policy_runtime
+                    .resolve(&f.profile_id, &GrantAction::Authenticate, "example.org");
+            assert_eq!(matched.action, RuleAction::Request);
+            assert!(!matched.granted, "the `*` grant is not for the exact rule");
+
+            let mut asked = req_at(&f, "example.org");
+            asked.challenge_b64u = b64u_encode(b"human");
+            asked.allow_credentials = vec![b64u_encode(&[1; 32])];
+            let ctx = f.make_ctx();
+            let ceremony = sign_on_thread(&f, &ctx, asked);
+            f.prompter.wait_shown(1);
+            f.prompter.decide(PromptEvent::Denied(
+                crate::agent::audit_events::EscalationDenyCause::User,
+            ));
+            let err = ceremony.join().unwrap().unwrap_err();
+            assert_eq!(err.code, ErrorCode::Forbidden);
+            assert_eq!(f.prompter.shown(), 1, "the human is asked");
+            assert_eq!(f.key_provider.sign_calls(), 0, "nothing was signed");
+        }
+
+        /// The pre-existing sibling of M1: an exact rule with `register = "request"` and
+        /// `authenticate = "request"`. After "Register once" the sign-in is upgraded, but only the
+        /// credential that was registered is usable: the prompt promised no more.
+        #[test]
+        fn an_exact_registration_grant_signs_only_with_the_registered_credential() {
+            let mut spec = FixtureSpec::new(
+                vec![rule(
+                    "example.org",
+                    RuleAction::Request,
+                    RuleAction::Request,
+                )],
+                vec!["example.org"],
+            );
+            // The human already holds a passkey at the site; the agent registered another.
+            spec.credentials = vec![stored(1, "example.org", 0), stored(2, "example.org", 1)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    registration_grant("example.org", PermittingRule::Exact, 2),
+                    64,
+                )
+                .unwrap();
+
+            // Even when the page names the human's credential, it is not used and no prompt is
+            // raised: the upgraded set is the registered credential, which `allowCredentials`
+            // does not name.
+            let mut asked = req_at(&f, "example.org");
+            asked.challenge_b64u = b64u_encode(b"human");
+            asked.allow_credentials = vec![b64u_encode(&[1; 32])];
+            assert!(f.make_handler().sign(&f.make_ctx(), &asked).is_err());
+            assert_eq!(f.key_provider.sign_calls(), 0);
+            assert_eq!(f.prompter.shown(), 0, "the grant allows it, no prompt");
+            assert_eq!(last_scope(&f, "example.org"), "registration_pinned");
+
+            // Without a selection from the page, it signs with the registered credential.
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &req_at(&f, "example.org")),
+            );
+            assert_eq!(signed, vec![2; 32]);
+            assert_eq!(last_scope(&f, "example.org"), "registration_pinned");
+        }
+
+        /// An escalation grant ("Allow always" on a sign-in) keeps discovery for its own rule.
+        #[test]
+        fn an_exact_escalation_grant_keeps_discovery_for_its_rule() {
+            let mut spec = FixtureSpec::new(
+                vec![rule("example.org", RuleAction::Request, RuleAction::Deny)],
+                vec!["example.org"],
+            );
+            spec.credentials = vec![stored(1, "example.org", 0)];
+            spec.dynamic_grant = true;
+            spec.escalation = true;
+            let f = AuditTestFixture::from_spec(spec);
+            f.store
+                .add(
+                    &f.policy_runtime,
+                    &f.profile_id,
+                    crate::agent::granted_rules::GrantedRule::new(
+                        "example.org",
+                        crate::agent::granted_rules::GrantKind::Escalation,
+                        "esc-signin",
+                        "https://example.org",
+                        PermittingRule::Exact,
+                        None,
+                    ),
+                    64,
+                )
+                .unwrap();
+            let signed = signed_credential(
+                f.make_handler()
+                    .sign(&f.make_ctx(), &req_at(&f, "example.org")),
+            );
+            assert_eq!(signed, vec![1; 32]);
+            assert_eq!(last_scope(&f, "example.org"), "discovered");
+            assert_eq!(f.prompter.shown(), 0);
         }
 
         #[test]

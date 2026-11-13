@@ -97,6 +97,7 @@ Candidate set for one ceremony, by matched rule (replaces the first step of §10
 
 | Matched rule | Profile `credential_refs` | Candidate set |
 |---|---|---|
+| exact, upgraded by registration grants only | either | the credentials those grants recorded, never discovery or the pins (review M1) |
 | exact | set | profile pins ∪ registration-granted refs for this RP (as today) |
 | exact | unset | discovery within this RP (as today) |
 | `*` | either | discovery within this RP, **unless** the RP has registration-granted refs, then those refs only (new, §2.2 item 3) |
@@ -160,15 +161,23 @@ form is future work (§15).
    `RegistrationApproval` bound to the creating ceremony's session, exactly one registration at
    exactly that RP. After the credential is written the daemon persists `authenticate = allow` for
    that RP with `kind = "registration"`, `rule = "*"` and the credential ref. That grant upgrades the
-   `*` rule's `authenticate = "request"`; it does not create an exact rule, and it becomes inert if the
-   `*` rule's `authenticate` is set to `deny` or the rule is removed (§6.2, unchanged).
+   `*` rule's `authenticate = "request"` and no other rule's: grants match by the identity of the rule
+   they were approved through (`rule = "*"` or `exact`), so if the operator later adds an exact rule
+   for the RP, the grant is inert there (`doctor` reports it) and the exact rule asks again. It does
+   not create an exact rule, and it becomes inert if the `*` rule's `authenticate` is set to `deny`,
+   the rule is removed, or an exact rule takes over the RP (§6.2).
 3. **The agent signs in only with its own passkey there.** For an RP matched through `*` that holds
    registration-granted refs, the candidate set is those refs only (table in §2.1), selected with
    `single`. Without this, discovery would find the new credential next to any credential the human
    already has at that RP, and `single` would fail every later sign-in. After the agent registers a
    passkey at an unlisted site, it signs in there only with that passkey, never with one the human
-   created. Exact rules are unchanged: with pins, registration-granted refs join the pins; without
-   pins, discovery continues as today.
+   created. The same holds for an exact rule whose `request` is upgraded by registration grants
+   alone ("Register once" at an exact `register = "request"` rule, or an exact rule added later
+   next to a grant made through that exact rule): the candidates are the recorded credentials only,
+   never discovery and never the pins, because the prompt promised only the new passkey. An exact
+   rule that is not upgraded by a registration grant is unchanged: with pins, the refs of grants
+   approved through that exact rule join the pins; without pins, discovery. An approved sign-in
+   escalation ("Allow always") keeps discovery for its own rule.
 4. **Hard cap.** `max_wildcard_registrations` (profile key, default 4) counts the profile's persisted
    granted rules with `kind = "registration"` and `rule = "*"`. At the cap a wildcard registration is
    refused without a prompt (`policy.deny`, `wildcard_registration_cap`). Revoking such a grant frees

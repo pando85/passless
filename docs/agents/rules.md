@@ -65,9 +65,11 @@ boundary.
 
 An approved escalation is kept in `<agents.state_dir>/granted-rules/<profile>.toml` (by default
 `$XDG_STATE_HOME/passless/agent`). The daemon owns the file; it is never your config. A granted rule
-only ever turns `request` into `allow` for one exact RP. Under the `*` rule it turns the wildcard's
-`authenticate = "request"` into `allow` for that one RP. It is permanent until you revoke it, and it
-becomes inert if you change the config rule to `deny` or remove it. A profile holds at most
+only ever turns `request` into `allow` for one exact RP, and only for the rule it was approved
+through: a grant made under the `*` rule turns the wildcard's `authenticate = "request"` into `allow`
+for that one RP and does nothing for an exact rule you add for the same RP later (that rule asks
+again). It is permanent until you revoke it, and it becomes inert if you change the config rule to
+`deny` or remove it. A profile holds at most
 `max_granted_rules` of them (default 64, 1 to 256).
 
 ```bash
@@ -93,7 +95,8 @@ Revoking a grant revokes every active agent session (the next request prompts ag
 policy change. Adding a grant does not. Use the RP's own controls too: revoking locally does not log
 the agent out of the site. A store that is malformed or has the wrong owner or mode disables grants
 for that profile and `passless doctor` reports it. A grant is inert, never consulted, when no rule
-reaches its RP, its rule is now `deny`, or its rule is now `allow`; `passless doctor --agents` and
+reaches its RP, its rule is now `deny` or `allow`, or a different rule reaches the RP now (a `*`
+grant at an RP with an exact rule); `passless doctor --agents` and
 `agent-admin profile check` list those as orphaned (a warning), and `doctor --agents` also lists the
 stores of profiles that no longer exist. The destructive admin commands (`revoke`, `clear`) refuse to
 run without `--confirm`.
@@ -175,8 +178,9 @@ What bounds it:
 - **One approval, one registration.** The approval is not joinable and is bound to the page that asked.
   Afterwards Passless stores `authenticate = allow` for that one RP (`kind = registration`, `rule = *`),
   so the agent signs in there without asking, **with the passkey it created only**, never with one you
-  already had at that site. The grant does not create an exact rule and becomes inert if the `*` rule's
-  `authenticate` is set to `deny`.
+  already had at that site. The grant belongs to the `*` rule: it does not create an exact rule, and it
+  becomes inert if the `*` rule's `authenticate` is set to `deny`, or if you later add an exact rule for
+  that site (which then asks again; `doctor` lists the grant as inert).
 - **A hard cap.** At `max_wildcard_registrations` stored wildcard registration grants, a new request is
   refused without a prompt (audit reason `wildcard_registration_cap`). `agent-admin grants revoke`
   frees a slot.
@@ -266,7 +270,9 @@ store. Pins are located from the store's file names, never by decrypting anythin
 ## Resolution order
 
 For `authenticate`, the first match wins: exact `deny`; exact `allow`; exact or `*` `request` (upgraded
-to `allow` if a granted rule exists for the RP); `*` `allow`; otherwise `deny`.
+to `allow` if a granted rule exists for the RP that was approved through that same rule); `*` `allow`;
+otherwise `deny`. When the upgrade rests on registration grants only (a "Register once" approval), the
+agent may sign in with the credential(s) it created there and no other.
 
 For `register`: exact `deny`; exact `allow`; exact `request`; `*` `request` (only in a profile with the
 acknowledgements above); otherwise `deny`. `*` with `register = "allow"` is invalid and would resolve

@@ -421,13 +421,17 @@ The effective action for `(profile, rp_id, action)` is:
 1. an exact config rule with `deny` gives `deny`;
 2. an exact config rule with `allow` gives `allow`;
 3. an exact or wildcard rule with `request` gives `allow` if the granted-rules store has a
-   matching exact entry, otherwise `request`;
+   entry for that RP that was approved through the same rule (`exact` or `*`), otherwise `request`;
 4. a wildcard rule with `allow` gives `allow`;
 5. otherwise `deny`.
 
-The granted-rules store can only upgrade `request` to `allow`. When the operator changes a config
-rule to `deny` or removes the `request` rule, matching granted entries become inert, and
-`passless doctor` reports them as orphaned.
+The granted-rules store can only upgrade `request` to `allow`, and only through the rule the grant
+was approved through: each entry records the permitting rule (`exact` or `*`), and the entry is
+consulted only when the rule that matches now has the same identity. A grant made through `*` never
+upgrades an exact rule that is added later, and an exact grant never upgrades `*`. When the operator
+changes a config rule to `deny` or removes the `request` rule, or an exact rule now governs an RP
+where the grant was made through `*`, matching granted entries become inert, and `passless doctor`
+reports them as orphaned.
 
 ### 6.3 Wildcard
 
@@ -689,9 +693,12 @@ ceremony. The approval binds to that ceremony's session and is not a separate tr
 credential. It does not persist `register = allow`. On successful creation it persists
 `authenticate = allow` for that exact RP with `kind = "registration"`, the matched rule (`exact`
 or `*`) and the new credential reference, and that credential reference joins the pinned set for the
-RP (§10.1). If registration fails after approval, nothing is persisted. Through `*` the persisted
-grant upgrades the `*` rule's `authenticate = "request"`; it creates no exact rule and becomes inert
-if that `authenticate` is set to `deny` or the rule is removed (§6.2).
+RP (§10.1). If registration fails after approval, nothing is persisted. The persisted grant
+upgrades `authenticate = "request"` of the rule it was approved through and of no other: through `*`
+it upgrades the `*` rule only, creates no exact rule, and becomes inert if that `authenticate` is
+set to `deny`, the rule is removed, or an exact rule is later added for that RP (§6.2). The upgrade
+it gives is scoped to what the prompt promised: sign-in with the credential the registration
+created, never discovery (§10.1).
 
 Every registration prompt, exact rule or `*`, says so: the summary is "CREATE A NEW PASSKEY? (not
 a sign-in)", the body names the store (the human's own for same-user, the agent's for isolated),
@@ -809,10 +816,14 @@ unrestricted listing.
 
 1. The candidate set depends on the matched rule. An exact rule uses the profile's
    `credential_refs` plus the credentials registration grants added at the RP when `credential_refs`
-   is set, and discovery within the RP otherwise. The `*` rule uses discovery within the RP, or,
-   when registration grants added credentials at that RP, those credentials only (so a passkey the
-   agent registered there is never ambiguous with one the human created); it never uses
-   `credential_refs`. An exact RP never falls through to `*`: a stale pin fails closed. The pins are
+   is set, and discovery within the RP otherwise; but when the `request` is upgraded to `allow` by
+   registration grants alone, the candidates are the credentials those grants recorded and nothing
+   else (neither discovery nor the pins), because the "Register once" approval promised only the new
+   passkey. The `*` rule uses discovery within the RP, or, when registration grants added
+   credentials at that RP, those credentials only (so a passkey the agent registered there is never
+   ambiguous with one the human created); it never uses `credential_refs`. Only grants approved
+   through the rule that matches now count (§6.2); an approved sign-in escalation ("Allow always")
+   keeps discovery for its own rule. An exact RP never falls through to `*`: a stale pin fails closed. The pins are
    read from the live policy, not from a copy in the session grant. Then `credential:<ref>` narrows
    the set.
 2. A non-empty `allowCredentials` chooses within that set.
