@@ -100,7 +100,10 @@ pub enum Emulation {
     /// notify-osd 1.0 as observed on Ubuntu: `GetServerInformation` is [`NOTIFY_OSD_SERVER_INFORMATION`]
     /// (use [`NOTIFY_OSD_CAPABILITIES`], which lacks `actions`); a notification with actions is a
     /// fallback dialog whose `Notify` returns id 0, every time; a click emits
-    /// `ActionInvoked(0, key)` then `NotificationClosed(0, 3)`; `CloseNotification` closes nothing.
+    /// `ActionInvoked(0, key)` then `NotificationClosed(0, 3)` (a scripted `close` step is a
+    /// keyboard or window-manager close: `NotificationClosed(0, 2)` alone); the scripted signals
+    /// are unicast to the connection that called `Notify`, as notify-osd's `dbus.c` does;
+    /// `CloseNotification` closes nothing.
     NotifyOsd,
 }
 

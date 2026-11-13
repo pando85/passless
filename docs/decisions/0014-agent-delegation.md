@@ -697,8 +697,14 @@ and never reveals whether the human holds a credential.
   action keys are `allow_always:<nonce>`/`deny:<nonce>` (`register_once:<nonce>`/`deny:<nonce>` on a
   registration prompt) with a fresh 128-bit nonce (labels unchanged): only the exact key from the
   verified sender decides, and a decision that does not belong to the prompt's verb (`register_once`
-  on a sign-in, `allow_always` on a registration) is a deny (prompt protocol version 2), a shared-id close is ignored and
-  not sent, and a stale dialog left visible after withdrawal grants nothing.
+  on a sign-in, `allow_always` on a registration) is a deny (prompt protocol version 2), and a stale dialog left visible after
+  withdrawal grants nothing. `CloseNotification` is not sent for the shared id. A
+  `NotificationClosed` for id 0 is attributed to the prompt that received it, because notify-osd
+  addresses every signal of a fallback dialog to the connection that called `Notify` (each prompt
+  child owns one connection and one dialog; a withdrawn child's dialog signals a connection that is
+  gone). It is a dismissal (a deny, never an approval): only a mouse click on a button emits
+  `ActionInvoked`, while a keypress, Escape, the window close and Cancel emit `NotificationClosed`
+  alone.
 - `agents.notify_user` names the human whose session bus receives escalation prompts. The user
   unit uses its own bus. If no bus can be resolved, escalation is unavailable: the request is denied
   immediately and audited. Headless hosts use explicit `allow` rules.

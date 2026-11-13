@@ -578,7 +578,9 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
         .map_err(|e| Error::Other(e.to_string()))?;
     match resp {
         passless_core::agent::AdminResponse::GrantedRuleList(list) => match output {
-            OutputFormat::Json => admin_output_json(&display_granted_rules(list)),
+            OutputFormat::Json => {
+                admin_output_json(&granted_rules_json(display_granted_rules(list))?)
+            }
             OutputFormat::Plain => {
                 print!("{}", format_granted_rules(&display_granted_rules(list)));
                 Ok(())
@@ -601,22 +603,39 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
     }
 }
 
-/// The text of an empty `origin` (an `authenticate` pre-request has no page) in both outputs.
+/// The text of an empty `origin` (an `authenticate` pre-request has no page) in the plain table.
 const NO_ORIGIN: &str = "-";
 
 /// The form both `grants list` outputs show (ADR 0014 amendment section 7): every grant carries
-/// its `source` (`ceremony` when the daemon did not say, as an older one does not) and an empty
-/// `origin` reads `-`.
+/// its `source` (`ceremony` when the daemon did not say, as an older one does not).
 fn display_granted_rules(mut list: GrantedRuleList) -> GrantedRuleList {
     for rule in list.profiles.iter_mut().flat_map(|p| p.rules.iter_mut()) {
         if rule.source.is_none() {
             rule.source = Some("ceremony".to_string());
         }
-        if rule.origin.is_empty() {
-            rule.origin = NO_ORIGIN.to_string();
-        }
     }
     list
+}
+
+/// The `grants list --json` document: the list with `origin` as `null` where the grant has none
+/// (the wire form is an empty string). The plain table prints `-` instead, which is a display
+/// placeholder and not a value for a script to read.
+fn granted_rules_json(list: GrantedRuleList) -> Result<serde_json::Value> {
+    let mut json = serde_json::to_value(&list).map_err(|e| Error::Other(e.to_string()))?;
+    let profiles = json
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut);
+    for rule in profiles
+        .into_iter()
+        .flatten()
+        .filter_map(|profile| profile.get_mut("rules")?.as_array_mut())
+        .flatten()
+    {
+        if rule.get("origin").and_then(serde_json::Value::as_str) == Some("") {
+            rule["origin"] = serde_json::Value::Null;
+        }
+    }
+    Ok(json)
 }
 
 /// The plain `agent-admin grants list` text: per profile a summary line, then a table with a header
@@ -1318,7 +1337,7 @@ mod tests {
     /// plain table and in the JSON; a grant from an older daemon, with no `source`, is a
     /// ceremony's.
     #[test]
-    fn grants_list_shows_the_source_and_a_dash_for_an_empty_origin() {
+    fn grants_list_shows_the_source_and_a_dash_for_an_empty_origin_in_the_table_only() {
         let mut pre = info("docs.example.net", "escalation", "*", None);
         pre.origin = String::new();
         pre.source = Some("pre_request".into());
@@ -1333,10 +1352,12 @@ mod tests {
                 rules: vec![pre, old],
             }],
         });
-        let json = serde_json::to_value(&list).unwrap();
+        // The JSON has `null`, never the table's `-`.
+        let json = granted_rules_json(list.clone()).unwrap();
         let rules = &json["profiles"][0]["rules"];
         assert_eq!(rules[0]["source"], "pre_request");
-        assert_eq!(rules[0]["origin"], "-");
+        assert!(rules[0]["origin"].is_null(), "{json}");
+        assert!(!json.to_string().contains("\"-\""), "{json}");
         assert_eq!(rules[1]["source"], "ceremony");
         assert_eq!(rules[1]["origin"], "https://github.com");
 

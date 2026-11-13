@@ -131,10 +131,10 @@ scenario({ id: 'E2E-63', exposeModes: ['port', 'pipe'], title: 'agent request-ac
   assert.equal(text.code, 0, text.stderr);
   assert.match(text.stdout, /^state: already_allowed\nrp_id: rp-c\.test\naction: authenticate\n/, text.stdout);
 
-  // ---- grants list: the source and a dash for the empty origin, in the table and in the JSON.
+  // ---- grants list: the source and an empty origin: `-` in the table, `null` in the JSON.
   const listed = (await stack.daemon.adminJson('grants', 'list', '--profile', 'agent')).profiles[0];
   assert.deepEqual(listed.rules.map(r => [r.rp_id, r.source, r.origin, r.kind]),
-    [['rp-a.test', 'pre_request', '-', 'escalation'], ['rp-f.test', 'pre_request', '-', 'escalation']], JSON.stringify(listed));
+    [['rp-a.test', 'pre_request', null, 'escalation'], ['rp-f.test', 'pre_request', null, 'escalation']], JSON.stringify(listed));
   const plainList = await stack.daemon.adminPlain('grants', 'list', '--profile', 'agent');
   const lines = plainList.stdout.split('\n').filter(Boolean);
   assert.deepEqual(lines[1].trim().split(/\s+/), ['RP_ID', 'ACTION', 'KIND', 'RULE', 'SOURCE', 'GRANTED_AT', 'REQUEST', 'ORIGIN', 'CREDENTIAL'], plainList.stdout);

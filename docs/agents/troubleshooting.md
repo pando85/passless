@@ -23,6 +23,7 @@ passless`) or reload a profile's policy with `passless agent-admin policy reload
 
 | Symptom | Cause and fix |
 |---|---|
+| `passless agent doctor` (or another principal command) says `this command must run inside an agent session` | These commands talk to the daemon through the control socket of a principal session. Run them inside one: `passless agent run --profile <profile> -- passless agent doctor --profile <profile>`. For an operator's view without a session, run `passless agent-admin profile check <profile>`. |
 | Daemon log: `Agent subsystem failed to start: IPC error: failed to create runtime dir: ... File exists`, `agent-admin` says `no agent socket`, `doctor --agents` fails `agent_subsystem` | Older versions left `$XDG_RUNTIME_DIR/agent` behind after a SIGTERM or a crash, and the next start could not create it. Current versions remove their own directory at a clean shutdown and reclaim a leftover at start: a real directory owned by the daemon's user with mode 0700 whose sockets nobody answers is removed and recreated. Upgrade and restart. Where the start still fails with `cannot reclaim the stale runtime dir`, the log says why: it is a symlink or a file, another user owns it or its mode is not 0700 (so Passless will not remove it; check it and delete it yourself), or a live daemon answers on it (stop that one). With an older build, `systemctl --user stop passless; rm -rf "$XDG_RUNTIME_DIR/agent"; systemctl --user start passless`. |
 | `doctor --agents` fails `agent_subsystem` with `nothing answers on the admin socket` | The daemon is not running, or it started without agents (the `Agent subsystem failed to start` line in `journalctl --user -u passless` says why), or `agents.enabled` was set after the daemon started: restart it. |
 
@@ -180,7 +181,8 @@ Every answer is a `state` ([Asking in advance](rules.md#asking-in-advance)); the
   the flag (`agent mcp install --with-access-tool` writes it). The CLI works with or without.
 - An `approved` `register` that the browser did not use within 10 minutes, or whose session ended, was
   dropped (`pre_approval.expired` in the audit); ask again. A second registration needs a second
-  request.
+  request. A lost approval still uses one of the profile's `wildcard_registration_prompts_per_day`
+  prompts; `agent-admin profile check <profile>` shows the count used in the last 24 hours.
 - A request run outside a principal session starts a session of its own that ends with the command, which
   withdraws a request still pending: use `--wait` up to 120 seconds, or call it from inside the agent's
   session.

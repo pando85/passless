@@ -52,7 +52,8 @@ fn parse_credential_ref(s: &str) -> Result<CredentialRef> {
 
 fn connect_principal(profile: &str) -> Result<PrincipalClient> {
     let base = resolve_runtime_base().map_err(client_error_to_result)?;
-    PrincipalClient::connect_launched(&base, profile).map_err(client_error_to_result)
+    PrincipalClient::connect_launched(&base, profile)
+        .map_err(|e| Error::Other(e.describe_for(profile)))
 }
 
 fn connect_admin() -> Result<AdminClient> {

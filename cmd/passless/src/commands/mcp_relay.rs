@@ -84,8 +84,8 @@ pub fn tool_definition() -> Value {
     fixed system prompt naming only the site and the action; your note is NOT shown to them, so \
     explain why in the chat. Approval does not sign in for you: navigate and use the site's normal \
     WebAuthn flow afterwards. For 'register' the approval is valid once, for 10 minutes, in this \
-    browser only. The result's state says what happened; 'pending' means call again later with the \
-    same arguments.",
+    browser only, and ends earlier when this session or MCP server exits. The result's state says \
+    what happened; 'pending' means call again later with the same arguments.",
         "inputSchema": {
             "type": "object",
             "properties": {

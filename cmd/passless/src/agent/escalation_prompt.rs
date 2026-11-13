@@ -28,10 +28,18 @@
 //! returns id 0 for every fallback dialog, so the id alone cannot tell concurrent prompts (other
 //! RPs, other profiles) apart, nor a stale dialog of a withdrawn prompt from a live one; the
 //! per-prompt keys do. A click on a dialog whose child has exited (withdrawn, timed out, denied
-//! into cooldown, daemon restarted) matches no live prompt and grants nothing. With a shared id 0
-//! a `NotificationClosed` cannot be attributed either: it is ignored, and the prompt waits for its
-//! action or the daemon's withdrawal; `CloseNotification(0)` is not sent, so a withdrawn dialog may
-//! stay visible (inert).
+//! into cooldown, daemon restarted) matches no live prompt and grants nothing.
+//! `CloseNotification(0)` is not sent, so a withdrawn dialog may stay visible (inert).
+//!
+//! notify-osd (`dialog.c`, `dbus.c`) addresses every signal of a fallback dialog to the unique name
+//! of the connection that called `Notify`, and each child owns one connection and one dialog. A
+//! `NotificationClosed(0, _)` received in that mode is therefore this prompt's own dialog going
+//! away, and it is reported as `closed` (a dismissal, never an approval). Only a mouse release on
+//! a button emits `ActionInvoked`; any keyboard activation of a button (Enter or space on the
+//! focused one), Escape, the window manager's close and "Cancel" emit `NotificationClosed(0, 2)`
+//! alone, and notify-osd's own "OK" emits `ActionInvoked(0, "default")` (no match here) and
+//! `NotificationClosed(0, 3)`. So a keypress can close the prompt but never approve it. For a
+//! server that returns a real id the close is matched by id, as before.
 //!
 //! Protocol version 2 (JSON lines). Daemon to child: first
 //! `{"v":2,"summary":…,"body":…,"actions":[["allow_always","Allow always"],["deny","Deny"]],"min_review_delay_ms":…}`
@@ -96,8 +104,10 @@ const APP_ICON: &str = "security-high";
 const URGENCY_CRITICAL: u8 = 2;
 const MAX_QUEUED_SIGNALS: usize = 64;
 /// The id notify-osd returns for every fallback dialog. The specification never assigns 0, so a
-/// notification with this id is not addressable: its closes cannot be attributed and
-/// `CloseNotification` cannot target it.
+/// notification with this id is not addressable: `CloseNotification` cannot target it, and the
+/// id alone does not tell dialogs apart. A close is still attributed, by delivery: notify-osd
+/// sends a fallback dialog's signals only to the connection that called `Notify`, which is this
+/// prompt's own.
 const SHARED_NOTIFICATION_ID: u32 = 0;
 /// Bytes of randomness in a prompt's action-key nonce.
 const NONCE_BYTES: usize = 16;
@@ -696,8 +706,11 @@ async fn name_owner(conn: &Connection) -> Option<String> {
     reply.body().deserialize::<String>().ok()
 }
 
-/// The capability gate. `Ok(server name)` when the server may show the prompt.
-async fn capability_gate(conn: &Connection, owner: &str) -> Result<String, ChildErrorKind> {
+/// The capability gate. `Ok((server name, support))` when the server may show the prompt.
+async fn capability_gate(
+    conn: &Connection,
+    owner: &str,
+) -> Result<(String, ServerSupport), ChildErrorKind> {
     let capabilities: Vec<String> = call(
         conn,
         owner,
@@ -727,13 +740,13 @@ async fn capability_gate(conn: &Connection, owner: &str) -> Result<String, Child
         ChildErrorKind::NoServer
     })?;
     match server_support(&name, &version, &capabilities) {
-        Ok(ServerSupport::Actions) => Ok(name),
+        Ok(ServerSupport::Actions) => Ok((name, ServerSupport::Actions)),
         Ok(ServerSupport::FallbackDialog) => {
             debug!(
                 "escalation prompt: '{}' {} has no actions capability; using its fallback dialog",
                 name, version
             );
-            Ok(name)
+            Ok((name, ServerSupport::FallbackDialog))
         }
         Err(why) => {
             warn!(
@@ -767,9 +780,10 @@ async fn subscribe(conn: &Connection, owner: &str) -> zbus::Result<(MessageStrea
 
 /// Classify a received message. Signals from any sender but the server's unique name (or, for
 /// `NameOwnerChanged`, the bus itself) are ignored. The action key is checked by the caller.
-/// A `NotificationClosed` for the shared id 0 is ignored: it may be any dialog's (a stale one of a
-/// withdrawn prompt, another profile's), so it cannot end this prompt.
-fn classify(message: &Message, owner: &str, id: u32) -> Option<Signal> {
+/// With the shared id 0 (`fallback_dialog`, notify-osd) a `NotificationClosed` carries no id to
+/// match, but notify-osd unicasts it to the connection that created the dialog, which is this
+/// one: any `NotificationClosed` from the server is this prompt's dialog closing.
+fn classify(message: &Message, owner: &str, id: u32, fallback_dialog: bool) -> Option<Signal> {
     let header = message.header();
     if header.message_type() != MessageType::Signal {
         return None;
@@ -784,12 +798,15 @@ fn classify(message: &Message, owner: &str, id: u32) -> Option<Signal> {
         }
         (NOTIFICATIONS_IFACE, "NotificationClosed") if sender == owner => {
             let (signal_id, reason): (u32, u32) = message.body().deserialize().ok()?;
-            if id == SHARED_NOTIFICATION_ID {
+            if fallback_dialog
+                && id == SHARED_NOTIFICATION_ID
+                && signal_id == SHARED_NOTIFICATION_ID
+            {
                 debug!(
-                    "escalation prompt: ignoring NotificationClosed for the shared id (reason {})",
-                    reason
+                    "escalation prompt: the fallback dialog was closed (id {}, reason {})",
+                    signal_id, reason
                 );
-                return None;
+                return Some(Signal::Closed(reason));
             }
             (signal_id == id).then_some(Signal::Closed(reason))
         }
@@ -875,8 +892,8 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
     };
 
     // 3. Capability gate.
-    let server = match capability_gate(&conn, &owner).await {
-        Ok(server) => server,
+    let (server, support) = match capability_gate(&conn, &owner).await {
+        Ok(gate) => gate,
         Err(kind) => return fail(output, kind),
     };
 
@@ -956,7 +973,12 @@ async fn run_prompt<W: Write>(inbox: &Inbox, output: &mut W, bus_address: Option
                 return 0;
             }
             Wake::Bus(Some(Err(e))) => debug!("escalation prompt: stream error: {}", e),
-            Wake::Bus(Some(Ok(message))) => match classify(&message, &owner, id) {
+            Wake::Bus(Some(Ok(message))) => match classify(
+                &message,
+                &owner,
+                id,
+                support == ServerSupport::FallbackDialog,
+            ) {
                 Some(Signal::Action(key)) => {
                     // Only this prompt's exact keys decide: a bare, foreign or stale key (another
                     // prompt's dialog sharing id 0, a dialog left from a withdrawn prompt) is

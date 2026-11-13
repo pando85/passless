@@ -1553,6 +1553,13 @@ impl Inner {
             }
             let request = entry.request.clone();
             let profile = request.profile.clone();
+            if was_prompting && departure == Departure::Timeout {
+                info!(
+                    "escalation {}: the prompt reached its timeout without an answer; withdrawing it \
+                     and denying the request",
+                    entry.id
+                );
+            }
             info!(
                 "escalation {}: last waiter left ({:?}); {}",
                 entry.id,
@@ -3342,6 +3349,20 @@ impl EscalationService {
             .profiles
             .get(profile)
             .map_or(0, |slot| slot.queue.len())
+    }
+
+    /// How many of `profile`'s `wildcard_registration_prompts_per_day` are in use now: the
+    /// wildcard registration prompts shown in the rolling 24 hours plus the queued ones that will
+    /// show one, as the admission check counts them. Read-only for the caller (it only prunes the
+    /// expired timestamps); an approval that was lost with its session still counts, because the
+    /// slot is never refunded.
+    pub fn wildcard_registration_prompts_used(&self, profile: &ProfileId) -> usize {
+        let now = self.clock.now();
+        let mut inner = self.lock();
+        let (_, unshown) = inner.live_wildcard_registrations(profile);
+        inner
+            .wildcard_prompts_shown(profile, now)
+            .saturating_add(unshown)
     }
 
     /// Whether `key` is in its cooldown now.
@@ -5929,6 +5950,43 @@ mod tests {
         );
         h.clock.advance(Duration::from_secs(1));
         assert!(h.service.precheck(&limited("c.example", 1)).is_ok());
+    }
+
+    /// The live count `agent-admin profile check` shows: prompts shown in the window (an approval
+    /// that ends unused still counts) plus the queued ones, per profile, rolling off with the
+    /// window.
+    #[test]
+    fn wildcard_registration_prompts_used_counts_shown_and_queued_prompts_per_profile() {
+        let h = harness();
+        let p = profile("p");
+        assert_eq!(h.service.wildcard_registration_prompts_used(&p), 0);
+        let parked = park(
+            h.service
+                .join_or_create(wildcard_register("p", "a.example", 1))
+                .unwrap(),
+        );
+        h.clock.advance(Duration::from_secs(5));
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        assert!(matches!(
+            parked.join().unwrap(),
+            EscalationOutcome::RegistrationApproved(_)
+        ));
+        // The approval is never used (its session ends): the slot stays spent.
+        assert_eq!(h.service.wildcard_registration_prompts_used(&p), 1);
+        assert_eq!(
+            h.service.wildcard_registration_prompts_used(&profile("q")),
+            0
+        );
+        // Exact-rule registration prompts do not count.
+        let _exact = h
+            .service
+            .join_or_create(register("p", "b.example", 2))
+            .unwrap();
+        assert_eq!(h.service.wildcard_registration_prompts_used(&p), 1);
+        // The window rolls.
+        h.clock.advance(WILDCARD_PROMPT_WINDOW);
+        assert_eq!(h.service.wildcard_registration_prompts_used(&p), 0);
     }
 
     #[test]

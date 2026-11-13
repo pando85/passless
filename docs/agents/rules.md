@@ -84,7 +84,7 @@ sign-in) or `registration` (a credential the agent created, shown in `CREDENTIAL
 configured rule that permitted it: `exact`, or `*` for a grant under the wildcard rule, and `SOURCE`
 says who raised the escalation: `ceremony` (a page did) or `pre_request` (the agent asked in advance,
 see [Asking in advance](#asking-in-advance)). A grant that no page was behind has no origin, shown as
-`-`; the JSON output has the same `source` and `origin` values. Wildcard registration grants count
+`-` in the table and as `null` in the JSON output, which has the same `source` values. Wildcard registration grants count
 against `max_wildcard_registrations`; revoking one frees a slot (the credential stays until
 `agent-admin credential delete`).
 
@@ -277,7 +277,7 @@ adopts the request while it is still pending), with no second prompt; a second r
 again. It lasts 10 minutes at most and never outlives its principal session. It is dropped when its
 session ends, its browser lease is revoked, the policy reloads with a change, or `grants revoke` or
 `grants clear` reaches the site. The audit records each token as `pre_approval.issued`, `consumed` or
-`expired` with the reason.
+`expired` with the reason. The prompt still counts toward `wildcard_registration_prompts_per_day` when the approval is lost this way, and `agent-admin profile check` shows how many of those prompts the last 24 hours used.
 
 **Limits.** One pending pre-request and six per 10 minutes per principal session, and at most three
 pending and twelve per 10 minutes per profile across all its sessions (a shell agent calling
