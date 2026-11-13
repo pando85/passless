@@ -208,7 +208,9 @@ fn dispatch_request_access(
 }
 
 /// The command a fresh principal session runs for `request-access` (the executable, then the
-/// arguments that reproduce this call).
+/// arguments that reproduce this call). The note goes in as `--note=<value>` and the RP ID after
+/// `--`, so neither can be read as a flag: a note such as `-urgent` or `--register` stays a value
+/// (review N4).
 fn request_access_argv(exe: &Path, profile: &str, args: &AccessArgs) -> Vec<String> {
     let mut argv = vec![
         exe.to_string_lossy().into_owned(),
@@ -216,7 +218,6 @@ fn request_access_argv(exe: &Path, profile: &str, args: &AccessArgs) -> Vec<Stri
         "--profile".to_string(),
         profile.to_string(),
         "request-access".to_string(),
-        args.rp_id.to_string(),
         "--wait".to_string(),
         args.wait.to_string(),
     ];
@@ -224,12 +225,14 @@ fn request_access_argv(exe: &Path, profile: &str, args: &AccessArgs) -> Vec<Stri
         argv.push("--register".to_string());
     }
     if let Some(note) = args.note {
-        argv.extend(["--note".to_string(), note.to_string()]);
+        argv.push(format!("--note={note}"));
     }
     if args.json {
         argv.push("--json".to_string());
     }
     argv.push("--fresh-session".to_string());
+    argv.push("--".to_string());
+    argv.push(args.rp_id.to_string());
     argv
 }
 
@@ -948,15 +951,71 @@ mod tests {
                 "--profile",
                 "coding",
                 "request-access",
-                "example.org",
                 "--wait",
                 "45",
-                "--note",
-                "why --register",
+                "--note=why --register",
                 "--json",
-                "--fresh-session"
+                "--fresh-session",
+                "--",
+                "example.org"
             ]
         );
+    }
+
+    #[test]
+    fn a_note_that_looks_like_a_flag_survives_the_rerun() {
+        use clap::Parser;
+        use passless_core::config::{Args, Commands};
+
+        for note in ["-urgent", "--register", "-", "--", "--note=x", "a b"] {
+            for register in [false, true] {
+                let args = AccessArgs {
+                    rp_id: "example.org",
+                    register,
+                    note: Some(note),
+                    wait: 30,
+                    json: false,
+                    fresh_session: false,
+                };
+                let argv = request_access_argv(Path::new("/usr/bin/passless"), "coding", &args);
+                let parsed = Args::try_parse_from(&argv)
+                    .unwrap_or_else(|e| panic!("{note:?} {argv:?}: {e}"));
+                let Some(Commands::Agent {
+                    profile,
+                    action:
+                        passless_core::AgentCommand::RequestAccess {
+                            rp_id,
+                            register: parsed_register,
+                            note: parsed_note,
+                            wait,
+                            fresh_session,
+                            ..
+                        },
+                    ..
+                }) = parsed.command
+                else {
+                    panic!("not agent request-access: {argv:?}");
+                };
+                assert_eq!(profile.as_deref(), Some("coding"));
+                assert_eq!(rp_id, "example.org");
+                // The note is a value, whatever it starts with, and sets no flag.
+                assert_eq!(parsed_note.as_deref(), Some(note), "{argv:?}");
+                assert_eq!(parsed_register, register, "{note:?} {argv:?}");
+                assert_eq!(wait, 30);
+                assert!(fresh_session);
+            }
+        }
+        // An RP ID that starts with a hyphen is not read as a flag either.
+        let args = AccessArgs {
+            rp_id: "-example.org",
+            register: false,
+            note: None,
+            wait: 30,
+            json: false,
+            fresh_session: false,
+        };
+        let argv = request_access_argv(Path::new("/usr/bin/passless"), "coding", &args);
+        assert!(Args::try_parse_from(&argv).is_ok(), "{argv:?}");
     }
 
     #[test]
