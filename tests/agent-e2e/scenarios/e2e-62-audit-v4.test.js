@@ -70,8 +70,10 @@ scenario({ id: 'E2E-62', exposeModes: ['port', 'pipe'], title: 'audit schema 4: 
   const all = auditEvents(audit);
   const fields = section12();
 
-  // Every record is schema version 4.
-  assert.deepEqual([...new Set(all.map(e => e.v))], [4], 'every record carries schema version 4');
+  // Every record carries one schema version, at least 4 (the Phase 1 fields); Phase 2 writes 5.
+  const versions = [...new Set(all.map(e => e.v))];
+  assert.equal(versions.length, 1, `one schema version: ${versions}`);
+  assert.ok(versions[0] >= 4, `schema version 4 or later: ${versions}`);
 
   // credential_scope on every operation record, present even when null.
   const operations = all.filter(e => fields.operationKinds.includes(e.kind));
