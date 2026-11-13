@@ -2024,7 +2024,9 @@ impl EscalationService {
 
     /// Admit `request` and attach it: the shared path of a ceremony and a pre-request. For a
     /// pre-request the per-session limits are checked again under the same mutex hold that
-    /// inserts its record, so they cannot be exceeded by concurrent calls.
+    /// inserts its record, so they cannot be exceeded by concurrent calls. A pre-request that
+    /// joins a live escalation writes its own `escalation.requested` before it is attached; a
+    /// failed write refuses it alone.
     fn enter(
         &self,
         request: EscalationRequest,
@@ -2040,7 +2042,9 @@ impl EscalationService {
         let revoke_token = self.grants.revoke_token(&request.profile, &request.rp_id);
 
         let now = self.clock.now();
-        let (entered, announcement) = {
+        // The escalation a pre-request joined and announced before attaching (see below).
+        let mut announced: Option<EscalationId> = None;
+        let (entered, announcement) = loop {
             let mut inner = self.lock();
             let admission = inner.admit(&request, &key, now, stored)?;
             if let (Attach::PreRequest { .. }, Some(principal)) = (&attach, &request.principal)
@@ -2055,7 +2059,31 @@ impl EscalationService {
                 return Err(EscalationRefusal::PreRequestRateLimited);
             }
             let (serial, joined, announcement) = match admission {
-                Admission::Join(serial) => (serial, true, None),
+                Admission::Join(serial) => {
+                    let id = inner.entries.get(&serial).map(|entry| entry.id.clone());
+                    if request.source == RequestSource::PreRequest
+                        && let Some(id) = id
+                        && announced.as_ref() != Some(&id)
+                    {
+                        // A pre-request that joins a live escalation is announced under that
+                        // escalation's ID with its own principal session hash and note. The
+                        // record is written before the joiner's waiter is attached, so it can
+                        // never follow `approved`, and a failed write refuses the joiner (ADR
+                        // 0014) without touching the escalation or its other waiters. The
+                        // state is admitted again afterwards, as it may have moved on.
+                        drop(inner);
+                        if let Err(e) = self.audit.record(request.audit_context(&id).requested()) {
+                            warn!(
+                                "escalation {}: the joining pre-request could not be audited: {}",
+                                id, e
+                            );
+                            return Err(EscalationRefusal::AuditFailure);
+                        }
+                        announced = Some(id);
+                        continue;
+                    }
+                    (serial, true, None)
+                }
                 Admission::Adopt(serial) => {
                     inner.adopt(serial, &request);
                     (serial, true, None)
@@ -2128,7 +2156,7 @@ impl EscalationService {
                     .or_default()
                     .push_back(now);
             }
-            (
+            break (
                 Entered {
                     serial,
                     waiter,
@@ -2136,25 +2164,10 @@ impl EscalationService {
                     joined,
                 },
                 announcement,
-            )
+            );
         };
 
         let Some(announcement) = announcement else {
-            if entered.joined && request.source == RequestSource::PreRequest {
-                // A pre-request that joins a live escalation is announced under that
-                // escalation's ID with its own principal session hash and note, so its note is
-                // not lost (review N3). The creator's record already opened the escalation, so a
-                // failed write only loses this one.
-                if let Err(e) = self
-                    .audit
-                    .record(request.audit_context(&entered.escalation_id).requested())
-                {
-                    warn!(
-                        "escalation {}: the joining pre-request could not be audited: {}",
-                        entered.escalation_id, e
-                    );
-                }
-            }
             debug!(
                 "escalation {}: {} ({}/{})",
                 entered.escalation_id,
@@ -7042,6 +7055,83 @@ mod tests {
                 PreRequestState::Pending
             );
             assert_eq!(h.audit.count("pre_approval.issued"), 0);
+        }
+
+        #[test]
+        fn a_failed_requested_record_refuses_the_joining_pre_request_only() {
+            let h = harness();
+            let ceremony = h
+                .service
+                .join_or_create(request("p", "b.example", 1))
+                .unwrap();
+            let b = principal(2);
+            h.audit.fail("escalation.requested");
+            assert_eq!(
+                pre_auth(&h, "b.example", &b),
+                PreRequestState::Refused(EscalationRefusal::AuditFailure)
+            );
+            h.audit.failing.lock().unwrap().clear();
+            // Nothing of the joiner is left: no record, no waiter, no rate-limit charge.
+            {
+                let inner = h.service.lock();
+                assert!(inner.pre_requests.is_empty());
+                assert!(!inner.pre_request_history.contains_key(&b));
+                let entry = inner.entries.values().next().unwrap();
+                assert_eq!(entry.waiters.len(), 1, "only the ceremony waits");
+            }
+            assert_eq!(h.audit.count("escalation.requested"), 1);
+            // The escalation and its waiter are unaffected.
+            let parked = park(ceremony);
+            approve_last(&h);
+            assert!(matches!(
+                parked.join().unwrap(),
+                EscalationOutcome::Approved { .. }
+            ));
+            assert_eq!(h.audit.count("escalation.approved"), 1);
+        }
+
+        #[test]
+        fn the_joiners_requested_record_precedes_approved() {
+            let h = harness();
+            let ceremony = h
+                .service
+                .join_or_create(request("p", "b.example", 1))
+                .unwrap();
+            let b = principal(2);
+            // The human approves while the joiner's record is being written: the joiner is not
+            // attached yet, so it can never be announced after `approved`.
+            let svc = h.service.clone();
+            let prompter = h.prompter.clone();
+            let clock = h.clock.clone();
+            let fired = Arc::new(AtomicBool::new(false));
+            h.audit.hook("escalation.requested", move || {
+                if !fired.swap(true, Ordering::SeqCst) {
+                    clock.advance(Duration::from_secs(2));
+                    svc.prompt_event(&prompter.last_shown(), PromptEvent::Approved);
+                }
+            });
+            let parked = park(ceremony);
+            let _ = pre_auth(&h, "b.example", &b);
+            assert!(matches!(
+                parked.join().unwrap(),
+                EscalationOutcome::Approved { .. }
+            ));
+            let kinds = h.audit.kinds();
+            let approved = kinds
+                .iter()
+                .position(|kind| kind == "escalation.approved")
+                .unwrap();
+            let joiner_requested = h
+                .audit
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|event| {
+                    event["kind"] == "escalation.requested" && event["source"] == "pre_request"
+                })
+                .unwrap();
+            assert!(joiner_requested < approved, "{kinds:?}");
         }
 
         #[test]
