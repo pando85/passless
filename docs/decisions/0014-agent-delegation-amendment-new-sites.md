@@ -517,10 +517,14 @@ without decrypting any credential. Findings, from `cmd/passless/src/storage/`:
 trait method `CredentialStorage::count_for_rp(&self, rp_id: &str) -> Option<usize>` returns the
 index count; its default is `None`, and a backend that returns `None` (none today, but a future one
 might) gets no count clause at all, never a "0". The pass wrapper runs its cheap refresh check before
-counting. The count is read in the register path before the escalation is raised, holding only the
-storage lock (level 40), briefly, never the operation lock and never across the wait (LOCKING.md).
-It counts files, so it includes a credential file that would fail to decrypt; the wording says
-"holds", which is accurate for that. The count is shown to the human only and never returned to the
+counting. The count is taken when the prompt is shown (review L4), not when the escalation is
+raised: a prompt queued behind another would otherwise show an old count. The escalation service
+asks a `StoreCounter` just before it hands the prompt to the notification driver, with no escalation
+lock held, so the count takes only the storage lock (level 40), briefly, never the operation lock
+and never across the wait (LOCKING.md). The RP matches ASCII-case-insensitively, as the sign path's
+post-filter does, so a credential under a differently-cased RP directory is counted. A count that
+cannot be made omits the clause. It counts files, so it includes a credential file that would fail
+to decrypt; the wording says "holds", which is accurate for that. The count is shown to the human only and never returned to the
 agent or the page.
 
 ### 5.3 Sign-in

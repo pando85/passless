@@ -186,9 +186,18 @@ pub struct EscalationRequest {
     pub max_wildcard_registrations: usize,
     /// The profile's live `wildcard_registration_prompts_per_day` (likewise).
     pub wildcard_registration_prompts_per_day: usize,
-    /// Registration only: the target store's passkey count for the RP, read from the backend's
-    /// index before the escalation was raised. Shown to the human only, never to the agent.
-    pub store_count: Option<usize>,
+    /// Registration only: how to count the target store's passkeys for the RP when the prompt is
+    /// shown (review L4), so a queued prompt shows the count of its own moment, not of the
+    /// moment it was raised. The count goes to the human only, never to the agent.
+    pub store_counter: Option<Arc<dyn StoreCounter>>,
+}
+
+/// Counts the passkeys a store holds for an RP, from metadata alone (never decrypting). Asked
+/// when a registration prompt is shown, with no escalation lock held, so an implementation may
+/// take the store's own lock for the count and nothing longer.
+pub trait StoreCounter: fmt::Debug + Send + Sync {
+    /// `None` when the count cannot be made: the prompt then omits the count clause.
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize>;
 }
 
 impl EscalationRequest {
@@ -228,10 +237,8 @@ impl EscalationRequest {
                 PermittingRule::Exact => PromptRule::Exact,
                 PermittingRule::Wildcard => PromptRule::Wildcard,
             },
-            store_count: match self.action {
-                CeremonyAction::Register => self.store_count,
-                CeremonyAction::Authenticate => None,
-            },
+            // Filled in when the prompt is shown, see `EscalationService::run`.
+            store_count: None,
         }
     }
 }
@@ -710,7 +717,8 @@ impl StoredWildcards {
 /// Deferred side effects, run after the mutex is released.
 enum Effect {
     Audit(AuditEvent),
-    Show(PromptTicket, PromptFields),
+    /// Show a prompt; a registration's count is taken just before it is rendered (review L4).
+    Show(PromptTicket, PromptFields, Option<Arc<dyn StoreCounter>>),
     Withdraw(PromptTicket),
 }
 
@@ -1130,7 +1138,11 @@ impl Inner {
             entry.ticket = Some(self.next_ticket);
             entry.prompted_at = Some(now);
             if let Some(ticket) = entry.ticket() {
-                effects.push(Effect::Show(ticket, entry.request.prompt_fields()));
+                let counter = match entry.request.action {
+                    CeremonyAction::Register => entry.request.store_counter.clone(),
+                    CeremonyAction::Authenticate => None,
+                };
+                effects.push(Effect::Show(ticket, entry.request.prompt_fields(), counter));
             }
         }
     }
@@ -1214,7 +1226,14 @@ impl EscalationService {
                         warn!("escalation: failed to audit {}: {}", kind, e);
                     }
                 }
-                Effect::Show(ticket, fields) => self.prompter.show(ticket, fields, self.sink()),
+                Effect::Show(ticket, mut fields, counter) => {
+                    // The count of this moment, under the store's lock for the count alone and
+                    // with no escalation lock held; an unavailable count omits the clause.
+                    if let Some(counter) = counter {
+                        fields.store_count = counter.count_for_rp(&fields.rp_id);
+                    }
+                    self.prompter.show(ticket, fields, self.sink());
+                }
                 Effect::Withdraw(ticket) => self.prompter.withdraw(&ticket),
             }
         }
@@ -2716,7 +2735,38 @@ mod tests {
             max_granted_rules: 64,
             max_wildcard_registrations: 4,
             wildcard_registration_prompts_per_day: 3,
-            store_count: None,
+            store_counter: None,
+        }
+    }
+
+    /// A store whose count the test changes: what `StoreCounter` reads when the prompt is shown.
+    #[derive(Debug)]
+    struct FakeStoreCounter {
+        count: Mutex<Option<usize>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl FakeStoreCounter {
+        fn new(count: Option<usize>) -> Arc<Self> {
+            Arc::new(Self {
+                count: Mutex::new(count),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn set(&self, count: Option<usize>) {
+            *self.count.lock().unwrap() = count;
+        }
+    }
+
+    impl StoreCounter for FakeStoreCounter {
+        fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+            assert!(
+                lock_order::held_levels().is_empty(),
+                "counted with a lock held"
+            );
+            self.asked.lock().unwrap().push(rp_id.to_string());
+            *self.count.lock().unwrap()
         }
     }
 
@@ -4091,7 +4141,7 @@ mod tests {
         EscalationRequest {
             rule: PermittingRule::Wildcard,
             mode: AgentMode::SameUser,
-            store_count: Some(2),
+            store_counter: Some(FakeStoreCounter::new(Some(2))),
             ..register(profile_name, rp_id, session)
         }
     }
@@ -4118,11 +4168,78 @@ mod tests {
         assert_eq!(fields.verb, PromptVerb::Register);
         assert_eq!(fields.rule, PromptRule::Wildcard);
         assert_eq!(fields.store_count, Some(2));
-        // A sign-in prompt never carries a count, even if one was set.
+        // A sign-in prompt never carries a count, even if a counter was set.
+        let counter = FakeStoreCounter::new(Some(5));
         let mut sign_in = request("p", "b.example", 1);
-        sign_in.store_count = Some(5);
+        sign_in.store_counter = Some(counter.clone());
         assert_eq!(sign_in.prompt_fields().store_count, None);
         assert_eq!(sign_in.prompt_fields().rule, PromptRule::Exact);
+        let _sign_in = h.service.join_or_create(sign_in).unwrap();
+        assert!(counter.asked.lock().unwrap().is_empty());
+    }
+
+    /// Review L4: the count is taken when the prompt is shown. A registration queued behind
+    /// another shows the count of the moment it reaches the screen, not the one it was raised
+    /// with.
+    #[test]
+    fn a_queued_registration_prompt_counts_when_it_is_shown() {
+        let h = harness();
+        let first = FakeStoreCounter::new(Some(0));
+        let second = FakeStoreCounter::new(Some(0));
+        let with = |rp: &str, counter: &Arc<FakeStoreCounter>| EscalationRequest {
+            store_counter: Some(counter.clone()),
+            ..wildcard_register("p", rp, 1)
+        };
+        let parked = park(h.service.join_or_create(with("a.example", &first)).unwrap());
+        let _queued = h
+            .service
+            .join_or_create(with("b.example", &second))
+            .unwrap();
+        assert_eq!(h.prompter.shown().len(), 1, "the second prompt is queued");
+        assert!(
+            second.asked.lock().unwrap().is_empty(),
+            "a queued prompt is not counted yet"
+        );
+
+        // The store changes while it waits (another registration, an external sync).
+        second.set(Some(3));
+        h.clock.advance(Duration::from_secs(5));
+        h.service
+            .prompt_event(&h.prompter.last_shown(), PromptEvent::Approved);
+        assert!(matches!(
+            parked.join().unwrap(),
+            EscalationOutcome::RegistrationApproved(_)
+        ));
+        let shown = h.prompter.shown.lock().unwrap();
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown[0].1.store_count, Some(0));
+        assert_eq!(
+            shown[1].1.store_count,
+            Some(3),
+            "the count of display time, not of admission"
+        );
+        assert_eq!(*second.asked.lock().unwrap(), vec!["b.example".to_string()]);
+    }
+
+    /// A count that cannot be made is omitted, never shown as "no passkey yet".
+    #[test]
+    fn an_unavailable_store_count_leaves_the_prompt_without_a_count() {
+        let h = harness();
+        let counter = FakeStoreCounter::new(None);
+        let _waiter = h
+            .service
+            .join_or_create(EscalationRequest {
+                store_counter: Some(counter.clone()),
+                ..wildcard_register("p", "a.example", 1)
+            })
+            .unwrap();
+        let fields = h.prompter.shown.lock().unwrap()[0].1.clone();
+        assert_eq!(fields.store_count, None);
+        assert_eq!(counter.asked.lock().unwrap().len(), 1);
+        let (_, body) = crate::agent::escalation_prompt::render_prompt(&fields)
+            .expect("the registration prompt renders");
+        assert!(!body.contains("holds no passkey"), "{body}");
+        assert!(!body.contains("already holds"), "{body}");
     }
 
     #[test]

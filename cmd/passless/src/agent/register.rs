@@ -16,7 +16,8 @@ use super::audit_events::{
     AuditAction, EscalationAuditContext, EscalationDenyCause, PolicyDenyReason,
 };
 use super::escalation::{
-    EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, WaiterSession,
+    EscalationOutcome, EscalationService, NoPark, ParkHook, RegistrationApproval, StoreCounter,
+    WaiterSession,
 };
 use super::lock_order::{self, LockLevel};
 use super::operation_audit::{AuditDeployment, AuditTarget, CeremonyAudit};
@@ -80,6 +81,22 @@ pub struct RegisterHandler {
     /// The deployment axes and backend that every operation record of this handler reports
     /// (ADR 0014 section 12).
     pub audit_deployment: AuditDeployment,
+}
+
+/// Counts the target store's passkeys for an RP for the registration prompt (review L4): the
+/// backend's path index only, under the storage lock for the count alone.
+struct StorageCounter(Arc<Mutex<Box<dyn CredentialStorage>>>);
+
+impl std::fmt::Debug for StorageCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageCounter").finish_non_exhaustive()
+    }
+}
+
+impl StoreCounter for StorageCounter {
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        lock_order::lock(&self.0, LockLevel::Storage).count_for_rp(rp_id)
+    }
 }
 
 /// A registration approval is bound to the creating ceremony: its profile, RP and session.
@@ -430,15 +447,14 @@ impl RegisterHandler {
             &challenge,
         );
         // The prompt shows how many passkeys the target store already holds for the site
-        // (amendment section 5.2): counted from the backend's path index, never by decrypting,
-        // holding only the storage lock and only for the count, before the escalation is raised
-        // and never across its wait (LOCKING.md). It goes to the human only.
-        let store_count = if matched.action == RuleAction::Request {
-            lock_order::lock(&self.credential_storage, LockLevel::Storage)
-                .count_for_rp(target.rp_id)
-        } else {
-            None
-        };
+        // (amendment section 5.2): counted from the backend's path index, never by decrypting.
+        // The count is taken when the prompt is shown (a queued prompt waits behind others), by
+        // the escalation service with no escalation lock held, under the storage lock for the
+        // count alone and never across the wait (LOCKING.md). It goes to the human only.
+        let store_counter: Option<Arc<dyn StoreCounter>> = (matched.action == RuleAction::Request)
+            .then(|| {
+                Arc::new(StorageCounter(self.credential_storage.clone())) as Arc<dyn StoreCounter>
+            });
         let escalation = Escalation {
             service: &self.escalation,
             policy_runtime: &self.policy_runtime,
@@ -449,7 +465,7 @@ impl RegisterHandler {
             origin: &req.origin,
             rule: &matched.rule,
             audit,
-            store_count,
+            store_counter,
         };
         let prepared = if matched.action == RuleAction::Request {
             Some(

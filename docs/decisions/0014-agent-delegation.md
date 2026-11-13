@@ -709,7 +709,8 @@ whether the site is on the operator's list, and, when the backend can count with
 how many passkeys the store already holds for the site. The actions are **Register once** and
 **Deny** (keys `register_once:<nonce>` and `deny:<nonce>`), because the approval is one
 registration, not "always". The count is read from the path index under the storage lock only,
-before the escalation is raised, and goes to the human only.
+when the prompt is shown (not when the escalation was raised, so a queued prompt is current), matches
+the RP case-insensitively, is omitted when it cannot be made, and goes to the human only.
 
 Wildcard registrations have their own pre-checks, in this order, each a refusal without a prompt:
 the profile-wide cooldown (`wildcard_registration_cooldown`), the hard cap

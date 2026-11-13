@@ -123,13 +123,18 @@ impl CredentialIndexes {
     /// [`CredentialFilter::ByRp`] would iterate, so a file that would fail to decrypt is counted.
     // Read by the agent registration path only.
     #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    ///
+    /// The RP matches ASCII-case-insensitively, as the sign path's post-filter does
+    /// (`eq_ignore_ascii_case` on the credential's RP ID): a credential stored under a
+    /// differently-cased RP directory belongs to the same site and is counted (review L4).
     pub fn count_for_rp(&self, rp_id: &str) -> usize {
-        self.rp.get(rp_id).map_or(0, |cred_ids| {
-            cred_ids
-                .iter()
-                .filter(|cred_id| self.id.contains_key(*cred_id))
-                .count()
-        })
+        let rp_id = rp_id.trim();
+        self.rp
+            .iter()
+            .filter(|(stored, _)| stored.eq_ignore_ascii_case(rp_id))
+            .flat_map(|(_, cred_ids)| cred_ids)
+            .filter(|cred_id| self.id.contains_key(*cred_id))
+            .count()
     }
 
     /// Every indexed credential as `(RP ID, credential ID)`, read from the path index alone: no
@@ -416,6 +421,24 @@ mod tests {
             assert_eq!(indexes.count_for_rp("unlisted.example"), 0, "{extension}");
             assert_eq!(indexes.count_for_rp(""), 0, "{extension}");
         }
+    }
+
+    /// Review L4: a credential under a differently-cased RP directory is the same site.
+    #[test]
+    fn count_for_rp_ignores_the_case_of_the_rp_directory() {
+        let dir = unreadable_store("bin");
+        let variant = dir.path().join("Example.COM");
+        std::fs::create_dir_all(&variant).unwrap();
+        let path = variant.join("ee.bin");
+        std::fs::write(&path, b"not a credential").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let indexes = load_credential_paths(dir.path(), "bin").unwrap();
+        for asked in ["example.com", "EXAMPLE.com", "Example.Com", " example.com "] {
+            assert_eq!(indexes.count_for_rp(asked), 3, "{asked}");
+        }
+        // Still exact on the label boundaries: a parent or sibling domain is another site.
+        assert_eq!(indexes.count_for_rp("login.example.com"), 1);
+        assert_eq!(indexes.count_for_rp("example.co"), 0);
     }
 
     #[test]

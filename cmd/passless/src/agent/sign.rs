@@ -19,7 +19,7 @@ use super::audit::AuditGate;
 use super::audit_events::{AuditAction, CredentialScope, PolicyDenyReason};
 use super::escalation::{
     EscalationOutcome, EscalationRefusal, EscalationRequest, EscalationService, NoPark, ParkHook,
-    WaiterSession,
+    StoreCounter, WaiterSession,
 };
 use super::granted_rules::PermittingRule;
 use super::lock_order::{self, LockLevel, Tracked};
@@ -1129,8 +1129,9 @@ pub(crate) struct Escalation<'a> {
     pub rule: &'a RuleIdentity,
     /// The ceremony's audit: told which escalation the ceremony waits on.
     pub audit: &'a CeremonyAudit,
-    /// Registration only: the target store's passkey count for the RP (prompt text only).
-    pub store_count: Option<usize>,
+    /// Registration only: counts the target store's passkeys for the RP when the prompt is shown
+    /// (prompt text only).
+    pub store_counter: Option<Arc<dyn StoreCounter>>,
 }
 
 /// An escalation request that passed the pre-checks (cooldown, grant cap and store, bus, queue,
@@ -1201,7 +1202,7 @@ impl Escalation<'_> {
             max_granted_rules: profile.max_granted_rules,
             max_wildcard_registrations: profile.max_wildcard_registrations,
             wildcard_registration_prompts_per_day: profile.wildcard_registration_prompts_per_day,
-            store_count: self.store_count,
+            store_counter: self.store_counter.clone(),
         };
         self.service
             .precheck(&request)
@@ -1736,7 +1737,7 @@ impl SignHandler {
             origin: &req.origin,
             rule: &matched.rule,
             audit,
-            store_count: None,
+            store_counter: None,
         };
         let prepared = if matched.action == RuleAction::Request {
             Some(
