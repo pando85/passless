@@ -61,7 +61,7 @@ every command goes through `passless agent browser-control` and the daemon's CDP
   `browser-status` (`interception: attached`, `incognito_allowed`, `cdp_exposure: pipe`) and every scenario still asserts the
   agent-path audit records.
 - Pipe-enabled: E2E-01 to 05, 07, 09, 12 (+/audit-rule), 13, 14, 15, 16, 17 (+/after-key-use), 23 to 30, 32 (+/abort), 33, 43, 48, 49,
-  50, 51; pipe-only: E2E-52, 52/strict, 53 (adapters refused for a pipe-mode profile, with a port-mode control), 54 (grants revoke ends
+  50, 51, 58, 59 (+/deny), 60, 61/localhost, 62; pipe-only: E2E-52, 52/strict, 53 (adapters refused for a pipe-mode profile, with a port-mode control), 54 (grants revoke ends
   the principal session and its browser). Every other scenario stays port-only with a comment saying why: the Playwright and
   CDP-endpoint tools, and the ones that read or stop the extension worker (hidden in pipe mode), inherently need a port.
 
@@ -91,12 +91,13 @@ Chrome for Testing are downloaded once into `target/agent-e2e-cache/` (never int
 
 A `request` rule escalates: the daemon's prompt child shows a notification on the private bus, and the scripted
 notification double answers it. Stack options: `notify: {script: [...]}` (step N answers the N-th new notification, calls
-beyond the list are `ignore`; `approve[:ms]`, `deny[:ms]`, `close[:ms]`, `ignore`), `notify: false` (no notification server
+beyond the list are `ignore`; `approve[:ms]`, `deny[:ms]`, `close[:ms]`, `ignore`; `approve` invokes the prompt's own approving key,
+`allow_always:<nonce>` on a sign-in prompt and `register_once:<nonce>` on a registration prompt), `notify: false` (no notification server
 on the private bus: escalation is denied `escalation_unavailable`), `agents: {escalation_cooldown: 2, escalation_timeout: N,
 state_dir: '/abs'}` (raw `[agents]` keys; a 1 s cooldown is accepted by debug builds only), per profile `max_granted_rules`.
 `stack.notify.stop()` waits for the double to exit (it owns `org.freedesktop.Notifications`); `stack.restartNotify({script})`
 starts a new one with its own log (`notify-2.jsonl`). Approvals must be scripted at `approve:1500` or later: the daemon
-accepts "Allow always" only 1000 ms after the notification was shown, and an earlier one is a deny.
+accepts "Allow always" and "Register once" only 1000 ms after the notification was shown, and an earlier one is a deny.
 
 Helpers (`lib/helpers.js`): `escalationEvents`, `grantedRuleEvents`, `denyReasons`, `grantsStore` (parsed grant store file).
 Quirks: the escalation pre-check runs before the replay key, so a refusal (cooldown, caps, unavailable) consumes neither;
@@ -105,11 +106,38 @@ fetch new RP options per call). `PASSLESS_INTERACTION_MODE=automatic` has no eff
 revocation or clear the daemon terminates the managed browsers (the admin-launched one too) and audits late use of the
 old bearer as `bearer_revoked`, so a scenario launches a fresh browser (E2E-31).
 
-CI subset: E2E-23, 24, 25, 27, 28, 29, 31, 48, 50 (about 5 to 15 s each). Full matrix only: E2E-20/escalation (6 min
+CI subset: E2E-23, 24, 25, 27, 28, 29, 31, 48, 50, 58 to 62 (about 5 to 30 s each). Full matrix only: E2E-20/escalation (6 min
 approval), 21 (3 min timeout), 26, 30, 43, 44, 49. E2E-26 proves sequential prompting in arrival order with four RPs; the queue
 bound (1 active + 8 queued) needs several bearer sessions of one profile, which the harness cannot create (admin launch
 returns the profile's live lease), so the bound is covered by the coordinator unit tests. E2E-44 sets
 `agents.allow_automatic_human_path`; E2E-44/startup-refusal proves agents refuse to start without it (R19).
+
+## Pins with `*` and registration at unlisted sites (ADR 0014 amendment, Phase 1)
+
+`lib/daemon.js` writes the acknowledgements a rule needs: a `*` rule with `register` other than `deny` also gets
+`acknowledge_global_registration` (next to `acknowledge_global_same_user` and `acknowledge_same_user_registration`); a profile's
+`omitAck: ['global_same_user' | 'same_user_registration' | 'global_registration']` leaves one out to prove the daemon refuses the
+config. Profile keys go through `extra`: `credential_refs` (pins, valid with `*`), `max_wildcard_registrations`,
+`wildcard_registration_prompts_per_day`. A pin is a credential reference, which exists only after seeding, so such a profile is
+configured with `stack.restartDaemon`. `daemon.adminPlain(...)` runs `agent-admin --output plain` (the grants table) and
+`daemon.doctorAgents()` runs the offline `passless doctor --agents` and returns its checks. `lib/escalation.js` holds the registration
+prompt's expected text (`REGISTER_SUMMARY`, `registrationBody`, `humanStoreLine`, `assertRegistrationActions`).
+
+| ID | What it proves |
+|---|---|
+| E2E-27 (updated) | An exact-rule registration prompt: summary "CREATE A NEW PASSKEY? (not a sign-in)", the isolated profile's own store with its passkey count (none, then 1), **Register once** / **Deny** with `register_once:<nonce>` keys, a fresh nonce per prompt |
+| E2E-28 (updated) | Daemon-derived text only for both kinds: the registration prompt (human store, count) and the sign-in prompt (**Allow always**); no page marker reaches either, seven lines at most, no expiry |
+| E2E-58 | Pins with `*`: an exact RP signs only with its pin (allowCredentials cannot name another), an unlisted RP discovers through `*`; with the pinned credential gone (file removed, daemon restarted) the exact RP fails closed although another credential and the wildcard exist; `profile check` and `doctor --agents` print `pin_coverage` and warn in `pin_health`, and the agent's own `doctor` carries none of those checks; audit `credential_scope` `pinned` and `discovered` |
+| E2E-59 | A same-user wildcard registration approved: the prompt names the human store, "NOT on your list; matched by the * rule" and the count, with Register once / Deny; the credential is in the human store; the grant is `registration` with rule `*` and the credential (audit, store file, `grants list` JSON and its plain table with a header); the next sign-in has no prompt and uses the new credential although the human already had one there (`registration_pinned`) |
+| E2E-59/exact-later | A grant belongs to the rule it was approved through: after a wildcard registration the operator adds an exact `authenticate = "request"` rule for the site and restarts; a sign-in that names the human's passkey prompts (and a deny signs nothing) instead of using the old `*` grant with discovery, and `profile check` lists the grant as inert |
+| E2E-59/deny | A deny starts the per-key cooldown and the profile-wide one: the same site and a second unlisted site are refused without a prompt (`escalation_cooldown`, `wildcard_registration_cooldown`), and an exact-rule registration of the profile still prompts and succeeds |
+| E2E-60 | Cap and daily limit, each with a non-default value: the refusal comes without a prompt (`wildcard_registration_rate`, `wildcard_registration_cap`); revoking one grant frees a cap slot, the next registration prompts and the one after is refused again |
+| E2E-61 | Config refusals (`*` with `register = "allow"`, each of the three acknowledgements missing, an isolated `*`); E2E-61/localhost: `localhost` is neither registered nor signed in through `*`, no prompt, store untouched |
+| E2E-62 | Audit schema 4 across three profiles: every record is version 4, every operation record carries `credential_scope` (`pinned`, `discovered`, `registration_pinned`, null before selection) and a terminal repeats it, the three new `policy.deny` reasons, escalations with `rule = "*"` and `action = "register"`, and the `registration` and `escalation` grants with rule `*` |
+| E2E-42/register | Local, optional (real dunst, like E2E-42): the registration prompt's summary and body as dunst displays them, the context menu offers **Register once** and **Deny** and not "Allow always", and choosing Register once completes the registration |
+
+notify-osd 1.0 (the motivating server) cannot run in CI: the release checklist has a manual check on it (the fallback dialog shows
+Register once and Deny, the body fits, only the nonced key from it decides).
 
 Containment (P10a): every managed browser runs under `bwrap --dev-bind / / --dev /dev --die-with-parent` (E2E-46 reads its
 `/dev` through `/proc/<pid>/root`); E2E-46/refused disables bwrap and expects the launch refusal; E2E-46/session-scope is the

@@ -10,7 +10,8 @@ use zbus::{Connection, Variant, interface};
 
 use crate::{
     Emulation, Event, LogWriter, NOTIFY_OSD_SERVER_INFORMATION, OBJECT_PATH, REASON_CLOSED_BY_CALL,
-    REASON_DISMISSED, Script, StepAction, WELL_KNOWN_NAME, resolve_action_key, value_to_json,
+    REASON_DISMISSED, Script, StepAction, WELL_KNOWN_NAME, resolve_action_key, resolve_approve_key,
+    value_to_json,
 };
 
 /// Delayed steps wait at least this long so signals follow the `Notify` reply.
@@ -123,7 +124,8 @@ async fn run_step(
         Emulation::NotifyOsd => REASON_CLOSED_BY_CALL,
     };
     match action {
-        StepAction::Ignore => {}
+        // `Approve` is resolved to the notification's own key before the step is scheduled.
+        StepAction::Ignore | StepAction::Approve => {}
         StepAction::Invoke(key) => {
             match emit(&conn, "ActionInvoked", &(id, key.as_str())).await {
                 Ok(()) => shared.log(&Event::ActionInvoked {
@@ -228,6 +230,7 @@ impl NotificationDouble {
         {
             let action = match step.action {
                 StepAction::Invoke(key) => StepAction::Invoke(resolve_action_key(&key, &actions)),
+                StepAction::Approve => StepAction::Invoke(resolve_approve_key(&actions)),
                 other => other,
             };
             tokio::spawn(run_step(

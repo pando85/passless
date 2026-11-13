@@ -38,13 +38,24 @@ the same keys; keys that do not apply yet are `null`:
 | Identity | `session_id_hash`, `request_id`, `escalation_id`, `profile_id`, `mode`, `principal_relationship` |
 | Policy state | `revocation_epoch`, `grant_epoch`, `rule` (`exact` or `*`), `grant_source` (`config` or `granted`), `decision`, `evidence_source` (`agent` or absent) |
 | Request | `action`, `rp_id`, `origin`, `top_origin` (null on the proxy path), `cross_origin` |
-| Credential | `credential_ref`, `selection_rule`, `backend` (`local`, `pass`, `tpm`), `key_provider`, `counter_before`, `counter_after` |
+| Credential | `credential_ref`, `credential_scope` (`pinned`, `discovered`, `registration_pinned`; null before the candidates are chosen), `selection_rule`, `backend` (`local`, `pass`, `tpm`), `key_provider`, `counter_before`, `counter_after` |
 | Outcome | `result` (`success`, `replay_served`, `denied`, `aborted`, `revoked`, `timeout`, `busy`, `error`), `failure_class` |
+
+`credential_scope` says where the candidate credentials came from (schema version 4): `pinned` (the
+profile's `credential_refs` at an exact rule), `discovered` (every credential of the site), or
+`registration_pinned` (only the credentials the agent registered at that site, which is how a site
+reached through `*` behaves once the agent has registered there). See
+[Rules](rules.md#credential-selection).
 
 A reservation and its terminal record share `request_id`. Evidence is always `agent`: agent-derived
 UP and UV are never recorded, or described, as human interaction.
 
-`policy.deny` and `policy.replay_served` also carry `reason` and `suppressed`. A page can loop a
+`policy.deny` and `policy.replay_served` also carry `reason` and `suppressed`. The reasons of a
+registration at an unlisted site (`register = "request"` on the `*` rule) that was refused without a
+prompt are `wildcard_registration_cap` (the profile holds `max_wildcard_registrations` such grants),
+`wildcard_registration_rate` (`wildcard_registration_prompts_per_day` prompts already shown in the last
+24 hours) and `wildcard_registration_cooldown` (a recent deny, timeout or repeated withdrawal started the
+profile-wide cooldown). A page can loop a
 refused request, so refusals are coalesced per session, RP, action and reason: the first 16 in a
 60 second window are written in full, and the rest are counted. The count is written as one
 `policy.deny` with `suppressed` set to the number of refusals it stands for (its `origin` fields are
@@ -56,7 +67,7 @@ either a record or part of a count. `suppressed` is null on every other record.
 
 - Escalation: `escalation.requested`, `approved`, `denied`, `expired` (`reason` = `timeout`, `aborted`
   or `server_lost`) and `revoked` (operator revocation or policy reload), each with `origin` and
-  `rule`.
+  `rule`. A registration at an unlisted site has `action = "register"` and `rule = "*"`.
 - Granted rules: `granted_rule.add` and `granted_rule.revoke`.
 - Browser sessions: `grant.request` and `grant.approve` (profile, principal, RP scope, TTL), and
   browser lease creation, expiry, revocation, exit and cleanup.
@@ -79,6 +90,7 @@ site afterwards.
 
 ## What to look for
 
-Sign-ins to RPs outside the task; a `same-user` profile registering a credential; repeated denials,
+Sign-ins to RPs outside the task; a `same-user` profile registering a credential (`rule = "*"` means a
+site you had not listed, and `agent-admin grants list` shows each one with its `RULE`); repeated denials,
 replays or budget exhaustion (a loop or a hostile page); escalations and their outcomes; whether the
 site still holds a session after local teardown.

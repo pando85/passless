@@ -142,6 +142,29 @@ pub trait CredentialStorage: Send + Sync {
     /// Count total number of stored credentials
     fn count_credentials(&self) -> usize;
 
+    /// How many credentials the store holds for exactly `rp_id`, when the backend can tell
+    /// without decrypting or unsealing anything (ADR 0014 amendment section 5.2).
+    ///
+    /// The count is shown to the human in a registration prompt only. It must come from metadata
+    /// such as the path index, never from [`Self::list_relying_parties`]'s default (which reads
+    /// every credential) or any other decrypting read. A backend that cannot count that way keeps
+    /// the default `None`, and the prompt then omits the count instead of showing 0.
+    // Read by the agent registration path only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    fn count_for_rp(&self, _rp_id: &str) -> Option<usize> {
+        None
+    }
+
+    /// Every credential the store holds as `(RP ID, credential ID)`, when the backend can tell
+    /// without decrypting or unsealing anything. The agent doctor checks locate profile pins
+    /// (`credential_refs`) with it. Like [`Self::count_for_rp`] it must come from the path index
+    /// only; a backend that cannot list that way keeps the default `None`.
+    // Read by the agent doctor checks only.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        None
+    }
+
     /// Check if user verification should be disabled for this backend
     ///
     /// Some backends (like pass) don't support user verification.
@@ -208,6 +231,14 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn count_credentials(&self) -> usize {
         (**self).count_credentials()
+    }
+
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        (**self).count_for_rp(rp_id)
+    }
+
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        (**self).indexed_credentials()
     }
 
     fn disable_user_verification(&self) -> bool {

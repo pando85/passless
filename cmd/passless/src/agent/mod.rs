@@ -14,6 +14,7 @@ pub mod deployment;
 pub mod doctor;
 pub mod doctor_agents;
 pub mod doctor_grants;
+pub mod doctor_pins;
 pub mod escalation;
 pub mod escalation_prompt;
 pub mod grant;

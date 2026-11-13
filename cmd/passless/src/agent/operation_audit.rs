@@ -31,8 +31,8 @@ use passless_core::agent::{AgentMode, CredentialRef, MatchedRule, ProfileId, Rul
 
 use super::audit::{AuditError, AuditGate};
 use super::audit_events::{
-    AuditAction, BackendKind, OperationRecord, OperationTerminalBuilder, PolicyAllowBuilder,
-    PolicyDenyBuilder, PolicyDenyReason, RuleGrantSource,
+    AuditAction, BackendKind, CredentialScope, OperationRecord, OperationTerminalBuilder,
+    PolicyAllowBuilder, PolicyDenyBuilder, PolicyDenyReason, RuleGrantSource,
 };
 use super::deployment::PrincipalRelationship;
 use super::policy_engine::PolicyRuntime;
@@ -142,6 +142,7 @@ struct State {
     grant_source: Option<RuleGrantSource>,
     escalation_id: Option<String>,
     credential_ref: Option<CredentialRef>,
+    credential_scope: Option<CredentialScope>,
     selection_rule: Option<String>,
     counter_before: Option<u32>,
     counter_after: Option<u32>,
@@ -225,6 +226,11 @@ impl CeremonyAudit {
         state.counter_before = counter_before;
     }
 
+    /// Record where the candidate credentials come from (audit schema version 4).
+    pub fn credential_scope(&self, scope: CredentialScope) {
+        self.state.borrow_mut().credential_scope = Some(scope);
+    }
+
     /// Record the credential a registration created.
     pub fn created(&self, credential_ref: CredentialRef) {
         self.state.borrow_mut().credential_ref = Some(credential_ref);
@@ -266,6 +272,7 @@ impl CeremonyAudit {
             )
             .matched(state.rule.clone(), state.grant_source)
             .credential(state.credential_ref.clone(), state.selection_rule.clone())
+            .credential_scope(state.credential_scope)
             .counters(state.counter_before, state.counter_after)
     }
 

@@ -11,6 +11,10 @@
 #   premature_approve  => Denied    ("Allow always" before min_review_delay elapsed)
 #   deny               => Denied    (explicit deny action)
 #   close              => Denied    (a dismissal is a deny)
+#   register_once_approve  => Approved  (a registration prompt, matched by the `*` rule: the first action is
+#                                        "Register once", accepted after min_review_delay)
+#   register_premature     => Denied    ("Register once" before min_review_delay)
+#   register_deny          => Denied    (explicit deny on a registration prompt)
 #
 
 set -euo pipefail
@@ -78,6 +82,8 @@ _av_rn_run_scenario() {
     local expected_decision="$3"
     local display_num="$4"
     local probe_bin="$5"
+    # Extra agent-prompt-probe arguments (the registration prompt: `--action register --wildcard --store-count 1`).
+    local probe_args="${6:-}"
 
     local session_dir="${TEMP_ROOT:-/tmp}/rn-session-$$-${scenario_name}"
     mkdir -p "$session_dir"
@@ -87,7 +93,17 @@ _av_rn_run_scenario() {
     local dunst_config="${session_dir}/dunstrc"
     local session_log="${session_dir}/session.log"
 
-    cat > "$dunst_config" << 'DUNST_EOF'
+    # A prompt has two actions, so `dunstctl action` opens dunst's context menu (dunst 1.13). The menu is answered
+    # through dunst's `dmenu` setting with a script that picks the entry a person would click for this scenario:
+    # the approving action ("Allow always", or "Register once" on a registration prompt) or "Deny".
+    local pick_pattern='allow always|register once'
+    [[ "$action_kind" == "deny" ]] && pick_pattern='deny'
+    local picker="${session_dir}/pick.sh"
+    printf '#!/bin/sh\ngrep -i -E %s | head -n 1\n' "'${pick_pattern}'" > "$picker"
+    chmod +x "$picker"
+    printf '[global]\ndmenu = %s\n\n' "$picker" > "$dunst_config"
+
+    cat >> "$dunst_config" << 'DUNST_EOF'
 [dunst]
 follow = mouse
 indicate_hidden = yes
@@ -165,9 +181,9 @@ _wait_for_dunst() {
         if dunstctl running 2>/dev/null | grep -qi 'true\|running\|1'; then
             return 0
         fi
+        # dunst owns the name once "dunstctl count displayed" (a bare number; plain "count" prints a table) succeeds.
         local c
-        c=\$(dunstctl count 2>/dev/null || echo "0")
-        if [[ "\$c" =~ ^[0-9]+\$ ]]; then
+        if c=\$(dunstctl count displayed 2>/dev/null) && [[ "\$c" =~ ^[0-9]+\$ ]]; then
             return 0
         fi
         sleep 0.25
@@ -182,12 +198,12 @@ if ! _wait_for_dunst; then
     exit 0
 fi
 
-"${probe_bin}" --timeout ${_RN_PROBE_TIMEOUT} --min-review-delay ${_RN_MIN_REVIEW_DELAY_MS} > "${probe_output}" 2>"${session_dir}/probe.stderr" &
+"${probe_bin}" --timeout ${_RN_PROBE_TIMEOUT} --min-review-delay ${_RN_MIN_REVIEW_DELAY_MS} ${probe_args} > "${probe_output}" 2>"${session_dir}/probe.stderr" &
 probe_pid=\$!
 
 waited=0
 while [[ \$waited -lt ${_RN_NOTIFY_WAIT_SECS} ]]; do
-    cnt=\$(dunstctl count 2>/dev/null || echo "0")
+    cnt=\$(dunstctl count displayed 2>/dev/null || echo "0")
     if [[ "\$cnt" =~ ^[0-9]+\$ ]] && [[ "\$cnt" -gt 0 ]]; then
         break
     fi
@@ -203,16 +219,16 @@ done
 
 case "${action_kind}" in
     delayed_approve)
-        sleep \$((_RN_DELAYED_EXTRA_MS / 1000)).\$((_RN_DELAYED_EXTRA_MS % 1000))
+        sleep $((_RN_DELAYED_EXTRA_MS / 1000)).$((_RN_DELAYED_EXTRA_MS % 1000))
         dunstctl action 0 2>/dev/null || true
         ;;
     premature_approve)
-        sleep 0.\$(printf '%01d' \$((_RN_PREMATURE_DELAY_MS / 100)))
+        sleep 0.$(printf '%01d' $((_RN_PREMATURE_DELAY_MS / 100)))
         dunstctl action 0 2>/dev/null || true
         ;;
     deny)
         sleep 0.5
-        dunstctl action 1 2>/dev/null || true
+        dunstctl action 0 2>/dev/null || true
         ;;
     close)
         sleep 0.5
@@ -319,6 +335,16 @@ stage_real_notifications() {
         return 0
     fi
 
+    # The scenarios need a display for dunst: nothing else starts one (the number only names a free one).
+    if ! av_start_xvfb "$display"; then
+        av_log_warn "Xvfb could not start on ${display}; skipping"
+        _av_rn_add_scenario "xvfb_display" "skip" "Xvfb did not start"
+        _av_rn_write_results "$results_file"
+        # shellcheck disable=SC2034
+        STAGE_SKIPPED=true
+        return 0
+    fi
+
     av_log_info "Running isolated notification scenarios on ${display}..."
 
     _av_rn_run_scenario "delayed_approve"    "delayed_approve"   "approved"  "$display" "$probe_bin"
@@ -326,6 +352,13 @@ stage_real_notifications() {
     _av_rn_run_scenario "deny"               "deny"              "denied"    "$display" "$probe_bin"
     _av_rn_run_scenario "close"              "close"             "denied"    "$display" "$probe_bin"
 
+    # The registration prompt (ADR 0014 amendment section 5): "Register once" is the approving action.
+    local register_args="--action register --wildcard --store-count 1"
+    _av_rn_run_scenario "register_once_approve" "delayed_approve"   "approved"  "$display" "$probe_bin" "$register_args"
+    _av_rn_run_scenario "register_premature"    "premature_approve" "denied"    "$display" "$probe_bin" "$register_args"
+    _av_rn_run_scenario "register_deny"         "deny"              "denied"    "$display" "$probe_bin" "$register_args"
+
+    av_stop_xvfb
     _av_rn_write_results "$results_file"
 
     if [[ $_av_rn_failed -gt 0 ]]; then

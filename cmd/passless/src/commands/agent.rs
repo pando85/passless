@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use passless_core::agent::protocol::{AuthorityRisk, PrincipalCredentialSummary};
+use passless_core::agent::protocol::{
+    AUTHORITY_SCOPE_DISCOVERED, AUTHORITY_SCOPE_PINNED, AuthorityCredentialScope, AuthorityRisk,
+    PrincipalCredentialSummary,
+};
 use passless_core::{
     AgentCommand, AgentCredentialAction, CredentialRef, Error, OutputFormat, ProfileId, Result,
 };
@@ -214,6 +217,33 @@ fn authority_risk_message(risk: AuthorityRisk) -> (&'static str, &'static str, &
     }
 }
 
+/// The plain `agent capabilities` lines for where the profile's credentials come from: one for
+/// the exact rules and one for the `*` rule (ADR 0014 amendment section 2.1).
+fn credential_scope_lines(scope: &AuthorityCredentialScope) -> Vec<String> {
+    let exact = match scope.exact_rules.as_str() {
+        AUTHORITY_SCOPE_PINNED => format!(
+            "pinned: the profile's credential_refs ({} configured), plus credentials registered \
+             at the RP",
+            scope.configured_reference_count
+        ),
+        AUTHORITY_SCOPE_DISCOVERED => "discovered: every credential of the RP".to_string(),
+        other => other.to_string(),
+    };
+    let wildcard = match scope.wildcard.as_deref() {
+        None => "none: the profile has no `*` rule".to_string(),
+        Some(AUTHORITY_SCOPE_DISCOVERED) => {
+            "discovered: every credential of the RP, or only the credentials registered at \
+             that RP once there are any; credential_refs never apply"
+                .to_string()
+        }
+        Some(other) => other.to_string(),
+    };
+    vec![
+        format!("credential_scope_exact_rules: {exact}"),
+        format!("credential_scope_wildcard: {wildcard}"),
+    ]
+}
+
 fn dispatch_capabilities(output: OutputFormat, profile: &str) -> Result<()> {
     let mut client = connect_principal(profile)?;
     let resp = client
@@ -233,10 +263,9 @@ fn dispatch_capabilities(output: OutputFormat, profile: &str) -> Result<()> {
                 println!("acts_as_human: {}", authority.identity.acts_as_human);
                 println!("policy_generation: {}", authority.policy_generation);
                 println!("credential_selection: {}", authority.credentials.selection);
-                println!(
-                    "dynamic_credential_scope: {}",
-                    authority.credentials.dynamic_per_rp
-                );
+                for line in credential_scope_lines(&authority.credentials) {
+                    println!("{line}");
+                }
                 println!(
                     "max_session_ttl_secs: {}",
                     authority.session.max_session_ttl_secs
@@ -653,6 +682,48 @@ fn exec_command_directly(command: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope(exact: &str, wildcard: Option<&str>, count: u32) -> AuthorityCredentialScope {
+        AuthorityCredentialScope {
+            exact_rules: exact.to_string(),
+            wildcard: wildcard.map(str::to_string),
+            configured_reference_count: count,
+            selection: "single".to_string(),
+        }
+    }
+
+    #[test]
+    fn capabilities_say_pins_cover_the_exact_rules_and_the_wildcard_discovers() {
+        let lines = credential_scope_lines(&scope(
+            AUTHORITY_SCOPE_PINNED,
+            Some(AUTHORITY_SCOPE_DISCOVERED),
+            19,
+        ));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("credential_scope_exact_rules: pinned"));
+        assert!(
+            lines[0].contains("credential_refs (19 configured)"),
+            "{lines:?}"
+        );
+        assert!(lines[1].starts_with("credential_scope_wildcard: discovered"));
+        assert!(
+            lines[1].contains("credential_refs never apply"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_say_so_when_there_is_no_wildcard_or_no_pin() {
+        let lines = credential_scope_lines(&scope(AUTHORITY_SCOPE_DISCOVERED, None, 0));
+        assert_eq!(
+            lines[0],
+            "credential_scope_exact_rules: discovered: every credential of the RP"
+        );
+        assert_eq!(
+            lines[1],
+            "credential_scope_wildcard: none: the profile has no `*` rule"
+        );
+    }
 
     #[test]
     fn json_envelope_has_no_secrets() {

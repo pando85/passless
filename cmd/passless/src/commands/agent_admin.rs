@@ -13,7 +13,7 @@ use passless_core::{
 };
 
 use passless_core::agent::PrincipalSessionId;
-use passless_core::agent::protocol::{AdminRequest, AuditExportFormat};
+use passless_core::agent::protocol::{AdminRequest, AuditExportFormat, GrantedRuleList};
 
 use serde::Serialize;
 
@@ -580,35 +580,7 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
         passless_core::agent::AdminResponse::GrantedRuleList(list) => match output {
             OutputFormat::Json => admin_output_json(&list),
             OutputFormat::Plain => {
-                for profile in &list.profiles {
-                    match &profile.disabled_reason {
-                        Some(reason) => {
-                            println!("{}: DISABLED ({})", profile.profile_id, reason)
-                        }
-                        None => println!(
-                            "{}: {} rule(s), digest {}",
-                            profile.profile_id,
-                            profile.rules.len(),
-                            profile.digest
-                        ),
-                    }
-                    for rule in &profile.rules {
-                        print!(
-                            "  {} {} kind={} rule={} granted_at={} request={} origin={}",
-                            rule.rp_id,
-                            rule.action,
-                            rule.kind,
-                            rule.rule,
-                            rule.granted_at,
-                            rule.request_id,
-                            rule.origin
-                        );
-                        if let Some(credential_ref) = &rule.credential_ref {
-                            print!(" credential={}", credential_ref);
-                        }
-                        println!();
-                    }
-                }
+                print!("{}", format_granted_rules(&list));
                 Ok(())
             }
         },
@@ -627,6 +599,82 @@ fn dispatch_admin_grants(output: OutputFormat, action: &AdminGrantsAction) -> Re
         }
         _ => Err(Error::Other("unexpected response".to_string())),
     }
+}
+
+/// The plain `agent-admin grants list` text: per profile a summary line, then a table with a header
+/// whose `RULE` column says which configured rule permitted each grant (`exact`, or `*` for a grant
+/// under the wildcard rule, ADR 0014 amendment section 2.2) and `KIND` whether it came from an
+/// approved sign-in (`escalation`) or a registration (`registration`, with its credential).
+fn format_granted_rules(list: &GrantedRuleList) -> String {
+    const HEADER: [&str; 8] = [
+        "RP_ID",
+        "ACTION",
+        "KIND",
+        "RULE",
+        "GRANTED_AT",
+        "REQUEST",
+        "ORIGIN",
+        "CREDENTIAL",
+    ];
+    let mut out = String::new();
+    for profile in &list.profiles {
+        match &profile.disabled_reason {
+            Some(reason) => {
+                out.push_str(&format!("{}: DISABLED ({})\n", profile.profile_id, reason))
+            }
+            None => out.push_str(&format!(
+                "{}: {} rule(s), digest {}\n",
+                profile.profile_id,
+                profile.rules.len(),
+                profile.digest
+            )),
+        }
+        if profile.rules.is_empty() {
+            continue;
+        }
+        let rows: Vec<[String; 8]> = profile
+            .rules
+            .iter()
+            .map(|rule| {
+                [
+                    rule.rp_id.clone(),
+                    rule.action.clone(),
+                    rule.kind.clone(),
+                    rule.rule.clone(),
+                    rule.granted_at.clone(),
+                    rule.request_id.clone(),
+                    rule.origin.clone(),
+                    rule.credential_ref.clone().unwrap_or_else(|| "-".into()),
+                ]
+            })
+            .collect();
+        // Every column but the last is padded to its widest cell.
+        let widths: Vec<usize> = (0..HEADER.len() - 1)
+            .map(|column| {
+                rows.iter()
+                    .map(|row| row[column].chars().count())
+                    .chain(std::iter::once(HEADER[column].len()))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let line = |cells: Vec<&str>| {
+            let mut text = String::from("  ");
+            for (column, cell) in cells.iter().enumerate() {
+                match widths.get(column) {
+                    Some(width) => text.push_str(&format!("{cell:<width$}  ")),
+                    None => text.push_str(cell),
+                }
+            }
+            text.push('\n');
+            text
+        };
+        out.push_str(&line(HEADER.to_vec()));
+        for row in &rows {
+            out.push_str(&line(row.iter().map(String::as_str).collect()));
+        }
+    }
+    out
 }
 
 fn require_confirm(confirm: bool) -> Result<()> {
@@ -1157,6 +1205,97 @@ mod tests {
     use super::*;
 
     use std::os::unix::fs::symlink;
+
+    use passless_core::agent::protocol::{GrantedRuleInfo, ProfileGrantedRules};
+
+    fn info(rp_id: &str, kind: &str, rule: &str, credential: Option<&str>) -> GrantedRuleInfo {
+        GrantedRuleInfo {
+            rp_id: rp_id.into(),
+            action: "authenticate".into(),
+            kind: kind.into(),
+            granted_at: "2026-11-12T10:00:00Z".into(),
+            request_id: "esc-1".into(),
+            origin: format!("https://{rp_id}"),
+            rule: rule.into(),
+            credential_ref: credential.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn grants_list_has_a_header_and_shows_rule_and_kind() {
+        let list = GrantedRuleList {
+            profiles: vec![ProfileGrantedRules {
+                profile_id: "coding".into(),
+                enabled: true,
+                disabled_reason: None,
+                digest: "d1".into(),
+                rules: vec![
+                    info("github.com", "escalation", "exact", None),
+                    info("new.example.org", "registration", "*", Some("ab12")),
+                ],
+            }],
+        };
+        let text = format_granted_rules(&list);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "coding: 2 rule(s), digest d1");
+        let header: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(
+            header,
+            [
+                "RP_ID",
+                "ACTION",
+                "KIND",
+                "RULE",
+                "GRANTED_AT",
+                "REQUEST",
+                "ORIGIN",
+                "CREDENTIAL"
+            ]
+        );
+        let exact: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(
+            exact[..4],
+            ["github.com", "authenticate", "escalation", "exact"]
+        );
+        assert_eq!(exact[7], "-");
+        let wildcard: Vec<&str> = lines[3].split_whitespace().collect();
+        assert_eq!(
+            wildcard[..4],
+            ["new.example.org", "authenticate", "registration", "*"]
+        );
+        assert_eq!(wildcard[7], "ab12");
+        // The columns line up: every row starts its RULE cell where the header does.
+        let column = lines[1].find("RULE").unwrap();
+        assert_eq!(&lines[2][column..column + 5], "exact");
+        assert_eq!(&lines[3][column..column + 1], "*");
+    }
+
+    #[test]
+    fn grants_list_prints_no_header_for_an_empty_or_disabled_profile() {
+        let list = GrantedRuleList {
+            profiles: vec![
+                ProfileGrantedRules {
+                    profile_id: "empty".into(),
+                    enabled: true,
+                    disabled_reason: None,
+                    digest: "d0".into(),
+                    rules: vec![],
+                },
+                ProfileGrantedRules {
+                    profile_id: "broken".into(),
+                    enabled: false,
+                    disabled_reason: Some("mode 0644".into()),
+                    digest: "d0".into(),
+                    rules: vec![],
+                },
+            ],
+        };
+        let text = format_granted_rules(&list);
+        assert_eq!(
+            text,
+            "empty: 0 rule(s), digest d0\nbroken: DISABLED (mode 0644)\n"
+        );
+    }
 
     use tempfile::tempdir;
 

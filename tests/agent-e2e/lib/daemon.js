@@ -33,7 +33,12 @@ function tomlValue(v) {
  *        credential_selection, max_operations, legacyDevice, extra:{...raw profile keys},
  *        legacyRules:[{rp, authenticate, register}] (raw TOML expressions, written verbatim: legacy vocabulary
  *        such as '"autonomous"' or '{ authorization = "confirm", ... }')}
- * `*` rules (same-user only) get the profile listed in `acknowledge_global_same_user` automatically.
+ * `*` rules (same-user only) get the profile listed in `acknowledge_global_same_user` automatically; a `*` rule with
+ * `register = "request"` (or `"allow"`, which the daemon refuses) also gets `acknowledge_global_registration`, and any
+ * registration rule gets `acknowledge_same_user_registration`. `omitAck: ['global_same_user' | 'same_user_registration' |
+ * 'global_registration']` leaves one of them out, to prove the daemon refuses the config (E2E-61).
+ * Profile keys go in `extra` (raw TOML values): `credential_refs: [hex, ...]` (pins, valid with `*`),
+ * `max_wildcard_registrations`, `wildcard_registration_prompts_per_day`.
  * @param {string[]} [o.browserArgs]  extra browser flags (variant + TLS), put after the executable
  * @param {string} o.browserExe
  * @param {object} [o.limits]  `[agents.limits]` keys
@@ -50,9 +55,11 @@ function renderConfig(env, o) {
   lines.push('[local]', `path = ${q(env.dirs.store)}`, '');
   const sameUserRegisterAck = [];
   const globalAck = [];
+  const globalRegistrationAck = [];
   const profileBlocks = [];
   for (const [name, p] of Object.entries(o.profiles)) {
     const mode = p.mode || 'same-user';
+    const omit = new Set(p.omitAck || []);
     const b = [];
     b.push(`[agents.profiles.${name}]`);
     b.push(`mode = ${q(mode)}`, `principal_user = ${q(user)}`);
@@ -91,8 +98,9 @@ function renderConfig(env, o) {
       if (!RULE_ACTIONS.includes(reg) || !RULE_ACTIONS.includes(auth)) throw new Error(`bad rule action in ${JSON.stringify(r)}`);
       b.push('', `[[agents.profiles.${name}.rules]]`, `rp_id = ${q(r.rp)}`, `authenticate = ${q(auth)}`, `register = ${q(reg)}`);
       if (r.credential_selection) b.push(`credential_selection = ${q(r.credential_selection)}`);
-      if (mode === 'same-user' && reg !== 'deny' && !sameUserRegisterAck.includes(name)) sameUserRegisterAck.push(name);
-      if (mode === 'same-user' && r.rp === '*' && !globalAck.includes(name)) globalAck.push(name);
+      if (mode === 'same-user' && reg !== 'deny' && !omit.has('same_user_registration') && !sameUserRegisterAck.includes(name)) sameUserRegisterAck.push(name);
+      if (mode === 'same-user' && r.rp === '*' && !omit.has('global_same_user') && !globalAck.includes(name)) globalAck.push(name);
+      if (mode === 'same-user' && r.rp === '*' && reg !== 'deny' && !omit.has('global_registration') && !globalRegistrationAck.includes(name)) globalRegistrationAck.push(name);
     }
     for (const r of p.legacyRules || []) {
       if (mode === 'same-user' && r.register !== '"deny"' && !sameUserRegisterAck.includes(name)) sameUserRegisterAck.push(name);
@@ -104,6 +112,7 @@ function renderConfig(env, o) {
   lines.push('[agents]', 'enabled = true', `audit_path = ${q(env.dirs.audit)}`);
   if (globalAck.length) lines.push(`acknowledge_global_same_user = ${tomlValue(globalAck)}`);
   if (sameUserRegisterAck.length) lines.push(`acknowledge_same_user_registration = ${tomlValue(sameUserRegisterAck)}`);
+  if (globalRegistrationAck.length) lines.push(`acknowledge_global_registration = ${tomlValue(globalRegistrationAck)}`);
   // Escalation keys (P7): `escalation_cooldown` (seconds; 1 is accepted by debug builds), `escalation_timeout` (seconds),
   // `state_dir` (absolute; default `$XDG_STATE_HOME/passless/agent`, inside the temp root here).
   for (const [k, v] of Object.entries(o.agents || {})) lines.push(`${k} = ${tomlValue(v)}`);
@@ -233,6 +242,17 @@ async function startDaemon(env, o) {
     return JSON.parse(r.stdout).data;
   };
 
+  /** `agent-admin --output plain ...`: the operator's text output (tables), not the JSON envelope. */
+  const adminPlain = (...args) => run(bins.passless, ['agent-admin', '--output', 'plain', ...args], childEnv);
+  /** `passless doctor --agents` offline checks as `{code, checks: [{name, passed, message}]}` (the daemon's backend is the local store). */
+  const doctorAgents = async () => {
+    const r = await run(bins.passless, ['--backend-type', 'local', 'doctor', '--agents', '--output', 'json'], childEnv, 120000);
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout); } catch { /* reported below */ }
+    if (!parsed) throw new Error(`doctor --agents printed no JSON (exit ${r.code}): ${r.stdout}${r.stderr}`);
+    return { code: r.code, checks: parsed.data.checks };
+  };
+
   const daemon = {
     logFile, configPath, pid: child.pid,
     /** The passless binary and the environment the daemon runs with (CLI clients use the same runtime dir and config). */
@@ -240,7 +260,7 @@ async function startDaemon(env, o) {
     /** This daemon's own human hidraw node (or why it could not be identified). */
     hidraw: human.node || null, hidrawError: human.error || null,
     log: readLog,
-    admin, adminJson,
+    admin, adminJson, adminPlain, doctorAgents,
     /** Launch the managed browser for a profile through the product path. */
     async launchBrowser(profile, startUrl) {
       const args = ['browser', 'launch', '--profile', profile];

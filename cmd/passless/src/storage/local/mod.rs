@@ -188,4 +188,44 @@ impl CredentialStorage for LocalStorageAdapter {
         debug!("count_credentials: {}", count);
         count
     }
+
+    /// From the path index: no credential file is read.
+    fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
+        Some(self.indexes.count_for_rp(rp_id))
+    }
+
+    /// From the path index: nothing is read, decrypted or unsealed.
+    fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
+        Some(self.indexes.credentials())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn count_for_rp_reads_the_index_without_opening_credential_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let rp_dir = dir.path().join("example.com");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+        for id in ["aa", "bb"] {
+            let path = rp_dir.join(format!("{id}.bin"));
+            std::fs::write(&path, b"not a credential").unwrap();
+            // Unreadable: a count that opened the file would fail.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let adapter = LocalStorageAdapter::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(adapter.count_for_rp("example.com"), Some(2));
+        assert_eq!(adapter.count_for_rp("example.org"), Some(0));
+        // The boxed adapter forwards the method instead of falling back to the default `None`.
+        let boxed: Box<dyn CredentialStorage> = Box::new(adapter);
+        assert_eq!(boxed.count_for_rp("example.com"), Some(2));
+        assert_eq!(
+            CredentialStorage::count_for_rp(&boxed, "example.com"),
+            Some(2)
+        );
+    }
 }

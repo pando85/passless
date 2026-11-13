@@ -668,10 +668,22 @@ pub struct AuthorityCeremony {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityCredentialScope {
-    pub dynamic_per_rp: bool,
+    /// How an operation matched by an exact rule finds its credentials: `pinned` (profile
+    /// `credential_refs`, plus registration-granted credentials) or `discovered` (every
+    /// credential of the RP).
+    pub exact_rules: String,
+    /// How an operation matched by the `*` rule finds its credentials: `discovered` (or only the
+    /// credentials registration grants added at that RP, when there are any), or null when the
+    /// profile has no `*` rule. Profile pins never apply to it (ADR 0014 amendment 2.1).
+    pub wildcard: Option<String>,
     pub configured_reference_count: u32,
     pub selection: String,
 }
+
+/// [`AuthorityCredentialScope::exact_rules`] when profile `credential_refs` is set.
+pub const AUTHORITY_SCOPE_PINNED: &str = "pinned";
+/// [`AuthorityCredentialScope::exact_rules`] or `wildcard` when credentials are discovered per RP.
+pub const AUTHORITY_SCOPE_DISCOVERED: &str = "discovered";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2472,6 +2484,31 @@ mod tests {
     fn reject_unknown_admin_action() {
         let json = r#"{"role":"admin","v":{"major":1,"minor":0},"seq":1,"action":"nuke"}"#;
         assert!(serde_json::from_str::<RequestFrame>(json).is_err());
+    }
+
+    #[test]
+    fn authority_credential_scope_names_exact_and_wildcard_sources() {
+        let scope = AuthorityCredentialScope {
+            exact_rules: AUTHORITY_SCOPE_PINNED.to_string(),
+            wildcard: None,
+            configured_reference_count: 2,
+            selection: "single".to_string(),
+        };
+        let json = serde_json::to_value(&scope).unwrap();
+        assert_eq!(json["exact_rules"], "pinned");
+        // Always present: null when the profile has no `*` rule.
+        assert!(json.as_object().unwrap().contains_key("wildcard"));
+        assert!(json["wildcard"].is_null());
+        let with_wildcard = AuthorityCredentialScope {
+            wildcard: Some(AUTHORITY_SCOPE_DISCOVERED.to_string()),
+            ..scope.clone()
+        };
+        let round_trip: AuthorityCredentialScope =
+            serde_json::from_value(serde_json::to_value(&with_wildcard).unwrap()).unwrap();
+        assert_eq!(round_trip, with_wildcard);
+        // The replaced field is refused.
+        let legacy = r#"{"dynamic_per_rp":true,"exact_rules":"discovered","wildcard":null,"configured_reference_count":0,"selection":"single"}"#;
+        assert!(serde_json::from_str::<AuthorityCredentialScope>(legacy).is_err());
     }
 
     #[test]
