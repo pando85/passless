@@ -1,5 +1,18 @@
 # E2E baseline
 
+## Pins with `*` and registration at unlisted sites (ADR 0014 amendment, Phase 1), 2026-11-13
+
+Branch `feat/agent-new-sites` on top of the core commits `7a5f76e`, `d1d00bb` and `c494328`. Debug build, `--features agent`.
+
+- Command: `AGENT_E2E_MATRIX=full tests/agent-e2e/run.sh E2E-27 E2E-28 E2E-42 E2E-58 E2E-59 E2E-60 E2E-61 E2E-62` (chromium,
+  pw-chromium and cft, headed and headless, port and pipe; the ids also select E2E-42/register, E2E-59/deny and
+  E2E-61/localhost): exit 0, 114 PASS, 0 FAIL, 0 XFAIL, 0 SKIP, 914 s. By attach mode: port 66 PASS, pipe 48 PASS (E2E-42 and E2E-61
+  are port-only: real dunst, and a configuration refused at start-up). Every scenario passes on each of the 6 variants.
+- `make test-agent-e2e` (CI subset, port, pw-chromium headless): exit 0, PASS=57 (72 node tests including setup), 0 FAIL.
+- E2E-58 to E2E-62 are new; E2E-27 and E2E-28 changed for the registration prompt (summary, body, Register once,
+  `register_once:<nonce>`); E2E-42/register is the local, optional dunst variant. See `README.md`, "Pins with `*` and registration at
+  unlisted sites".
+
 ## Final matrix across attach modes, 2026-11-12
 
 Branch `feat/agent-delegation-adr-0014` at HEAD `5b0bace`. Debug build, `--features agent`, default `target/`. Supersedes the P12 full
