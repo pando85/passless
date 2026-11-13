@@ -1,9 +1,10 @@
 //! Passless vendor command `0x45`: change the stored `credProtect` level of credentials.
 //!
 //! `credProtect` is fixed when a credential is created. A credential created while user
-//! verification ran (always the case with `security.always_uv = true`) is stored with level 3
-//! and then needs user verification for every use. This command lets the human change the
-//! stored level of their own credentials afterwards, in either direction.
+//! verification ran (always the case with `security.always_uv = true`) is stored with level 2
+//! since soft-fido2 0.18, and with level 3 by earlier versions; level 3 needs user verification
+//! for every use. This command lets the human change the stored level of their own
+//! credentials afterwards, in either direction.
 //!
 //! # Wire format
 //!
